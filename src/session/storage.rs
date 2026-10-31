@@ -1259,6 +1259,10 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Finalize initial readiness without replacing newer runtime activity.
+    fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,

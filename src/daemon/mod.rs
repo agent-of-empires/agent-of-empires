@@ -439,8 +439,14 @@ impl DaemonClient {
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
-            .await
+        self.request_mutation_with_outcome(
+            self.http
+                .post(url)
+                .timeout(Duration::from_secs(30 * 60))
+                .json(body),
+            epoch,
+        )
+        .await
     }
 
     pub async fn ensure_terminal(

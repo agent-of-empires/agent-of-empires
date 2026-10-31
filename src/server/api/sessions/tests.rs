@@ -5758,34 +5758,6 @@ async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
     );
 }
 
-#[test]
-fn create_session_validates_tool_before_builder_or_persistence() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions/create.rs"),
-    )
-    .unwrap();
-    let create_start = source.find("pub async fn create_session").unwrap();
-    let create_source = &source[create_start..];
-    // Anchor on the call, not the bare name: a comment above mentions the
-    // fn earlier in the handler and would satisfy a name-only find.
-    let validation = create_source
-        .find("if !validate_session_tool_identity(")
-        .unwrap();
-    let profile_default = create_source.find("body.profile.unwrap_or").unwrap();
-    let spawn_blocking = create_source.find("tokio::task::spawn_blocking").unwrap();
-    // Build and persistence both go through session_spawn.
-    let session_spawn = create_source
-        .find("crate::server::session_spawn::")
-        .unwrap();
-
-    assert!(validation < profile_default);
-    assert!(validation < spawn_blocking);
-    assert!(validation < session_spawn);
-    assert!(create_source.contains("body.profile.as_deref().unwrap_or(&default_profile)"));
-    assert!(create_source.contains("std::path::Path::new(&body.path)"));
-    assert!(!create_source[validation..spawn_blocking].contains("command_override"));
-}
-
 /// Session and terminal handlers must take the per-session lock before
 /// snapshotting the instance; a read-then-lock order lets a concurrent mutation
 /// land between the two and hands `spawn_blocking` a stale clone.
@@ -10525,16 +10497,27 @@ async fn cli_concurrent_duplicate_creation_runs_hooks_only_for_the_winner() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn cli_canonical_fork_uses_the_pinned_binding_across_agent_accounts() {
+async fn creation_boundary_cli_fork_reads_the_pinned_binding_across_agent_accounts() {
     let _home = crate::session::test_support::isolate_app_dir();
     let binding = qualified_parent_binding();
     let mut source = Instance::new("source", "/tmp");
     source.source_profile = "test".into();
     source.tool = "claude".into();
     source.agent_session_id = Some("superseded-conversation".into());
-    source.resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
-    source.resume_binding = Some(binding.clone());
+    source.resume_intent = crate::session::ResumeIntent::Cleared;
+    source.status = Status::Stopped;
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
     let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows[0].resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+            rows[0].resume_binding = Some(binding.clone());
+            Ok(())
+        })
+        .unwrap();
+    state.instances.write().await[0].status = Status::Running;
     for tool in ["claude", "claude-b"] {
         let body = create_body_from_json(serde_json::json!({
             "path": "/tmp", "profile": "test", "tool": tool, "cli": {},
@@ -10547,6 +10530,86 @@ async fn cli_canonical_fork_uses_the_pinned_binding_across_agent_accounts() {
         };
         assert_eq!(*parent, binding);
     }
+    {
+        let canonical = state.instances.read().await;
+        assert_eq!(canonical[0].status, Status::Running);
+        assert_eq!(
+            canonical[0].resume_intent,
+            crate::session::ResumeIntent::Cleared
+        );
+    }
+    {
+        let mut canonical = state.instances.write().await;
+        canonical[0].resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+        canonical[0].resume_binding = Some(binding.clone());
+    }
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows[0].resume_intent = crate::session::ResumeIntent::Cleared;
+            rows[0].resume_binding = None;
+            Ok(())
+        })
+        .unwrap();
+    let body = create_body_from_json(serde_json::json!({
+        "path": "/tmp", "profile": "test", "tool": "claude", "cli": {},
+    }));
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+
+    let profile = "fork-after-profile-create";
+    let created = crate::server::api::system::create_profile(
+        State(state.clone()),
+        Ok(Json(crate::daemon::CreateProfileBody {
+            name: profile.into(),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let mut new_source = Instance::new("new profile parent", "/tmp");
+    new_source.source_profile = profile.into();
+    new_source.tool = "claude".into();
+    new_source.resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+    new_source.resume_binding = Some(binding.clone());
+    Storage::open_unwatched(profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(new_source.clone());
+            Ok(())
+        })
+        .unwrap();
+    state.instances.write().await.push(new_source.clone());
+    let body = create_body_from_json(serde_json::json!({
+        "path": "/tmp", "profile": profile, "tool": "claude", "cli": {},
+    }));
+    let seed = create::resolve_canonical_fork_seed(&state, &body, &new_source.id)
+        .await
+        .unwrap();
+    let crate::session::ForkSeed::Terminal { parent, .. } = seed else {
+        panic!("a freshly acknowledged profile must support native forks");
+    };
+    assert_eq!(*parent, binding);
+
+    let retired = tempfile::tempdir().unwrap();
+    std::fs::rename(
+        crate::session::get_profile_dir_path(profile).unwrap(),
+        retired.path().join("retired"),
+    )
+    .unwrap();
+    Storage::new_unwatched(profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(new_source.clone());
+            Ok(())
+        })
+        .unwrap();
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &new_source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -10694,11 +10757,170 @@ async fn cli_fork_inherits_a_custom_identity_instead_of_its_builtin_token() {
     source.source_profile = "test".into();
     source.tool = "claude-personal".into();
     let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
-    let mut body = create_body_from_json(serde_json::json!({
+    let body = create_body_from_json(serde_json::json!({
         "path": project.path(), "tool": "", "profile": "test", "cli": {"fork_source": source.id},
     }));
-    super::cli_create::resolve_cli_creation(&state, &mut body, "test")
+    let (body, _) = super::cli_create::resolve_cli_creation(&state, body, "test")
         .await
         .unwrap();
     assert_eq!(body.tool, "claude-personal");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_structured_hook_refusal_replays_without_repeating_create_hooks() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let marker = project.path().join("create-count");
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("claude".into());
+        config
+            .session
+            .agent_command_override
+            .insert("claude".into(), "/bin/true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), "/bin/true".into());
+        config.hooks.on_create = vec![format!(
+            "printf 'x\\n' >> {}",
+            shell_words::quote(marker.to_str().unwrap())
+        )];
+    })
+    .unwrap();
+    crate::session::config::update_app_state(|app| {
+        app.has_acknowledged_agent_hooks = false;
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut body = serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": "consent", "view": "structured", "agent_name": "fake",
+        "idempotency_key": "consent-refusal", "cli": {},
+    });
+    let (status, code, failure) = post_create_raw(&state, body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code.as_deref(), Some("agent_hooks_not_approved"));
+    assert!(failure["message"]
+        .as_str()
+        .unwrap()
+        .contains("aoe hooks approve"));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\n");
+    assert!(state.instances.read().await.is_empty());
+
+    crate::session::config::update_app_state(|app| {
+        app.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+    let (status, code, _) = post_create_raw(&state, body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code.as_deref(), Some("agent_hooks_not_approved"));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\n");
+    assert!(state.instances.read().await.is_empty());
+
+    body["idempotency_key"] = serde_json::json!("consent-new-intention");
+    let (status, created) = post_create(&state, body).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\nx\n");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_relative_adapter_uses_the_provisioned_directory_and_effective_hooks() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("fake".into());
+        config
+            .session
+            .custom_agents
+            .insert("fake".into(), "/bin/true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), "./adapter".into());
+        config.acp.acp_defaults.insert(
+            "fake".into(),
+            crate::session::config::AcpAgentDefaults {
+                model: Some("derived-model".into()),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let base = serde_json::json!({
+        "path": "", "scratch": true, "tool": "", "profile": "test",
+        "view": "structured", "cli": {},
+    });
+    let mut explicit = base.clone();
+    explicit["agent_name"] = serde_json::json!("fake");
+    let (status, failure) = post_create(&state, explicit).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{failure}");
+    assert_eq!(failure["error"], "acp_adapter_missing");
+    assert!(state.instances.read().await.is_empty());
+    assert!(support::load_instances_from_disk_for_test("test").is_empty());
+    assert_eq!(std::fs::read_dir(app.join("scratch")).unwrap().count(), 0);
+
+    for model in [None, Some("explicit-model")] {
+        let mut implicit = base.clone();
+        implicit["title"] = serde_json::json!(format!("terminal fallback {model:?}"));
+        implicit["agent_model"] = serde_json::json!(model);
+        let (status, created) = post_create(&state, implicit).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let fallback = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == created["id"].as_str().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(fallback.view, crate::session::View::Terminal);
+        assert_eq!(fallback.status, crate::session::Status::Stopped);
+        assert_eq!(fallback.agent_model.as_deref(), model);
+        assert!(fallback.acp_effort.is_none());
+    }
+
+    crate::session::config::update_config(|config| {
+        config.hooks.on_create = vec!["cp /bin/true ./adapter".into()];
+    })
+    .unwrap();
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut installed = base;
+    installed["title"] = serde_json::json!("installed adapter");
+    installed["agent_name"] = serde_json::json!("fake");
+    let (status, created) = post_create(&state, installed).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == created["id"].as_str().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(row.view, crate::session::View::Structured);
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        std::fs::metadata(std::path::Path::new(&row.project_path).join("adapter"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
 }

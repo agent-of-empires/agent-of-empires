@@ -138,6 +138,78 @@ pub(super) async fn resolve_canonical_fork_seed(
     }
     let lock = state.instance_lock(source_id).await;
     let _guard = lock.lock().await;
+    if body.cli.is_some() {
+        let (profile, identity) = {
+            let instances = state.instances.read().await;
+            let source = instances
+                .iter()
+                .find(|row| row.id == source_id)
+                .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+            let cache = state
+                .runtime_read_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let identity = cache
+                .inventory
+                .iter()
+                .find(|profile| profile.name == source.source_profile)
+                .map(|profile| profile.identity)
+                .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+            (source.source_profile.clone(), identity)
+        };
+        let worker_state = state.clone();
+        let source_id = source_id.to_owned();
+        let (source, _lifecycle) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            use crate::session::SessionStore;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &profile,
+                None,
+            )
+            .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+            identity
+                .verify_storage(native.storage())
+                .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+            let lifecycle = native
+                .storage()
+                .acquire_instance_lifecycle_lock(&source_id)
+                .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+            let mut source = native
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source_id)
+                .ok_or(crate::session::SessionGone)?;
+            source.source_profile = profile;
+            Ok((source, lifecycle))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+        .map_err(|error| {
+            super::lifecycle::lifecycle_rejection(state, &error)
+                .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
+        })?;
+        if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+            return Err((
+                StatusCode::CONFLICT,
+                crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            )
+                .into_response());
+        }
+        if source.effective_profile() != body.profile.as_deref().unwrap_or(&state.served_profile())
+            || source.project_path != body.path
+        {
+            return Err(StatusCode::CONFLICT.into_response());
+        }
+        if body.view != crate::session::View::Terminal {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+        return crate::session::fork::terminal_fork_seed(
+            source.fork_parent_ref().ok().flatten(),
+            crate::session::capture::generate_session_uuid(),
+            source.is_sandboxed(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST.into_response());
+    }
     let instances = state.instances.read().await;
     let source = instances
         .iter()
@@ -149,24 +221,6 @@ pub(super) async fn resolve_canonical_fork_seed(
             crate::daemon::ApiErrorCode::LifecycleLocked.header(),
         )
             .into_response());
-    }
-    if body.cli.is_some()
-        && (source.effective_profile()
-            != body.profile.as_deref().unwrap_or(&state.served_profile())
-            || source.project_path != body.path)
-    {
-        return Err(StatusCode::CONFLICT.into_response());
-    }
-    if body.cli.is_some() {
-        if body.view != crate::session::View::Terminal {
-            return Err(StatusCode::BAD_REQUEST.into_response());
-        }
-        return crate::session::fork::terminal_fork_seed(
-            source.fork_parent_ref().ok().flatten(),
-            crate::session::capture::generate_session_uuid(),
-            source.is_sandboxed(),
-        )
-        .map_err(|_| StatusCode::BAD_REQUEST.into_response());
     }
     if source.tool != body.tool
         || source.view != body.view
@@ -717,7 +771,7 @@ pub async fn create_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
@@ -757,7 +811,7 @@ pub async fn create_session(
             return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
         if let Some(failure) = state.create_progress.recent_failure(key) {
-            return api_error(failure.status, failure.code, failure.message);
+            return create_failure_response(failure);
         }
         if body
             .retry_origin
@@ -784,17 +838,30 @@ pub async fn create_session(
     };
     let namespace = state.profile_namespace.read().await;
     let default_profile = state.served_profile().to_string();
-    let cli_warnings =
-        match super::cli_create::resolve_cli_creation(&state, &mut body, &default_profile).await {
-            Ok(warnings) => warnings,
-            Err(error) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "validation_failed",
-                    error.to_string(),
-                )
-            }
-        };
+    let (mut body, cli_warnings) = match super::cli_create::resolve_cli_creation(
+        &state,
+        body,
+        &default_profile,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) if error.is::<crate::server::session_spawn::SessionBuildPanicked>() => {
+            tracing::error!(target: "http.api.sessions", %error, "CLI creation resolution failed");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            );
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                error.to_string(),
+            )
+        }
+    };
 
     if state.cityhall_mode {
         // CityHall derives execution and outbound effects from operator policy.
@@ -1354,8 +1421,19 @@ pub async fn create_session(
                 return response;
             }
             let failure = create_failure(&e).expect("hooks_need_trust returned above");
-            api_error(failure.status, failure.code, failure.message)
+            create_failure_response(failure)
         }
+    }
+}
+
+fn create_failure_response(
+    failure: crate::server::create_progress::CreateFailure,
+) -> axum::response::Response {
+    let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
+    if failure.code == code.as_str() {
+        crate::server::api::api_error_with_code_header(code, failure.message)
+    } else {
+        api_error(failure.status, failure.code, failure.message)
     }
 }
 
@@ -1363,6 +1441,24 @@ pub async fn create_session(
 /// caller resubmits with the same key.
 fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
     use crate::server::create_progress::CreateFailure;
+    if let Some(refusal) = e.downcast_ref::<crate::session::HostHookApprovalRequired>() {
+        let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
+        return Some(CreateFailure {
+            status: code.status(),
+            code: code.as_str(),
+            message: refusal.to_string(),
+        });
+    }
+    if let Some(
+        refusal @ crate::session::builder::structured::StructuredChoiceError::AdapterMissing(_),
+    ) = e.downcast_ref::<crate::session::builder::structured::StructuredChoiceError>()
+    {
+        return Some(CreateFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "acp_adapter_missing",
+            message: refusal.to_string(),
+        });
+    }
     // A refusal the caller corrects and resends under the same idempotency key must not
     // be frozen into the replay map: recording it would make every later attempt on that
     // key short-circuit on the first refusal for a whole FAILURE_TTL. `HooksNeedTrust` is

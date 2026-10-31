@@ -1289,6 +1289,7 @@ pub mod structured {
             }
         }
     }
+    impl std::error::Error for StructuredChoiceError {}
 
     /// The session a structured-view choice is checked for.
     pub struct StructuredChoice<'a> {

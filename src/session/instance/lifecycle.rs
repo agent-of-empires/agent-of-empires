@@ -262,19 +262,8 @@ impl Instance {
         Ok(())
     }
 
-    /// Publish the outcome of a creation that released its reservation when
-    /// its registration window closed.
-    ///
-    /// A structured creation has nothing left to fence once the row, its
-    /// worktree, branch, sandbox and scratch dir are durable, so it drops the
-    /// reservation rather than hold a purge off for the whole ACP handshake,
-    /// a wait with no durable effect. What remains after the release is
-    /// ownership proof, and the durable generation is exactly that: every peer
-    /// transition mints a newer one, so a mismatch means an archive, trash,
-    /// restore, stop or purge took the row and this write is refused instead of
-    /// stamping a status onto it. The reservation release is a no-op here, the
-    /// creation having already given it up, and is kept so one commit serves
-    /// both shapes.
+    /// Settle a created launch only while its generation remains current.
+    /// Readiness must not replace runtime activity admitted during the handshake.
     pub(crate) fn commit_created_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
@@ -282,12 +271,14 @@ impl Instance {
         status: Status,
     ) -> Result<()> {
         let idle = status == Status::Idle;
-        let committed = storage.update(|instances, _groups| {
+        let mut committed = false;
+        let mut mutation = |instances: &mut Vec<Instance>,
+                            _groups: &mut Vec<crate::session::Group>| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
+                return Ok(());
             };
             if stored.lifecycle_generation != generation {
-                return Ok(false);
+                return Ok(());
             }
             stored.status = status;
             stored.idle_entered_at = if idle { self.idle_entered_at } else { None };
@@ -296,8 +287,14 @@ impl Instance {
             stored.capture_started_at = self.capture_started_at;
             stored.active_execution = self.active_execution.clone();
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-            Ok(true)
-        })?;
+            committed = true;
+            Ok(())
+        };
+        if idle {
+            storage.commit_launch_ready(&mut mutation)?;
+        } else {
+            storage.commit(&mut mutation)?;
+        }
         anyhow::ensure!(committed, LifecycleReservationError::Superseded);
         self.lifecycle_reservation = None;
         self.status = status;

@@ -2353,6 +2353,11 @@ async fn commit_profile_owned(
         &suppressed,
     );
     *state.canonical_metadata.write().await = loaded.metadata;
+    state
+        .runtime_read_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inventory = loaded.inventory;
     *state.canonical_health.write().await = RuntimeHealth::Healthy;
     state
         .mutation_epoch

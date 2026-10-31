@@ -362,9 +362,10 @@ pub(crate) async fn spawn_structured_session(
             }
         };
         let mut instance = build_result.instance;
-        let build_warnings = build_result.warnings;
+        let mut build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let mut validation_error = None;
         let agent_effort = if provision_error.is_none() {
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
@@ -404,6 +405,36 @@ pub(crate) async fn spawn_structured_session(
                 );
             instance.agent_model = resolved_model;
             instance.acp_effort = explicit_effort;
+            if cli.is_some() && instance.is_structured() {
+                use crate::session::builder::structured::{
+                    preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                    StructuredChoiceError,
+                };
+                let choice = StructuredChoice {
+                    tool: &instance.tool,
+                    agent_name: instance.agent_name.as_deref(),
+                    command_override: &instance.command,
+                    sandboxed: instance.is_sandboxed(),
+                    project_path: Some(std::path::Path::new(&instance.project_path)),
+                    preparation_hooks: &|| preparation_hooks_apply(
+                        &config.hooks,
+                        std::path::Path::new(&original_path),
+                        scratch,
+                        trust_hooks,
+                    ),
+                };
+                if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
+                    if matches!(error, StructuredChoiceError::NotCapable(_))
+                        || instance.agent_name.is_some()
+                        || instance.acp_effort.is_some()
+                    {
+                        validation_error = Some(anyhow::Error::new(error));
+                    } else {
+                        build_warnings.push(format!("{error}; using terminal view"));
+                        instance.view = crate::session::View::Terminal;
+                    }
+                }
+            }
             // Don't trust the client's capability decision.
             if instance.is_structured() {
                 let resolved = instance
@@ -542,7 +573,7 @@ pub(crate) async fn spawn_structured_session(
             rollback(native, instance, provisioning_failed);
             return Err(error);
         }
-        let creation = match provision_error {
+        let creation = match provision_error.or(validation_error) {
             Some(error) => Err(error),
             None => creation_guard
                 .check()

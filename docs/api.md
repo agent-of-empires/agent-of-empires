@@ -402,18 +402,24 @@ The optional `cli` object carries CLI selection intent: `parent`, `projects`,
 `command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
 Selectors, project registries, configuration and paths are resolved on the Daemon host.
 A terminal creation with `cli` runs creation hooks and finishes **Stopped**, without
-launching the agent. Launch is a separate epoch-checked request. Requests without
+launching the agent. Launch is a separate epoch-checked request. The CLI client
+allows up to 30 minutes for creation and launch, including host hooks. Requests without
 `cli` keep the existing lifecycle. `GET /api/runtime` advertises `cli_creation: true`;
 clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
 Concurrent CLI requests with the same title and working directory cannot create duplicates.
+
+CLI forks use the latest durable parent binding, including a completed
+`aoe session set-session-id`, without waiting for the filesystem watcher.
 
 With CLI intent, `extra_args` uses shell-style word grouping, then each argument
 is quoted for literal delivery. Quotes group text; shell operators and substitutions
 are arguments, not scripts. Other API callers retain their existing input validation.
 
-Host launches that need agent-hook approval return `409` with
-`aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
-host before retrying launch; repository creation trust does not grant this approval.
+Host launches and structured creations that need agent-hook approval return `409`
+with `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
+host; repository creation trust does not grant this approval. The Daemon caches
+failed creations. Use a new key after approval; replaying a cached refusal does
+not repeat creation hooks.
 
 For `trust_hooks`, omission refuses unapproved repository hooks with
 `hooks_need_trust`; `true` approves hooks and project MCP; `false` explicitly

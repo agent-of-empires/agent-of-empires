@@ -19,11 +19,11 @@ pub(crate) fn resolve_cli_session<'a>(
 
 pub(super) async fn resolve_cli_creation(
     state: &super::AppState,
-    body: &mut CreateSessionBody,
+    mut body: CreateSessionBody,
     default_profile: &str,
-) -> Result<Vec<String>> {
+) -> Result<(CreateSessionBody, Vec<String>)> {
     let Some(mut options) = body.cli.take() else {
-        return Ok(Vec::new());
+        return Ok((body, Vec::new()));
     };
     anyhow::ensure!(
         !state.cityhall_mode,
@@ -33,7 +33,6 @@ pub(super) async fn resolve_cli_creation(
         .agent_effort
         .take()
         .map(|effort| effort.trim().to_owned());
-    let mut warnings = Vec::new();
     let profile = body.profile.as_deref().unwrap_or(default_profile);
     let mut inherited_tool = None;
     if let Some(selector) = options.fork_source.as_deref() {
@@ -66,6 +65,35 @@ pub(super) async fn resolve_cli_creation(
         body.group = parent.group_path.clone();
         options.parent = Some(parent.id.clone());
     }
+    let default_profile = if body.profile.is_none() {
+        default_profile.to_owned()
+    } else {
+        String::new()
+    };
+    tokio::task::spawn_blocking(move || {
+        resolve_host_creation(body, options, inherited_tool, &default_profile)
+    })
+    .await
+    .map_err(|error| {
+        anyhow::Error::new(crate::server::session_spawn::SessionBuildPanicked(
+            error.to_string(),
+        ))
+    })?
+}
+
+fn resolve_host_creation(
+    mut body: CreateSessionBody,
+    options: crate::daemon::CliCreationOptions,
+    inherited_tool: Option<String>,
+    default_profile: &str,
+) -> Result<(CreateSessionBody, Vec<String>)> {
+    let profile = body.profile.as_deref().unwrap_or(default_profile);
+    let mut warnings = Vec::new();
+    let mut original_repos = if body.create_new_branch && !body.repo_bases.is_empty() {
+        vec![std::path::PathBuf::from(&body.path)]
+    } else {
+        Vec::new()
+    };
     if !body.scratch {
         let path = std::path::Path::new(&body.path)
             .canonicalize()
@@ -89,21 +117,35 @@ pub(super) async fn resolve_cli_creation(
                 .map(|project| project.path),
         );
     }
+    if !original_repos.is_empty() {
+        original_repos.extend(body.extra_repo_paths.iter().map(std::path::PathBuf::from));
+        let pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
+            .into_iter()
+            .map(|pair| (pair.repo, pair.base_branch))
+            .collect();
+        body.repo_bases =
+            crate::session::builder::resolve_repo_base_selectors(&original_repos, &pairs)?
+                .into_iter()
+                .map(|(path, base_branch)| {
+                    Ok(crate::daemon::RepoBaseInput {
+                        repo: path
+                            .canonicalize()
+                            .context(
+                                "Failed to resolve a repository base selector on the Daemon host",
+                            )?
+                            .to_string_lossy()
+                            .into_owned(),
+                        base_branch,
+                    })
+                })
+                .collect::<Result<_>>()?;
+    }
     for path in &mut body.extra_repo_paths {
         *path = std::path::Path::new(path)
             .canonicalize()
             .context("Failed to resolve an additional repository on the Daemon host")?
             .to_string_lossy()
             .into_owned();
-    }
-    for pair in &mut body.repo_bases {
-        if std::path::Path::new(&pair.repo).is_absolute() {
-            pair.repo = std::path::Path::new(&pair.repo)
-                .canonicalize()
-                .context("Failed to resolve a repository base selector on the Daemon host")?
-                .to_string_lossy()
-                .into_owned();
-        }
     }
     anyhow::ensure!(
         body.extra_repo_paths.is_empty()
@@ -277,5 +319,5 @@ pub(super) async fn resolve_cli_creation(
         }
     }
     body.cli = Some(options);
-    Ok(warnings)
+    Ok((body, warnings))
 }

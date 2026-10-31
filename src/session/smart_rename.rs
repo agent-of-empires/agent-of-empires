@@ -1667,7 +1667,7 @@ mod serve {
         if let Err(error) = crate::server::reload::adopt_committed_profiles(
             state,
             [(profile, rows, groups)],
-            |_| false,
+            |_| None,
             &prepared.2,
             &publication,
         )

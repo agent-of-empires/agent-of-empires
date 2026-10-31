@@ -14,6 +14,17 @@ pub(crate) struct ProfileIdentity {
     inode: u64,
 }
 
+impl ProfileIdentity {
+    pub(crate) fn verify_storage(self, storage: &Storage) -> anyhow::Result<()> {
+        let (device, inode) = storage.bound_profile_identity()?;
+        anyhow::ensure!(
+            self == Self { device, inode },
+            "Profile identity changed during read"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SelectableProfile {
     pub name: String,
@@ -132,11 +143,7 @@ fn read_inventory_instances(
     file_watch: Arc<FileWatchService>,
 ) -> anyhow::Result<Vec<Instance>> {
     let storage = Storage::open_inventory_reference(name, file_watch)?;
-    let (device, inode) = storage.bound_profile_identity()?;
-    anyhow::ensure!(
-        identity == ProfileIdentity { device, inode },
-        "Profile identity changed during read"
-    );
+    identity.verify_storage(&storage)?;
     let instances = storage.load_instances_readonly()?;
     storage.verify_bound_profile()?;
     Ok(instances)
@@ -488,9 +495,11 @@ pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetai
     })
 }
 
-pub(super) enum StatusCommit {
+#[derive(Clone, Copy)]
+pub(crate) enum StatusCommit {
     Passive,
     Lifecycle,
+    LaunchReady,
 }
 
 pub(super) fn replace_committed_profiles<const N: usize>(
@@ -550,10 +559,19 @@ pub(super) fn replace_committed_profiles<const N: usize>(
                     row.merge_runtime_for_profile_move(previous);
                 }
                 if let Some(commit) = committed_status(&row.id) {
-                    row.status = status;
-                    row.idle_entered_at = idle_entered_at;
-                    if matches!(commit, StatusCommit::Lifecycle) {
-                        row.last_error = committed_error;
+                    let owns_status = match commit {
+                        StatusCommit::LaunchReady => {
+                            previous.lifecycle_generation == row.lifecycle_generation
+                                && previous.status == crate::session::Status::Starting
+                        }
+                        StatusCommit::Passive | StatusCommit::Lifecycle => true,
+                    };
+                    if owns_status {
+                        row.status = status;
+                        row.idle_entered_at = idle_entered_at;
+                        if !matches!(commit, StatusCommit::Passive) {
+                            row.last_error = committed_error;
+                        }
                     }
                 }
                 row.last_accessed_at = row.last_accessed_at.max(previous.last_accessed_at);
@@ -599,7 +617,7 @@ pub(super) fn replace_committed_profiles<const N: usize>(
 pub(crate) async fn adopt_committed_profiles<const N: usize>(
     state: &Arc<AppState>,
     committed: [(&str, Vec<Instance>, Vec<crate::session::Group>); N],
-    committed_status: impl Fn(&str) -> bool,
+    committed_status: impl Fn(&str) -> Option<StatusCommit>,
     _reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<(), ReloadFailure> {
@@ -607,12 +625,10 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
     let mut current = state.instances.write().await;
     let prior_statuses: Vec<_> = current
         .iter()
-        .filter(|row| committed_status(&row.id))
+        .filter(|row| committed_status(&row.id).is_some())
         .map(|row| (row.id.clone(), row.status))
         .collect();
-    replace_committed_profiles(&mut current, &mut metadata, committed, |id| {
-        committed_status(id).then_some(StatusCommit::Lifecycle)
-    })?;
+    replace_committed_profiles(&mut current, &mut metadata, committed, committed_status)?;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
