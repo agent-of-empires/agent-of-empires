@@ -2,7 +2,13 @@
 
 import { useCallback, useSyncExternalStore } from "react";
 import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
-import { emptyAcpState, normaliseTurnState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
+import {
+  emptyAcpState,
+  normaliseTurnState,
+  type AcpState,
+  type BackgroundAgent,
+  type WorkflowRun,
+} from "../../lib/acpTypes";
 import {
   STORAGE_KEY_PREFIX,
   STATE_TTL_MS,
@@ -184,18 +190,36 @@ function subscribeAcpState(sessionId: string, cb: () => void): () => void {
 }
 
 const EMPTY_BACKGROUND_AGENTS: BackgroundAgent[] = [];
+const EMPTY_BACKGROUND_TASKS: string[] = [];
+const EMPTY_WORKFLOW_RUNS: Record<string, WorkflowRun> = {};
 
-/** Background agents for a session, read from the cache so sibling panels need no second WebSocket. */
-export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
+/** One field of a session's cached state, so sibling panels need no second WebSocket. */
+function useCachedField<T>(sessionId: string | null, pick: (state: AcpState) => T, empty: T): T {
   const subscribe = useCallback(
     (cb: () => void) => (sessionId ? subscribeAcpState(sessionId, cb) : () => {}),
     [sessionId],
   );
-  const getSnapshot = useCallback(
-    () => (sessionId ? stateCache.get(sessionId)?.backgroundAgents : undefined) ?? EMPTY_BACKGROUND_AGENTS,
-    [sessionId],
-  );
+  const getSnapshot = useCallback(() => {
+    const state = sessionId ? stateCache.get(sessionId) : undefined;
+    return state ? pick(state) : empty;
+  }, [sessionId, pick, empty]);
   return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+const pickBackgroundAgents = (s: AcpState) => s.backgroundAgents;
+const pickBackgroundTasks = (s: AcpState) => s.backgroundTasks;
+const pickWorkflowRuns = (s: AcpState) => s.workflowRuns;
+
+export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
+  return useCachedField(sessionId, pickBackgroundAgents, EMPTY_BACKGROUND_AGENTS);
+}
+
+export function useBackgroundTasks(sessionId: string | null): string[] {
+  return useCachedField(sessionId, pickBackgroundTasks, EMPTY_BACKGROUND_TASKS);
+}
+
+export function useWorkflowRuns(sessionId: string | null): Record<string, WorkflowRun> {
+  return useCachedField(sessionId, pickWorkflowRuns, EMPTY_WORKFLOW_RUNS);
 }
 
 /** Drop one session's cached state, or all of it, so a reused id never shows a prior transcript. */

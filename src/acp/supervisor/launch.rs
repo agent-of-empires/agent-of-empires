@@ -2206,6 +2206,7 @@ mod tests {
             destructive: false,
             options: Vec::new(),
             choice: false,
+            plan: None,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
@@ -2297,6 +2298,7 @@ mod tests {
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent.jsonl".into(),
                 started_at: chrono::Utc::now(),
+                workflow: None,
             },
         );
         sink.publish(
@@ -2489,6 +2491,7 @@ mod tests {
                 model: "claude".into(),
                 output_file: output_file.into(),
                 started_at: chrono::Utc::now(),
+                workflow: None,
             },
         );
         sink.publish(
@@ -2548,6 +2551,7 @@ mod tests {
                     task_id: task_id.into(),
                     tool_call_id: Some("toolu_task".into()),
                     description: "sleep".into(),
+                    workflow: None,
                 },
             );
         }

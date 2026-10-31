@@ -44,7 +44,7 @@ With `session.tie_workdir_to_name` off, `git worktree move` changes only the fin
 |---------|-----|
 | CLI | `aoe session set-worktree-name <session> --name <new-name> [--rename-branch]` |
 | TUI | Select the session and press `W`, or use **Edit worktree workdir name** in the command palette |
-| Web | Right-click the row and choose **Edit workdir name** |
+| Web | Right-click the row and choose **More > Rename workdir** |
 | REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": false }` |
 
 ### When the Directory Moves Outside aoe

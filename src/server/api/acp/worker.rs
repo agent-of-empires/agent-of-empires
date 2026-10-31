@@ -262,7 +262,15 @@ pub async fn shutdown_acp(
             )
             .await
             {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Ok(()) => {
+                    tracing::info!(
+                        target: "session.stop",
+                        session = %id,
+                        view = "structured",
+                        "session stopped"
+                    );
+                    StatusCode::NO_CONTENT.into_response()
+                }
                 Err(response) => response,
             }
         })
@@ -545,6 +553,14 @@ pub async fn switch_acp_agent(
         .filter(|r| !r.is_empty())
         .unwrap_or("manual")
         .to_string();
+    tracing::info!(
+        target: "acp.switch",
+        session = %id,
+        from = %from_agent,
+        to = %target,
+        reason = %reason,
+        "agent switched"
+    );
     let switch_seq =
         state
             .acp_supervisor
@@ -797,6 +813,13 @@ pub async fn switch_acp_provider(
     if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
         return supervisor_error_response("spawn failed after provider switch", &e);
     }
+    tracing::info!(
+        target: "acp.switch",
+        session = %id,
+        provider = %provider,
+        model_cleared,
+        "provider switched"
+    );
 
     Json(SwitchProviderResponse {
         session_id: id,

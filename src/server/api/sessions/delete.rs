@@ -16,6 +16,31 @@ pub(crate) async fn purge_session_artifacts(
     additional_protection: Option<crate::session::path_identity::CleanupProtection>,
     selection: Option<crate::session::deletion::PurgeSelection>,
 ) -> anyhow::Result<PurgeOutcome> {
+    let outcome = purge_session_artifacts_inner(
+        state,
+        id,
+        instance,
+        body,
+        recent_entry,
+        additional_protection,
+        selection,
+    )
+    .await?;
+    if let PurgeOutcome::Deleted { cleanup_errors, .. } = &outcome {
+        tracing::info!(target: "session.delete", session = %id, cleanup_errors = cleanup_errors.len(), "session purged");
+    }
+    Ok(outcome)
+}
+
+async fn purge_session_artifacts_inner(
+    state: &Arc<AppState>,
+    id: &str,
+    instance: Instance,
+    body: &DeleteSessionBody,
+    recent_entry: Option<crate::session::RecentProjectEntry>,
+    additional_protection: Option<crate::session::path_identity::CleanupProtection>,
+    selection: Option<crate::session::deletion::PurgeSelection>,
+) -> anyhow::Result<PurgeOutcome> {
     use crate::session::deletion::{DeletionDisposition, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
         anyhow::bail!(super::lifecycle::LifecycleTargetError::CityHall);
@@ -431,6 +456,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
             tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
             continue;
         }
+        tracing::info!(target: "session.delete", session = %id, source = "recovery", "session purged");
     }
     drop(_namespace);
     if let Err(error) = state.runtime.publish(state).await {
@@ -802,7 +828,10 @@ pub async fn delete_session(
                 if error.is::<PurgeCleanupFailed>() {
                     let snapshot = match state.runtime.publish(&state).await {
                         Ok(snapshot) => snapshot,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Err(publish_error) => {
+                            tracing::debug!(target: "server.runtime", error = %publish_error, "runtime publish failed");
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
                     };
                     return crate::server::runtime::mutation_response(
                         &snapshot.value.cursor,
@@ -822,7 +851,10 @@ pub async fn delete_session(
         };
         let snapshot = match state.runtime.publish(&state).await {
             Ok(snapshot) => snapshot,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(error) => {
+                tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
         };
         crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
     });
@@ -975,11 +1007,21 @@ async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::respo
             }
         }
     }
+    tracing::info!(
+        target: "session.delete",
+        %profile,
+        purged = outcome.sessions.len(),
+        failed = outcome.failures.len(),
+        "trash emptied"
+    );
     match state.runtime.publish(&state).await {
         Ok(snapshot) => {
             crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
         }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -1077,6 +1119,7 @@ pub async fn abandon_purge(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    tracing::info!(target: "session.delete", session = %id, "purge abandoned");
     let cleanup_state = state.clone();
     state.runtime.work.spawn("abandoned purge cleanup", async move {
         let _namespace = namespace;
@@ -1093,7 +1136,10 @@ pub async fn abandon_purge(
     });
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     crate::server::runtime::mutation_response(&snapshot.value.cursor, StatusCode::ACCEPTED)
 }
@@ -1441,6 +1487,7 @@ pub async fn delete_workspace(
     }
     let plan = order_workspace_deletion(&session_ids, &body);
     let join = tokio::spawn(async move {
+        let owner = owner_id.clone();
         let (deleted, kept, failed, messages, dirty) =
             purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await;
         if let Some(msg) = dirty {
@@ -1477,9 +1524,21 @@ pub async fn delete_workspace(
             )
                 .into_response();
         }
+        tracing::info!(
+            target: "session.delete",
+            %owner,
+            count = deleted.len(),
+            kept = kept.len(),
+            failed = failed.len(),
+            busy = busy.len(),
+            "workspace deleted"
+        );
         let snapshot = match state.runtime.publish(&state).await {
             Ok(snapshot) => snapshot,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(error) => {
+                tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
         };
         crate::server::runtime::mutation_response(
             &snapshot.value.cursor,

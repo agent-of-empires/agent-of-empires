@@ -2,7 +2,7 @@
 import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent } from "../../../lib/acpTypes";
+import type { BackgroundAgent, WorkflowRun } from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -10,8 +10,12 @@ vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedV
 // The panel reads the live list from the useAcpSession store; mock it so
 // the test drives the rendering purely from a fixed agent list.
 const agentsMock = vi.fn<() => BackgroundAgent[]>(() => []);
+const tasksMock = vi.fn<() => string[]>(() => []);
+const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
 vi.mock("../../../hooks/useAcpSession", () => ({
   useBackgroundAgents: () => agentsMock(),
+  useBackgroundTasks: () => tasksMock(),
+  useWorkflowRuns: () => runsMock(),
 }));
 
 import { BackgroundAgentsPanel } from "../BackgroundAgentsPanel";
@@ -37,6 +41,56 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
 }
 
 describe("BackgroundAgentsPanel", () => {
+  it("groups a workflow's agents under the run and its phases", () => {
+    const wf = (phase: string) => ({ run_id: "wf_1", name: "issue-drafts", phase });
+    const ended = new Date().toISOString();
+    agentsMock.mockReturnValue([
+      agent({ agentId: "p1", description: "plain task", status: "completed", endedAt: ended }),
+      agent({ agentId: "d1", description: "draft:one", workflow: wf("Draft"), status: "completed", endedAt: ended }),
+      agent({ agentId: "d2", description: "draft:two", workflow: wf("Draft"), status: "completed", endedAt: ended }),
+      agent({ agentId: "v1", description: "verify:one", workflow: wf("Verify") }),
+    ]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = container.textContent ?? "";
+    expect(text).toContain("Background agents · 4");
+    expect(text).toContain("issue-drafts");
+    expect(text).toContain("2 of 3 done");
+    expect(text).toContain("Draft · 2/2");
+    expect(text).toContain("Verify · 0/1");
+    // The active run sorts first; its phases keep start order; plain agents stay ungrouped.
+    const order = ["issue-drafts", "draft:one", "draft:two", "verify:one", "plain task"].map((s) => text.indexOf(s));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // Collapsing the run hides its agents only.
+    const runHeader = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("issue-drafts"));
+    fireEvent.click(runHeader!);
+    expect(container.textContent).not.toContain("draft:one");
+    expect(container.textContent).toContain("plain task");
+  });
+
+  it("keeps a run live between phases, until its task ends", () => {
+    const ended = new Date().toISOString();
+    agentsMock.mockReturnValue([
+      agent({
+        workflow: { run_id: "wf_1", name: "issue-drafts", phase: "Draft" },
+        status: "completed",
+        endedAt: ended,
+      }),
+    ]);
+    runsMock.mockReturnValue({ "task-1": { taskId: "wfx", name: "issue-drafts", summary: null } });
+    const runDot = (container: HTMLElement) =>
+      [...container.querySelectorAll("button")]
+        .find((b) => b.textContent?.includes("issue-drafts"))!
+        .querySelector("span")!.className;
+    tasksMock.mockReturnValue(["wfx"]);
+    const gap = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(runDot(gap.container)).toContain("animate-pulse");
+    gap.unmount();
+    tasksMock.mockReturnValue([]);
+    const finished = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(runDot(finished.container)).not.toContain("animate-pulse");
+    runsMock.mockReturnValue({});
+  });
+
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);

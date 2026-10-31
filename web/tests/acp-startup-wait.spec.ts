@@ -18,7 +18,7 @@ test("one startup line names the Agent and counts", async ({ page }) => {
   await expect(line.getByTestId("startup-wait-elapsed")).toHaveText(/^0:0[0-9]$/);
 });
 
-test("a never-started Session that isn't starting waits to resume, not for its Agent", async ({ page }) => {
+test("a stopped Session says the queue sends when its Agent starts, and offers to start it", async ({ page }) => {
   const mock = await mockAcpSession(page, { title: "story-absent", workerState: "absent" });
   const at = new Date().toISOString();
   await page.route("**/api/sessions/*/queue", (r) =>
@@ -30,8 +30,8 @@ test("a never-started Session that isn't starting waits to resume, not for its A
     }),
   );
   await openStructuredSession(page, mock);
-  await expect(page.getByText("Pending until session resumes (2)")).toBeVisible();
-  await expect(page.getByText(/Pending until .* is ready/)).toHaveCount(0);
+  await expect(page.getByTestId("queued-strip-header")).toHaveText("Queued (2)· sends when the Agent starts");
+  await expect(page.getByTestId("queued-send-now").first()).toHaveText("Start and send");
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
 });
 
@@ -112,7 +112,7 @@ test.describe("at 375px", () => {
     expect(overflow).toBeLessThanOrEqual(0);
   });
 
-  test("a long unspaced Agent name wraps in the line and the queued heading", async ({ page }) => {
+  test("a long unspaced Agent name wraps in the line and the queued reason", async ({ page }) => {
     // Underscores, unlike hyphens, give the browser no place to break.
     const agent = "acme_internal_structured_agent_with_a_very_long_registry_name";
     const mock = await mockAcpSession(page, { title: "story-long-agent", workerStarting: true, startingAgent: agent });
@@ -132,11 +132,17 @@ test.describe("at 375px", () => {
     await expect(line.getByTestId("startup-wait-elapsed")).toBeInViewport({ ratio: 1 });
     expect(await line.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
 
-    const heading = page.getByText(`Pending until ${agent} is ready (2)`);
-    await expect(heading).toBeVisible();
+    await expect(page.getByTestId("queued-strip-header")).toContainText("Queued (2)");
+    const reason = page.getByTestId("queued-strip-reason");
+    await expect(reason).toHaveText(`· sends when ${agent} is ready`);
+    await expect(reason).toBeInViewport({ ratio: 1 });
     const clearAll = page.getByRole("button", { name: "Clear all" });
     await expect(clearAll).toBeInViewport({ ratio: 1 });
-    const headingBox = (await heading.boundingBox())!;
-    expect(headingBox.x + headingBox.width).toBeLessThanOrEqual((await clearAll.boundingBox())!.x);
+    // The reason may wrap Clear all onto its own line, but never under it.
+    const [r, c] = [(await reason.boundingBox())!, (await clearAll.boundingBox())!];
+    const overlaps = r.x < c.x + c.width && c.x < r.x + r.width && r.y < c.y + c.height && c.y < r.y + r.height;
+    expect(overlaps).toBe(false);
+    const strip = page.getByTestId("queued-strip");
+    expect(await strip.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
   });
 });
