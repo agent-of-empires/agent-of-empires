@@ -128,7 +128,8 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              homepage        INTEGER NOT NULL DEFAULT 1,
              sidebar         INTEGER NOT NULL DEFAULT 0,
              refresh_minutes INTEGER NOT NULL DEFAULT 15,
-             start_without_review INTEGER NOT NULL DEFAULT 0
+             start_without_review INTEGER NOT NULL DEFAULT 0,
+             show_source_ref INTEGER NOT NULL DEFAULT 1
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
              profile     TEXT NOT NULL,
@@ -677,6 +678,7 @@ pub struct PrefsPatch {
     pub sidebar: Option<bool>,
     pub refresh_minutes: Option<u32>,
     pub start_without_review: Option<bool>,
+    pub show_source_ref: Option<bool>,
     /// Every provider id exactly once.
     pub provider_order: Option<Vec<String>>,
     pub provider_enabled: Option<BTreeMap<String, bool>>,
@@ -722,26 +724,29 @@ fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>
 
 pub(crate) const DEFAULT_REFRESH_MINUTES: u32 = 15;
 
-/// `(homepage, sidebar, refresh_minutes, start_without_review)` of a profile that never saved any.
-pub(crate) const DEFAULT_PREFS: (bool, bool, u32, bool) =
-    (true, false, DEFAULT_REFRESH_MINUTES, false);
+/// `(homepage, sidebar, refresh_minutes, start_without_review, show_source_ref)`
+/// of a profile that never saved any.
+pub(crate) const DEFAULT_PREFS: Prefs = (true, false, DEFAULT_REFRESH_MINUTES, false, true);
 
-pub(crate) fn prefs_json(prefs: (bool, bool, u32, bool), provider_order: &[&str]) -> Value {
+pub(crate) type Prefs = (bool, bool, u32, bool, bool);
+
+pub(crate) fn prefs_json(prefs: Prefs, provider_order: &[&str]) -> Value {
     json!({
         "homepage": prefs.0,
         "sidebar": prefs.1,
         "refresh_minutes": prefs.2,
         "start_without_review": prefs.3,
+        "show_source_ref": prefs.4,
         "provider_order": provider_order,
     })
 }
 
-fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool, u32, bool)> {
+fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<Prefs> {
     Ok(conn
         .query_row(
-            "SELECT homepage, sidebar, refresh_minutes, start_without_review FROM suggestion_preferences WHERE profile = ?1",
+            "SELECT homepage, sidebar, refresh_minutes, start_without_review, show_source_ref FROM suggestion_preferences WHERE profile = ?1",
             [profile],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?
         .unwrap_or(DEFAULT_PREFS))
@@ -812,6 +817,12 @@ pub(crate) fn apply_prefs(
     if let Some(v) = patch.start_without_review {
         tx.execute(
             "UPDATE suggestion_preferences SET start_without_review = ?2 WHERE profile = ?1",
+            params![profile, v],
+        )?;
+    }
+    if let Some(v) = patch.show_source_ref {
+        tx.execute(
+            "UPDATE suggestion_preferences SET show_source_ref = ?2 WHERE profile = ?1",
             params![profile, v],
         )?;
     }
@@ -2097,7 +2108,8 @@ mod tests {
         assert_eq!(
             snap("p")["prefs"],
             json!({ "homepage": true, "sidebar": false, "refresh_minutes": 15,
-                    "start_without_review": false, "provider_order": ["acme.github", "acme.linear"] })
+                    "start_without_review": false, "show_source_ref": true,
+                    "provider_order": ["acme.github", "acme.linear"] })
         );
         assert_eq!(
             snapshot(&conn, "p", &[]).unwrap()["prefs"],
@@ -2123,9 +2135,11 @@ mod tests {
         }
         apply(json!({ "homepage": true })).unwrap();
         apply(json!({ "sidebar": true })).unwrap();
-        apply(json!({ "start_without_review": true })).unwrap();
-        assert_eq!(snap("p")["prefs"]["start_without_review"], true);
-        assert_eq!(snap("q")["prefs"]["start_without_review"], false);
+        for (field, value) in [("start_without_review", true), ("show_source_ref", false)] {
+            apply(json!({ field: value })).unwrap();
+            assert_eq!(snap("p")["prefs"][field], value, "{field}");
+            assert_eq!(snap("q")["prefs"][field], !value, "{field}");
+        }
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
             .unwrap();
         let prefs = snap("p")["prefs"].clone();
