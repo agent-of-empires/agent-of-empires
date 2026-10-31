@@ -153,11 +153,15 @@ pub struct ProviderRef {
 
 pub async fn run_suggestion_fix(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ProviderRef>,
+    body: Result<Json<ProviderRef>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let Some(host) = &state.plugin_host else {
         return unavailable();
     };
@@ -300,7 +304,6 @@ pub async fn patch_suggestion_prefs(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    let refresh_changed = patch.refresh_minutes.is_some();
     let result = tokio::task::spawn_blocking({
         let host = host.clone();
         move || {
@@ -312,7 +315,7 @@ pub async fn patch_suggestion_prefs(
     })
     .await;
     match result {
-        Ok(Ok(Ok(()))) => {
+        Ok(Ok(Ok(refresh_changed))) => {
             if refresh_changed {
                 host.refresh_suggestions(None).await;
             }

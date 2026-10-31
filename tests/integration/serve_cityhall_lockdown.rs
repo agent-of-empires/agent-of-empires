@@ -155,6 +155,11 @@ async fn sensitive_routes_are_blocked() {
         (Method::POST, "/api/suggestions/checks/run", "{}"),
         (
             Method::POST,
+            "/api/suggestions/fix",
+            r#"{"provider_id":"x"}"#,
+        ),
+        (
+            Method::POST,
             "/api/suggestions/dismiss",
             r#"{"provider_id":"x","id":"y"}"#,
         ),

@@ -178,6 +178,13 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
   const [busy, setBusy] = useState(false);
   const [templates, setTemplates] = useState(Boolean(templateFocus));
   const mounted = useRef(true);
+  // Keyed on primitives: App rebuilds `templateFocus` every render, which must not reopen the view.
+  const focusKey = templateFocus && `${templateFocus.providerId}/${templateFocus.criterion}`;
+  const [seenFocus, setSeenFocus] = useState(focusKey);
+  if (focusKey !== seenFocus) {
+    setSeenFocus(focusKey);
+    if (focusKey) setTemplates(true);
+  }
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
   useEffect(() => {

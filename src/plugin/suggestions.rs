@@ -644,8 +644,10 @@ fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>
     order
 }
 
+pub(crate) const DEFAULT_REFRESH_MINUTES: u32 = 15;
+
 /// `(homepage, sidebar, refresh_minutes)` of a profile that never saved any.
-pub(crate) const DEFAULT_PREFS: (bool, bool, u32) = (true, false, 15);
+pub(crate) const DEFAULT_PREFS: (bool, bool, u32) = (true, false, DEFAULT_REFRESH_MINUTES);
 
 pub(crate) fn prefs_json(prefs: (bool, bool, u32), provider_order: &[&str]) -> Value {
     json!({
@@ -672,13 +674,13 @@ pub(crate) fn refresh_minutes(conn: &Connection, profile: &str) -> rusqlite::Res
 }
 
 /// Applies `patch` atomically; the inner `Err` is a validation message and
-/// nothing is stored.
+/// nothing is stored. The inner `Ok` says whether the stored refresh interval changed.
 pub(crate) fn apply_prefs(
     conn: &Connection,
     profile: &str,
     known: &[String],
     patch: &PrefsPatch,
-) -> anyhow::Result<Result<(), String>> {
+) -> anyhow::Result<Result<bool, String>> {
     if let Some(minutes) = patch.refresh_minutes {
         if !REFRESH_MINUTES.contains(&minutes) {
             return Ok(Err(format!(
@@ -702,6 +704,10 @@ pub(crate) fn apply_prefs(
             return Ok(Err(format!("unknown provider {id:?}")));
         }
     }
+    let refresh_changed = match patch.refresh_minutes {
+        Some(minutes) => minutes != load_prefs(conn, profile)?.2,
+        None => false,
+    };
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT OR IGNORE INTO suggestion_preferences (profile) VALUES (?1)",
@@ -740,7 +746,7 @@ pub(crate) fn apply_prefs(
         )?;
     }
     tx.commit()?;
-    Ok(Ok(()))
+    Ok(Ok(refresh_changed))
 }
 
 pub(crate) fn snapshot(
@@ -1395,6 +1401,11 @@ mod tests {
             for (table, columns, values) in [
                 ("suggestion_checks", "checks_json", "'[]'"),
                 (
+                    "suggestion_fixes",
+                    "label, method",
+                    "'Fix', 'suggestions.fix.k'",
+                ),
+                (
                     "suggestion_templates",
                     "criterion, template",
                     "'assigned', 't'",
@@ -1435,6 +1446,7 @@ mod tests {
             "suggestion_providers",
             "suggestion_items",
             "suggestion_checks",
+            "suggestion_fixes",
         ] {
             assert_eq!(count(table), 0, "{table}");
         }
@@ -1879,7 +1891,18 @@ mod tests {
         );
 
         assert_eq!(refresh_minutes(&conn, "p").unwrap(), 15);
-        apply(json!({ "sidebar": true })).unwrap();
+        // Only a real change of the interval reports `true`.
+        for (patch, changed) in [
+            (json!({ "sidebar": true }), false),
+            (json!({ "refresh_minutes": 15 }), false),
+            (json!({ "refresh_minutes": 60 }), true),
+            (json!({ "refresh_minutes": 60 }), false),
+            (json!({ "homepage": false }), false),
+        ] {
+            assert_eq!(apply(patch.clone()).unwrap(), Ok(changed), "{patch}");
+        }
+        apply(json!({ "homepage": true })).unwrap().unwrap();
+        apply(json!({ "sidebar": true })).unwrap().unwrap();
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
             .unwrap();
         let prefs = snap("p")["prefs"].clone();

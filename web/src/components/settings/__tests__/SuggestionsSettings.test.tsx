@@ -225,6 +225,22 @@ describe("SuggestionsSettings", () => {
     expect(openFull).toHaveBeenCalledWith(false);
   });
 
+  it("opens the templates view when a focus arrives after mount, once per focus", async () => {
+    api.fetchSuggestions.mockResolvedValue(snapshot());
+    api.fetchSuggestionTemplates.mockResolvedValue([]);
+    api.fetchSuggestionMappings.mockResolvedValue([]);
+    api.fetchProjects.mockResolvedValue([]);
+    const focus = () => ({ providerId: "gh", criterion: "review-requested" });
+    const view = render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
+    await screen.findByText("Plugin · updated 2 min ago");
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Suggestions/ }));
+    await screen.findByText("Plugin · updated 2 min ago");
+    // A fresh object with the same values (an App re-render) must not reopen it.
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
+    expect(screen.queryByLabelText("GitHub review-requested template")).toBeNull();
+  });
+
   it("maps a source to a Project and clears it", async () => {
     open();
     fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
