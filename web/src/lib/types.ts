@@ -410,6 +410,8 @@ export interface CreateSessionRequest {
   custom_instruction?: string;
   /** Typed into the agent as its first turn once it is ready. */
   initial_prompt?: string;
+  /** Links the new Session to the suggestion it starts from; omitted by "Start another". */
+  suggestion?: { provider_id: string; id: string };
   profile?: string;
   view?: "structured" | "terminal";
   agent_model?: string;
@@ -579,8 +581,19 @@ export interface SuggestionProvider {
   enabled: boolean;
   /** Unix seconds of the last report; absent before the first one. */
   updated_at?: number;
+  /** A refresh the host requested is unanswered. */
+  refreshing?: boolean;
   sources: SuggestionSource[];
   checks?: SuggestionSetupCheck[];
+}
+
+/** The oldest live Session started from a suggestion. */
+export interface StartedSession {
+  id: string;
+  title: string;
+  status: SessionStatus;
+  archived: boolean;
+  created_at: string;
 }
 
 export interface SuggestionPrefs {
@@ -621,6 +634,11 @@ export interface SuggestionItem {
   variables?: Record<string, string>;
   draft: { title: string; prompt: string };
   dismissed: boolean;
+  started_session?: StartedSession;
+  /** The source closed or changed; the row is dimmed and cannot start. */
+  stale?: boolean;
+  /** The registered Project the item resolves to; the provider's `project` is only a hint. */
+  resolved_project?: { name: string; path: string } | null;
 }
 
 export interface SuggestionsSnapshot {

@@ -83,6 +83,9 @@ pub struct CreateSessionBody {
     /// Typed into the agent as its first turn, only once it is ready.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Suggestion this session starts from; omitted by "Start another".
+    #[serde(default)]
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]

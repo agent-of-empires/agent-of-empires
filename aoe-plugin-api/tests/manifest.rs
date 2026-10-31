@@ -465,4 +465,6 @@ fn suggestion_items_reject_host_owned_fields() {
     assert!(item(serde_json::json!({})).is_ok());
     assert!(item(serde_json::json!({"variables":{"repo":"a/b"}})).is_ok());
     assert!(item(serde_json::json!({"provider_id":"forged"})).is_err());
+    assert!(!item(serde_json::json!({})).unwrap().stale);
+    assert!(item(serde_json::json!({"stale":true})).unwrap().stale);
 }

@@ -943,7 +943,13 @@ impl HomeView {
         if let Some(view) = &self.suggestions_view {
             self.divider_col = None;
             self.main_area_width = 0;
-            view.render(frame, area, theme, &self.suggestions_feed);
+            view.render(
+                frame,
+                area,
+                theme,
+                &self.suggestions_feed,
+                self.session_feed.mutation_block(),
+            );
             if let Some(palette) = &mut self.command_palette {
                 palette.render(frame, area, theme);
             }
