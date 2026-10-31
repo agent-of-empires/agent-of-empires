@@ -6,6 +6,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::containers;
+use crate::plugin::suggestions::MAX_PROMPT_BYTES;
 use crate::session::builder;
 use crate::session::config::repo_config;
 use crate::session::{
@@ -201,13 +202,31 @@ pub struct AddArgs {
     scratch: bool,
 }
 
+const PROMPT_NEEDS_STRUCTURED: &str =
+    "--prompt needs the structured view; terminal sessions cannot receive it from `aoe add`.\n\
+     Pass --structured-view (or --agent) with an installed ACP adapter.";
+
 /// The `--prompt` / `--prompt-file` text, validated before anything is created.
 /// Kept as typed: only blankness is judged on the trimmed text.
 fn resolve_initial_prompt(args: &AddArgs) -> Result<Option<String>> {
     let text = match (&args.prompt, &args.prompt_file) {
         (Some(text), _) => text.clone(),
-        (None, Some(path)) => std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read prompt file: {}", path.display()))?,
+        (None, Some(path)) => {
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("Failed to read prompt file: {}", path.display()))?;
+            if !meta.is_file() {
+                bail!("Prompt file is not a regular file: {}", path.display());
+            }
+            if meta.len() > MAX_PROMPT_BYTES as u64 {
+                bail!(
+                    "Prompt file is larger than {} KiB: {}",
+                    MAX_PROMPT_BYTES / 1024,
+                    path.display()
+                );
+            }
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read prompt file: {}", path.display()))?
+        }
         (None, None) => return Ok(None),
     };
     if text.trim().is_empty() {
@@ -312,6 +331,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 
     let wants_structured = args.structured_view || args.agent.is_some();
+    if initial_prompt.is_some() && !wants_structured {
+        bail!(PROMPT_NEEDS_STRUCTURED);
+    }
     if args.fork_from.is_some() && wants_structured {
         bail!(
             "`--fork-from` performs a terminal fork and cannot be combined with \
@@ -804,10 +826,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             },
             None,
         );
-        bail!(
-            "--prompt needs the structured view; terminal sessions cannot receive it from `aoe add`.\n\
-             Pass --structured-view (or --agent) with an installed ACP adapter."
-        );
+        bail!(PROMPT_NEEDS_STRUCTURED);
     }
     instance.pending_initial_turn = initial_prompt.map(|text| crate::session::PendingInitialTurn {
         text,
@@ -1766,12 +1785,73 @@ mod tests {
                 vec!["aoe", "add", "--prompt-file", "/nonexistent/aoe-prompt"],
                 Err("Failed to read prompt file"),
             ),
+            (
+                vec!["aoe", "add", "--prompt-file", dir.path().to_str().unwrap()],
+                Err("not a regular file"),
+            ),
         ] {
             let got = super::resolve_initial_prompt(&parse_add(&argv).unwrap());
             match expected {
                 Ok(text) => assert_eq!(got.unwrap().as_deref(), text, "{argv:?}"),
                 Err(msg) => assert!(got.unwrap_err().to_string().contains(msg), "{argv:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn an_oversized_prompt_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.md");
+        std::fs::write(&file, "x".repeat(super::MAX_PROMPT_BYTES + 1)).unwrap();
+        let args = parse_add(&["aoe", "add", "--prompt-file", file.to_str().unwrap()]).unwrap();
+        let err = super::resolve_initial_prompt(&args).unwrap_err();
+        assert!(err.to_string().contains("larger than 64 KiB"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_add_stores_the_prompt_verbatim_as_the_pending_turn() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("prompt.md");
+        std::fs::write(&file, "  indented first\nsecond\n").unwrap();
+        for (title, flag, value, expected) in [
+            ("inline", "--prompt", "  go now ", "  go now "),
+            (
+                "from-file",
+                "--prompt-file",
+                file.to_str().unwrap(),
+                "  indented first\nsecond\n",
+            ),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let args = parse_add(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "-t",
+                title,
+                "--tool",
+                "claude",
+                "--structured-view",
+                flag,
+                value,
+            ])
+            .unwrap();
+            super::run("default", args).await.unwrap();
+
+            let (rows, _) = crate::session::Storage::new_unwatched("default")
+                .unwrap()
+                .load_with_groups()
+                .unwrap();
+            let turn = rows
+                .iter()
+                .find(|i| i.title == title)
+                .and_then(|i| i.pending_initial_turn.clone())
+                .unwrap_or_else(|| panic!("{title}: no pending turn stored"));
+            assert_eq!(turn.text, expected, "{title}");
+            assert!(turn.attachments.is_empty() && !turn.synthesized && turn.error.is_none());
         }
     }
 
