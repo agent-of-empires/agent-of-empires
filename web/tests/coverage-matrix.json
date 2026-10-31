@@ -748,7 +748,7 @@
       "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
-      "description": "Server, migration and systemd area controls preserve unrelated logging overrides when edited or cleared.",
+      "description": "Server, migration and session area controls preserve unrelated logging overrides when edited or cleared.",
       "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },

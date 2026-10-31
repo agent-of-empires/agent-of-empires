@@ -299,6 +299,7 @@ pub async fn cancel_creation(
         }
     }
     if state.session_service.cancel_creation(&id) {
+        tracing::info!(target: "session.create", session = %id, "creation cancelled");
         // The acknowledgement is a mutation response like any other, so the
         // caller can fence it against the snapshot it was applied at.
         let cursor = state
@@ -308,7 +309,10 @@ pub async fn cancel_creation(
             .map(|snapshot| snapshot.value.cursor.clone());
         match cursor {
             Ok(cursor) => crate::server::runtime::mutation_response(&cursor, StatusCode::ACCEPTED),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(error) => {
+                tracing::debug!(target: "server.runtime", %error, "runtime snapshot failed");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
         }
     } else {
         crate::server::api::api_error_with_code_header(
@@ -1271,7 +1275,9 @@ pub async fn create_session(
             // advertise the phantom row for up to a publish interval after the
             // response is sent. Symmetric with the success arm, which
             // publishes through `created_session_response`.
-            let _ = state.runtime.publish(&state).await;
+            if let Err(error) = state.runtime.publish(&state).await {
+                tracing::debug!(target: "server.runtime", %error, "publish after failed create failed");
+            }
             if e.is::<crate::server::session_service::CreationCancelled>() {
                 return crate::server::api::api_error_with_code_header(
                     crate::daemon::ApiErrorCode::CreationCancelled,
@@ -1413,7 +1419,10 @@ async fn created_session_response(
 ) -> axum::response::Response {
     let snapshot = match state.runtime.publish(state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let Some(row) = snapshot
         .value

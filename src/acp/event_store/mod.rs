@@ -339,6 +339,18 @@ fn decode(json: &str) -> Option<Event> {
     serde_json::from_str(json).ok()
 }
 
+fn decode_logged(json: &str, session_id: &str, what: &str) -> Option<Event> {
+    serde_json::from_str(json)
+        .map_err(|e| {
+            warn!(
+                target: "acp.event_store",
+                session = %session_id,
+                "{what}: deserialise failed: {e}"
+            )
+        })
+        .ok()
+}
+
 /// Log a failed query as `None`.
 fn logged<T>(result: rusqlite::Result<T>, what: &str, session_id: &str) -> Option<T> {
     result

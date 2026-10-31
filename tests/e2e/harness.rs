@@ -792,7 +792,7 @@ last_seen_version = "{}"
 
     /// Build the shell command string to run inside the tmux session.
     /// When recording, wraps the command with `asciinema rec`.
-    fn build_tmux_command(&mut self, args: &[&str]) -> String {
+    fn build_tmux_command(&mut self, args: &[&str], cols: &str, rows: &str) -> String {
         let runtime_state = self.home_dir.path().join("runtime-state");
         // A respawned TUI must not read as ready before its first draw.
         let _ = std::fs::remove_file(&runtime_state);
@@ -817,7 +817,7 @@ last_seen_version = "{}"
         if self.recording {
             let cast_path = recordings_dir().join(format!("{}.cast", self.test_name));
             let cmd = format!(
-                "asciinema rec --overwrite --cols 100 --rows 30 -c {} {}",
+                "asciinema rec --overwrite --cols {cols} --rows {rows} -c {} {}",
                 shell_words::quote(&aoe_cmd),
                 shell_words::quote(cast_path.to_str().expect("recording path"))
             );
@@ -867,10 +867,21 @@ last_seen_version = "{}"
         self.tmux_new_detached(name, &format!("env {} {binary}", self.pane_env_policy()));
     }
 
+    /// Spawn `aoe` in a detached tmux session at the requested dimensions.
+    pub fn spawn_tui_sized(&mut self, cols: u16, rows: u16) {
+        self.spawn_sized(&[], cols, rows);
+    }
+
     /// Spawn `aoe <args>` inside a detached tmux session.
     pub fn spawn(&mut self, args: &[&str]) {
+        self.spawn_sized(args, 100, 30);
+    }
+
+    fn spawn_sized(&mut self, args: &[&str], cols: u16, rows: u16) {
         self.input_barrier = args.first() != Some(&"add");
-        let cmd_str = self.build_tmux_command(args);
+        let cols = cols.to_string();
+        let rows = rows.to_string();
+        let cmd_str = self.build_tmux_command(args, &cols, &rows);
         let start_gate = self.home_dir.path().join("tui-start");
         let cmd_str = if self.input_barrier {
             if start_gate.exists() {
@@ -895,9 +906,9 @@ last_seen_version = "{}"
             .arg("-s")
             .arg(&self.session_name)
             .arg("-x")
-            .arg("100")
+            .arg(&cols)
             .arg("-y")
-            .arg("30")
+            .arg(&rows)
             .arg(&cmd_str)
             // This harness owns server teardown, including gaps between TUI processes.
             .args([";", "set-option", "-s", "exit-empty", "off"])

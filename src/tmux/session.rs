@@ -1652,7 +1652,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     fn owner_snapshot_with_deadline(
@@ -1946,7 +1948,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     pub fn release_vt_owner(&self, owner_id: &str) {
@@ -2049,7 +2053,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     /// Force ownership to owner_id, even over a live holder. Used by the

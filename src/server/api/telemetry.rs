@@ -78,6 +78,7 @@ pub async fn set_telemetry_consent(
     // Reconcile the install id (no-op under DO_NOT_TRACK). The daemon, not the
     // browser, owns the id.
     crate::telemetry::apply_opt_in_change(req.enabled);
+    tracing::info!(target: "http.api.telemetry", enabled = req.enabled, "telemetry consent changed");
     (StatusCode::OK, Json(current_status())).into_response()
 }
 

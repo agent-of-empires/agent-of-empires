@@ -852,7 +852,11 @@ fn install(
             let _ = std::fs::remove_dir_all(&staging);
             if let Some(backup) = &backup {
                 // Put the user's directory back before surfacing the failure.
-                let _ = std::fs::rename(backup, dest);
+                if let Err(error) = std::fs::rename(backup, dest) {
+                    tracing::error!(target: "session.skills", dest = %dest.display(), backup = %backup.display(), %error,
+                        "failed to restore user skill dir from backup"
+                    );
+                }
             }
             Err(e.into())
         }
