@@ -2030,12 +2030,10 @@ impl PluginManagerDialog {
                     ),
                     Span::styled(format!("{:<30}", r.slug), Style::default().fg(theme.text)),
                 ];
-                if r.suggestions {
-                    spans.push(Span::styled(
-                        "✦ Suggestions ",
-                        Style::default().fg(theme.accent),
-                    ));
-                }
+                spans.push(Span::styled(
+                    format!("{:<14}", if r.suggestions { "✦ Suggestions" } else { "" }),
+                    Style::default().fg(theme.accent),
+                ));
                 spans.push(Span::styled(
                     r.description.clone().unwrap_or_default(),
                     Style::default().fg(theme.dimmed),
@@ -2181,7 +2179,7 @@ mod mouse_tests {
         d.mode = Mode::Discover;
         let mut flagged = result("owner/flagged");
         flagged.suggestions = true;
-        d.discover_rows = vec![flagged, result("owner/plain")];
+        d.discover_rows = vec![result("owner/plain"), flagged];
 
         let buf = draw(120, 30, |f, theme| d.render(f, f.area(), theme));
         let (_, marked) = find(&buf, "✦ Suggestions");
