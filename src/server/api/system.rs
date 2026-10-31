@@ -64,6 +64,8 @@ pub struct AgentInfo {
     pub display_name: String,
     pub binary: String,
     pub host_only: bool,
+    /// The agent always runs in Yolo mode, so the wizard locks the switch on.
+    pub always_yolo: bool,
     pub installed: bool,
     pub install_hint: String,
     /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
@@ -147,36 +149,69 @@ fn build_custom_agent_infos(
                 && !command.trim().is_empty()
                 && crate::agents::get_agent(name).is_none()
         })
-        .map(|(name, _command)| AgentInfo {
-            lifecycle: crate::agents::AgentLifecycle::Active,
-            kind: "custom".to_string(),
-            name: name.clone(),
-            display_name: name.clone(),
-            binary: name.clone(),
-            host_only: false,
-            installed: true,
-            install_hint: "Configured custom agent".to_string(),
-            oneshot_capable: false,
-            acp_capable: agent_acp_cmd
+        .map(|(name, _command)| {
+            let own_adapter = agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
-                || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
-            acp_allowed: policy.allows(name),
-            // Set by `list_agents`, which holds the config the probe needs.
-            acp_installed: false,
-            // Custom agents' command values are deliberately never
-            // serialized here; they can hold hostnames or secrets.
-            acp_command: None,
-            acp_args: Vec::new(),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok());
+            let base = crate::acp::inherited_acp_base(name, agent_detect_as);
+            AgentInfo {
+                lifecycle: crate::agents::AgentLifecycle::Active,
+                kind: "custom".to_string(),
+                name: name.clone(),
+                display_name: name.clone(),
+                binary: name.clone(),
+                host_only: false,
+                always_yolo: crate::acp::runs_always_yolo(name, agent_acp_cmd, agent_detect_as),
+                installed: true,
+                install_hint: "Configured custom agent".to_string(),
+                oneshot_capable: false,
+                acp_capable: own_adapter || base.is_some(),
+                acp_allowed: policy.allows(name),
+                // Set by `list_agents`, which holds the config the probe needs.
+                acp_installed: false,
+                // Custom agents' command values are deliberately never
+                // serialized here; they can hold hostnames or secrets.
+                acp_command: None,
+                acp_args: Vec::new(),
+            }
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries
 }
 
-pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
+#[derive(Deserialize)]
+pub struct AgentsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/agents[?profile=]`: the agents as the profile resolves them, so the
+/// wizard reads a custom agent's base from the profile it creates in.
+pub async fn list_agents(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<AgentsQuery>,
+) -> Result<Json<Vec<AgentInfo>>, axum::response::Response> {
     let _namespace = state.profile_namespace.read().await;
-    let profile = state.served_profile().to_string();
+    let profile = match query.profile.filter(|p| !p.is_empty()) {
+        Some(name) => {
+            let known = state
+                .canonical_metadata
+                .read()
+                .await
+                .profiles
+                .iter()
+                .any(|p| p.name == name);
+            if !known {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "profile_not_found",
+                    format!("Profile '{name}' doesn't exist."),
+                ));
+            }
+            name
+        }
+        None => state.served_profile().to_string(),
+    };
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let tools = crate::tmux::AvailableTools::detect();
@@ -199,6 +234,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                         .to_string(),
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
+                    always_yolo: crate::agents::is_always_yolo(a.name),
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
@@ -229,11 +265,16 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         agents
     })
     .await
-    .unwrap_or_else(|e| {
+    // An empty list would read as "no agents", so the client retries instead.
+    .map_err(|e| {
         tracing::error!("list_agents task failed: {e}");
-        Vec::new()
-    });
-    Json(result)
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Couldn't list the agents.",
+        )
+    })?;
+    Ok(Json(result))
 }
 
 // --- Settings ---
@@ -1890,33 +1931,34 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response
 #[derive(Serialize)]
 pub struct DockerStatus {
     pub available: bool,
+    /// The configured runtime's config value (`docker`, `podman`,
+    /// `apple_container`), also when it is down.
     pub runtime: Option<String>,
+    /// Its display name ("Apple Container"), for messages that name it.
+    pub runtime_name: Option<&'static str>,
 }
 
 pub async fn docker_status() -> Json<DockerStatus> {
     let result = tokio::task::spawn_blocking(|| {
         let runtime = crate::containers::get_container_runtime();
         let available = runtime.is_available() && runtime.is_daemon_running();
-        let runtime_name = if available {
-            let config = crate::session::Config::load_or_warn();
-            Some(
+        let config = crate::session::Config::load_or_warn();
+        DockerStatus {
+            available,
+            runtime_name: Some(runtime.display_name()),
+            runtime: Some(
                 serde_json::to_value(config.sandbox.container_runtime)
                     .ok()
                     .and_then(|v| v.as_str().map(String::from))
                     .unwrap_or_else(|| "docker".to_string()),
-            )
-        } else {
-            None
-        };
-        DockerStatus {
-            available,
-            runtime: runtime_name,
+            ),
         }
     })
     .await
     .unwrap_or(DockerStatus {
         available: false,
         runtime: None,
+        runtime_name: None,
     });
     Json(result)
 }
@@ -3446,6 +3488,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_custom_agent_is_always_yolo_only_when_it_runs_an_always_yolo_base() {
+        let custom = custom_agents(&[
+            ("my-pi", "pi --profile work"),
+            ("own-pi", "pi"),
+            ("my-claude", "claude"),
+        ]);
+        let detect_as =
+            custom_agents(&[("my-pi", "pi"), ("own-pi", "pi"), ("my-claude", "claude")]);
+        let acp = custom_agents(&[("own-pi", "own-pi-acp")]);
+        let entries = build_custom_agent_infos(&custom, &acp, &detect_as, &unrestricted());
+        for (name, expected) in [("my-pi", true), ("own-pi", false), ("my-claude", false)] {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(entry.always_yolo, expected, "{name}");
+        }
+    }
+
+    /// The wizard names the runtime that isn't running, so it's reported
+    /// whether or not it's available.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn docker_status_names_the_configured_runtime() {
+        use crate::session::config::ContainerRuntimeName;
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (runtime, value, display) in [
+            (ContainerRuntimeName::Docker, "docker", "Docker"),
+            (ContainerRuntimeName::Podman, "podman", "Podman"),
+            (
+                ContainerRuntimeName::AppleContainer,
+                "apple_container",
+                "Apple Container",
+            ),
+        ] {
+            crate::session::config::update_config(|c| c.sandbox.container_runtime = runtime)
+                .unwrap();
+            let Json(status) = docker_status().await;
+            assert_eq!(status.runtime.as_deref(), Some(value), "{display}");
+            assert_eq!(status.runtime_name, Some(display));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agents_resolve_the_requested_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (profile, base) in [("alpha", "pi"), ("beta", "claude")] {
+            crate::session::create_profile(profile).unwrap();
+            std::fs::write(
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap(),
+                format!(
+                    "[session.custom_agents]\nwrapper = \"{base}\"\n\n[session.agent_detect_as]\nwrapper = \"{base}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for (profile, always_yolo) in [("alpha", true), ("beta", false)] {
+            let query = AgentsQuery {
+                profile: Some(profile.into()),
+            };
+            let Ok(Json(agents)) =
+                list_agents(State(state.clone()), axum::extract::Query(query)).await
+            else {
+                panic!("{profile}: list_agents failed");
+            };
+            let wrapper = agents.iter().find(|a| a.name == "wrapper").unwrap();
+            assert_eq!(wrapper.always_yolo, always_yolo, "{profile}");
+        }
+        let unknown = AgentsQuery {
+            profile: Some("gone".into()),
+        };
+        let Err(response) = list_agents(State(state), axum::extract::Query(unknown)).await else {
+            panic!("an unknown profile must not list agents");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /// `acp_installed` follows the structured create check, so a custom
     /// agent counts when its adapter is on the configured `environment` PATH.
     #[tokio::test]
@@ -3479,7 +3599,14 @@ mod tests {
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let Json(agents) = list_agents(State(state)).await;
+        let Ok(Json(agents)) = list_agents(
+            State(state),
+            axum::extract::Query(AgentsQuery { profile: None }),
+        )
+        .await
+        else {
+            panic!("list_agents failed");
+        };
         for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
             let agent = agents.iter().find(|a| a.name == name).unwrap();
             assert_eq!(agent.acp_installed, installed, "{name}");

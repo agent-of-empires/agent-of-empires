@@ -928,10 +928,7 @@ impl NewSessionDialog {
     }
 
     fn selected_tool_always_yolo(&self) -> bool {
-        let tool_name = &self.available_tools[self.tool_index];
-        crate::agents::get_agent(tool_name)
-            .and_then(|a| a.yolo.as_ref())
-            .is_some_and(|y| matches!(y, crate::agents::YoloMode::AlwaysYolo))
+        crate::agents::is_always_yolo(&self.available_tools[self.tool_index])
     }
 
     fn selected_tool_host_only(&self) -> bool {
