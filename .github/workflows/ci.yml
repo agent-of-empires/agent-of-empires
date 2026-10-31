@@ -282,7 +282,7 @@ jobs:
   nix-build:
     name: Nix Build
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     # Builds the default (aoe) crate through crane. Nix Eval only evaluates
     # derivations, so a flake recipe that compiles nowhere (a bad source filter,
     # a missing buildInput) passes it but fails here.
