@@ -1534,7 +1534,9 @@ mod tests {
             &[],
             &[AgentIntegrationContribution {
                 tool: "agent".into(),
+                provider_versions: Vec::new(),
                 command: Some("agent --flag".into()),
+                replies: false,
             }],
         ));
     }

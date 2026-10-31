@@ -13,6 +13,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
+use crate::tui::components::text::{prefix_within_width, rendered_width, truncate_to_width};
 use crate::tui::styles::{has_min_contrast, Theme};
 
 /// Contrast floor for the focused choice against the dialog background. The
@@ -45,10 +46,45 @@ pub enum PermissionResponseChoice {
     Deny,
 }
 
-struct StructuredApprovalDetail {
-    tool_name: String,
-    target: String,
-    destructive: bool,
+enum ApprovalDetail {
+    Integration(String),
+    Structured {
+        tool_name: String,
+        target: String,
+        destructive: bool,
+    },
+}
+
+struct TitleWindow {
+    text: String,
+    start: usize,
+    content_width: usize,
+    has_more: bool,
+}
+
+fn title_window(title: &str, offset: usize, width: usize) -> TitleWindow {
+    let prefix = prefix_within_width(title, offset);
+    let remaining = &title[prefix.len()..];
+    let start = rendered_width(prefix);
+    let left_width = if start > 0 { 2 } else { 0 };
+    let available = width.saturating_sub(left_width);
+    let has_more = rendered_width(remaining) > available;
+    let content_width = available.saturating_sub(if has_more { 2 } else { 0 });
+    let content = prefix_within_width(remaining, content_width);
+    let mut text = String::with_capacity(content.len() + 4);
+    if start > 0 {
+        text.push_str("< ");
+    }
+    text.push_str(content);
+    if has_more {
+        text.push_str(" >");
+    }
+    TitleWindow {
+        text,
+        start,
+        content_width: rendered_width(content),
+        has_more,
+    }
 }
 
 pub struct PermissionResponseDialog {
@@ -57,10 +93,11 @@ pub struct PermissionResponseDialog {
     focused: usize,
     /// Whether `choices` includes `AllowAlways`, computed once in `new`.
     supports_allow_always: bool,
-    /// `Some` for a structured ACP approval: the dialog shows what is being
-    /// approved and drops the terminal-only "raw keystrokes" guidance, which
-    /// does not hold on the ACP path.
-    detail: Option<StructuredApprovalDetail>,
+    detail: Option<ApprovalDetail>,
+    /// Horizontal cell offset into an integration title.
+    title_scroll: usize,
+    /// Approximate page advance, set from the rendered header width.
+    title_page_size: usize,
     /// Click rects parallel to `choices`.
     choice_rects: Vec<Rect>,
     /// The hovered choice. Visual only; never moves `focused`.
@@ -76,9 +113,17 @@ const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
 impl PermissionResponseDialog {
     pub fn new(
         session_title: &str,
-        allow_always: Option<&'static [crate::agents::KeyToken]>,
+        allow_always: Option<&'static [crate::agents::KeyToken<'static>]>,
     ) -> Self {
         Self::build(session_title, allow_always.is_some(), None)
+    }
+
+    pub fn integration(session_title: &str, prompt_title: &str, allow_always: bool) -> Self {
+        Self::build(
+            session_title,
+            allow_always,
+            Some(ApprovalDetail::Integration(prompt_title.to_owned())),
+        )
     }
 
     /// Show the ACP tool, target and destructive flag before resolving its request.
@@ -91,7 +136,7 @@ impl PermissionResponseDialog {
         Self::build(
             session_title,
             true,
-            Some(StructuredApprovalDetail {
+            Some(ApprovalDetail::Structured {
                 tool_name: tool_name.to_owned(),
                 target: target.to_owned(),
                 destructive,
@@ -102,7 +147,7 @@ impl PermissionResponseDialog {
     fn build(
         session_title: &str,
         supports_allow_always: bool,
-        detail: Option<StructuredApprovalDetail>,
+        detail: Option<ApprovalDetail>,
     ) -> Self {
         let choices = ALL_CHOICES
             .into_iter()
@@ -116,8 +161,24 @@ impl PermissionResponseDialog {
             focused: 0,
             supports_allow_always,
             detail,
+            title_scroll: 0,
+            title_page_size: 1,
             choice_rects: Vec::new(),
             hover: HoverState::default(),
+        }
+    }
+
+    fn scroll_title(&mut self, down: bool) {
+        let Some(ApprovalDetail::Integration(title)) = self.detail.as_ref() else {
+            return;
+        };
+        let window = title_window(title, self.title_scroll, self.title_page_size + 4);
+        if down {
+            if window.has_more {
+                self.title_scroll = window.start + window.content_width.saturating_sub(2).max(1);
+            }
+        } else {
+            self.title_scroll = window.start.saturating_sub(self.title_page_size);
         }
     }
 
@@ -139,6 +200,14 @@ impl PermissionResponseDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PermissionResponseChoice> {
         match key.code {
+            KeyCode::PageUp => {
+                self.scroll_title(false);
+                DialogResult::Continue
+            }
+            KeyCode::PageDown => {
+                self.scroll_title(true);
+                DialogResult::Continue
+            }
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => DialogResult::Submit(self.choices[self.focused].1),
             KeyCode::Left | KeyCode::Up => {
@@ -177,30 +246,38 @@ impl PermissionResponseDialog {
             ])
             .split(inner);
 
-        use crate::tui::components::text::truncate_to_width;
-
         let width = chunks[0].width as usize;
+        self.title_page_size = width.saturating_sub(4).max(1);
         let mut header_lines = Vec::with_capacity(3);
         header_lines.push(Line::from(Span::styled(
             truncate_to_width(&self.session_title, width),
             Style::default().fg(theme.title).bold(),
         )));
+        let mut can_page_title = false;
         match &self.detail {
-            Some(detail) => {
-                let warning = if detail.destructive {
-                    "destructive: "
-                } else {
-                    ""
-                };
+            Some(ApprovalDetail::Integration(title)) => {
+                let window = title_window(title, self.title_scroll, width);
+                can_page_title = window.has_more || window.start > 0;
+                header_lines.push(Line::from(Span::styled(
+                    window.text,
+                    Style::default().fg(theme.text),
+                )));
+            }
+            Some(ApprovalDetail::Structured {
+                tool_name,
+                target,
+                destructive,
+            }) => {
+                let warning = if *destructive { "destructive: " } else { "" };
                 header_lines.push(Line::from(vec![
                     Span::styled(warning, Style::default().fg(theme.error).bold()),
                     Span::styled(
-                        truncate_to_width(&detail.tool_name, width.saturating_sub(warning.len())),
+                        truncate_to_width(tool_name, width.saturating_sub(warning.len())),
                         Style::default().fg(theme.text),
                     ),
                 ]));
                 header_lines.push(Line::from(Span::styled(
-                    truncate_to_width(&detail.target, width),
+                    truncate_to_width(target, width),
                     Style::default().fg(theme.text),
                 )));
             }
@@ -253,6 +330,9 @@ impl PermissionResponseDialog {
             hint.push_str("  A=always");
         }
         hint.push_str("  d=deny  Esc=cancel");
+        if can_page_title {
+            hint.push_str("  PgUp/Dn:title");
+        }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
@@ -272,7 +352,7 @@ mod tests {
     /// Stand-in for a real agent's `allow_always` mapping. `Some(&[])` would
     /// also satisfy `.is_some()` but reads as "supported with zero
     /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
-    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
+    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken<'static>]> =
         Some(&[crate::agents::KeyToken::Literal("2")]);
 
     fn dialog() -> PermissionResponseDialog {
@@ -402,5 +482,75 @@ mod tests {
                 assert!(out.contains(context), "missing {context:?}:\n{out}");
             }
         }
+    }
+
+    #[test]
+    fn provider_approval_renders_the_provider_prompt_title() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut dialog = PermissionResponseDialog::integration(
+            "session-one",
+            "Delete the production database?",
+            false,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .unwrap();
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(output.contains("session-one"));
+        assert!(output.contains("Delete the production database?"));
+    }
+
+    #[test]
+    fn integration_title_can_be_paged_before_submitting_allow() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let suffix = " [delete all customer records]";
+        let title = format!(
+            "Delete production data using{}{}",
+            " with old backups".repeat(4),
+            suffix
+        );
+        let mut dialog = PermissionResponseDialog::integration("session-one", &title, false);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let render = |dialog: &mut PermissionResponseDialog,
+                      terminal: &mut Terminal<TestBackend>,
+                      theme: &Theme| {
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), theme))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let first_page = render(&mut dialog, &mut terminal, &theme);
+        assert!(first_page.contains("PgUp/Dn:title"));
+        assert!(!first_page.contains(suffix));
+
+        dialog.handle_key(key(KeyCode::PageDown));
+        dialog.handle_key(key(KeyCode::PageDown));
+        let last_page = render(&mut dialog, &mut terminal, &theme);
+        assert!(last_page.contains(suffix));
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(PermissionResponseChoice::Allow)
+        ));
     }
 }

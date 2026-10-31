@@ -258,6 +258,33 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
+        let integration_configured = crate::plugin::agent_integration::configured(self);
+        let integration_snapshot = integration_configured
+            .then(|| crate::plugin::agent_integration::snapshot(self))
+            .flatten();
+        if let Some(status) = crate::plugin::agent_integration::session_status_override(
+            integration_configured,
+            is_dead,
+            integration_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status),
+        ) {
+            self.status = status;
+            self.detection.pending = None;
+            self.detection.rule = Some("agent_integration");
+            if self.status == Status::Error {
+                if is_dead {
+                    self.explain_error_from_pane(&session);
+                } else if self.last_error.is_none() {
+                    self.last_error = Some(summarize_error_from_pane(
+                        &session.capture_pane(20).unwrap_or_default(),
+                    ));
+                }
+            } else {
+                self.last_error = None;
+            }
+            return;
+        }
 
         // Two detection identities: hooks are installed for (and must be interpreted by) the
         // `agent_detect_as` alias when one is set, so hook reconciliation keeps the alias identity.

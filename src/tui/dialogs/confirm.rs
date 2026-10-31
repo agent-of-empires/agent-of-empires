@@ -8,6 +8,7 @@ use super::DialogResult;
 use crate::tui::components::buttons::{render_buttons_with_focus, ButtonFocus};
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
+use crate::tui::components::text::wrapped_line_count;
 use crate::tui::styles::Theme;
 
 const DONT_ASK_AGAIN: &str = "dont_ask_again";
@@ -242,7 +243,14 @@ impl ConfirmDialog {
             .max();
         let width: u16 = widest_checkbox.map_or(50, |w| w.max(56)).min(area.width);
         let text_width = width.saturating_sub(4).max(1);
-        let message_rows = wrapped_line_count(&self.message, text_width as usize);
+        // Match `Paragraph::new(&str)`, which splits the message on line
+        // breaks; a single wrapped Line would drop every `\n` and undercount.
+        let message_rows = self
+            .message
+            .lines()
+            .map(|line| wrapped_line_count(&Line::from(line), text_width))
+            .sum::<usize>()
+            .max(1);
         // Border, margin and buttons, plus the checkbox rows and their spacers.
         let chrome: u16 = if rows > 0 { 8 + rows } else { 6 };
         let min_height: u16 = if rows > 0 { 10 + rows } else { 8 };
@@ -330,42 +338,6 @@ impl ConfirmDialog {
             .wrap(Wrap { trim: true });
         frame.render_widget(message, area);
     }
-}
-
-/// Rows a message occupies when word-wrapped at `width` columns: greedy fill
-/// on whitespace, long words broken mid-word. Close enough to ratatui's
-/// `Wrap { trim: true }` to size the dialog, and an overestimate is harmless
-/// where an underestimate would clip.
-fn wrapped_line_count(message: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 0usize;
-    for line in message.lines() {
-        let mut used = 0usize;
-        let mut line_rows = 1usize;
-        for word in line.split_whitespace() {
-            let mut len = word.chars().count();
-            if used > 0 && used + 1 + len <= width {
-                used += 1 + len;
-                continue;
-            }
-            if used > 0 && len <= width {
-                line_rows += 1;
-                used = len;
-                continue;
-            }
-            // First word on the row, or one longer than it.
-            if used > 0 {
-                line_rows += 1;
-            }
-            while len > width {
-                line_rows += 1;
-                len -= width;
-            }
-            used = len;
-        }
-        rows += line_rows;
-    }
-    rows.max(1)
 }
 
 #[cfg(test)]
@@ -656,18 +628,29 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_line_count_matches_the_renderer_closely_enough_to_size_the_dialog() {
-        // (message, width, rows)
-        let cases: &[(&str, usize, usize)] = &[
-            ("", 46, 1),
-            ("short", 46, 1),
-            ("a\nb", 46, 2),
-            ("aaaaaaaaaa bbbbbbbbbb", 10, 2),
-        ];
-        for (message, width, rows) in cases {
-            assert_eq!(wrapped_line_count(message, *width), *rows, "{message:?}");
-        }
-        // A single word longer than the row breaks across rows.
-        assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
+    fn a_blank_line_between_body_and_warning_grows_the_dialog_instead_of_clipping() {
+        // The Empty Trash prompt appends a \n\n warning; the message must be
+        // counted per logical line or the warning row is cut off.
+        let body = "Delete this session? It cannot be undone.\n\nRemoving from \
+                    aoe skips cleanup: worktrees and branches stay on disk.";
+        let mut dialog = ConfirmDialog::new("Empty trash", body, "empty_trash");
+        let (screen, _buf, _theme) = render_to(&mut dialog, 80, 24);
+
+        assert!(
+            screen.contains("skips cleanup"),
+            "warning tail clipped:\n{screen}"
+        );
+        let warning_row = screen
+            .lines()
+            .position(|l| l.contains("skips cleanup"))
+            .expect("warning tail row");
+        let yes_row = screen
+            .lines()
+            .position(|l| l.contains("Yes"))
+            .expect("yes button row");
+        assert!(
+            yes_row > warning_row,
+            "buttons must sit below the warning line, not over it"
+        );
     }
 }

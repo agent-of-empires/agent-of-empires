@@ -30,7 +30,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::libc;
-use nix::sys::stat::{fstat, mkdirat, Mode};
+use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
 use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 // Path resolution.
@@ -329,6 +329,15 @@ pub(crate) fn read_file_at(
     name: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(read_file_with_metadata_at(dir, name, max_bytes)?.map(|(_, bytes)| bytes))
+}
+
+/// Read a bounded regular file and return metadata from the same opened inode.
+pub(crate) fn read_file_with_metadata_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<(Metadata, Vec<u8>)>> {
     use std::io::Read;
     validate_hook_leaf(name)?;
     let fd = match openat(
@@ -342,13 +351,15 @@ pub(crate) fn read_file_at(
         Err(e) => return Err(e).with_context(|| format!("openat read {name}")),
     };
     let mut file = std::fs::File::from(fd);
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Ok(None);
     }
-    let mut buf = Vec::with_capacity(max_bytes.min(4096));
-    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    file.by_ref().take(limit).read_to_end(&mut buf)?;
-    Ok(Some(buf))
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    file.by_ref()
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    Ok(Some((metadata, bytes)))
 }
 
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` view for mtime gating. Returns `Ok(None)` on
@@ -393,8 +404,7 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-/// Atomic write via an `O_CREAT|O_EXCL` tmpfile and `renameat`, used for the
-/// `session_id` sidecar.
+/// Atomic `0o600` sidecar write via an `O_CREAT|O_EXCL` tmpfile and `renameat`.
 ///
 /// Atomicity, not durability: no `fsync` before the rename, so a power loss
 /// may revert or drop the file. The tree lives under `/tmp` and every reader
@@ -424,6 +434,8 @@ pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Res
     )
     .with_context(|| format!("openat tmp {tmp}"))?;
     {
+        // Reply consumers require exactly 0o600, even under a restrictive umask.
+        fchmod(&fd, Mode::S_IRUSR | Mode::S_IWUSR).with_context(|| format!("fchmod tmp {tmp}"))?;
         let mut file = std::fs::File::from(fd);
         file.write_all(bytes)?;
     }
@@ -901,6 +913,59 @@ mod tests {
             Some("/tmp"),
             "production hook base must live under /tmp; got {}",
             path.display()
+        );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn atomic_reply_stays_owner_readable_under_restrictive_umask() {
+        const CHILD_BASE: &str = "AOE_HOOK_ATOMIC_UMASK_CHILD_BASE";
+        const NAME: &str = "integration-omp.agent-of-empires.reply.json";
+        const RESPONSE: &[u8] = br#"{"response":{"kind":"approval","choice":"allow"}}"#;
+        if let Some(base) = std::env::var_os(CHILD_BASE) {
+            let _guard = BaseGuard::with_base(base.into());
+            let dir = open_instance_dir("atomic_reply").unwrap();
+            // Only this isolated, single-test child changes its process umask.
+            nix::sys::stat::umask(Mode::from_bits_truncate(0o777));
+            write_atomic(dir.as_fd(), NAME, RESPONSE).unwrap();
+            return;
+        }
+
+        let (_guard, base, _tmp) = BaseGuard::ready();
+        let dir = open_instance_dir("atomic_reply").unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!("{module}::atomic_reply_stays_owner_readable_under_restrictive_umask"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_BASE, &base);
+        let output = crate::process::run_with_timeout_process_group(
+            &mut command,
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("restrictive-umask child timed out");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (metadata, bytes) = read_file_with_metadata_at(dir.as_fd(), NAME, 4096)
+            .unwrap()
+            .expect("child must publish the completed reply");
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(bytes, RESPONSE);
+        assert_eq!(
+            std::fs::read_dir(base.join("atomic_reply"))
+                .unwrap()
+                .count(),
+            1,
+            "atomic write must not leave a temporary file"
         );
     }
 
