@@ -89,7 +89,18 @@ impl Instance {
         if container.is_running()? {
             return Ok(false);
         }
-        store.migrate_sandbox_store(&self.id, reporter, container.runtime())?;
+        store
+            .migrate_sandbox_store(&self.id, reporter, container.runtime())
+            .map_err(|error| {
+                if error.is::<crate::session::NativeStoreUnavailable>()
+                    || error.is::<LifecycleReservationError>()
+                    || error.is::<crate::migrations::SandboxMigrationError>()
+                {
+                    error
+                } else {
+                    error.context(crate::migrations::SandboxMigrationError::Failed)
+                }
+            })?;
         Ok(true)
     }
 
@@ -144,17 +155,19 @@ impl Instance {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<containers::DockerContainer> {
         let storage = Storage::new(&self.effective_profile(), self.resolve_file_watch())?;
-        self.ensure_container_with_hook_in(&storage, cancel, Self::mint_before_start_env)
+        self.ensure_container_with_hook_in(&storage, cancel, None, Self::mint_before_start_env)
             .map(|(container, _)| container)
     }
 
     pub(crate) fn ensure_container_in(
         &mut self,
         store: &dyn SessionStore,
+        launch_generation: Option<u64>,
     ) -> Result<containers::DockerContainer> {
         self.ensure_container_with_hook_in(
             store,
             &tokio_util::sync::CancellationToken::new(),
+            launch_generation,
             Self::mint_before_start_env,
         )
         .map(|(container, _)| container)
@@ -164,6 +177,7 @@ impl Instance {
         &mut self,
         store: &dyn SessionStore,
         cancel: &tokio_util::sync::CancellationToken,
+        launch_generation: Option<u64>,
         mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
     ) -> Result<(containers::DockerContainer, bool)> {
         let launch_config = store.launch_configuration(Path::new(&self.project_path))?;
@@ -199,11 +213,20 @@ impl Instance {
         {
             self.reconcile_from_store(store)?;
         }
+        let mut launch_locks = launch_generation
+            .map(|generation| self.reacquire_launch_locks_after_hooks(store, generation, Ok(())))
+            .transpose()?;
         self.warn_legacy_agent_config_mounts(profile_config);
         let mut transition_lock = self.container_transition_lock()?;
         let mut scoped_hook = |instance: &mut Self, config: &crate::session::LaunchConfig| {
             drop(transition_lock.take());
+            drop(launch_locks.take());
             let result = run_hook(instance, config);
+            launch_locks = launch_generation
+                .map(|generation| {
+                    instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))
+                })
+                .transpose()?;
             transition_lock = instance.container_transition_lock()?;
             store.check_available()?;
             result
@@ -681,6 +704,82 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn superseded_launch_never_brings_up_a_container() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| config.systemd.enabled = false)?;
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let effect = root.path().join("container-started");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n\
+             'image inspect'*) exit 0;;\n\
+             *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;;\n\
+             run\\ *|create\\ *|start\\ *) touch '{}'; echo 'permission denied' >&2; exit 1;;\n\
+             esac\nexit 0\n",
+            effect.display()
+        );
+        for runtime in ["docker", "podman", "container"] {
+            let path = bin.join(runtime);
+            std::fs::write(&path, &script)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let store = Storage::new_unwatched("default")?;
+        let mut raw = serde_json::to_value(Instance::new("expired", project.to_str().unwrap()))?;
+        raw["tool"] = "codex".into();
+        raw["command"] = "codex".into();
+        raw["source_profile"] = "default".into();
+        raw["sandbox_info"] = serde_json::json!({
+            "enabled": true, "image": "test-image", "container_name": "expired",
+        });
+        let mut stale: Instance = serde_json::from_value(raw)?;
+        stale.source_profile = store.profile().into();
+        let generation = stale.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            Utc::now() - chrono::Duration::minutes(11),
+        )?;
+        store.update(|rows, _| {
+            rows.push(stale.clone());
+            Ok(())
+        })?;
+        store.update(|rows, _| {
+            let row = &mut rows[0];
+            let stop = row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )?;
+            assert!(row.finish_lifecycle_status(LifecycleOperation::Stop, stop, Status::Stopped));
+            Ok(())
+        })?;
+        let error = stale
+            .run_pre_launch_hooks(true, &store, None, Some(generation))
+            .unwrap_err();
+        assert!(
+            error.is::<LifecycleReservationError>(),
+            "{error:#}; container effect: {}",
+            effect.exists()
+        );
+        assert!(
+            !effect.exists(),
+            "an expired launch brought up a container after Stop"
+        );
+        let stopped = store.load()?;
+        assert_eq!(stopped[0].status, Status::Stopped);
+        assert!(stopped[0].lifecycle_generation > generation);
+        Ok(())
+    }
 
     #[test]
     fn hook_mount_source_is_restored_for_agent_without_hooks() {

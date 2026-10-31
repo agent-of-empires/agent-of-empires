@@ -320,10 +320,11 @@ impl Instance {
         skip_on_launch: bool,
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+        launch_generation: Option<u64>,
     ) -> Result<()> {
         let config = store.configuration(Some(store.storage().profile()))?;
         self.mint_host_session_env(&config)?;
-        self.run_launch_hooks(skip_on_launch, store, progress)
+        self.run_launch_hooks(skip_on_launch, store, progress, launch_generation)
     }
 
     fn run_launch_hooks(
@@ -331,6 +332,7 @@ impl Instance {
         skip_on_launch: bool,
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+        launch_generation: Option<u64>,
     ) -> Result<()> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
@@ -356,7 +358,7 @@ impl Instance {
         };
 
         if self.is_sandboxed() {
-            self.ensure_container_in(store)?;
+            self.ensure_container_in(store, launch_generation)?;
             if let (Some(hook_cmds), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {

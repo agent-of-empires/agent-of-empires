@@ -313,6 +313,23 @@ pub fn assert_schema_current() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub(crate) enum SandboxMigrationError {
+    #[error("sandbox migration is pending")]
+    Deferred,
+    #[error("sandbox migration failed")]
+    Failed,
+}
+
+impl SandboxMigrationError {
+    pub(crate) fn api_code(self) -> crate::daemon::ApiErrorCode {
+        match self {
+            Self::Deferred => crate::daemon::ApiErrorCode::SandboxMigrationDeferred,
+            Self::Failed => crate::daemon::ApiErrorCode::SandboxMigrationFailed,
+        }
+    }
+}
+
 /// Move this session's shared sandbox store and isolate its native content,
 /// reporting copy progress to the caller. Unproven content remains pending.
 pub(crate) fn migrate_sandbox_store_for_with(

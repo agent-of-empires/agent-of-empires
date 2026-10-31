@@ -378,7 +378,8 @@ impl Instance {
     ) -> Result<StartOutcome> {
         let generation =
             self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        let hook_result =
+            self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
         self.finish_reserved_launch(storage, size, options, generation, hook_result)
     }
     pub(crate) fn capture_before_restart_in(

@@ -415,6 +415,7 @@ impl Instance {
             let (container, _) = self.ensure_container_with_hook_in(
                 store,
                 &tokio_util::sync::CancellationToken::new(),
+                None,
                 |instance, config| {
                     drop(ownership.take());
                     let result = run_hook(instance, config);

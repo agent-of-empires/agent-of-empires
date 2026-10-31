@@ -576,7 +576,10 @@ async fn run_queued_command(
                             }
                             let mut failure = match error {
                                 error @ crate::daemon::DaemonClientError::Committed {
-                                    code: crate::daemon::ApiErrorCode::ManagedResumeRefused(_),
+                                    code:
+                                        crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
+                                        | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                                        | crate::daemon::ApiErrorCode::SandboxMigrationFailed,
                                     ..
                                 } => CommandFailure::Rejected(error.to_string()),
                                 error => CommandFailure::submitted(error),
@@ -611,6 +614,8 @@ async fn run_queued_command(
                     code,
                     crate::daemon::ApiErrorCode::PurgeFailed
                         | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
+                        | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                        | crate::daemon::ApiErrorCode::SandboxMigrationFailed
                 ) {
                     CommandFailure::Rejected(message)
                 } else {
@@ -2366,10 +2371,20 @@ mod tests {
                 "managed_resume_refused",
                 true,
             ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "sandbox_migration_deferred",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "sandbox_migration_failed",
+                true,
+            ),
         ] {
             let app = axum::Router::new().fallback(move || async move {
                 (
-                    if code == "start_failed" {
+                    if matches!(code, "start_failed" | "sandbox_migration_failed") {
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR
                     } else {
                         axum::http::StatusCode::CONFLICT
@@ -3783,14 +3798,61 @@ mod tests {
     #[tokio::test]
     async fn committed_start_remains_fenced_when_pane_preparation_fails() {
         use axum::response::IntoResponse;
-        for (start_refused, ensure_status, committed_revision) in [
-            (false, axum::http::StatusCode::FORBIDDEN, None),
-            (false, axum::http::StatusCode::CONFLICT, None),
-            (false, axum::http::StatusCode::INTERNAL_SERVER_ERROR, None),
-            (false, axum::http::StatusCode::OK, None),
-            (true, axum::http::StatusCode::FORBIDDEN, None),
-            (false, axum::http::StatusCode::CONFLICT, Some("1")),
-            (false, axum::http::StatusCode::CONFLICT, Some("3")),
+        for (start_refused, ensure_status, committed_revision, code) in [
+            (
+                false,
+                axum::http::StatusCode::FORBIDDEN,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::CONFLICT,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::OK,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                true,
+                axum::http::StatusCode::FORBIDDEN,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::CONFLICT,
+                Some("1"),
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "managed_resume_refused",
+            ),
+            (
+                false,
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "sandbox_migration_deferred",
+            ),
+            (
+                false,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Some("3"),
+                "sandbox_migration_failed",
+            ),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let app = axum::Router::new()
@@ -3828,10 +3890,7 @@ mod tests {
                                     return (
                                         ensure_status,
                                         [
-                                            (
-                                                crate::daemon::ERROR_CODE_HEADER,
-                                                "managed_resume_refused",
-                                            ),
+                                            (crate::daemon::ERROR_CODE_HEADER, code),
                                             (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
                                             (crate::daemon::RUNTIME_REVISION_HEADER, revision),
                                         ],
@@ -3902,7 +3961,8 @@ mod tests {
                 feed.mark_snapshot_applied(snapshot("test", revision));
                 let errors = feed.drain_command_errors();
                 assert!(preparation.result.try_recv().unwrap().is_err());
-                let unknown = ensure_status.is_server_error() || ensure_status.is_success();
+                let unknown = committed_revision.is_none()
+                    && (ensure_status.is_server_error() || ensure_status.is_success());
                 assert_eq!(feed.can_submit("id"), !unknown);
                 assert_eq!(errors.iter().any(|error| error.outcome_unknown), unknown);
                 assert_eq!(*seen.lock().unwrap(), ["start", "ensure"]);

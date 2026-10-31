@@ -144,6 +144,9 @@ pub(crate) enum LocalRuntimeError {
 }
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
+    if let Some(message) = code.sandbox_migration_message() {
+        return message;
+    }
     match code {
         ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
@@ -156,6 +159,9 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
     match code {
+        Some(code) if code.sandbox_migration_message().is_some() => {
+            code.sandbox_migration_message().unwrap().into()
+        }
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
@@ -910,6 +916,8 @@ impl DaemonClient {
                 code,
                 Some(
                     ApiErrorCode::StartFailed
+                        | ApiErrorCode::SandboxMigrationDeferred
+                        | ApiErrorCode::SandboxMigrationFailed
                         | ApiErrorCode::ResumeFailed
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
@@ -920,6 +928,7 @@ impl DaemonClient {
                     .and_then(|value| value.to_str().ok())
                 {
                     if code == Some(ApiErrorCode::PurgeFailed)
+                        || code.is_some_and(|code| code.sandbox_migration_message().is_some())
                         || response.headers().contains_key(RUNTIME_EPOCH_HEADER)
                         || response.headers().contains_key(RUNTIME_REVISION_HEADER)
                     {
@@ -929,7 +938,9 @@ impl DaemonClient {
                             code: code.unwrap(),
                         });
                     }
-                } else if code == Some(ApiErrorCode::PurgeFailed) {
+                } else if code == Some(ApiErrorCode::PurgeFailed)
+                    || code.is_some_and(|code| code.sandbox_migration_message().is_some())
+                {
                     return Err(DaemonClientError::InvalidMutationReceipt);
                 }
             }
@@ -940,6 +951,8 @@ impl DaemonClient {
                     ApiErrorCode::LifecycleLocked
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
+                        | ApiErrorCode::SandboxMigrationDeferred
+                        | ApiErrorCode::SandboxMigrationFailed
                 )
             ) || status == StatusCode::UNAUTHORIZED
             {
@@ -1896,6 +1909,40 @@ mod tests {
             (409, "resume_failed", "epoch-1", "3", true, false),
             (409, "purge_failed", "epoch-1", "3", true, false),
             (409, "managed_resume_refused", "epoch-1", "3", true, false),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "epoch-1",
+                "3",
+                true,
+                false,
+            ),
+            (500, "sandbox_migration_failed", "epoch-1", "3", true, false),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "absent",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                500,
+                "sandbox_migration_failed",
+                "absent",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "foreign",
+                "3",
+                false,
+                true,
+            ),
+            (500, "sandbox_migration_failed", "epoch-1", "0", false, true),
             (409, "managed_resume_refused", "foreign", "3", false, true),
             (409, "managed_resume_refused", "epoch-1", "0", false, true),
             (
