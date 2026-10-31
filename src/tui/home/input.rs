@@ -5780,6 +5780,9 @@ impl HomeView {
                 }
                 Item::Group { .. } => None,
                 Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                    if let Some(state) = self.live_send.clone() {
+                        self.exit_live_send_and_restore_sizing(&state);
+                    }
                     self.cursor = abs_idx;
                     self.update_selected();
                     self.activate_suggestion_row();
@@ -5794,6 +5797,9 @@ impl HomeView {
                 None
             }
             Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                if let Some(state) = self.live_send.clone() {
+                    self.exit_live_send_and_restore_sizing(&state);
+                }
                 self.cursor = abs_idx;
                 self.update_selected();
                 None
