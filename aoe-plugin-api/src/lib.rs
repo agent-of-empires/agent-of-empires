@@ -1,6 +1,7 @@
 //! Plugin manifest types for the Agent of Empires plugin system.
 
 pub mod acp;
+pub mod agent_integration;
 mod capability;
 mod id;
 mod manifest;

@@ -52,6 +52,10 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
+    /// Optional agent launch metadata. Requires API v19.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
+
     /// Host-rendered UI slots the plugin may populate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -966,6 +970,30 @@ impl PluginManifest {
                 format!("status[{i}].id must not be empty"),
             );
         }
+        let mut integration_tools = std::collections::HashSet::new();
+        for (i, integration) in self.agent_integrations.iter().enumerate() {
+            check(
+                !integration.tool.is_empty()
+                    && integration.tool.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    }),
+                format!("agent_integrations[{i}].tool must be a nonempty lowercase agent id"),
+            );
+            check(
+                integration
+                    .command
+                    .as_ref()
+                    .is_none_or(|command| !command.trim().is_empty()),
+                format!("agent_integrations[{i}].command must not be blank"),
+            );
+            check(
+                integration_tools.insert(integration.tool.as_str()),
+                format!(
+                    "agent_integrations must not repeat tool {:?}",
+                    integration.tool
+                ),
+            );
+        }
         check(
             self.screenshots.len() <= MAX_SCREENSHOTS,
             format!(
@@ -1101,6 +1129,12 @@ impl PluginManifest {
             check(
                 self.settings.iter().all(|s| !s.per_project),
                 "per_project settings require api_version >= 18".into(),
+            );
+        }
+        if self.api_version < 19 {
+            check(
+                self.agent_integrations.is_empty(),
+                "agent_integrations require api_version >= 19".into(),
             );
         }
         for key in self.setting_defaults.keys() {

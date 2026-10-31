@@ -2834,6 +2834,406 @@ fn agent_probe_output(
     }
 }
 
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME").and_then(|home| home.into_string().ok())
+}
+
+/// Split a discovery command into shell words while expanding the supported
+/// `$HOME`/`${HOME}` and leading `~`, so the probe agrees with the launch
+/// shell. Splitting happens on the command's own unquoted whitespace, so an
+/// expansion that itself contains whitespace (a `$HOME` path with a space)
+/// stays inside one word, exactly as the shell assignment treats it. Quote
+/// context is preserved: single-quoted `$HOME` stays literal (the launch does
+/// not expand it), tilde never expands inside quotes, and a backslash escapes
+/// the next character outside single quotes (`foo\ bar` is one word, `\$HOME`
+/// is a literal dollar). Unsupported constructs are left verbatim and rejected
+/// later only when they sit in the probed assignments or executable (never in
+/// trailing agent arguments).
+fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
+    let home = home_dir();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            // Outside single quotes a backslash escapes the next character; in
+            // double quotes POSIX only lets it escape `$`, backtick, `"`, `\`
+            // and newline, so a `\ ` there retains the backslash (`foo\ bar` is
+            // one word and `\$HOME` is a literal dollar when unquoted, but
+            // `"a\ b"` keeps the backslash). Inside single quotes backslash is
+            // literal, exactly as the launch shell treats it.
+            '\\' if !in_single => match (in_double, chars.peek().copied()) {
+                (false, Some(next)) => {
+                    chars.next();
+                    current.push(next);
+                }
+                (true, Some(next @ ('$' | '`' | '"' | '\\' | '\n'))) => {
+                    chars.next();
+                    current.push(next);
+                }
+                (true, _) => current.push('\\'),
+                (false, None) => current.push('\\'),
+            },
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            '$' if !in_single => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut name = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            break;
+                        }
+                        name.push(ch);
+                    }
+                    if name == "HOME" {
+                        match &home {
+                            // HOME is unavailable: keep the form literal so it is
+                            // rejected by the probed-word scan, never blanked.
+                            Some(home) => current.push_str(home),
+                            None => current.push_str("${HOME}"),
+                        }
+                    } else {
+                        current.push_str("${");
+                        current.push_str(&name);
+                        current.push('}');
+                    }
+                } else {
+                    let mut token = String::new();
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii_alphanumeric() || next == '_' {
+                            token.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if token == "HOME" {
+                        match &home {
+                            Some(home) => current.push_str(home),
+                            None => current.push_str("$HOME"),
+                        }
+                    } else {
+                        current.push('$');
+                        current.push_str(&token);
+                    }
+                }
+            }
+            // Tilde expands only at the start of a word (the executable or a
+            // standalone argument), exactly as the launching shell treats it.
+            // `~` after `=` in a `NAME=value` argument to `env` is left literal
+            // by sh/zsh/dash, so expanding it here would report an agent
+            // installed that the launch cannot run.
+            '~' if !in_single && !in_double && current.is_empty() => match (&home, chars.peek()) {
+                (Some(home), Some('/') | None) => current.push_str(home),
+                _ => current.push('~'),
+            },
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    let assignments = words
+        .iter()
+        .take_while(|word| {
+            word.split_once('=')
+                .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
+        })
+        .count();
+    (words.get(assignments).is_some()).then_some((words, assignments))
+}
+
+fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
+    let (words, assignments) = probe_command_words(command)?;
+    if words.len() <= assignments {
+        return None;
+    }
+    // Only the assignments and the executable are probed, so only there do we
+    // refuse constructs discovery cannot safely verify (command substitution,
+    // backticks, a `$` the launch would expand but we kept literal, or a `~`
+    // that `which` would expand but the launch's `env` passes literally).
+    // Trailing agent arguments are never inspected or run.
+    if words[..=assignments]
+        .iter()
+        .any(|word| word.contains('$') || word.contains('`') || word.contains('~'))
+    {
+        return None;
+    }
+    Some((words, assignments))
+}
+
+fn plugin_command_on_path(command: &str) -> bool {
+    let Some((words, assignments)) = plugin_command_parts(command) else {
+        return false;
+    };
+    let binary = &words[assignments];
+    let path_override = words[..assignments]
+        .iter()
+        .rev()
+        .find_map(|word| word.strip_prefix("PATH="));
+    match path_override {
+        Some(path) => std::env::current_dir()
+            .ok()
+            .is_some_and(|cwd| which::which_in(binary, Some(path), cwd).is_ok()),
+        None => which::which(binary).is_ok(),
+    }
+}
+
+fn plugin_cache_key(agent: crate::plugin::agent_integration::PluginAgent<'_>) -> String {
+    format!(
+        "plugin\0{}\0{}\0{}",
+        agent.plugin, agent.tool, agent.command
+    )
+}
+
+fn shell_basename(shell: &str) -> &str {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+}
+
+/// Only fish needs the `begin; set -lx …; and printf` probe dialect. The other
+/// non-POSIX shells (nu, pwsh) cannot parse either dialect, so they keep the
+/// POSIX form rather than receiving fish syntax.
+fn is_fish_shell(shell: &str) -> bool {
+    shell_basename(shell) == "fish"
+}
+
+/// Quote one word as a fish single-quoted literal (fish rejects the POSIX
+/// `'\''` idiom, so escaping must stay inside one single-quoted segment).
+fn fish_quote_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    for character in word.chars() {
+        if character == '\'' || character == '\\' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('\'');
+    out
+}
+
+/// One batched login-shell availability probe for a plugin agent. POSIX shells
+/// scope the leading `KEY=VALUE` assignments in a subshell; fish has no
+/// position subshell (`( cmd )` is a rejected command substitution), so it gets
+/// a `begin; set -lx …; end; and printf …` block with identical semantics.
+fn plugin_probe_fragment(fish: bool, assignments: &[String], binary: &str, index: usize) -> String {
+    let mut fragment = if fish {
+        String::from("begin; ")
+    } else {
+        String::from("( ")
+    };
+    for assignment in assignments {
+        let (key, value) = assignment.split_once('=').unwrap();
+        if fish {
+            fragment.push_str("set -lx ");
+            fragment.push_str(key);
+            fragment.push(' ');
+            fragment.push_str(&fish_quote_word(value));
+            fragment.push_str("; ");
+        } else {
+            fragment.push_str(key);
+            fragment.push('=');
+            fragment.push_str(&shell_words::quote(value));
+            fragment.push(' ');
+        }
+    }
+    let terminator = if fish {
+        " >/dev/null 2>&1; end; and printf '\\nAOE_PLUGIN_OK "
+    } else {
+        " >/dev/null 2>&1 ) && printf '\\nAOE_PLUGIN_OK "
+    };
+    let quoted_binary = if fish {
+        fish_quote_word(binary)
+    } else {
+        shell_words::quote(binary).into_owned()
+    };
+    fragment.push_str("command -v ");
+    fragment.push_str(&quoted_binary);
+    fragment.push_str(terminator);
+    fragment.push_str(&index.to_string());
+    fragment.push_str("\\n'; ");
+    fragment
+}
+
+fn plugin_agents_available(
+    agents: &[crate::plugin::agent_integration::PluginAgent<'_>],
+    login_shell: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    force: bool,
+) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let mut uncached = Vec::new();
+    if !force {
+        if let Ok(cache) = AGENT_AVAILABILITY.read() {
+            for agent in agents {
+                match cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(&plugin_cache_key(*agent)))
+                {
+                    Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
+                        found.insert(agent.tool.to_string());
+                    }
+                    Some((false, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {}
+                    _ => uncached.push(*agent),
+                }
+            }
+        } else {
+            uncached.extend_from_slice(agents);
+        }
+    } else {
+        uncached.extend_from_slice(agents);
+    }
+    if uncached.is_empty() {
+        return found;
+    }
+
+    let _probe_guard = if let Some(cancel) = cancel {
+        loop {
+            if cancel.is_cancelled() {
+                return found;
+            }
+            match AGENT_PROBE_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+            }
+        }
+    } else {
+        AGENT_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    };
+    if force {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            if let Some(cache) = cache.as_mut() {
+                for agent in agents {
+                    cache.remove(&plugin_cache_key(*agent));
+                }
+            }
+        }
+    } else if let Ok(cache) = AGENT_AVAILABILITY.read() {
+        let cached = cache.as_ref();
+        uncached.retain(|agent| {
+            match cached.and_then(|cache| cache.get(&plugin_cache_key(*agent))) {
+                Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
+                    found.insert(agent.tool.to_string());
+                    false
+                }
+                Some((false, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => false,
+                _ => true,
+            }
+        });
+    }
+    if uncached.is_empty() {
+        return found;
+    }
+
+    let mut results = Vec::new();
+    let mut needs_shell = Vec::new();
+    for agent in uncached {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return found;
+        }
+        let Some((words, assignments)) = plugin_command_parts(agent.command) else {
+            results.push((agent, false));
+            continue;
+        };
+        let on_path = plugin_command_on_path(agent.command);
+        if on_path {
+            results.push((agent, true));
+        } else if login_shell {
+            needs_shell.push((agent, words, assignments));
+        } else {
+            results.push((agent, false));
+        }
+    }
+
+    if !needs_shell.is_empty() {
+        let probe_shell = crate::session::user_shell();
+        let fish = is_fish_shell(&probe_shell);
+        let mut script = String::new();
+        for (index, (_, words, assignments)) in needs_shell.iter().enumerate() {
+            script.push_str(&plugin_probe_fragment(
+                fish,
+                &words[..*assignments],
+                &words[*assignments],
+                index,
+            ));
+        }
+        let output = agent_probe_output(
+            Command::new(&probe_shell).args(["-lc", &script]),
+            LOGIN_SHELL_PROBE_TIMEOUT,
+            cancel,
+        );
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return found;
+        }
+        let shell_found: HashSet<usize> = output
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+                    .filter_map(|index| index.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (index, (agent, _, _)) in needs_shell.into_iter().enumerate() {
+            results.push((agent, shell_found.contains(&index)));
+        }
+    }
+
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return found;
+    }
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        let now = std::time::Instant::now();
+        for (agent, available) in &results {
+            map.insert(plugin_cache_key(*agent), (*available, now));
+        }
+    }
+    found.extend(
+        results
+            .into_iter()
+            .filter(|(_, available)| *available)
+            .map(|(agent, _)| agent.tool.to_string()),
+    );
+    found
+}
+
+#[cfg(test)]
+fn plugin_command_available(
+    command: &str,
+    login_shell: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    let Some((words, assignments)) = plugin_command_parts(command) else {
+        return false;
+    };
+    let Some(binary) = words.get(assignments) else {
+        return false;
+    };
+    let agent = crate::plugin::agent_integration::PluginAgent {
+        plugin: "availability-test",
+        tool: binary,
+        command,
+    };
+    plugin_agents_available(&[agent], login_shell, cancel, false).contains(binary)
+}
+
 fn agent_available_direct(
     agent: &crate::agents::AgentDef,
     cancel: Option<&tokio_util::sync::CancellationToken>,
@@ -3122,15 +3522,35 @@ impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(agent_availability_snapshot(&refs))
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
+        Self::from_detected(
+            agent_availability_snapshot(&refs),
+            false,
+            None,
+            false,
+            session.as_ref(),
+        )
     }
 
     pub fn detect() -> Self {
-        // One batched probe warms the memo for later per-agent callers.
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
-        Self::from_detected(found)
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
+        Self::from_detected(found, true, None, false, session.as_ref())
+    }
+
+    pub(crate) fn detect_with_custom_agents(
+        session: &crate::session::config::SessionConfig,
+    ) -> Self {
+        session.warn_custom_agent_issues();
+        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        let found = probe_agents_available(&refs);
+        Self::from_detected(found, true, None, false, Some(session))
     }
 
     pub(crate) fn detect_cancellable(
@@ -3138,40 +3558,71 @@ impl AvailableTools {
         force: bool,
     ) -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(probe_agents_available_inner(&refs, Some(cancel), force))
+        let found = probe_agents_available_inner(&refs, Some(cancel), force);
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
+        Self::from_detected(found, true, Some(cancel), force, session.as_ref())
     }
 
-    fn from_detected(found: HashSet<String>) -> Self {
+    fn from_detected(
+        found: HashSet<String>,
+        login_shell: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        force: bool,
+        session_config: Option<&crate::session::config::SessionConfig>,
+    ) -> Self {
         let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
             .iter()
-            .filter(|a| found.contains(a.name))
-            .map(|a| a.name.to_string())
+            .filter(|agent| found.contains(agent.name))
+            .map(|agent| agent.name.to_string())
             .collect();
+        let empty_custom_agents = std::collections::HashMap::new();
+        let custom_agents = session_config
+            .map(|config| &config.custom_agents)
+            .unwrap_or(&empty_custom_agents);
+        let mut custom: Vec<_> = custom_agents
+            .iter()
+            .filter(|(name, command)| {
+                !name.is_empty()
+                    && !command.trim().is_empty()
+                    && !available.iter().any(|available| available == *name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        custom.sort();
+        available.extend(custom);
 
-        // Custom agents always count as available (they may target a wrapper).
-        if let Ok(config) = crate::session::config::Config::load() {
-            config.session.warn_custom_agent_issues();
-            let mut custom: Vec<_> = config
-                .session
-                .custom_agents
-                .keys()
-                .filter(|name| !name.is_empty() && !available.iter().any(|n| n == *name))
-                .cloned()
-                .collect();
-            custom.sort();
-            available.extend(custom);
-        }
-
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            agents.iter().map(|agent| agent.name),
+            custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        );
+        let found_plugins = if login_shell {
+            plugin_agents_available(&plugin_agents, true, cancel, force)
+        } else {
+            plugin_agents
+                .iter()
+                .filter(|agent| plugin_command_on_path(agent.command))
+                .map(|agent| agent.tool.to_string())
+                .collect()
+        };
+        available.extend(
+            plugin_agents
+                .iter()
+                .filter(|agent| found_plugins.contains(agent.tool))
+                .map(|agent| agent.tool.to_string()),
+        );
         Self { available }
     }
 
     pub fn any_available(&self) -> bool {
         !self.available.is_empty()
-    }
-
-    pub fn available_list(&self) -> &[String] {
-        &self.available
     }
 
     #[cfg(test)]
@@ -3180,6 +3631,17 @@ impl AvailableTools {
             available: tools.iter().map(|s| s.to_string()).collect(),
         }
     }
+
+    pub fn available_list(&self) -> &[String] {
+        &self.available
+    }
+}
+
+/// Load the effective session config once and surface its misconfiguration
+/// warnings here, so discovery and the picker do not reload it or warn twice.
+fn load_session(config: crate::session::config::Config) -> crate::session::config::SessionConfig {
+    config.session.warn_custom_agent_issues();
+    config.session
 }
 
 #[cfg(test)]
@@ -3386,6 +3848,166 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plugin_command_availability_handles_shell_launches() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir(&login_bin).unwrap();
+        let spaced_bin = home.path().join("my tools");
+        std::fs::create_dir(&spaced_bin).unwrap();
+        let executed = home.path().join("executed");
+        for path in [
+            home.path().join("bin/direct-agent"),
+            login_bin.join("login-agent"),
+            spaced_bin.join("spaced-agent"),
+        ] {
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n/bin/touch {}\n", executed.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let probe_path = home.path().join("probes");
+        let probes = shell_words::quote(probe_path.to_str().unwrap());
+        std::fs::write(
+            home.path().join("bin/login-shell"),
+            format!(
+                "#!/bin/sh\nprintf 'login\\n' >> {}\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                probes,
+                login_bin.display()
+            ),
+        )
+        .unwrap();
+        let injected = format!("login-agent \"$(/bin/touch {})\"", executed.display());
+        let cases = [
+            ("direct-agent", true),
+            ("TOKEN=local direct-agent", true),
+            ("login-agent", true),
+            ("TOKEN=local login-agent", true),
+            (injected.as_str(), true),
+            // `$HOME` expands so discovery agrees with the launch shell, but a
+            // literal `~` after `=` is a `env` argument, left unexpanded by
+            // sh/zsh/dash, so such an agent is unavailable, as at launch.
+            ("PATH=$HOME/login-bin login-agent", true),
+            ("PATH=~/login-bin login-agent", false),
+            // A quoted `$HOME` path containing a space resolves a real executable.
+            ("PATH=\"$HOME/my tools\" spaced-agent", true),
+            // Single-quoted `$HOME` stays literal, as the launch shell would.
+            ("PATH='$HOME/login-bin' login-agent", false),
+            // Command substitution in a probed part is rejected, never run.
+            ("PATH=$(printf /missing) login-agent", false),
+            ("PATH=/missing direct-agent", false),
+            ("TOKEN=local", false),
+            ("9INVALID=local direct-agent", false),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter(|(command, expected)| {
+                plugin_command_available(command, true, None) != *expected
+            })
+            .collect();
+        let batch = [
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin-a",
+                tool: "session-agent",
+                command: "TOKEN=local login-agent",
+            },
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin-b",
+                tool: "worker-agent",
+                command: "TOKEN=other login-agent --ignored",
+            },
+        ];
+        std::fs::remove_file(home.path().join("probes")).ok();
+        assert_eq!(
+            plugin_agents_available(&batch, true, None, false),
+            HashSet::from(["session-agent".to_owned(), "worker-agent".to_owned()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("probes"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "login")
+                .count(),
+            1,
+            "uncached plugin agents share a single login shell"
+        );
+        assert_eq!(
+            plugin_agents_available(&batch, true, None, false),
+            HashSet::from(["session-agent".to_owned(), "worker-agent".to_owned()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("probes"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "login")
+                .count(),
+            1,
+            "cached plugin results avoid another login shell"
+        );
+        assert!(!executed.exists(), "discovery must not execute the agent");
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plugin_probe_spawn_failure_preserves_path_hits_and_caches_results() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let direct_binary = home.path().join("bin/direct-agent");
+        std::fs::write(&direct_binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&direct_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shell = home.path().join("missing-login-shell");
+        let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", shell)]);
+        let batch = [
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "direct-agent",
+                command: "direct-agent",
+            },
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "login-agent",
+                command: "login-agent",
+            },
+        ];
+        let expected = HashSet::from(["direct-agent".to_owned()]);
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        let direct_key = plugin_cache_key(batch[0]);
+        let shell_key = plugin_cache_key(batch[1]);
+        let cached = || {
+            AGENT_AVAILABILITY
+                .read()
+                .ok()
+                .and_then(|cache| {
+                    let cache = cache.as_ref()?;
+                    Some((*cache.get(&direct_key)?, *cache.get(&shell_key)?))
+                })
+                .expect("probe results cached")
+        };
+        let first_cache = cached();
+        let (direct, shell) = first_cache;
+        assert!(direct.0, "PATH-discovered agent remains available");
+        assert!(!shell.0, "failed shell probe is cached as unavailable");
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        assert_eq!(cached(), first_cache, "failed shell probe is not repeated");
+    }
+
+    #[test]
     #[serial_test::serial]
     fn availability_snapshot_retains_expired_login_shell_discoveries() {
         let memo = AgentAvailabilityGuard::capture();
@@ -3398,6 +4020,273 @@ mod tests {
         assert!(
             agent_availability_snapshot(&[crate::agents::get_agent("vibe").unwrap()])
                 .contains("vibe")
+        );
+    }
+
+    #[test]
+    fn fish_probe_dialect_is_selected_only_for_fish() {
+        for shell in ["fish", "/usr/bin/fish", "/opt/homebrew/bin/fish"] {
+            assert!(is_fish_shell(shell), "{shell} is fish");
+        }
+        for shell in [
+            "bash",
+            "zsh",
+            "sh",
+            "nu",
+            "nushell",
+            "pwsh",
+            "powershell",
+            "/bin/bash",
+        ] {
+            assert!(!is_fish_shell(shell), "{shell} must keep the POSIX dialect");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_command_words_expands_home_and_keeps_quote_context() {
+        let home = tempfile::tempdir().unwrap();
+        // A HOME whose path contains a space must stay one word after expansion.
+        let spaced = home.path().join("my home");
+        std::fs::create_dir(&spaced).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", &spaced)]);
+        let h = spaced.to_string_lossy().into_owned();
+        assert_eq!(
+            probe_command_words("PATH=$HOME/.local/bin acmebot"),
+            Some((
+                vec![format!("PATH={h}/.local/bin"), "acmebot".to_string()],
+                1
+            ))
+        );
+        assert_eq!(
+            probe_command_words("PATH=\"$HOME/my tools\" spaced-agent"),
+            Some((
+                vec![format!("PATH={h}/my tools"), "spaced-agent".to_string()],
+                1
+            ))
+        );
+        assert_eq!(
+            probe_command_words("PATH=${HOME}/bin acmebot"),
+            Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
+        );
+        // `~` after `=` is an `env` argument, left literal by sh/zsh/dash.
+        assert_eq!(
+            probe_command_words("PATH=~/bin acmebot"),
+            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // A leading `~` (the executable or a standalone word) does expand.
+        assert_eq!(
+            probe_command_words("~/bin/acmebot --flag"),
+            Some((vec![format!("{h}/bin/acmebot"), "--flag".to_string()], 0))
+        );
+        // Single quotes preserve a literal `$HOME`, exactly as the launch shell.
+        assert_eq!(
+            probe_command_words("PATH='$HOME/.local/bin' acmebot"),
+            Some((
+                vec!["PATH=$HOME/.local/bin".to_string(), "acmebot".to_string()],
+                1
+            ))
+        );
+        // Tilde does not expand inside double quotes, exactly as the shell.
+        assert_eq!(
+            probe_command_words("PATH=\"~/bin\" acmebot"),
+            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // `~user` is another user's home and stays literal.
+        assert_eq!(
+            probe_command_words("PATH=~alice/bin acmebot"),
+            Some((
+                vec!["PATH=~alice/bin".to_string(), "acmebot".to_string()],
+                1
+            ))
+        );
+        // A backslash escapes the next character: `foo\ bar` is one word and
+        // `\$HOME` is a literal dollar, exactly as the launch shell treats them.
+        assert_eq!(
+            probe_command_words("foo\\ bar acmebot"),
+            Some((vec!["foo bar".to_string(), "acmebot".to_string()], 0))
+        );
+        assert_eq!(
+            probe_command_words("PATH=\\$HOME/bin acmebot"),
+            Some((vec!["PATH=$HOME/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // Inside double quotes a backslash only escapes `$`, backtick, `"` and
+        // `\`, so `\ ` retains the backslash (the launch path is `<h>/my\ tools`).
+        assert_eq!(
+            probe_command_words("PATH=\"$HOME/my\\ tools\" spaced-agent"),
+            Some((
+                vec![format!("PATH={h}/my\\ tools"), "spaced-agent".to_string()],
+                1
+            ))
+        );
+        // The escaped literal `$HOME` cannot be verified and is refused.
+        assert!(plugin_command_parts("PATH=\\$HOME/bin acmebot").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_command_parts_rejects_unverifiable_probed_constructs() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
+        let h = home.path().to_string_lossy().into_owned();
+        // Expanded and accepted.
+        let (words, assignments) = plugin_command_parts("PATH=$HOME/bin acmebot").unwrap();
+        assert_eq!(words, vec![format!("PATH={h}/bin"), "acmebot".to_string()]);
+        assert_eq!(assignments, 1);
+        // Command substitution, backticks, and other variables in a probed part
+        // are refused: discovery never runs arbitrary shell.
+        assert!(plugin_command_parts("PATH=$(printf /tmp) acmebot").is_none());
+        assert!(plugin_command_parts("PATH=`echo /tmp` acmebot").is_none());
+        assert!(plugin_command_parts("PATH=${OTHER} acmebot").is_none());
+        assert!(plugin_command_parts("PATH=$HOME_x acmebot").is_none());
+        // A single-quoted literal `$HOME` is refused too (it cannot be verified).
+        assert!(plugin_command_parts("PATH='$HOME/bin' acmebot").is_none());
+        // A literal `~` after `=` is an `env` argument: the launch passes it
+        // literally, so `which` must not be allowed to expand it either.
+        assert!(plugin_command_parts("PATH=~/bin acmebot").is_none());
+        // Unsupported constructs in trailing arguments are not probed.
+        assert!(plugin_command_parts("acmebot \"$(printf x)\"").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_with_home_unset_keeps_ordinary_commands_and_refuses_home_forms() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["HOME"]);
+        // Ordinary commands need no expansion and stay discoverable.
+        let (words, assignments) = plugin_command_parts("plain-agent --flag").unwrap();
+        assert_eq!(words, vec!["plain-agent".to_string(), "--flag".to_string()]);
+        assert_eq!(assignments, 0);
+        assert_eq!(
+            plugin_command_parts("TOKEN=local plain-agent").unwrap().0[0],
+            "TOKEN=local"
+        );
+        // A `$HOME`-dependent probe cannot be verified without HOME and is refused.
+        assert!(plugin_command_parts("PATH=$HOME/bin plain-agent").is_none());
+    }
+
+    #[test]
+    fn plugin_probe_fragment_matches_posix_and_fish_dialects() {
+        let assignments = ["TOKEN=local".to_string()];
+        let posix = plugin_probe_fragment(false, &assignments, "session-agent", 2);
+        assert!(posix.starts_with("( TOKEN="), "POSIX subshell: {posix}");
+        assert!(posix.contains(") && printf"), "POSIX: {posix}");
+        let fish = plugin_probe_fragment(true, &assignments, "session-agent", 2);
+        assert!(
+            fish.starts_with("begin; set -lx TOKEN "),
+            "fish block, not a rejected position subshell: {fish}"
+        );
+        assert!(fish.contains("end; and printf"), "fish: {fish}");
+        assert!(
+            !fish.contains("( "),
+            "fish fragment drops the abandoned position-subshell syntax"
+        );
+
+        // An apostrophe is a valid assignment value; each dialect must quote it
+        // into a single word its parser accepts.
+        let tricky = ["TITLE=a'b c".to_string()];
+        let posix = plugin_probe_fragment(false, &tricky, "session-agent", 3);
+        assert!(
+            posix.contains("TITLE='a'\\''b c'"),
+            "POSIX keeps the `'\\''` idiom: {posix}"
+        );
+        let fish = plugin_probe_fragment(true, &tricky, "session-agent", 3);
+        assert!(
+            fish.contains("'a\\'b c'"),
+            "fish keeps the apostrophe inside one single-quoted literal: {fish}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn fish_login_probe_fragments_execute_under_fish() {
+        // Fish rejects `( cmd )` at a position command (a disallowed command
+        // substitution), so its login-shell variant must use begin/set/and.
+        // If fish is not installed the fragment-shape test above still pins the
+        // dialect contract.
+        let fish = std::env::var_os("AOE_FISH_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/homebrew/bin/fish"));
+        if !fish.exists() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let first: &[String] = &["TITLE=a'b c".to_string()];
+        let none: &[String] = &[];
+        let mut batched = String::new();
+        for (assignments, binary, index) in [(first, "/bin/sh", 0), (none, "definitely-missing", 1)]
+        {
+            batched.push_str(&plugin_probe_fragment(true, assignments, binary, index));
+        }
+        let mut command = Command::new(&fish);
+        command
+            .args(["-lc", &batched])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("PATH", "/bin:/usr/bin");
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let found: HashSet<usize> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+            .filter_map(|index| index.parse().ok())
+            .collect();
+        assert_eq!(found, HashSet::from([0]), "stdout: {stdout}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial_test::serial]
+    fn posix_login_probe_fragments_still_execute_under_sh() {
+        // The trailing probe legitimately fails, so the batch exits nonzero;
+        // availability is read from the printed markers, not the shell status.
+        let first: &[String] = &["TITLE=a'b c".to_string()];
+        let none: &[String] = &[];
+        let mut batched = String::new();
+        for (assignments, binary, index) in [(first, "sh", 0), (none, "definitely-missing-agnt", 1)]
+        {
+            batched.push_str(&plugin_probe_fragment(false, assignments, binary, index));
+        }
+        let output = Command::new("/bin/sh")
+            .args(["-c", &batched])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let found: HashSet<usize> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+            .filter_map(|index| index.parse().ok())
+            .collect();
+        assert_eq!(found, HashSet::from([0]), "stdout: {stdout}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn detect_with_custom_agents_warns_on_misconfigured_entries() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        // The controlled probe environment keeps real user tools, home, shell
+        // and plugins out of discovery while still exercising the detection
+        // path that surfaces the warning.
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .custom_agents
+            .insert("empty-cmd".to_string(), String::new());
+        let logs = crate::session::test_support::LogCapture::start();
+        let _ = AvailableTools::detect_with_custom_agents(&session);
+        let captured = logs.contents();
+        drop(logs);
+        assert!(
+            captured.contains("has an empty command"),
+            "misconfigured custom agent must be surfaced once: {captured}"
         );
     }
 

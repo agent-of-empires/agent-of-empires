@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
+use aoe_plugin_api::agent_integration::AgentIntegrationContribution;
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::Serialize;
 
@@ -199,6 +200,7 @@ pub struct UpdateConsent {
     pub removed_capabilities: Vec<String>,
     pub ui: Vec<UiView>,
     pub build_steps: Vec<String>,
+    pub agent_integrations: Vec<AgentIntegrationContribution>,
     pub runtime_change: Option<String>,
     pub trust_downgrade: bool,
     pub fingerprint: String,
@@ -245,6 +247,7 @@ pub struct InstallConsent {
     pub capabilities: Vec<String>,
     pub ui: Vec<UiView>,
     pub build_steps: Vec<String>,
+    pub agent_integrations: Vec<AgentIntegrationContribution>,
     pub fingerprint: String,
 }
 
@@ -359,8 +362,12 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     }
     let build = build_steps(&prepared.fetched.manifest);
     let granted = if assume_yes
-        || !install_needs_consent(&prepared.capabilities, build, &prepared.fetched.manifest.ui)
-    {
+        || !install_needs_consent(
+            &prepared.capabilities,
+            build,
+            &prepared.fetched.manifest.ui,
+            &prepared.fetched.manifest.agent_integrations,
+        ) {
         true
     } else {
         confirm_capabilities(
@@ -368,6 +375,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
             &prepared.capabilities,
             &prepared.fetched.manifest.ui,
             build,
+            &prepared.fetched.manifest.agent_integrations,
         )?
     };
     if !granted {
@@ -403,6 +411,7 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
             .iter()
             .map(|s| s.command.join(" "))
             .collect(),
+        agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
         fingerprint: p.fingerprint.clone(),
     })
 }
@@ -463,13 +472,66 @@ struct Prepared {
     removed_capabilities: Vec<String>,
     build_changed: bool,
     ui_changed: bool,
+    agents_changed: bool,
     runtime_change: Option<String>,
     trust_downgrade: bool,
     needs_consent: bool,
 }
 
+/// The consent structures serialize to the CLI/TUI/web disclosures, so their
+/// agent commands carry the display-escaped form (control and bidi characters
+/// made visible) rather than the raw bytes. The runnable command in the
+/// manifest is never altered.
+fn disclosure_integrations(
+    integrations: &[AgentIntegrationContribution],
+) -> Vec<AgentIntegrationContribution> {
+    integrations
+        .iter()
+        .map(|integration| {
+            let mut out = integration.clone();
+            if let Some(command) = &out.command {
+                out.command = Some(super::agent_integration::display_command(command));
+            }
+            out
+        })
+        .collect()
+}
+
 fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> String {
     format!("{tree_hash}|{}|{trust}", asset_sha256.unwrap_or(""))
+}
+
+fn installed_agent_integrations(
+    id: &str,
+    expected_manifest_hash: Option<&str>,
+) -> Option<Vec<AgentIntegrationContribution>> {
+    let bytes = std::fs::read(super::plugins_dir().ok()?.join(id).join("aoe-plugin.toml")).ok()?;
+    let actual_manifest_hash = PluginManifest::hash_bytes(&bytes);
+    if expected_manifest_hash != Some(actual_manifest_hash.as_str()) {
+        return None;
+    }
+    let manifest = std::str::from_utf8(&bytes).ok()?;
+    PluginManifest::from_toml_str(manifest)
+        .ok()
+        .map(|manifest| manifest.agent_integrations)
+}
+
+fn agent_integrations_changed(
+    previous: Option<&[AgentIntegrationContribution]>,
+    current: &[AgentIntegrationContribution],
+) -> bool {
+    let Some(previous) = previous else {
+        return !current.is_empty();
+    };
+    current.iter().any(|current| {
+        let Some(previous) = previous
+            .iter()
+            .find(|previous| previous.tool == current.tool)
+        else {
+            return true;
+        };
+        current.command.is_some() && previous.command != current.command
+    })
 }
 
 async fn prepare_update(id: &str) -> Result<Prepared> {
@@ -499,6 +561,12 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
+    let previous_agent_integrations = installed_agent_integrations(
+        id,
+        prior_grant
+            .as_ref()
+            .map(|grant| grant.manifest_hash.as_str()),
+    );
 
     let lock = Lockfile::load()?;
     let prior_locked = lock.get(id);
@@ -548,6 +616,10 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     };
     let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
+    let agents_changed = agent_integrations_changed(
+        previous_agent_integrations.as_deref(),
+        &fetched.manifest.agent_integrations,
+    );
     let new_is_release_binary = matches!(
         fetched.manifest.runtime,
         Some(RuntimeSpec::ReleaseBinary { .. })
@@ -567,6 +639,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let needs_consent = (!capabilities.is_empty() && caps_changed)
         || build_changed
         || ui_changed
+        || agents_changed
         || runtime_change.is_some()
         || trust_downgrade;
 
@@ -591,6 +664,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         removed_capabilities,
         build_changed,
         ui_changed,
+        agents_changed,
         runtime_change,
         trust_downgrade,
         needs_consent,
@@ -659,6 +733,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
                 &prepared.capabilities,
                 &prepared.fetched.manifest.ui,
                 build_steps(&prepared.fetched.manifest),
+                &prepared.fetched.manifest.agent_integrations,
             )?
         {
             Some(CapabilityGrant {
@@ -717,6 +792,7 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
             .iter()
             .map(|s| s.command.join(" "))
             .collect(),
+        agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
         fingerprint: p.fingerprint.clone(),
@@ -795,6 +871,7 @@ pub struct ReapproveConsent {
     pub validation: String,
     pub capabilities: Vec<String>,
     pub ui: Vec<UiView>,
+    pub agent_integrations: Vec<AgentIntegrationContribution>,
     pub manifest_hash: String,
 }
 
@@ -838,6 +915,7 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
                 id: u.id.clone(),
             })
             .collect(),
+        agent_integrations: disclosure_integrations(&plugin.manifest.agent_integrations),
         manifest_hash: plugin.manifest_hash.clone(),
     })
 }
@@ -927,6 +1005,9 @@ fn skip_reason(prepared: &Prepared) -> String {
     }
     if prepared.ui_changed {
         parts.push("UI change");
+    }
+    if prepared.agents_changed {
+        parts.push("agent launch change");
     }
     if prepared.runtime_change.is_some() {
         parts.push("runtime change");
@@ -1127,8 +1208,9 @@ fn install_needs_consent(
     capabilities: &[String],
     build: &[BuildStep],
     ui: &[UiContribution],
+    integrations: &[AgentIntegrationContribution],
 ) -> bool {
-    !capabilities.is_empty() || !build.is_empty() || !ui.is_empty()
+    !capabilities.is_empty() || !build.is_empty() || !ui.is_empty() || !integrations.is_empty()
 }
 
 fn confirm_capabilities(
@@ -1136,12 +1218,11 @@ fn confirm_capabilities(
     capabilities: &[String],
     ui: &[UiContribution],
     build: &[BuildStep],
+    integrations: &[AgentIntegrationContribution],
 ) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!(
-            "{id} requests capabilities [{}]{} but stdin is not a terminal; re-run with --yes to grant them",
-            capabilities.join(", "),
-            if build.is_empty() { "" } else { " and declares build steps" },
+            "{id} declares plugin access or executable commands but stdin is not a terminal; re-run with --yes to approve them",
         );
     }
     if !capabilities.is_empty() {
@@ -1163,6 +1244,20 @@ fn confirm_capabilities(
         );
         for step in build {
             println!("  $ {}", step.command.join(" "));
+        }
+    }
+    if !integrations.is_empty() {
+        println!("Plugin {id} declares these agent commands (run as your user, unsandboxed):");
+        for integration in integrations {
+            println!(
+                "  {}: {}",
+                integration.tool,
+                integration
+                    .command
+                    .as_deref()
+                    .map(super::agent_integration::display_command)
+                    .unwrap_or_else(|| "No launch command declared".to_string())
+            );
         }
     }
     println!(
@@ -1424,14 +1519,37 @@ mod tests {
     }
 
     #[test]
-    fn install_consent_required_for_caps_build_or_ui() {
-        assert!(!install_needs_consent(&[], &[], &[]));
-        assert!(install_needs_consent(&["net".to_string()], &[], &[]));
+    fn install_consent_required_for_caps_build_ui_or_agent_integrations() {
+        assert!(!install_needs_consent(&[], &[], &[], &[]));
+        assert!(install_needs_consent(&["net".to_string()], &[], &[], &[]));
         assert!(install_needs_consent(
             &[],
             &[],
-            &[ui(UiSlot::StatusBar, "s")]
+            &[ui(UiSlot::StatusBar, "s")],
+            &[],
         ));
+        assert!(install_needs_consent(
+            &[],
+            &[],
+            &[],
+            &[AgentIntegrationContribution {
+                tool: "agent".into(),
+                command: Some("agent --flag".into()),
+            }],
+        ));
+    }
+
+    #[test]
+    fn disclosure_integrations_escapes_commands_for_display_but_keeps_manifest_raw() {
+        let raw = AgentIntegrationContribution {
+            tool: "session-helper".into(),
+            command: Some("x\u{202e}tail".into()),
+        };
+        let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
+        // The consent that the CLI/TUI/web serialize carries the escaped form.
+        assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
+        // The manifest / launch command stays raw.
+        assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
     }
 
     #[tokio::test]
