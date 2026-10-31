@@ -395,7 +395,7 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
             .iter()
             .map(|s| s.command.join(" "))
             .collect(),
-        agent_integrations: p.fetched.manifest.agent_integrations.clone(),
+        agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
         fingerprint: p.fingerprint.clone(),
     })
 }
@@ -460,6 +460,25 @@ struct Prepared {
     runtime_change: Option<String>,
     trust_downgrade: bool,
     needs_consent: bool,
+}
+
+/// The consent structures serialize to the CLI/TUI/web disclosures, so their
+/// agent commands carry the display-escaped form (control and bidi characters
+/// made visible) rather than the raw bytes. The runnable command in the
+/// manifest is never altered.
+fn disclosure_integrations(
+    integrations: &[AgentIntegrationContribution],
+) -> Vec<AgentIntegrationContribution> {
+    integrations
+        .iter()
+        .map(|integration| {
+            let mut out = integration.clone();
+            if let Some(command) = &out.command {
+                out.command = Some(super::agent_integration::display_command(command));
+            }
+            out
+        })
+        .collect()
 }
 
 fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> String {
@@ -756,7 +775,7 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
             .iter()
             .map(|s| s.command.join(" "))
             .collect(),
-        agent_integrations: p.fetched.manifest.agent_integrations.clone(),
+        agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
         fingerprint: p.fingerprint.clone(),
@@ -879,7 +898,7 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
                 id: u.id.clone(),
             })
             .collect(),
-        agent_integrations: plugin.manifest.agent_integrations.clone(),
+        agent_integrations: disclosure_integrations(&plugin.manifest.agent_integrations),
         manifest_hash: plugin.manifest_hash.clone(),
     })
 }
@@ -1201,13 +1220,15 @@ fn confirm_capabilities(
     if !integrations.is_empty() {
         println!("Plugin {id} declares these agent commands (run as your user, unsandboxed):");
         for integration in integrations {
-            if let Some(command) = &integration.command {
-                println!(
-                    "  {}: {}",
-                    integration.tool,
-                    super::agent_integration::display_command(command)
-                );
-            }
+            println!(
+                "  {}: {}",
+                integration.tool,
+                integration
+                    .command
+                    .as_deref()
+                    .map(super::agent_integration::display_command)
+                    .unwrap_or_else(|| "No launch command declared".to_string())
+            );
         }
     }
     println!(

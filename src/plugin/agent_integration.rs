@@ -2,6 +2,12 @@
 
 use std::collections::HashMap;
 
+/// Collisions already reported for a `(plugin, tool)`, so the reserved-name
+/// warning fires once per process rather than on every catalog lookup.
+static RESERVED_WARNED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginAgent<'a> {
@@ -26,17 +32,27 @@ fn unique_candidates<'a, 'b, 'c>(
     for name in custom_names {
         candidate_counts.remove(name);
     }
+    let mut warned = RESERVED_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     for (plugin, tool, _) in &candidates {
         if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
-            tracing::warn!(
-                plugin = %plugin,
-                tool = %tool,
-                builtin = %builtin,
-                "plugin agent tool name contains a built-in name or alias; preserving built-in precedence"
-            );
+            // Warn once per (plugin, tool) per process: catalog runs on every
+            // agents listing, detection, launch-command resolution and session
+            // validation, so repeating it would flood the log.
+            if warned.insert((plugin.to_string(), tool.to_string())) {
+                tracing::warn!(
+                    target: "plugin.agents",
+                    plugin = %plugin,
+                    tool = %tool,
+                    builtin = %builtin,
+                    "plugin agent tool name contains a built-in name or alias; preserving built-in precedence"
+                );
+            }
             candidate_counts.remove(tool);
         }
     }
+    drop(warned);
     candidates
         .into_iter()
         .filter_map(|(plugin, tool, command)| {
@@ -70,17 +86,35 @@ pub fn catalog<'a, 'b, 'c>(
     unique_candidates(candidates, builtin_names, custom_names)
 }
 
-/// Display form of a plugin-declared command: control characters (including
-/// terminal escape sequences, which a malicious manifest could otherwise use to
-/// rewrite the approval prompt) become visible `\x..` escapes. The runnable
-/// command is never altered, only this disclosure string.
+/// Whether a character could spoof or rewrite displayed text: control
+/// characters (Cc) and Unicode format characters (Cf), especially the bidi
+/// controls a browser or terminal would otherwise reorder.
+fn display_dangerous(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c as u32,
+            // ZWNJ/ZWJ/LRM/RLM, the bidi controls, invisible operators,
+            // Arabic letter mark and the zero-width no-break space.
+            0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x2064
+                | 0x061C
+                | 0xFEFF
+        )
+}
+
+/// Display form of a plugin-declared command: control and format characters
+/// (terminal escape sequences, which a malicious manifest could otherwise use
+/// to rewrite the approval prompt, and bidi characters that would reorder it)
+/// become visible `\x..` escapes. The runnable command is never altered, only
+/// this disclosure string.
 pub fn display_command(command: &str) -> String {
-    if !command.chars().any(char::is_control) {
+    if !command.chars().any(display_dangerous) {
         return command.to_string();
     }
     let mut out = String::with_capacity(command.len());
     for character in command.chars() {
-        if character.is_control() {
+        if display_dangerous(character) {
             out.extend(character.escape_default());
         } else {
             out.push(character);
@@ -104,6 +138,7 @@ pub fn agent_command<'a>(
     .find(|agent| agent.tool == tool)
     .map(|agent| {
         tracing::debug!(
+            target: "plugin.agents",
             tool,
             plugin = agent.plugin,
             "resolved plugin-provided agent command"
@@ -150,11 +185,13 @@ mod tests {
     }
 
     #[test]
-    fn display_command_escapes_only_controls() {
+    fn display_command_escapes_controls_and_bidi() {
         assert_eq!(
             display_command("session-helper --flag"),
             "session-helper --flag"
         );
         assert_eq!(display_command("x\u{1b}[2Jtail"), "x\\u{1b}[2Jtail");
+        // Bidi controls are escaped too, not just Cc controls.
+        assert_eq!(display_command("x\u{202e}tail"), "x\\u{202e}tail");
     }
 }

@@ -2916,17 +2916,15 @@ fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
                     }
                 }
             }
-            // Tilde expands only outside quotes at a word or assignment-value
-            // start, exactly as the launch shell treats it.
-            '~' if !in_single
-                && !in_double
-                && (current.is_empty() || current.ends_with('=') || current.ends_with(':')) =>
-            {
-                match (&home, chars.peek()) {
-                    (Some(home), Some('/') | None) => current.push_str(home),
-                    _ => current.push('~'),
-                }
-            }
+            // Tilde expands only at the start of a word (the executable or a
+            // standalone argument), exactly as the launching shell treats it.
+            // `~` after `=` in a `NAME=value` argument to `env` is left literal
+            // by sh/zsh/dash, so expanding it here would report an agent
+            // installed that the launch cannot run.
+            '~' if !in_single && !in_double && current.is_empty() => match (&home, chars.peek()) {
+                (Some(home), Some('/') | None) => current.push_str(home),
+                _ => current.push('~'),
+            },
             _ => current.push(c),
         }
     }
@@ -2950,11 +2948,12 @@ fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
     }
     // Only the assignments and the executable are probed, so only there do we
     // refuse constructs discovery cannot safely verify (command substitution,
-    // backticks, or a `$` the launch would expand but we kept literal). Trailing
-    // agent arguments are never inspected or run.
+    // backticks, a `$` the launch would expand but we kept literal, or a `~`
+    // that `which` would expand but the launch's `env` passes literally).
+    // Trailing agent arguments are never inspected or run.
     if words[..=assignments]
         .iter()
-        .any(|word| word.contains('$') || word.contains('`'))
+        .any(|word| word.contains('$') || word.contains('`') || word.contains('~'))
     {
         return None;
     }
@@ -3165,7 +3164,7 @@ fn plugin_agents_available(
             ));
         }
         let output = agent_probe_output(
-            Command::new(crate::session::user_shell()).args(["-lc", &script]),
+            Command::new(&probe_shell).args(["-lc", &script]),
             LOGIN_SHELL_PROBE_TIMEOUT,
             cancel,
         );
@@ -3883,9 +3882,11 @@ mod tests {
             ("login-agent", true),
             ("TOKEN=local login-agent", true),
             (injected.as_str(), true),
-            // `$HOME` and `~/` expand so discovery agrees with the launch shell.
+            // `$HOME` expands so discovery agrees with the launch shell, but a
+            // literal `~` after `=` is a `env` argument, left unexpanded by
+            // sh/zsh/dash, so such an agent is unavailable, as at launch.
             ("PATH=$HOME/login-bin login-agent", true),
-            ("PATH=~/login-bin login-agent", true),
+            ("PATH=~/login-bin login-agent", false),
             // A quoted `$HOME` path containing a space resolves a real executable.
             ("PATH=\"$HOME/my tools\" spaced-agent", true),
             // Single-quoted `$HOME` stays literal, as the launch shell would.
@@ -4058,9 +4059,15 @@ mod tests {
             probe_command_words("PATH=${HOME}/bin acmebot"),
             Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
         );
+        // `~` after `=` is an `env` argument, left literal by sh/zsh/dash.
         assert_eq!(
             probe_command_words("PATH=~/bin acmebot"),
-            Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
+            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // A leading `~` (the executable or a standalone word) does expand.
+        assert_eq!(
+            probe_command_words("~/bin/acmebot --flag"),
+            Some((vec![format!("{h}/bin/acmebot"), "--flag".to_string()], 0))
         );
         // Single quotes preserve a literal `$HOME`, exactly as the launch shell.
         assert_eq!(
@@ -4115,6 +4122,9 @@ mod tests {
         assert!(plugin_command_parts("PATH=$HOME_x acmebot").is_none());
         // A single-quoted literal `$HOME` is refused too (it cannot be verified).
         assert!(plugin_command_parts("PATH='$HOME/bin' acmebot").is_none());
+        // A literal `~` after `=` is an `env` argument: the launch passes it
+        // literally, so `which` must not be allowed to expand it either.
+        assert!(plugin_command_parts("PATH=~/bin acmebot").is_none());
         // Unsupported constructs in trailing arguments are not probed.
         assert!(plugin_command_parts("acmebot \"$(printf x)\"").is_some());
     }
