@@ -100,7 +100,7 @@ fn daemon_status_ignores_an_unknown_session_id() {
 }
 
 fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionResponse {
-    let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(instance, false);
     row.status = status.into();
     row.last_error = None;
     row.pane_dead_observed = false;
@@ -127,7 +127,9 @@ pub(super) fn daemon_snapshot(view: &HomeView, id: &str, status: &str) -> Sessio
     sessions.extend(
         view.instances()
             .filter(|instance| instance.id != id)
-            .map(|instance| crate::daemon::SessionResponse::from_instance(instance, false)),
+            .map(|instance| {
+                crate::server::api::sessions::session_response_from_instance(instance, false)
+            }),
     );
     SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(
         sessions,
@@ -1428,9 +1430,9 @@ fn canonical_row(
     instance: &Instance,
     overrides: serde_json::Value,
 ) -> crate::daemon::SessionResponse {
-    let mut value = serde_json::to_value(crate::daemon::SessionResponse::from_instance(
-        instance, false,
-    ))
+    let mut value = serde_json::to_value(
+        crate::server::api::sessions::session_response_from_instance(instance, false),
+    )
     .unwrap();
     let object = value.as_object_mut().expect("an object row");
     for (key, item) in overrides.as_object().expect("object overrides") {
