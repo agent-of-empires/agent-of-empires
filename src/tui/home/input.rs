@@ -1903,18 +1903,32 @@ impl HomeView {
             }
         }
 
-        if let Some(view) = &mut self.suggestions_view {
-            let block = self.session_feed.mutation_block();
-            match view.handle_key(key, block) {
-                SuggestionsAction::Continue => {}
-                SuggestionsAction::Close => {
-                    self.suggestions_view = None;
-                    self.suggestions_feed.reload();
+        if self.command_palette.is_none()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('k' | 'K'))
+        {
+            if let Some(selected) = self.suggestions_view.as_ref().map(|v| v.selected_key()) {
+                match selected.and_then(|key| self.open_source_command(&key)) {
+                    Some(command) => {
+                        self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+                    }
+                    None => {
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_error("This suggestion has no link to open");
+                        }
+                    }
                 }
+                return None;
+            }
+        }
+        if let (Some(view), None) = (&mut self.suggestions_view, &self.command_palette) {
+            let block = self.session_feed.mutation_block();
+            match view.handle_key(key, block, &mut self.suggestions_feed) {
+                SuggestionsAction::Continue => {}
+                SuggestionsAction::Close => self.suggestions_view = None,
                 SuggestionsAction::Start(start) => self.start_suggestion(*start),
                 SuggestionsAction::OpenSession(id) => {
                     self.suggestions_view = None;
-                    self.suggestions_feed.reload();
                     self.jump_to_session_id(&id);
                 }
             }
@@ -3061,9 +3075,7 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
-            ActionId::Suggestions => {
-                self.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::new())
-            }
+            ActionId::Suggestions => self.open_suggestions_view(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();
@@ -3921,6 +3933,13 @@ impl HomeView {
             payload: PaletteAction::Invoke(ActionId::Quit),
         });
 
+        if let Some(command) = self
+            .cursor_suggestion()
+            .and_then(|key| self.open_source_command(&key))
+        {
+            entries.push(command);
+        }
+
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
         // clear that Stop/Delete will be a no-op for them.
@@ -4057,6 +4076,10 @@ impl HomeView {
                 None
             }
             PaletteAction::ToolSession(tool_name) => self.activate_tool(tool_name, false),
+            PaletteAction::OpenLink(url) => {
+                self.open_link(&url);
+                None
+            }
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }

@@ -600,6 +600,8 @@ export interface SuggestionPrefs {
   homepage: boolean;
   sidebar: boolean;
   refresh_minutes: number;
+  /** Start creates the session from the prepared draft instead of opening the wizard. */
+  start_without_review: boolean;
   /** Every provider id, in the order the user set. */
   provider_order: string[];
 }
@@ -648,6 +650,8 @@ export interface SuggestionsSnapshot {
 export interface SuggestionPrepared {
   title: string;
   initial_prompt: string;
+  /** The prompt is the user's saved template, not the provider's draft text. */
+  templated: boolean;
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;

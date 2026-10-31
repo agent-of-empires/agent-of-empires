@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::Deserialize;
 
+#[cfg(not(test))]
 use crate::acp::client::{locate_daemon, HttpClient};
 use crate::tui::session_feed::MutationBlock;
 use crate::tui::styles::Theme;
@@ -126,7 +127,16 @@ enum Req {
     Prepare {
         provider_id: String,
         id: String,
+        target: PrepareTarget,
     },
+}
+
+/// Which surface asked for a prepare, so its answer goes back to that surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrepareTarget {
+    Home,
+    /// The view with this epoch; a closed view's answer matches no later view.
+    View(u64),
 }
 
 enum Res {
@@ -135,6 +145,7 @@ enum Res {
     Prepared(Result<Prepared, String>),
 }
 
+#[cfg(not(test))]
 impl Res {
     fn error(&self) -> Option<&str> {
         match self {
@@ -156,11 +167,13 @@ fn text(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+#[cfg(not(test))]
 async fn load(client: &HttpClient) -> Result<Snapshot, String> {
     let value = client.suggestions().await.map_err(text)?;
     serde_json::from_value(value).map_err(text)
 }
 
+#[cfg(not(test))]
 async fn run(req: &Req) -> Res {
     let client = match locate_daemon()
         .await
@@ -187,7 +200,9 @@ async fn run(req: &Req) -> Res {
             }
             .await,
         ),
-        Req::Prepare { provider_id, id } => Res::Prepared(
+        Req::Prepare {
+            provider_id, id, ..
+        } => Res::Prepared(
             async {
                 let value = client
                     .prepare_suggestion(provider_id, id)
@@ -200,6 +215,7 @@ async fn run(req: &Req) -> Res {
     }
 }
 
+#[cfg(not(test))]
 fn spawn_worker() -> Worker<Req, Res> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -230,6 +246,40 @@ fn plain(s: &str) -> String {
             }
         })
         .collect()
+}
+
+const NO_PROJECT: &str = "No registered project matches this suggestion";
+
+/// Resolves a prepared suggestion into a dialog `Start`; `None` when the
+/// prepare response names no registered project.
+fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> Option<Start> {
+    let project = prepared.project?;
+    let item = snapshot
+        .iter()
+        .flat_map(|s| &s.items)
+        .find(|i| i.provider_id == key.0 && i.id == key.1);
+    let provider = snapshot
+        .iter()
+        .flat_map(|s| &s.providers)
+        .find(|p| p.id == key.0)
+        .map_or(key.0.as_str(), |p| p.name.as_str())
+        .to_owned();
+    Some(Start {
+        provider,
+        source_ref: item.map(|i| i.source_ref.clone()).unwrap_or_default(),
+        reason: item.map(|i| i.reason.clone()).unwrap_or_default(),
+        source_text: item
+            .map(|i| i.preview.clone())
+            .filter(|p| !p.trim().is_empty()),
+        path: project.path,
+        title: prepared.title,
+        initial_prompt: prepared.initial_prompt,
+        tool: prepared.tool,
+        suggestion: Some(crate::session::SuggestionOrigin {
+            provider_id: key.0.clone(),
+            id: key.1.clone(),
+        }),
+    })
 }
 
 /// The note for a daemon that refuses mutations, in the web dashboard's words.
@@ -275,39 +325,8 @@ fn ago_label(secs: i64) -> String {
     }
 }
 
-const NO_PROJECT: &str = "No registered project matches this suggestion";
-
-/// Resolves a prepared suggestion into a dialog `Start`; `None` when the
-/// prepare response names no registered project.
-fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> Option<Start> {
-    let project = prepared.project?;
-    let item = snapshot
-        .iter()
-        .flat_map(|s| &s.items)
-        .find(|i| i.provider_id == key.0 && i.id == key.1);
-    let provider = snapshot
-        .iter()
-        .flat_map(|s| &s.providers)
-        .find(|p| p.id == key.0)
-        .map_or(key.0.as_str(), |p| p.name.as_str())
-        .to_owned();
-    Some(Start {
-        provider,
-        source_ref: item.map(|i| i.source_ref.clone()).unwrap_or_default(),
-        reason: item.map(|i| i.reason.clone()).unwrap_or_default(),
-        source_text: item
-            .map(|i| i.preview.clone())
-            .filter(|p| !p.trim().is_empty()),
-        path: project.path,
-        title: prepared.title,
-        initial_prompt: prepared.initial_prompt,
-        tool: prepared.tool,
-        suggestion: Some(crate::session::SuggestionOrigin {
-            provider_id: key.0.clone(),
-            id: key.1.clone(),
-        }),
-    })
-}
+/// How long a dismissed row stays listed so `x` can undo it.
+const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) enum SuggestionsAction {
     Continue,
@@ -321,60 +340,56 @@ pub(super) enum SuggestionsAction {
 type ItemKey = (String, String);
 
 pub(super) struct SuggestionsView {
-    snapshot: Option<Snapshot>,
-    /// Indices into `snapshot.items` in display order, rebuilt when the
-    /// snapshot or the dismissed filter changes.
-    order: Vec<usize>,
+    /// Listed items in display order (core interleaves providers), rebuilt
+    /// when the store's snapshot or the dismissed filter changes.
+    order: Vec<ItemKey>,
     pub(super) error: Option<String>,
     notice: Option<String>,
-    /// The item whose `prepare` is in flight.
-    prepare_key: Option<ItemKey>,
-    /// The in-flight `prepare` is for "Start another", which does not claim the link.
-    prepare_another: bool,
     /// The resolved prefill, shown before the second Enter confirms it.
     prepared: Option<(ItemKey, Start)>,
+    epoch: u64,
     selected: usize,
     detail_scroll: u16,
     show_dismissed: bool,
-    busy: bool,
+    /// The item a `prepare` is in flight for.
+    preparing: Option<ItemKey>,
+    /// The in-flight `prepare` is for "Start another", which does not claim the link.
+    prepare_another: bool,
+    /// The last start that failed, shown on its row; Enter tries again.
+    failed: Option<(ItemKey, String)>,
     /// The item a dismiss request is in flight for.
     dismissing: Option<ItemKey>,
     /// The item a restore request is in flight for; it leaves `recent` only once that succeeds.
     restoring: Option<ItemKey>,
-    /// The last start that failed, shown on its row; Enter tries again.
-    failed: Option<(ItemKey, String)>,
-    /// Items dismissed in the last [`UNDO_WINDOW`], kept in the list so `x` undoes them.
+    /// Items dismissed in the last [`UNDO_WINDOW`], kept listed so `x` undoes them.
     recent: Vec<(ItemKey, std::time::Instant)>,
-    worker: Worker<Req, Res>,
 }
 
-const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-
 impl SuggestionsView {
-    pub(super) fn new() -> Self {
-        let mut view = Self::with_worker(spawn_worker());
-        view.send(Req::Load);
+    pub(super) fn new(store: &mut SuggestionsFeed) -> Self {
+        store.view_epoch += 1;
+        let mut view = Self::empty();
+        view.epoch = store.view_epoch;
+        view.reorder(store, None);
         view
     }
 
-    fn with_worker(worker: Worker<Req, Res>) -> Self {
+    fn empty() -> Self {
         Self {
-            snapshot: None,
             order: Vec::new(),
             error: None,
             notice: None,
-            prepare_key: None,
-            prepare_another: false,
             prepared: None,
+            epoch: 0,
             selected: 0,
             detail_scroll: 0,
             show_dismissed: false,
-            busy: false,
+            preparing: None,
+            prepare_another: false,
+            failed: None,
             dismissing: None,
             restoring: None,
-            failed: None,
             recent: Vec::new(),
-            worker,
         }
     }
 
@@ -382,93 +397,83 @@ impl SuggestionsView {
         self.error = Some(message.into());
     }
 
-    fn send(&mut self, req: Req) {
-        self.busy = true;
+    /// Clears what the previous request left on screen.
+    fn begin(&mut self) {
         self.error = None;
         self.notice = None;
         self.prepared = None;
-        self.worker.request(req);
     }
 
-    fn item_at(&self, index: usize) -> Option<&Item> {
-        let snapshot = self.snapshot.as_ref()?;
-        snapshot.items.get(*self.order.get(index)?)
+    fn item_at<'a>(&self, store: &'a SuggestionsFeed, index: usize) -> Option<&'a Item> {
+        let key = self.order.get(index)?;
+        store.item(key)
     }
 
-    fn selected_key(&self) -> Option<ItemKey> {
-        self.item_at(self.selected)
-            .map(|i| (i.provider_id.clone(), i.id.clone()))
+    pub(super) fn selected_key(&self) -> Option<ItemKey> {
+        self.order.get(self.selected).cloned()
+    }
+
+    fn is_recent(&self, key: &ItemKey) -> bool {
+        self.recent.iter().any(|(k, _)| k == key)
     }
 
     /// The Project path an item sits under; empty when unresolved.
-    fn group_key(&self, index: usize) -> &str {
-        self.item_at(index)
+    fn group_key<'a>(&self, store: &'a SuggestionsFeed, index: usize) -> &'a str {
+        self.item_at(store, index)
             .and_then(|i| i.resolved_project.as_ref())
             .map_or("", |p| p.path.as_str())
     }
 
     /// Headings show only once some item resolved to a Project.
-    fn has_project_groups(&self) -> bool {
-        (0..self.order.len()).any(|i| !self.group_key(i).is_empty())
+    fn has_project_groups(&self, store: &SuggestionsFeed) -> bool {
+        (0..self.order.len()).any(|i| !self.group_key(store, i).is_empty())
     }
 
-    fn is_recent(&self, item: &Item) -> bool {
-        self.recent
-            .iter()
-            .any(|(key, _)| key.0 == item.provider_id && key.1 == item.id)
-    }
-
-    fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
-        self.snapshot
-            .iter()
-            .flat_map(|s| &s.providers)
-            .find(|p| p.id == id)
-            .map_or(id, |p| p.name.as_str())
-    }
-
-    /// Rebuilds `order` in snapshot order (core interleaves providers),
-    /// keeping the selection on `key` when it is still listed.
-    fn reorder(&mut self, key: Option<ItemKey>) {
-        self.order = self
+    /// Rebuilds `order`, grouped by resolved Project in first-seen order with
+    /// unresolved last (snapshot order holds within a group), keeping the
+    /// selection on `key` when it is still listed.
+    fn reorder(&mut self, store: &SuggestionsFeed, key: Option<ItemKey>) {
+        let listed: Vec<&Item> = store
             .snapshot
             .iter()
             .flat_map(|s| &s.items)
-            .enumerate()
-            .filter(|(_, i)| self.show_dismissed || !i.dismissed || self.is_recent(i))
-            .map(|(index, _)| index)
+            .filter(|i| {
+                self.show_dismissed
+                    || !i.dismissed
+                    || self.is_recent(&(i.provider_id.clone(), i.id.clone()))
+            })
             .collect();
-        // Group by resolved Project in first-seen order, unresolved last; the
-        // sort is stable, so snapshot order holds within a group.
-        let items: Vec<&Item> = self.snapshot.iter().flat_map(|s| &s.items).collect();
         let mut seen: Vec<&str> = Vec::new();
-        for &index in &self.order {
-            if let Some(project) = &items[index].resolved_project {
+        for item in &listed {
+            if let Some(project) = &item.resolved_project {
                 if !seen.contains(&project.path.as_str()) {
                     seen.push(&project.path);
                 }
             }
         }
-        self.order.sort_by_key(|&index| {
-            items[index]
-                .resolved_project
-                .as_ref()
-                .and_then(|p| seen.iter().position(|s| *s == p.path))
-                .unwrap_or(usize::MAX)
-        });
-        let kept = key.and_then(|(provider_id, id)| {
-            (0..self.order.len()).find(|&index| {
-                self.item_at(index)
-                    .is_some_and(|i| i.provider_id == provider_id && i.id == id)
+        let mut ranked: Vec<(usize, &Item)> = listed
+            .into_iter()
+            .map(|i| {
+                let rank = i
+                    .resolved_project
+                    .as_ref()
+                    .and_then(|p| seen.iter().position(|s| *s == p.path))
+                    .unwrap_or(usize::MAX);
+                (rank, i)
             })
-        });
+            .collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
+        self.order = ranked
+            .into_iter()
+            .map(|(_, i)| (i.provider_id.clone(), i.id.clone()))
+            .collect();
+        let kept = key.and_then(|key| self.order.iter().position(|k| *k == key));
         self.selected =
             kept.unwrap_or_else(|| self.selected.min(self.order.len().saturating_sub(1)));
     }
 
-    fn replace(&mut self, snapshot: Snapshot) {
-        let key = self.selected_key();
-        self.snapshot = Some(snapshot);
-        self.reorder(key);
+    fn sync(&mut self, store: &SuggestionsFeed) {
+        self.reorder(store, self.selected_key());
     }
 
     fn select(&mut self, index: usize) {
@@ -481,6 +486,7 @@ impl SuggestionsView {
         &mut self,
         key: KeyEvent,
         block: Option<MutationBlock>,
+        store: &mut SuggestionsFeed,
     ) -> SuggestionsAction {
         let mutations_allowed = block.is_none();
         match key.code {
@@ -492,24 +498,27 @@ impl SuggestionsView {
             KeyCode::Char('d') => {
                 let key = self.selected_key();
                 self.show_dismissed = !self.show_dismissed;
-                self.reorder(key);
+                self.reorder(store, key);
             }
-            _ if self.busy => {}
-            KeyCode::Char('l') => self.send(Req::Load),
-            KeyCode::Char('r') if mutations_allowed => self.send(Req::Refresh),
+            KeyCode::Char('l') => {
+                self.begin();
+                store.reload();
+            }
+            KeyCode::Char('r') if mutations_allowed => {
+                self.begin();
+                store.refresh();
+            }
             KeyCode::Char('x') if mutations_allowed => {
-                if let Some((key, dismissed)) = self
-                    .item_at(self.selected)
-                    .map(|i| ((i.provider_id.clone(), i.id.clone()), i.dismissed))
-                {
-                    let req = Req::Dismiss {
-                        provider_id: key.0.clone(),
-                        id: key.1.clone(),
-                        dismissed: !dismissed,
-                    };
-                    self.dismissing = (!dismissed).then(|| key.clone());
-                    self.restoring = dismissed.then_some(key);
-                    self.send(req);
+                if let Some(item) = self.item_at(store, self.selected) {
+                    let (key, dismissed) =
+                        ((item.provider_id.clone(), item.id.clone()), !item.dismissed);
+                    self.begin();
+                    if dismissed {
+                        self.dismissing = Some(key.clone());
+                    } else {
+                        self.restoring = Some(key.clone());
+                    }
+                    store.dismiss(&key, dismissed);
                 }
             }
             KeyCode::Char('r' | 'x') => {
@@ -520,7 +529,7 @@ impl SuggestionsView {
                 let Some(key) = self.selected_key() else {
                     return SuggestionsAction::Continue;
                 };
-                let item = self.item_at(self.selected);
+                let item = self.item_at(store, self.selected);
                 if let Some(started) = item
                     .and_then(|i| i.started_session.as_ref())
                     .filter(|_| !another)
@@ -535,7 +544,6 @@ impl SuggestionsView {
                     self.notice = Some(STALE_NOTE.to_string());
                     return SuggestionsAction::Continue;
                 }
-                self.failed = None;
                 if self.prepare_another == another
                     && self.prepared.as_ref().is_some_and(|(k, _)| *k == key)
                 {
@@ -543,84 +551,74 @@ impl SuggestionsView {
                         return SuggestionsAction::Start(Box::new(start));
                     }
                 }
-                self.prepare_key = Some(key.clone());
+                self.begin();
+                self.failed = None;
+                self.preparing = Some(key.clone());
                 self.prepare_another = another;
-                self.send(Req::Prepare {
-                    provider_id: key.0,
-                    id: key.1,
-                });
+                store.prepare_in_view(key, self.epoch);
             }
             _ => {}
         }
         SuggestionsAction::Continue
     }
 
-    /// Applies a finished request, if any. True when state changed.
-    pub(super) fn poll(&mut self) -> bool {
+    /// Takes what a store poll holds for this view. True when state changed.
+    pub(super) fn apply(&mut self, store: &SuggestionsFeed, polled: &mut FeedPoll) -> bool {
+        let mut changed = false;
         let before = self.recent.len();
         self.recent.retain(|(_, at)| at.elapsed() < UNDO_WINDOW);
-        let expired = self.recent.len() != before;
-        if expired {
-            let key = self.selected_key();
-            self.reorder(key);
+        if self.recent.len() != before {
+            self.sync(store);
+            changed = true;
         }
-        let res = match self.worker.try_recv() {
-            Ok(res) => res,
-            Err(TryRecvError::Disconnected) if self.busy => {
-                self.busy = false;
-                self.error = Some("The suggestions worker stopped".into());
-                return true;
-            }
-            Err(_) => return expired,
-        };
-        self.busy = false;
-        let answered = matches!(res, Res::Snapshot(Ok(_)));
-        if let Some(key) = self.dismissing.take() {
-            if answered {
-                self.recent.retain(|(k, _)| *k != key);
-                self.recent.push((key, std::time::Instant::now()));
-            }
-        }
-        if let Some(key) = self.restoring.take() {
-            if answered {
-                self.recent.retain(|(k, _)| *k != key);
-            }
-        }
-        match res {
-            Res::Snapshot(Ok(snapshot)) => self.replace(snapshot),
-            Res::Refreshed(Ok(())) => {
-                self.notice = Some("Refresh requested. Press l to reload the list.".into());
-            }
-            Res::Prepared(Err(e)) => match self.prepare_key.take() {
-                Some(key) => self.failed = Some((key, e)),
-                None => self.error = Some(e),
-            },
-            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) => {
-                self.error = Some(e);
-            }
-            Res::Prepared(Ok(prepared)) => {
-                let key = self.prepare_key.take();
-                match (prepared.project.is_some(), key) {
-                    (false, key) => match key {
-                        Some(key) => self.failed = Some((key, NO_PROJECT.into())),
-                        None => self.error = Some(NO_PROJECT.into()),
-                    },
-                    (true, Some(key)) => {
-                        let mut start = start_for(self.snapshot.as_ref(), &key, prepared);
-                        if self.prepare_another {
-                            if let Some(start) = &mut start {
-                                start.suggestion = None;
-                            }
-                        }
-                        self.notice =
-                            Some("Review the prompt below, then press Enter to start.".into());
-                        self.prepared = start.map(|start| (key, start));
+        if polled.changed {
+            // The reply to a dismiss or restore is the snapshot that shows it.
+            if let Some(key) = self.dismissing.clone() {
+                match store.item(&key) {
+                    Some(item) if item.dismissed => {
+                        self.recent.retain(|(k, _)| *k != key);
+                        self.recent.push((key, std::time::Instant::now()));
+                        self.dismissing = None;
                     }
-                    (true, None) => {}
+                    Some(_) => {}
+                    None => self.dismissing = None,
                 }
             }
+            if let Some(key) = self.restoring.clone() {
+                if store.item(&key).is_none_or(|i| !i.dismissed) {
+                    self.recent.retain(|(k, _)| *k != key);
+                    self.restoring = None;
+                }
+            }
+            self.sync(store);
+            changed = true;
         }
-        true
+        if polled.refreshed {
+            self.notice = Some("Refresh requested. Press l to reload the list.".into());
+            changed = true;
+        }
+        if let Some(error) = polled.error.take() {
+            // A failed request leaves the undo window as it was.
+            self.dismissing = None;
+            self.restoring = None;
+            match self.preparing.take() {
+                Some(key) => self.failed = Some((key, error)),
+                None => self.error = Some(error),
+            }
+            changed = true;
+        }
+        if matches!(polled.start, Some((_, _, PrepareTarget::View(e))) if e == self.epoch) {
+            if let Some((key, mut start, _)) = polled.start.take() {
+                self.preparing = None;
+                if self.prepare_another {
+                    start.suggestion = None;
+                }
+                self.notice = Some("Review the prompt below, then press Enter to start.".into());
+                self.prepared = Some((key, start));
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub(super) fn render(
@@ -628,6 +626,7 @@ impl SuggestionsView {
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
+        store: &SuggestionsFeed,
         mutation_block: Option<MutationBlock>,
     ) {
         frame.render_widget(Clear, area);
@@ -659,7 +658,7 @@ impl SuggestionsView {
                 Style::default().fg(theme.waiting),
             )));
         }
-        for provider in self
+        for provider in store
             .snapshot
             .iter()
             .flat_map(|s| &s.providers)
@@ -673,13 +672,13 @@ impl SuggestionsView {
                 Style::default().fg(theme.dimmed),
             )));
         }
-        for provider in self
+        for provider in store
             .snapshot
             .iter()
             .flat_map(|s| &s.providers)
             .filter(|p| p.enabled)
         {
-            let any_items = self
+            let any_items = store
                 .snapshot
                 .iter()
                 .flat_map(|s| &s.items)
@@ -716,10 +715,12 @@ impl SuggestionsView {
         };
 
         let height = list_area.height as usize;
-        let headed = self.has_project_groups();
+        let headed = self.has_project_groups(store);
         // A heading opens the window and every group in it.
         let heading_at = |first: usize, index: usize| {
-            headed && (index == first || self.group_key(index) != self.group_key(index - 1))
+            headed
+                && (index == first
+                    || self.group_key(store, index) != self.group_key(store, index - 1))
         };
         let window = |first: usize| -> usize {
             (first..=self.selected)
@@ -735,17 +736,18 @@ impl SuggestionsView {
             if lines.len() >= height {
                 break;
             }
-            let Some(item) = self.item_at(index) else {
+            let Some(item) = self.item_at(store, index) else {
                 continue;
             };
+            let item_key = (item.provider_id.clone(), item.id.clone());
             if heading_at(start, index) {
-                let key = self.group_key(index);
+                let key = self.group_key(store, index);
                 let name = item
                     .resolved_project
                     .as_ref()
                     .map_or("No project", |p| p.name.as_str());
                 let count = (0..self.order.len())
-                    .filter(|&i| self.group_key(i) == key)
+                    .filter(|&i| self.group_key(store, i) == key)
                     .count();
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -757,7 +759,7 @@ impl SuggestionsView {
             }
             let current = index == self.selected;
             let marker = if current { "› " } else { "  " };
-            let state = match (item.dismissed, self.is_recent(item)) {
+            let state = match (item.dismissed, self.is_recent(&item_key)) {
                 (false, _) => "",
                 (true, true) => " [dismissed, x to undo]",
                 (true, false) => " [dismissed]",
@@ -775,16 +777,13 @@ impl SuggestionsView {
                 Span::styled(
                     plain(&format!(
                         "{marker}{} ",
-                        self.provider_name(&item.provider_id)
+                        store.provider_name(&item.provider_id)
                     )),
                     Style::default().fg(theme.dimmed),
                 ),
                 Span::styled(plain(&format!("{}{state}", item.title)), title_style),
             ]));
-            let failure = self
-                .failed
-                .as_ref()
-                .filter(|(key, _)| key.0 == item.provider_id && key.1 == item.id);
+            let failure = self.failed.as_ref().filter(|(key, _)| *key == item_key);
             if let Some((_, message)) = failure {
                 lines.push(Line::from(Span::styled(
                     plain(&format!(
@@ -816,7 +815,7 @@ impl SuggestionsView {
             )));
         }
         if lines.is_empty() {
-            let message = match (&self.snapshot, self.busy) {
+            let message = match (&store.snapshot, store.busy) {
                 (None, true) => "Loading suggestions…",
                 (None, false) => "No suggestions loaded. Press l to reload.",
                 (Some(_), _) => "Nothing to suggest right now.",
@@ -829,14 +828,14 @@ impl SuggestionsView {
         frame.render_widget(Paragraph::new(lines), list_area);
 
         let mut detail: Vec<Line> = Vec::new();
-        if let Some(item) = self.item_at(self.selected) {
+        if let Some(item) = self.item_at(store, self.selected) {
             detail.push(Line::from(Span::styled(
                 plain(&item.title),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             detail.push(Line::from(plain(&format!(
                 "{} · {} · {}",
-                self.provider_name(&item.provider_id),
+                store.provider_name(&item.provider_id),
                 item.source_ref,
                 item.source_url
             ))));
@@ -879,9 +878,7 @@ impl SuggestionsView {
 
     #[cfg(test)]
     pub(super) fn idle_for_test() -> Self {
-        Self::with_worker(Worker::spawn("test-suggestions", |_| {
-            unreachable!("no request expected")
-        }))
+        Self::empty()
     }
 }
 
@@ -900,21 +897,30 @@ pub(super) struct Entry {
     pub project: Option<String>,
     pub prompt: String,
     pub provider_error: Option<String>,
+    /// The item's `source_url` when it is an http(s) address; core validates
+    /// it, this is a second check before anything is opened.
+    pub source_url: Option<String>,
 }
 
 pub(super) struct FeedPoll {
     pub changed: bool,
-    /// A prepared suggestion, with the key it was requested for.
-    pub start: Option<(ItemKey, Start)>,
+    /// The daemon accepted a refresh request.
+    pub refreshed: bool,
+    /// A prepared suggestion, with the key and the surface it was requested for.
+    pub start: Option<(ItemKey, Start, PrepareTarget)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
 }
 
-/// Background snapshot behind the Home list's Suggested group. The full view
-/// keeps its own state; both read the same daemon endpoints.
+/// The one suggestions store, owned by `HomeView`: snapshot, worker and
+/// in-flight state behind both the Suggested group and the full view, which
+/// keeps only its own UI state.
 pub(super) struct SuggestionsFeed {
     snapshot: Option<Snapshot>,
     prepare_key: Option<ItemKey>,
+    prepare_target: PrepareTarget,
+    /// Epoch of the most recently opened full view.
+    view_epoch: u64,
     /// The in-flight request came from the user (prepare or dismiss), so its
     /// failure is worth showing.
     in_flight_user: bool,
@@ -942,6 +948,8 @@ impl SuggestionsFeed {
         Self {
             snapshot: None,
             prepare_key: None,
+            prepare_target: PrepareTarget::Home,
+            view_epoch: 0,
             in_flight_user: false,
             busy: false,
             queued: std::collections::VecDeque::new(),
@@ -951,26 +959,46 @@ impl SuggestionsFeed {
         }
     }
 
-    fn send(&mut self, req: Req) {
+    fn send(&mut self, req: Req, user: bool) {
         self.busy = true;
-        self.in_flight_user = !matches!(req, Req::Load);
+        self.in_flight_user = user;
         match &req {
             Req::Load => self.load_attempt_at = Some(std::time::Instant::now()),
-            Req::Prepare { provider_id, id } => {
+            Req::Prepare {
+                provider_id,
+                id,
+                target,
+            } => {
                 self.prepare_key = Some((provider_id.clone(), id.clone()));
+                self.prepare_target = *target;
             }
             _ => {}
         }
         self.worker.request(req);
     }
 
-    /// Sends now, or behind the request in flight.
+    /// Sends a user request now, or behind the request in flight.
     fn submit(&mut self, req: Req) {
         if self.busy {
             self.queued.push_back(req);
         } else {
-            self.send(req);
+            self.send(req, true);
         }
+    }
+
+    fn item(&self, key: &ItemKey) -> Option<&Item> {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.items)
+            .find(|i| i.provider_id == key.0 && i.id == key.1)
+    }
+
+    fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .find(|p| p.id == id)
+            .map_or(id, |p| p.name.as_str())
     }
 
     /// Whether the provider is listed: items of an unlisted provider are not
@@ -1004,11 +1032,7 @@ impl SuggestionsFeed {
     }
 
     pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
-        let item = self
-            .snapshot
-            .iter()
-            .flat_map(|s| &s.items)
-            .find(|i| i.provider_id == key.0 && i.id == key.1)?;
+        let item = self.item(key)?;
         let provider = self.provider(&key.0)?;
         let label: String = plain(&provider.name)
             .split_whitespace()
@@ -1026,6 +1050,7 @@ impl SuggestionsFeed {
             project: item.project.as_deref().map(plain),
             prompt: plain(&item.draft.prompt),
             provider_error: provider.error.as_deref().map(plain),
+            source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
         })
     }
 
@@ -1034,7 +1059,7 @@ impl SuggestionsFeed {
     pub(super) fn tick(&mut self, connected: bool) {
         let due = |at: Option<std::time::Instant>| at.is_none_or(|at| at.elapsed() >= FEED_RELOAD);
         if connected && !self.busy && due(self.loaded_at) && due(self.load_attempt_at) {
-            self.send(Req::Load);
+            self.send(Req::Load, false);
         }
     }
 
@@ -1065,7 +1090,9 @@ impl SuggestionsFeed {
                     let _ = sink.send(format!("dismiss {provider_id}/{id} {dismissed}"));
                     Res::Snapshot(parse())
                 }
-                Req::Prepare { provider_id, id } => {
+                Req::Prepare {
+                    provider_id, id, ..
+                } => {
                     let _ = sink.send(format!("prepare {provider_id}/{id}"));
                     Res::Prepared(Ok(Prepared {
                         title: "Prepared title".into(),
@@ -1088,28 +1115,43 @@ impl SuggestionsFeed {
         Self::with_worker(Worker::seeded_for_test("test-suggestions-feed", seeded))
     }
 
+    /// A reload the user asked for, so its failure is shown.
     pub(super) fn reload(&mut self) {
         self.submit(Req::Load);
     }
 
-    pub(super) fn dismiss(&mut self, key: &ItemKey) {
+    pub(super) fn refresh(&mut self) {
+        self.submit(Req::Refresh);
+    }
+
+    pub(super) fn dismiss(&mut self, key: &ItemKey, dismissed: bool) {
         self.submit(Req::Dismiss {
             provider_id: key.0.clone(),
             id: key.1.clone(),
-            dismissed: true,
+            dismissed,
         });
     }
 
     pub(super) fn prepare(&mut self, key: ItemKey) {
+        self.submit_prepare(key, PrepareTarget::Home);
+    }
+
+    fn prepare_in_view(&mut self, key: ItemKey, epoch: u64) {
+        self.submit_prepare(key, PrepareTarget::View(epoch));
+    }
+
+    fn submit_prepare(&mut self, key: ItemKey, target: PrepareTarget) {
         self.submit(Req::Prepare {
             provider_id: key.0,
             id: key.1,
+            target,
         });
     }
 
     pub(super) fn poll(&mut self) -> FeedPoll {
         let mut out = FeedPoll {
             changed: false,
+            refreshed: false,
             start: None,
             error: None,
         };
@@ -1136,7 +1178,7 @@ impl SuggestionsFeed {
                 match key.and_then(|key| {
                     start_for(self.snapshot.as_ref(), &key, prepared).map(|start| (key, start))
                 }) {
-                    Some(start) => out.start = Some(start),
+                    Some((key, start)) => out.start = Some((key, start, self.prepare_target)),
                     None => out.error = Some(NO_PROJECT.into()),
                 }
             }
@@ -1148,10 +1190,10 @@ impl SuggestionsFeed {
                     tracing::debug!(target: "tui.suggestions", error = %e, "suggestions reload failed");
                 }
             }
-            Res::Refreshed(Ok(())) => {}
+            Res::Refreshed(Ok(())) => out.refreshed = true,
         }
         if let Some(next) = self.queued.pop_front() {
-            self.send(next);
+            self.send(next, true);
         }
         out
     }
@@ -1190,9 +1232,14 @@ mod tests {
         item
     }
 
-    fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> SuggestionsView {
-        let mut view = SuggestionsView::with_worker(worker);
-        view.replace(Snapshot {
+    struct Rig {
+        view: SuggestionsView,
+        store: SuggestionsFeed,
+    }
+
+    fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> Rig {
+        let mut store = SuggestionsFeed::with_worker(worker);
+        store.snapshot = Some(Snapshot {
             providers: vec![Provider {
                 id: "p".into(),
                 name: "GitHub".into(),
@@ -1203,34 +1250,42 @@ mod tests {
             }],
             items,
         });
-        view
+        let view = SuggestionsView::new(&mut store);
+        Rig { view, store }
     }
 
     fn idle_worker() -> Worker<Req, Res> {
         Worker::spawn("test-suggestions", |_| unreachable!("no request expected"))
     }
 
-    fn press(view: &mut SuggestionsView, code: KeyCode, mutations: bool) -> SuggestionsAction {
-        press_blocked(view, code, (!mutations).then_some(MutationBlock::ReadOnly))
+    fn press(rig: &mut Rig, code: KeyCode, mutations: bool) -> SuggestionsAction {
+        press_blocked(rig, code, (!mutations).then_some(MutationBlock::ReadOnly))
     }
 
     fn press_blocked(
-        view: &mut SuggestionsView,
+        rig: &mut Rig,
         code: KeyCode,
         block: Option<MutationBlock>,
     ) -> SuggestionsAction {
-        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), block)
+        rig.view.handle_key(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            block,
+            &mut rig.store,
+        )
     }
 
-    fn render_text(view: &SuggestionsView) -> String {
-        render_text_blocked(view, None)
+    fn render_text(rig: &Rig) -> String {
+        render_text_blocked(rig, None)
     }
 
-    fn render_text_blocked(view: &SuggestionsView, block: Option<MutationBlock>) -> String {
+    fn render_text_blocked(rig: &Rig, block: Option<MutationBlock>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| view.render(frame, frame.area(), &Theme::default(), block))
+            .draw(|frame| {
+                rig.view
+                    .render(frame, frame.area(), &Theme::default(), &rig.store, block)
+            })
             .unwrap();
         terminal
             .backend()
@@ -1242,19 +1297,17 @@ mod tests {
             .join("\n")
     }
 
-    fn ids(view: &SuggestionsView) -> Vec<String> {
-        (0..view.order.len())
-            .filter_map(|i| view.item_at(i))
-            .map(|i| i.id.clone())
-            .collect()
+    fn ids(rig: &Rig) -> Vec<String> {
+        rig.view.order.iter().map(|k| k.1.clone()).collect()
     }
 
     /// Seeded results are queued before the worker thread starts and a dead
     /// worker disconnects shortly after a request, so a bounded retry loop
     /// only covers scheduling.
-    fn poll_until_settled(view: &mut SuggestionsView) -> bool {
+    fn poll_until_settled(rig: &mut Rig) -> bool {
         for _ in 0..200 {
-            if view.poll() {
+            let mut polled = rig.store.poll();
+            if rig.view.apply(&rig.store, &mut polled) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1273,7 +1326,7 @@ mod tests {
 
     #[test]
     fn dismissed_items_are_hidden_until_toggled_and_keep_snapshot_order() {
-        let mut view = view_with(
+        let mut rig = view_with(
             vec![
                 item("b", Some("zeta"), false),
                 item("a", Some("alpha"), false),
@@ -1281,20 +1334,20 @@ mod tests {
             ],
             idle_worker(),
         );
-        assert_eq!(ids(&view), ["b", "a"]);
-        press(&mut view, KeyCode::Char('d'), true);
-        assert_eq!(ids(&view), ["b", "a", "gone"]);
+        assert_eq!(ids(&rig), ["b", "a"]);
+        press(&mut rig, KeyCode::Char('d'), true);
+        assert_eq!(ids(&rig), ["b", "a", "gone"]);
     }
 
     #[test]
     fn selection_follows_the_item_across_a_snapshot_replace() {
-        let mut view = view_with(
+        let mut rig = view_with(
             vec![item("a", Some("p1"), false), item("b", Some("p2"), false)],
             idle_worker(),
         );
-        press(&mut view, KeyCode::Char('j'), true);
-        assert_eq!(view.item_at(view.selected).unwrap().id, "b");
-        view.replace(Snapshot {
+        press(&mut rig, KeyCode::Char('j'), true);
+        assert_eq!(rig.view.selected_key().unwrap().1, "b");
+        rig.store.snapshot = Some(Snapshot {
             providers: vec![],
             items: vec![
                 item("new", Some("p0"), false),
@@ -1302,56 +1355,71 @@ mod tests {
                 item("b", Some("p2"), false),
             ],
         });
-        assert_eq!(view.item_at(view.selected).unwrap().id, "b");
+        rig.view.sync(&rig.store);
+        assert_eq!(rig.view.selected_key().unwrap().1, "b");
     }
 
     #[test]
     fn mutating_keys_are_refused_when_read_only() {
-        let mut view = view_with(vec![item("a", None, false)], idle_worker());
-        press(&mut view, KeyCode::Char('x'), false);
-        press(&mut view, KeyCode::Char('r'), false);
-        assert!(!view.busy);
-        assert!(view.error.is_some());
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        press(&mut rig, KeyCode::Char('x'), false);
+        press(&mut rig, KeyCode::Char('r'), false);
+        assert!(!rig.store.busy);
+        assert!(rig.view.error.is_some());
     }
 
     #[test]
     fn enter_resolves_the_final_prompt_and_a_second_enter_starts() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         assert!(matches!(
-            press(&mut view, KeyCode::Enter, true),
+            press(&mut rig, KeyCode::Enter, true),
             SuggestionsAction::Continue
         ));
-        assert!(poll_until_settled(&mut view));
-        assert!(view.prepared.is_some());
-        assert!(render_text(&view).contains("final prompt"));
-        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Enter, true) else {
+        assert!(poll_until_settled(&mut rig));
+        assert!(rig.view.prepared.is_some());
+        assert!(render_text(&rig).contains("final prompt"));
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Enter, true) else {
             panic!("expected a start");
         };
         assert_eq!(start.path, "/repo");
         assert_eq!(start.initial_prompt, "final prompt");
-        assert!(view.prepared.is_none());
+        assert!(rig.view.prepared.is_none());
+    }
+
+    #[test]
+    fn prepare_without_a_registered_project_cannot_start() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(None))));
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        press(&mut rig, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut rig));
+        assert!(rig.view.prepared.is_none());
+        assert!(render_text(&rig).contains("Couldn't start: No registered project"));
+    }
+
+    fn started(id: &str, status: &str) -> Option<Started> {
+        Some(Started {
+            id: id.into(),
+            status: status.into(),
+            archived: false,
+        })
     }
 
     #[test]
     fn a_started_item_opens_its_session_and_start_another_does_not_link() {
-        let mut started = item("a", Some("repo"), false);
-        started.started_session = Some(Started {
-            id: "sess-1".into(),
-            status: "Running".into(),
-            archived: false,
-        });
+        let mut linked = item("a", Some("repo"), false);
+        linked.started_session = started("sess-1", "Running");
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut view = view_with(vec![started], worker);
-        assert!(render_text(&view).contains("Session running"));
-        let SuggestionsAction::OpenSession(id) = press(&mut view, KeyCode::Enter, true) else {
+        let mut rig = view_with(vec![linked], worker);
+        assert!(render_text(&rig).contains("Session running"));
+        let SuggestionsAction::OpenSession(id) = press(&mut rig, KeyCode::Enter, true) else {
             panic!("expected the linked session to open");
         };
         assert_eq!(id, "sess-1");
 
-        press(&mut view, KeyCode::Char('N'), true);
-        assert!(poll_until_settled(&mut view));
-        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Char('N'), true) else {
+        press(&mut rig, KeyCode::Char('N'), true);
+        assert!(poll_until_settled(&mut rig));
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('N'), true) else {
             panic!("expected a start");
         };
         assert!(start.suggestion.is_none());
@@ -1360,10 +1428,10 @@ mod tests {
     #[test]
     fn a_plain_start_carries_the_suggestion_reference() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut view, KeyCode::Enter, true);
-        assert!(poll_until_settled(&mut view));
-        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Enter, true) else {
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut rig, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut rig));
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Enter, true) else {
             panic!("expected a start");
         };
         let origin = start.suggestion.unwrap();
@@ -1375,7 +1443,7 @@ mod tests {
 
     #[test]
     fn items_group_by_resolved_project_with_unresolved_last() {
-        let mut view = view_with(
+        let mut rig = view_with(
             vec![
                 item("loose", None, false),
                 in_project(item("b1", None, false), "web"),
@@ -1384,12 +1452,12 @@ mod tests {
             ],
             idle_worker(),
         );
-        assert_eq!(ids(&view), ["b1", "b2", "a1", "loose"]);
-        assert!(render_text(&view).contains("web 2"));
+        assert_eq!(ids(&rig), ["b1", "b2", "a1", "loose"]);
+        assert!(render_text(&rig).contains("web 2"));
         for _ in 0..3 {
-            press(&mut view, KeyCode::Char('j'), true);
+            press(&mut rig, KeyCode::Char('j'), true);
         }
-        let text = render_text(&view);
+        let text = render_text(&rig);
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in {text}"))
@@ -1398,7 +1466,6 @@ mod tests {
             at("api 1") < at("No project 1"),
             "the window scrolled to the last group"
         );
-
         let flat = view_with(vec![item("x", None, false)], idle_worker());
         assert!(
             !render_text(&flat).contains("No project"),
@@ -1406,147 +1473,120 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_dismissed_item_stays_dimmed_for_ten_seconds_and_x_undoes_it() {
-        let mut view = view_with(vec![item("a", None, false)], idle_worker());
-        let key = ("p".to_string(), "a".to_string());
-        let mut gone = item("a", None, true);
-        gone.title = "a".into();
-        view.dismissing = Some(key.clone());
-        view.busy = true;
-        view.worker = Worker::seeded_for_test(
-            "t",
-            Res::Snapshot(Ok(Snapshot {
-                providers: vec![],
-                items: vec![gone],
-            })),
-        );
-        assert!(poll_until_settled(&mut view));
-        assert_eq!(ids(&view), ["a"], "kept while the undo window is open");
-        assert!(render_text(&view).contains("[dismissed, x to undo]"));
-
-        let stale =
-            std::time::Instant::now().checked_sub(UNDO_WINDOW + std::time::Duration::from_secs(1));
-        view.recent[0].1 = stale.expect("monotonic clock far enough from boot");
-        assert!(view.poll());
-        assert!(
-            ids(&view).is_empty(),
-            "then only the dismissed list shows it"
-        );
-        press(&mut view, KeyCode::Char('d'), true);
-        assert_eq!(ids(&view), ["a"]);
+    fn dismissed_snapshot(rig: &mut Rig, dismissed: bool) {
+        rig.store.snapshot = Some(Snapshot {
+            providers: vec![],
+            items: vec![item("a", None, dismissed)],
+        });
     }
 
     #[test]
-    fn the_home_feed_never_offers_a_stale_item() {
-        let mut stale = item("old", None, false);
-        stale.stale = true;
-        let mut feed = SuggestionsFeed::with_worker(idle_worker());
-        feed.snapshot = Some(Snapshot {
-            providers: vec![Provider {
-                id: "p".into(),
-                name: "GitHub".into(),
-                error: None,
-                enabled: true,
-                updated_at: Some(0),
-                refreshing: false,
-            }],
-            items: vec![item("fresh", None, false), stale],
-        });
-        assert_eq!(feed.keys(), [("p".to_string(), "fresh".to_string())]);
+    fn a_dismissed_item_stays_dimmed_for_ten_seconds_and_x_undoes_it() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        let key = ("p".to_string(), "a".to_string());
+        rig.view.dismissing = Some(key.clone());
+        dismissed_snapshot(&mut rig, true);
+        let mut polled = FeedPoll {
+            changed: true,
+            refreshed: false,
+            start: None,
+            error: None,
+        };
+        assert!(rig.view.apply(&rig.store, &mut polled));
+        assert_eq!(ids(&rig), ["a"], "kept while the undo window is open");
+        assert!(render_text(&rig).contains("[dismissed, x to undo]"));
+
+        let stale = std::time::Instant::now()
+            .checked_sub(UNDO_WINDOW + std::time::Duration::from_secs(1))
+            .expect("monotonic clock far enough from boot");
+        rig.view.recent[0].1 = stale;
+        let mut polled = FeedPoll {
+            changed: false,
+            refreshed: false,
+            start: None,
+            error: None,
+        };
+        assert!(rig.view.apply(&rig.store, &mut polled));
+        assert!(
+            ids(&rig).is_empty(),
+            "then only the dismissed list shows it"
+        );
+        press(&mut rig, KeyCode::Char('d'), true);
+        assert_eq!(ids(&rig), ["a"]);
     }
 
     #[test]
     fn a_failed_restore_keeps_the_undo_window() {
-        let mut view = view_with(vec![item("a", None, true)], idle_worker());
+        let mut rig = view_with(vec![item("a", None, true)], idle_worker());
         let key = ("p".to_string(), "a".to_string());
-        view.recent.push((key.clone(), std::time::Instant::now()));
-        view.reorder(Some(key.clone()));
-        view.worker = Worker::seeded_for_test("t", Res::Snapshot(Err("boom".into())));
-        press(&mut view, KeyCode::Char('x'), true);
-        assert!(poll_until_settled(&mut view));
-        assert_eq!(view.recent.len(), 1, "an API hiccup does not lose the undo");
-        assert_eq!(ids(&view), ["a"]);
-
-        view.worker = Worker::seeded_for_test(
-            "t",
-            Res::Snapshot(Ok(Snapshot {
-                providers: vec![],
-                items: vec![item("a", None, false)],
-            })),
+        rig.view
+            .recent
+            .push((key.clone(), std::time::Instant::now()));
+        rig.view.sync(&rig.store);
+        rig.view.restoring = Some(key.clone());
+        let mut failed = FeedPoll {
+            changed: false,
+            refreshed: false,
+            start: None,
+            error: Some("boom".into()),
+        };
+        rig.view.apply(&rig.store, &mut failed);
+        assert_eq!(
+            rig.view.recent.len(),
+            1,
+            "an API hiccup does not lose the undo"
         );
-        press(&mut view, KeyCode::Char('x'), true);
-        assert!(poll_until_settled(&mut view));
-        assert!(view.recent.is_empty(), "dropped once the restore succeeded");
-    }
+        assert_eq!(ids(&rig), ["a"]);
 
-    #[test]
-    fn the_subtitle_prefers_the_resolved_project_over_the_hint() {
-        let resolved = in_project(item("a", Some("hint-name"), false), "api");
-        let hinted = item("b", Some("hint-name"), false);
-        let view = view_with(vec![resolved, hinted], idle_worker());
-        let text = render_text(&view);
-        assert!(text.contains("reason · api"), "{text}");
-        assert!(text.contains("reason · hint-name"), "{text}");
-    }
-
-    #[test]
-    fn each_provider_gets_a_status_line() {
-        let mut view = view_with(vec![item("a", None, false)], idle_worker());
-        assert!(render_text(&view).contains("GitHub: updated 2 min ago"));
-        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
-        provider.refreshing = true;
-        assert!(render_text(&view).contains("⠙ GitHub: refreshing…"));
-        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
-        provider.refreshing = false;
-        provider.error = Some("API key rejected".into());
-        assert!(render_text(&view).contains("GitHub: couldn't refresh, API key rejected"));
-        view.snapshot.as_mut().unwrap().providers[0].error = None;
-        view.snapshot.as_mut().unwrap().items.clear();
-        assert!(render_text(&view).contains("GitHub: nothing new"));
+        rig.view.restoring = Some(key);
+        dismissed_snapshot(&mut rig, false);
+        let mut ok = FeedPoll {
+            changed: true,
+            refreshed: false,
+            start: None,
+            error: None,
+        };
+        rig.view.apply(&rig.store, &mut ok);
+        assert!(
+            rig.view.recent.is_empty(),
+            "dropped once the restore succeeded"
+        );
     }
 
     #[test]
     fn a_stale_item_cannot_start_and_says_why() {
         let mut stale = item("a", None, false);
         stale.stale = true;
-        let mut view = view_with(vec![stale], idle_worker());
+        let mut rig = view_with(vec![stale], idle_worker());
         assert!(matches!(
-            press(&mut view, KeyCode::Enter, true),
+            press(&mut rig, KeyCode::Enter, true),
             SuggestionsAction::Continue
         ));
-        assert!(!view.busy, "no prepare was sent");
-        assert!(render_text(&view).contains("No longer open at the source"));
+        assert!(!rig.store.busy, "no prepare was sent");
+        assert!(render_text(&rig).contains("No longer open at the source"));
     }
 
     #[test]
     fn a_failed_start_stays_on_its_row_and_enter_tries_again() {
         let worker =
             Worker::seeded_for_test("t", Res::Prepared(Err("branch already exists".into())));
-        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut view, KeyCode::Enter, true);
-        assert!(poll_until_settled(&mut view));
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        rig.store.in_flight_user = true;
+        press(&mut rig, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut rig));
         assert!(
-            view.error.is_none(),
+            rig.view.error.is_none(),
             "the failure is on the row, not the footer"
         );
-        assert!(render_text(&view).contains("Couldn't start: branch already exists"));
-        view.worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        press(&mut view, KeyCode::Enter, true);
-        assert!(view.failed.is_none());
-        assert!(poll_until_settled(&mut view));
-        assert!(!render_text(&view).contains("Couldn't start"));
+        assert!(render_text(&rig).contains("Couldn't start: branch already exists"));
+        assert!(rig.view.failed.is_some());
     }
 
     #[test]
     fn read_only_and_offline_explain_themselves_and_still_allow_open() {
-        let mut started = item("a", None, false);
-        started.started_session = Some(Started {
-            id: "sess-1".into(),
-            status: "Idle".into(),
-            archived: false,
-        });
-        let mut view = view_with(vec![item("b", None, false), started], idle_worker());
+        let mut linked = item("a", None, false);
+        linked.started_session = started("sess-1", "Idle");
+        let mut rig = view_with(vec![item("b", None, false), linked], idle_worker());
         for (block, note) in [
             (
                 MutationBlock::ReadOnly,
@@ -1557,17 +1597,17 @@ mod tests {
                 "Disconnected. Suggestions show from the last fetch; reconnect to start one.",
             ),
         ] {
-            assert!(render_text_blocked(&view, Some(block)).contains(note));
-            let SuggestionsAction::Continue = press_blocked(&mut view, KeyCode::Enter, Some(block))
+            assert!(render_text_blocked(&rig, Some(block)).contains(note));
+            let SuggestionsAction::Continue = press_blocked(&mut rig, KeyCode::Enter, Some(block))
             else {
                 panic!("Start must be refused");
             };
-            assert_eq!(view.error.as_deref(), Some(note));
-            assert!(!view.busy);
+            assert_eq!(rig.view.error.as_deref(), Some(note));
+            assert!(!rig.store.busy);
         }
-        press(&mut view, KeyCode::Char('j'), true);
+        press(&mut rig, KeyCode::Char('j'), true);
         let SuggestionsAction::OpenSession(id) =
-            press_blocked(&mut view, KeyCode::Enter, Some(MutationBlock::Offline))
+            press_blocked(&mut rig, KeyCode::Enter, Some(MutationBlock::Offline))
         else {
             panic!("a linked session still opens");
         };
@@ -1576,14 +1616,30 @@ mod tests {
 
     #[test]
     fn a_disabled_provider_is_explained() {
-        let mut view = view_with(vec![], idle_worker());
-        view.snapshot.as_mut().unwrap().providers[0].enabled = false;
-        let text = render_text(&view);
+        let mut rig = view_with(vec![], idle_worker());
+        rig.store.snapshot.as_mut().unwrap().providers[0].enabled = false;
+        let text = render_text(&rig);
         assert!(text.contains("GitHub suggestions are hidden because GitHub is off in Settings"));
         assert!(
             !text.contains("GitHub: nothing new"),
             "no status line for a disabled provider"
         );
+    }
+
+    #[test]
+    fn each_provider_gets_a_status_line() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        assert!(render_text(&rig).contains("GitHub: updated 2 min ago"));
+        let provider = &mut rig.store.snapshot.as_mut().unwrap().providers[0];
+        provider.refreshing = true;
+        assert!(render_text(&rig).contains("⠙ GitHub: refreshing…"));
+        let provider = &mut rig.store.snapshot.as_mut().unwrap().providers[0];
+        provider.refreshing = false;
+        provider.error = Some("API key rejected".into());
+        assert!(render_text(&rig).contains("GitHub: couldn't refresh, API key rejected"));
+        rig.store.snapshot.as_mut().unwrap().providers[0].error = None;
+        rig.store.snapshot.as_mut().unwrap().items.clear();
+        assert!(render_text(&rig).contains("GitHub: nothing new"));
     }
 
     #[test]
@@ -1593,11 +1649,11 @@ mod tests {
         bad.title = format!("T {hostile}");
         bad.reason = format!("R {hostile}");
         bad.project = Some(format!("P {hostile}"));
-        let mut view = view_with(vec![bad], idle_worker());
-        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
+        let mut rig = view_with(vec![bad], idle_worker());
+        let provider = &mut rig.store.snapshot.as_mut().unwrap().providers[0];
         provider.name = format!("N {hostile}");
         provider.error = Some(format!("E {hostile}"));
-        let text = render_text(&view);
+        let text = render_text(&rig);
         assert!(text.contains("T \u{fffd}[31mred"), "{text}");
         for bad in ['\u{1b}', '\u{202e}', '\u{7}'] {
             assert!(!text.contains(bad), "{bad:?} reached the terminal: {text}");
@@ -1605,13 +1661,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_without_a_registered_project_cannot_start() {
-        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(None))));
-        let mut view = view_with(vec![item("a", None, false)], worker);
-        press(&mut view, KeyCode::Enter, true);
-        assert!(poll_until_settled(&mut view));
-        assert!(view.prepared.is_none());
-        assert!(render_text(&view).contains("Couldn't start: No registered project"));
+    fn the_subtitle_prefers_the_resolved_project_over_the_hint() {
+        let resolved = in_project(item("a", Some("hint-name"), false), "api");
+        let hinted = item("b", Some("hint-name"), false);
+        let rig = view_with(vec![resolved, hinted], idle_worker());
+        let text = render_text(&rig);
+        assert!(text.contains("reason · api"), "{text}");
+        assert!(text.contains("reason · hint-name"), "{text}");
+    }
+
+    #[test]
+    fn the_home_feed_never_offers_a_stale_item() {
+        let mut stale = item("old", None, false);
+        stale.stale = true;
+        let rig = view_with(vec![item("fresh", None, false), stale], idle_worker());
+        assert_eq!(rig.store.keys(), [("p".to_string(), "fresh".to_string())]);
     }
 
     #[test]
@@ -1648,18 +1712,20 @@ mod tests {
     #[test]
     fn failed_request_keeps_the_last_snapshot() {
         let worker = Worker::seeded_for_test("t", Res::Snapshot(Err("daemon down".into())));
-        let mut view = view_with(vec![item("a", None, false)], worker);
-        assert!(poll_until_settled(&mut view));
-        assert_eq!(view.error.as_deref(), Some("daemon down"));
-        assert_eq!(ids(&view), ["a"]);
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        rig.store.reload();
+        assert!(poll_until_settled(&mut rig));
+        assert_eq!(rig.view.error.as_deref(), Some("daemon down"));
+        assert_eq!(ids(&rig), ["a"]);
     }
 
     #[test]
     fn refresh_notifies_and_asks_for_a_reload() {
         let worker = Worker::seeded_for_test("t", Res::Refreshed(Ok(())));
-        let mut view = view_with(vec![], worker);
-        assert!(poll_until_settled(&mut view));
-        assert!(view.notice.as_deref().unwrap().contains("Press l"));
+        let mut rig = view_with(vec![], worker);
+        rig.store.refresh();
+        assert!(poll_until_settled(&mut rig));
+        assert!(rig.view.notice.as_deref().unwrap().contains("Press l"));
     }
 
     #[test]
@@ -1667,22 +1733,120 @@ mod tests {
         let worker = Worker::spawn("test-suggestions", |_: Req| -> Res {
             panic!("worker died")
         });
-        let mut view = view_with(vec![item("a", None, false)], worker);
-        press(&mut view, KeyCode::Char('l'), true);
-        assert!(view.busy);
-        assert!(poll_until_settled(&mut view));
-        assert!(!view.busy);
-        assert!(view.error.is_some());
-        assert!(!view.poll());
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        press(&mut rig, KeyCode::Char('l'), true);
+        assert!(rig.store.busy);
+        assert!(poll_until_settled(&mut rig));
+        assert!(!rig.store.busy);
+        assert!(rig.view.error.is_some());
+        let mut polled = rig.store.poll();
+        assert!(!rig.view.apply(&rig.store, &mut polled));
+    }
+
+    #[test]
+    fn a_dismiss_in_the_view_reaches_the_home_keys_without_a_reload() {
+        let (sink, requests) = std::sync::mpsc::channel();
+        let snapshot = serde_json::json!({
+            "providers": [{ "id": "p", "name": "GitHub" }],
+            "items": [{
+                "provider_id": "p", "id": "a", "title": "a", "reason": "r",
+                "source_url": "https://example.test/a", "source_ref": "#a",
+                "preview": "", "dismissed": true, "draft": { "prompt": "x" }
+            }],
+        });
+        let mut store = SuggestionsFeed::recording_for_test(snapshot, sink);
+        store.set_snapshot_for_test(serde_json::json!({
+            "providers": [{ "id": "p", "name": "GitHub" }],
+            "items": [{
+                "provider_id": "p", "id": "a", "title": "a", "reason": "r",
+                "source_url": "https://example.test/a", "source_ref": "#a",
+                "preview": "", "draft": { "prompt": "x" }
+            }],
+        }));
+        let mut view = SuggestionsView::new(&mut store);
+        assert_eq!(store.keys().len(), 1);
+        view.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            None,
+            &mut store,
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "dismiss p/a true"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut polled = store.poll();
+        while !polled.changed {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            polled = store.poll();
+        }
+        assert!(store.keys().is_empty());
+        assert!(requests.try_recv().is_err(), "no reload was sent");
+    }
+
+    #[test]
+    fn a_view_prepare_answered_after_the_view_closed_is_left_for_the_caller_to_drop() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut rig, KeyCode::Enter, true);
+        let mut view_closed = rig.store.poll();
+        for _ in 0..200 {
+            if view_closed.start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            view_closed = rig.store.poll();
+        }
+        assert!(matches!(
+            view_closed.start,
+            Some((_, _, PrepareTarget::View(_)))
+        ));
+    }
+
+    #[test]
+    fn a_view_prepare_does_not_land_in_a_reopened_view() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut rig, KeyCode::Enter, true);
+        rig.view = SuggestionsView::new(&mut rig.store);
+        let mut polled = rig.store.poll();
+        for _ in 0..200 {
+            if polled.start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            polled = rig.store.poll();
+        }
+        assert!(polled.start.is_some());
+        rig.view.apply(&rig.store, &mut polled);
+        assert!(rig.view.prepared.is_none());
+    }
+
+    #[test]
+    fn keys_are_not_swallowed_while_a_background_load_is_in_flight() {
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], idle_worker());
+        rig.store.busy = true;
+        let key = ("p".to_string(), "a".to_string());
+        let start = start_for(rig.store.snapshot.as_ref(), &key, prepared(Some("/repo")));
+        rig.view.prepared = Some((key, start.unwrap()));
+        assert!(matches!(
+            press(&mut rig, KeyCode::Enter, true),
+            SuggestionsAction::Start(_)
+        ));
+
+        press(&mut rig, KeyCode::Char('l'), true);
+        assert_eq!(rig.store.queued.len(), 1, "the reload waits its turn");
     }
 
     #[test]
     fn view_shows_prompt_and_preview_as_plain_text() {
         let mut hostile = item("a", Some("repo"), false);
         hostile.draft.prompt = "run \u{1b}[31mrm -rf\u{1b}[0m now".into();
-        let view = view_with(vec![hostile], idle_worker());
-        let text = render_text(&view);
-        println!("{text}");
+        let rig = view_with(vec![hostile], idle_worker());
+        let text = render_text(&rig);
         for expected in [
             "GitHub a",
             "reason · repo",

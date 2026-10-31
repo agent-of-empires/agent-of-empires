@@ -1,14 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   dismissSuggestion,
+  createSession,
+  fetchCreateBootId,
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
   type SuggestionResult,
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
+import {
+  newIdempotencyKey,
+  peekPendingCreate,
+  registerPendingCreate,
+  releasePendingCreate,
+  resolvePendingCreate,
+} from "../lib/pendingCreates";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
-import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
+import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
 
 /** A start that failed, kept on its row so a retry repeats the same kind of start. */
@@ -19,11 +28,19 @@ export interface StartFailure {
 
 const REFRESH_POLL_MS = 2000;
 const UNDO_MS = 10_000;
+const PENDING_NOTICE = "A session is still being created. Wait for it to finish.";
 
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
-/** Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot. */
-export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
+/**
+ * Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot.
+ * With "Start without review" on and a resolved, templated draft, `start` creates the session and
+ * calls `onStarted`; anything unresolved or needing hook trust opens the wizard through `onPrepare`.
+ */
+export function useSuggestions(
+  onPrepare: (prefill: WizardPrefill) => void,
+  onStarted?: (session: SessionResponse) => void,
+) {
   const offline = useServerDown();
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -103,16 +120,60 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
-      setBusy(null);
       setFailures(({ [key]: _gone, ...rest }) => rest);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-      onPrepare(
-        toWizardPrefill(
-          result.data,
-          { label, title: item.title, url: item.source_url },
-          another ? undefined : { provider_id: item.provider_id, id: item.id },
-        ),
-      );
+      const link = another ? undefined : { provider_id: item.provider_id, id: item.id };
+      const prefill = toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }, link);
+      const draft = result.data;
+      // The pref is ignored when a host passes no `onStarted`. Only the user's own template
+      // runs unreviewed; the provider's draft prompt always goes through the wizard.
+      // "Start another" always opens the wizard, so it never starts unreviewed.
+      if (
+        onStarted &&
+        !another &&
+        snapshot?.prefs.start_without_review &&
+        draft.project &&
+        draft.templated &&
+        draft.initial_prompt
+      ) {
+        if (peekPendingCreate()) {
+          setNotice(PENDING_NOTICE);
+          setBusy(null);
+          return;
+        }
+        const body = {
+          title: draft.title || undefined,
+          path: draft.project.path,
+          tool: draft.tool,
+          yolo_mode: draft.yolo,
+          sandbox: draft.sandbox,
+          worktree_enabled: draft.worktree,
+          initial_prompt: draft.initial_prompt,
+          suggestion: link,
+          idempotency_key: newIdempotencyKey(),
+        };
+        const origin = await fetchCreateBootId();
+        registerPendingCreate({ body, tool: draft.tool, since: Date.now(), origin }, { claimed: true });
+        const created = await createSession(body);
+        // No definite answer: the app-level owner keeps reconciling under this key, and a
+        // re-click is refused until it does.
+        if (created.network || created.outcomeUnknown) releasePendingCreate(body.idempotency_key);
+        else resolvePendingCreate(body.idempotency_key);
+        if (created.ok && created.session) {
+          // Both views navigate away, so the snapshot is not reloaded.
+          onStarted(created.session);
+          if (mounted.current) setBusy(null);
+          return;
+        }
+        if (!mounted.current) return;
+        if (created.network || created.outcomeUnknown || !(created.hooksNeedTrust || created.trustChanged)) {
+          setNotice(created.error ?? "Could not start the session.");
+          setBusy(null);
+          return;
+        }
+      }
+      setBusy(null);
+      onPrepare(prefill);
       return;
     }
     // A stale item is explained by the reload; any other failure stays on its row.

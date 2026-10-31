@@ -12,6 +12,7 @@ import {
   SuggestionStatusNotes,
   UndoBar,
 } from "./SuggestionRow";
+import type { SessionResponse } from "../lib/types";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -21,6 +22,8 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
   onOpenSession: (sessionId: string) => void;
   onOpenSettings?: () => void;
+  /** Called when "Start without review" created the session directly. */
+  onStarted?: (session: SessionResponse) => void;
   /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
   onOpenMarketplace?: () => void;
 }
@@ -63,10 +66,11 @@ export function SuggestionsView({
   onPrepare,
   onOpenSession,
   onOpenSettings,
+  onStarted,
   onOpenMarketplace,
 }: Props) {
   const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start, load } =
-    useSuggestions(onPrepare);
+    useSuggestions(onPrepare, onStarted);
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
 

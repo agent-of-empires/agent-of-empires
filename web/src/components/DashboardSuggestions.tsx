@@ -1,3 +1,4 @@
+import type { SessionResponse } from "../lib/types";
 import { updateSuggestionSource } from "../lib/api";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
@@ -13,14 +14,17 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
   onOpenSession: (sessionId: string) => void;
 }
 
-export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll, onOpenSession }: Props) {
+export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll, onOpenSession }: Props) {
   const wide = useIsWideViewport();
-  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh, start } =
-    useSuggestions(onPrepare);
+  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh, start } = useSuggestions(
+    onPrepare,
+    onStarted,
+  );
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
   if (!snapshot || snapshot.providers.length === 0) return null;

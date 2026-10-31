@@ -7,10 +7,14 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::*;
+use crate::tui::dialogs::{PaletteAction, PaletteCommand, PaletteGroup};
 use crate::tui::styles::Theme;
 
 /// Prompt lines shown in the preview before it is ellipsised.
 const PREVIEW_PROMPT_LINES: usize = 4;
+
+/// Terminal width from which the key line names the ^K action.
+const WIDE_KEY_LINE_COLS: u16 = 120;
 
 /// "A", "A and B", "A, B and C".
 fn join_names(names: &[String]) -> String {
@@ -91,7 +95,7 @@ impl HomeView {
             self.flat_items.get(self.cursor),
             Some(Item::SuggestionsViewAll { .. })
         ) {
-            self.suggestions_view = Some(super::super::suggestions::SuggestionsView::new());
+            self.open_suggestions_view();
             return true;
         }
         false
@@ -103,11 +107,24 @@ impl HomeView {
             return false;
         };
         if self.session_feed.mutations_available() {
-            self.suggestions_feed.dismiss(&key);
+            self.suggestions_feed.dismiss(&key, true);
         } else {
             self.flash_status("The daemon is read-only or unavailable");
         }
         true
+    }
+
+    /// "Open in <provider>" for a suggestion, when its `source_url` is openable.
+    pub(super) fn open_source_command(&self, key: &(String, String)) -> Option<PaletteCommand> {
+        let entry = self.suggestions_feed.entry(key)?;
+        Some(PaletteCommand {
+            id: "open-suggestion-source",
+            title: format!("Open in {}", entry.provider),
+            group: PaletteGroup::Actions,
+            keywords: vec!["open", "link", "source", "browser"],
+            hotkey: String::new(),
+            payload: PaletteAction::OpenLink(entry.source_url?),
+        })
     }
 
     /// Paints the preview for the Suggested group or a suggestion row. False
@@ -183,7 +200,12 @@ impl HomeView {
                     lines.push(Line::from("  …"));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("↵ start  z dismiss  ^K more", dim)));
+                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS {
+                    format!("↵ start  z dismiss  ^K open in {}", entry.provider)
+                } else {
+                    "↵ start  z dismiss  ^K more".to_string()
+                };
+                lines.push(Line::from(Span::styled(keys, dim)));
                 ("Suggestion".to_string(), lines)
             }
             _ => return false,
