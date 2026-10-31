@@ -123,7 +123,12 @@ export function useSuggestions(
       setFailures(({ [key]: _gone, ...rest }) => rest);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
       const link = another ? undefined : { provider_id: item.provider_id, id: item.id };
-      const prefill = toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }, link);
+      const prefill = toWizardPrefill(
+        result.data,
+        { label, title: item.title, url: item.source_url },
+        item.provider_id,
+        link,
+      );
       const draft = result.data;
       // The pref is ignored when a host passes no `onStarted`. Only the user's own template
       // runs unreviewed; the provider's draft prompt always goes through the wizard.

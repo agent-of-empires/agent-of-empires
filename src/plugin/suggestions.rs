@@ -7,9 +7,10 @@
 //! templates are stored.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use aoe_plugin_api::suggestions::MAX_KEY_BYTES;
+use aoe_plugin_api::suggestions::{MAX_KEY_BYTES, SUGGESTIONS_FIX_PREFIX};
 use aoe_plugin_api::{
-    SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionsError, SuggestionsSpec,
+    SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionFix, SuggestionsError,
+    SuggestionsSpec,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -23,6 +24,7 @@ use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
 const MAX_TITLE_BYTES: usize = 512;
+const MAX_FIX_BYTES: usize = 64;
 const MAX_REASON_BYTES: usize = 2048;
 const MAX_URL_BYTES: usize = 2048;
 const MAX_PROJECT_BYTES: usize = 4096;
@@ -100,6 +102,13 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              mapping_key   TEXT NOT NULL,
              projects_json TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, mapping_key)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_fixes (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             label       TEXT NOT NULL,
+             method      TEXT NOT NULL,
+             PRIMARY KEY (profile, provider_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_stale (
              profile     TEXT NOT NULL,
@@ -275,6 +284,7 @@ fn set_at(
 pub(super) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     for table in [
+        "suggestion_fixes",
         "suggestion_checks",
         "suggestion_stale",
         "suggestion_items",
@@ -302,7 +312,20 @@ pub(super) fn error(
             "suggestions.error message is limited to {MAX_ERROR_BYTES} bytes"
         )));
     }
-    record_status(conn, profile, provider_id, Some(&request.message)).map_err(db_error)?;
+    if let Some(fix) = &request.fix {
+        validate_fix(fix).map_err(DispatchError::invalid_params)?;
+    }
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    record_status(&tx, profile, provider_id, Some(&request.message)).map_err(db_error)?;
+    if let Some(fix) = &request.fix {
+        tx.execute(
+            "INSERT INTO suggestion_fixes (profile, provider_id, label, method) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (profile, provider_id) DO UPDATE SET label = ?3, method = ?4",
+            params![profile, provider_id, fix.label, fix.method],
+        )
+        .map_err(db_error)?;
+    }
+    tx.commit().map_err(db_error)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -326,6 +349,41 @@ pub(super) fn set_checks(
     )
     .map_err(db_error)?;
     Ok(json!({ "ok": true, "stored": request.checks.len() }))
+}
+
+fn validate_fix(fix: &SuggestionFix) -> Result<(), String> {
+    if fix.label.trim().is_empty() || fix.label.len() > MAX_FIX_BYTES {
+        return Err(format!(
+            "fix label must be non-empty and at most {MAX_FIX_BYTES} bytes"
+        ));
+    }
+    let name = fix.method.strip_prefix(SUGGESTIONS_FIX_PREFIX);
+    let valid = fix.method.len() <= MAX_FIX_BYTES
+        && name.is_some_and(|n| {
+            !n.is_empty()
+                && n.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        });
+    if !valid {
+        return Err(format!(
+            "fix method must be {SUGGESTIONS_FIX_PREFIX}<name> of at most {MAX_FIX_BYTES} bytes, using a-z 0-9 . _ -"
+        ));
+    }
+    Ok(())
+}
+
+/// The worker method behind the provider's current error fix, if any.
+pub(crate) fn fix_method(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT method FROM suggestion_fixes WHERE profile = ?1 AND provider_id = ?2",
+        params![profile, provider_id],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 fn validate_checks(checks: &[SetupCheck]) -> Result<(), String> {
@@ -394,6 +452,11 @@ fn record_status(
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (profile, provider_id) DO UPDATE SET error = ?3, updated_at = ?4",
         params![profile, provider_id, error, chrono::Utc::now().timestamp()],
+    )?;
+    // A new status replaces the old error's fix; `error` stores its own afterwards.
+    conn.execute(
+        "DELETE FROM suggestion_fixes WHERE profile = ?1 AND provider_id = ?2",
+        params![profile, provider_id],
     )?;
     Ok(())
 }
@@ -657,8 +720,11 @@ fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>
     order
 }
 
+pub(crate) const DEFAULT_REFRESH_MINUTES: u32 = 15;
+
 /// `(homepage, sidebar, refresh_minutes, start_without_review)` of a profile that never saved any.
-pub(crate) const DEFAULT_PREFS: (bool, bool, u32, bool) = (true, false, 15, false);
+pub(crate) const DEFAULT_PREFS: (bool, bool, u32, bool) =
+    (true, false, DEFAULT_REFRESH_MINUTES, false);
 
 pub(crate) fn prefs_json(prefs: (bool, bool, u32, bool), provider_order: &[&str]) -> Value {
     json!({
@@ -681,14 +747,18 @@ fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool,
         .unwrap_or(DEFAULT_PREFS))
 }
 
+pub(crate) fn refresh_minutes(conn: &Connection, profile: &str) -> rusqlite::Result<u32> {
+    load_prefs(conn, profile).map(|prefs| prefs.2)
+}
+
 /// Applies `patch` atomically; the inner `Err` is a validation message and
-/// nothing is stored.
+/// nothing is stored. The inner `Ok` says whether the stored refresh interval changed.
 pub(crate) fn apply_prefs(
     conn: &Connection,
     profile: &str,
     known: &[String],
     patch: &PrefsPatch,
-) -> anyhow::Result<Result<(), String>> {
+) -> anyhow::Result<Result<bool, String>> {
     if let Some(minutes) = patch.refresh_minutes {
         if !REFRESH_MINUTES.contains(&minutes) {
             return Ok(Err(format!(
@@ -712,6 +782,10 @@ pub(crate) fn apply_prefs(
             return Ok(Err(format!("unknown provider {id:?}")));
         }
     }
+    let refresh_changed = match patch.refresh_minutes {
+        Some(minutes) => minutes != load_prefs(conn, profile)?.2,
+        None => false,
+    };
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT OR IGNORE INTO suggestion_preferences (profile) VALUES (?1)",
@@ -756,7 +830,7 @@ pub(crate) fn apply_prefs(
         )?;
     }
     tx.commit()?;
-    Ok(Ok(()))
+    Ok(Ok(refresh_changed))
 }
 
 pub(crate) fn snapshot(
@@ -801,10 +875,23 @@ pub(crate) fn snapshot(
             })).collect::<Vec<_>>(),
             "checks": load_checks(conn, profile, &provider.id)?,
         });
+        if provider.spec.uses_agent {
+            entry["uses_agent"] = json!(true);
+        }
         if let Some((error, updated_at)) = status {
             entry["updated_at"] = json!(updated_at);
             if let Some(message) = error {
                 entry["error"] = json!(message);
+                let label: Option<String> = conn
+                    .query_row(
+                        "SELECT label FROM suggestion_fixes WHERE profile = ?1 AND provider_id = ?2",
+                        params![profile, provider.id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(label) = label {
+                    entry["fix"] = json!({ "label": label });
+                }
             }
         }
         out_providers.push(entry);
@@ -1261,6 +1348,7 @@ pub(crate) fn prepare(
     Ok(json!({
         "title": item.draft.title,
         "initial_prompt": prompt,
+        "template_criterion": template.map(|_| &item.criterion),
         "templated": template.is_some(),
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
@@ -1290,6 +1378,7 @@ mod tests {
                 source("assigned", &["repo"], true),
                 source("quiet", &[], false),
             ],
+            uses_agent: false,
         }
     }
 
@@ -1528,6 +1617,11 @@ mod tests {
             for (table, columns, values) in [
                 ("suggestion_checks", "checks_json", "'[]'"),
                 (
+                    "suggestion_fixes",
+                    "label, method",
+                    "'Fix', 'suggestions.fix.k'",
+                ),
+                (
                     "suggestion_templates",
                     "criterion, template",
                     "'assigned', 't'",
@@ -1568,6 +1662,7 @@ mod tests {
             "suggestion_providers",
             "suggestion_items",
             "suggestion_checks",
+            "suggestion_fixes",
         ] {
             assert_eq!(count(table), 0, "{table}");
         }
@@ -1661,6 +1756,9 @@ mod tests {
         }
         let out = prepared(None);
         assert_eq!(out["initial_prompt"], "Do work");
+        assert!(out["template_criterion"].is_null());
+        let templated = prepare("default", &item("a", "assigned"), Some(""), None).unwrap();
+        assert_eq!(templated["template_criterion"], "assigned");
         assert_eq!(out["source_ref"], "example/1");
         assert_eq!(out["extra_projects"], json!([]));
     }
@@ -2012,6 +2110,18 @@ mod tests {
             json!(["acme.github", "acme.linear"])
         );
 
+        assert_eq!(refresh_minutes(&conn, "p").unwrap(), 15);
+        // Only a real change of the interval reports `true`.
+        for (patch, changed) in [
+            (json!({ "sidebar": true }), false),
+            (json!({ "refresh_minutes": 15 }), false),
+            (json!({ "refresh_minutes": 60 }), true),
+            (json!({ "refresh_minutes": 60 }), false),
+            (json!({ "homepage": false }), false),
+        ] {
+            assert_eq!(apply(patch.clone()), Ok(changed), "{patch}");
+        }
+        apply(json!({ "homepage": true })).unwrap();
         apply(json!({ "sidebar": true })).unwrap();
         apply(json!({ "start_without_review": true })).unwrap();
         assert_eq!(snap("p")["prefs"]["start_without_review"], true);
@@ -2022,6 +2132,8 @@ mod tests {
         assert_eq!(prefs["sidebar"], true);
         assert_eq!(prefs["homepage"], true);
         assert_eq!(prefs["refresh_minutes"], 60);
+        assert_eq!(refresh_minutes(&conn, "p").unwrap(), 60);
+        assert_eq!(refresh_minutes(&conn, "other").unwrap(), 15);
         assert_eq!(
             prefs["provider_order"],
             json!(["acme.linear", "acme.github"])
@@ -2063,6 +2175,49 @@ mod tests {
             HashSet::from(["acme.github".to_string()])
         );
         assert!(disabled_providers(&conn, "other").unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_fix_is_validated_listed_without_its_method_and_cleared() {
+        let conn = store();
+        let fixed = |fix: serde_json::Value| {
+            error(
+                &conn,
+                "p",
+                "acme.github",
+                &json!({ "message": "bad key", "fix": fix }),
+            )
+        };
+        for bad in [
+            json!({ "label": "Fix", "method": "refresh" }),
+            json!({ "label": "Fix", "method": "suggestions.fix." }),
+            json!({ "label": "Fix", "method": "suggestions.fix.A b" }),
+            json!({ "label": " ", "method": "suggestions.fix.key" }),
+            json!({ "label": "x".repeat(MAX_FIX_BYTES + 1), "method": "suggestions.fix.key" }),
+        ] {
+            assert!(fixed(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(fix_method(&conn, "p", "acme.github").unwrap().is_none());
+
+        fixed(json!({ "label": "Fix in Linear settings", "method": "suggestions.fix.sign-in" }))
+            .unwrap();
+        assert_eq!(
+            fix_method(&conn, "p", "acme.github").unwrap().as_deref(),
+            Some("suggestions.fix.sign-in")
+        );
+        let mut agent = provider();
+        agent.spec.uses_agent = true;
+        let entry = snapshot(&conn, "p", &[agent]).unwrap()["providers"][0].clone();
+        assert_eq!(entry["uses_agent"], true);
+        assert_eq!(entry["fix"], json!({ "label": "Fix in Linear settings" }));
+
+        error(&conn, "p", "acme.github", &json!({ "message": "again" })).unwrap();
+        assert!(fix_method(&conn, "p", "acme.github").unwrap().is_none());
+        fixed(json!({ "label": "Fix", "method": "suggestions.fix.sign-in" })).unwrap();
+        set(&conn, "p", "acme.github", &spec(), &json!({ "items": [] })).unwrap();
+        assert!(fix_method(&conn, "p", "acme.github").unwrap().is_none());
+        let entry = snapshot(&conn, "p", &[provider()]).unwrap()["providers"][0].clone();
+        assert!(entry.get("fix").is_none() && entry.get("uses_agent").is_none());
     }
 
     #[test]
