@@ -1667,8 +1667,7 @@ function AppContent({
   }, [navigate, activeSessionId]);
 
   const handleSuggestionStarted = useCallback(
-    (session?: SessionResponse) => {
-      if (!session) return;
+    (session: SessionResponse) => {
       injectSession(session);
       navigate(`/session/${encodeURIComponent(session.id)}`);
       if (window.innerWidth < 768) setSidebarOpen(false);

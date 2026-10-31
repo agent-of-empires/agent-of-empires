@@ -9,7 +9,7 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
-  onStarted?: (session: SessionResponse | undefined) => void;
+  onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
 }
 

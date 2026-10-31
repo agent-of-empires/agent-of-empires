@@ -23,7 +23,7 @@ interface Props {
   readOnly?: boolean;
   /** Both required to show the Suggested sessions section. */
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
-  onSuggestionStarted?: (session: SessionResponse | undefined) => void;
+  onSuggestionStarted?: (session: SessionResponse) => void;
   onViewAllSuggestions?: () => void;
 }
 

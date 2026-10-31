@@ -13,7 +13,7 @@ interface Props {
   initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
   /** Called when "Start without review" created the session directly. */
-  onStarted?: (session: SessionResponse | undefined) => void;
+  onStarted?: (session: SessionResponse) => void;
 }
 
 export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare, onStarted }: Props) {

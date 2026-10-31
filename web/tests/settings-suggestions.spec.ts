@@ -113,3 +113,12 @@ test("375px shows an arrow button instead of the drag handle", async ({ page }) 
   await page.getByRole("button", { name: "Move Linear up" }).click();
   await expect.poll(() => bodies).toContainEqual({ provider_order: ["linear", "github"] });
 });
+
+test("the Start without review switch persists through the prefs PATCH", async ({ page }) => {
+  const bodies = await setup(page);
+  await page.goto("/settings/suggestions");
+  const sw = page.getByRole("switch", { name: "Start without review" });
+  await expect(sw).toBeEnabled();
+  await sw.click();
+  await expect.poll(() => bodies).toContainEqual({ start_without_review: true });
+});

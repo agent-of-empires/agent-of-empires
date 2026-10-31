@@ -622,6 +622,8 @@ export interface SuggestionsSnapshot {
 export interface SuggestionPrepared {
   title: string;
   initial_prompt: string;
+  /** The prompt is the user's saved template, not the provider's draft text. */
+  templated: boolean;
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;

@@ -5,15 +5,23 @@ import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, createSession } = vi.hoisted(
-  () => ({
-    createSession: vi.fn(),
-    fetchSuggestions: vi.fn(),
-    prepareSuggestion: vi.fn(),
-    refreshSuggestions: vi.fn(),
-    dismissSuggestion: vi.fn(),
-  }),
-);
+const {
+  fetchSuggestions,
+  prepareSuggestion,
+  refreshSuggestions,
+  dismissSuggestion,
+  createSession,
+  fetchCreateBootId,
+  pending,
+} = vi.hoisted(() => ({
+  createSession: vi.fn(),
+  fetchCreateBootId: vi.fn(),
+  fetchSuggestions: vi.fn(),
+  prepareSuggestion: vi.fn(),
+  refreshSuggestions: vi.fn(),
+  dismissSuggestion: vi.fn(),
+  pending: { peek: vi.fn(), register: vi.fn(), release: vi.fn(), resolve: vi.fn() },
+}));
 
 vi.mock("../../lib/api", () => ({
   fetchSuggestions,
@@ -21,6 +29,15 @@ vi.mock("../../lib/api", () => ({
   refreshSuggestions,
   dismissSuggestion,
   createSession,
+  fetchCreateBootId,
+}));
+
+vi.mock("../../lib/pendingCreates", () => ({
+  newIdempotencyKey: () => "key-1",
+  peekPendingCreate: pending.peek,
+  registerPendingCreate: pending.register,
+  releasePendingCreate: pending.release,
+  resolvePendingCreate: pending.resolve,
 }));
 
 const item: SuggestionItem = {
@@ -65,6 +82,8 @@ afterEach(() => {
   cleanup();
   setServerDown(false);
   vi.clearAllMocks();
+  pending.peek.mockReturnValue(null);
+  fetchCreateBootId.mockResolvedValue("boot-1");
 });
 
 async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean; initialDismissed?: boolean } = {}) {
@@ -78,6 +97,7 @@ async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolea
 const prepared = {
   title: "Fix lifecycle",
   initial_prompt: "Template prompt.",
+  templated: true,
   source_ref: "example/1",
   project: { name: "aoe", path: "/work/aoe" },
   tool: "opencode",
@@ -105,6 +125,7 @@ describe("SuggestionsView", () => {
       data: {
         title: "Fix lifecycle",
         initial_prompt: "Review the issue.",
+        templated: false,
         source_ref: "example/1",
         project: { name: "aoe", path: "/work/aoe" },
         tool: "opencode",
@@ -141,7 +162,12 @@ describe("SuggestionsView", () => {
       sandbox: false,
       worktree_enabled: true,
       initial_prompt: "Template prompt.",
+      idempotency_key: "key-1",
     });
+    expect(pending.register).toHaveBeenCalledWith(expect.objectContaining({ tool: "opencode", origin: "boot-1" }), {
+      claimed: true,
+    });
+    expect(pending.resolve).toHaveBeenCalledWith("key-1");
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
@@ -149,6 +175,7 @@ describe("SuggestionsView", () => {
     for (const [data, created] of [
       [{ project: null }, undefined],
       [{ initial_prompt: "" }, undefined],
+      [{ templated: false }, undefined],
       [{}, { ok: false, error: "hooks", hooksNeedTrust: {} }],
       [{}, { ok: false, error: "changed", trustChanged: true }],
     ] as const) {
@@ -158,6 +185,7 @@ describe("SuggestionsView", () => {
       await waitFor(() => expect(onPrepare).toHaveBeenCalled());
       expect(onStarted).not.toHaveBeenCalled();
       expect(createSession).toHaveBeenCalledTimes(created ? 1 : 0);
+      if (created) expect(pending.resolve).toHaveBeenCalledWith("key-1");
     }
   });
 
@@ -173,7 +201,18 @@ describe("SuggestionsView", () => {
       expect((await screen.findByRole("alert")).textContent).toBe(created.error);
       expect(onPrepare).not.toHaveBeenCalled();
       expect(onStarted).not.toHaveBeenCalled();
+      const unresolved = "network" in created || "outcomeUnknown" in created;
+      expect(pending.release).toHaveBeenCalledTimes(unresolved ? 1 : 0);
+      expect(pending.resolve).toHaveBeenCalledTimes(unresolved ? 0 : 1);
     }
+  });
+
+  it("Start without review refuses a re-click while an earlier create is unresolved", async () => {
+    pending.peek.mockReturnValue({ body: { idempotency_key: "old" } });
+    const { onPrepare } = await startWithoutReview({});
+    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
+    expect(createSession).not.toHaveBeenCalled();
+    expect(onPrepare).not.toHaveBeenCalled();
   });
 
   it("renders one compact row: title, then Source, reason and Project, with no preview or chip", async () => {
