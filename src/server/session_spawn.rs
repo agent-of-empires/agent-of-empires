@@ -1314,6 +1314,7 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(peers.clone());
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let spec = StructuredSessionSpec {
+                suggestion: None,
                 title: Some("hooked".into()),
                 title_typed: true,
                 size: None,
