@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tui::dialogs::PromptOrigin;
-use crate::tui::suggestions::{Start, SuggestionsView};
+use crate::tui::suggestions::{PrepareTarget, Start, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -51,19 +51,20 @@ impl HomeView {
 
     /// Drains the suggestions worker. True when state changed.
     pub fn apply_suggestions_results(&mut self) -> bool {
-        let mut changed = self
-            .suggestions_view
-            .as_mut()
-            .is_some_and(SuggestionsView::poll);
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
-        let polled = self.suggestions_feed.poll();
+        let mut polled = self.suggestions_feed.poll();
+        let mut changed = match &mut self.suggestions_view {
+            Some(view) => view.apply(&self.suggestions_feed, &mut polled),
+            None => false,
+        };
         if polled.changed {
             self.rebuild_flat_items_keeping_cursor();
             self.update_selected();
             changed = true;
         }
-        if let Some((key, start)) = polled.start {
+        // A view prepare answered after the view closed has no one to start it.
+        if let Some((key, start, PrepareTarget::Home)) = polled.start {
             // The prepare answered after the user moved on or opened another dialog.
             if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
                 self.start_suggestion(start);
@@ -77,6 +78,10 @@ impl HomeView {
             changed = true;
         }
         changed
+    }
+
+    pub(super) fn open_suggestions_view(&mut self) {
+        self.suggestions_view = Some(SuggestionsView::new(&mut self.suggestions_feed));
     }
 
     /// Replaces the view with the regular new-session dialog, prefilled; when
