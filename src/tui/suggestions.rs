@@ -339,6 +339,8 @@ pub(super) struct SuggestionsView {
     busy: bool,
     /// The item a dismiss request is in flight for.
     dismissing: Option<ItemKey>,
+    /// The item a restore request is in flight for; it leaves `recent` only once that succeeds.
+    restoring: Option<ItemKey>,
     /// The last start that failed, shown on its row; Enter tries again.
     failed: Option<(ItemKey, String)>,
     /// Items dismissed in the last [`UNDO_WINDOW`], kept in the list so `x` undoes them.
@@ -369,6 +371,7 @@ impl SuggestionsView {
             show_dismissed: false,
             busy: false,
             dismissing: None,
+            restoring: None,
             failed: None,
             recent: Vec::new(),
             worker,
@@ -504,8 +507,8 @@ impl SuggestionsView {
                         id: key.1.clone(),
                         dismissed: !dismissed,
                     };
-                    self.recent.retain(|(k, _)| *k != key);
-                    self.dismissing = (!dismissed).then_some(key);
+                    self.dismissing = (!dismissed).then(|| key.clone());
+                    self.restoring = dismissed.then_some(key);
                     self.send(req);
                 }
             }
@@ -571,9 +574,16 @@ impl SuggestionsView {
             Err(_) => return expired,
         };
         self.busy = false;
+        let answered = matches!(res, Res::Snapshot(Ok(_)));
         if let Some(key) = self.dismissing.take() {
-            if matches!(res, Res::Snapshot(Ok(_))) {
+            if answered {
+                self.recent.retain(|(k, _)| *k != key);
                 self.recent.push((key, std::time::Instant::now()));
+            }
+        }
+        if let Some(key) = self.restoring.take() {
+            if answered {
+                self.recent.retain(|(k, _)| *k != key);
             }
         }
         match res {
@@ -788,7 +798,11 @@ impl SuggestionsView {
                 plain(&format!(
                     "    {} · {}{}",
                     item.reason,
-                    item.project.as_deref().unwrap_or("no project"),
+                    item.resolved_project
+                        .as_ref()
+                        .map(|p| p.name.as_str())
+                        .or(item.project.as_deref())
+                        .unwrap_or("no project"),
                     item.started_session
                         .as_ref()
                         .map(|s| if s.archived {
@@ -975,7 +989,7 @@ impl SuggestionsFeed {
         self.snapshot
             .iter()
             .flat_map(|s| &s.items)
-            .filter(|i| !i.dismissed && self.provider(&i.provider_id).is_some())
+            .filter(|i| !i.dismissed && !i.stale && self.provider(&i.provider_id).is_some())
             .map(|i| (i.provider_id.clone(), i.id.clone()))
             .collect()
     }
@@ -1421,6 +1435,59 @@ mod tests {
         );
         press(&mut view, KeyCode::Char('d'), true);
         assert_eq!(ids(&view), ["a"]);
+    }
+
+    #[test]
+    fn the_home_feed_never_offers_a_stale_item() {
+        let mut stale = item("old", None, false);
+        stale.stale = true;
+        let mut feed = SuggestionsFeed::with_worker(idle_worker());
+        feed.snapshot = Some(Snapshot {
+            providers: vec![Provider {
+                id: "p".into(),
+                name: "GitHub".into(),
+                error: None,
+                enabled: true,
+                updated_at: Some(0),
+                refreshing: false,
+            }],
+            items: vec![item("fresh", None, false), stale],
+        });
+        assert_eq!(feed.keys(), [("p".to_string(), "fresh".to_string())]);
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_undo_window() {
+        let mut view = view_with(vec![item("a", None, true)], idle_worker());
+        let key = ("p".to_string(), "a".to_string());
+        view.recent.push((key.clone(), std::time::Instant::now()));
+        view.reorder(Some(key.clone()));
+        view.worker = Worker::seeded_for_test("t", Res::Snapshot(Err("boom".into())));
+        press(&mut view, KeyCode::Char('x'), true);
+        assert!(poll_until_settled(&mut view));
+        assert_eq!(view.recent.len(), 1, "an API hiccup does not lose the undo");
+        assert_eq!(ids(&view), ["a"]);
+
+        view.worker = Worker::seeded_for_test(
+            "t",
+            Res::Snapshot(Ok(Snapshot {
+                providers: vec![],
+                items: vec![item("a", None, false)],
+            })),
+        );
+        press(&mut view, KeyCode::Char('x'), true);
+        assert!(poll_until_settled(&mut view));
+        assert!(view.recent.is_empty(), "dropped once the restore succeeded");
+    }
+
+    #[test]
+    fn the_subtitle_prefers_the_resolved_project_over_the_hint() {
+        let resolved = in_project(item("a", Some("hint-name"), false), "api");
+        let hinted = item("b", Some("hint-name"), false);
+        let view = view_with(vec![resolved, hinted], idle_worker());
+        let text = render_text(&view);
+        assert!(text.contains("reason · api"), "{text}");
+        assert!(text.contains("reason · hint-name"), "{text}");
     }
 
     #[test]
