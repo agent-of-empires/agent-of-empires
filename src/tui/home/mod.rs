@@ -355,6 +355,7 @@ pub struct HomeView {
 
     pub(super) available_tools: AvailableTools,
 
+    pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
     pub(super) preview_link_prefixes: Vec<String>,
