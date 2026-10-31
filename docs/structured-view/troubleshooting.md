@@ -26,6 +26,10 @@ The dashboard shows the same thing inline, as a screen that names the Agent, the
 
 `aoe serve` captures the launching shell's `PATH` at startup. If the adapter lives under a node-version-manager directory (nvm, fnm, mise, asdf) and the node version on the daemon's `PATH` does not match, the spawn fails with `No such file or directory`. Restart `aoe serve` from a shell where `which claude-agent-acp` resolves, or symlink the binary into `/usr/local/bin` or `~/.local/bin`.
 
+### Codex times out connecting to a local gateway on macOS
+
+Codex's default HTTP client can use the macOS system proxy without honoring its exceptions. On supported Codex versions, enable `features.respect_system_proxy = true` in Codex's configuration to use its native system proxy resolver. AoE also supplies a loopback-only fallback for host Codex ACP children when no explicit proxy or bypass environment policy exists; see [Host Environment](../guides/configuration.md#host-environment). After upgrading AoE, restart `aoe serve` and restart the affected agent so newly launched children receive the fallback. Existing detached workers keep their original environment.
+
 ### Native binary launch failure
 
 A banner reading `Claude Code native binary at ... exists but failed to launch` means the adapter found its bundled native sub-binary but the kernel rejected `execve`. Reinstalling the adapter does not help. The causes:

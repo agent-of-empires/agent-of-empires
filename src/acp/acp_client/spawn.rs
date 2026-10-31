@@ -277,6 +277,21 @@ pub(super) fn prepend_path_dirs(path: &std::ffi::OsStr, dirs: &[PathBuf]) -> std
     std::env::join_paths(&chain).unwrap_or_else(|_| path.to_os_string())
 }
 
+pub(super) fn apply_host_codex_loopback_bypass(
+    cmd: &mut std::process::Command,
+    config: &SpawnConfig,
+    overrides: &[(String, String)],
+) {
+    let backend = config
+        .wrapper_substitution
+        .as_ref()
+        .map(|(_, base)| base.as_str())
+        .unwrap_or(&config.agent_key);
+    if config.sandbox_info.is_none() && backend == "codex" {
+        crate::process::apply_codex_loopback_bypass(cmd, overrides);
+    }
+}
+
 fn apply_stdio_env(
     cmd: &mut tokio::process::Command,
     config: &SpawnConfig,
@@ -303,6 +318,7 @@ fn apply_stdio_env(
     if let Some(socket_path) = &config.socket_path {
         cmd.env("AOE_ACP_SOCKET", socket_path);
     }
+    apply_host_codex_loopback_bypass(cmd.as_std_mut(), config, &[]);
     keys
 }
 
@@ -617,6 +633,107 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_loopback_bypass_uses_resolved_backend_and_skips_sandboxes() {
+        for (agent_key, wrapper_base, command, sandboxed, expected) in [
+            ("codex", None, "/custom/adapter", false, true),
+            ("claude", None, "codex-acp", false, false),
+            ("custom", None, "codex-acp", false, false),
+            ("wrapper", Some("codex"), "/custom/wrapper", false, true),
+            ("codex", Some("claude"), "codex-acp", false, false),
+            ("codex", None, "codex-acp", true, false),
+        ] {
+            let mut config = env_test_spawn_config(std::env::temp_dir());
+            config.agent_key = agent_key.into();
+            config.spec.command = command.into();
+            config.wrapper_substitution = wrapper_base.map(|base| (agent_key.into(), base.into()));
+            if sandboxed {
+                config.sandbox_info = Some(SandboxInfo {
+                    provider: None,
+                    enabled: true,
+                    container_id: None,
+                    image: "alpine:latest".into(),
+                    container_name: "aoe-codex-bypass-test".into(),
+                    extra_env: None,
+                    custom_instruction: None,
+                    before_start_env: Vec::new(),
+                    container_workdir: None,
+                });
+            }
+            let mut cmd = std::process::Command::new(command);
+            cmd.env_clear();
+            apply_host_codex_loopback_bypass(&mut cmd, &config, &[]);
+            for key in ["NO_PROXY", "no_proxy"] {
+                assert_eq!(
+                    effective_env_value(&cmd, key).as_deref(),
+                    expected.then_some("localhost,127.0.0.1,::1"),
+                    "{agent_key}, {wrapper_base:?}, sandboxed={sandboxed}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn codex_loopback_bypass_stdio_respects_final_environment_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]);
+        for layer in ["none", "provider", "host", "routing", "allowlist"] {
+            let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+            config.agent_key = "codex".into();
+            let setting = vec![("no_proxy".into(), String::new())];
+            match layer {
+                "provider" => config.provider_env = setting,
+                "host" => config.host_environment = setting,
+                "routing" => config.provider_routing = setting,
+                "allowlist" => config.spec.env_allowlist = Some(vec!["no_proxy".into()]),
+                _ => {}
+            }
+            let _allowlist = (layer == "allowlist")
+                .then(|| crate::session::test_support::EnvGuard::set(&[("no_proxy", "")]));
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "printf '%s|%s' \"$NO_PROXY\" \"$no_proxy\""]);
+            apply_stdio_env(&mut cmd, &config, &[]);
+            assert_eq!(
+                effective_env_value(cmd.as_std(), "no_proxy").as_deref(),
+                Some(if layer == "none" {
+                    "localhost,127.0.0.1,::1"
+                } else {
+                    ""
+                }),
+                "{layer}"
+            );
+            assert_eq!(
+                effective_env_value(cmd.as_std(), "NO_PROXY").is_some(),
+                layer == "none",
+                "{layer}"
+            );
+            let output = cmd.as_std_mut().output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if layer == "none" {
+                    b"localhost,127.0.0.1,::1|localhost,127.0.0.1,::1".as_slice()
+                } else {
+                    b"|".as_slice()
+                },
+                "{layer}"
+            );
+        }
     }
 
     #[tokio::test]

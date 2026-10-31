@@ -252,6 +252,14 @@ pub(crate) use platform::unix_peer_uid;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::detach_daemon_stdin;
 
+/// Apply macOS loopback proxy defaults without overriding explicit policy.
+pub(crate) fn apply_codex_loopback_bypass(cmd: &mut Command, overrides: &[(String, String)]) {
+    #[cfg(target_os = "macos")]
+    macos::apply_codex_loopback_bypass(cmd, overrides);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (cmd, overrides);
+}
+
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     #[cfg(target_os = "macos")]
