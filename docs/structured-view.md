@@ -156,8 +156,6 @@ Select a session in the expanded **Trash** section to read its retained ACP
 transcript. Inspection never starts an agent or prepares a terminal or tool pane,
 regardless of the session's current view or click preference.
 
-![Read-only Trash inspection with retained ACP history and a text selection](assets/structured-view/trash-readonly.png)
-
 Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
 footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
 **Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
