@@ -1292,30 +1292,30 @@ impl HomeView {
         if width == 0 || view.total_lines == 0 {
             return None;
         }
-        // The structured preview's transcript is its own line source: the view re-derives
-        // the pre-wrapped rows the renderer painted (`wrapped_transcript`), so slicing
-        // maps one-to-one onto the on-screen cells. Terminal previews read the tmux cache.
+        // Retained copy borrows the painted projection; live previews rebuild their line source.
         let retained = self
             .selected_session
             .as_deref()
             .and_then(|id| self.get_instance(id))
             .filter(|inst| inst.is_trashed());
-        let structured_lines = if let Some(inst) = retained {
-            Some(
-                self.retained_preview
-                    .as_ref()
-                    .filter(|view| view.matches(inst))
-                    .map_or_else(Default::default, |view| view.selection_text(width)),
-            )
-        } else {
+        let structured_lines = if retained.is_none() {
             self.structured_preview
                 .as_ref()
                 .filter(|_| self.structured_transcript_painted)
-                .map(|v| v.selection_text(width))
+                .map(|view| view.selection_text(width))
+        } else {
+            None
         };
-        let lines = match structured_lines.as_ref() {
-            Some(text) => text,
-            None => self.active_preview_cache().parsed_text.as_ref()?,
+        let lines = if let Some(inst) = retained {
+            self.retained_preview
+                .as_ref()
+                .filter(|view| view.matches(inst))?
+                .rendered_text(width)?
+        } else {
+            match structured_lines.as_ref() {
+                Some(text) => text,
+                None => self.active_preview_cache().parsed_text.as_ref()?,
+            }
         };
         // Resolve `from_bottom` distances against the same `total_lines` the renderer used
         // this frame, so the copied range matches the painted highlight cell for cell.

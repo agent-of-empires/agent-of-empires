@@ -3821,19 +3821,26 @@ mod tests {
             Some(endpoint),
             &inst,
         ));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+        let theme = crate::tui::styles::Theme::default();
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 ticker.tick().await;
                 app.reconcile_structured_preview().await;
+                terminal
+                    .draw(|frame| {
+                        app.home
+                            .render(frame, frame.area(), &theme, None, None, None);
+                    })
+                    .unwrap();
                 if app
                     .home
                     .retained_preview
                     .as_ref()
                     .unwrap()
-                    .selection_text(80)
-                    .to_string()
-                    .contains("OLD-RETAINED")
+                    .rendered_text(app.home.preview_text_view.pane.width)
+                    .is_some_and(|text| text.to_string().contains("OLD-RETAINED"))
                 {
                     break;
                 }
@@ -3843,8 +3850,6 @@ mod tests {
         .unwrap();
         app.home.retained_focus = Some((id.clone(), inst.lifecycle_generation));
         app.home.retained_scroll_offset = 7;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
-        let theme = crate::tui::styles::Theme::default();
         terminal
             .draw(|frame| {
                 app.home
@@ -3879,6 +3884,66 @@ mod tests {
             .preview_copy_text
             .as_ref()
             .is_some_and(|text| text.contains("OLD")));
+        terminal
+            .draw(|frame| {
+                app.home
+                    .render(frame, frame.area(), &theme, None, None, None);
+            })
+            .unwrap();
+        assert!(
+            app.home.preview_selection.is_some(),
+            "unchanged repaint keeps selection"
+        );
+        assert!(app.home.preview_copy_text.is_some());
+        for resize in [false, true] {
+            let changed_theme = crate::tui::styles::Theme {
+                text: ratatui::style::Color::Yellow,
+                ..theme.clone()
+            };
+            terminal = Terminal::new(ratatui::backend::TestBackend::new(
+                if resize { 180 } else { 200 },
+                40,
+            ))
+            .unwrap();
+            terminal
+                .draw(|frame| {
+                    app.home.render(
+                        frame,
+                        frame.area(),
+                        if resize { &theme } else { &changed_theme },
+                        None,
+                        None,
+                        None,
+                    );
+                })
+                .unwrap();
+            assert!(app.home.preview_selection.is_none());
+            assert!(!app.home.preview_copy_pending);
+            assert!(app.home.take_preview_copy_text().is_none());
+            assert!(app.home.retained_reader_focused());
+            assert_eq!(app.home.retained_scroll_offset, 7);
+            terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.home
+                        .render(frame, frame.area(), &theme, None, None, None);
+                })
+                .unwrap();
+            assert!(app.home.handle_drag_start(x, y));
+            assert!(app.home.handle_drag_move(x + 8, y));
+            app.home.handle_drag_end();
+            terminal
+                .draw(|frame| {
+                    app.home
+                        .render(frame, frame.area(), &theme, None, None, None);
+                })
+                .unwrap();
+            assert!(app
+                .home
+                .preview_copy_text
+                .as_ref()
+                .is_some_and(|text| text.contains("OLD")));
+        }
         state
             .acp_event_store
             .record(
@@ -3894,14 +3959,19 @@ mod tests {
             loop {
                 ticker.tick().await;
                 app.reconcile_structured_preview().await;
+                terminal
+                    .draw(|frame| {
+                        app.home
+                            .render(frame, frame.area(), &theme, None, None, None);
+                    })
+                    .unwrap();
                 if app
                     .home
                     .retained_preview
                     .as_ref()
                     .unwrap()
-                    .selection_text(80)
-                    .to_string()
-                    .contains("NEW-RETAINED")
+                    .rendered_text(app.home.preview_text_view.pane.width)
+                    .is_some_and(|text| text.to_string().contains("NEW-RETAINED"))
                 {
                     break;
                 }

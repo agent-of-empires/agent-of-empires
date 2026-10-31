@@ -3254,6 +3254,7 @@ impl HomeView {
         // Seed the text-view snapshot inert: the output branches refine it once they know
         // their pane rect and line count, and the no-scrollback paths leave it here so a
         // drag-select over them does nothing.
+        let previous_text_area = self.preview_text_view.pane;
         self.preview_text_view = crate::tui::home::PreviewTextView::default();
         frame.render_widget(block, area);
 
@@ -3348,7 +3349,7 @@ impl HomeView {
 
         if selected_trashed {
             self.structured_transcript_painted = true;
-            self.render_trashed_preview(frame, inner, theme);
+            self.render_trashed_preview(frame, inner, theme, previous_text_area);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -3973,7 +3974,13 @@ impl HomeView {
         );
     }
 
-    fn render_trashed_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_trashed_preview(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        previous_text_area: Rect,
+    ) {
         let inst = self
             .selected_session
             .as_ref()
@@ -3993,18 +4000,22 @@ impl HomeView {
         let areas = Layout::vertical([Constraint::Length(height), Constraint::Min(0)]).split(area);
         frame.render_widget(Paragraph::new(errors).wrap(Wrap { trim: false }), areas[0]);
         let area = areas[1];
-        if let Some(view) = self
+        let matching = self
             .retained_preview
             .as_ref()
-            .filter(|view| inst.is_some_and(|inst| view.matches(inst)))
-        {
-            let geometry = view.render(
+            .is_some_and(|view| inst.is_some_and(|inst| view.matches(inst)));
+        let focused = self.retained_reader_focused();
+        if matching {
+            let (geometry, changed) = self.retained_preview.as_mut().unwrap().render(
                 frame,
                 area,
                 theme,
                 self.retained_scroll_offset,
-                self.retained_reader_focused(),
+                focused,
             );
+            if changed || previous_text_area != geometry.text_area {
+                self.clear_preview_selection();
+            }
             if geometry.total_lines > 0 {
                 self.retained_scroll_offset = self.retained_scroll_offset.min(
                     geometry

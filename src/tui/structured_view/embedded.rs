@@ -40,6 +40,13 @@ pub enum EmbeddedEvent {
 const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const RETAINED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+struct RetainedTextCache {
+    width: u16,
+    theme: Theme,
+    roots: Option<crate::acp::session_paths::SessionPathRoots>,
+    text: ratatui::text::Text<'static>,
+}
+
 /// Retained transcript reader. No WebSocket, composer dispatcher, or worker setup.
 pub struct RetainedView {
     session_id: String,
@@ -47,6 +54,7 @@ pub struct RetainedView {
     generation: u64,
     state: Option<StructuredViewState>,
     unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
+    text_cache: Option<RetainedTextCache>,
     load: Option<tokio::task::JoinHandle<()>>,
     result: tokio::sync::oneshot::Receiver<
         Result<Option<crate::acp::client::http::RetainedReplay>, String>,
@@ -69,6 +77,7 @@ impl RetainedView {
             generation: inst.lifecycle_generation,
             state: None,
             unfinished_outputs: Vec::new(),
+            text_cache: None,
             load: None,
             result,
             known_highest: None,
@@ -163,6 +172,7 @@ impl RetainedView {
                 if !changed {
                     return false;
                 }
+                self.text_cache = None;
                 let snapshot = replay.transcript;
                 let lost = replay.incomplete;
                 self.message = if snapshot.rows.is_empty() && snapshot.unfinished_outputs.is_empty()
@@ -194,8 +204,18 @@ impl RetainedView {
         true
     }
 
-    pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        self.state
+    fn prepare_text(&mut self, width: u16, theme: &Theme) -> bool {
+        let roots = self
+            .state
+            .as_ref()
+            .and_then(|state| state.path_roots.as_ref());
+        if self.text_cache.as_ref().is_some_and(|cache| {
+            cache.width == width && &cache.theme == theme && cache.roots.as_ref() == roots
+        }) {
+            return false;
+        }
+        let text = self
+            .state
             .as_ref()
             .filter(|state| {
                 !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
@@ -203,21 +223,35 @@ impl RetainedView {
             .map_or_else(Default::default, |state| {
                 render::wrapped_transcript(
                     state,
-                    &Theme::default(),
+                    theme,
                     width,
                     render::ToolOutputMode::Retained(&self.unfinished_outputs),
                 )
-            })
+            });
+        self.text_cache = Some(RetainedTextCache {
+            width,
+            theme: theme.clone(),
+            roots: roots.cloned(),
+            text,
+        });
+        true
+    }
+
+    pub fn rendered_text(&self, width: u16) -> Option<&ratatui::text::Text<'static>> {
+        self.text_cache
+            .as_ref()
+            .filter(|cache| cache.width == width)
+            .map(|cache| &cache.text)
     }
 
     pub fn render(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
         offset: usize,
         focused: bool,
-    ) -> render::TranscriptGeometry {
+    ) -> (render::TranscriptGeometry, bool) {
         use ratatui::{style::Style, widgets::Paragraph};
         let mut status = Vec::new();
         render::wrap_line_into(
@@ -246,31 +280,43 @@ impl RetainedView {
             chunks[1],
         );
         let text_area = chunks[2];
-        let mut text = self
-            .state
-            .as_ref()
-            .filter(|state| {
-                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
-            })
-            .map_or_else(Default::default, |state| {
-                render::wrapped_transcript(
-                    state,
-                    theme,
-                    text_area.width,
-                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
-                )
-            });
+        if text_area.is_empty() {
+            return (
+                render::TranscriptGeometry {
+                    text_area,
+                    first_line: 0,
+                    total_lines: 0,
+                },
+                false,
+            );
+        }
+        let changed = self.prepare_text(text_area.width, theme);
+        let text = self.rendered_text(text_area.width).unwrap();
         let total = text.lines.len();
         let max = total.saturating_sub(text_area.height as usize);
         let first = max.saturating_sub(offset);
-        text.lines.drain(..first);
-        text.lines.truncate(text_area.height as usize);
-        frame.render_widget(Paragraph::new(text), text_area);
-        render::TranscriptGeometry {
-            text_area,
-            first_line: first,
-            total_lines: total,
+        frame.buffer_mut().set_style(text_area, text.style);
+        for (row, line) in text.lines[first..]
+            .iter()
+            .take(text_area.height as usize)
+            .enumerate()
+        {
+            // Buffer advances spans with CellWidth, matching wrapping and selection.
+            frame.buffer_mut().set_line(
+                text_area.x,
+                text_area.y.saturating_add(row as u16),
+                line,
+                text_area.width,
+            );
         }
+        (
+            render::TranscriptGeometry {
+                text_area,
+                first_line: first,
+                total_lines: total,
+            },
+            changed,
+        )
     }
 }
 
@@ -516,6 +562,167 @@ mod retained_tests {
     };
     use std::{sync::Arc, time::Duration};
 
+    fn prepared_text(view: &mut RetainedView, width: u16) -> &ratatui::text::Text<'static> {
+        view.prepare_text(width, &Theme::default());
+        view.rendered_text(width).unwrap()
+    }
+
+    #[test]
+    fn retained_painted_cells_match_copy_across_styled_graphemes() {
+        use crate::acp::state::Event;
+        use ratatui::style::Modifier;
+        use unicode_segmentation::UnicodeSegmentation;
+        for prefix in ["ﾊﾟ", "♥️", "e\u{301}"] {
+            let inst = crate::session::Instance::new("styled copy", "/tmp");
+            let endpoint = DaemonEndpoint::new(
+                "http://127.0.0.1:1".into(),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            );
+            let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+            let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+            let mut model = crate::acp::transcript::TranscriptModel::new();
+            model.apply_event(
+                1,
+                &Event::AgentMessageChunk {
+                    text: format!("{prefix} **tail**"),
+                    message_id: None,
+                },
+            );
+            state.transcript.server_rows = model.into_rows();
+            let mut view = RetainedView::new(None, &inst);
+            view.state = Some(state);
+            for width in [8, 32] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+                let mut geometry = None;
+                terminal
+                    .draw(|frame| {
+                        geometry = Some(
+                            view.render(frame, frame.area(), &Theme::default(), usize::MAX, true)
+                                .0,
+                        );
+                    })
+                    .unwrap();
+                let geometry = geometry.unwrap();
+                let text = view.rendered_text(width).unwrap();
+                let buffer = terminal.backend().buffer();
+                for (index, line) in text.lines.iter().enumerate() {
+                    let columns = crate::tui::components::text::line_columns(line, width);
+                    let y = geometry.text_area.y + index as u16;
+                    for (byte, grapheme) in columns.text.grapheme_indices(true) {
+                        let x = geometry.text_area.x + columns.column_at(byte);
+                        assert_eq!(
+                            buffer[(x, y)].symbol(),
+                            grapheme,
+                            "{prefix}, width={width}, x={x}"
+                        );
+                    }
+                    if let Some(byte) = columns.text.find("tail") {
+                        let x = geometry.text_area.x + columns.column_at(byte);
+                        assert_eq!(
+                            columns.slice(x - geometry.text_area.x, x - geometry.text_area.x + 4),
+                            "tail"
+                        );
+                        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_projection_tracks_width_theme_and_path_roots() {
+        use crate::acp::state::{DiffPreview, Event, ToolCall};
+        use ratatui::style::Color;
+        let inst = crate::session::Instance::new("projection", "/repo");
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:1".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        model.apply_event(
+            1,
+            &Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "projection".into(),
+                    name: "ProjectionTool".into(),
+                    kind: "edit".into(),
+                    args_preview: "arguments ".repeat(12),
+                    started_at: at,
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: vec![DiffPreview {
+                        path: "/repo/src/test.rs".into(),
+                        old_text: Some("before".into()),
+                        new_text: Some("after".into()),
+                        created_at: at,
+                    }],
+                },
+            },
+        );
+        model.apply_event(
+            2,
+            &Event::ToolCallCompleted {
+                tool_call_id: "projection".into(),
+                is_error: false,
+                content: "BODY-TEXT ♥️ e\u{301} 界 END".into(),
+                output: Vec::new(),
+                completed_at: at,
+                async_subagent: false,
+            },
+        );
+        state.transcript.server_rows = model.into_rows();
+        let mut view = RetainedView::new(None, &inst);
+        view.state = Some(state);
+        assert!(view.rendered_text(80).is_none());
+        for (width, color, relative) in [
+            (80, Color::Red, false),
+            (32, Color::Red, false),
+            (80, Color::Cyan, false),
+            (80, Color::Cyan, true),
+        ] {
+            view.state.as_mut().unwrap().path_roots =
+                relative.then(|| crate::acp::session_paths::SessionPathRoots {
+                    id: inst.id.clone(),
+                    project_path: "/repo".into(),
+                    main_repo_path: None,
+                    workspace_repos: Vec::new(),
+                });
+            let theme = Theme {
+                text: color,
+                ..Theme::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            let mut geometry = None;
+            terminal
+                .draw(|frame| {
+                    geometry = Some(view.render(frame, frame.area(), &theme, usize::MAX, true).0);
+                })
+                .unwrap();
+            let geometry = geometry.unwrap();
+            let copied = view.rendered_text(width).unwrap().to_string();
+            assert!(copied.contains("BODY-TEXT ♥️ e\u{301} 界 END"));
+            let path = if relative {
+                "Before: src/test.rs"
+            } else {
+                "Before: /repo/src/test.rs"
+            };
+            assert!(copied.contains(path), "{copied}");
+            assert!(view.rendered_text(width - 1).is_none());
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, geometry.text_area.y)].fg, color);
+            let painted: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(painted.contains("ProjectionTool"));
+            assert!(painted.contains(path));
+        }
+    }
+
     #[test]
     fn trash_home_reaches_history_beyond_u16_lines() {
         let inst = crate::session::Instance::new("large retained", "/tmp");
@@ -547,6 +754,7 @@ mod retained_tests {
             .draw(|frame| {
                 first = view
                     .render(frame, frame.area(), &Theme::default(), usize::MAX, false)
+                    .0
                     .first_line;
             })
             .unwrap();
@@ -629,8 +837,7 @@ mod retained_tests {
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {
-                    let copied = view
-                        .selection_text(width)
+                    let copied = prepared_text(&mut view, width)
                         .lines
                         .iter()
                         .map(ToString::to_string)
@@ -769,7 +976,7 @@ mod retained_tests {
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {
-                    let copied = view.selection_text(width).to_string();
+                    let copied = prepared_text(&mut view, width).to_string();
                     let mut terminal =
                         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20))
                             .unwrap();
@@ -933,7 +1140,7 @@ mod retained_tests {
                 .unwrap()
                 .unwrap();
             assert!(view.tick());
-            let copied = view.selection_text(80).to_string();
+            let copied = prepared_text(&mut view, 80).to_string();
             assert!(
                 copied.contains("UNFINISHED-TAIL"),
                 "started={started}: {copied}"
@@ -1032,7 +1239,7 @@ mod retained_tests {
                 .unwrap()
                 .unwrap();
             assert!(view.tick());
-            let before = view.selection_text(80).to_string();
+            let before = prepared_text(&mut view, 80).to_string();
             assert!(before.contains("BEFORE-TEARDOWN"));
             assert!(before.contains("completion unavailable"));
             if !summary_races {
@@ -1063,14 +1270,14 @@ mod retained_tests {
                 loop {
                     ticker.tick().await;
                     view.tick();
-                    if view.selection_text(80).to_string().contains('◼') {
+                    if prepared_text(&mut view, 80).to_string().contains('◼') {
                         break;
                     }
                 }
             })
             .await
             .expect("mounted reader must acquire persisted final output without reselection");
-            let copied = view.selection_text(80).to_string();
+            let copied = prepared_text(&mut view, 80).to_string();
             let expected = if summary_races {
                 "BEFORE-TEARDOWN"
             } else {
@@ -1166,8 +1373,7 @@ mod retained_tests {
             finish(view).await
         }
         assert!(finish(&mut view).await);
-        assert!(view
-            .selection_text(80)
+        assert!(prepared_text(&mut view, 80)
             .to_string()
             .contains("KEEP-ON-ERROR"));
         assert!(!view.tick(), "not due");
@@ -1179,7 +1385,8 @@ mod retained_tests {
         assert!(refresh(&mut view).await);
         assert!(view.message.contains("503"));
         assert!(view
-            .selection_text(80)
+            .rendered_text(80)
+            .unwrap()
             .to_string()
             .contains("KEEP-ON-ERROR"));
         assert!(
@@ -1192,13 +1399,12 @@ mod retained_tests {
             "recovery at unchanged watermark must reload"
         );
         assert!(!view.message.contains("failed"));
-        assert!(view
-            .selection_text(80)
+        assert!(prepared_text(&mut view, 80)
             .to_string()
             .contains("KEEP-ON-ERROR"));
         state.acp_event_store.delete_session(&id);
         assert!(refresh(&mut view).await);
-        assert!(view.selection_text(80).lines.is_empty());
+        assert!(prepared_text(&mut view, 80).lines.is_empty());
         assert!(view.message.contains("No readable retained ACP content"));
         state
             .acp_event_store
@@ -1212,7 +1418,7 @@ mod retained_tests {
             )
             .unwrap();
         assert!(refresh(&mut view).await);
-        let text = view.selection_text(80).to_string();
+        let text = prepared_text(&mut view, 80).to_string();
         assert!(text.contains("RESET-RETAINED"));
         assert!(!text.contains("KEEP-ON-ERROR"));
         state
@@ -1251,7 +1457,9 @@ mod retained_tests {
             .unwrap();
         view.next_recheck = Instant::now();
         assert!(refresh(&mut view).await);
-        assert!(view.selection_text(80).to_string().contains("BACKFILLED"));
+        assert!(prepared_text(&mut view, 80)
+            .to_string()
+            .contains("BACKFILLED"));
         assert!(!view.message.contains("incomplete"));
         server.abort();
         let _ = server.await;
@@ -1331,7 +1539,7 @@ mod retained_tests {
             .unwrap();
         assert!(failed.tick());
         assert!(failed.message.contains("503"), "{}", failed.message);
-        assert!(failed.selection_text(60).lines.is_empty());
+        assert!(prepared_text(&mut failed, 60).lines.is_empty());
         server.abort();
         let _ = server.await;
     }

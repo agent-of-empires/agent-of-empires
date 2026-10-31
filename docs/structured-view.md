@@ -176,6 +176,10 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
+Painting and copying use the same wrapped document. Scrolling reuses it instead
+of rebuilding the full history. Resizing or changing the theme clears the
+previous text selection.
+
 While selected, the reader checks the highest persisted ACP sequence every two
 seconds and reloads when it changes. It also rereads incomplete histories to
 acquire events committed out of order. An identical incomplete replay backs off
