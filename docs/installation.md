@@ -52,12 +52,17 @@ Local Unix transport requires a current-user-owned `daemon/` directory with mode
 group-write bits, including under umask `002`; it does not change existing
 `~/.config` permissions. On each daemon start, AoE removes group and other write
 permissions from an existing application directory owned by the current user.
-Follow the recovery advice for the refused directory:
-set `daemon/` to mode `0700`, or remove both group and other write permissions from
-another refused ancestor, then retry. A directory owned by another user also
-requires ownership recovery; changing its mode alone is not sufficient.
+If the parent chain is unsafe, repair its unsafe ancestors from the highest down,
+or select a location with trusted ancestors, then retry before changing the
+refused directory. Once the parent chain is trusted, follow the recovery advice:
+set `daemon/` to mode `0700`, or remove both group and other write permissions
+from another refused ancestor. A directory owned by another user also requires
+ownership recovery; changing its mode alone is not sufficient.
 
-Daemon directory refusals report escaped paths and recovery guidance. Paths containing non-UTF-8 bytes, control characters, bidirectional formatting characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
+Daemon directory refusals report escaped paths and recovery guidance. Paths with
+an unsafe parent chain, non-UTF-8 bytes, control characters, bidirectional
+formatting characters, or backticks receive manual instructions instead of a
+shell command.
 
 ## Downgrading
 
