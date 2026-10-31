@@ -1056,7 +1056,19 @@ fn trash_retained_transcript_is_read_only() {
         });
     }
     h.wait_for("SUCCESS-OUTPUT-END");
-    let screen = h.capture_screen();
+    let screen = wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let screen = h.capture_screen();
+        let middle = screen.lines().count() / 2;
+        let row = screen
+            .lines()
+            .position(|line| line.contains("SUCCESS-OUTPUT-END"))
+            .ok_or_else(|| "waiting for retained tool tail".to_string())?;
+        if row.abs_diff(middle) <= 1 {
+            return Ok(screen);
+        }
+        h.send_keys(if row < middle { "Up" } else { "Down" });
+        Err("moving retained tool tail away from autoscroll edges".to_string())
+    });
     let (y, line) = screen
         .lines()
         .enumerate()
