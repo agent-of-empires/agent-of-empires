@@ -20,7 +20,7 @@ pub(crate) mod vt;
 
 pub use composite::PaneGeom;
 pub use detect::{HookObservation, Observation, ObservationKey};
-pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
+pub(crate) use session::{submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::{detect_status_from_content_in, DetectionPlan};
@@ -273,7 +273,7 @@ pub(crate) fn native_socket_locator() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn tmux_query_command_for_socket(socket: &str) -> Command {
+pub(crate) fn tmux_query_command_for_socket(socket: &str) -> Command {
     let mut cmd = Command::new("tmux");
     cmd.args(["-S", socket, "-u"]);
     cmd.env_remove("TMUX");
@@ -340,6 +340,30 @@ pub struct PaneMetadata {
     /// the signal the passive-resize reconcile can compare against what it
     /// applied without false mismatches.
     pub window_size: Option<(u16, u16)>,
+}
+
+impl PaneMetadata {
+    pub(crate) fn physical_observation(
+        &self,
+    ) -> Option<std::sync::Arc<crate::session::LegacyToolObservation>> {
+        let server = self.server.as_ref()?;
+        if !ToolSession::valid_pane_ids(&self.session_id, &self.pane_id)
+            || self
+                .pane_pid
+                .is_some_and(|pid| pid == 0 || i32::try_from(pid).is_err())
+            || (!self.pane_dead && self.pane_pid.is_none())
+        {
+            return None;
+        }
+        Some(std::sync::Arc::new(crate::session::LegacyToolObservation {
+            identity: crate::session::LegacyToolIdentity {
+                session_id: self.session_id.clone(),
+                pane_id: self.pane_id.clone(),
+                pane_pid: self.pane_pid,
+            },
+            server: server.clone(),
+        }))
+    }
 }
 
 static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -447,7 +471,7 @@ impl TmuxCommandDeadline {
     }
 
     #[cfg(test)]
-    fn expiring_after_commands(commands: i64) -> Self {
+    pub(crate) fn expiring_after_commands(commands: i64) -> Self {
         Self {
             deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
             budget: Some(CommandBudget(std::sync::atomic::AtomicI64::new(commands))),
@@ -1396,48 +1420,35 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
     );
     let mut command = tmux_query_command();
-    command.args(["list-panes", "-a", "-F", format]);
+    command.args([
+        "display-message",
+        "-p",
+        "#{socket_path}|#{pid}",
+        ";",
+        "list-panes",
+        "-a",
+        "-F",
+        format,
+    ]);
     let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let mut panes = parse_pane_metadata(&stdout);
-            if panes.iter().any(|(name, pane)| {
-                name.starts_with(TOOL_PREFIX)
-                    && (pane.pane_dead || matches!(pane.tool_owner, ToolPaneOwner::Unmarked))
-            }) {
-                if let Ok(server) = ToolSession::server_identity() {
-                    let mut command = tmux_query_command_for_socket(&server.socket);
-                    command.args([
-                        "display-message",
-                        "-p",
-                        "#{pid}",
-                        ";",
-                        "list-panes",
-                        "-a",
-                        "-F",
-                        format,
-                    ]);
-                    if let Ok(output) = run_tmux_command_with_timeout(&mut command) {
-                        let output_text = String::from_utf8_lossy(&output.stdout);
-                        if let Some((pid, rows)) = output_text.split_once('\n') {
-                            if output.status.success()
-                                && pid.trim().parse::<u32>().ok() == Some(server.pid)
-                                && crate::process::process_birth_is_live(server.pid, &server.birth)
-                                    .unwrap_or(false)
-                            {
-                                panes = parse_pane_metadata(rows);
-                                let server = std::sync::Arc::new(server);
-                                for (name, pane) in &mut panes {
-                                    if name.starts_with(TOOL_PREFIX) {
-                                        pane.server = Some(server.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let (header, rows) = stdout
+                .split_once('\n')
+                .ok_or_else(|| anyhow::anyhow!("pane inventory omitted tmux server identity"))?;
+            let (socket, pid) = parse_tmux_server_identity(header)?;
+            let birth = crate::process::process_birth_identity(pid)?
+                .ok_or_else(|| anyhow::anyhow!("pane inventory server birth unavailable"))?;
+            let server = std::sync::Arc::new(crate::session::TmuxServerIdentity {
+                socket: socket.to_owned(),
+                pid,
+                birth,
+            });
+            let mut panes = parse_pane_metadata(rows);
+            for pane in panes.values_mut() {
+                pane.server = Some(server.clone());
             }
             Ok(panes)
         }

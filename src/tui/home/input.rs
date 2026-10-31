@@ -4573,7 +4573,13 @@ impl HomeView {
                 return true;
             }
         }
-        live_send::send_key_oneshot(target, key);
+        let Some(id) = self.selected_session.as_deref() else {
+            return false;
+        };
+        let Some(lease) = self.session_feed.preview_input_lease(id, target) else {
+            return false;
+        };
+        live_send::send_key_oneshot(lease, key);
         true
     }
 
@@ -6574,6 +6580,15 @@ impl HomeView {
     /// Deliberately does not restore the window's sizing: the new owner already resized
     /// the window, and `window-size latest` would stomp it.
     pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        if let Some(error) = self
+            .live_send_worker
+            .as_ref()
+            .and_then(|worker| worker.take_input_error())
+        {
+            self.teardown_live_send();
+            self.info_dialog = Some(InfoDialog::new("Live send ended", &error));
+            return true;
+        }
         if !self
             .live_send_worker
             .as_ref()

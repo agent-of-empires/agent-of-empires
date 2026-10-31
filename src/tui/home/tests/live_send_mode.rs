@@ -114,11 +114,7 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
     let mut env = create_test_env_with_sessions(1);
     let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
-    env.view.live_send_worker = Some(LiveSendWorker::spawn(
-        "fake".to_string(),
-        None,
-        crate::tui::session_feed::NativeLease::valid_for_test(),
-    ));
+    env.view.live_send_worker = Some(LiveSendWorker::notification_fixture_for_test());
 
     // Flag not set: the poll is a no-op and live mode stays.
     assert!(!env.view.poll_live_send_takeover());
@@ -143,6 +139,29 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
         "dialog must explain the takeover, got: {}",
         dialog.message()
     );
+}
+
+#[test]
+#[serial]
+fn unavailable_native_input_scope_ends_live_mode_without_restart() {
+    use crate::tui::home::live_send::LiveSendWorker;
+    let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    install_live_for_first_session(&mut env);
+    env.view.live_send_worker = Some(LiveSendWorker::spawn(
+        None,
+        crate::tui::session_feed::NativeLease::valid_for_test(),
+    ));
+    assert!(env.view.poll_live_send_takeover());
+    assert!(env.view.live_send.is_none());
+    assert!(env.view.live_send_worker.is_none());
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("input refusal is visible");
+    assert_eq!(dialog.title(), "Live send ended");
+    assert!(dialog.message().contains("ownership"));
 }
 
 /// Ctrl+q is the safety chord: it exits cleanly even when the session vanished, so a stuck
@@ -284,6 +303,7 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
                     tool_name: "lazygit".to_owned(),
                 },
                 pane: crate::session::PaneObservation {
+                    physical: None,
                     state: crate::session::PanePresence::Alive,
                     tmux_session: Some("tool".into()),
                     legacy_tool: None,
@@ -660,6 +680,7 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
                     state,
                     tmux_session: Some("host".into()),
                     legacy_tool: None,
+                    physical: None,
                 },
             }];
         });
@@ -1295,7 +1316,12 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
             Ok(())
         })
         .unwrap();
-    let mut released = env.view.get_instance(&id).cloned().expect("instance");
+    let mut released = storage
+        .load_instances_complete()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("fresh durable action");
     released
         .start_tool_with_size_in("probe", None, &storage, None, None)
         .unwrap();

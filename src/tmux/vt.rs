@@ -30,6 +30,7 @@ use crate::tmux::PaneCursor;
 /// bytes anyway, and an unbounded accumulator would let a malformed stream
 /// grow it forever).
 const OSC52_MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+const INPUT_WRITE_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Osc52State {
@@ -768,7 +769,7 @@ fn notify_change_wakeup(slot: &Mutex<Option<ChangeWakeup>>) {
 /// immediately, not just the visible screen.
 pub(crate) const SCROLLBACK_LINES: usize = 2000;
 
-fn lookup(session: &str) -> Option<Arc<VtChannel>> {
+pub(crate) fn lookup(session: &str) -> Option<Arc<VtChannel>> {
     REGISTRY
         .lock()
         .unwrap()
@@ -790,52 +791,6 @@ fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
         .and_then(Weak::upgrade)
 }
 
-/// DECCKM state of `session`'s pane as its *live* grid last saw it, readable
-/// whether or not the channel accepts socket input: `send-keys -H` is as
-/// literal as the socket, so the web terminal re-encodes cursor keys either
-/// way. `None` when no live channel exists.
-pub(crate) fn cursor_mode(session: &str) -> Option<bool> {
-    lookup(session)
-        .filter(|c| c.is_alive())
-        .map(|c| c.app_cursor.load(Ordering::Relaxed))
-}
-
-/// If `session` has a *live* armed channel, return its current cursor-key mode
-/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed, it is output-only, or
-/// its forwarder has disconnected. Presence of `Some` is the single-writer
-/// signal: while live, ALL pane input must go through [`try_send_input`]
-/// (never `send-keys`), so the two writers don't interleave. Gating on
-/// liveness means a dead channel reports `None` and input falls back to
-/// `send-keys` rather than vanishing.
-pub(crate) fn input_mode(session: &str) -> Option<bool> {
-    lookup(session)
-        .filter(|c| c.input && c.is_alive())
-        .map(|c| c.app_cursor.load(Ordering::Relaxed))
-}
-
-/// Deliver raw `bytes` to `session`'s pane via its channel. Returns `true` if
-/// written, `false` if no channel is armed or the forwarder hasn't connected.
-pub(crate) fn try_send_input(session: &str, bytes: &[u8]) -> bool {
-    lookup(session)
-        .map(|c| c.write_input(bytes))
-        .unwrap_or(false)
-}
-
-/// Paste `text` through `session`'s input channel as `paste-buffer -p` would, so it
-/// keeps its order with keystrokes on the same socket. `false` when no input-capable
-/// channel is live.
-pub(crate) fn try_send_paste(session: &str, text: &str) -> bool {
-    let Some(channel) = lookup(session).filter(|c| c.input && c.is_alive()) else {
-        return false;
-    };
-    let bracketed = channel
-        .parser
-        .lock()
-        .is_ok_and(|p| p.screen().bracketed_paste());
-    channel.write_input(&paste_bytes(text, bracketed))
-}
-
 /// tmux's paste: LF becomes CR, wrapped in bracketed-paste markers only when the pane
 /// enabled DECSET 2004.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
@@ -850,6 +805,19 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// Single-quote a path for the `/bin/sh -c` line `tmux pipe-pane` runs.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn pipe_executable() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(executable) = crate::process::test_support::executable() {
+        return Some(executable);
+    }
+    std::env::current_exe().ok()
+}
+
+#[cfg(test)]
+pub(crate) fn pipe_input_supported_for_test() -> bool {
+    tmux_supports_pipe_pane_input(&crate::tmux::TmuxCommandDeadline::new())
 }
 
 /// The pane's geometry AND cursor in one `display-message` fork:
@@ -2118,7 +2086,11 @@ fn run_reader_with_wait(
     };
     // Publish the writable half so input dispatch can reach the pane.
     if let Ok(w) = conn.try_clone() {
-        *ctx.stream.lock().unwrap() = Some(w);
+        // Keep raw transport blocking, but do not pin native lifecycle exclusion
+        // indefinitely when the receiving PTY stops draining. Failure is never replayed.
+        if w.set_write_timeout(Some(INPUT_WRITE_BUDGET)).is_ok() {
+            *ctx.stream.lock().unwrap() = Some(w);
+        }
     }
     // Now the live single-writer; `acquire` waits for this.
     VtLifecycle::Live.store(&ctx.lifecycle);
@@ -2249,6 +2221,7 @@ pub(crate) struct VtChannel {
     owner_id: String,
     /// Server-unique pane ID, fixed for this channel generation.
     target: String,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Writable half of the socket, `Some` once the forwarder connects. Shared
     /// with the reader thread, which fills it after `accept`.
@@ -2562,7 +2535,12 @@ impl VtChannel {
         if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
-        let target = super::utils::first_pane_id_with_deadline(name, deadline)?;
+        let (physical, state, _) = super::utils::observe_pane(name, deadline).ok()??;
+        if state != crate::tmux::utils::PaneProbe::Alive {
+            return None;
+        }
+        let physical = Arc::new(physical);
+        let target = physical.identity.pane_id.clone();
         // Arming only needs the geometry; the cursor rides along because the
         // probe is shared with `reconcile_grid` and costs one fork either way.
         let (cols, rows, _, _) = pane_size_cursor(&target, deadline)?;
@@ -2616,7 +2594,7 @@ impl VtChannel {
             session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
-        let Some(exe) = std::env::current_exe().ok() else {
+        let Some(exe) = pipe_executable() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
@@ -2734,11 +2712,16 @@ impl VtChannel {
                 VtRefreshResult::Busy => {}
             }
         }
-        if seed_result != VtRefreshResult::Refreshed {
+        if seed_result != VtRefreshResult::Refreshed
+            || !matches!(
+                super::utils::probe_owned_pane(name, &physical, deadline),
+                Ok(Some((crate::tmux::utils::PaneProbe::Alive, _, _)))
+            )
+        {
             tracing::warn!(
                 %target,
                 result = ?seed_result,
-                "vt: initial seed failed; falling back to capture"
+                "vt: initial seed or physical validation failed; falling back to capture"
             );
             stop_and_wake_reader(&stop, &sock_path);
             let _ = UnixStream::connect(&control_path);
@@ -2761,6 +2744,7 @@ impl VtChannel {
             input,
             owner_id: owner,
             target,
+            physical: Some(physical),
             parser,
             stream,
             app_cursor,
@@ -3328,16 +3312,75 @@ impl VtChannel {
         Some((since_last, self.prev_gap_ms.load(Ordering::Relaxed)))
     }
 
-    fn write_input(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn belongs_to(
+        &self,
+        physical: Option<&crate::session::LegacyToolObservation>,
+    ) -> bool {
+        self.physical.as_deref() == physical
+    }
+
+    pub(crate) fn input_mode(&self) -> Option<bool> {
+        (self.input && self.is_alive()).then(|| self.app_cursor.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn cursor_mode(&self) -> Option<bool> {
+        self.is_alive()
+            .then(|| self.app_cursor.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn paste_text(&self, text: &str) -> bool {
+        if self.input_mode().is_none() {
+            return false;
+        }
+        let bracketed = self
+            .parser
+            .lock()
+            .is_ok_and(|p| p.screen().bracketed_paste());
+        self.write_input(&paste_bytes(text, bracketed))
+    }
+
+    pub(crate) fn write_input(&self, bytes: &[u8]) -> bool {
         use std::io::Write;
-        if !self.input {
+        if !self.input || !self.is_alive() {
             return false;
         }
         let mut guard = self.stream.lock().unwrap();
-        match guard.as_mut() {
-            Some(stream) => stream.write_all(bytes).is_ok(),
-            None => false,
+        let Some(stream) = guard.as_mut() else {
+            return false;
+        };
+        let deadline = Instant::now() + INPUT_WRITE_BUDGET;
+        let mut pending = bytes;
+        let mut adjusted = false;
+        let delivered = loop {
+            if pending.is_empty() {
+                break true;
+            }
+            match stream.write(pending) {
+                Ok(0) => break false,
+                Ok(count) => pending = &pending[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break false,
+            }
+            if pending.is_empty() {
+                break true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            // SO_SNDTIMEO alone bounds one write, not a progressively drained
+            // batch. Only the uncommon partial/EINTR path adjusts the remainder.
+            if stream.set_write_timeout(Some(remaining)).is_err() {
+                break false;
+            }
+            adjusted = true;
+        };
+        if adjusted && stream.set_write_timeout(Some(INPUT_WRITE_BUDGET)).is_err() {
+            // Do not change a confirmed prefix/full write into a replay request.
+            // Retire only this writer; output has its own read-side descriptor.
+            *guard = None;
         }
+        delivered
     }
     pub(crate) fn shutdown_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
         if self.stop.swap(true, Ordering::Relaxed) {
@@ -3469,7 +3512,7 @@ impl Osc52Channel {
             session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
-        let Some(exe) = std::env::current_exe().ok() else {
+        let Some(exe) = pipe_executable() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
@@ -3659,12 +3702,26 @@ pub(crate) fn dummy_channel_with_input(
     dir: &std::path::Path,
     input: bool,
 ) -> (Arc<VtChannel>, Arc<AtomicU8>) {
+    dummy_channel_with_physical(name, dir, input, None)
+}
+
+#[cfg(test)]
+fn dummy_channel_with_physical(
+    name: &str,
+    dir: &std::path::Path,
+    input: bool,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+) -> (Arc<VtChannel>, Arc<AtomicU8>) {
     let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
     let ch = Arc::new(VtChannel {
         name: name.to_string(),
         input,
         owner_id: new_pipe_owner_id(),
-        target: format!("={name}:^"),
+        target: physical
+            .as_ref()
+            .map(|pane| pane.identity.pane_id.clone())
+            .unwrap_or_else(|| format!("={name}:^")),
+        physical,
         parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
         stream: Arc::new(Mutex::new(None)),
         app_cursor: Arc::new(AtomicBool::new(false)),
@@ -3713,6 +3770,28 @@ pub(crate) fn register_live_for_test(
         .unwrap()
         .insert(name.to_string(), Arc::downgrade(&channel));
     channel
+}
+
+#[cfg(test)]
+pub(crate) fn register_live_with_physical_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    physical: Arc<crate::session::LegacyToolObservation>,
+    app_cursor: bool,
+) -> (Arc<VtChannel>, UnixStream) {
+    let (channel, lifecycle) = dummy_channel_with_physical(name, dir, true, Some(physical));
+    let (stream, peer) = UnixStream::pair().expect("input pair");
+    stream
+        .set_write_timeout(Some(INPUT_WRITE_BUDGET))
+        .expect("bounded input writer");
+    *channel.stream.lock().unwrap() = Some(stream);
+    channel.app_cursor.store(app_cursor, Ordering::Relaxed);
+    VtLifecycle::Live.store(&lifecycle);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_owned(), Arc::downgrade(&channel));
+    (channel, peer)
 }
 
 #[cfg(test)]
@@ -4264,8 +4343,8 @@ mod tests {
                 .unwrap()
                 .insert(name.clone(), Arc::downgrade(&channel));
 
-            assert_eq!(input_mode(&name).is_some(), delivered, "input={input}");
-            assert_eq!(try_send_input(&name, b"x"), delivered, "input={input}");
+            assert_eq!(channel.input_mode().is_some(), delivered, "input={input}");
+            assert_eq!(channel.write_input(b"x"), delivered, "input={input}");
             let mut buf = [0u8; 8];
             let got = pane_side.read(&mut buf).unwrap_or(0);
             let want: &[u8] = if delivered { b"x" } else { b"" };
@@ -4284,11 +4363,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let channel = register_live_for_test(&name, dir.path(), false, true);
 
-        assert_eq!(cursor_mode(&name), Some(true));
-        assert_eq!(input_mode(&name), None);
+        assert_eq!(channel.cursor_mode(), Some(true));
+        assert_eq!(channel.input_mode(), None);
 
         VtLifecycle::fail(&channel.lifecycle);
-        assert_eq!(cursor_mode(&name), None, "a dead grid's mode is stale");
+        assert_eq!(channel.cursor_mode(), None, "a dead grid's mode is stale");
 
         unregister_for_test(&name);
     }

@@ -190,7 +190,7 @@ pub(super) struct PassiveSynced {
 
 pub(in crate::tui) struct ReadyNativeAttachment {
     pub id: String,
-    pub tmux_name: String,
+    pub terminal: std::sync::Arc<crate::daemon::TerminalTarget>,
     pub lease: crate::tui::session_feed::NativeLease,
     /// What the caller asked to do with this pane once it was ready.
     pub intent: crate::tui::home::panes::PaneIntent,

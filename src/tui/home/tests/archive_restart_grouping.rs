@@ -2463,6 +2463,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                     state: PanePresence::Alive,
                     tmux_session: Some("host".into()),
                     legacy_tool: None,
+                    physical: None,
                 },
             },
             AuxiliaryObservation {
@@ -2473,6 +2474,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                     state: PanePresence::Alive,
                     tmux_session: Some("tool".into()),
                     legacy_tool: None,
+                    physical: None,
                 },
             },
         ];

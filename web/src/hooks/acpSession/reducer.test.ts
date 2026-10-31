@@ -69,14 +69,21 @@ describe("locally resolved cards", () => {
     resolved: null,
   });
 
-  it("an approval removes its card and clears the error; an unknown nonce keeps both", () => {
-    const state = { ...empty(), lastError: "stale", pendingApprovals: [approval("n-1"), approval("n-2")] };
+  it("an approval clears only its matching interaction error; an unknown nonce keeps it", () => {
+    const state = reducer(
+      { ...empty(), pendingApprovals: [approval("n-1"), approval("n-2")] },
+      {
+        kind: "error",
+        message: "stale",
+        target: { kind: "approval", nonce: "n-1" },
+      },
+    );
     const next = reducer(state, { kind: "approval_resolved_locally", nonce: "n-1" });
     expect(next.pendingApprovals.map((a) => a.nonce)).toEqual(["n-2"]);
-    expect(next.lastError).toBeNull();
+    expect(next.interactionError).toBeNull();
     const noop = reducer(state, { kind: "approval_resolved_locally", nonce: "missing" });
     expect(noop.pendingApprovals).toHaveLength(2);
-    expect(noop.lastError).toBe("stale");
+    expect(noop.interactionError?.message).toBe("stale");
   });
 
   it("an accepted elicitation drops the card and records an optimistic answer row (#2209)", () => {
@@ -104,6 +111,91 @@ describe("locally resolved cards", () => {
       { kind: "elicitation_resolved_locally", nonce: "e-1", resolution },
     );
     expect(next.optimisticRows.some((r) => r.kind === "elicitation_answered")).toBe(false);
+  });
+
+  it("keeps canonical typed and legacy failures through local and remote card resolution, including a failed HTTP retry", () => {
+    const typed = {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      reported_code: -32603,
+      observed_at_ms: 100,
+    } as const;
+    for (const evidence of [undefined, null, typed]) {
+      for (const kind of ["approval", "elicitation"] as const) {
+        for (const delivery of ["local", "remote"] as const) {
+          const nonce = kind === "approval" ? "n-1" : "e-1";
+          let failed = applyEvent(
+            {
+              ...empty(),
+              pendingApprovals: [approval("n-1")],
+              pendingElicitations: [elicitation("e-1")],
+            },
+            {
+              session_id: "s",
+              seq: 1,
+              event: { PromptRuntimeError: { message: "canonical operation failed", evidence } },
+            },
+          );
+          failed = applyEvent(failed, { session_id: "s", seq: 2, event: { Stopped: { reason: "prompt_failed" } } });
+          const resolve = (state: AcpState, target: string): AcpState =>
+            delivery === "local"
+              ? reducer(
+                  state,
+                  kind === "approval"
+                    ? { kind: "approval_resolved_locally", nonce: target }
+                    : { kind: "elicitation_resolved_locally", nonce: target, resolution: { action: "decline" } },
+                )
+              : applyEvent(state, {
+                  session_id: "s",
+                  seq: 3,
+                  event:
+                    kind === "approval"
+                      ? { ApprovalResolved: { nonce: target, decision: "Allow" } }
+                      : { ElicitationResolved: { nonce: target, outcome: "Declined" } },
+                });
+          const direct = resolve(failed, nonce);
+          expect(direct.lastError).toBe("canonical operation failed");
+          expect(direct.lastErrorEvidence).toEqual(evidence ?? null);
+          const retryFailed = reducer(failed, {
+            kind: "error",
+            message: "resolution HTTP request failed",
+            target: { kind, nonce },
+          });
+          expect(retryFailed.lastError).toBe("canonical operation failed");
+          expect(retryFailed.lastErrorEvidence).toEqual(evidence ?? null);
+          expect(resolve(retryFailed, "other-nonce").interactionError?.message).toBe("resolution HTTP request failed");
+          const resolved = resolve(retryFailed, nonce);
+          expect(resolved.interactionError).toBeNull();
+          expect(resolved.lastError).toBe("canonical operation failed");
+          expect(resolved.lastErrorEvidence).toEqual(evidence ?? null);
+          const dismissedInteraction = reducer(retryFailed, { kind: "clear_error" });
+          expect(dismissedInteraction.lastError).toBe("canonical operation failed");
+          expect(dismissedInteraction.interactionError).toBeNull();
+          expect(reducer(dismissedInteraction, { kind: "clear_error" }).lastError).toBeNull();
+          const unscoped = reducer(failed, { kind: "error", message: "unrelated client request failed" });
+          expect(resolve(unscoped, nonce).interactionError?.message).toBe("unrelated client request failed");
+          const next = applyEvent(resolved, {
+            session_id: "s",
+            seq: 4,
+            event: { UserPromptSent: { text: "next explicit request", prompt_id: "p2" } },
+          });
+          expect(next.lastError).toBeNull();
+          expect(next.lastErrorEvidence).toBeNull();
+          expect(next.interactionError).toBeNull();
+          const boundaries: AcpFrame["event"][] = [
+            "SessionCleared",
+            { AgentSwitched: { from: "old", to: "new", reason: "explicit switch" } },
+          ];
+          for (const event of boundaries) {
+            const cleared = applyEvent(retryFailed, { session_id: "s", seq: 4, event });
+            expect(cleared.lastError).toBeNull();
+            expect(cleared.lastErrorEvidence).toBeNull();
+            expect(cleared.interactionError).toBeNull();
+          }
+        }
+      }
+    }
   });
 });
 

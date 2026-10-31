@@ -2,7 +2,6 @@
 //! lifecycle signals, the silent-orphan and cancel-escalation watchdogs, and
 //! mid-turn steering.
 
-use crate::acp::control_protocol::PromptOutcome;
 use crate::acp::state::{Event, RateLimitInfo};
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
@@ -19,7 +18,9 @@ use super::CANCEL_ESCALATION_GRACE;
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::control::prompt_outcome_to_response;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
-use crate::acp::acp_client::errors::acp_internal_error;
+use crate::acp::acp_client::errors::{
+    acp_internal_error, control_transport_closed_error, prompt_runtime_error, public_error_message,
+};
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
@@ -38,6 +39,15 @@ type AcpResult<T> = Result<T, agent_client_protocol::Error>;
 type PromptFut = Pin<Box<dyn Future<Output = AcpResult<PromptResponse>> + Send>>;
 type SteerFut =
     Pin<Box<dyn Future<Output = (Vec<ContentBlock>, AcpResult<serde_json::Value>)> + Send>>;
+
+struct LocalPromptScope(std::sync::Arc<super::notifications::Shared>);
+
+impl Drop for LocalPromptScope {
+    fn drop(&mut self) {
+        self.0.prompt_in_flight.store(false, Ordering::Release);
+        self.0.local_prompt_settled.notify_waiters();
+    }
+}
 
 #[cfg(test)]
 pub(super) struct SelectProbe {
@@ -82,6 +92,7 @@ struct TurnFlags {
     agent_unresponsive: bool,
     /// The adapter resolved with `StopReason::Cancelled`.
     prompt_cancelled: bool,
+    prompt_failed: bool,
     orphan_cancel_sent: bool,
     cancelling: bool,
     /// What the adapter reported; `None` when no `PromptResponse` arrived.
@@ -163,6 +174,7 @@ impl Session {
             .store(true, Ordering::Relaxed);
         shared.adopted_turn_active.store(false, Ordering::Relaxed);
         shared.prompt_in_flight.store(true, Ordering::Relaxed);
+        let _scope = LocalPromptScope(shared.clone());
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
         clear_captured_rejections(&shared.rate_limit_rejections);
@@ -267,9 +279,10 @@ impl Session {
             Ok(params) => {
                 let rx = control.prompt(params).await;
                 Box::pin(async move {
-                    // A closed channel ends the turn; the dying connection
-                    // surfaces the underlying failure.
-                    prompt_outcome_to_response(rx.await.unwrap_or(PromptOutcome::Aborted))
+                    match rx.await {
+                        Ok(outcome) => prompt_outcome_to_response(outcome),
+                        Err(_) => Err(control_transport_closed_error()),
+                    }
                 })
             }
             Err(e) => {
@@ -319,6 +332,9 @@ impl Session {
             Err(e) => e,
         };
         let label = &self.shared.session_label;
+        if agent_client_protocol::is_incoming_transport_closed(&e) {
+            return Err(e);
+        }
         // A rate limit parks the session rather than burning restart budget
         // on a worker that would hit it again (#1281).
         let resets_at =
@@ -346,14 +362,26 @@ impl Session {
             );
             self.shared
                 .emit(Event::SessionContextReset {
-                    reason: format!("resumed session no longer available: {e}"),
+                    reason: format!(
+                        "resumed session no longer available: {}",
+                        public_error_message(&e)
+                    ),
                 })
                 .await;
             self.shared
                 .context_reset_emitted
                 .store(true, Ordering::Relaxed);
+            return Err(e);
         }
-        Err(e)
+        warn!(target: "acp.protocol", session = %label, error = ?e, "prompt operation failed; preserving connection and conversation");
+        self.shared
+            .emit(prompt_runtime_error(
+                &e,
+                crate::session::ErrorEvidenceSource::LocalPromptResult,
+            ))
+            .await;
+        turn.flags.prompt_failed = true;
+        Ok(Flow::Break)
     }
 
     /// The adapter can end a limited turn normally, so a still-future rejected
@@ -620,32 +648,53 @@ impl Session {
         }
         let w = &turn.watchdog;
         let finished = w.cost_seen() && w.off_protocol_work_seen().is_none();
-        if shared.profile.key == "opencode" && finished && !w.saw_progress() {
+        if !turn.flags.prompt_failed
+            && shared.profile.key == "opencode"
+            && finished
+            && !w.saw_progress()
+        {
             if let Some(message) =
                 recover_opencode_prompt_error(&self.acp_session_id.0, prompt_started_at_ms)
             {
-                shared.emit(Event::PromptRuntimeError { message }).await;
+                shared
+                    .emit(Event::PromptRuntimeError {
+                        message,
+                        evidence: Some(crate::session::OperationErrorEvidence::new(
+                            crate::session::ErrorEvidenceSource::TranscriptRecovery,
+                            crate::session::ErrorOperation::Prompt,
+                        )),
+                    })
+                    .await;
+                turn.flags.prompt_failed = true;
             }
         }
         let f = &turn.flags;
-        let reason = terminal_stop_reason(
-            f.rate_limited,
-            f.force_stopped,
-            f.prompt_orphaned,
-            f.agent_unresponsive,
-            f.shutdown,
-            f.prompt_cancelled,
-            f.orphan_cancel_sent && finished,
-        );
-        // A completion the runner reports after this is dropped.
-        shared.terminal_claim.claim();
-        shared
-            .emit(Event::Stopped {
-                reason: reason.into(),
-            })
-            .await;
+        let reason = if f.prompt_failed {
+            "prompt_failed"
+        } else {
+            terminal_stop_reason(
+                f.rate_limited,
+                f.force_stopped,
+                f.prompt_orphaned,
+                f.agent_unresponsive,
+                f.shutdown,
+                f.prompt_cancelled,
+                f.orphan_cancel_sent && finished,
+            )
+        };
+        let claimed = if f.prompt_failed {
+            shared.terminal_claim.claim_failed()
+        } else {
+            shared.terminal_claim.claim()
+        };
+        if claimed {
+            shared
+                .emit(Event::Stopped {
+                    reason: reason.into(),
+                })
+                .await;
+        }
         shared.reset_message_dedup();
-        shared.prompt_in_flight.store(false, Ordering::Relaxed);
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
             target: "acp.protocol",
