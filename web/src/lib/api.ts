@@ -28,6 +28,7 @@ import type {
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
+import { notifySuggestionsChanged } from "./suggestionEvents";
 
 type Payload = Record<string, unknown>;
 
@@ -3246,6 +3247,13 @@ async function suggestionRequest<T>(url: string, method: string, body?: unknown)
   }
 }
 
+/** A change other mounted suggestion views must reload for, such as the sidebar section. */
+async function suggestionMutation(url: string, method: string, body?: unknown): Promise<SuggestionResult<unknown>> {
+  const result = await suggestionRequest(url, method, body);
+  if (result.ok) notifySuggestionsChanged();
+  return result;
+}
+
 export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
 
 export const runSuggestionFix = (providerId: string) =>
@@ -3255,10 +3263,13 @@ export const runSuggestionFix = (providerId: string) =>
 export const runSuggestionChecks = () => suggestionRequest("/api/suggestions/checks/run", "POST");
 
 export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
-  suggestionRequest(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", { provider_id: providerId, id });
+  suggestionMutation(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", {
+    provider_id: providerId,
+    id,
+  });
 
 export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
-  suggestionRequest("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+  suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
 
 /** Resolves the wizard prefill. Creates nothing. */
 export const prepareSuggestion = (providerId: string, id: string) =>
@@ -3270,7 +3281,7 @@ export type SuggestionPrefsPatch = Partial<Omit<SuggestionPrefs, "provider_order
 };
 
 export const updateSuggestionPrefs = (patch: SuggestionPrefsPatch) =>
-  suggestionRequest("/api/suggestions/prefs", "PATCH", patch);
+  suggestionMutation("/api/suggestions/prefs", "PATCH", patch);
 
 export async function fetchSuggestionTemplates(): Promise<SuggestionTemplate[] | null> {
   const body = await fetchJson<{ templates: SuggestionTemplate[] }>("/api/suggestions/templates");

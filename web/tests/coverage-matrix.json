@@ -854,6 +854,14 @@
       ]
     },
     {
+      "id": "sidebar.suggested",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSuggestions.test.tsx"],
+      "components": ["web/src/components/sidebar/SidebarSuggestions.tsx", "web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The Suggested Group shows only while prefs.sidebar is on, and appears without a remount when the pref changes in Settings."
+    },
+    {
       "id": "suggestions.first-run-setup",
       "kind": "mocked-playwright",
       "risk": "medium",

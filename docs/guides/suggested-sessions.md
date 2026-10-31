@@ -4,7 +4,7 @@ Suggested sessions are things worth starting a session for, such as a PR that wa
 
 Each item has a title, a reason, the plugin that proposed it, and a draft prompt. Plugins decide what to publish; this page covers using them. Writing a provider is covered in the [plugin contract](../plugin-api.md#suggested-sessions).
 
-Suggestions show up in the web dashboard (homepage section and `/suggestions`) and in the TUI. They are stored per [profile](configuration.md#profiles).
+Suggestions show up in the web dashboard (homepage section, `/suggestions`, and optionally the sidebar) and in the TUI. They are stored per [profile](configuration.md#profiles).
 
 ## Setting up
 
@@ -55,6 +55,7 @@ If a provider is switched off, its items are hidden and the view says "<provider
 | Setting | What it does |
 |---|---|
 | Show suggestions on the homepage | The homepage section. |
+| Show in sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**, or opens its Session once started. Off by default. |
 | Show source reference | Shows where each suggestion comes from, such as `owner/repo#123`, above the title on web rows and before it on TUI rows. On by default. |
 | Providers | Drag to order (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch and a **Show** checkbox per kind of suggestion. A provider that uses an agent says so, since it spends your agent usage. A provider error can carry a fix button from the plugin. |
 | Refresh every | 5 min, 15 min, 30 min, 1 h or 2 h. A hint sent to plugins; they may refresh less often. |
