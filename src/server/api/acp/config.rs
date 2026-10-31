@@ -52,6 +52,12 @@ pub async fn acp_set_mode(
     };
     match state.acp_supervisor.set_mode(&id, &req.mode_id).await {
         Ok(()) => {
+            tracing::info!(
+                target: "acp.protocol",
+                session = %id,
+                mode_id = %req.mode_id,
+                "mode set"
+            );
             count_plan_mode(&state, &req.mode_id);
             StatusCode::ACCEPTED.into_response()
         }
@@ -225,6 +231,13 @@ pub async fn acp_set_config_option(
                 .await;
         }
     }
+    tracing::info!(
+        target: "acp.protocol",
+        session = %id,
+        config_id = %req.config_id,
+        value = %req.value,
+        "config option set"
+    );
     count_plan_mode(&state, &req.value);
     StatusCode::ACCEPTED.into_response()
 }

@@ -137,6 +137,8 @@ export interface Approval {
   options?: ApprovalOption[];
   /** The options are answers rather than a permission vocabulary; post back the picked `option_id`. */
   choice?: boolean;
+  /** Full ExitPlanMode markdown; `tool_call.args_preview` may truncate it. */
+  plan?: string;
   requested_at: string;
   resolved?: {
     decision: ApprovalDecision;
@@ -404,6 +406,7 @@ export type AcpEvent =
         description: string;
         prompt: string;
         model: string;
+        workflow?: WorkflowRef | null;
         started_at: string;
       };
     }
@@ -465,8 +468,15 @@ export type AcpEvent =
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
-  | { BackgroundTaskStarted: { task_id: string; tool_call_id?: string; description: string } }
-  | { BackgroundTaskFinished: { task_id: string } }
+  | {
+      BackgroundTaskStarted: {
+        task_id: string;
+        tool_call_id?: string;
+        description: string;
+        workflow?: { run_id: string; name: string; summary?: string | null } | null;
+      };
+    }
+  | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
@@ -553,6 +563,15 @@ export interface ReducedState {
   /** Existing current WorkerDown queue/wake eligibility, not native health. */
   prompt_wake_eligible?: boolean | null;
   last_seq?: number;
+  /** The session's workflow runs; omitted when there are none. */
+  workflow_runs?: {
+    task_id: string;
+    tool_call_id: string;
+    name: string;
+    summary?: string | null;
+    finished?: boolean;
+    ended_at?: string | null;
+  }[];
 }
 
 export interface InteractionError {
@@ -666,8 +685,12 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
-  /** Ids of running background tasks that are not sub-agents (backgrounded commands). */
+  /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Workflow runs by the `Workflow` tool call that launched them. */
+  workflowRuns: Record<string, WorkflowRun>;
+  /** Runs explicitly covered by the latest current daemon snapshot. */
+  workflowSnapshotKeys?: string[];
   /** Agent-pushed advisories for the current turn, oldest first. */
   sessionNotices: SessionNotice[];
   /** Ids dismissed in this tab. Local, so it never clears another client. */
@@ -692,10 +715,28 @@ export interface BackgroundAgentTool {
   ok?: boolean | null;
 }
 
+/** The workflow run and phase a background sub-agent belongs to. */
+export interface WorkflowRef {
+  run_id: string;
+  name: string;
+  phase: string;
+}
+
+export interface WorkflowRun {
+  /** The run's background task, live until the run ends. */
+  taskId: string;
+  name: string;
+  summary: string | null;
+  /** Set by its task's finish, or by a later start reusing the task id. */
+  finished?: boolean;
+  endedAt?: string | null;
+}
+
 export interface BackgroundAgent {
   agentId: string;
-  /** The parent `Task` call that launched this agent. */
+  /** The parent `Task` (or `Workflow`) call that launched this agent. */
   toolCallId: string;
+  workflow?: WorkflowRef | null;
   description: string;
   prompt: string;
   model: string;
@@ -954,6 +995,8 @@ export function emptyAcpState(): AcpState {
     agentOrphaned: false,
     backgroundAgents: [],
     backgroundTasks: [],
+    workflowRuns: {},
+    workflowSnapshotKeys: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1051,7 +1094,25 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   const covered = state.nativeSnapshotSeq != null && frame.seq <= state.nativeSnapshotSeq;
   const rawTurnActive = covered ? (state.replayTurnActive ?? state.serverTurnActive) : state.serverTurnActive;
-  const next = applyRawEvent(state, frame, rawTurnActive, covered);
+  let rawState = state;
+  let protectedRuns: Record<string, WorkflowRun> | undefined;
+  if (
+    covered &&
+    typeof frame.event === "object" &&
+    ("BackgroundTaskStarted" in frame.event || "BackgroundTaskFinished" in frame.event)
+  ) {
+    const current = new Set(state.workflowSnapshotKeys ?? []);
+    const entries = Object.entries(state.workflowRuns);
+    const protectedEntries = entries.filter(([key, run]) => current.has(key) || run.finished);
+    const protectedKeys = new Set(protectedEntries.map(([key]) => key));
+    protectedRuns = Object.fromEntries(protectedEntries);
+    rawState = {
+      ...state,
+      workflowRuns: Object.fromEntries(entries.filter(([key]) => !protectedKeys.has(key))),
+    };
+  }
+  const next = applyRawEvent(rawState, frame, rawTurnActive, covered);
+  if (protectedRuns) next.workflowRuns = { ...next.workflowRuns, ...protectedRuns };
   next.replayTurnActive =
     typeof frame.event === "object" &&
     "AcpConnectionUnavailable" in frame.event &&
@@ -1435,6 +1496,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       description: e.description,
       prompt: e.prompt,
       model: e.model,
+      workflow: e.workflow ?? null,
       status: "running",
       startedAt: e.started_at,
       endedAt: null,
@@ -1491,17 +1553,35 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
-    const id = event.BackgroundTaskStarted.task_id;
+    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
+    if (workflow && toolCallId) {
+      next.workflowRuns = {
+        ...next.workflowRuns,
+        [toolCallId]: { taskId: id, name: workflow.name, summary: workflow.summary ?? null },
+      };
+    }
     return next;
   }
   if ("BackgroundTaskFinished" in event) {
-    const id = event.BackgroundTaskFinished.task_id;
+    const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
   // Remaining events carry no client control state.
   return next;
+}
+
+/** Task ids can be reused, so only the run still open on `taskId` is closed. */
+function closeWorkflowRun(
+  runs: Record<string, WorkflowRun>,
+  taskId: string,
+  endedAt: string | null,
+): Record<string, WorkflowRun> {
+  const key = Object.keys(runs).find((k) => runs[k]!.taskId === taskId && !runs[k]!.finished);
+  return key ? { ...runs, [key]: { ...runs[key]!, finished: true, endedAt } } : runs;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
@@ -1566,6 +1646,8 @@ export function applyReducedState(
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
+    workflowSnapshotKeys: reduced.workflow_runs?.map((run) => run.tool_call_id) ?? [],
     locallyResolved,
   };
   if (connectionReady) {
@@ -1577,6 +1659,28 @@ export function applyReducedState(
     next.incompatibleAgent = null;
   }
   if (next.connectionUnavailable) closeUnavailableConnection(next);
+  return next;
+}
+
+/** The replay window can miss a run's launch or finish. Adopts runs it
+ *  lacks and finishes it missed, never reopening a run it closed. */
+function restoreWorkflowRuns(
+  runs: Record<string, WorkflowRun>,
+  records: NonNullable<ReducedState["workflow_runs"]>,
+): Record<string, WorkflowRun> {
+  let next = runs;
+  for (const record of records) {
+    const local = runs[record.tool_call_id];
+    if (local && (local.finished || !record.finished)) continue;
+    next = next === runs ? { ...runs } : next;
+    next[record.tool_call_id] = {
+      ...local,
+      taskId: record.task_id,
+      name: record.name,
+      summary: local?.summary ?? record.summary ?? null,
+      ...(record.finished && { finished: true, endedAt: record.ended_at ?? null }),
+    };
+  }
   return next;
 }
 

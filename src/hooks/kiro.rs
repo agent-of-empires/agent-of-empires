@@ -27,7 +27,13 @@ const KIRO_HOOKS_AGENT_NAME: &str = kiro_hooks_agent_name!();
 pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agent_name!(), ".json");
 
 fn read_agent_config(path: &Path) -> Result<Map<String, Value>> {
-    Ok(serde_json::from_str(&std::fs::read_to_string(path)?).unwrap_or_default())
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw).unwrap_or_else(|error| {
+        tracing::warn!(target: "hooks.install", path = %path.display(), %error,
+            "kiro agent config is not valid JSON; rewriting"
+        );
+        Map::new()
+    }))
 }
 
 /// Install AoE hooks into a Kiro agent config, creating it with a default

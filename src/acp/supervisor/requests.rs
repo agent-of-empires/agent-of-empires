@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use super::launch::{apply_mode, set_spawn_model};
 use super::{
@@ -218,6 +218,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn; an already-exited agent has no turn to cancel.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
+        debug!(target: "acp.supervisor", session = %session_id, "turn cancel requested");
         let client = match self.ready_client(session_id).await {
             Ok(client) => client,
             Err(SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning)) => {
@@ -233,8 +234,13 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// User-initiated "Force stop".
     pub async fn force_end_turn(&self, session_id: &str) {
-        if let Ok(client) = self.client_for_session(session_id).await {
-            let _ = client.force_cancel().await;
+        debug!(target: "acp.supervisor", session = %session_id, "force stop requested");
+        let delivered = match self.client_for_session(session_id).await {
+            Ok(client) => client.force_cancel().await.map_err(SupervisorError::Acp),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            warn!(target: "acp.supervisor", session = %session_id, %error, "force stop: cancel not delivered");
         }
         self.publish_next(
             session_id,

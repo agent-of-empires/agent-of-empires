@@ -430,14 +430,21 @@ pub async fn send_message(
             .into_response();
     }
 
-    match send_terminal_message(&state.session_service, &id, req.message, req.revive).await {
-        Ok(_) => match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                (StatusCode::OK, Json(serde_json::json!({"sent": true}))),
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        },
+    let revive = req.revive;
+    match send_terminal_message(&state.session_service, &id, req.message, revive).await {
+        Ok(_) => {
+            tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
+            match state.runtime.publish(&state).await {
+                Ok(snapshot) => crate::server::runtime::mutation_response(
+                    &snapshot.value.cursor,
+                    (StatusCode::OK, Json(serde_json::json!({"sent": true}))),
+                ),
+                Err(error) => {
+                    tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        }
         Err(error) => error.into_response(),
     }
 }

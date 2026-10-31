@@ -310,7 +310,7 @@ impl RuntimeReadCache {
         }
     }
 }
-use super::push::publish_status_change;
+use super::push::{publish, publish_status_change};
 
 use super::state::{AppState, StatusSource};
 use super::structured_repair::{
@@ -962,9 +962,9 @@ pub(super) fn observed_transitions(
 /// poller's view (#2690 / #2697). Disk therefore stays permanently out of step
 /// with live, and `status_poll_loop` compares exactly those two: `prev` comes
 /// from `state.instances` (overlaid, live), `fresh` from disk. Left alone, every
-/// tick reads that standing mismatch as a brand new transition, which logs a
-/// `session.status_change` line, broadcasts a `StatusChange`, and resets the
-/// push dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
+/// tick reads that standing mismatch as a brand new transition, which
+/// broadcasts a `StatusChange` (logged at publish time) and resets the push
+/// dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
 /// restarts because `seed_acp_statuses` re-derives the same live status from the
 /// stored event log on boot. One session whose worker died with
 /// `AgentStartupError` wrote 81k such lines into a single 43MB log file.
@@ -1002,6 +1002,20 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
     true
 }
 
+/// Logs health transitions only, so steady-state reloads stay silent.
+async fn set_canonical_health(state: &AppState, to: crate::daemon::RuntimeHealth) {
+    let mut health = state.canonical_health.write().await;
+    if *health == to {
+        return;
+    }
+    if to == crate::daemon::RuntimeHealth::Healthy {
+        tracing::info!(target: "server.runtime", from = ?*health, to = ?to, "runtime health recovered");
+    } else {
+        tracing::warn!(target: "server.runtime", from = ?*health, to = ?to, "runtime health degraded");
+    }
+    *health = to;
+}
+
 // Both polling and disk notifications use this merge; polling remains authoritative.
 // Preserve runtime-only fields per ID. DiskOnly also preserves live status and
 // detection tracking; TmuxApplied keeps the newly sampled decision and tracking.
@@ -1014,11 +1028,11 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 
 /// Snapshot of the prior in-memory `state.instances` keyed by id, used
 /// for per-id merging in `reload_state_instances_from_disk` and the
-/// acp-overlay pass. Intentionally exposes only `drain_from` and `get`;
-/// no `remove` method, because invariant 5 of the merge contract
-/// requires the same map to be populated when
-/// `apply_acp_overlay_inplace` runs after the merge loop. The compiler
-/// rejects any future `.remove()` call instead of relying on prose.
+/// acp-overlay pass. Intentionally exposes no `remove` method, because
+/// invariant 5 of the merge contract requires the same map to be
+/// populated when `apply_acp_overlay_inplace` runs after the merge loop.
+/// The compiler rejects any future `.remove()` call instead of relying on
+/// prose.
 pub(super) struct PriorById(std::collections::HashMap<String, Instance>);
 
 impl PriorById {
@@ -1034,6 +1048,46 @@ impl PriorById {
     fn get(&self, id: &str) -> Option<&Instance> {
         self.0.get(id)
     }
+
+    fn values(&self) -> impl Iterator<Item = &Instance> {
+        self.0.values()
+    }
+}
+
+/// Rows another process changed on disk, as `(session, change)`. This daemon's
+/// own commits update the in-memory rows first, so they produce no diff here.
+fn external_session_changes<'a>(
+    prior_by_id: &'a PriorById,
+    merged: &'a [Instance],
+) -> Vec<(&'a str, &'static str)> {
+    let mut changes = Vec::new();
+    for row in merged {
+        let Some(prior) = prior_by_id.get(&row.id) else {
+            changes.push((row.id.as_str(), "added"));
+            continue;
+        };
+        let diffs = [
+            (prior.title != row.title, "title"),
+            (prior.group_path != row.group_path, "group"),
+            (prior.is_archived() != row.is_archived(), "archived"),
+            (prior.snoozed_until != row.snoozed_until, "snoozed"),
+            (prior.trashed_at != row.trashed_at, "trashed"),
+        ];
+        changes.extend(
+            diffs
+                .into_iter()
+                .filter(|(changed, _)| *changed)
+                .map(|(_, change)| (row.id.as_str(), change)),
+        );
+    }
+    let present: std::collections::HashSet<&str> = merged.iter().map(|r| r.id.as_str()).collect();
+    changes.extend(
+        prior_by_id
+            .values()
+            .filter(|prior| !present.contains(prior.id.as_str()))
+            .map(|prior| (prior.id.as_str(), "removed")),
+    );
+    changes
 }
 
 pub(super) async fn reload_state_instances_from_disk(
@@ -1166,7 +1220,7 @@ pub(super) async fn reload_state_instances_from_disk(
             &native_health,
             crate::daemon::RuntimeHealth::Degraded { .. }
         ) {
-            *state.canonical_health.write().await = native_health;
+            set_canonical_health(state, native_health).await;
             *state
                 .canonical_diagnostics
                 .write()
@@ -1190,7 +1244,7 @@ pub(super) async fn reload_state_instances_from_disk(
         {
             tracing::warn!(target: "server.file_watch", error = ?error, "retaining last complete state after repair failure");
             let diagnostics = error.owner_diagnostics();
-            *state.canonical_health.write().await = error.health;
+            set_canonical_health(state, error.health).await;
             *state
                 .canonical_diagnostics
                 .write()
@@ -1209,7 +1263,7 @@ pub(super) async fn reload_state_instances_from_disk(
         .await
         {
             let diagnostics = error.owner_diagnostics();
-            *state.canonical_health.write().await = error.health;
+            set_canonical_health(state, error.health).await;
             *state
                 .canonical_diagnostics
                 .write()
@@ -1230,14 +1284,14 @@ pub(super) async fn reload_state_instances_from_disk(
     }
     drop(current);
     *state.canonical_metadata.write().await = metadata;
-    *state.canonical_health.write().await = native_health;
+    set_canonical_health(state, native_health).await;
     *state
         .canonical_diagnostics
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = native_diagnostics;
     state.runtime.request_publish();
     for change in &changes {
-        let _ = state.status_tx.send(change.clone());
+        publish(&state.status_tx, change.clone());
     }
     changes
 }
@@ -1359,6 +1413,17 @@ pub(super) fn merge_loaded_rows(
         merged.push(row);
     }
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
+    if matches!(status_source, StatusSource::DiskOnly) {
+        for (session, change) in external_session_changes(&prior_by_id, &merged) {
+            tracing::info!(
+                target: "session.sync",
+                session,
+                change,
+                source = "disk",
+                "session changed on disk"
+            );
+        }
+    }
     let mut changes = Vec::new();
     let now = chrono::Utc::now();
     for row in &mut merged {
@@ -1426,6 +1491,39 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn external_session_changes_reports_added_removed_and_edited_rows() {
+        let kept = Instance::new("kept", "/tmp/kept");
+        let gone = Instance::new("gone", "/tmp/gone");
+        let added = Instance::new("added", "/tmp/added");
+        let prior = PriorById::drain_from(&mut vec![kept.clone(), gone.clone()]);
+        assert!(external_session_changes(&prior, &[gone.clone(), kept.clone()]).is_empty());
+
+        let mut edited = kept.clone();
+        edited.title = "renamed".into();
+        edited.group_path = "team/b".into();
+        edited.archive();
+        edited.trashed_at = Some(Utc::now());
+        let mut snoozed = gone.clone();
+        snoozed.snoozed_until = Some(Utc::now());
+        let merged = vec![edited, added.clone(), snoozed];
+        assert_eq!(
+            external_session_changes(&prior, &merged),
+            vec![
+                (kept.id.as_str(), "title"),
+                (kept.id.as_str(), "group"),
+                (kept.id.as_str(), "archived"),
+                (kept.id.as_str(), "trashed"),
+                (added.id.as_str(), "added"),
+                (gone.id.as_str(), "snoozed"),
+            ]
+        );
+        assert_eq!(
+            external_session_changes(&prior, std::slice::from_ref(&kept)),
+            vec![(gone.id.as_str(), "removed")]
+        );
+    }
 
     #[test]
     fn committed_profile_batch_preserves_moved_runtime_and_rejects_partial_metadata() {

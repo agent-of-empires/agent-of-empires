@@ -513,7 +513,8 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
     };
     // Published by rename so a claim can never see a half-written marker.
     let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
-    if std::fs::write(&staged, generation.to_string()).is_err() {
+    if let Err(error) = std::fs::write(&staged, generation.to_string()) {
+        warn!(target: "acp.registry", session = %session_id, %error, "failed to write restart marker");
         return;
     }
     #[cfg(unix)]
@@ -521,7 +522,8 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600));
     }
-    if std::fs::rename(&staged, &path).is_err() {
+    if let Err(error) = std::fs::rename(&staged, &path) {
+        warn!(target: "acp.registry", session = %session_id, %error, "failed to write restart marker");
         let _ = std::fs::remove_file(&staged);
     }
 }

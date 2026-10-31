@@ -99,6 +99,8 @@ struct TurnFlags {
     cancelling: bool,
     connection_lost: bool,
     result_observed: bool,
+    /// What the adapter reported; `None` when no `PromptResponse` arrived.
+    agent_stop_reason: Option<StopReason>,
 }
 
 struct Turn {
@@ -386,6 +388,7 @@ impl Session {
         let e = match res {
             Ok(resp) => {
                 turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
+                turn.flags.agent_stop_reason = Some(resp.stop_reason);
                 if !turn.flags.prompt_cancelled {
                     if let Some(info) = self.take_parking_rejection() {
                         self.shared.emit(Event::RateLimit { info }).await;
@@ -485,7 +488,9 @@ impl Session {
                     target: "acp.protocol",
                     "force-stop requested during in-flight prompt; ending turn and restarting worker"
                 );
-                let _ = self.send_cancel().await;
+                if let Err(error) = self.send_cancel().await {
+                    debug!(target: "acp.protocol", %error, "cancel notification failed");
+                }
                 turn.flags.force_stopped = true;
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
@@ -782,11 +787,13 @@ impl Session {
         }
         shared.reset_message_dedup();
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
-        debug!(
+        info!(
             target: "acp.protocol",
             session = %shared.session_label,
             reason,
-            "prompt drain complete; between-prompt idle ownership restored"
+            agent_stop_reason = ?f.agent_stop_reason,
+            duration_ms = now_ms() - prompt_started_at_ms,
+            "turn finished; between-prompt idle ownership restored"
         );
         turn.flags.shutdown
     }

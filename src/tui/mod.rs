@@ -15,6 +15,8 @@ pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
 pub(crate) mod plugin_ui;
+pub(crate) mod plugin_ui_poller;
+
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
 mod session_feed;
@@ -241,6 +243,56 @@ pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(
     Ok(())
 }
 
+/// Run `migrate` behind the boot spinner, then offer a daemon restart if one
+/// blocked it. The spinner writes nothing unless a migration reports progress.
+pub(crate) async fn migrate_for_startup(
+    migrate: impl Fn(Option<migrations::progress::Reporter>) -> Result<()> + Send + Sync + 'static,
+    interactive: bool,
+    daemon: &impl crate::cli::migrate::RestartPrompt,
+) -> Result<()> {
+    let migrate = std::sync::Arc::new(migrate);
+    let console = std::sync::Arc::new(std::sync::Mutex::new(
+        migrations::progress::ConsoleProgress::default(),
+    ));
+    let reporter: migrations::progress::Reporter = {
+        let console = console.clone();
+        std::sync::Arc::new(move |event| {
+            console
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .apply(event);
+        })
+    };
+    let migration_handle = tokio::task::spawn_blocking({
+        let migrate = migrate.clone();
+        move || migrate(Some(reporter))
+    });
+    tokio::pin!(migration_handle);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    let mut frame = 0usize;
+    let mut spinner = boot_spinner::BootSpinner::default();
+    let outcome = loop {
+        tokio::select! {
+            result = &mut migration_handle => {
+                let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = spinner.finish(&mut io::stdout(), &mut console);
+                drop(console);
+                break result?;
+            }
+            _ = tick.tick() => {
+                let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = spinner.draw(&mut io::stdout(), &mut console, frame, width);
+                frame += 1;
+            }
+        }
+    };
+    crate::cli::migrate::resolve_blocked_migration(outcome, interactive, daemon, || {
+        migrate(Some(crate::cli::migrate::stderr_reporter()))
+    })
+    .await
+}
+
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // `AOE_DAEMON_URL` makes this a pure client of a remote daemon.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
@@ -252,44 +304,13 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Opening the store creates the profile directory, so refuse unknown names first.
     crate::session::require_known_profile(profile)?;
 
-    // The spinner writes nothing unless a migration reports progress.
-    {
-        let console = std::sync::Arc::new(std::sync::Mutex::new(
-            migrations::progress::ConsoleProgress::default(),
-        ));
-        let reporter: migrations::progress::Reporter = {
-            let console = console.clone();
-            std::sync::Arc::new(move |event| {
-                console
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .apply(event);
-            })
-        };
-        let migration_handle =
-            tokio::task::spawn_blocking(move || migrations::run_migrations_with(Some(reporter)));
-        tokio::pin!(migration_handle);
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
-        let mut frame = 0usize;
-        let mut spinner = boot_spinner::BootSpinner::default();
-        loop {
-            tokio::select! {
-                result = &mut migration_handle => {
-                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = spinner.finish(&mut io::stdout(), &mut console);
-                    drop(console);
-                    result??;
-                    break;
-                }
-                _ = tick.tick() => {
-                    let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
-                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = spinner.draw(&mut io::stdout(), &mut console, frame, width);
-                    frame += 1;
-                }
-            }
-        }
-    }
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    migrate_for_startup(
+        migrations::run_migrations_with,
+        interactive,
+        &crate::cli::migrate::LocalDaemon,
+    )
+    .await?;
 
     if !crate::tmux::is_tmux_available() {
         eprintln!("Error: tmux not found in PATH");

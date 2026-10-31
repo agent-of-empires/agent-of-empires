@@ -377,6 +377,7 @@ mod tests {
                 destructive: false,
                 options: Vec::new(),
                 choice: false,
+                plan: None,
                 requested_at: chrono::Utc::now(),
                 resolved: None,
             },

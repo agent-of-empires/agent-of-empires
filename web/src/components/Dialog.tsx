@@ -14,6 +14,7 @@ export function Dialog({
   title,
   titleClassName = "text-text-primary",
   panelTestId,
+  panelClassName = "w-[420px]",
   bodyClassName = "px-5 py-4",
   describedBy = `${id}-desc`,
   onDismiss,
@@ -24,6 +25,7 @@ export function Dialog({
   title: ReactNode;
   titleClassName?: string;
   panelTestId?: string;
+  panelClassName?: string;
   bodyClassName?: string;
   /** Element id for aria-describedby: the body by default, a prompt id when the body has controls, or false. */
   describedBy?: string | false;
@@ -43,7 +45,7 @@ export function Dialog({
     >
       <div
         data-testid={panelTestId}
-        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[420px] max-w-[90vw] shadow-2xl animate-slide-up"
+        className={`bg-surface-800 border border-surface-700/50 rounded-lg ${panelClassName} max-w-[90vw] shadow-2xl animate-slide-up`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 py-4 border-b border-surface-700">

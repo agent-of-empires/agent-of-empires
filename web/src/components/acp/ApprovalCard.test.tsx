@@ -2,8 +2,9 @@
 // The card is the only UI gate before a destructive tool runs, so hold semantics are pinned closely.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
+import { AcpFileRefContext } from "./AcpFileRefContext";
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalOption } from "../../lib/acpTypes";
 
@@ -11,6 +12,27 @@ vi.mock("../../lib/connectionState", () => ({
   useServerDown: () => false,
   OFFLINE_TITLE: "Disconnected",
 }));
+
+// The primitive needs a message context; the plan modal's own wiring is under test.
+vi.mock("./Markdown", async () => {
+  const { useAcpFileRef } = await import("./AcpFileRefContext");
+  return {
+    // A "LINK" in the text stands in for an in-repo file link in the rendered plan.
+    Markdown: ({ text }: { text: string }) => {
+      const { onOpenFileRef } = useAcpFileRef();
+      return (
+        <div data-testid="plan-rendered">
+          {text}
+          {text.includes("LINK") && (
+            <a href="#plan-file" onClick={() => onOpenFileRef?.({ path: "/repo/PLAN.md" })}>
+              plan file
+            </a>
+          )}
+        </div>
+      );
+    },
+  };
+});
 
 function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "ls -al" }, name = "Bash"): Approval {
   return {
@@ -29,7 +51,7 @@ function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "
 }
 
 function mount(approval: Approval, onResolve = vi.fn().mockResolvedValue(undefined)) {
-  render(<ApprovalCard approval={approval} onResolve={onResolve} />);
+  render(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
   return onResolve;
 }
 
@@ -144,6 +166,32 @@ describe("ApprovalCard decisions", () => {
       fireEvent.mouseUp(button);
       expect(onResolve).not.toHaveBeenCalled();
       hold(button, 800);
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
+    });
+
+    it("requires a new full hold after permission is withdrawn and regranted", () => {
+      const approval = makeApproval({ destructive: true });
+      const onResolve = vi.fn().mockResolvedValue(undefined);
+      const { rerender } = render(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      const button = screen.getByRole("button", { name: "Hold to allow" }) as HTMLButtonElement;
+      hold(button, 400);
+      rerender(<ApprovalCard approval={approval} canDecide={false} onResolve={onResolve} />);
+      expect(button.disabled).toBe(true);
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      rerender(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      expect(button.disabled).toBe(false);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+
+      hold(button, 799);
+      expect(onResolve).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
       expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
     });
 
@@ -292,5 +340,207 @@ describe("ApprovalCard destructive rollback retry", () => {
     });
     expect(onResolve).toHaveBeenCalledTimes(2);
     expect(onResolve).toHaveBeenLastCalledWith("Allow", choice ? "retry-option" : undefined);
+  });
+});
+
+describe("ApprovalCard plan viewer", () => {
+  const PLAN = "# Plan\n\nProse with no bullets";
+  const withPlan = () => makeApproval({ plan: PLAN }, "{ truncated json", "Ready to code?");
+
+  it("offers the plan only when the approval carries one, even if the args preview is unparsable", () => {
+    mount(makeApproval());
+    expect(screen.queryByText("View plan")).toBeNull();
+    cleanup();
+    mount(withPlan());
+    expect(screen.getByText("View plan")).toBeTruthy();
+  });
+
+  it("switches between the rendered and raw plan, and closing resolves nothing", () => {
+    const onResolve = mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("plan-rendered").textContent).toBe(PLAN);
+
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Raw" }));
+    expect(within(dialog).queryByTestId("plan-rendered")).toBeNull();
+    expect(within(dialog).getByText(/Prose with no bullets/).tagName).toBe("PRE");
+
+    fireEvent.click(within(dialog).getByText("Close"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("resolves from the modal footer with the card's decisions", () => {
+    for (const [label, decision] of [
+      ["Allow", "Allow"],
+      ["Always", "AllowAlways"],
+      ["Deny", "Deny"],
+    ] as const) {
+      const onResolve = mount(withPlan());
+      fireEvent.click(screen.getByText("View plan"));
+      fireEvent.click(within(screen.getByRole("dialog")).getByText(label));
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, undefined);
+      cleanup();
+    }
+  });
+  it("shows text past the 16 KiB preview cap in both views", () => {
+    const tail = "TAIL-MARKER-PAST-THE-CAP";
+    const long = `${"line of plan\n".repeat(2000)}${tail}`;
+    expect(long.length).toBeGreaterThan(16 * 1024);
+    mount(
+      makeApproval({ plan: long }, `{"plan":"${"line of plan\\n".repeat(1500)}\u2026[truncated]`, "Ready to code?"),
+    );
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("plan-rendered").textContent).toContain(tail);
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Raw" }));
+    expect(within(dialog).getByText(/TAIL-MARKER-PAST-THE-CAP/).tagName).toBe("PRE");
+  });
+
+  it("moves focus into the modal, wraps Tab, closes on Escape and restores focus", () => {
+    mount(withPlan());
+    const opener = screen.getByText("View plan");
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole("dialog");
+    const buttons = Array.from(dialog.querySelectorAll("button"));
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    buttons[buttons.length - 1].focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(buttons[buttons.length - 1]);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+  it("leaves Tab and Escape to a higher overlay or an inert modal but reclaims plain focus", () => {
+    mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const overlay = document.createElement("div");
+    overlay.setAttribute("aria-modal", "true");
+    const other = document.createElement("input");
+    overlay.append(other);
+    document.body.append(overlay);
+    other.focus();
+    for (const init of [{ key: "Tab" }, { key: "Escape" }]) {
+      const ev = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
+      document.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(false);
+      expect(screen.queryByRole("dialog")).not.toBeNull();
+    }
+    expect(document.activeElement).toBe(other);
+    overlay.remove();
+
+    const plain = document.createElement("textarea");
+    document.body.append(plain);
+    plain.focus();
+    const reached = vi.fn();
+    plain.addEventListener("keydown", reached);
+    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    plain.dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(reached).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    plain.focus();
+    fireEvent.keyDown(plain, { key: "Escape" });
+    expect(reached).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    plain.remove();
+    fireEvent.click(screen.getByText("View plan"));
+
+    const dialog = screen.getByRole("dialog");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("inert", "");
+    dialog.parentElement?.insertBefore(wrapper, dialog);
+    wrapper.append(dialog);
+    (document.activeElement as HTMLElement | null)?.blur();
+    for (const init of [{ key: "Tab" }, { key: "Escape" }]) {
+      const ev = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
+      document.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(false);
+    }
+    expect(screen.queryByRole("dialog", { hidden: true })).not.toBeNull();
+  });
+  it("binds each plan modal's trap to its own dialog when a covered session keeps one open", () => {
+    const covered = makeApproval({ plan: PLAN, nonce: "n-a" }, "{}", "Ready to code?");
+    const active = makeApproval({ plan: PLAN, nonce: "n-b" }, "{}", "Ready to code?");
+    const { container } = render(
+      <>
+        <div data-testid="covered" inert>
+          <ApprovalCard approval={covered} canDecide onResolve={vi.fn()} />
+        </div>
+        <div data-testid="active">
+          <ApprovalCard approval={active} canDecide onResolve={vi.fn()} />
+        </div>
+      </>,
+    );
+    for (const id of ["covered", "active"]) {
+      fireEvent.click(within(within(container).getByTestId(id)).getByText("View plan"));
+    }
+    expect(screen.getAllByRole("dialog", { hidden: true })).toHaveLength(2);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    const left = screen.getAllByRole("dialog", { hidden: true });
+    expect(left).toHaveLength(1);
+    expect(
+      within(container)
+        .getByTestId("covered")
+        .contains(left[0] ?? null),
+    ).toBe(true);
+  });
+  it("moves between the view tabs with the arrow keys and labels the panel", () => {
+    mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    const rendered = within(dialog).getByRole("tab", { name: "Rendered" });
+    const raw = within(dialog).getByRole("tab", { name: "Raw" });
+    expect(rendered.getAttribute("tabindex")).toBe("0");
+    expect(raw.getAttribute("tabindex")).toBe("-1");
+
+    rendered.focus();
+    fireEvent.keyDown(rendered, { key: "ArrowRight" });
+    expect(raw.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(raw);
+    expect(within(dialog).getByRole("tabpanel").getAttribute("aria-labelledby")).toBe(raw.id);
+
+    fireEvent.keyDown(raw, { key: "Home" });
+    expect(rendered.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(rendered);
+  });
+
+  it("answers a choice approval with its option id from the modal", () => {
+    const options: ApprovalOption[] = [
+      { option_id: "a", name: "Plan A", kind: "allow_once" },
+      { option_id: "b", name: "Plan B", kind: "allow_once" },
+    ];
+    for (const [label, decision, optionId] of [
+      ["Plan B", "Allow", "b"],
+      ["Dismiss", "Cancelled", undefined],
+    ] as const) {
+      const onResolve = mount(makeApproval({ plan: PLAN, choice: true, options }, "{}", "Ready to code?"));
+      fireEvent.click(screen.getByText("View plan"));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).queryByText("Deny")).toBeNull();
+      fireEvent.click(within(dialog).getByText(label));
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, optionId);
+      cleanup();
+    }
+  });
+  it("closes the modal before handing a plan file link to the viewer", () => {
+    const onOpenFileRef = vi.fn();
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
+        <ApprovalCard approval={makeApproval({ plan: "see LINK" })} canDecide onResolve={onResolve} />
+      </AcpFileRefContext.Provider>,
+    );
+    fireEvent.click(screen.getByText("View plan"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByText("plan file"));
+    expect(onOpenFileRef).toHaveBeenCalledExactlyOnceWith({ path: "/repo/PLAN.md" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onResolve).not.toHaveBeenCalled();
   });
 });

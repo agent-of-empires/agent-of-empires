@@ -1,6 +1,24 @@
 //! Agent plans: parsing bullet text into steps and mapping ACP plan status.
 
+use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::state::{Plan, PlanStep, PlanStepStatus};
+
+/// The ExitPlanMode markdown for the approval's plan viewer. `args_preview`
+/// caps at 16 KiB and truncated JSON no longer parses, so the plan is read
+/// from the raw input instead.
+pub(super) fn approval_plan_text(
+    profile: &AgentProfile,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    if !profile.supports_exit_plan_mode {
+        return None;
+    }
+    let plan = raw_input?.get("plan")?.as_str()?;
+    if plan.trim().is_empty() {
+        return None;
+    }
+    Some(plan.to_string())
+}
 
 /// ExitPlanMode ships its markdown in `raw_input.plan`, which has no ACP
 /// `SessionUpdate::Plan` of its own (#1059). `None` for a missing, non-string,
@@ -98,6 +116,30 @@ pub(super) fn plan_status_to_str(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::agent_profiles::{CLAUDE, GEMINI};
+
+    #[test]
+    fn approval_plan_text_cases() {
+        let plan = serde_json::json!({ "plan": "# Plan\n\nprose, no bullets" });
+        assert_eq!(
+            approval_plan_text(&CLAUDE, Some(&plan)).as_deref(),
+            Some("# Plan\n\nprose, no bullets")
+        );
+        assert!(approval_plan_text(&GEMINI, Some(&plan)).is_none());
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({ "plan": 42 }),
+            serde_json::json!({ "plan": "  \n" }),
+        ] {
+            assert!(approval_plan_text(&CLAUDE, Some(&raw)).is_none(), "{raw}");
+        }
+        assert!(approval_plan_text(&CLAUDE, None).is_none());
+
+        // Past the 16 KiB args_preview cap the plan is still kept whole.
+        let long = "\u{e9}".repeat(20_000);
+        let kept = approval_plan_text(&CLAUDE, Some(&serde_json::json!({ "plan": long })));
+        assert_eq!(kept.as_deref(), Some(long.as_str()));
+    }
 
     /// A plan needs bullets; anything else renders as a generic tool card.
     #[test]

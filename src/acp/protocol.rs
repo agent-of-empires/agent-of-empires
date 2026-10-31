@@ -10,16 +10,31 @@ use super::approvals::ApprovalDecision;
 use super::state::{DiffComment, Event};
 use crate::daemon::PromptAttachmentKind;
 
-/// `BackgroundAgentLaunched::output_file` is a host filesystem path: persisted
-/// in event_json so a restarted daemon can re-tail the sub-agent, but never
-/// sent to clients. Every place an `Event` is serialized for a client goes
-/// through this so the invariant holds structurally.
+/// `BackgroundAgentLaunched::output_file` and a workflow's `transcript_dir`
+/// are host filesystem paths: persisted in event_json so a restarted daemon can
+/// re-tail them, but never sent to clients. Every place an `Event` is
+/// serialized for a client goes through this so the invariant holds
+/// structurally.
 fn strip_transcript_path(event: &Event) -> Cow<'_, Event> {
     match event {
         Event::BackgroundAgentLaunched { output_file, .. } if !output_file.is_empty() => {
             let mut stripped = event.clone();
             if let Event::BackgroundAgentLaunched { output_file, .. } = &mut stripped {
                 output_file.clear();
+            }
+            Cow::Owned(stripped)
+        }
+        Event::BackgroundTaskStarted {
+            workflow: Some(workflow),
+            ..
+        } if !workflow.transcript_dir.is_empty() => {
+            let mut stripped = event.clone();
+            if let Event::BackgroundTaskStarted {
+                workflow: Some(workflow),
+                ..
+            } = &mut stripped
+            {
+                workflow.transcript_dir.clear();
             }
             Cow::Owned(stripped)
         }
@@ -314,33 +329,51 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_frame_strips_background_agent_output_file() {
-        let frame = AcpBroadcastFrame {
+    fn broadcast_frame_strips_transcript_paths() {
+        let frame = |event: Event| AcpBroadcastFrame {
             native_subject: None,
             session_id: "s-1".into(),
             seq: 1,
-            event: Arc::new(Event::BackgroundAgentLaunched {
-                agent_id: "a1".into(),
-                tool_call_id: "tc1".into(),
-                description: "d".into(),
-                prompt: "p".into(),
-                model: "m".into(),
-                output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
-                started_at: chrono::Utc::now(),
-            }),
+            event: Arc::new(event),
             worker_generation: None,
             sidebar_status: None,
         };
-        let json = serde_json::to_string(&frame).unwrap();
-        assert!(
-            !json.contains("transcripts"),
-            "transcript path must not reach the client: {json}"
-        );
-        assert!(!json.contains("worker_generation"));
-        let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
-        match &*back.event {
-            Event::BackgroundAgentLaunched { output_file, .. } => assert_eq!(output_file, ""),
-            other => panic!("unexpected event: {other:?}"),
+        let agent = frame(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "d".into(),
+            prompt: "p".into(),
+            model: "m".into(),
+            output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
+            started_at: chrono::Utc::now(),
+            workflow: None,
+        });
+        let workflow = frame(Event::BackgroundTaskStarted {
+            task_id: "wf1".into(),
+            tool_call_id: Some("tc2".into()),
+            description: "run".into(),
+            workflow: Some(crate::acp::state::WorkflowLaunch {
+                run_id: "wf_1".into(),
+                name: "run".into(),
+                summary: None,
+                transcript_dir: "/home/user/.claude/transcripts/wf_1".into(),
+            }),
+        });
+        for frame in [agent, workflow] {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(
+                !json.contains("transcripts"),
+                "transcript path must not reach the client: {json}"
+            );
+            assert!(!json.contains("worker_generation"));
+            let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
+            match &*back.event {
+                Event::BackgroundAgentLaunched { output_file, .. } => assert_eq!(output_file, ""),
+                Event::BackgroundTaskStarted {
+                    workflow: Some(w), ..
+                } => assert_eq!(w.transcript_dir, ""),
+                other => panic!("unexpected event: {other:?}"),
+            }
         }
     }
 }

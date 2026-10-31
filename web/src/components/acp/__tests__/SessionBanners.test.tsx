@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
+import { applyEvent, emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
 import type { AcpState, Approval, Elicitation, ReducedState } from "../../../lib/acpTypes";
 import { setServerDown } from "../../../lib/connectionState";
 import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
@@ -123,6 +123,7 @@ describe("interaction card retries through the session hook", () => {
                   <ApprovalCard
                     key={approval.nonce}
                     approval={approval}
+                    canDecide={acp.status === "open" && nativeInputAvailable(acp.state)}
                     onResolve={(decision, optionId) => acp.resolveApproval(approval.nonce, decision, optionId)}
                   />
                 ))}

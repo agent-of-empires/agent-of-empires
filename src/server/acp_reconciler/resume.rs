@@ -185,6 +185,7 @@ pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &s
         .session_service
         .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
         .await;
+    tracing::debug!(target: "acp.supervisor", session = %session_id, "queued monitor re-arm reminder");
 }
 
 async fn admit(
@@ -231,8 +232,16 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
             .await
         {
             Ok(Ok(record)) => record,
-            Ok(Err(refusal)) => return target.unavailable(refusal, None),
-            Err(_) => return ResumeOutcome::Retry,
+            Ok(Err(refusal)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %refusal,
+                    "resume: retained runtime admission refused");
+                return target.unavailable(refusal, None);
+            }
+            Err(error) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                    "resume: retained runtime admission probe failed");
+                return ResumeOutcome::Retry;
+            }
         };
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(

@@ -91,6 +91,8 @@ export interface SessionResponse {
   keeps_context?: boolean;
   /** Slash commands that reset the conversation for this agent. */
   clear_aliases?: string[];
+  /** Slash commands that compact the conversation for this agent. */
+  compact_aliases?: string[];
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
   /** The agent binary was replaced after launch and a restart is safe to offer now. */

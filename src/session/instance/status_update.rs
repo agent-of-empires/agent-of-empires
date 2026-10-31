@@ -87,14 +87,14 @@ impl Instance {
         self.live_status_baseline = Some(self.status);
     }
 
-    /// One `info` line per observed status transition, carrying the evidence a wrong-state report
-    /// needs.
+    /// Records the tmux detection evidence behind a transition; the committed transition itself is
+    /// logged at publish time in `server::push`.
     fn log_status_transition(&self, prev: Status) {
         let detection_tool =
             tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let hook = crate::hooks::read_hook_status(&self.id);
         let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
-        tracing::info!(target: "session.status_change",
+        tracing::debug!(target: "session.status_change",
             "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} rule={})",
             self.id, detection_tool, prev, self.status, hook, hook_age_ms,
             self.detection.rule.unwrap_or("none")

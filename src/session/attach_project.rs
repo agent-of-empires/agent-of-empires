@@ -1015,11 +1015,19 @@ pub(crate) fn quiesce_for_conversion(
 
     // The worker registry only exists in a build with the structured view, and
     // without it there is no ACP worker to stop.
-    if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
-        crate::process::worker_registry::delete(&instance.id).ok();
-        crate::process::worker::terminate_process_group(record.pid);
-        quiesced.worker_was_running = true;
-        quiesced.worker_generation = record.generation;
+    match crate::process::worker_registry::load(&instance.id) {
+        Ok(Some(record)) => {
+            if let Err(error) = crate::process::worker_registry::delete(&instance.id) {
+                tracing::warn!(target: "session.attach", session = %instance.id, %error, "quiesce: worker record delete failed");
+            }
+            crate::process::worker::terminate_process_group(record.pid);
+            quiesced.worker_was_running = true;
+            quiesced.worker_generation = record.generation;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(target: "session.attach", session = %instance.id, %error, "quiesce: worker record load failed");
+        }
     }
 
     if instance.tmux_session().is_ok_and(|s| s.exists()) {

@@ -214,7 +214,9 @@ the optional wake field is deserializable live metadata but is omitted from
 embedded management disconnects withdraw the accepted receipt. Submission and
 native responder/mode/cancel effects check it before consuming a composer,
 recall edit or picker selection. Existing named queue edits/deletes, link opening
-and read-only picker inspection remain management/local actions. Refused new
+and read-only picker inspection remain management/local actions. Local plan
+inspection (open/read, rendered/raw, copy and close) likewise needs no native
+decision authority; approval decisions still require it. Refused new
 intent cannot silently become a queue write; a retained ordinary request failure
 alone does not withdraw a genuine current Available receipt.
 

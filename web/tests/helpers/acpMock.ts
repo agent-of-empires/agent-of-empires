@@ -50,6 +50,8 @@ export interface AcpSessionMockOptions {
   promptWakeEligible?: boolean;
   /** Let a spec hold current authority while the socket/replay is already open. */
   emitNativeSnapshot?: boolean;
+  /** Extra `SessionResponse` fields, such as the agent's `clear_aliases` and `compact_aliases`. */
+  sessionFields?: Record<string, unknown>;
 }
 
 export interface AcpSessionMock {
@@ -281,6 +283,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
             ...(opts.importPending ? { import_pending: true } : {}),
             ...(opts.rateLimitAutoResume === undefined ? {} : { rate_limit_auto_resume: opts.rateLimitAutoResume }),
+            ...opts.sessionFields,
             claude_fullscreen: false,
           },
         ],
