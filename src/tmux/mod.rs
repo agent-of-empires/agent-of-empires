@@ -2844,9 +2844,11 @@ fn home_dir() -> Option<String> {
 /// expansion that itself contains whitespace (a `$HOME` path with a space)
 /// stays inside one word, exactly as the shell assignment treats it. Quote
 /// context is preserved: single-quoted `$HOME` stays literal (the launch does
-/// not expand it) and tilde never expands inside quotes. Unsupported
-/// constructs are left verbatim and rejected later only when they sit in the
-/// probed assignments or executable (never in trailing agent arguments).
+/// not expand it), tilde never expands inside quotes, and a backslash escapes
+/// the next character outside single quotes (`foo\ bar` is one word, `\$HOME`
+/// is a literal dollar). Unsupported constructs are left verbatim and rejected
+/// later only when they sit in the probed assignments or executable (never in
+/// trailing agent arguments).
 fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
     let home = home_dir();
     let mut words = Vec::new();
@@ -2858,6 +2860,14 @@ fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
         match c {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
+            // Outside single quotes a backslash escapes the next character: it
+            // neither splits words nor expands nor toggles quotes (`foo\ bar`
+            // is one word, `\$HOME` is a literal dollar). Inside single quotes
+            // backslash is literal, exactly as the launch shell treats it.
+            '\\' if !in_single => match chars.next() {
+                Some(next) => current.push(next),
+                None => current.push('\\'),
+            },
             c if c.is_whitespace() && !in_single && !in_double => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -4073,6 +4083,18 @@ mod tests {
                 1
             ))
         );
+        // A backslash escapes the next character: `foo\ bar` is one word and
+        // `\$HOME` is a literal dollar, exactly as the launch shell treats them.
+        assert_eq!(
+            probe_command_words("foo\\ bar acmebot"),
+            Some((vec!["foo bar".to_string(), "acmebot".to_string()], 0))
+        );
+        assert_eq!(
+            probe_command_words("PATH=\\$HOME/bin acmebot"),
+            Some((vec!["PATH=$HOME/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // The escaped literal `$HOME` cannot be verified and is refused.
+        assert!(plugin_command_parts("PATH=\\$HOME/bin acmebot").is_none());
     }
 
     #[test]
