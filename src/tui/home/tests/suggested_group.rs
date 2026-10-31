@@ -343,6 +343,28 @@ fn the_full_view_palette_opens_the_selected_source_and_esc_returns_to_the_view()
     assert!(env.view.suggestions_view.is_some());
 }
 
+fn preview_text(env: &mut TestEnv, width: u16) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            assert!(env.view.render_suggestion_preview(
+                frame,
+                area,
+                &crate::tui::styles::Theme::default()
+            ));
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
 #[test]
 #[serial]
 fn the_preview_key_line_names_the_source_from_120_columns() {
@@ -355,25 +377,7 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
         (120, true, "Z dismiss  ^K open in GitHub"),
     ] {
         env.view.strict_hotkeys = strict;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                assert!(env.view.render_suggestion_preview(
-                    frame,
-                    area,
-                    &crate::tui::styles::Theme::default()
-                ));
-            })
-            .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let text = preview_text(&mut env, width);
         assert!(
             text.contains(expected),
             "{width} cols, strict {strict}: {expected:?}"
@@ -445,4 +449,30 @@ fn the_group_shows_without_any_session() {
         .collect();
     assert!(text.contains("Suggested"), "{text}");
     assert!(!text.contains("No sessions yet"));
+}
+
+#[test]
+#[serial]
+fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
+    let (mut env, _requests) = expanded_env(1);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    for (prefs, prefix, meta) in [
+        (None, "GitHub #0 ", "GitHub · #0 · review requested"),
+        (
+            Some(serde_json::json!({ "show_source_ref": false })),
+            "GitHub ",
+            "GitHub · review requested",
+        ),
+    ] {
+        let mut snap = snapshot(1, &[]);
+        if let Some(prefs) = prefs {
+            snap["prefs"] = prefs;
+        }
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        let row = env.view.suggestion_row_text("gh", "i0").unwrap();
+        assert_eq!(row.0, prefix);
+        let text = preview_text(&mut env, 100);
+        assert!(text.contains(meta), "{meta:?}: {text}");
+    }
 }
