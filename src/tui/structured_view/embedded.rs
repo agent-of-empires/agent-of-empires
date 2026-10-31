@@ -79,7 +79,7 @@ impl RetainedView {
         let id = inst.id.clone();
         view.load = Some(tokio::spawn(async move {
             let rows = http
-                .replay_rows_paged(&id, 0, 1000)
+                .replay_retained_paged(&id, 0, 1000)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(rows);
@@ -109,7 +109,7 @@ impl RetainedView {
                 self.message = if rows.is_empty() {
                     "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
                 } else if lost {
-                    "Retained ACP history is incomplete (retention gap).".into()
+                    "Retained ACP history is incomplete; some events are unavailable.".into()
                 } else {
                     "Retained ACP transcript · scroll to read · drag to copy".into()
                 };

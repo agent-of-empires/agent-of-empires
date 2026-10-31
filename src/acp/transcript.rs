@@ -141,6 +141,10 @@ impl TranscriptModel {
         &self.rows
     }
 
+    pub fn into_rows(self) -> Vec<TranscriptRow> {
+        self.rows
+    }
+
     pub fn last_seq(&self) -> u64 {
         self.last_seq
     }

@@ -40,6 +40,13 @@ pub struct PluginCommandView {
     pub action: Option<aoe_plugin_api::ClientAction>,
 }
 
+#[derive(Clone, Copy)]
+enum ReplayKind {
+    Live,
+    Rows,
+    Retained,
+}
+
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
@@ -170,21 +177,20 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Fold replay pages through the first page's snapshot window. Row replay
-    /// keeps reading retained content after a gap; raw replay stops for reset.
+    /// Live replay stops for reset after loss; retained replay keeps reading.
     async fn replay_pages(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
-        view_rows: bool,
-        mut consume: impl FnMut(ReplayResponse),
+        kind: ReplayKind,
+        mut consume: impl FnMut(ReplayResponse, u64),
     ) -> Result<(u64, Option<u64>, bool), HttpError> {
         let mut cursor = since;
         let mut target = None;
         let mut any_lost = false;
         loop {
-            let page = if view_rows {
+            let page = if matches!(kind, ReplayKind::Rows) {
                 self.replay_rows_page(session_id, cursor, page_size).await?
             } else {
                 self.replay_page(session_id, cursor, page_size).await?
@@ -193,9 +199,14 @@ impl HttpClient {
             let (highest_seq, lowest_seq, lost) = (page.highest_seq, page.lowest_seq, page.lost);
             any_lost |= lost;
             let (next_cursor, has_more) = (page.next_cursor, page.has_more);
-            consume(page);
+            consume(page, cap);
             match next_cursor {
-                Some(next) if (!lost || view_rows) && has_more && next > cursor && next < cap => {
+                Some(next)
+                    if (!lost || !matches!(kind, ReplayKind::Live))
+                        && has_more
+                        && next > cursor
+                        && next < cap =>
+                {
                     cursor = next;
                 }
                 _ => return Ok((highest_seq, lowest_seq, any_lost)),
@@ -213,7 +224,7 @@ impl HttpClient {
     ) -> Result<ReplayResponse, HttpError> {
         let mut frames = Vec::new();
         let (highest_seq, lowest_seq, lost) = self
-            .replay_pages(session_id, since, page_size, false, |page| {
+            .replay_pages(session_id, since, page_size, ReplayKind::Live, |page, _| {
                 frames.extend(page.frames);
             })
             .await?;
@@ -258,7 +269,7 @@ impl HttpClient {
     ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
         let mut rows = Vec::new();
         let (_, _, lost) = self
-            .replay_pages(session_id, since, page_size, true, |page| {
+            .replay_pages(session_id, since, page_size, ReplayKind::Rows, |page, _| {
                 if let Some(page_rows) = page.rows {
                     for row in page_rows {
                         crate::acp::transcript::upsert_transcript_row(&mut rows, row);
@@ -267,6 +278,40 @@ impl HttpClient {
             })
             .await?;
         Ok((rows, lost))
+    }
+
+    /// Fold retained raw events once, preserving reducer state across pages.
+    pub async fn replay_retained_paged(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+    ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        let mut last_seen = since;
+        let mut snapshot_highest = since;
+        let mut incomplete = false;
+        let (_, _, reported_lost) = self
+            .replay_pages(
+                session_id,
+                since,
+                page_size,
+                ReplayKind::Retained,
+                |page, cap| {
+                    snapshot_highest = cap;
+                    for frame in page.frames {
+                        if frame.seq <= last_seen || frame.seq > cap {
+                            continue;
+                        }
+                        incomplete |= frame.seq != last_seen.saturating_add(1);
+                        last_seen = frame.seq;
+                        model.apply_event(frame.seq, &frame.event);
+                    }
+                },
+            )
+            .await?;
+        incomplete |= reported_lost || last_seen < snapshot_highest;
+        Ok((model.into_rows(), incomplete))
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -1270,6 +1315,194 @@ mod tests {
                 .map(|seq| format!("retained-{seq}"))
                 .collect::<Vec<_>>()
         );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_preserves_reducer_state_across_pages() {
+        use crate::acp::{
+            approvals::Nonce,
+            elicitations::Elicitation,
+            state::{Event, ToolCall},
+            transcript::TranscriptRowKind,
+        };
+        use axum::{routing::get, Router};
+        let inst = crate::session::Instance::new("retained state", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let completed = |tool_call_id: &str| Event::ToolCallCompleted {
+            tool_call_id: tool_call_id.into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: at,
+            async_subagent: false,
+        };
+        let events = [
+            Event::AgentMessageChunk {
+                text: "first".into(),
+                message_id: Some("a".into()),
+            },
+            Event::AgentMessageChunk {
+                text: " continuation".into(),
+                message_id: Some("a".into()),
+            },
+            Event::AgentMessageChunk {
+                text: "second".into(),
+                message_id: Some("b".into()),
+            },
+            Event::ToolCallContent {
+                tool_call_id: "output".into(),
+                content: "retained output".into(),
+            },
+            completed("output"),
+            Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "question".into(),
+                    name: "Ask".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: at,
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            },
+            Event::ElicitationRequested {
+                elicitation: Elicitation {
+                    nonce: Nonce(uuid::Uuid::new_v4().to_string()),
+                    message: "Pick one".into(),
+                    title: None,
+                    description: None,
+                    tool_call_id: Some("question".into()),
+                    questions: Vec::new(),
+                    requested_at: at,
+                    resolved: None,
+                },
+            },
+            completed("question"),
+        ];
+        for (index, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(&id, index as u64 + 1, event)
+                .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for size in [1, 2, 8] {
+            let (rows, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            assert!(!incomplete);
+            let messages: Vec<_> = rows
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::Message)
+                .collect();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|row| row.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", " continuation", "second"]
+            );
+            assert_eq!(messages[0].group_id, messages[1].group_id);
+            assert_ne!(
+                messages[1].group_id, messages[2].group_id,
+                "page size {size}"
+            );
+            let output = rows
+                .iter()
+                .find(|row| row.kind == TranscriptRowKind::ToolComplete)
+                .unwrap();
+            assert_eq!(output.text, "retained output");
+            assert!(!rows
+                .iter()
+                .any(|row| row.tool_call_id.as_deref() == Some("question")));
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_marks_pinned_sequence_gaps() {
+        use crate::acp::{event_store::EventStore, state::Event};
+        use axum::{routing::get, Router};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(EventStore::open(&dir.path().join("events.db"), 3).unwrap());
+        let inst = crate::session::Instance::new("pinned metadata", "/tmp");
+        let id = inst.id.clone();
+        store
+            .record(
+                &id,
+                1,
+                &Event::AvailableCommandsUpdated {
+                    commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        for seq in 2..=20 {
+            store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("message-{seq}"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .replay_from(&id, 0)
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [1, 18, 19, 20]
+        );
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            vec![inst],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(store),
+            |_| {},
+            std::convert::identity,
+        );
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for size in [1, 2, 10] {
+            let (rows, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            assert!(incomplete, "page size {size}");
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+                ["message-18", "message-19", "message-20"]
+            );
+        }
         server.abort();
         let _ = server.await;
     }

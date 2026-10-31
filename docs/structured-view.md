@@ -160,14 +160,15 @@ Scroll with the mouse wheel, or press **Enter** to focus the reader and use
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
-Rename and workdir dialogs, plus quick permission replies, close if their session
-changes lifecycle or disappears. A pending dialog cannot retarget another session
-when the list updates.
+Rename and workdir dialogs, quick permission replies, and pending Trash
+confirmations close if their session changes lifecycle or disappears. A pending
+dialog cannot retarget another session when the list updates.
 
-The reader uses the daemon's persisted ACP events, including events retained
-before a switch to terminal view. Retention gaps are marked explicitly. It does
-not import native agent history files: those files may remain in the agent's
-store, but their formats and availability vary by agent and execution environment.
+The reader folds persisted ACP events across all retained pages, including events
+recorded before a switch to terminal view. Missing or unreadable event ranges are
+marked explicitly, even when older metadata survives retention. It does not
+import native agent history files: their formats and availability vary by agent
+and execution environment.
 Missing content and read failures are shown without restarting the agent.
 Destroyed tmux scrollback cannot be recovered by this reader.
 

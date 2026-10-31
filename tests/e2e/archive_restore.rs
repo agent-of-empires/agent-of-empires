@@ -699,18 +699,43 @@ fn trash_retained_transcript_is_read_only() {
     .unwrap();
     let app_dir = app_dir_in(h.home_path());
     let store = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    store
+        .record(
+            &id,
+            1,
+            &Event::AvailableCommandsUpdated {
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
     for seq in 10..=1014 {
-        store
-            .record(
-                &id,
-                seq,
-                &Event::AgentMessageChunk {
-                    text: format!("retained-{seq:04}\n\n"),
-                    message_id: None,
-                },
-            )
-            .unwrap();
+        let event = if seq == 1008 {
+            Event::ToolCallContent {
+                tool_call_id: "retained-tool".into(),
+                content: "retained-tool-output".into(),
+            }
+        } else {
+            Event::AgentMessageChunk {
+                text: format!("retained-{seq:04}\n\n"),
+                message_id: None,
+            }
+        };
+        store.record(&id, seq, &event).unwrap();
     }
+    store
+        .record(
+            &id,
+            1015,
+            &Event::ToolCallCompleted {
+                tool_call_id: "retained-tool".into(),
+                is_error: true,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
     drop(store);
     let launch_marker = h.home_path().join("agent-launched");
     let bin = h.install_path_command("claude");
@@ -750,6 +775,8 @@ fn trash_retained_transcript_is_read_only() {
     h.send_mouse_click(0, 7, row);
     h.send_keys("Enter");
     h.wait_for("retained-1014");
+    h.wait_for("retained-tool-output");
+    h.assert_screen_contains("history is incomplete");
     h.assert_screen_contains("Trash · read-only");
     let before = h.read_sessions();
     h.send_keys("C-q");
