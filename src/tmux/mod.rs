@@ -2845,7 +2845,7 @@ fn home_dir() -> Option<String> {
 /// are left verbatim here and rejected later only when they sit in the probed
 /// assignments or executable (never in trailing agent arguments).
 fn expand_home_in_command(command: &str) -> String {
-    let home = home_dir().unwrap_or_default();
+    let home = home_dir();
     let mut out = String::with_capacity(command.len() + 16);
     let mut chars = command.chars().peekable();
     let mut in_single = false;
@@ -2871,7 +2871,12 @@ fn expand_home_in_command(command: &str) -> String {
                         name.push(ch);
                     }
                     if name == "HOME" {
-                        out.push_str(&home);
+                        match &home {
+                            Some(home) => out.push_str(home),
+                            // HOME is unavailable: keep the form literal so it is
+                            // rejected by the probed-word scan, never blanked.
+                            None => out.push_str("${HOME}"),
+                        }
                     } else {
                         out.push_str("${");
                         out.push_str(&name);
@@ -2888,22 +2893,28 @@ fn expand_home_in_command(command: &str) -> String {
                         }
                     }
                     if token == "HOME" {
-                        out.push_str(&home);
+                        match &home {
+                            Some(home) => out.push_str(home),
+                            None => out.push_str("$HOME"),
+                        }
                     } else {
                         out.push('$');
                         out.push_str(&token);
                     }
                 }
             }
+            // Tilde expansion happens only outside quotes, exactly as the
+            // launch shell treats it.
             '~' if !in_single
+                && !in_double
                 && matches!(
                     out.chars().last(),
                     None | Some(' ') | Some('\t') | Some('=') | Some(':')
                 ) =>
             {
-                match chars.peek() {
-                    Some('/') | None => out.push_str(&home),
-                    Some(_) => out.push('~'),
+                match (&home, chars.peek()) {
+                    (Some(home), Some('/') | None) => out.push_str(home),
+                    _ => out.push('~'),
                 }
             }
             _ => out.push(c),
@@ -3826,10 +3837,13 @@ mod tests {
         let _env = probe_environment(home.path());
         let login_bin = home.path().join("login-bin");
         std::fs::create_dir(&login_bin).unwrap();
+        let spaced_bin = home.path().join("my tools");
+        std::fs::create_dir(&spaced_bin).unwrap();
         let executed = home.path().join("executed");
         for path in [
             home.path().join("bin/direct-agent"),
             login_bin.join("login-agent"),
+            spaced_bin.join("spaced-agent"),
         ] {
             std::fs::write(
                 &path,
@@ -3859,6 +3873,8 @@ mod tests {
             // `$HOME` and `~/` expand so discovery agrees with the launch shell.
             ("PATH=$HOME/login-bin login-agent", true),
             ("PATH=~/login-bin login-agent", true),
+            // A quoted `$HOME` path containing a space resolves a real executable.
+            ("PATH=\"$HOME/my tools\" spaced-agent", true),
             // Single-quoted `$HOME` stays literal, as the launch shell would.
             ("PATH='$HOME/login-bin' login-agent", false),
             // Command substitution in a probed part is rejected, never run.
@@ -4003,6 +4019,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn expand_home_in_command_expands_home_and_keeps_quote_context() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
@@ -4028,6 +4045,11 @@ mod tests {
             expand_home_in_command("PATH='$HOME/.local/bin' acmebot"),
             "PATH='$HOME/.local/bin' acmebot"
         );
+        // Tilde does not expand inside double quotes, exactly as the shell.
+        assert_eq!(
+            expand_home_in_command("PATH=\"~/bin\" acmebot"),
+            "PATH=\"~/bin\" acmebot"
+        );
         // `~user` is another user's home and stays literal.
         assert_eq!(
             expand_home_in_command("PATH=~alice/bin acmebot"),
@@ -4036,6 +4058,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn plugin_command_parts_rejects_unverifiable_probed_constructs() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
