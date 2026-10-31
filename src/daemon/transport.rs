@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::DaemonClientError;
-use crate::util::{runtime_path_refusal, RuntimePathRemedy};
 
 const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b' ')
@@ -22,6 +21,101 @@ const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimePathRemedy {
+    Advice(&'static str),
+    Command {
+        template: &'static str,
+        manual: &'static str,
+    },
+}
+
+/// Format a refused directory without terminal controls or lossy shell commands.
+fn runtime_path_refusal(
+    path: &std::path::Path,
+    mode: u32,
+    cause: &str,
+    remedy: RuntimePathRemedy,
+) -> String {
+    fn append_path(output: &mut String, template: &str, path: impl std::fmt::Display) {
+        use std::fmt::Write;
+        let mut parts = template.split("{path}");
+        output.push_str(parts.next().unwrap_or_default());
+        for part in parts {
+            write!(output, "{path}{part}").unwrap();
+        }
+    }
+
+    let mut message = format!(
+        "Unsafe runtime directory: {path:?} is {cause} (mode {:04o}). ",
+        mode & 0o7777
+    );
+    match remedy {
+        RuntimePathRemedy::Advice(advice) => {
+            message.push_str("Resolve this by: ");
+            message.push_str(advice);
+        }
+        RuntimePathRemedy::Command { template, manual } => {
+            let text = path.to_str().filter(|text| {
+                !text.contains(|c: char| {
+                    // Bidi_Control characters are not covered by is_control().
+                    c.is_control()
+                        || matches!(
+                            c,
+                            '`' | '\u{061c}'
+                                | '\u{200e}'..='\u{200f}'
+                                | '\u{202a}'..='\u{202e}'
+                                | '\u{2066}'..='\u{2069}'
+                        )
+                })
+            });
+            if let Some(text) = text {
+                message.push_str("Resolve this by: `");
+                append_path(
+                    &mut message,
+                    template,
+                    crate::session::environment::shell_escape(text),
+                );
+                message.push_str("`, then retry.");
+            } else {
+                message.push_str(manual);
+                message.push_str(
+                    " manually, then retry. No copyable shell command is available for this path.",
+                );
+            }
+        }
+    }
+    message
+}
+
+fn permission_refusal(
+    path: &Path,
+    mode: u32,
+    cause: &'static str,
+    template: &'static str,
+    manual: &'static str,
+    unsafe_ancestry_advice: &'static str,
+    owner: u32,
+) -> anyhow::Error {
+    let upper_ancestors_are_trusted = path.ancestors().skip(1).all(|ancestor| {
+        std::fs::symlink_metadata(ancestor)
+            .is_ok_and(|metadata| trusted_directory(&metadata, owner))
+    });
+    let remedy = if upper_ancestors_are_trusted {
+        RuntimePathRemedy::Command { template, manual }
+    } else {
+        RuntimePathRemedy::Advice(unsafe_ancestry_advice)
+    };
+    anyhow::anyhow!(runtime_path_refusal(path, mode, cause, remedy))
+}
+
+fn trusted_directory(metadata: &std::fs::Metadata, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && trusted_ancestor(metadata.uid(), metadata.mode(), owner)
+}
 
 pub(crate) fn path_segment(
     value: &str,
@@ -69,15 +163,15 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
         )
     );
     if directory.mode() & 0o777 != 0o700 {
-        return Err(anyhow::anyhow!(runtime_path_refusal(
+        return Err(permission_refusal(
             parent,
             directory.mode(),
             "not private to its owner",
-            RuntimePathRemedy::Command {
-                template: "chmod -- 0700 {path}",
-                manual: "Set this directory to mode 0700",
-            },
-        )));
+            "chmod -- 0700 {path}",
+            "Set this directory to mode 0700",
+            "Set this directory to mode 0700 manually, then retry. No copyable shell command is available because its parent chain is unsafe.",
+            owner,
+        ));
     }
     Ok(())
 }
@@ -90,31 +184,33 @@ fn check_ancestor(ancestor: &Path, parent: &Path, owner: u32) -> anyhow::Result<
         && meta.mode() & 0o022 != 0
         && !trusted_ancestor(meta.uid(), meta.mode(), owner)
     {
-        if ancestor == parent {
-            return Err(anyhow::anyhow!(runtime_path_refusal(
-                ancestor,
-                meta.mode(),
+        let (cause, template, manual, unsafe_ancestry_advice) = if ancestor == parent {
+            (
                 "not private to its owner",
-                RuntimePathRemedy::Command {
-                    template: "chmod -- 0700 {path}",
-                    manual: "Set this directory to mode 0700",
-                },
-            )));
-        }
-        return Err(anyhow::anyhow!(runtime_path_refusal(
+                "chmod -- 0700 {path}",
+                "Set this directory to mode 0700",
+                "Set this directory to mode 0700 manually, then retry. No copyable shell command is available because its parent chain is unsafe.",
+            )
+        } else {
+            (
+                "writable by its group or by others",
+                "chmod -- go-w {path}",
+                "Remove group/other write permission from this directory",
+                "Remove group/other write permission manually, then retry. No copyable shell command is available because this directory's parent chain is unsafe.",
+            )
+        };
+        return Err(permission_refusal(
             ancestor,
             meta.mode(),
-            "writable by its group or by others",
-            RuntimePathRemedy::Command {
-                template: "chmod -- go-w {path}",
-                manual: "Remove group/other write permission from this directory",
-            },
-        )));
+            cause,
+            template,
+            manual,
+            unsafe_ancestry_advice,
+            owner,
+        ));
     }
     anyhow::ensure!(
-        meta.is_dir()
-            && !meta.file_type().is_symlink()
-            && trusted_ancestor(meta.uid(), meta.mode(), owner),
+        trusted_directory(&meta, owner),
         "{}",
         runtime_path_refusal(
             ancestor,
@@ -614,6 +710,52 @@ mod tests {
         run_directory_recovery(&error);
         assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o755);
         prepare_runtime_directory(&parent).unwrap();
+    }
+
+    #[test]
+    fn unsafe_upper_ancestors_suppress_copyable_recovery_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let upper = root.path().canonicalize().unwrap().join("unsafe upper");
+        let lower = upper.join("unsafe lower");
+        let app = lower.join("app");
+        let socket = app.join("daemon");
+        std::fs::create_dir_all(&socket).unwrap();
+        for directory in [&upper, &lower] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let ancestor_error = prepare_runtime_directory(&socket).unwrap_err();
+        let ancestor_diagnostic = ancestor_error.to_string();
+        assert!(
+            ancestor_diagnostic.contains(&format!("{lower:?}")),
+            "{ancestor_diagnostic}"
+        );
+        assert!(
+            !ancestor_diagnostic.contains("`chmod"),
+            "{ancestor_diagnostic}"
+        );
+        assert!(
+            ancestor_diagnostic.contains("parent chain is unsafe"),
+            "{ancestor_diagnostic}"
+        );
+
+        let socket_diagnostic = check_ancestor(&socket, &socket, nix::unistd::geteuid().as_raw())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            socket_diagnostic.contains(&format!("{socket:?}")),
+            "{socket_diagnostic}"
+        );
+        assert!(!socket_diagnostic.contains("`chmod"), "{socket_diagnostic}");
+        assert!(
+            socket_diagnostic.contains("parent chain is unsafe"),
+            "{socket_diagnostic}"
+        );
     }
 
     #[test]
