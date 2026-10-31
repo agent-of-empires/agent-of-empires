@@ -2,28 +2,53 @@
 // existing WebSocket, so this pane opens no connection of its own.
 
 import { useEffect, useState } from "react";
-import { Bot, ChevronDown, Maximize2, Square, X } from "lucide-react";
+import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 
-import { useBackgroundAgents } from "../../hooks/useAcpSession";
+import { useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
+import { isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
+
+type Entry =
+  | { kind: "agent"; agent: BackgroundAgent }
+  | { kind: "workflow"; runId: string; name: string; agents: BackgroundAgent[] };
+
+/** Plain agents as they sort; a workflow's agents together, where its first one sorts. */
+function entries(sorted: BackgroundAgent[], all: BackgroundAgent[]): Entry[] {
+  const seen = new Set<string>();
+  const out: Entry[] = [];
+  for (const agent of sorted) {
+    const workflow = agent.workflow;
+    if (!workflow) {
+      out.push({ kind: "agent", agent });
+    } else if (!seen.has(workflow.run_id)) {
+      seen.add(workflow.run_id);
+      const agents = all.filter((a) => a.workflow?.run_id === workflow.run_id);
+      out.push({ kind: "workflow", runId: workflow.run_id, name: workflow.name, agents });
+    }
+  }
+  return out;
+}
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
   const agents = useBackgroundAgents(sessionId);
+  const backgroundTasks = useBackgroundTasks(sessionId);
+  const workflowRuns = useWorkflowRuns(sessionId);
 
   if (agents.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
         No background sub-agents launched yet. When the agent dispatches an async{" "}
-        <span className="font-mono">Task</span>, it shows up here with live progress.
+        <span className="font-mono">Task</span> or runs a <span className="font-mono">Workflow</span>, its agents show
+        up here with live progress.
       </div>
     );
   }
 
   // Running first, then most-recently-started within each group.
   const sorted = [...agents].sort((a, b) => {
-    const ra = isActive(a.status) ? 0 : 1;
-    const rb = isActive(b.status) ? 0 : 1;
+    const ra = isActiveAgent(a) ? 0 : 1;
+    const rb = isActiveAgent(b) ? 0 : 1;
     if (ra !== rb) return ra - rb;
     return b.startedAt.localeCompare(a.startedAt);
   });
@@ -39,20 +64,63 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
         {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
       </div>
       <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents show here. Synchronous sub-agents run
-        inline in the transcript.
+        Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
+        <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
+        transcript.
       </p>
       <div className="flex flex-col">
-        {sorted.map((a) => (
-          <AgentRow key={a.agentId} agent={a} />
-        ))}
+        {entries(sorted, agents).map((entry) =>
+          entry.kind === "agent" ? (
+            <AgentRow key={entry.agent.agentId} agent={entry.agent} />
+          ) : (
+            <WorkflowGroup
+              key={entry.runId}
+              name={entry.name}
+              agents={entry.agents}
+              live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
+            />
+          ),
+        )}
       </div>
     </div>
   );
 }
 
-function isActive(status: BackgroundAgentStatus): boolean {
-  return status === "running" || status === "stalled";
+function WorkflowGroup({ name, agents, live }: { name: string; agents: BackgroundAgent[]; live: boolean }) {
+  const [open, setOpen] = useState(true);
+  const done = agents.filter((a) => !isActiveAgent(a)).length;
+  return (
+    <div className="border-b border-surface-700">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-800"
+      >
+        <StatusDot status={live ? "running" : "completed"} />
+        <Workflow className="h-3.5 w-3.5 shrink-0 text-text-dim" />
+        <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{name}</span>
+        <span className="shrink-0 text-[11px] tabular-nums text-text-dim">
+          {done} of {agents.length} done
+        </span>
+        <ChevronDown
+          className={`h-3.5 w-3.5 shrink-0 text-text-dim transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+      {open &&
+        workflowPhases(agents).map(({ phase, agents: phaseAgents }) => (
+          <div key={phase} className="pl-3">
+            {phase && (
+              <div className="px-3 pt-1 text-[10px] uppercase tracking-wider text-text-dim">
+                {phase} · {phaseAgents.filter((a) => !isActiveAgent(a)).length}/{phaseAgents.length}
+              </div>
+            )}
+            {phaseAgents.map((a) => (
+              <AgentRow key={a.agentId} agent={a} />
+            ))}
+          </div>
+        ))}
+    </div>
+  );
 }
 
 /** ACP has no per-agent cancel; cancelling the session stops its async sub-agents. */
@@ -102,7 +170,7 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
           <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">
             {agent.description || "Sub-agent"}
           </span>
-          <Elapsed startedAt={agent.startedAt} endedAt={agent.endedAt} active={isActive(agent.status)} />
+          <Elapsed startedAt={agent.startedAt} endedAt={agent.endedAt} active={isActiveAgent(agent)} />
           <StatusLabel status={agent.status} toolCount={agent.toolCount} />
           <ChevronDown
             className={`h-3.5 w-3.5 shrink-0 text-text-dim transition-transform ${open ? "rotate-180" : ""}`}

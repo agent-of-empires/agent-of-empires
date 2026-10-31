@@ -29,6 +29,7 @@ export interface AgentProfile {
     skillNames: string[];
     scheduleNames: string[];
     harnessNames: string[];
+    workflowNames: string[];
   };
   /** Mirrors `AgentDef.lifecycle` in src/agents.rs; absent for Active agents. */
   lifecycle?: AgentLifecycleInfo;
@@ -53,6 +54,7 @@ const CLAUDE: AgentProfile = {
     skillNames: ["skill", "claude-skill"],
     scheduleNames: ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
     harnessNames: ["ToolSearch", "Monitor", "TaskStop"],
+    workflowNames: ["Workflow"],
   },
 };
 
@@ -79,7 +81,7 @@ const CODEX: AgentProfile = {
     edit: ["apply_patch"],
     read: ["view_file", "read_file", "read"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const OPENCODE: AgentProfile = {
@@ -103,7 +105,7 @@ const OPENCODE: AgentProfile = {
     search: ["grep", "glob"],
     fetch: ["webfetch"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const GEMINI: AgentProfile = {
@@ -126,7 +128,7 @@ const GEMINI: AgentProfile = {
     search: ["grep", "glob"],
     fetch: ["web_fetch"],
   },
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
   // Mirrors AgentLifecycle::Deprecated in src/agents.rs: Google cut off consumer accounts.
   lifecycle: {
     state: "deprecated",
@@ -175,7 +177,7 @@ const VIBE: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const PI: AgentProfile = {
@@ -192,7 +194,7 @@ const PI: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const OMP: AgentProfile = {
@@ -209,7 +211,7 @@ const OMP: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const KIMI: AgentProfile = {
@@ -226,7 +228,7 @@ const KIMI: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const PRIME_AGENT: AgentProfile = {
@@ -243,7 +245,7 @@ const PRIME_AGENT: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 // aoe's own agent: three tools with real ToolKinds, no `_meta`, specials, modes, or heartbeats.
@@ -261,7 +263,7 @@ const AOE_AGENT: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 /** Fallback for unknown agents: kind-only dispatch. */
@@ -279,7 +281,7 @@ export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   aliases: {},
-  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] },
 };
 
 const PROFILES: Record<string, AgentProfile> = {
