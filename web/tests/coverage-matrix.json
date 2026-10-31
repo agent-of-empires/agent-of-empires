@@ -844,6 +844,7 @@
       "specs": [
         "tests/suggestions-review.spec.ts",
         "tests/dashboard-suggestions.spec.ts",
+        "tests/suggestions-filter-mapping.spec.ts",
         "src/components/__tests__/SuggestionsView.test.tsx",
         "src/components/__tests__/DashboardSuggestions.test.tsx"
       ],

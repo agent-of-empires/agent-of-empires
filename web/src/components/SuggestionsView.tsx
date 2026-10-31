@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { RefreshCw, Settings } from "lucide-react";
+import { RefreshCw, Search, Settings, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
+import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
@@ -73,6 +74,8 @@ export function SuggestionsView({
     useSuggestions(onPrepare, onStarted);
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
+  const [query, setQuery] = useState("");
+  const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
 
   const disabled = readOnly || offline;
   const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
@@ -81,12 +84,22 @@ export function SuggestionsView({
   const active = items.filter((item) => !item.dismissed);
   const dismissedCount = items.length - active.length;
   const showDismissed = filter === "dismissed";
-  const visible =
+  const listed =
     filter === "all"
       ? active
       : showDismissed
         ? items.filter((i) => i.dismissed)
         : active.filter((i) => i.provider_id === filter.provider);
+  const chipGroups = keyChipGroups(listed);
+  const narrowed = query.trim() !== "" || keyChips.length > 0;
+  const visible = filterSuggestions(listed, query, keyChips);
+  const toggleChip = (chip: KeyChip) =>
+    setKeyChips((current) =>
+      current.some((c) => chipId(c) === chipId(chip))
+        ? current.filter((c) => chipId(c) !== chipId(chip))
+        : [...current, chip],
+    );
+  const chipSelected = (chip: KeyChip) => keyChips.some((c) => chipId(c) === chipId(chip));
   const providers = snapshot?.providers.filter((p) => p.enabled) ?? [];
   const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
   const groups = groupByProject(visible);
@@ -189,6 +202,70 @@ export function SuggestionsView({
                 </button>
               )}
             </div>
+            {listed.length > 0 && (
+              <div className="mt-3 flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <label className="relative flex-1">
+                    <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-text-dim" />
+                    <input
+                      type="search"
+                      aria-label="Search suggestions"
+                      placeholder="Search title, reference, reason or source"
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      className="h-8 w-full rounded-md border border-surface-700 bg-surface-800 pl-8 pr-2 text-sm text-text-primary placeholder:text-text-dim"
+                    />
+                  </label>
+                  {narrowed && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setQuery("");
+                        setKeyChips([]);
+                      }}
+                      className="inline-flex h-8 flex-none items-center gap-1 rounded-md px-2.5 text-xs text-text-secondary hover:bg-surface-800"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      Clear filters
+                    </button>
+                  )}
+                </div>
+                {chipGroups.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter by source">
+                    {chipGroups.flatMap((group) => {
+                      const keyChipsOf = group.keys.map(({ key, label, count }) => (
+                        <button
+                          key={`key:${key}`}
+                          type="button"
+                          aria-pressed={chipSelected({ key })}
+                          title={key}
+                          onClick={() => toggleChip({ key })}
+                          className={chip(chipSelected({ key }))}
+                        >
+                          <span className="font-mono">{label}</span> <span className="text-text-dim">{count}</span>
+                        </button>
+                      ));
+                      if (group.org === null) return keyChipsOf;
+                      const org = { org: group.org };
+                      return [
+                        <button
+                          key={`org:${group.org}`}
+                          type="button"
+                          aria-pressed={chipSelected(org)}
+                          title={`Everything under ${group.org}/`}
+                          onClick={() => toggleChip(org)}
+                          className={chip(chipSelected(org))}
+                        >
+                          <span className="font-mono">{group.org}/</span>{" "}
+                          <span className="text-text-dim">{group.count}</span>
+                        </button>,
+                        ...keyChipsOf,
+                      ];
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
             <ul
               aria-label="Provider status"
               className="mt-3 flex flex-col gap-1 font-mono text-xs md:flex-row md:flex-wrap md:gap-x-[18px]"
@@ -271,11 +348,13 @@ export function SuggestionsView({
             <ul className="mt-4 overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
               {visible.length === 0 && (
                 <li className={SUGGESTION_NOTE_CLASS}>
-                  {showDismissed
-                    ? "No dismissed suggestions."
-                    : snapshot.providers.length === 0
-                      ? noProviderNote
-                      : "Nothing to suggest right now."}
+                  {narrowed && listed.length > 0
+                    ? "No suggestions match the filters."
+                    : showDismissed
+                      ? "No dismissed suggestions."
+                      : snapshot.providers.length === 0
+                        ? noProviderNote
+                        : "Nothing to suggest right now."}
                 </li>
               )}
               {snapshot.providers

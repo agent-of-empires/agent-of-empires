@@ -21,6 +21,7 @@ The homepage shows up to 3 suggestions (2 on a narrow screen) under "Suggested s
 The full view lists every suggestion:
 
 - Filter chips: **All**, one per provider, and **Dismissed** once something is dismissed.
+- A search box matching the title, source reference, reason and source key, ignoring case, and one chip per source key with a count. Keys of the form `org/repo` are grouped: the `org/` chip shows everything under that org, a repo chip only that repository. Selected chips combine, they work whether or not a source is mapped to a Project, and **Clear filters** resets both.
 - One status line per provider: "updated 2 min ago", "waiting for first results", "nothing new", "refreshing…", or "couldn't refresh, <error>". Items from a failing provider stay listed from the last fetch.
 - Items group under the registered Project they resolve to; items with none sit last under "No project".
 - **Refresh** asks every provider to look again.

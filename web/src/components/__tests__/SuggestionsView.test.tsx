@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
@@ -662,5 +662,30 @@ describe("SuggestionsView", () => {
       }
       expect(onPrepare).not.toHaveBeenCalled();
     });
+  });
+
+  it("filters by search and by org or repo chips regardless of project mapping", async () => {
+    const at = (id: string, title: string, mapping_key: string) => ({ ...item, id, title, mapping_key, project: null });
+    await open(
+      snapshot({
+        items: [at("1", "Web bug", "acme/web"), at("2", "Api bug", "acme/api"), at("3", "Tool chore", "other/tool")],
+      }),
+    );
+    await screen.findByText("Web bug");
+    const titles = () => ["Web bug", "Api bug", "Tool chore"].filter((t) => screen.queryByText(t));
+    const chips = screen.getByRole("group", { name: "Filter by source" });
+
+    fireEvent.click(within(chips).getByRole("button", { name: "acme/ 2" }));
+    expect(titles()).toEqual(["Web bug", "Api bug"]);
+    fireEvent.click(within(chips).getByRole("button", { name: "tool 1" }));
+    expect(titles()).toEqual(["Web bug", "Api bug", "Tool chore"]);
+    fireEvent.click(within(chips).getByRole("button", { name: "acme/ 2" }));
+    expect(titles()).toEqual(["Tool chore"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    fireEvent.change(screen.getByLabelText("Search suggestions"), { target: { value: "API" } });
+    expect(titles()).toEqual(["Api bug"]);
+    fireEvent.change(screen.getByLabelText("Search suggestions"), { target: { value: "nothing" } });
+    expect(screen.getByText("No suggestions match the filters.")).toBeTruthy();
   });
 });
