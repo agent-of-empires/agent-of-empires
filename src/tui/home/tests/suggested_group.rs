@@ -422,3 +422,27 @@ fn clicking_a_suggestion_row_leaves_live_send() {
     assert_eq!(env.view.cursor, idx);
     assert!(env.view.live_send.is_none());
 }
+
+#[test]
+#[serial]
+fn the_group_shows_without_any_session() {
+    let mut env = create_test_env_with_sessions(0);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(1, &[]));
+    env.view.rebuild_flat_items();
+    let theme = crate::tui::styles::Theme::default();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Suggested"), "{text}");
+    assert!(!text.contains("No sessions yet"));
+}
