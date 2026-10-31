@@ -5,6 +5,7 @@ import { dismissSuggestion } from "../lib/api";
 import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
+import type { SessionResponse } from "../lib/types";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -12,13 +13,21 @@ interface Props {
   /** Opens on the Dismissed filter. */
   initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  /** Called when "Start without review" created the session directly. */
+  onStarted?: (session: SessionResponse) => void;
   /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
   onOpenMarketplace?: () => void;
 }
 
-export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare, onOpenMarketplace }: Props) {
+export function SuggestionsView({
+  readOnly = false,
+  initialDismissed = false,
+  onPrepare,
+  onStarted,
+  onOpenMarketplace,
+}: Props) {
   const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start, load } =
-    useSuggestions(onPrepare);
+    useSuggestions(onPrepare, onStarted);
   const [showDismissed, setShowDismissed] = useState(initialDismissed);
 
   const disabled = readOnly || offline;

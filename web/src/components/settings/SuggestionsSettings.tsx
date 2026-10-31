@@ -24,19 +24,9 @@ function ago(updatedAt: number): string {
   return hours < 24 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
 }
 
-function Row({
-  title,
-  description,
-  children,
-  dim,
-}: {
-  title: ReactNode;
-  description: string;
-  children: ReactNode;
-  dim?: boolean;
-}) {
+function Row({ title, description, children }: { title: ReactNode; description: string; children: ReactNode }) {
   return (
-    <div className={`flex items-center justify-between gap-4 py-3 ${dim ? "opacity-60" : ""}`}>
+    <div className="flex items-center justify-between gap-4 py-3">
       <div className="min-w-0">
         <div className="text-sm text-text-primary">{title}</div>
         <div className="mt-0.5 text-xs text-text-dim">{description}</div>
@@ -298,18 +288,15 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
           </button>
         </Row>
         <Row
-          dim
-          title={
-            <>
-              Start without review{" "}
-              <span className="ml-1 rounded border border-brand-600 px-1 font-mono text-[10px] text-brand-400">
-                Later
-              </span>
-            </>
-          }
+          title="Start without review"
           description="When on, Start launches with the template and mapping, skipping the wizard."
         >
-          <SuggestionSwitch checked={false} disabled label="Start without review" onChange={() => {}} />
+          <SuggestionSwitch
+            checked={prefs.start_without_review}
+            disabled={disabled}
+            label="Start without review"
+            onChange={(v) => void patch({ start_without_review: v })}
+          />
         </Row>
       </div>
     </div>
