@@ -1504,6 +1504,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn disclosure_integrations_escapes_commands_for_display_but_keeps_manifest_raw() {
+        let raw = AgentIntegrationContribution {
+            tool: "session-helper".into(),
+            command: Some("x\u{202e}tail".into()),
+        };
+        let disclosed = disclosure_integrations(&[raw.clone()]);
+        // The consent that the CLI/TUI/web serialize carries the escaped form.
+        assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
+        // The manifest / launch command stays raw.
+        assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
+    }
+
     #[tokio::test]
     async fn web_install_rejects_non_gh_sources() {
         let err = preview_install("/tmp/some/plugin")

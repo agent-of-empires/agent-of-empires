@@ -2860,13 +2860,23 @@ fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
         match c {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            // Outside single quotes a backslash escapes the next character: it
-            // neither splits words nor expands nor toggles quotes (`foo\ bar`
-            // is one word, `\$HOME` is a literal dollar). Inside single quotes
-            // backslash is literal, exactly as the launch shell treats it.
-            '\\' if !in_single => match chars.next() {
-                Some(next) => current.push(next),
-                None => current.push('\\'),
+            // Outside single quotes a backslash escapes the next character; in
+            // double quotes POSIX only lets it escape `$`, backtick, `"`, `\`
+            // and newline, so a `\ ` there retains the backslash (`foo\ bar` is
+            // one word and `\$HOME` is a literal dollar when unquoted, but
+            // `"a\ b"` keeps the backslash). Inside single quotes backslash is
+            // literal, exactly as the launch shell treats it.
+            '\\' if !in_single => match (in_double, chars.peek().copied()) {
+                (false, Some(next)) => {
+                    chars.next();
+                    current.push(next);
+                }
+                (true, Some(next @ ('$' | '`' | '"' | '\\' | '\n'))) => {
+                    chars.next();
+                    current.push(next);
+                }
+                (true, _) => current.push('\\'),
+                (false, None) => current.push('\\'),
             },
             c if c.is_whitespace() && !in_single && !in_double => {
                 if !current.is_empty() {
@@ -4099,6 +4109,15 @@ mod tests {
         assert_eq!(
             probe_command_words("PATH=\\$HOME/bin acmebot"),
             Some((vec!["PATH=$HOME/bin".to_string(), "acmebot".to_string()], 1))
+        );
+        // Inside double quotes a backslash only escapes `$`, backtick, `"` and
+        // `\`, so `\ ` retains the backslash (the launch path is `<h>/my\ tools`).
+        assert_eq!(
+            probe_command_words("PATH=\"$HOME/my\\ tools\" spaced-agent"),
+            Some((
+                vec![format!("PATH={h}/my\\ tools"), "spaced-agent".to_string()],
+                1
+            ))
         );
         // The escaped literal `$HOME` cannot be verified and is refused.
         assert!(plugin_command_parts("PATH=\\$HOME/bin acmebot").is_none());
