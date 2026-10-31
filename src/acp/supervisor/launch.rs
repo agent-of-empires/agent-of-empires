@@ -2295,6 +2295,7 @@ mod tests {
                 description: "do a thing".into(),
                 prompt: "do a thing".into(),
                 model: "claude".into(),
+                wire_tracked: false,
                 output_file: "/tmp/nonexistent.jsonl".into(),
                 started_at: chrono::Utc::now(),
             },
@@ -2309,6 +2310,7 @@ mod tests {
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
+                model: None,
                 at: chrono::Utc::now(),
             },
         );
@@ -2487,6 +2489,7 @@ mod tests {
                 description: "do a thing".into(),
                 prompt: "do a thing".into(),
                 model: "claude".into(),
+                wire_tracked: false,
                 output_file: output_file.into(),
                 started_at: chrono::Utc::now(),
             },
@@ -2501,6 +2504,7 @@ mod tests {
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
+                model: None,
                 at: chrono::Utc::now(),
             },
         );

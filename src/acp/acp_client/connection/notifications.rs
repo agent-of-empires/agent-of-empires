@@ -16,6 +16,7 @@ use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
 };
+use crate::acp::acp_client::omp_tasks::OmpTaskTracker;
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
@@ -43,8 +44,7 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
-    /// Epoch-ms of the last inbound notification, for the resume-idle
-    /// watchdog.
+    /// Epoch-ms of the last inbound notification, for resume-idle recovery.
     pub(super) last_event_at: AtomicI64,
     /// A lifecycle-bearing notification arrived after attach. Ambient
     /// updates do not prove turn progress.
@@ -70,6 +70,7 @@ pub(super) struct Shared {
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
+    omp_tasks: std::sync::Mutex<OmpTaskTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
@@ -116,6 +117,7 @@ impl Shared {
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
+            omp_tasks: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
             bg_tasks: Arc::default(),
@@ -134,7 +136,9 @@ impl Shared {
         id: SessionId,
     ) -> Result<(), agent_client_protocol::Error> {
         let _guard = self.ingress.fence.lock().await;
+        let previous = self.ingress.current();
         let replay = self.ingress.finish(Some(id.clone()))?;
+        self.commit_background_tracking(previous.as_ref(), &id);
         self.emit(Event::AcpSessionAssigned {
             acp_session_id: id.0.to_string(),
         })
@@ -147,6 +151,21 @@ impl Shared {
     pub(super) async fn apply_replay(&self, replay: Vec<SessionNotification>) {
         for notification in replay {
             self.handle_notification(notification, false).await;
+        }
+    }
+
+    /// Called under the ingress fence, before the committed updates replay.
+    pub(super) fn commit_background_tracking(&self, previous: Option<&SessionId>, id: &SessionId) {
+        if previous.is_some_and(|previous| previous != id) {
+            self.omp_tasks
+                .lock()
+                .expect("omp task tracker mutex poisoned")
+                .clear();
+            self.between_prompt
+                .bg_agents
+                .lock()
+                .expect("background agent mutex poisoned")
+                .clear();
         }
     }
 
@@ -179,8 +198,8 @@ impl Shared {
         mut notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
-        self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
@@ -249,8 +268,14 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
+        let task_events = self
+            .omp_tasks
+            .lock()
+            .expect("omp task tracker mutex poisoned")
+            .observe(&notification.update, suppressing);
         let mut events = map_update_to_events(notification.update, self.profile);
         events.extend(restored_wake_event);
+        events.extend(task_events);
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
         forward_lifecycle_signals(
@@ -318,6 +343,27 @@ impl Shared {
                 }
                 continue;
             }
+            match &event {
+                Event::BackgroundAgentLaunched {
+                    agent_id,
+                    wire_tracked: true,
+                    ..
+                } => {
+                    self.between_prompt
+                        .bg_agents
+                        .lock()
+                        .expect("background agent mutex poisoned")
+                        .insert(agent_id.clone());
+                }
+                Event::BackgroundAgentCompleted { agent_id, .. } => {
+                    self.between_prompt
+                        .bg_agents
+                        .lock()
+                        .expect("background agent mutex poisoned")
+                        .remove(agent_id);
+                }
+                _ => {}
+            }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
                 break;
@@ -366,5 +412,90 @@ impl Shared {
             retained,
             "observed adapter rate-limit meta"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::agent_profiles::OMP;
+    use serde_json::json;
+
+    fn task_notification(status: &str, child_status: &str) -> SessionNotification {
+        serde_json::from_value(json!({
+            "sessionId": "native",
+            "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "batch", "status": status,
+                "_meta": {"omp": {"taskLifecycle": "completed"}},
+                "rawOutput": {"details": {"async": {"type": "task"}, "progress": [{
+                    "id": "Child", "agent": "task", "status": child_status,
+                    "resolvedModel": "provider/model", "assignment": "Inspect code",
+                    "toolCount": 1, "recentTools": [{"tool": "read", "args": "src"}],
+                    "recentOutput": ["Preview"]
+                }]}}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn omp_tasks_preserve_tool_cards_without_transcript_tailing() {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &OMP,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+            None,
+        );
+        shared
+            .handle_notification(task_notification("completed", "running"), false)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallCompleted { .. })));
+        assert!(events.iter().any(|e| matches!(e, Event::BackgroundAgentLaunched { output_file, wire_tracked: true, .. } if output_file.is_empty())));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::BackgroundAgentCompleted { .. })));
+        assert!(shared
+            .between_prompt
+            .bg_agents
+            .lock()
+            .unwrap()
+            .contains("Child"));
+
+        shared
+            .handle_notification(task_notification("completed", "completed"), false)
+            .await;
+        let mut terminal = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, Event::BackgroundAgentLaunched { .. }));
+            terminal += usize::from(matches!(event, Event::BackgroundAgentCompleted { .. }));
+        }
+        assert_eq!(terminal, 1);
+        assert!(!shared
+            .between_prompt
+            .bg_agents
+            .lock()
+            .unwrap()
+            .contains("Child"));
+
+        shared
+            .suppress_history_replay
+            .store(true, Ordering::Relaxed);
+        shared
+            .handle_notification(task_notification("completed", "running"), false)
+            .await;
+        assert!(event_rx.try_recv().is_err());
     }
 }

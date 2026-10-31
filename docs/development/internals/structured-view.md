@@ -99,6 +99,14 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+### omp async task updates
+
+The omp tracker consumes structured task details from ACP tool updates, not display text. A mixed async batch registers every task row without requiring a per-row `detached` flag. Repeated rolling snapshots replace the prior snapshot, rather than appending output or duplicating task rows. Preview text comes from `recentOutput`; the full async final result is not a preview source.
+
+Task records use the shared `BackgroundAgentLaunched`, `BackgroundAgentProgress`, and `BackgroundAgentCompleted` events. Launches mark lifetime wire tracking with `wire_tracked` (default false for older events). A duplicate wire-tracked launch with the same agent and tool-call IDs preserves existing progress and terminal history; other launches retain replacement behavior. Progress may carry a resolved `model`; an omitted model preserves the existing value. Terminal records do not reopen on late progress.
+
+The native `omp acp` adapter must forward lifetime task updates after `session/prompt` returns, including progress and terminal transitions. AoE cannot reconstruct source updates that the adapter never forwards. Until that bridge is deployed in the installed omp adapter, neither continued progress nor completion after the prompt ends is guaranteed.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.

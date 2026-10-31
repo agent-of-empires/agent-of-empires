@@ -333,6 +333,8 @@ impl Session {
             .map(|resp| resp.session_id.clone())
             .unwrap_or_else(|_| self.acp_session_id.clone());
         let mut replay = ingress.finish(Some(retained_id.clone()))?;
+        self.shared
+            .commit_background_tracking(Some(&self.acp_session_id), &retained_id);
         if retained_id == self.acp_session_id {
             self.shared.apply_replay(std::mem::take(&mut replay)).await;
         }

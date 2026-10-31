@@ -376,11 +376,13 @@ export type AcpEvent =
         prompt: string;
         model: string;
         started_at: string;
+        wire_tracked?: boolean;
       };
     }
   | {
       BackgroundAgentProgress: {
         agent_id: string;
+        model?: string;
         status: BackgroundAgentStatus;
         tool_count: number;
         tools?: BackgroundAgentTool[];
@@ -517,6 +519,7 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  background_agents?: BackgroundAgentWire[];
 }
 
 export interface AcpState {
@@ -647,6 +650,7 @@ export interface BackgroundAgent {
   description: string;
   prompt: string;
   model: string;
+  wireTracked: boolean;
   status: BackgroundAgentStatus;
   startedAt: string;
   endedAt: string | null;
@@ -656,6 +660,24 @@ export interface BackgroundAgent {
   lastText: string | null;
   result: string | null;
   warning: string | null;
+}
+
+export interface BackgroundAgentWire {
+  agent_id: string;
+  tool_call_id: string;
+  description: string;
+  prompt: string;
+  model: string;
+  wire_tracked?: boolean;
+  status: BackgroundAgentStatus;
+  started_at: string;
+  ended_at?: string | null;
+  tool_count?: number;
+  tools?: BackgroundAgentTool[];
+  last_tool?: string | null;
+  last_text?: string | null;
+  result?: string | null;
+  warning?: string | null;
 }
 
 export interface RejectedPrompt {
@@ -1236,12 +1258,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("BackgroundAgentLaunched" in event) {
     const e = event.BackgroundAgentLaunched;
+    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
+    if (e.wire_tracked && next.backgroundAgents[i]?.toolCallId === e.tool_call_id) return next;
     const record: BackgroundAgent = {
       agentId: e.agent_id,
       toolCallId: e.tool_call_id,
       description: e.description,
       prompt: e.prompt,
       model: e.model,
+      wireTracked: e.wire_tracked ?? false,
       status: "running",
       startedAt: e.started_at,
       endedAt: null,
@@ -1252,8 +1277,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       result: null,
       warning: null,
     };
-    // Idempotent on replay.
-    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
     next.backgroundAgents =
       i >= 0 ? next.backgroundAgents.map((a, idx) => (idx === i ? record : a)) : [...next.backgroundAgents, record];
     return next;
@@ -1269,9 +1292,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
       return {
         ...a,
+        model: e.model ?? a.model,
         status: e.status,
         toolCount: e.tool_count,
-        tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+        tools: e.tools ?? a.tools,
         // A Progress never ends an agent; only the terminal
         // BackgroundAgentCompleted sets endedAt (#4001).
         endedAt: null,
@@ -1291,7 +1315,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
             endedAt: e.ended_at,
             tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
             result: e.result ?? a.result,
-            warning: e.warning ?? a.warning,
+            warning: e.warning ?? null,
           }
         : a,
     );
@@ -1355,6 +1379,25 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    backgroundAgents: holds("background_agents")
+      ? state.backgroundAgents
+      : (reduced.background_agents ?? []).map((agent) => ({
+          agentId: agent.agent_id,
+          toolCallId: agent.tool_call_id,
+          description: agent.description,
+          prompt: agent.prompt,
+          model: agent.model,
+          wireTracked: agent.wire_tracked ?? false,
+          status: agent.status,
+          startedAt: agent.started_at,
+          endedAt: agent.ended_at ?? null,
+          toolCount: agent.tool_count ?? 0,
+          tools: agent.tools ?? [],
+          lastTool: agent.last_tool ?? null,
+          lastText: agent.last_text ?? null,
+          result: agent.result ?? null,
+          warning: agent.warning ?? null,
+        })),
     locallyResolved,
   };
 }
@@ -1511,6 +1554,10 @@ export function normaliseTurnState(
       : 0;
   return {
     ...state,
+    backgroundAgents: (state.backgroundAgents ?? []).map((agent) => ({
+      ...agent,
+      wireTracked: agent.wireTracked ?? false,
+    })),
     oldestSeq,
     rejectedPrompts,
     agentUnresponsive,

@@ -605,6 +605,77 @@ done
     }
 
     #[tokio::test]
+    async fn omp_tasks_reset_clears_only_committed_changed_identity() {
+        for outcome in ["changed", "same", "failed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let script = write_early_identity_agent(temp.path());
+            let task = r#"task() {
+  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"batch","status":"completed","rawOutput":{"details":{"async":{"type":"task"},"progress":[{"id":"Child","agent":"task","status":"completed","assignment":"Inspect code"}]}}}}}\n' "$sid"
+}
+"#;
+            let reply = match outcome {
+                "same" => r#"{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}"#,
+                "failed" => {
+                    r#"{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"reset rejected"}}"#
+                }
+                _ => "",
+            };
+            let reset = if outcome == "changed" {
+                "      task".to_string()
+            } else {
+                format!("      if [ \"$count\" -eq 2 ]; then\n        sid=sid-1\n        task\n        printf '{reply}\\n' \"$id\"\n        continue\n      fi\n      task")
+            };
+            let source = std::fs::read_to_string(&script)
+                .unwrap()
+                .replace(
+                    "while IFS= read -r line; do",
+                    &format!("{task}while IFS= read -r line; do"),
+                )
+                .replace(
+                    "      update \"$sid\" \"early-$count\"",
+                    &format!("{reset}\n      update \"$sid\" \"early-$count\""),
+                );
+            std::fs::write(&script, source).unwrap();
+            let mut config = reset_fake_spawn_config(&script, temp.path());
+            config.agent_key = "omp".into();
+            let mut client =
+                AcpClient::spawn(config, AcpSessionId(format!("task-reset-{outcome}")))
+                    .await
+                    .unwrap();
+            client.send_prompt("before", &[]).await.unwrap();
+            let initial = identity_events_until_stop(&mut client).await;
+            assert_eq!(
+                initial
+                    .iter()
+                    .filter(|event| matches!(event, Event::BackgroundAgentCompleted { .. }))
+                    .count(),
+                1
+            );
+            let reset = client.reset_session("/new").await.unwrap();
+            assert_eq!(
+                matches!(reset, ResetSessionOutcome::Reset { .. }),
+                outcome == "changed"
+            );
+            let events = identity_events_until_stop(&mut client).await;
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::BackgroundAgentLaunched { .. }))
+                    .count(),
+                usize::from(outcome == "changed")
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::BackgroundAgentCompleted { .. }))
+                    .count(),
+                usize::from(outcome == "changed")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn native_identity_admits_immediate_post_response_callbacks_before_config() {
         for fork in [false, true] {
             let temp = tempfile::tempdir().unwrap();

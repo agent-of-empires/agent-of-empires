@@ -16,6 +16,7 @@ mod fs_handlers;
 mod handshake;
 mod lifecycle;
 mod list;
+mod omp_tasks;
 mod opencode;
 mod pending;
 mod permission_handlers;

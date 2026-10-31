@@ -449,6 +449,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
       description: "map backend",
       prompt: "do the thing",
       model: "claude-opus-4-8",
+      wireTracked: false,
       status: endedAt ? "completed" : "running",
       startedAt: "2026-06-27T00:00:00Z",
       endedAt,

@@ -27,8 +27,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
     if (ra !== rb) return ra - rb;
     return b.startedAt.localeCompare(a.startedAt);
   });
-  // A stalled agent is no longer writing, so cancel would be a no-op.
-  const anyRunning = agents.some((a) => a.status === "running");
+  const anyCancellable = agents.some((a) => a.status === "running" && !a.wireTracked);
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -36,11 +35,11 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
         <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
           Background agents · {agents.length}
         </span>
-        {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
+        {anyCancellable && sessionId && <StopButton sessionId={sessionId} />}
       </div>
       <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents show here. Synchronous sub-agents run
-        inline in the transcript.
+        Background <span className="font-mono">Task</span> sub-agents show here. Mixed omp batches also include their
+        synchronous sub-agents.
       </p>
       <div className="flex flex-col">
         {sorted.map((a) => (
@@ -55,14 +54,13 @@ function isActive(status: BackgroundAgentStatus): boolean {
   return status === "running" || status === "stalled";
 }
 
-/** ACP has no per-agent cancel; cancelling the session stops its async sub-agents. */
 function StopButton({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
   return (
     <button
       type="button"
       disabled={busy}
-      title="Interrupt the session and stop running sub-agents"
+      title="Interrupt the session and stop supported running sub-agents"
       onClick={async () => {
         setBusy(true);
         try {

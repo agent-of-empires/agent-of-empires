@@ -538,6 +538,7 @@ fn progress(agent_id: String, status: BackgroundAgentStatus, snap: &Snapshot) ->
         tools: snapshot_tools(snap),
         last_tool: snap.last_tool.clone(),
         last_text: snap.last_text.clone(),
+        model: None,
         at: Utc::now(),
     }
 }

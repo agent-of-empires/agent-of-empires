@@ -1303,6 +1303,7 @@ mod tests {
                 description: "do a thing".into(),
                 prompt: "do a thing".into(),
                 model: "claude".into(),
+                wire_tracked: false,
                 output_file: "/tmp/nonexistent-4029.jsonl".into(),
                 started_at: chrono::Utc::now(),
             },

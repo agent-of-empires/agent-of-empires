@@ -1526,6 +1526,7 @@ mod tests {
                         description: "map backend".into(),
                         prompt: "do it".into(),
                         model: "claude-opus-4-8".into(),
+                        wire_tracked: false,
                         output_file: "/tmp/bg-1.output".into(),
                         started_at: chrono::Utc::now(),
                     },
@@ -2155,6 +2156,7 @@ mod tests {
                     description: "map backend".into(),
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
+                    wire_tracked: false,
                     output_file: "/tmp/bg-1.output".into(),
                     started_at: chrono::Utc::now(),
                 },
@@ -2565,6 +2567,7 @@ mod tests {
             tools: Vec::new(),
             last_tool: None,
             last_text: None,
+            model: None,
             at: chrono::Utc::now(),
         };
         let cases = [

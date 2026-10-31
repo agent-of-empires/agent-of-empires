@@ -656,4 +656,38 @@ mod tests {
             assert!(wakeup.is_none());
         }
     }
+
+    #[test]
+    fn unmarked_or_non_omp_task_terminals_keep_foreground_cleanup() {
+        for profile in [&agent_profiles::OMP, &agent_profiles::CLAUDE] {
+            for marker in [None, Some("progress"), Some("completed"), Some("unknown")] {
+                if profile.key == "omp" && matches!(marker, Some("progress" | "completed")) {
+                    continue;
+                }
+                for status in ["completed", "failed"] {
+                    let mut frame = serde_json::json!({
+                        "sessionUpdate": "tool_call_update", "toolCallId": "batch",
+                        "status": status,
+                        "rawOutput": {"details": {"async": {"type": "task"}}}
+                    });
+                    if let Some(marker) = marker {
+                        frame["_meta"] = serde_json::json!({"omp": {"taskLifecycle": marker}});
+                    }
+                    let update = serde_json::from_value(frame).unwrap();
+                    let (signal, wakeup) =
+                        classify_watchdog_notification_signals(&update, None, profile, false);
+                    assert!(matches!(signal, Some(L::ToolCompleted { .. })));
+                    assert!(wakeup.is_none());
+                    let t0 = Instant::now();
+                    let wall = chrono::Utc::now();
+                    let mut watchdog = SilentOrphanWatchdog::default();
+                    watchdog.apply_signal(start("batch", false), t0, wall, CFG);
+                    let completed_at = t0 + Duration::from_secs(10);
+                    watchdog.apply_signal(signal.unwrap(), completed_at, wall, CFG);
+                    assert_eq!(watchdog.tool_calls_in_flight_len(), 0);
+                    assert_eq!(watchdog.last_progress_at, Some(completed_at));
+                }
+            }
+        }
+    }
 }

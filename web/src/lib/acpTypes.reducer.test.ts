@@ -288,11 +288,95 @@ describe("applyEvent / background agents", () => {
 
   it("builds, updates, and finalizes a record", () => {
     expect(agent(launched)).toEqual([
-      expect.objectContaining({ status: "running", toolCallId: "task-1", endedAt: null }),
+      expect.objectContaining({ status: "running", toolCallId: "task-1", wireTracked: false, endedAt: null }),
     ]);
     const running = progress("running", 4, "2026-06-27T00:00:05Z", { last_tool: "Read", last_text: "scanning" });
     expect(agent(launched, running)[0]).toMatchObject({ toolCount: 4, lastTool: "Read" });
     expect(agent(launched, running, completed)[0]).toMatchObject({ status: "completed", result: "done" });
+  });
+
+  it("applies terminal corrections and clears superseded warnings without reopening", () => {
+    const failed: AcpEvent = {
+      BackgroundAgentCompleted: {
+        agent_id: "a1",
+        status: "error",
+        warning: "omp task failed",
+        ended_at: "2026-06-27T00:00:11Z",
+      },
+    };
+    expect(agent(launched, completed, failed)[0]).toMatchObject({
+      status: "error",
+      warning: "omp task failed",
+    });
+    const lateRunning = progress("running", 4, "2026-06-27T00:00:12Z");
+    expect(agent(launched, completed, failed, lateRunning)[0].status).toBe("error");
+    expect(agent(launched, completed, failed, completed)[0]).toMatchObject({
+      status: "completed",
+      warning: null,
+    });
+  });
+
+  it("replaces progress snapshots, including empty tools and preview text", () => {
+    const first = progress("running", 2, "2026-06-27T00:00:02Z", {
+      tools: [{ name: "Read" }, { name: "Bash" }],
+      last_text: "first preview",
+    });
+    const replacement = progress("running", 3, "2026-06-27T00:00:03Z", {
+      tools: [{ name: "Write" }],
+      last_text: "latest preview",
+    });
+    const empty = progress("running", 3, "2026-06-27T00:00:04Z", { tools: [], last_text: "" });
+    const omitted = progress("running", 3, "2026-06-27T00:00:05Z");
+    expect(agent(launched, first, replacement, omitted)[0]).toMatchObject({
+      tools: [{ name: "Write" }],
+      lastText: "latest preview",
+    });
+    expect(agent(launched, first, replacement, empty, omitted)[0]).toMatchObject({ tools: [], lastText: "" });
+  });
+
+  it("updates a resolved model from progress and preserves it when omitted", () => {
+    const resolved = progress("running", 1, "2026-06-27T00:00:02Z", { model: "resolved-model" });
+    const unchanged = progress("running", 2, "2026-06-27T00:00:03Z");
+    expect(agent(launched, unchanged)[0].model).toBe("claude-opus-4-8");
+    expect(agent(launched, resolved)[0].model).toBe("resolved-model");
+    expect(agent(launched, resolved, unchanged)[0].model).toBe("resolved-model");
+    expect(agent(launched, completed, resolved)[0].model).toBe("claude-opus-4-8");
+  });
+
+  it("preserves wire-tracked history on duplicate launches but replaces other launches", () => {
+    const wireLaunch: AcpEvent = {
+      BackgroundAgentLaunched: { ...launched.BackgroundAgentLaunched, wire_tracked: true },
+    };
+    expect(agent(wireLaunch)[0].wireTracked).toBe(true);
+    expect(agent(wireLaunch, completed)[0].wireTracked).toBe(true);
+    const running = progress("running", 4, "2026-06-27T00:00:05Z", {
+      model: "resolved-model",
+      last_text: "scanning",
+    });
+    for (const history of [
+      [wireLaunch, running],
+      [wireLaunch, running, completed],
+    ]) {
+      expect(agent(...history, wireLaunch)).toEqual(agent(...history));
+    }
+    expect(agent(wireLaunch, running, completed, launched)[0]).toMatchObject({
+      status: "running",
+      toolCount: 0,
+      model: "claude-opus-4-8",
+      endedAt: null,
+      result: null,
+      wireTracked: false,
+    });
+    const differentCall: AcpEvent = {
+      BackgroundAgentLaunched: { ...wireLaunch.BackgroundAgentLaunched, tool_call_id: "task-2" },
+    };
+    expect(agent(wireLaunch, running, completed, differentCall)[0]).toMatchObject({
+      toolCallId: "task-2",
+      status: "running",
+      toolCount: 0,
+      endedAt: null,
+      wireTracked: true,
+    });
   });
 
   it("leaves endedAt null on a stall, so the elapsed timer keeps ticking (#4001)", () => {
@@ -309,6 +393,80 @@ describe("applyEvent / background agents", () => {
     // own abort timeout), so the endedAt guard, not the status list, has to stop it.
     const late = agent(launched, stalledTerminal, lateProgress)[0];
     expect(late).toMatchObject({ status: "stalled", toolCount: 0, endedAt: "2026-06-27T00:00:10Z" });
+  });
+});
+
+describe("applyReducedState / background agents", () => {
+  const wireAgent = {
+    agent_id: "omp-1",
+    tool_call_id: "task-1",
+    description: "inspect backend",
+    prompt: "trace the lifecycle",
+    model: "resolved-model",
+    wire_tracked: true,
+    status: "running" as const,
+    started_at: "2026-06-27T00:00:00Z",
+    tool_count: 2,
+    tools: [{ name: "Read", title: "state.rs", ok: true }],
+    last_tool: "Read",
+    last_text: "checking lifecycle",
+  };
+
+  it("maps the daemon's snake_case records and preserves wire provenance through replay", () => {
+    const state = applyReducedState(emptyAcpState(), reducedState({ background_agents: [wireAgent] }));
+    expect(state.backgroundAgents).toEqual([
+      {
+        agentId: "omp-1",
+        toolCallId: "task-1",
+        description: "inspect backend",
+        prompt: "trace the lifecycle",
+        model: "resolved-model",
+        wireTracked: true,
+        status: "running",
+        startedAt: "2026-06-27T00:00:00Z",
+        endedAt: null,
+        toolCount: 2,
+        tools: [{ name: "Read", title: "state.rs", ok: true }],
+        lastTool: "Read",
+        lastText: "checking lifecycle",
+        result: null,
+        warning: null,
+      },
+    ]);
+    const replayed = ev(state, 1, { BackgroundAgentLaunched: wireAgent });
+    expect(replayed.backgroundAgents).toEqual(state.backgroundAgents);
+  });
+
+  it("preserves cold agents only when unchanged, and otherwise replaces or clears them", () => {
+    const state = applyReducedState(emptyAcpState(), reducedState({ background_agents: [wireAgent] }));
+    expect(applyReducedState(state, reducedState(), ["background_agents"]).backgroundAgents).toBe(
+      state.backgroundAgents,
+    );
+    expect(applyReducedState(state, reducedState({ background_agents: [] })).backgroundAgents).toEqual([]);
+    expect(applyReducedState(state, reducedState()).backgroundAgents).toEqual([]);
+    const replaced = applyReducedState(
+      state,
+      reducedState({
+        background_agents: [
+          {
+            ...wireAgent,
+            wire_tracked: undefined,
+            agent_id: "legacy",
+            status: "completed",
+            ended_at: "2026-06-27T00:01:00Z",
+            result: "done",
+          },
+        ],
+      }),
+    );
+    expect(replaced.backgroundAgents).toHaveLength(1);
+    expect(replaced.backgroundAgents[0]).toMatchObject({
+      agentId: "legacy",
+      wireTracked: false,
+      status: "completed",
+      endedAt: "2026-06-27T00:01:00Z",
+      result: "done",
+    });
   });
 });
 

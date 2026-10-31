@@ -30,6 +30,7 @@ pub struct TerminalRepairProbe {
 pub struct UnresolvedBackgroundAgentLaunch {
     pub agent_id: String,
     pub output_file: String,
+    pub wire_tracked: bool,
 }
 
 /// Launches with no matching completion, shared by both unresolved-launch
@@ -290,7 +291,8 @@ impl EventStore {
         let what = "unresolved_background_agent_launches";
         let sql = format!(
             "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')\
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),\
+                    COALESCE(json_extract(event_json, '$.BackgroundAgentLaunched.wire_tracked'), 0)\
              {UNRESOLVED_BACKGROUND_AGENT_WHERE}"
         );
         let Some(mut stmt) = logged(conn.prepare(&sql), what, session_id) else {
@@ -300,6 +302,7 @@ impl EventStore {
             Ok(UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
                 output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                wire_tracked: row.get(2)?,
             })
         });
         logged(rows, what, session_id)
@@ -609,6 +612,7 @@ mod tests {
             tools: Vec::new(),
             last_tool: None,
             last_text: None,
+            model: None,
             at: chrono::Utc::now(),
         };
         let startup_error = Event::AgentStartupError {
@@ -1029,6 +1033,29 @@ mod tests {
         assert!(store.unresolved_background_task_ids("s-2").is_empty());
     }
 
+    #[test]
+    fn structured_background_launch_retains_wire_tracking_on_replay() {
+        let (_tmp, store) = open_store(1000);
+        let mut wire = bg_launched("omp-child", "");
+        if let Event::BackgroundAgentLaunched { wire_tracked, .. } = &mut wire {
+            *wire_tracked = true;
+        }
+        record_from(&store, "s-wire", 1, [wire, bg_launched("legacy", "")]);
+        let launches = store.unresolved_background_agent_launches("s-wire");
+        assert_eq!(launches.len(), 2);
+        assert!(launches[0].wire_tracked);
+        assert!(!launches[1].wire_tracked);
+        assert!(launches.iter().all(|l| l.output_file.is_empty()));
+        let mut state = crate::acp::state::AcpState::default();
+        for (_, event) in store.replay_from("s-wire", 0) {
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
+        }
+        assert_eq!(state.background_agents.len(), 2);
+        assert_eq!(state.background_agents[0].agent_id, "omp-child");
+    }
+
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: agent_id.into(),
@@ -1036,6 +1063,7 @@ mod tests {
             description: "map backend".into(),
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
+            wire_tracked: false,
             output_file: output_file.into(),
             started_at: chrono::Utc::now(),
         }
