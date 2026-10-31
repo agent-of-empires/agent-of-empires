@@ -1,8 +1,7 @@
-// Model and reasoning-effort pickers from the agent's config options. Pessimistic:
-// the current value changes only when the adapter confirms; the pending choice is disabled.
+// Config pickers stay on the confirmed value while the pending choice is disabled.
 
 import { ChevronUp } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
@@ -146,11 +145,50 @@ function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 
 function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
   const [open, setOpen] = useState(false);
   if (lockedReason && open) setOpen(false);
+  const [query, setQuery] = useState("");
   const [menuLayout, setMenuLayout] = useState<MenuLayout>(DEFAULT_MENU_LAYOUT);
   const ref = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const currentOptionRef = useRef<HTMLButtonElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
   const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
   const label = current?.name ?? option.current_value;
+  const searchable = option.category === "model";
+  const terms = query.trim().toLowerCase().split(/\s+/);
+  const filteredOptions = searchable
+    ? option.options.filter((opt) => {
+        const text = `${opt.name} ${opt.value}`.toLowerCase();
+        return terms.every((term) => text.includes(term));
+      })
+    : option.options;
+
+  const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!searchable || e.nativeEvent.isComposing) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+    );
+    const currentIndex = query.trim() ? -1 : items.findIndex((item) => item === currentOptionRef.current);
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (items.length === 0) return;
+      const focusedIndex = items.findIndex((item) => item === document.activeElement);
+      const index = focusedIndex < 0 ? currentIndex : focusedIndex;
+      const next = e.key === "ArrowDown" ? (index + 1) % items.length : (index <= 0 ? items.length : index) - 1;
+      items[next]?.focus({ preventScroll: true });
+      items[next]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter" && e.target instanceof HTMLInputElement) {
+      e.preventDefault();
+      items[Math.max(0, currentIndex)]?.click();
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -190,11 +228,28 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
     };
   }, [open]);
 
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    if (!open || !searchable || !menu) return;
+    const selected = currentOptionRef.current;
+    if (query.trim() || !selected) {
+      menu.scrollTop = 0;
+      return;
+    }
+    const itemRect = selected.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    menu.scrollTop += itemRect.top - menuRect.top - (menu.clientHeight - itemRect.height) / 2;
+  }, [open, searchable, query, option.current_value, menuLayout.maxHeight]);
+
   return (
     <div ref={ref} className="relative">
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setQuery("");
+          setOpen((v) => !v);
+        }}
         disabled={!!lockedReason}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -215,23 +270,43 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
       {open && (
         <div
           id={menuId}
+          onKeyDown={onMenuKeyDown}
           className={[
             "absolute left-0 z-30 flex w-64 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl",
             menuLayout.direction === "up" ? "bottom-full mb-1" : "top-full mt-1",
           ].join(" ")}
           style={{ maxHeight: menuLayout.maxHeight }}
-          role="menu"
         >
-          <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
+          <div className="shrink-0 border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {option.name}
           </div>
-          <div className="overflow-y-auto">
-            {option.options.map((opt) => {
+          {searchable && (
+            <div className="shrink-0 border-b border-surface-800 p-2">
+              <input
+                type="text"
+                autoFocus
+                autoComplete="off"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                aria-label="Search models"
+                placeholder="Search models..."
+                className="w-full rounded border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+              />
+            </div>
+          )}
+          <div ref={menuRef} role="menu" aria-label={option.name} className="min-h-0 overflow-y-auto">
+            {searchable && filteredOptions.length === 0 && (
+              <div role="status" className="px-3 py-2 text-xs text-text-dim">
+                No models match your search.
+              </div>
+            )}
+            {filteredOptions.map((opt) => {
               const isCurrent = opt.value === option.current_value;
               const isPending = pending === opt.value;
               return (
                 <button
                   key={opt.value}
+                  ref={isCurrent ? currentOptionRef : undefined}
                   type="button"
                   role="menuitem"
                   disabled={!!lockedReason || isPending}

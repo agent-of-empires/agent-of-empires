@@ -3236,7 +3236,7 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive."
+      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive. Model search filters case-insensitively by display name and provider/model id with whitespace-separated terms. Unit tests cover empty results, pending choices, confirmed values, and reset on reopen; mocked browser tests cover search focus, Arrow/Enter selection without prompt submission, Escape/outside dismissal, and pinned search with scrollable results. Desktop and short viewports center the current model on open, reopen, and search clearing without moving the page or taking search focus. Before searching, Enter preserves the current model and arrows navigate from it; reopening after a switch reveals the newly confirmed model."
     },
     {
       "id": "acp.mode-switch",
