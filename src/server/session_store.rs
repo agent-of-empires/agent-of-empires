@@ -562,12 +562,17 @@ impl SessionStore for NativeSessionStore {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
+        _reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        self.run_sandbox_migration(|| {
-            crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
-        })
+        let (reporter, _progress) =
+            super::runtime::sandbox_reporter(self.state.clone(), id, self.storage.profile());
+        let result = self.run_sandbox_migration(|| {
+            crate::migrations::migrate_sandbox_store_for_with(id, Some(reporter), self, runtime)
+        });
+        // Content isolation also retires conversation bindings in this profile.
+        self.commit(&mut |_, _| Ok(()))?;
+        result
     }
 
     fn sandbox_registry_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {

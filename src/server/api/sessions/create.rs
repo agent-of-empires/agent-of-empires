@@ -522,7 +522,7 @@ pub(crate) fn run_create_hooks(
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
-        instance.ensure_container_in(store)?;
+        instance.ensure_container_in(store, None)?;
         let workdir = instance.container_workdir();
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(

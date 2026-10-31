@@ -430,7 +430,7 @@ A launch runs exactly one of `before_start` (sandboxed) and `before_session` (ho
 
 `before_start` runs when a container is created or restarted, including after a runtime restart. An already-running container reuses its last values, backfilling only when none are stored. Stdout `KEY=VALUE` lines become inherited container environment variables, never Docker argv; other lines are ignored and stdout is never logged. A non-zero exit aborts startup. Invalid identifier keys are warned and dropped; diagnostic keys containing spaces are ignored.
 
-Paired-container creation retains its durable lifecycle reservation while host hooks run, but releases title, lifecycle and store-transition flocks. Native HTTP and WebSocket entrypoints release their API locks too, so hooks can call the Daemon. Competing lifecycle operations receive a conflict. Before creating or publishing the replacement runtime, AoE reacquires locks and revalidates the reservation and current session.
+Sandbox preparation retains its durable lifecycle reservation while host hooks run, but releases title, lifecycle and store-transition flocks, including native-content admission. Native HTTP and WebSocket entrypoints release their API locks too, so hooks can call the Daemon. Competing lifecycle operations receive a conflict. Before runtime effects, AoE reacquires locks, revalidates the reservation and session, and re-admits native content.
 
 `before_session` runs before every host agent launch, including restart and a view switch that respawns it. It uses the same stdout and failure contract as `before_start`, and persists no values between launches.
 

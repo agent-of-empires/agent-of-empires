@@ -2319,6 +2319,9 @@ async fn finish_structured_restart(
             if let Some(response) = lifecycle_rejection(state, &error) {
                 return response;
             }
+            if let Some(response) = sandbox_migration_response(state, id, &error).await {
+                return response;
+            }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2817,6 +2820,7 @@ async fn prepare_agent_session_inner(
                     restart.as_ref().is_some_and(|body| body.skip_on_launch),
                     &native,
                     None,
+                    Some(generation),
                 );
                 Ok(Some((
                     generation,
@@ -2947,6 +2951,10 @@ async fn prepare_agent_session_inner(
         Ok(Err(error)) => Err(error),
         Err(error) => Err(error.into()),
     };
+    let migration_failure = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<crate::migrations::SandboxMigrationError>());
     let outcome = match outcome {
         Err(error) => {
             let response = if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -2965,6 +2973,14 @@ async fn prepare_agent_session_inner(
                     axum::http::HeaderValue::from_static(refusal.0.as_str()),
                 );
                 response
+            } else if let Some(failure) =
+                error.downcast_ref::<crate::migrations::SandboxMigrationError>()
+            {
+                let code = failure.api_code();
+                crate::server::api::api_error_with_code_header(
+                    code,
+                    code.sandbox_migration_message().unwrap(),
+                )
             } else {
                 tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
                 api_error(
@@ -2973,7 +2989,7 @@ async fn prepare_agent_session_inner(
                     "Session start failed",
                 )
             };
-            if restart_identity.is_some() {
+            if restart_identity.is_some() || migration_failure {
                 drop(guard);
                 drop(submission);
                 drop(namespace);
@@ -3086,10 +3102,186 @@ async fn prepare_agent_session_inner(
     }
 }
 
+pub(super) async fn sandbox_migration_response(
+    state: &Arc<AppState>,
+    id: &str,
+    error: &anyhow::Error,
+) -> Option<axum::response::Response> {
+    let failure = error.downcast_ref::<crate::migrations::SandboxMigrationError>()?;
+    tracing::warn!(target: "http.api.sessions", session = %id, error = %format_args!("{error:#}"), "sandbox migration refused");
+    let code = failure.api_code();
+    let response = crate::server::api::api_error_with_code_header(
+        code,
+        code.sandbox_migration_message().unwrap(),
+    );
+    Some(match state.runtime.publish(state).await {
+        Ok(snapshot) => crate::server::runtime::mutation_response(&snapshot.value.cursor, response),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    })
+}
+
 #[cfg(all(test, unix))]
 mod durable_stop_tests {
     use super::*;
     use crate::process::worker_registry::{self, WorkerRecord};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_migration_refusals_publish_known_sanitized_failures() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for (deferred, target) in [
+            (true, "start"),
+            (false, "start"),
+            (true, "restart"),
+            (false, "restart"),
+            (true, "container-terminal"),
+            (false, "container-terminal"),
+        ] {
+            let root = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            crate::migrations::run_migrations()?;
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })?;
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+                config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+            })?;
+            let _env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
+                .and_set("DOCKER_HOST", "unix:///var/run/docker.sock")
+                .and_set(
+                    "AOE_DEFER_SANDBOX_MIGRATION",
+                    if deferred { "1" } else { "" },
+                )
+                .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin)?;
+            for runtime in ["docker", "podman", "container"] {
+                let path = bin.join(runtime);
+                std::fs::write(&path, "#!/bin/sh\ncase \"$*\" in *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\nexit 0\n")?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let mut raw = serde_json::to_value(Instance::new(
+                "migration refusal",
+                project.to_str().unwrap(),
+            ))?;
+            raw["tool"] = "codex".into();
+            raw["command"] = "codex".into();
+            raw["status"] = "stopped".into();
+            raw["sandbox_store_generation"] = 0.into();
+            raw["sandbox_info"] = serde_json::json!({
+                "enabled": true, "image": "test-image", "container_name": "migration",
+            });
+            let mut row: Instance = serde_json::from_value(raw)?;
+            row.source_profile = "default".into();
+            if target == "restart" {
+                row.view = crate::session::View::Structured;
+                row.status = Status::Running;
+            }
+            let source = root.path().join(".codex/sandbox").join(&row.id);
+            std::fs::create_dir_all(&source)?;
+            let private = source.join("config.toml");
+            std::fs::write(&private, b"private-content")?;
+            if !deferred {
+                std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))?;
+            }
+            let cause = (!deferred).then(|| {
+                let error = std::fs::read(&private).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string()
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let logs = crate::session::test_support::LogCapture::start();
+            let before = state.runtime.publish(&state).await?;
+            let response = match target {
+                "restart" => {
+                    restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
+                }
+                "container-terminal" => super::super::ensure::ensure_container_terminal(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    axum::extract::Query(crate::server::live_ws::TerminalIndexQuery::default()),
+                    Ok(None),
+                )
+                .await
+                .into_response(),
+                _ => start_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await
+                    .into_response(),
+            };
+            let code = if deferred {
+                crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+            } else {
+                crate::daemon::ApiErrorCode::SandboxMigrationFailed
+            };
+            assert_eq!(response.status(), code.status());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::daemon::ERROR_CODE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(code.as_str()),
+                "{}",
+                logs.contents()
+            );
+            assert_eq!(
+                response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                before.value.cursor.epoch
+            );
+            let revision: u64 = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()?
+                .parse()?;
+            assert!(revision > before.value.cursor.revision);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
+            let public = String::from_utf8_lossy(&bytes);
+            assert!(!public.contains(root.path().to_str().unwrap()));
+            assert!(!public.contains("private-content"));
+            if let Some(cause) = cause.as_ref() {
+                assert!(!public.contains(cause));
+            }
+            if target == "container-terminal" {
+                if let Some(cause) = cause.as_ref() {
+                    let captured = logs.contents();
+                    assert!(
+                        captured.lines().any(|line| {
+                            line.contains(&row.id)
+                                && line.contains("config.toml")
+                                && line.contains(cause)
+                        }),
+                        "missing correlated migration cause: {captured}"
+                    );
+                }
+            }
+            let rows = state.instances.read().await;
+            let current = rows.iter().find(|current| current.id == row.id).unwrap();
+            assert_eq!(
+                current.status,
+                if target == "container-terminal" {
+                    Status::Stopped
+                } else {
+                    Status::Error
+                }
+            );
+            assert!(current.last_error.as_ref().is_none_or(|message| {
+                !message.contains(source.to_str().unwrap())
+                    && !message.contains("private-content")
+                    && cause.as_ref().is_none_or(|cause| !message.contains(cause))
+            }));
+            assert!(current.lifecycle_reservation.is_none());
+            assert_eq!(current.sandbox_store_generation, 0);
+            assert!(private.exists());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[serial_test::serial]

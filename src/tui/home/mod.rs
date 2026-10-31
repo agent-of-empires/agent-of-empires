@@ -388,10 +388,6 @@ pub struct HomeView {
     /// Sessions awaiting a daemon start snapshot (see `apply_restart_results`).
     pub(super) restart_in_flight: std::collections::HashSet<String>,
 
-    store_move_poller: crate::tui::store_move_poller::StoreMovePoller,
-    store_move_in_flight: Option<store_move::StoreMoveInFlight>,
-    store_move_bypass: Option<String>,
-
     /// The creation this view submitted to the daemon and still displays. The
     /// daemon owns provisioning, hooks, and the committed row.
     pub(super) pending_creation: Option<PendingCreation>,

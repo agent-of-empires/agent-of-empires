@@ -598,7 +598,7 @@ pub(crate) async fn spawn_structured_session(
         }
 
         creation_guard.phase(CreationPhase::LaunchHooks);
-        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));
+        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
         if let Err(error) = hooks {
             rollback(native, instance, false);
             return Err(error);

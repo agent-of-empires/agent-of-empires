@@ -698,6 +698,15 @@ impl Instance {
                 } else {
                     message.into()
                 }
+            } else if let Some(failure) =
+                error.downcast_ref::<crate::migrations::SandboxMigrationError>()
+            {
+                tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "sandbox migration refused");
+                let message = failure.api_code().sandbox_migration_message().unwrap();
+                match scope_failure {
+                    Some(_) => format!("{message}\nScope retirement remains unproven."),
+                    None => message.into(),
+                }
             } else {
                 match scope_failure {
                     Some(scope) => {

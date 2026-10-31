@@ -315,6 +315,23 @@ pub fn assert_schema_current() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub(crate) enum SandboxMigrationError {
+    #[error("sandbox migration is pending")]
+    Deferred,
+    #[error("sandbox migration failed")]
+    Failed,
+}
+
+impl SandboxMigrationError {
+    pub(crate) fn api_code(self) -> crate::daemon::ApiErrorCode {
+        match self {
+            Self::Deferred => crate::daemon::ApiErrorCode::SandboxMigrationDeferred,
+            Self::Failed => crate::daemon::ApiErrorCode::SandboxMigrationFailed,
+        }
+    }
+}
+
 /// Move this session's shared sandbox store and isolate its native content,
 /// reporting copy progress to the caller. Unproven content remains pending.
 pub(crate) fn migrate_sandbox_store_for_with(
@@ -328,20 +345,7 @@ pub(crate) fn migrate_sandbox_store_for_with(
     }
     let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id, store, runtime)?;
-    v033_isolate_sandbox_content::migrate_instance(id)
-}
-
-/// [`migrate_sandbox_store_for_with`] with the container probes injected, for
-/// a test that drives the launch-time move with no container runtime.
-#[cfg(test)]
-pub(crate) fn migrate_sandbox_store_for_test(
-    id: &str,
-    reporter: Option<progress::Reporter>,
-    is_running: &dyn Fn(&str) -> Result<bool>,
-    reap: &dyn Fn(&str) -> Result<bool>,
-) -> Result<()> {
-    let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap, None)
+    v033_isolate_sandbox_content::migrate_instance(id, runtime)
 }
 
 /// A live daemon or concurrent migration blocks the schema write. Callers
