@@ -180,8 +180,8 @@ describe("SuggestionsView", () => {
       const onPrepare = await openStarted();
       expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
-      expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe(
-        "GitHub · example/1 · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
+      expect(row.querySelector("p:nth-of-type(3)")?.textContent).toBe(
+        "GitHub · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
       );
       fireEvent.click(screen.getByRole("button", { name: "Open" }));
       expect(onPrepare.onOpenSession).toHaveBeenCalledWith("sess-1");
@@ -277,13 +277,14 @@ describe("SuggestionsView", () => {
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
-  it("renders one compact row: title, then Source, reference, reason and Project, with no preview or chip", async () => {
+  it("renders one compact row: reference, title, then Source, reason and Project, with no preview or chip", async () => {
     await open(snapshot());
     const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
     expect(row.textContent).not.toContain("UNTRUSTED BODY");
     expect(row.querySelector("a")).toBeNull();
-    const meta = row.querySelector("p:nth-of-type(2)") as HTMLElement;
-    expect(meta.textContent).toBe("GitHub · example/1 · Assigned to you · aoe");
+    expect(row.querySelector("p:nth-of-type(1)")?.textContent).toBe("example/1");
+    const meta = row.querySelector("p:nth-of-type(3)") as HTMLElement;
+    expect(meta.textContent).toBe("GitHub · Assigned to you · aoe");
     expect(meta.firstElementChild?.className).toContain("font-mono");
   });
 
@@ -308,8 +309,7 @@ describe("SuggestionsView", () => {
   describe("edge states", () => {
     it("a stale item is dimmed and can only be dismissed", async () => {
       await open(snapshot({ items: [{ ...item, stale: true }] }));
-      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
-      expect(row.querySelector("p")?.className).toContain("opacity-[0.55]");
+      expect((await screen.findByText("Fix lifecycle")).className).toContain("opacity-[0.55]");
       expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
     });

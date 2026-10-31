@@ -39,7 +39,7 @@ function StartedReason({ session }: { session: StartedSession }) {
 interface RowProps {
   title: string;
   source: string;
-  /** Shown after the source when non-empty. */
+  /** Shown above the title when non-empty. */
   sourceRef?: string;
   reason: string;
   project?: string | null;
@@ -50,6 +50,26 @@ interface RowProps {
   /** A start that failed; shown on the row, which stays startable. */
   failure?: string;
   actions: ReactNode;
+}
+
+/**
+ * A `scope/name#n` reference that, when cut, loses the scope first and never the
+ * trailing `#n`.
+ */
+function SourceRef({ value }: { value: string }) {
+  const hash = value.lastIndexOf("#");
+  const head = hash > 0 ? value.slice(0, hash) : value;
+  const tail = hash > 0 ? value.slice(hash) : "";
+  const slash = head.indexOf("/");
+  const scope = slash > 0 ? head.slice(0, slash + 1) : "";
+  const name = slash > 0 ? head.slice(slash + 1) : head;
+  return (
+    <p className="flex font-mono text-[11px] text-text-dim" title={value} data-testid="suggestion-source-ref">
+      {scope && <span className="min-w-0 shrink-[100] truncate">{scope}</span>}
+      <span className="min-w-0 truncate">{name}</span>
+      {tail && <span className="shrink-0">{tail}</span>}
+    </p>
+  );
 }
 
 export function SuggestionRow({
@@ -70,15 +90,10 @@ export function SuggestionRow({
       }`}
     >
       <div className="min-w-0 flex-1">
+        {sourceRef && <SourceRef value={sourceRef} />}
         <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""}`}>{title}</p>
         <p className={`mt-0.5 truncate text-xs ${stale ? "text-text-dim" : "text-text-muted"}`}>
           <span className={`font-mono font-medium text-text-secondary ${stale ? "opacity-[0.55]" : ""}`}>{source}</span>
-          {sourceRef && (
-            <>
-              {" · "}
-              <span className="inline-block max-w-[40%] truncate align-bottom font-mono">{sourceRef}</span>
-            </>
-          )}
           {" · "}
           {session ? <StartedReason session={session} /> : reason}
           {project && (
