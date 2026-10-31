@@ -118,19 +118,7 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              sort_order  INTEGER NOT NULL DEFAULT 2147483647,
              PRIMARY KEY (profile, provider_id)
          );",
-    )?;
-    let has_start_pref: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('suggestion_preferences') WHERE name = 'start_without_review'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_start_pref {
-        conn.execute(
-            "ALTER TABLE suggestion_preferences ADD COLUMN start_without_review INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    Ok(())
+    )
 }
 
 fn db_error(e: rusqlite::Error) -> DispatchError {
@@ -1069,6 +1057,7 @@ pub(crate) fn prepare(
     Ok(json!({
         "title": item.draft.title,
         "initial_prompt": prompt,
+        "templated": template.is_some(),
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
         "extra_projects": extras.unwrap_or_default().iter().map(describe).collect::<Vec<_>>(),
@@ -1777,6 +1766,10 @@ mod tests {
             Ok(json!("Fix acme/widgets {nope}"))
         );
         assert_eq!(prompt(Some("")), Ok(json!("")));
+        let templated =
+            |template| prepare("default", &i, template, None).unwrap()["templated"].clone();
+        assert_eq!(templated(None), json!(false));
+        assert_eq!(templated(Some("Fix {repo}")), json!(true));
         // 12-byte value, template within the stored bound: expansion is not.
         let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_PROMPT_BYTES);
@@ -1842,24 +1835,6 @@ mod tests {
         }
         assert_eq!(snap("p")["prefs"]["refresh_minutes"], 60);
         assert!(serde_json::from_value::<PrefsPatch>(json!({ "extra": 1 })).is_err());
-    }
-
-    #[test]
-    fn init_adds_start_without_review_to_an_existing_preferences_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE suggestion_preferences (
-                 profile TEXT PRIMARY KEY,
-                 homepage INTEGER NOT NULL DEFAULT 1,
-                 sidebar INTEGER NOT NULL DEFAULT 0,
-                 refresh_minutes INTEGER NOT NULL DEFAULT 15
-             );
-             INSERT INTO suggestion_preferences (profile, sidebar) VALUES ('p', 1);",
-        )
-        .unwrap();
-        init(&conn).unwrap();
-        init(&conn).unwrap();
-        assert_eq!(load_prefs(&conn, "p").unwrap(), (true, true, 15, false));
     }
 
     #[test]
