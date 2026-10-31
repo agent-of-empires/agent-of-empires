@@ -342,7 +342,7 @@ At least one source is required. Criteria are unique, non-empty and at most 256 
 
 Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
 
-An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
+An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, stale?, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
 
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
@@ -351,7 +351,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapp
 - `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
-After validation, items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
+After validation, items of a source that is not enabled are dropped and counted in `dropped`. `stale: true` marks an item whose source closed or changed; clients dim it and offer only Dismiss, and put the explanation in `reason`. Core drops a stale item, counted in `dropped`, 24 hours after the first publish that marked it stale. `suggestions.error` messages are limited to 4096 bytes.
 
 Each `suggestions.set` replaces the provider's whole set, so an empty `items` clears it and an item left out disappears. `suggestions.error` records the failure on the provider and keeps the last published items; the next successful `suggestions.set` clears it. A user's dismissal is stored by provider and item `id`, survives republishing and never changes the source, so reuse an `id` only for the same suggestion.
 

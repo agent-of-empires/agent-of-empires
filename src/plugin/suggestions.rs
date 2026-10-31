@@ -31,6 +31,8 @@ pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_VARIABLE_VALUE_BYTES: usize = 2048;
 const MAX_ERROR_BYTES: usize = 4096;
 const MAX_CHECKS: usize = 32;
+/// How long an item stays listed after its provider marked it stale.
+const STALE_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_CHECK_TEXT_BYTES: usize = 2048;
 pub(crate) const MAX_MAPPING_PROJECTS: usize = 16;
 
@@ -98,6 +100,13 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              mapping_key   TEXT NOT NULL,
              projects_json TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, mapping_key)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_stale (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             item_id     TEXT NOT NULL,
+             since       INTEGER NOT NULL,
+             PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_checks (
              profile     TEXT NOT NULL,
@@ -176,6 +185,24 @@ pub(super) fn set(
     spec: &SuggestionsSpec,
     params: &Value,
 ) -> Result<Value, DispatchError> {
+    set_at(
+        conn,
+        profile,
+        provider_id,
+        spec,
+        params,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+fn set_at(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    spec: &SuggestionsSpec,
+    params: &Value,
+    now: i64,
+) -> Result<Value, DispatchError> {
     let request: SetSuggestions = serde_json::from_value(params.clone()).map_err(|e| {
         DispatchError::invalid_params(format!("invalid suggestions.set params: {e}"))
     })?;
@@ -183,14 +210,50 @@ pub(super) fn set(
     let overrides = overrides(conn, profile, provider_id).map_err(db_error)?;
     let accepted =
         validate_items(spec, &overrides, request.items).map_err(DispatchError::invalid_params)?;
+    let first_stale: HashMap<String, i64> = conn
+        .prepare(
+            "SELECT item_id, since FROM suggestion_stale WHERE profile = ?1 AND provider_id = ?2",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![profile, provider_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect()
+        })
+        .map_err(db_error)?;
+    // A stale item keeps the time it first went stale and expires after the TTL.
+    let mut stale_since: Vec<(&str, i64)> = Vec::new();
+    let mut kept = Vec::with_capacity(accepted.len());
+    for item in &accepted {
+        if item.stale {
+            let since = first_stale.get(&item.id).copied().unwrap_or(now);
+            if now - since > STALE_TTL_SECS {
+                continue;
+            }
+            stale_since.push((item.id.as_str(), since));
+        }
+        kept.push(item);
+    }
     // `unchecked_`: the connection is only reachable as `&Connection` behind the host mutex.
     let tx = conn.unchecked_transaction().map_err(db_error)?;
+    tx.execute(
+        "DELETE FROM suggestion_stale WHERE profile = ?1 AND provider_id = ?2",
+        params![profile, provider_id],
+    )
+    .map_err(db_error)?;
+    for (id, since) in &stale_since {
+        tx.execute(
+            "INSERT INTO suggestion_stale (profile, provider_id, item_id, since) VALUES (?1, ?2, ?3, ?4)",
+            params![profile, provider_id, id, since],
+        )
+        .map_err(db_error)?;
+    }
     tx.execute(
         "DELETE FROM suggestion_items WHERE profile = ?1 AND provider_id = ?2",
         params![profile, provider_id],
     )
     .map_err(db_error)?;
-    for item in &accepted {
+    for item in &kept {
         let json = serde_json::to_string(item)
             .map_err(|e| DispatchError::internal(format!("encode suggestion: {e}")))?;
         tx.execute(
@@ -201,7 +264,7 @@ pub(super) fn set(
     }
     record_status(&tx, profile, provider_id, None).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
-    Ok(json!({ "ok": true, "accepted": accepted.len(), "dropped": total - accepted.len() }))
+    Ok(json!({ "ok": true, "accepted": kept.len(), "dropped": total - kept.len() }))
 }
 
 /// Drops what a provider's worker published, in every profile, so a
@@ -211,6 +274,7 @@ pub(super) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqli
     let tx = conn.unchecked_transaction()?;
     for table in [
         "suggestion_checks",
+        "suggestion_stale",
         "suggestion_items",
         "suggestion_providers",
     ] {
@@ -1213,6 +1277,7 @@ mod tests {
             project: None,
             mapping_key: None,
             criterion: criterion.into(),
+            stale: false,
             variables: if criterion == "assigned" {
                 [("repo".to_string(), "acme/widgets".to_string())].into()
             } else {
@@ -2004,6 +2069,40 @@ mod tests {
         assert_eq!(snapshot["items"][0]["started_session"]["id"], "archived");
         assert!(snapshot["items"][1].get("started_session").is_none());
         assert!(started_sessions(&instances[2..3], "p").is_empty());
+    }
+
+    #[test]
+    fn a_stale_item_keeps_its_first_time_and_expires_after_a_day() {
+        let conn = store();
+        let publish_at = |items: &[Suggestion], now: i64| {
+            set_at(
+                &conn,
+                "p",
+                "acme.github",
+                &spec(),
+                &json!({ "items": items }),
+                now,
+            )
+            .unwrap()
+        };
+        let stale = |id: &str| Suggestion {
+            stale: true,
+            ..item(id, "assigned")
+        };
+        let day = STALE_TTL_SECS;
+        publish_at(&[stale("a"), item("b", "assigned")], 1_000);
+        // Republished stale later: the clock keeps running from the first time.
+        let out = publish_at(&[stale("a"), item("b", "assigned")], 1_000 + day);
+        assert_eq!(out["dropped"], 0, "exactly a day is still listed");
+        assert_eq!(snap(&conn, "p")["items"][0]["stale"], true);
+        assert!(snap(&conn, "p")["items"][1].get("stale").is_none());
+        let out = publish_at(&[stale("a"), item("b", "assigned")], 1_001 + day);
+        assert_eq!(out["dropped"], 1);
+        assert_eq!(ids(&snap(&conn, "p")), ["b"]);
+        // Fresh again, then stale again: a new clock starts.
+        publish_at(&[item("a", "assigned")], 2_000 + day);
+        let out = publish_at(&[stale("a")], 3_000 + day);
+        assert_eq!(out["dropped"], 0);
     }
 
     #[test]
