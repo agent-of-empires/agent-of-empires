@@ -106,7 +106,10 @@ pub async fn list_projects(
     let _namespace = state.profile_namespace.read().await;
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let contents = &snapshot.value.contents;
     if query.scope.as_deref() == Some("global") {
@@ -240,6 +243,14 @@ async fn commit_project(
         ProjectChange::Current(index) => ProjectChange::Current(committed[index].path.clone()),
         ProjectChange::Removed(project) => ProjectChange::Removed(project),
     };
+    match &change {
+        ProjectChange::Current(path) => {
+            tracing::info!(target: "http.api.projects", ?scope, ?profile, %path, "project registry changed")
+        }
+        ProjectChange::Removed(project) => {
+            tracing::info!(target: "http.api.projects", ?scope, ?profile, path = %project.path, name = %project.name, "project removed")
+        }
+    }
     {
         let mut metadata = state.canonical_metadata.write().await;
         match shared_profiles.split_last() {
@@ -277,7 +288,10 @@ async fn commit_project(
     }
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let response = match change {
         ProjectChange::Removed(project) => (status, Json(project)).into_response(),

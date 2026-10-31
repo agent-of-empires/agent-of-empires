@@ -37,7 +37,7 @@ describe("resolveAgentProfile", () => {
       heartbeatKeepalives: false,
     });
     expect(p.parentMetaNamespaces).toEqual([]);
-    expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [], harnessNames: [] });
+    expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] });
   });
 
   it("maps agent tool names to canonical cards", () => {

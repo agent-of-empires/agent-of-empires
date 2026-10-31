@@ -1,7 +1,7 @@
 //! Events synthesized from a tool call's raw input: wakeups, monitors, and
 //! background agent launches.
 
-use crate::acp::state::Event;
+use crate::acp::state::{Event, WorkflowLaunch};
 use tracing::{debug, info, warn};
 
 /// Reads `delaySeconds` (a number, or a numeric string) into an absolute wake
@@ -90,23 +90,45 @@ pub(super) fn background_command_launched_from_value(v: &serde_json::Value) -> O
     Some(Event::MonitorArmed { description: None })
 }
 
-/// The background task such a `Bash` launch started, so the session stays busy
-/// until the task ends (reported through the session transcript, see
-/// `crate::acp::task_transcript`).
+/// The background task such a `Bash` launch, or a `Workflow` run, started, so
+/// the session stays busy until the task ends (reported through the session
+/// transcript, see `crate::acp::task_transcript`).
 pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Option<Event> {
     let cc = v.get("_meta")?.get("claudeCode")?;
-    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Bash") {
-        return None;
+    let tr = cc.get("toolResponse")?;
+    let tool_call_id = v
+        .get("toolCallId")
+        .and_then(|id| id.as_str())
+        .map(str::to_string);
+    let str_field = |key: &str| {
+        tr.get(key)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    match cc.get("toolName").and_then(|t| t.as_str())? {
+        "Bash" => Some(Event::BackgroundTaskStarted {
+            task_id: tr.get("backgroundTaskId")?.as_str()?.to_string(),
+            tool_call_id,
+            description: String::new(),
+            workflow: None,
+        }),
+        // The task tailer needs the tool call id to recognise the run's end.
+        "Workflow" if str_field("status") == Some("async_launched") && tool_call_id.is_some() => {
+            let name = str_field("workflowName").unwrap_or("Workflow").to_string();
+            Some(Event::BackgroundTaskStarted {
+                task_id: str_field("taskId")?.to_string(),
+                tool_call_id,
+                description: name.clone(),
+                workflow: Some(WorkflowLaunch {
+                    run_id: str_field("runId")?.to_string(),
+                    name,
+                    summary: str_field("summary").map(str::to_string),
+                    transcript_dir: str_field("transcriptDir").unwrap_or_default().to_string(),
+                }),
+            })
+        }
+        _ => None,
     }
-    let task_id = cc.get("toolResponse")?.get("backgroundTaskId")?.as_str()?;
-    Some(Event::BackgroundTaskStarted {
-        task_id: task_id.to_string(),
-        tool_call_id: v
-            .get("toolCallId")
-            .and_then(|id| id.as_str())
-            .map(str::to_string),
-        description: String::new(),
-    })
 }
 
 /// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
@@ -141,6 +163,7 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
         model: str_field("resolvedModel"),
         output_file: str_field("outputFile"),
         started_at: chrono::Utc::now(),
+        workflow: None,
     })
 }
 
@@ -190,6 +213,66 @@ mod tests {
             serde_json::json!({"stdout": "ok"})
         ))
         .is_none());
+    }
+
+    #[test]
+    fn workflow_launch_starts_a_task() {
+        // Trimmed from a real claude-agent-acp 0.96 launch result.
+        let launched = serde_json::json!({
+            "status": "async_launched",
+            "taskId": "wfgxmundi",
+            "taskType": "local_workflow",
+            "workflowName": "acp-0991-issue-drafts",
+            "runId": "wf_c10b3836-59f",
+            "summary": "Draft and verify 5 issues",
+            "transcriptDir": "/home/u/.claude/projects/p/s/subagents/workflows/wf_c10b3836-59f",
+        });
+        let update = |tool_call_id: Option<&str>, response: serde_json::Value| {
+            serde_json::json!({
+                "toolCallId": tool_call_id,
+                "_meta": {"claudeCode": {"toolName": "Workflow", "toolResponse": response}},
+            })
+        };
+        match background_task_started_from_value(&update(Some("toolu_1"), launched.clone())) {
+            Some(Event::BackgroundTaskStarted {
+                task_id,
+                tool_call_id,
+                description,
+                workflow,
+            }) => {
+                assert_eq!(task_id, "wfgxmundi");
+                assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));
+                assert_eq!(description, "acp-0991-issue-drafts");
+                assert_eq!(
+                    workflow,
+                    Some(WorkflowLaunch {
+                        run_id: "wf_c10b3836-59f".into(),
+                        name: "acp-0991-issue-drafts".into(),
+                        summary: Some("Draft and verify 5 issues".into()),
+                        transcript_dir:
+                            "/home/u/.claude/projects/p/s/subagents/workflows/wf_c10b3836-59f"
+                                .into(),
+                    })
+                );
+            }
+            other => panic!("expected BackgroundTaskStarted, got {other:?}"),
+        }
+        let without = |key: &str| {
+            let mut r = launched.clone();
+            r.as_object_mut().unwrap().remove(key);
+            r
+        };
+        for (label, tool_call_id, response) in [
+            ("no tool call id", None, launched.clone()),
+            ("no task id", Some("toolu_1"), without("taskId")),
+            ("no run id", Some("toolu_1"), without("runId")),
+            ("not launched", Some("toolu_1"), without("status")),
+        ] {
+            assert!(
+                background_task_started_from_value(&update(tool_call_id, response)).is_none(),
+                "{label}"
+            );
+        }
     }
 
     #[test]

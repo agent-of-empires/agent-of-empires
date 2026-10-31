@@ -1316,6 +1316,8 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            self.home.request_plugin_ui_refresh();
+
             if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
                 self.home.request_metrics_refresh();
                 last_metrics_sample = std::time::Instant::now();
@@ -1323,6 +1325,10 @@ impl App {
 
             if self.home.apply_metrics_updates() {
                 refresh_needed = true;
+            }
+
+            if self.home.apply_plugin_ui_updates() {
+                needs_full_refresh = true;
             }
 
             needs_full_refresh |= self.home.apply_session_feed();

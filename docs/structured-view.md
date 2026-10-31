@@ -100,7 +100,10 @@ Features depend on the ACP adapter and its profile:
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
 | Subagent indentation | ✓ | — | unverified | — | — |
+| Workflow agents in the Sub agents pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
+
+In a sandboxed session a Claude `Workflow` run is not tracked, like a backgrounded command: the session can show idle while its agents still work.
 
 Capabilities depend on channels the adapter advertises; unavailable mode, slash-command or usage controls stay empty rather than stale. Codex currently advertises no Plan-mode channel. OpenCode 1.16.0 or newer improves edit/think classification, read output and permission context; older versions use generic cards and prompts. Report unexpected `tool.kind` and `tool.name` values. See [agent profiles](development/internals/structured-view.md#agent-profiles).
 

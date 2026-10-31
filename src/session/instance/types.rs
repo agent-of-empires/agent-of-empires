@@ -194,6 +194,13 @@ pub(crate) struct SandboxStoreTransitionPath {
     pub(crate) destination: PathBuf,
 }
 
+/// The runtime endpoint and container ID a sandbox container was built or adopted on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SandboxPin {
+    pub(crate) runtime: crate::containers::RuntimeExecutionSnapshot,
+    pub(crate) container_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub enabled: bool,
