@@ -14,8 +14,8 @@
 // chrome still wins the header, but not the action area: holding cannot
 // express which answer was meant.
 //
-// Optimistic state shows a spinner until the server's broadcast removes
-// the approval from AcpState.pendingApprovals.
+// Submitting disables actions until the hook confirms resolution or rejects
+// to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
@@ -105,7 +105,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   // fired just before the finger lifted, whose callback is already
   // queued. It finds a newer generation and submits nothing.
   const startLongPress = (key: string, run: () => void) => {
-    if (phase !== "pending") return;
+    if (phase === "submitting") return;
     clearHoldTimers();
     holdGeneration.current += 1;
     const generation = holdGeneration.current;
@@ -190,7 +190,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
+        <p className="px-3 pt-2 text-rose-400 text-xs">Could not submit approval. Tap to retry.</p>
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
@@ -266,7 +266,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             className={[
               "relative flex flex-1 items-center justify-center gap-1.5 overflow-hidden",
               "rounded-md text-white text-xs font-medium py-2 px-3",
-              phase === "pending" ? "bg-rose-600 hover:bg-rose-500" : "bg-rose-700 opacity-70 cursor-wait",
+              phase === "submitting" ? "bg-rose-700 opacity-70 cursor-wait" : "bg-rose-600 hover:bg-rose-500",
             ].join(" ")}
             disabled={offline || (phase !== "pending" && phase !== "rolled-back")}
             onMouseDown={() => startLongPress("allow", () => void submit("Allow"))}
@@ -291,9 +291,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
                 "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
+                phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
               ].join(" ")}
-              disabled={offline || phase !== "pending"}
+              disabled={offline || phase === "submitting"}
               onClick={() => void submit("Allow")}
             >
               <Check className="h-3.5 w-3.5" />

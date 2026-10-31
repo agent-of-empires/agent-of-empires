@@ -168,6 +168,7 @@ mod tests {
         row.profile = profile.into();
         row.status = "Stopped".into();
         row.agent_pane = PaneObservation {
+            physical: None,
             state: PanePresence::Absent,
             ..Default::default()
         };

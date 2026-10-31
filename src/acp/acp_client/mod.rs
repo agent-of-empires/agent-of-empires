@@ -606,7 +606,7 @@ impl AcpClient {
                 return Err(AcpError::Spawn("runner construction cancelled".into()));
             }
             connected = connect_runner_control_v3(
-                &control_path, events.0.clone(), label.clone(),
+                &control_path, label.clone(),
                 terminal_claim.clone(), prompt_in_flight.clone(),
             ) => connected,
         };

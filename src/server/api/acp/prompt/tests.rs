@@ -669,6 +669,186 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
 }
 
+#[tokio::test]
+async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for (reason, interaction, late) in [
+        ("prompt_failed", None, false),
+        ("prompt_failed", Some("approval"), false),
+        ("prompt_failed", Some("elicitation"), false),
+        ("prompt_failed", Some("approval"), true),
+        ("prompt_failed", Some("elicitation"), true),
+        ("session_reset_failed", None, false),
+        ("startup_error", None, false),
+    ] {
+        let id = format!(
+            "queued-after-{reason}-{}-{late}",
+            interaction.unwrap_or("none")
+        );
+        let state = structured_state(&id, true).await;
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let first = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            prompt_req("first explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let second = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            prompt_req("second explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            1
+        );
+        let inject = |event: Event| {
+            let seq = state.acp_event_store.highest_seq_checked(&id).unwrap() + 1;
+            state.acp_event_store.record(&id, seq, &event).unwrap();
+            state.acp_control_cache.apply_if_cached(&id, seq, &event);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
+        };
+        let (mut requested, resolved) = match interaction {
+            Some("approval") => {
+                let approval = crate::acp::permissions::build_approval(
+                    crate::acp::state::ToolCall {
+                        id: "pending-tool".into(),
+                        name: "shell".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    Vec::new(),
+                );
+                let nonce = approval.nonce.clone();
+                (
+                    Some(Event::ApprovalRequested { approval }),
+                    Some(Event::ApprovalResolved {
+                        nonce,
+                        decision: crate::acp::approvals::ApprovalDecision::Allow,
+                    }),
+                )
+            }
+            Some("elicitation") => {
+                let nonce = crate::acp::approvals::Nonce("pending-question".into());
+                (
+                    Some(Event::ElicitationRequested {
+                        elicitation: crate::acp::elicitations::Elicitation {
+                            nonce: nonce.clone(),
+                            message: "Choose".into(),
+                            title: None,
+                            description: None,
+                            tool_call_id: None,
+                            questions: Vec::new(),
+                            requested_at: chrono::Utc::now(),
+                            resolved: None,
+                        },
+                    }),
+                    Some(Event::ElicitationResolved {
+                        nonce,
+                        outcome: crate::acp::elicitations::ElicitationOutcome::Declined,
+                        answers: Vec::new(),
+                    }),
+                )
+            }
+            _ => (None, None),
+        };
+        if !late {
+            if let Some(event) = requested.take() {
+                inject(event);
+            }
+        }
+        if reason == "prompt_failed" {
+            inject(Event::PromptRuntimeError {
+                message: "first request failed".into(),
+                evidence: None,
+            });
+        }
+        if reason == "startup_error" {
+            state
+                .acp_supervisor
+                .publish_startup_error(&id, "transport closed".into());
+        } else {
+            state
+                .acp_supervisor
+                .synthesize_stopped_for_orphan(&id, reason);
+        }
+        if let Some(event) = requested.take() {
+            inject(event);
+        }
+        if let Some(event) = resolved {
+            inject(event);
+        }
+        let control = state.session_service.fold_control_state(&id).await;
+        assert!(!control.turn_active);
+        assert_eq!(control.sidebar_status(), crate::session::Status::Error);
+        if reason == "prompt_failed" {
+            assert_eq!(
+                control.sidebar_phase,
+                crate::acp::state::SidebarPhase::PromptFailed
+            );
+            assert!(
+                control.pending_approvals.is_empty() && control.pending_elicitations.is_empty()
+            );
+        }
+        state.instances.write().await[0].status = crate::session::Status::Error;
+        state.session_service.drain_queued_prompts_once(&id).await;
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
+        let follows = reason == "prompt_failed";
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            if follows { 2 } else { 1 },
+            "{reason}"
+        );
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            usize::from(!follows),
+            "{reason}"
+        );
+        let prompts: Vec<_> = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::UserPromptSent {
+                    text, synthesized, ..
+                } => {
+                    assert!(!synthesized, "failed work is not redelivered");
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            if follows {
+                vec!["first explicit request", "second explicit request"]
+            } else {
+                vec!["first explicit request"]
+            }
+        );
+    }
+}
+
 /// #3649: a review that loses the guard to a turn-starting submission is
 /// refused, with nothing sent or published.
 #[tokio::test]

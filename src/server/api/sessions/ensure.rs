@@ -1,6 +1,7 @@
 //! The ensure-* lifecycle endpoints and terminal attach/kill.
 
 use super::*;
+use crate::session::SessionStore;
 
 pub async fn stop_auxiliary(
     State(state): State<Arc<AppState>>,
@@ -88,6 +89,12 @@ pub async fn ensure_tool(
             &instance.source_profile,
             None,
         )?;
+        anyhow::ensure!(
+            body.expected.as_ref().is_none_or(|expected| {
+                expected.matches(&instance) && expected.matches_source(native.storage())
+            }),
+            crate::session::LifecycleReservationError::Superseded
+        );
         let legacy_scope = if body.adoption.is_some() {
             let loaded = crate::server::reload::load_all_profiles(&worker_state.file_watch)
                 .map_err(|error| error.source.context(crate::session::NativeStoreUnavailable))?;
@@ -105,7 +112,7 @@ pub async fn ensure_tool(
             body.adoption.as_ref(),
             legacy_scope.as_ref(),
         )?;
-        Ok((tool, created, instance, body.tool_name))
+        Ok((tool, created, instance, body.tool_name, native))
     })
     .await
     .map_err(anyhow::Error::from)
@@ -113,10 +120,10 @@ pub async fn ensure_tool(
     drop(guard);
     drop(namespace);
     let result = match result {
-        Ok((tool, true, instance, tool_name)) => {
+        Ok((tool, true, instance, tool_name, native)) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 tool.wait_until_ready()?;
-                Ok((tool, true, instance, tool_name))
+                Ok((tool, true, instance, tool_name, native))
             })
             .await
             .map_err(anyhow::Error::from)
@@ -126,22 +133,19 @@ pub async fn ensure_tool(
         Err(error) => Err(error),
     };
     let result = match result {
-        Ok((tool, created, instance, tool_name)) => {
-            let identity = (
-                instance.lifecycle_generation,
-                instance.source_profile.clone(),
-            );
+        Ok((_tool, created, instance, tool_name, native)) => {
             crate::server::pane::publish_auxiliary_after_ensure(
                 &state,
                 instance,
                 crate::session::AuxiliaryTarget::Tool { tool_name },
+                created,
+                native,
             )
             .await
-            .map(|cursor| (tool, created, cursor, identity))
         }
         Err(error) => Err(error),
     };
-    let (tool, created, cursor, (lifecycle_generation, profile)) = match result {
+    let receipt = match result {
         Ok(tool) => tool,
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -149,6 +153,9 @@ pub async fn ensure_tool(
             }
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if error.is::<crate::server::pane::AuxiliaryTargetUnavailable>() {
+                return StatusCode::CONFLICT.into_response();
             }
             if error.is::<crate::tmux::LegacyToolUnavailable>() {
                 return (StatusCode::CONFLICT,
@@ -166,19 +173,7 @@ pub async fn ensure_tool(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    crate::server::runtime::mutation_response(
-        &cursor,
-        Json(crate::daemon::TerminalTarget {
-            tmux_session: tool.session_name().to_owned(),
-            status: if created {
-                crate::daemon::TerminalTargetStatus::Created
-            } else {
-                crate::daemon::TerminalTargetStatus::Exists
-            },
-            lifecycle_generation,
-            profile,
-        }),
-    )
+    crate::server::runtime::mutation_response(&receipt.cursor, Json(receipt.outcome))
 }
 
 pub async fn ensure_session(
@@ -199,7 +194,9 @@ pub async fn ensure_session(
     .await
 }
 
-pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+pub(super) fn physical_agent_target(
+    instance: &Instance,
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
@@ -209,33 +206,69 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     if pane.pane_dead {
         return Ok(None);
     }
-    if !instance.expects_shell()
-        && !instance.has_command_override()
-        && crate::hooks::read_hook_status(&instance.id).is_none()
-    {
-        let command = pane
-            .pane_current_command
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
-        if crate::tmux::utils::is_pane_running_shell_command(
-            command,
-            pane.pane_start_command_is_protected,
-        ) {
-            return Ok(None);
-        }
-    }
-    Ok(Some(name.to_owned()))
+    let physical = pane
+        .physical_observation()
+        .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
+    Ok(Some((name.to_owned(), physical)))
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("Agent pane is not ready")]
 struct AgentTargetUnavailable;
 
+pub(super) fn indeterminate_launch_response(
+    cause: crate::session::LaunchIndeterminateCause,
+) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::LaunchIndeterminate.header(),
+        Json(serde_json::json!({
+            "error": "launch_indeterminate", "cause": cause.as_str(), "message": cause.message(),
+        })),
+    )
+        .into_response()
+}
+
+pub(super) struct PreparedAgentTarget {
+    pub(super) created_at: chrono::DateTime<chrono::Utc>,
+    pub(super) target: crate::daemon::TerminalTarget,
+    pub(super) native: crate::server::session_store::NativeSessionStore,
+}
+
+impl PreparedAgentTarget {
+    pub(super) fn captured(
+        created_at: chrono::DateTime<chrono::Utc>,
+        generation: u64,
+        profile: String,
+        pane: crate::session::PaneObservation,
+        status: crate::daemon::TerminalTargetStatus,
+        native: crate::server::session_store::NativeSessionStore,
+    ) -> Option<Self> {
+        if pane.state != crate::session::PanePresence::Alive || pane.legacy_tool.is_some() {
+            return None;
+        }
+        Some(Self {
+            created_at,
+            native,
+            target: crate::daemon::TerminalTarget {
+                tmux_session: pane.tmux_session?,
+                physical: Some(pane.physical?),
+                status,
+                lifecycle_generation: generation,
+                profile,
+            },
+        })
+    }
+}
+
 pub(super) async fn agent_target_response(
     state: &Arc<AppState>,
     id: &str,
     outcome: Option<crate::session::StartOutcome>,
 ) -> axum::response::Response {
+    if let Some(crate::session::StartOutcome::Indeterminate { cause }) = outcome {
+        return indeterminate_launch_response(cause);
+    }
     let Some(mut instance) = state
         .instances
         .read()
@@ -248,19 +281,6 @@ pub(super) async fn agent_target_response(
     };
     if instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
-    }
-    if outcome.is_some() {
-        instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session = instance.tmux_session()?;
-            instance.wait_for_pane_ready(&session);
-            Ok(instance)
-        })
-        .await
-        {
-            Ok(Ok(instance)) => instance,
-            Ok(Err(error)) => return agent_target_error(state, error),
-            Err(error) => return agent_target_error(state, error.into()),
-        };
     }
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(id).await;
@@ -275,61 +295,90 @@ pub(super) async fn agent_target_response(
         )?;
         let generation = instance.lifecycle_generation;
         let title = instance.title.clone();
-        let ownership = instance.acquire_auxiliary_locks_in(&native)?;
+        let _ownership = instance.acquire_auxiliary_locks_in(&native)?;
         anyhow::ensure!(
             instance.lifecycle_generation == generation && instance.title == title,
             crate::session::LifecycleReservationError::Superseded
         );
         anyhow::ensure!(!instance.is_structured(), AgentTargetUnavailable);
         native.configuration(Some(&instance.source_profile))?;
-        let name = ready_agent_session(&instance)?.ok_or(AgentTargetUnavailable)?;
+        let (name, physical) = physical_agent_target(&instance)?.ok_or(AgentTargetUnavailable)?;
         native.adopt_agent_observation(
             &instance,
             crate::session::PaneObservation {
+                physical: Some(physical.clone()),
                 state: crate::session::PanePresence::Alive,
                 tmux_session: Some(name.clone()),
                 legacy_tool: None,
             },
         )?;
-        Ok((instance, name, ownership))
+        Ok(PreparedAgentTarget {
+            created_at: instance.created_at,
+            target: crate::daemon::TerminalTarget {
+                tmux_session: name,
+                physical: Some(physical),
+                lifecycle_generation: instance.lifecycle_generation,
+                profile: instance.source_profile,
+                status: crate::daemon::TerminalTargetStatus::Alive,
+            },
+            native,
+        })
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let (instance, name, ownership) = match result {
+    let prepared = match result {
         Ok(target) => target,
         Err(error) => return agent_target_error(state, error),
     };
-    let current = {
-        let _publication = state.publication.read().await;
-        state.instances.read().await.iter().any(|row| {
-            row.id == id
-                && row.lifecycle_generation == instance.lifecycle_generation
-                && row.source_profile == instance.source_profile
-                && row.title == instance.title
-        })
-    };
-    drop(ownership);
     drop(guard);
     drop(namespace);
-    if !current {
+    prepared_agent_target_response(state, id, outcome, Some(prepared)).await
+}
+
+/// Publish only the exact target captured by this operation under ownership.
+pub(super) async fn prepared_agent_target_response(
+    state: &Arc<AppState>,
+    id: &str,
+    outcome: Option<crate::session::StartOutcome>,
+    prepared: Option<PreparedAgentTarget>,
+) -> axum::response::Response {
+    if let Some(crate::session::StartOutcome::Indeterminate { cause }) = outcome {
+        return indeterminate_launch_response(cause);
+    }
+    let Some(PreparedAgentTarget {
+        created_at,
+        target,
+        native,
+    }) = prepared
+    else {
+        return agent_target_error(state, AgentTargetUnavailable.into());
+    };
+    if let Err(error) = native.storage().verify_bound_profile() {
         return agent_target_error(
             state,
-            crate::session::LifecycleReservationError::Superseded.into(),
+            error.context(crate::session::LifecycleReservationError::Superseded),
         );
     }
     let snapshot = match state.runtime.publish(state).await {
         Ok(snapshot) => snapshot,
         Err(error) => return agent_target_error(state, error),
     };
+    if let Err(error) = native.storage().verify_bound_profile() {
+        return agent_target_error(
+            state,
+            error.context(crate::session::LifecycleReservationError::Superseded),
+        );
+    }
     if snapshot.value.contents.health != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if !snapshot.value.contents.sessions.iter().any(|row| {
         row.id == id
-            && row.lifecycle_generation == instance.lifecycle_generation
-            && row.profile == instance.source_profile
-            && row.title == instance.title
+            && row.created_at.parse::<chrono::DateTime<chrono::Utc>>().ok() == Some(created_at)
+            && row.lifecycle_generation == target.lifecycle_generation
+            && row.profile == target.profile
+            && row.agent_pane.physical == target.physical
     }) {
         return agent_target_error(
             state,
@@ -337,9 +386,10 @@ pub(super) async fn agent_target_response(
         );
     }
     let mut body = serde_json::json!({
-        "lifecycle_generation": instance.lifecycle_generation,
-        "profile": instance.source_profile,
-        "tmux_session": name,
+        "lifecycle_generation": target.lifecycle_generation,
+        "profile": target.profile,
+        "tmux_session": target.tmux_session,
+        "physical": target.physical,
         "status": if outcome.is_some() { "restarted" } else { "alive" },
     });
     if let Some(outcome) = outcome {
@@ -347,6 +397,7 @@ pub(super) async fn agent_target_response(
             crate::session::StartOutcome::Resumed => "resumed",
             crate::session::StartOutcome::Fresh => "fresh",
             crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
+            crate::session::StartOutcome::Indeterminate { .. } => unreachable!("indeterminate launch cannot produce a ready target"),
             crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
                 body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
                 body["prior_session_id"] = sid.into();
@@ -430,12 +481,18 @@ pub async fn ensure_terminal(
             &instance.source_profile,
             None,
         )?;
-        let (terminal, created) = instance.start_terminal_with_size_indexed_in(
+        anyhow::ensure!(
+            body.expected.as_ref().is_none_or(|expected| {
+                expected.matches(&instance) && expected.matches_source(native.storage())
+            }),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let (_, created) = instance.start_terminal_with_size_indexed_in(
             index,
             body.size.map(|size| (size.cols.get(), size.rows.get())),
             &native,
         )?;
-        Ok((terminal, created, instance))
+        Ok((created, instance, native))
     })
     .await
     .map_err(anyhow::Error::from)
@@ -443,22 +500,19 @@ pub async fn ensure_terminal(
     drop(guard);
     drop(namespace);
     let result = match result {
-        Ok((terminal, created, instance)) => {
-            let identity = (
-                instance.lifecycle_generation,
-                instance.source_profile.clone(),
-            );
+        Ok((created, instance, native)) => {
             crate::server::pane::publish_auxiliary_after_ensure(
                 &state,
                 instance,
                 crate::session::AuxiliaryTarget::Host { index },
+                created,
+                native,
             )
             .await
-            .map(|cursor| (terminal, created, cursor, identity))
         }
         Err(error) => Err(error),
     };
-    let (terminal, created, cursor, (lifecycle_generation, profile)) = match result {
+    let receipt = match result {
         Ok(result) => result,
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -467,28 +521,25 @@ pub async fn ensure_terminal(
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            if error.is::<crate::server::pane::AuxiliaryTargetUnavailable>() {
+                return StatusCode::CONFLICT.into_response();
+            }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal ensure failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     crate::server::runtime::mutation_response(
-        &cursor,
+        &receipt.cursor,
         (
-            if created {
+            if matches!(
+                receipt.outcome.status,
+                crate::daemon::TerminalTargetStatus::Created
+            ) {
                 StatusCode::CREATED
             } else {
                 StatusCode::OK
             },
-            Json(crate::daemon::TerminalTarget {
-                tmux_session: terminal.name().to_owned(),
-                status: if created {
-                    crate::daemon::TerminalTargetStatus::Created
-                } else {
-                    crate::daemon::TerminalTargetStatus::Exists
-                },
-                lifecycle_generation,
-                profile,
-            }),
+            Json(receipt.outcome),
         ),
     )
 }
@@ -531,7 +582,15 @@ pub async fn ensure_container_terminal(
     let size = body.size.map(|size| (size.cols.get(), size.rows.get()));
     drop(guard);
     drop(namespace);
-    match crate::server::pane::ensure_native_container_terminal(&state, &id, q.index, size).await {
+    match crate::server::pane::ensure_native_container_terminal(
+        &state,
+        &id,
+        q.index,
+        size,
+        body.expected,
+    )
+    .await
+    {
         Ok((target, cursor)) => {
             let status = if matches!(&target.status, crate::daemon::TerminalTargetStatus::Created) {
                 StatusCode::CREATED
@@ -614,6 +673,48 @@ pub async fn kill_terminal(
             }
             tracing::error!(target: "http.api.sessions", session = %id, %error, "Terminal kill failed");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"}))).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod indeterminate_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_launch_never_returns_a_ready_target() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let row = Instance::new("uncertain", "/tmp");
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        for cause in [
+            crate::session::LaunchIndeterminateCause::CommandTimedOut,
+            crate::session::LaunchIndeterminateCause::ObservationFailed,
+            crate::session::LaunchIndeterminateCause::StabilizationExpired,
+            crate::session::LaunchIndeterminateCause::OwnershipUnproven,
+        ] {
+            let response = agent_target_response(
+                &state,
+                &row.id,
+                Some(crate::session::StartOutcome::Indeterminate { cause }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "launch_indeterminate"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["cause"], cause.as_str());
+            assert!(body.get("tmux_session").is_none());
+            assert!(body.get("resume_outcome").is_none());
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].lifecycle_generation, row.lifecycle_generation);
+            assert_eq!(rows[0].conversation_state(), row.conversation_state());
+            assert_eq!(rows[0].resume_probe_failed_sid, None);
         }
     }
 }

@@ -3,6 +3,32 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "acp.operation-error-evidence",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/ApprovalCard.test.tsx",
+        "src/components/acp/AskUserQuestionCard.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/ApprovalCard.tsx",
+        "web/src/components/acp/AskUserQuestionCard.tsx",
+        "web/src/lib/types.ts",
+        "web/src/components/acp/SystemNotices.tsx"
+      ],
+      "notes": "Request-local prompt failure preserves the canonical diagnostic without a startup failure or stopped-worker claim. Typed and legacy missing/null failures survive retained-card resolution and A-to-transient-B-to-resolution compound failures. Hook/card consumers cover HTTP and network rejection, enabled retry of the same nonce, and success or named-404 resolution revealing the canonical banner; destructive approval retries require a fresh full hold. HTTP errors are not relabelled as network failures. Matching request errors clear independently and reveal the canonical banner; transient errors are not persisted. Reattach and optimistic retry retain diagnostics; accepted prompts and intentional clear/switch retire them. Session responses forward optional terminal evidence without a new retry policy."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -197,7 +223,7 @@
         "web/src/components/TerminalComposeSheet.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ],
-      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Backend ownership heartbeat fences require the live read-only recheck; these unit cases do not claim physical tmux-lock coverage."
+      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Hook regressions retire queued binary and paste input across close, error, manual/online reconnect, session/route/deselection changes and ownership denial; stale socket callbacks cannot affect a new connection, and fresh owner-confirmed input retains order. Backend ownership heartbeat and native generation/physical fences require backend tests and live rechecks; these unit cases do not claim physical tmux-lock coverage."
     },
     {
       "id": "terminal.live-grid-transport",
