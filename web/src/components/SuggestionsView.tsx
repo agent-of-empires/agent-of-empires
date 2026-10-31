@@ -3,7 +3,9 @@ import { RefreshCw } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import { dismissSuggestion } from "../lib/api";
 import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
+import type { SessionResponse } from "../lib/types";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -11,11 +13,21 @@ interface Props {
   /** Opens on the Dismissed filter. */
   initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  /** Called when "Start without review" created the session directly. */
+  onStarted?: (session: SessionResponse) => void;
+  /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
+  onOpenMarketplace?: () => void;
 }
 
-export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare }: Props) {
-  const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } =
-    useSuggestions(onPrepare);
+export function SuggestionsView({
+  readOnly = false,
+  initialDismissed = false,
+  onPrepare,
+  onStarted,
+  onOpenMarketplace,
+}: Props) {
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start, load } =
+    useSuggestions(onPrepare, onStarted);
   const [showDismissed, setShowDismissed] = useState(initialDismissed);
 
   const disabled = readOnly || offline;
@@ -24,6 +36,19 @@ export function SuggestionsView({ readOnly = false, initialDismissed = false, on
   const items = snapshot?.items ?? [];
   const visible = items.filter((item) => item.dismissed === showDismissed);
   const dismissedCount = items.filter((item) => item.dismissed).length;
+
+  const noProviderNote =
+    !readOnly && onOpenMarketplace ? (
+      <SuggestionsSetupHint
+        ignoreDismissed
+        noProvider
+        onOpenMarketplace={onOpenMarketplace}
+        onFinished={() => void load()}
+        fallback="No plugin provides suggestions."
+      />
+    ) : (
+      "No plugin provides suggestions."
+    );
 
   return (
     <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
@@ -122,7 +147,7 @@ export function SuggestionsView({ readOnly = false, initialDismissed = false, on
                 {showDismissed
                   ? "No dismissed suggestions."
                   : snapshot.providers.length === 0
-                    ? "No plugin provides suggestions."
+                    ? noProviderNote
                     : "Nothing to suggest right now."}
               </li>
             )}
