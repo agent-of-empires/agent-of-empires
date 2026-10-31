@@ -881,6 +881,7 @@ pub(super) const CSP: &str = "default-src 'self'; \
     style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
     font-src 'self'; \
+    media-src 'self' blob:; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
     base-uri 'self'; \
@@ -1943,6 +1944,7 @@ mod tests {
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
             "img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
+            "media-src 'self' blob:",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {
