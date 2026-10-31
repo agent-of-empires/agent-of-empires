@@ -97,6 +97,9 @@ pub struct Approval {
     /// web dashboard cannot disagree about which cards are answer lists.
     #[serde(default)]
     pub choice: bool,
+    /// Full ExitPlanMode markdown, which `tool_call.args_preview` may truncate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub resolved: Option<ResolvedApproval>,
 }

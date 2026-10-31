@@ -643,3 +643,31 @@ pub async fn serve_owner_router_for_test(
         .expect("fixture owner server");
     })
 }
+
+/// Everything `f` logs through a plain fmt layer, so tests can assert on the rendered line.
+#[cfg(test)]
+pub fn capture_log(f: impl FnOnce()) -> String {
+    use std::io::Write;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(src);
+            Ok(src.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer = buf.clone();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || Buf(writer.clone()))
+        .with_ansi(false);
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry::Registry::default().with(layer),
+        f,
+    );
+    let out = buf.lock().unwrap().clone();
+    String::from_utf8(out).unwrap()
+}

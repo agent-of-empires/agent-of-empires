@@ -329,7 +329,10 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
         sink.publish(
             session_id,
             next_seq(next_seqs, session_id),
-            &Event::BackgroundTaskFinished { task_id },
+            &Event::BackgroundTaskFinished {
+                task_id,
+                ended_at: Some(chrono::Utc::now()),
+            },
         );
     }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);

@@ -111,7 +111,7 @@ pub fn vapid_auth_header(state: &PushState, endpoint: &str) -> Result<String> {
     Ok(format!("vapid t={}, k={}", jwt, state.vapid.public_b64url))
 }
 
-fn endpoint_origin(endpoint: &str) -> Result<String> {
+pub(super) fn endpoint_origin(endpoint: &str) -> Result<String> {
     let url = reqwest::Url::parse(endpoint).context("parse push endpoint URL")?;
     let scheme = url.scheme();
     let host = url
@@ -221,8 +221,8 @@ pub async fn send_one<T: Serialize>(
     match send_one_inner(client, state, subscription, payload, ttl_secs).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            tracing::warn!(target: "http.middleware",
-                endpoint = %subscription.endpoint,
+            tracing::warn!(target: "push",
+                endpoint = %endpoint_origin(&subscription.endpoint).unwrap_or_default(),
                 error = %e,
                 "push: send_one error, marking Failed"
             );
@@ -262,8 +262,8 @@ async fn send_one_inner<T: Serialize>(
         .await
         .unwrap_or_else(|_| String::from("(body unreadable)"));
     let outcome = classify_response(status.as_u16(), &text);
-    tracing::warn!(target: "http.middleware",
-        endpoint = %subscription.endpoint,
+    tracing::warn!(target: "push",
+        endpoint = %endpoint_origin(&subscription.endpoint).unwrap_or_default(),
         status = %status,
         body = %text,
         outcome = outcome.as_str(),

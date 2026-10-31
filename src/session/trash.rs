@@ -379,12 +379,21 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     };
     let commit = storage.update(|instances, _groups| {
         if let Some(relocation) = &relocation {
-            let _ = crate::session::claim::commit_trash_relocation(
+            use crate::session::claim::RelocationCommit;
+            match crate::session::claim::commit_trash_relocation(
                 instances,
                 &request.session_id,
                 request.generation,
                 relocation,
-            );
+            ) {
+                RelocationCommit::Persisted => {}
+                outcome @ RelocationCommit::Superseded => {
+                    tracing::warn!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
+                }
+                outcome => {
+                    tracing::debug!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
+                }
+            }
         } else if let Err(error) = &stopped {
             if let Some(row) = instances
                 .iter_mut()

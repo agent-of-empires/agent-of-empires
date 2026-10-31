@@ -23,6 +23,8 @@ import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
+  /** Start a Session, for a queued row's "Start and send". */
+  onStartSession?: (sessionId: string) => void;
   readOnly: boolean;
   view: RightPanelView;
   pluginPanes: PluginPane[];
@@ -71,6 +73,7 @@ function layerClass(active: boolean): string {
 /** Keep terminal geometry and scrollback across switches; only the visible
  *  surface owns keyboard input. */
 export function MobileMainPane({
+  onStartSession,
   readOnly,
   view,
   pluginPanes,
@@ -154,6 +157,8 @@ export function MobileMainPane({
                     startedBefore={hasStartedBefore(session)}
                     acpProvider={session.acp_provider ?? null}
                     clearAliases={session.clear_aliases}
+                    compactAliases={session.compact_aliases}
+                    onStartSession={onStartSession && (() => onStartSession(session.id))}
                     archivedAt={session.archived_at ?? null}
                     snoozedUntil={session.snoozed_until ?? null}
                     trashedAt={session.trashed_at ?? null}

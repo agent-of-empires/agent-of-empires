@@ -3,7 +3,7 @@
 use rusqlite::{params, OptionalExtension};
 use tracing::warn;
 
-use super::{decode, logged, EventStore};
+use super::{decode_logged, logged, EventStore};
 use crate::acp::state::{Event, RateLimitInfo, RATE_LIMIT_EXHAUSTED_RETRIES_REASON};
 use crate::events;
 
@@ -37,7 +37,7 @@ impl EventStore {
             .optional()
             .ok()
             .flatten()?;
-        match decode(&json)? {
+        match decode_logged(&json, session_id, "latest_rate_limit_event")? {
             Event::RateLimit { info } => Some((info, created_at)),
             _ => None,
         }
@@ -61,10 +61,12 @@ impl EventStore {
                 None
             });
         let (anchor_seq, info, recorded_at_ms) = match latest_rate_limit {
-            Some((seq, json, created_at)) => match decode(&json) {
-                Some(Event::RateLimit { info }) => (seq, Some(info), created_at),
-                _ => (seq, None, created_at),
-            },
+            Some((seq, json, created_at)) => {
+                match decode_logged(&json, session_id, "rate_limit_park") {
+                    Some(Event::RateLimit { info }) => (seq, Some(info), created_at),
+                    _ => (seq, None, created_at),
+                }
+            }
             // Retention may have pruned the `RateLimit` row while its stop survives.
             None => conn
                 .query_row(
@@ -150,16 +152,17 @@ impl EventStore {
             session_id,
         )
         .flatten()?;
-        let (text, attachments) = match decode(&prompt_json)? {
-            Event::UserPromptSent {
-                text, attachments, ..
-            } => (text, attachments),
-            // The agent received only the assembled markdown.
-            Event::UserDiffCommentsPrompt {
-                assembled_markdown, ..
-            } => (assembled_markdown, Vec::new()),
-            _ => return None,
-        };
+        let (text, attachments) =
+            match decode_logged(&prompt_json, session_id, "rate_limited_turn_prompt")? {
+                Event::UserPromptSent {
+                    text, attachments, ..
+                } => (text, attachments),
+                // The agent received only the assembled markdown.
+                Event::UserDiffCommentsPrompt {
+                    assembled_markdown, ..
+                } => (assembled_markdown, Vec::new()),
+                _ => return None,
+            };
         let terminator: Option<String> = logged(
             conn.query_row(
                 concat!(
@@ -182,7 +185,9 @@ impl EventStore {
             session_id,
         )
         .flatten();
-        match terminator.and_then(|json| decode(&json)) {
+        match terminator
+            .and_then(|json| decode_logged(&json, session_id, "rate_limited_turn_prompt"))
+        {
             Some(Event::Stopped { reason }) if reason == "rate_limited" => {
                 Some((text, attachments))
             }

@@ -34,7 +34,7 @@
       "id": "acp.current-native-authority",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/acp-structured-view.spec.ts"],
+      "specs": ["tests/acp-structured-view.spec.ts", "tests/acp-startup-wait.spec.ts", "tests/acp-plan-modal.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/Composer.tsx",
@@ -791,7 +791,7 @@
       "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
-      "description": "Server, migration and systemd area controls preserve unrelated logging overrides when edited or cleared.",
+      "description": "Server, migration and session area controls preserve unrelated logging overrides when edited or cleared.",
       "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
@@ -2999,6 +2999,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
+      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card. A composed current-snapshot/replay/pane regression keeps a current run live when covered historical Started/Finished events reuse its task id, while retaining the completed historical run for inspection.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3527,7 +3528,16 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
+      "notes": "Native decision permission is explicit and independent of offline/submitting state. Withdrawing permission retires an active destructive hold; regranting permission cannot revive it and requires a new full hold."
+    },
+    {
+      "id": "acp.plan-modal",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-plan-modal.spec.ts"],
+      "components": ["web/src/components/acp/PlanModal.tsx"],
+      "notes": "View plan, local expansion, Raw/Rendered, copy, and dismissal remain available without current native authority. A browser case opens under Unknown, changes current sequenced readiness while the modal stays open, then reads/copies/closes the plan with native decisions disabled and zero approval POSTs."
     },
     {
       "id": "acp.markdown",
@@ -3653,7 +3663,7 @@
       "risk": "low",
       "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
       "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
-      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+      "reason": "The queued-messages header's Tooltip opens on keyboard focus and dismisses on Tab; a strip with an unconfirmed row says it isn't sent yet."
     },
     {
       "id": "acp.queue-send-now",
@@ -3816,6 +3826,23 @@
         "web/src/components/acp/ComposerControls.tsx"
       ],
       "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it. A running Worker never shows it while the first connection or replay loads; its disconnected Send, follow-up and queue strip copy say \"while disconnected\" instead of \"until session resumes\", and its queue strip says \"Queued\" unless a row is unconfirmed."
+    },
+    {
+      "id": "acp.queued-strip-reason",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/queuedReason.test.ts",
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "tests/acp-startup-wait.spec.ts",
+        "tests/acp-queued-stop-and-run.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/queuedReason.ts",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx"
+      ],
+      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all. Explicit Start posts /start under core admission without granting native send authority; socket-open with Unknown cannot send or wake queued intent until a current governor receipt permits it."
     },
     {
       "id": "acp.startup-error-screen",

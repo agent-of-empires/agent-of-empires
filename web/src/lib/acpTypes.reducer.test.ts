@@ -22,6 +22,7 @@ import {
   type TranscriptRow,
   type ToolCall,
 } from "./acpTypes";
+import { workflowRunning } from "../components/acp/backgroundAgentsContext";
 
 const ev = (state: AcpState, seq: number, event: AcpEvent) => applyEvent(state, { session_id: "s-1", seq, event });
 
@@ -314,6 +315,151 @@ describe("applyEvent / background agents", () => {
     // own abort timeout), so the endedAt guard, not the status list, has to stop it.
     const late = agent(launched, stalledTerminal, lateProgress)[0];
     expect(late).toMatchObject({ status: "stalled", toolCount: 0, endedAt: "2026-06-27T00:00:10Z" });
+  });
+});
+
+describe("applyEvent / workflow runs", () => {
+  it("records a workflow run by its tool call and tags its agents", () => {
+    const events: AcpEvent[] = [
+      {
+        BackgroundTaskStarted: {
+          task_id: "wfx",
+          tool_call_id: "toolu_wf",
+          description: "drafts",
+          workflow: { run_id: "wf_1", name: "drafts", summary: "Draft five issues" },
+        },
+      },
+      {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "toolu_wf",
+          description: "draft:one",
+          prompt: "",
+          model: "",
+          workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
+          started_at: "2026-10-29T19:42:10Z",
+        },
+      },
+      { BackgroundTaskStarted: { task_id: "bash1", tool_call_id: "toolu_bash", description: "" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.workflowRuns).toEqual({ toolu_wf: { taskId: "wfx", name: "drafts", summary: "Draft five issues" } });
+    expect(state.backgroundTasks).toEqual(["wfx", "bash1"]);
+    expect(state.backgroundAgents[0]).toMatchObject({
+      toolCallId: "toolu_wf",
+      workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
+    });
+  });
+
+  it("keeps the run's end time from its task", () => {
+    const events: AcpEvent[] = [
+      {
+        BackgroundTaskStarted: {
+          task_id: "wfx",
+          tool_call_id: "toolu_wf",
+          description: "drafts",
+          workflow: { run_id: "wf_1", name: "drafts" },
+        },
+      },
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:01:00Z" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.backgroundTasks).toEqual([]);
+    expect(state.workflowRuns.toolu_wf).toMatchObject({ taskId: "wfx", endedAt: "2026-10-30T10:01:00Z" });
+  });
+
+  it("attributes a reused task id to the run still open on it", () => {
+    const run = (toolCallId: string, name: string): AcpEvent => ({
+      BackgroundTaskStarted: {
+        task_id: "wfx",
+        tool_call_id: toolCallId,
+        description: name,
+        workflow: { run_id: name, name },
+      },
+    });
+    const events: AcpEvent[] = [
+      run("toolu_a", "a"),
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:01:00Z" } },
+      run("toolu_b", "b"),
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:05:00Z" } },
+      run("toolu_c", "c"),
+      { BackgroundTaskStarted: { task_id: "wfx", tool_call_id: "toolu_bash", description: "sleep" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.workflowRuns.toolu_a).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:05:00Z" });
+    // A command reusing the id replaces the run, which never reported an end.
+    expect(state.workflowRuns.toolu_c).toMatchObject({ finished: true, endedAt: null });
+    expect(state.backgroundTasks).toEqual(["wfx"]);
+  });
+});
+
+describe("applyReducedState / workflow runs", () => {
+  it("restores a run launched before the replay window and follows its task", () => {
+    const agent = {
+      agentId: "d1",
+      toolCallId: "toolu_wf",
+      workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
+      description: "d1",
+      prompt: "",
+      model: "",
+      status: "completed" as const,
+      startedAt: "2026-10-30T10:00:00Z",
+      endedAt: "2026-10-30T10:00:10Z",
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    // Only the snapshot knows the launch; its first phase is done.
+    let state = applyReducedState(
+      { ...emptyAcpState(), backgroundAgents: [agent] },
+      reducedState({
+        background_tasks: ["wfx"],
+        workflow_runs: [{ task_id: "wfx", tool_call_id: "toolu_wf", name: "drafts" }],
+      }),
+    );
+    const live = () => workflowRunning(state.workflowRuns.toolu_wf, state.backgroundTasks, state.backgroundAgents);
+    expect(state.workflowRuns.toolu_wf).toMatchObject({ taskId: "wfx", name: "drafts" });
+    expect(live()).toBe(true);
+    state = ev(state, 1, { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:01:00Z" } });
+    expect(live()).toBe(false);
+    expect(state.workflowRuns.toolu_wf).toMatchObject({ endedAt: "2026-10-30T10:01:00Z" });
+  });
+
+  it("adopts a finish the replay missed without reopening a closed run", () => {
+    const record = { task_id: "wfx", name: "drafts", finished: true, ended_at: "2026-10-30T10:01:00Z" };
+    const replayed = ev(emptyAcpState(), 1, {
+      BackgroundTaskStarted: {
+        task_id: "wfx",
+        tool_call_id: "toolu_b",
+        description: "drafts",
+        workflow: { run_id: "b", name: "drafts" },
+      },
+    });
+    const state = applyReducedState(
+      replayed,
+      reducedState({
+        workflow_runs: [
+          { ...record, tool_call_id: "toolu_a" },
+          { ...record, tool_call_id: "toolu_b" },
+          { ...record, tool_call_id: "toolu_c", finished: false, ended_at: null },
+        ],
+      }),
+    );
+    expect(state.workflowRuns.toolu_a).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_c).toMatchObject({ taskId: "wfx" });
+    expect(state.workflowRuns.toolu_c?.finished).toBeUndefined();
+    // A snapshot behind the replay leaves its later finish alone.
+    const closed = ev(replayed, 2, { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:02:00Z" } });
+    const kept = applyReducedState(
+      closed,
+      reducedState({ workflow_runs: [{ ...record, tool_call_id: "toolu_b", finished: false, ended_at: null }] }),
+    );
+    expect(kept.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:02:00Z" });
   });
 });
 

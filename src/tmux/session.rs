@@ -203,6 +203,8 @@ fn run_input_effect(
                         // User hooks may re-enter AoE. Release before draining/reaping
                         // their command client, and independently fence a later Enter.
                         drop(native.take());
+                        #[cfg(test)]
+                        tests::observe_selected_input_ack();
                         break;
                     }
                 } else {
@@ -2119,7 +2121,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     fn owner_snapshot_with_deadline(
@@ -2413,7 +2417,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     pub fn release_vt_owner(&self, owner_id: &str) {
@@ -2516,7 +2522,9 @@ impl Session {
             &condition,
             &release,
         ]);
-        let _ = deadline.run(&mut command);
+        if let Err(error) = deadline.run(&mut command) {
+            tracing::debug!(target: "tmux.command", %error, "owner release failed");
+        }
     }
 
     /// Force ownership to owner_id, even over a live holder. Used by the
@@ -3153,61 +3161,100 @@ mod tests {
         let fifo = temp.path().join("release");
         let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        let entered = temp.path().join("entered");
+        // Retain both ends until cleanup so an early write survives a late reader.
+        let mut release_fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         // A declared control peer leaves its client alive after the selected ACK,
         // as a synchronous input followed by a waiting user hook does in tmux.
         let script = format!(
             "printf '%s\\n' '%begin 1 10 0' '%end 1 10 0' '%begin 1 23 0' '%end 1 23 0'; \
-             printf entered > {}; read -r released < {}",
-            shell_escape_script_word(entered.to_str().unwrap()),
+             read -r released < {}",
             shell_escape_script_word(fifo.to_str().unwrap()),
         );
         let (done_tx, done) = std::sync::mpsc::channel();
+        let (ack_tx, ack) = std::sync::mpsc::channel();
+        let (resume_tx, resume) = std::sync::mpsc::channel();
         let input = std::thread::spawn(move || {
+            let _ack = SelectedInputAckGuard::install(SelectedInputAckProbe {
+                acknowledged: ack_tx,
+                resume,
+            });
             let result = run_input_effect(
                 std::process::Command::new("sh").args(["-c", &script]),
                 Some(native),
             );
             done_tx.send(result).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !entered.exists() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
+        let acknowledged = ack.recv_timeout(Duration::from_secs(5));
         let (released_tx, released) = std::sync::mpsc::channel();
         let probe = std::thread::spawn(move || {
-            let _native = storage
+            let result = storage
                 .acquire_instance_lifecycle_lock("control-ack")
-                .unwrap();
-            released_tx.send(()).unwrap();
+                .map(drop);
+            released_tx.send(result).unwrap();
         });
         let unlocked = released.recv_timeout(Duration::from_secs(5));
         let early = done.try_recv().ok();
         let completed_early = early.is_some();
-        // Always release the peer before asserting, including the failure path.
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fifo)
-            .unwrap()
-            .write_all(b"released\n")
-            .unwrap();
-        let result = early.unwrap_or_else(|| done.recv_timeout(Duration::from_secs(5)).unwrap());
-        input.join().unwrap();
-        probe.join().unwrap();
-        assert!(
-            entered.exists(),
-            "control peer reached its post-ACK barrier"
-        );
-        assert!(
-            unlocked.is_ok(),
-            "native lock must be released at selected effect ACK"
-        );
+        // Release both barriers before assertions, even if an observation failed.
+        let peer_released = release_fifo.write_all(b"released\n");
+        let checkpoint_released = resume_tx.send(());
+        drop(resume_tx);
+        let result = early
+            .map(Ok)
+            .unwrap_or_else(|| done.recv_timeout(Duration::from_secs(5)));
+        let input_joined = input.join();
+        let probe_joined = probe.join();
+        drop(release_fifo);
+        acknowledged.expect("input worker reached the selected-ACK checkpoint");
+        unlocked
+            .expect("native lock must be released while the ACK worker remains parked")
+            .expect("native lock probe succeeded");
         assert!(
             !completed_early,
             "client completion must not stand in for the effect ACK"
         );
-        result.unwrap();
+        peer_released.unwrap();
+        checkpoint_released.unwrap();
+        input_joined.unwrap();
+        probe_joined.unwrap();
+        result.unwrap().unwrap();
+    }
+
+    struct SelectedInputAckProbe {
+        acknowledged: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static SELECTED_INPUT_ACK: std::cell::RefCell<Option<SelectedInputAckProbe>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_selected_input_ack() {
+        SELECTED_INPUT_ACK.with(|slot| {
+            if let Some(probe) = slot.borrow().as_ref() {
+                if probe.acknowledged.send(()).is_ok() {
+                    let _ = probe.resume.recv();
+                }
+            }
+        });
+    }
+
+    struct SelectedInputAckGuard(Option<SelectedInputAckProbe>);
+
+    impl SelectedInputAckGuard {
+        fn install(probe: SelectedInputAckProbe) -> Self {
+            Self(SELECTED_INPUT_ACK.with(|slot| slot.replace(Some(probe))))
+        }
+    }
+
+    impl Drop for SelectedInputAckGuard {
+        fn drop(&mut self) {
+            SELECTED_INPUT_ACK.with(|slot| slot.replace(self.0.take()));
+        }
     }
 
     struct ReadyCaptureProbe {
