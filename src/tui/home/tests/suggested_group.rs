@@ -349,10 +349,12 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
     let (mut env, _requests) = expanded_env(1);
     env.view.cursor += 1;
     env.view.update_selected();
-    for (width, expected) in [
-        (119, "z dismiss  ^K more"),
-        (120, "z dismiss  ^K open in GitHub"),
+    for (width, strict, expected) in [
+        (119, false, "z dismiss  ^K more"),
+        (120, false, "z dismiss  ^K open in GitHub"),
+        (120, true, "Z dismiss  ^K open in GitHub"),
     ] {
+        env.view.strict_hotkeys = strict;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
         terminal
@@ -372,7 +374,10 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains(expected), "{width} cols: {expected:?}");
+        assert!(
+            text.contains(expected),
+            "{width} cols, strict {strict}: {expected:?}"
+        );
     }
 }
 
