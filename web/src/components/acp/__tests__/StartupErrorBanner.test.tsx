@@ -142,8 +142,11 @@ describe("StartupErrorBanner layout", () => {
       info: claude({ sandboxed: true }),
       headline: "Claude couldn't start in Structured view",
       command: CLAUDE_NPM,
-      texts: ["Run this inside the container, then Retry", "sandbox image update available"],
-      absent: ["where the Daemon runs"],
+      texts: [
+        "Run this inside the container, then Retry",
+        'the dashboard\'s "Sandbox image update available" banner pulls it, or shows the command to run.',
+      ],
+      absent: ["where the Daemon runs", "TUI"],
       actions: ["Retry", "Use Terminal view"],
     },
     {

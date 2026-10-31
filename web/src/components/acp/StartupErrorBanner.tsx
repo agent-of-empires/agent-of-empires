@@ -269,9 +269,9 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
         <p className="mt-2">Run this inside the container, then Retry:</p>
         <CommandBlock {...hint} testId="startup-error-banner-command" />
         <p className="mt-2 text-text-subtle">
-          This updates the running container only. To keep new Sessions from hitting this, refresh the sandbox image:
-          the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your configured
-          container runtime.
+          This updates the running container only. To keep new Sessions from hitting this, refresh the Sandbox image.
+          When a newer image is published and update checks are on, the dashboard's "Sandbox image update available"
+          banner pulls it, or shows the command to run.
         </p>
       </div>
     );
