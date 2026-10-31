@@ -214,6 +214,14 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/live-terminal/TermRow.tsx"]
     },
     {
+      "id": "terminal.live-pipe-contention-notice",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it."
+    },
+    {
       "id": "terminal.live-alt-screen-scroll",
       "kind": "vitest",
       "risk": "high",
