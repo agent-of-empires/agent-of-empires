@@ -423,6 +423,39 @@ describe("applyReducedState / workflow runs", () => {
     expect(live()).toBe(false);
     expect(state.workflowRuns.toolu_wf).toMatchObject({ endedAt: "2026-10-30T10:01:00Z" });
   });
+
+  it("adopts a finish the replay missed without reopening a closed run", () => {
+    const record = { task_id: "wfx", name: "drafts", finished: true, ended_at: "2026-10-30T10:01:00Z" };
+    const replayed = ev(emptyAcpState(), 1, {
+      BackgroundTaskStarted: {
+        task_id: "wfx",
+        tool_call_id: "toolu_b",
+        description: "drafts",
+        workflow: { run_id: "b", name: "drafts" },
+      },
+    });
+    const state = applyReducedState(
+      replayed,
+      reducedState({
+        workflow_runs: [
+          { ...record, tool_call_id: "toolu_a" },
+          { ...record, tool_call_id: "toolu_b" },
+          { ...record, tool_call_id: "toolu_c", finished: false, ended_at: null },
+        ],
+      }),
+    );
+    expect(state.workflowRuns.toolu_a).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_c).toMatchObject({ taskId: "wfx" });
+    expect(state.workflowRuns.toolu_c?.finished).toBeUndefined();
+    // A snapshot behind the replay leaves its later finish alone.
+    const closed = ev(replayed, 2, { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:02:00Z" } });
+    const kept = applyReducedState(
+      closed,
+      reducedState({ workflow_runs: [{ ...record, tool_call_id: "toolu_b", finished: false, ended_at: null }] }),
+    );
+    expect(kept.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:02:00Z" });
+  });
 });
 
 describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {

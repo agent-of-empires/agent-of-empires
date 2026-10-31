@@ -23,7 +23,14 @@ vi.mock("../../hooks/useSkillIndex", () => ({
   useSkillIndex: () => skillIndexRef.current,
 }));
 
-import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
+import {
+  applyReducedState,
+  emptyAcpState,
+  type ActivityRow,
+  type BackgroundAgent,
+  type ToolCall,
+  type ToolOutputBlock,
+} from "../../lib/acpTypes";
 import { writeClipboard } from "../../lib/clipboard";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
@@ -901,12 +908,30 @@ describe("WorkflowToolCard", () => {
   it.each([
     ["its last agent ended", [{ ...member("d1", "Draft", "completed"), endedAt: "2026-10-30T10:00:10Z" }]],
     ["it had no agents", []],
-  ] as const)("times a finished run by its task even when %s", (_label, agents) => {
-    const value = {
-      agents: [...agents],
-      workflowRuns: { toolu_wf: { taskId: "wfx", name: "drafts", summary: null, endedAt: "2026-10-30T10:01:00Z" } },
-      backgroundTasks: [],
-    };
+  ] as const)("times a run opened after it finished by its task even when %s", (_label, agents) => {
+    // The replay window holds neither its launch nor its finish; only the
+    // daemon's state and the history rows know the run.
+    const state = applyReducedState(emptyAcpState(), {
+      agent: "claude",
+      model: null,
+      mode: "Default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      workflow_runs: [
+        { task_id: "wfx", tool_call_id: "toolu_wf", name: "drafts", finished: true, ended_at: "2026-10-30T10:01:00Z" },
+      ],
+    });
+    const value = { agents: [...agents], workflowRuns: state.workflowRuns, backgroundTasks: state.backgroundTasks };
     const { container } = render(
       wrap(
         <BackgroundAgentsContext.Provider value={value}>

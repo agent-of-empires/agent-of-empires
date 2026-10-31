@@ -392,15 +392,21 @@ pub struct WorkflowLaunch {
     pub transcript_dir: String,
 }
 
-/// A workflow run whose task is still open, so a client whose replay window
-/// starts after the launch can still tie the task to its tool call.
+/// A workflow run of the session, kept like `background_agents` so a client
+/// whose replay window misses its launch or finish still ties the task to its
+/// tool call and end time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenWorkflowRun {
+pub struct WorkflowRunRecord {
     pub task_id: String,
     pub tool_call_id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Closed by its task's finish, or by a later start reusing the task id.
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// The workflow run and phase a background sub-agent belongs to.
@@ -515,7 +521,7 @@ pub struct AcpState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workflow_runs: Vec<OpenWorkflowRun>,
+    pub workflow_runs: Vec<WorkflowRunRecord>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -902,6 +908,18 @@ impl AcpState {
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
+    /// Task ids can be reused, so only the run still open on `task_id` closes.
+    fn close_workflow_run(&mut self, task_id: &str, ended_at: Option<DateTime<Utc>>) {
+        if let Some(run) = self
+            .workflow_runs
+            .iter_mut()
+            .find(|run| run.task_id == task_id && !run.finished)
+        {
+            run.finished = true;
+            run.ended_at = ended_at;
+        }
+    }
+
     /// The sidebar status this state implies. A live background agent keeps
     /// the row `Running` between main turns.
     pub fn sidebar_status(&self) -> Status {
@@ -1188,21 +1206,23 @@ impl AcpState {
                 ..
             } => {
                 // A reused task id replaces whatever run held it.
-                self.workflow_runs.retain(|run| run.task_id != task_id);
+                self.close_workflow_run(&task_id, None);
                 if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
-                    self.workflow_runs.push(OpenWorkflowRun {
+                    self.workflow_runs.push(WorkflowRunRecord {
                         task_id: task_id.clone(),
                         tool_call_id,
                         name: workflow.name,
                         summary: workflow.summary,
+                        finished: false,
+                        ended_at: None,
                     });
                 }
                 if !self.background_tasks.contains(&task_id) {
                     self.background_tasks.push(task_id);
                 }
             }
-            Event::BackgroundTaskFinished { task_id, .. } => {
-                self.workflow_runs.retain(|run| run.task_id != task_id);
+            Event::BackgroundTaskFinished { task_id, ended_at } => {
+                self.close_workflow_run(&task_id, ended_at);
                 self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
@@ -2231,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn open_workflow_runs_follow_their_task() {
+    fn workflow_runs_keep_their_end_after_their_task() {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: Some(call.into()),
@@ -2243,14 +2263,27 @@ mod tests {
                 transcript_dir: "/home/u/.claude/wf".into(),
             }),
         };
-        let open = |s: &AcpState| {
+        let runs = |s: &AcpState| {
             s.workflow_runs
                 .iter()
-                .map(|run| run.tool_call_id.clone())
+                .map(|run| {
+                    (
+                        run.tool_call_id.clone(),
+                        run.finished,
+                        run.ended_at.map(|at| at.to_rfc3339()),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
+        let ended_at: Option<DateTime<Utc>> = "2026-10-30T10:01:00Z".parse().ok();
         let mut s = applied([workflow("wfx", "toolu_a"), workflow("wfy", "toolu_b")]);
-        assert_eq!(open(&s), ["toolu_a", "toolu_b"]);
+        assert_eq!(
+            runs(&s),
+            [
+                ("toolu_a".into(), false, None),
+                ("toolu_b".into(), false, None)
+            ]
+        );
         for event in [
             Event::BackgroundTaskStarted {
                 task_id: "wfx".into(),
@@ -2260,12 +2293,27 @@ mod tests {
             },
             Event::BackgroundTaskFinished {
                 task_id: "wfy".into(),
-                ended_at: None,
+                ended_at,
+            },
+            // The command reusing `wfx` ends; the replaced run keeps no time.
+            Event::BackgroundTaskFinished {
+                task_id: "wfx".into(),
+                ended_at,
             },
         ] {
             s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
-        assert!(open(&s).is_empty(), "replaced and finished runs close");
+        assert_eq!(
+            runs(&s),
+            [
+                ("toolu_a".into(), true, None),
+                (
+                    "toolu_b".into(),
+                    true,
+                    Some("2026-10-30T10:01:00+00:00".into())
+                ),
+            ]
+        );
     }
 
     /// #4001: `turn_active` gates prompt dispatch and the queue drain, not
