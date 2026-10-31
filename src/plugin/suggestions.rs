@@ -222,15 +222,16 @@ fn set_at(
         })
         .map_err(db_error)?;
     // A stale item keeps the time it first went stale and expires after the TTL.
+    // An expired item's time is kept too, so republishing it stale cannot start a new day.
     let mut stale_since: Vec<(&str, i64)> = Vec::new();
     let mut kept = Vec::with_capacity(accepted.len());
     for item in &accepted {
         if item.stale {
             let since = first_stale.get(&item.id).copied().unwrap_or(now);
+            stale_since.push((item.id.as_str(), since));
             if now - since > STALE_TTL_SECS {
                 continue;
             }
-            stale_since.push((item.id.as_str(), since));
         }
         kept.push(item);
     }
@@ -470,6 +471,14 @@ pub(crate) fn templates(
     )?
     .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
     .collect()
+}
+
+/// Why `prepare` refused an item.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PrepareRefusal {
+    PromptTooLong,
+    /// The source closed or changed, so the item cannot start.
+    Stale,
 }
 
 /// An expanded prompt would exceed [`MAX_PROMPT_BYTES`].
@@ -1170,15 +1179,18 @@ pub(crate) fn attach_projects(
     Ok(())
 }
 
-/// Sets `refreshing` on every snapshot provider.
-pub(crate) fn attach_refreshing(snapshot: &mut Value, refreshing: &HashSet<String>) {
+/// Sets `refreshing` on every snapshot provider: asked to refresh (unix seconds in
+/// `requested`) and not reported since, so an earlier publish does not end it.
+pub(crate) fn attach_refreshing(snapshot: &mut Value, requested: &HashMap<String, i64>) {
     let Some(providers) = snapshot["providers"].as_array_mut() else {
         return;
     };
     for provider in providers {
+        let updated = provider["updated_at"].as_i64();
         let is = provider["id"]
             .as_str()
-            .is_some_and(|id| refreshing.contains(id));
+            .and_then(|id| requested.get(id))
+            .is_some_and(|&at| updated.is_none_or(|u| at > u));
         provider["refreshing"] = json!(is);
     }
 }
@@ -1212,9 +1224,14 @@ pub(crate) fn prepare(
     item: &Suggestion,
     template: Option<&str>,
     mapped: Option<&[String]>,
-) -> Result<Value, PromptTooLong> {
+) -> Result<Value, PrepareRefusal> {
+    if item.stale {
+        return Err(PrepareRefusal::Stale);
+    }
     let prompt = match template {
-        Some(t) => expand(t, &item.variables)?,
+        Some(t) => {
+            expand(t, &item.variables).map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?
+        }
         None => item.draft.prompt.clone(),
     };
     let registered = projects::load_merged(profile).unwrap_or_default();
@@ -1947,7 +1964,7 @@ mod tests {
         // 12-byte value, template within the stored bound: expansion is not.
         let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_PROMPT_BYTES);
-        assert_eq!(prompt(Some(&bomb)), Err(PromptTooLong));
+        assert_eq!(prompt(Some(&bomb)), Err(PrepareRefusal::PromptTooLong));
     }
 
     #[test]
@@ -2099,6 +2116,11 @@ mod tests {
         let out = publish_at(&[stale("a"), item("b", "assigned")], 1_001 + day);
         assert_eq!(out["dropped"], 1);
         assert_eq!(ids(&snap(&conn, "p")), ["b"]);
+        // Still published stale after expiring: still dropped, not given a fresh day.
+        for later in [2_000 + day, 1_000 + 3 * day] {
+            let out = publish_at(&[stale("a"), item("b", "assigned")], later);
+            assert_eq!(out["dropped"], 1, "at {later}");
+        }
         // Fresh again, then stale again: a new clock starts.
         publish_at(&[item("a", "assigned")], 2_000 + day);
         let out = publish_at(&[stale("a")], 3_000 + day);
@@ -2106,11 +2128,31 @@ mod tests {
     }
 
     #[test]
+    fn prepare_refuses_a_stale_item() {
+        let mut stale = item("a", "assigned");
+        stale.stale = true;
+        assert_eq!(
+            prepare("default", &stale, None, None),
+            Err(PrepareRefusal::Stale)
+        );
+    }
+
+    #[test]
     fn refreshing_marks_every_provider() {
-        let mut snapshot = json!({ "providers": [{ "id": "a" }, { "id": "b" }] });
-        attach_refreshing(&mut snapshot, &HashSet::from(["b".to_string()]));
-        assert_eq!(snapshot["providers"][0]["refreshing"], false);
-        assert_eq!(snapshot["providers"][1]["refreshing"], true);
+        let mut snapshot = json!({ "providers": [
+            { "id": "a" },
+            { "id": "b", "updated_at": 90 },
+            { "id": "c", "updated_at": 110 },
+            { "id": "d", "updated_at": 100 },
+            { "id": "e" },
+        ]});
+        let requested = HashMap::from(["b", "c", "d", "e"].map(|id| (id.to_string(), 100)));
+        attach_refreshing(&mut snapshot, &requested);
+        let flags: Vec<bool> = (0..5)
+            .map(|i| snapshot["providers"][i]["refreshing"].as_bool().unwrap())
+            .collect();
+        // a never asked; b not heard since; c and d reported at or after the request; e never reported.
+        assert_eq!(flags, [false, true, false, false, true]);
     }
 
     #[test]

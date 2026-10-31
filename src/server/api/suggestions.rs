@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::plugin::suggestions::{self, PromptTooLong, Provider};
+use crate::plugin::suggestions::{self, PrepareRefusal, Provider};
 use axum::http::StatusCode;
 
 #[derive(Deserialize)]
@@ -325,7 +325,12 @@ pub async fn prepare_suggestion(
     .await;
     match result {
         Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
-        Ok(Ok(Some(Err(PromptTooLong)))) => api_error(
+        Ok(Ok(Some(Err(PrepareRefusal::Stale)))) => api_error(
+            StatusCode::BAD_REQUEST,
+            "stale",
+            "That suggestion is no longer open at its source",
+        ),
+        Ok(Ok(Some(Err(PrepareRefusal::PromptTooLong)))) => api_error(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             format!(
