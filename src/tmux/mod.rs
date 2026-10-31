@@ -4263,7 +4263,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
     fn detect_with_custom_agents_warns_on_misconfigured_entries() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        // The controlled probe environment keeps real user tools, home, shell
+        // and plugins out of discovery while still exercising the detection
+        // path that surfaces the warning.
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
         let mut session = crate::session::config::SessionConfig::default();
         session
             .custom_agents
