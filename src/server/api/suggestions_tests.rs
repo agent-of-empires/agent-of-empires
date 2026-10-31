@@ -582,3 +582,36 @@ async fn mappings_validate_list_and_delete_by_query() {
         .await;
     assert_eq!(listed["mappings"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn projects_list_each_registered_project_with_its_origin_slug() {
+    let f = fixture();
+    let cloned = f.repo.parent().unwrap().join("cloned");
+    git2::Repository::init(&cloned)
+        .unwrap()
+        .remote("origin", "git@github.com:Acme/Web.git")
+        .unwrap();
+    projects::add(
+        "default",
+        ProjectScope::Global,
+        Project::new("web-app", cloned.to_string_lossy(), ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    let (status, _, body) = f
+        .call(Method::GET, "/api/suggestions/projects", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Vec<(&str, Value)> = body["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["name"].as_str().unwrap(), p["origin"].clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [("repo", Value::Null), ("web-app", json!("Acme/Web"))]
+    );
+}

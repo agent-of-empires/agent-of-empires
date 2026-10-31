@@ -590,6 +590,31 @@ pub async fn list_suggestion_mappings(State(state): State<Arc<AppState>>) -> imp
     }
 }
 
+/// The Projects a mapping may name, each with the `owner/repo` of its git
+/// `origin` (or `null`), so a client can propose mappings. Mutates nothing.
+pub async fn list_suggestion_projects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let registered = crate::session::projects::load_merged(&host.suggestions_profile())?;
+        let projects: Vec<_> = registered
+            .into_iter()
+            .map(|p| {
+                let origin = crate::git::get_remote_slug(std::path::Path::new(&p.path));
+                json!({ "name": p.name, "path": p.path, "origin": origin })
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(json!({ "projects": projects }))
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
 pub async fn put_suggestion_mapping(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MappingBody>, axum::extract::rejection::JsonRejection>,

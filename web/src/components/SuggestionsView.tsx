@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { RefreshCw, Search, Settings, X } from "lucide-react";
+import { FolderGit2, RefreshCw, Search, Settings, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
+import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import {
   SUGGESTION_NOTE_CLASS,
@@ -76,6 +77,7 @@ export function SuggestionsView({
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
+  const [mapping, setMapping] = useState(false);
 
   const disabled = readOnly || offline;
   const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
@@ -131,6 +133,19 @@ export function SuggestionsView({
             </p>
           </div>
           <div className="flex flex-none items-center gap-1">
+            {items.some((i) => i.mapping_key) && (
+              <button
+                type="button"
+                aria-label="Map projects"
+                onClick={() => setMapping(true)}
+                disabled={disabled}
+                title={unavailableTitle ?? "Map sources to Projects"}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3"
+              >
+                <FolderGit2 className="h-4 w-4" />
+                <span className="hidden md:inline">Map projects</span>
+              </button>
+            )}
             <button
               type="button"
               aria-label="Refresh"
@@ -385,6 +400,14 @@ export function SuggestionsView({
           </>
         )}
       </div>
+      {mapping && snapshot && (
+        <SuggestionMappingWizard
+          items={items}
+          providers={snapshot.providers}
+          disabled={disabled}
+          onClose={() => setMapping(false)}
+        />
+      )}
     </main>
   );
 }

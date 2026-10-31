@@ -81,9 +81,10 @@ pub use skills::{
 };
 pub use suggestions::{
     delete_suggestion_mapping, delete_suggestion_template, dismiss_suggestion,
-    get_suggestion_templates, get_suggestions, list_suggestion_mappings, patch_suggestion_prefs,
-    prepare_suggestion, put_suggestion_mapping, put_suggestion_template, refresh_suggestions,
-    run_suggestion_checks, run_suggestion_fix, undismiss_suggestion, update_suggestion_source,
+    get_suggestion_templates, get_suggestions, list_suggestion_mappings, list_suggestion_projects,
+    patch_suggestion_prefs, prepare_suggestion, put_suggestion_mapping, put_suggestion_template,
+    refresh_suggestions, run_suggestion_checks, run_suggestion_fix, undismiss_suggestion,
+    update_suggestion_source,
 };
 
 pub use system::{

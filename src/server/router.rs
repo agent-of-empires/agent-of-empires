@@ -313,6 +313,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .put(api::put_suggestion_mapping)
                 .delete(api::delete_suggestion_mapping),
         )
+        .route(
+            "/api/suggestions/projects",
+            get(api::list_suggestion_projects),
+        )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",

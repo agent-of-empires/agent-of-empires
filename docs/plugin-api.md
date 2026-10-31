@@ -385,6 +385,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
+| `GET /api/suggestions/projects` | none | `{ projects: [{ name, path, origin }] }` |
 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, start_without_review: false, show_source_ref: true, provider_order: [] }` and is per profile. `start_without_review` lets the web Start button create the session from the prepared draft instead of opening the wizard; clients only do so when `prepare` returns `templated: true` and a `project`. `show_source_ref` makes the web and TUI suggestion rows show each item's `source_ref`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
@@ -411,6 +412,8 @@ The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view
 ### Project mappings
 
 An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired (`DELETE` is refused in CityHall mode).
+
+`GET /api/suggestions/projects` lists the registered projects of the suggestions profile, the ones a mapping may name. `origin` is the `owner/repo` of the project's git `origin` remote, case as written, or `null` when the project is not a repository, has no `origin`, or the URL is not a hosted `owner/repo`. The host is not checked. Clients use it to propose mappings; it changes nothing.
 
 `PUT` replaces the list. `projects` holds 1 to 16 distinct registered projects, each named by its path, and is stored as the registered paths. Errors: 404 `unknown_provider`, 400 `validation_failed` (empty or oversized key, bad list, a path that is not exactly one registered project), 403 `read_only`. Mutations are refused in CityHall mode.
 

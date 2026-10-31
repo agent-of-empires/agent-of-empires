@@ -627,6 +627,13 @@ export interface SuggestionMapping {
   projects: string[];
 }
 
+/** A registered Project a mapping may name, with the `owner/repo` of its git `origin`. */
+export interface SuggestionProject {
+  name: string;
+  path: string;
+  origin: string | null;
+}
+
 /** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */
 export interface SuggestionItem {
   id: string;

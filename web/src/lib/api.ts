@@ -21,6 +21,7 @@ import type {
   ImportableSession,
   SettingsFieldDescriptor,
   SuggestionMapping,
+  SuggestionProject,
   SuggestionPrefs,
   SuggestionPrepared,
   SuggestionTemplate,
@@ -3306,6 +3307,11 @@ export const putSuggestionMapping = (providerId: string, mappingKey: string, pro
     mapping_key: mappingKey,
     projects,
   });
+
+export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
+  const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");
+  return body?.projects ?? null;
+}
 
 export const deleteSuggestionMapping = (providerId: string, mappingKey: string) =>
   suggestionRequest(

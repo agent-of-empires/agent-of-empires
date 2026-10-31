@@ -846,12 +846,14 @@
         "tests/dashboard-suggestions.spec.ts",
         "tests/suggestions-filter-mapping.spec.ts",
         "src/components/__tests__/SuggestionsView.test.tsx",
-        "src/components/__tests__/DashboardSuggestions.test.tsx"
+        "src/components/__tests__/DashboardSuggestions.test.tsx",
+        "src/components/__tests__/SuggestionMappingWizard.test.tsx"
       ],
       "components": [
         "web/src/components/SuggestionsView.tsx",
         "web/src/components/SuggestionRow.tsx",
-        "web/src/components/DashboardSuggestions.tsx"
+        "web/src/components/DashboardSuggestions.tsx",
+        "web/src/components/SuggestionMappingWizard.tsx"
       ]
     },
     {
