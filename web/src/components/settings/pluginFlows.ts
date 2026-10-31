@@ -178,7 +178,8 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void, init
     setDiscovering(false);
   };
 
-  const install = async (source: string) => {
+  /** Resolves `true` when the preview opened a consent. */
+  const install = async (source: string): Promise<boolean> => {
     setPreviewingSource(source);
     setError(null);
     setInstallError(null);
@@ -186,6 +187,7 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void, init
       const res = await previewPluginInstall(source);
       if (res.kind === "ok") setConsent(res.consent);
       else setError(res.message);
+      return res.kind === "ok";
     } finally {
       setPreviewingSource(null);
     }

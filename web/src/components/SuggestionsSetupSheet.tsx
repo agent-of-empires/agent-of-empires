@@ -50,14 +50,14 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
     const [head] = picked;
     if (!head) return;
     setQueue(picked);
-    void market.install(head);
+    void market.install(head).then((ok) => ok || setQueue([]));
   };
 
   const jobClosed = () => {
     const [, next, ...after] = queue;
     setJob(null);
     setQueue(next ? [next, ...after] : []);
-    if (next) void market.install(next);
+    if (next) void market.install(next).then((ok) => ok || setQueue([]));
     else setStep("checks");
   };
 
