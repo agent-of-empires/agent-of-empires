@@ -2291,7 +2291,7 @@ async fn finish_structured_restart(
             if let Some(response) = lifecycle_rejection(state, &error) {
                 return response;
             }
-            if let Some(response) = sandbox_migration_response(state, &error).await {
+            if let Some(response) = sandbox_migration_response(state, id, &error).await {
                 return response;
             }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
@@ -3057,9 +3057,11 @@ async fn prepare_agent_session_inner(
 
 pub(super) async fn sandbox_migration_response(
     state: &Arc<AppState>,
+    id: &str,
     error: &anyhow::Error,
 ) -> Option<axum::response::Response> {
     let failure = error.downcast_ref::<crate::migrations::SandboxMigrationError>()?;
+    tracing::warn!(target: "http.api.sessions", session = %id, error = %format_args!("{error:#}"), "sandbox migration refused");
     let code = failure.api_code();
     let response = crate::server::api::api_error_with_code_header(
         code,
@@ -3080,7 +3082,14 @@ mod durable_stop_tests {
     #[serial_test::serial]
     async fn sandbox_migration_refusals_publish_known_sanitized_failures() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        for (deferred, structured) in [(true, false), (false, false), (true, true), (false, true)] {
+        for (deferred, target) in [
+            (true, "start"),
+            (false, "start"),
+            (true, "restart"),
+            (false, "restart"),
+            (true, "container-terminal"),
+            (false, "container-terminal"),
+        ] {
             let root = tempfile::tempdir()?;
             let _home = crate::session::test_support::isolate_app_dir_at(root.path());
             crate::migrations::run_migrations()?;
@@ -3122,7 +3131,7 @@ mod durable_stop_tests {
             });
             let mut row: Instance = serde_json::from_value(raw)?;
             row.source_profile = "default".into();
-            if structured {
+            if target == "restart" {
                 row.view = crate::session::View::Structured;
                 row.status = Status::Running;
             }
@@ -3133,6 +3142,11 @@ mod durable_stop_tests {
             if !deferred {
                 std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))?;
             }
+            let cause = (!deferred).then(|| {
+                let error = std::fs::read(&private).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string()
+            });
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
                 vec![row.clone()],
@@ -3141,12 +3155,21 @@ mod durable_stop_tests {
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let logs = crate::session::test_support::LogCapture::start();
             let before = state.runtime.publish(&state).await?;
-            let response = if structured {
-                restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
-            } else {
-                start_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+            let response = match target {
+                "restart" => {
+                    restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
+                }
+                "container-terminal" => super::super::ensure::ensure_container_terminal(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    axum::extract::Query(crate::server::live_ws::TerminalIndexQuery::default()),
+                    Ok(None),
+                )
+                .await
+                .into_response(),
+                _ => start_session(State(state.clone()), Path(row.id.clone()), Ok(None))
                     .await
-                    .into_response()
+                    .into_response(),
             };
             let code = if deferred {
                 crate::daemon::ApiErrorCode::SandboxMigrationDeferred
@@ -3172,12 +3195,40 @@ mod durable_stop_tests {
                 .parse()?;
             assert!(revision > before.value.cursor.revision);
             let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
-            let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-            assert_eq!(body["message"], code.sandbox_migration_message().unwrap());
-            assert!(!String::from_utf8_lossy(&bytes).contains(root.path().to_str().unwrap()));
+            let public = String::from_utf8_lossy(&bytes);
+            assert!(!public.contains(root.path().to_str().unwrap()));
+            assert!(!public.contains("private-content"));
+            if let Some(cause) = cause.as_ref() {
+                assert!(!public.contains(cause));
+            }
+            if target == "container-terminal" {
+                if let Some(cause) = cause.as_ref() {
+                    let captured = logs.contents();
+                    assert!(
+                        captured.lines().any(|line| {
+                            line.contains(&row.id)
+                                && line.contains("config.toml")
+                                && line.contains(cause)
+                        }),
+                        "missing correlated migration cause: {captured}"
+                    );
+                }
+            }
             let rows = state.instances.read().await;
             let current = rows.iter().find(|current| current.id == row.id).unwrap();
-            assert_eq!(current.status, Status::Error);
+            assert_eq!(
+                current.status,
+                if target == "container-terminal" {
+                    Status::Stopped
+                } else {
+                    Status::Error
+                }
+            );
+            assert!(current.last_error.as_ref().is_none_or(|message| {
+                !message.contains(source.to_str().unwrap())
+                    && !message.contains("private-content")
+                    && cause.as_ref().is_none_or(|cause| !message.contains(cause))
+            }));
             assert!(current.lifecycle_reservation.is_none());
             assert_eq!(current.sandbox_store_generation, 0);
             assert!(private.exists());

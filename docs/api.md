@@ -671,7 +671,7 @@ Sandbox preparation failures use `409 sandbox_migration_deferred` or
 Clients apply that snapshot before offering an explicit retry. These known
 failures do not quarantine mutation authority. Missing or invalid receipt headers
 remain an unknown outcome. Public messages omit migration paths and underlying
-filesystem errors; detailed failures belong in daemon logs.
+filesystem errors. Daemon logs retain the full cause and session ID.
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
 includes the finite code header and its canonical receipt; clients wait for that

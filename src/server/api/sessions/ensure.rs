@@ -151,7 +151,7 @@ pub async fn ensure_tool(
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             if let Some(response) =
-                super::lifecycle::sandbox_migration_response(&state, &error).await
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
             {
                 return response;
             }
@@ -553,7 +553,7 @@ pub async fn ensure_container_terminal(
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             if let Some(response) =
-                super::lifecycle::sandbox_migration_response(&state, &error).await
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
             {
                 return response;
             }
