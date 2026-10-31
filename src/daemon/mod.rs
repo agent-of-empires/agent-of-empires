@@ -1065,14 +1065,20 @@ pub(crate) async fn decode_json_bounded<T: serde::de::DeserializeOwned>(
     limit: usize,
 ) -> Result<T, DaemonClientError> {
     let body = read_bounded_body(&mut response, limit).await?;
-    serde_json::from_slice(&body).map_err(|_| DaemonClientError::AuthenticatedDecode)
+    serde_json::from_slice(&body).map_err(|error| {
+        tracing::debug!(target: "daemon.client", %error, "daemon response decode failed");
+        DaemonClientError::AuthenticatedDecode
+    })
 }
 
 pub(crate) async fn decode_text(
     mut response: reqwest::Response,
 ) -> Result<String, DaemonClientError> {
     let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
-    String::from_utf8(body).map_err(|_| DaemonClientError::AuthenticatedDecode)
+    String::from_utf8(body).map_err(|error| {
+        tracing::debug!(target: "daemon.client", %error, "daemon response decode failed");
+        DaemonClientError::AuthenticatedDecode
+    })
 }
 
 async fn read_bounded_body(

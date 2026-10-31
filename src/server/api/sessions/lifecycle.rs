@@ -53,6 +53,7 @@ pub async fn update_session_pin(
     if let Err(response) = committed {
         return response;
     }
+    tracing::info!(target: "session.sync", session = %id, field = "pinned", value = pinned, "session updated");
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
@@ -84,6 +85,7 @@ pub async fn update_session_favorite(
         };
         instance.source_profile.clone()
     };
+    let favorited = body.favorited;
     let persist_id = id.clone();
     let committed = commit_profile_update(
         &state,
@@ -107,6 +109,7 @@ pub async fn update_session_favorite(
     if let Err(response) = committed {
         return response;
     }
+    tracing::info!(target: "session.sync", session = %id, field = "favorite", value = favorited, "session updated");
     drop(guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
@@ -155,6 +158,7 @@ pub async fn update_session_color(
         inst.source_profile.clone()
     };
 
+    let color = new_color.clone();
     let persist_id = id.clone();
     let committed = commit_profile_update(
         &state,
@@ -172,6 +176,7 @@ pub async fn update_session_color(
     if let Err(response) = committed {
         return response;
     }
+    tracing::info!(target: "session.sync", session = %id, field = "color", value = ?color, "session updated");
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
@@ -339,6 +344,7 @@ pub async fn update_session_archive(
     };
     let worker_state = state.clone();
     let worker_id = id.clone();
+    let (archived, kill_pane) = (body.archived, body.kill_pane);
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let native = crate::server::session_store::NativeSessionStore::open(
             worker_state.clone(), &profile, Some(worker_id.clone()),
@@ -470,6 +476,11 @@ pub async fn update_session_archive(
         }
         tracing::warn!(target: "http.api.sessions", session = %id, %error, "archive commit failed");
         return persist_failed_response();
+    }
+    if archived {
+        tracing::info!(target: "session.lifecycle", session = %id, kill_pane, "session archived");
+    } else {
+        tracing::info!(target: "session.lifecycle", session = %id, kill_pane, "session unarchived");
     }
     drop(guard);
     drop(submission);
@@ -656,6 +667,9 @@ pub async fn trash_session(
         })?;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    if result.is_ok() {
+        tracing::info!(target: "session.trash", session = %id, "session trashed");
+    }
     let relocation = match result {
         Ok((_, Some(reason))) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %reason, "trash tmux teardown failed");
@@ -838,6 +852,7 @@ pub async fn restore_session(
                 return response;
             }
             if let Some(WorktreeFailure(reason)) = error.downcast_ref::<WorktreeFailure>() {
+                tracing::warn!(target: "session.restore", session = %id, %reason, "restore rejected: worktree conflict");
                 return api_error(
                     StatusCode::CONFLICT,
                     "worktree_restore_failed",
@@ -851,6 +866,7 @@ pub async fn restore_session(
             return persist_failed_response();
         }
     };
+    tracing::info!(target: "session.restore", session = %id, ?outcome, "session restored");
     drop(guard);
     drop(submission);
     drop(namespace);
@@ -939,6 +955,7 @@ pub async fn force_smart_rename(
         }
     }
 
+    tracing::info!(target: "smart_rename", session = %id, structured, "manual rename requested");
     if !structured {
         state.runtime.work.spawn(
             "server.terminal_smart_rename",
@@ -1089,6 +1106,7 @@ pub async fn summarize_session(
         return (status, Json(serde_json::json!({ "message": message }))).into_response();
     }
 
+    tracing::info!(target: "session.lifecycle", session = %id, "summary requested");
     state.runtime.work.spawn(
         "server.conversation_summary",
         crate::session::conversation_summary::try_conversation_summary(
@@ -1346,13 +1364,15 @@ async fn finish_structured_user_stop(
                 .acquire_instance_lifecycle_lock(&release_id)?;
             native.storage().verify_bound_profile()?;
             // A newer stop or explicit resume owns its own hook status files.
-            if native
-                .storage()
-                .load()?
+            let rows = native.storage().load()?;
+            if let Some(row) = rows
                 .iter()
-                .any(|row| row.id == release_id && row.lifecycle_generation == generation)
+                .find(|row| row.id == release_id && row.lifecycle_generation == generation)
             {
                 crate::hooks::cleanup_hook_status_dir(&release_id);
+                if let Err(error) = crate::session::worktree_edit::stop_pinned_sandbox_container(row) {
+                    tracing::warn!(target: "containers.runtime", session = %release_id, %error, "sandbox container stop after structured stop failed");
+                }
             }
             native.release_lifecycle_reservation(
                 &release_id,
@@ -1769,16 +1789,22 @@ pub async fn stop_session(
     };
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    let profile = {
+    let (profile, view) = {
         let rows = state.instances.read().await;
         let Some(row) = rows.iter().find(|row| row.id == id) else {
             return crate::server::api::session_not_found();
         };
-        row.source_profile.clone()
+        let view = if row.is_structured() {
+            "structured"
+        } else {
+            "terminal"
+        };
+        (row.source_profile.clone(), view)
     };
-    if let Err(response) = stop_with_commit(&state, profile, &id).await {
+    if let Err(response) = stop_with_commit(&state, profile.clone(), &id).await {
         return response;
     }
+    tracing::info!(target: "session.stop", session = %id, %profile, view, "session stopped");
     drop(guard);
     drop(submission);
     drop(namespace);
@@ -2088,6 +2114,7 @@ struct StructuredRestartLaunch {
     hooks: anyhow::Result<()>,
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
     wake: Option<String>,
+    reason: &'static str,
 }
 
 async fn finish_structured_restart(
@@ -2095,6 +2122,7 @@ async fn finish_structured_restart(
     id: &str,
     launch: StructuredRestartLaunch,
 ) -> axum::response::Response {
+    let reason = launch.reason;
     let result = async {
         use crate::session::SessionStore;
         let namespace = state.profile_namespace.read().await;
@@ -2109,6 +2137,7 @@ async fn finish_structured_restart(
             hooks,
             carry,
             wake,
+            reason: _,
         } = launch;
         let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
             let sandbox_info = started.sandbox_info.take();
@@ -2274,6 +2303,7 @@ async fn finish_structured_restart(
     .await;
     match result {
         Ok((generation, profile)) => {
+            tracing::info!(target: "session.restart", session = %id, view = "structured", reason, "session restarted");
             crate::server::runtime::session_mutation_response(
                 state,
                 id,
@@ -2310,6 +2340,18 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
+}
+
+fn restart_reason(
+    origin: RestartOrigin,
+    body: Option<&crate::daemon::RestartSessionBody>,
+) -> &'static str {
+    match (origin, body) {
+        (RestartOrigin::StartupRecovery, _) => "startup_recovery",
+        (_, Some(body)) if body.discard_sandbox_container => "recreate_container",
+        (_, Some(body)) if body.only_if_idle => "agent_update",
+        _ => "user",
+    }
 }
 
 fn select_restart_wake_message(
@@ -2473,7 +2515,8 @@ async fn prepare_agent_session_inner(
             Err(response) => return response,
         };
     }
-    if instance.is_structured() && restart.is_some() {
+    let structured = instance.is_structured();
+    if structured && restart.is_some() {
         let worker_state = state.clone();
         let candidate = instance.clone();
         let restart_body = restart.clone().expect("restart body");
@@ -2760,6 +2803,7 @@ async fn prepare_agent_session_inner(
     drop(guard);
     drop(submission);
     drop(namespace);
+    let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
         Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
@@ -2800,6 +2844,7 @@ async fn prepare_agent_session_inner(
                     hooks,
                     carry,
                     wake: requested_wake_message,
+                    reason,
                 },
             )
             .await;
@@ -3021,6 +3066,7 @@ async fn prepare_agent_session_inner(
             }
         }
         drop(rows);
+        tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
             &id,
@@ -3045,6 +3091,9 @@ async fn prepare_agent_session_inner(
             response
         }
     } else {
+        if outcome.is_some() || structured {
+            tracing::info!(target: "session.start", session = %id, ?outcome, "session started");
+        }
         crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
     }
 }
@@ -3399,6 +3448,105 @@ mod durable_stop_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn structured_stop_stops_the_pinned_container_only_for_the_committed_generation() {
+        for superseded in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let (pin, calls) =
+                crate::session::test_support::fake_sandbox_pin(runtime.path(), "c1", 0, "");
+            let mut row = Instance::new("sandboxed stop", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.status = Status::Running;
+            row.tool = "claude".into();
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: Some("c1".into()),
+                image: "img".into(),
+                container_name: "aoe-sandboxed-stop".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            row.sandbox_pin = Some(pin);
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let worker_state = state.clone();
+            let id = row.id.clone();
+            let mut committed = tokio::task::spawn_blocking(move || {
+                commit_structured_user_stop(worker_state, "default", &id)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if superseded {
+                committed.generation += 1;
+            }
+            let _ = finish_structured_user_stop(&state, &row.id, committed).await;
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            assert_eq!(
+                log.trim(),
+                if superseded { "" } else { "stop c1" },
+                "superseded={superseded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_stop_leaves_the_pinned_container_when_retirement_is_unproven() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (pin, calls) =
+            crate::session::test_support::fake_sandbox_pin(runtime.path(), "c1", 0, "");
+        let mut row = Instance::new("unproven retirement", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Running;
+        row.tool = "claude".into();
+        row.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: Some("c1".into()),
+            image: "img".into(),
+            container_name: "aoe-unproven".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        row.sandbox_pin = Some(pin);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        // An unattested live runner cannot be proven retired.
+        let (_runner, mut record) = live_runner(&row).await;
+        record.runner_identity = None;
+        worker_registry::save(&record).unwrap();
+        let response = stop_structured_with_commit(&state, "default".into(), &row.id)
+            .await
+            .expect_err("unproven retirement must not report success");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the container must not be stopped before retirement is proven"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn native_stop_keeps_commit_failure_and_adoption_failure_distinct() {
         for adoption_failure in [false, true] {
             let _home = crate::session::test_support::isolate_app_dir();
@@ -3631,6 +3779,11 @@ pub async fn update_session_snooze(
     .await;
     if let Err(response) = committed {
         return response;
+    }
+    if minutes.is_some() {
+        tracing::info!(target: "session.lifecycle", session = %id, ?minutes, structured = was_structured_view, "session snoozed");
+    } else {
+        tracing::info!(target: "session.lifecycle", session = %id, structured = was_structured_view, "session woken");
     }
 
     // Preserve the transcript; reconciliation resumes it after snooze expires.

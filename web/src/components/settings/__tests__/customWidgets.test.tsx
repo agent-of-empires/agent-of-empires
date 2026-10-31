@@ -78,7 +78,7 @@ function commitText(input: HTMLInputElement, value: string) {
 }
 
 it("LoggingTargetsWidget clears one area without losing unrelated overrides", () => {
-  const initial = { "runtime.uds": "warn", "plugin:external": "error" };
+  const initial = { "runtime.ws": "warn", "plugin:external": "error" };
   const { save, rerender } = mount(LoggingTargetsWidget, "Targets", initial);
   fireEvent.change(control("server.lifecycle", "select"), { target: { value: "debug" } });
   expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });
@@ -88,6 +88,13 @@ it("LoggingTargetsWidget clears one area without losing unrelated overrides", ()
   rerender({ ...initial, "server.lifecycle": "debug", "migrations.v043": "info" });
   fireEvent.change(control("migrations.v043", "select"), { target: { value: "" } });
   expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });
+});
+
+it("LoggingTargetsWidget exposes the session lifecycle area and saves only that override", () => {
+  const initial = { "plugin.host": "warn" };
+  const { save } = mount(LoggingTargetsWidget, "Targets", initial);
+  fireEvent.change(control("session.status_change", "select"), { target: { value: "info" } });
+  expect(save).toHaveBeenLastCalledWith({ ...initial, "session.status_change": "info" });
 });
 
 describe("ThemeNameWidget", () => {
