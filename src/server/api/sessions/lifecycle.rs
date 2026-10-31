@@ -2017,6 +2017,7 @@ fn admit_restart(
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
     row.last_error = None;
+    row.last_error_evidence = None;
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
@@ -2759,6 +2760,7 @@ async fn prepare_agent_session_inner(
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
                 row.last_error = None;
+                row.last_error_evidence = None;
                 if row.is_structured() {
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(
@@ -2985,6 +2987,18 @@ async fn prepare_agent_session_inner(
                 };
             }
             return response;
+        }
+        Ok(Some(crate::session::StartOutcome::Indeterminate { cause })) => {
+            let response = super::ensure::indeterminate_launch_response(cause);
+            drop(guard);
+            drop(submission);
+            drop(namespace);
+            return match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                }
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
         }
         Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
             let response = (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({

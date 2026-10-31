@@ -93,6 +93,17 @@ impl RetirementResources {
         *slot = Some(Arc::new(tokio::sync::Mutex::new(Some(handle.drain_task))));
     }
 
+    /// The captured original drainer remains owned while retained or joined.
+    /// Never await its slot: that drainer can itself be publishing during join.
+    pub(super) fn has_retained_drain(&self) -> bool {
+        lock_recover(&self.drain)
+            .as_ref()
+            .is_some_and(|drain| match drain.try_lock() {
+                Ok(slot) => slot.is_some(),
+                Err(_) => true,
+            })
+    }
+
     pub(crate) fn clear(&self) {
         *lock_recover(&self.clients) = [None, None];
         lock_recover(&self.drain).take();
@@ -1489,6 +1500,30 @@ mod tests {
     use crate::acp::state::AcpSessionId;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn retained_drain_custody_ends_when_the_join_slot_is_quiesced() {
+        let resources = RetirementResources::default();
+        assert!(!resources.has_retained_drain());
+        let task = tokio::spawn(std::future::pending::<()>());
+        let retained = Arc::new(tokio::sync::Mutex::new(Some(task)));
+        *lock_recover(&resources.drain) = Some(retained.clone());
+        assert!(resources.has_retained_drain());
+        let mut joining = retained.lock().await;
+        assert!(
+            resources.has_retained_drain(),
+            "joining cannot block the original publisher"
+        );
+        let task = joining.as_mut().unwrap();
+        task.abort();
+        let _ = task.await;
+        joining.take();
+        drop(joining);
+        assert!(
+            !resources.has_retained_drain(),
+            "an empty retained slot is not publication custody"
+        );
+    }
+
     struct CompletionAppendFailure {
         inner: Arc<super::super::ChannelSink>,
         fail_stopped: bool,
@@ -1710,26 +1745,46 @@ mod tests {
                 workflow: None,
             },
         );
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
-        let drain = p
-            .sup
-            .start_drain_task(id.into(), lease.clone(), inbound_rx, None);
+        let original_task = Event::BackgroundTaskStarted {
+            task_id: "original-task".into(),
+            tool_call_id: None,
+            description: "work".into(),
+            workflow: None,
+        };
+        // A worker publication retains workers+lifecycle through persistence;
+        // retirement cannot pass that boundary while the sink is parked.
+        // Persist first, then park only the drain join outside those locks.
+        p.sup.sink.inner.publish(
+            id,
+            super::super::next_seq(&p.sup.next_seqs, id),
+            &original_task,
+        );
+        assert_eq!(
+            p.store.unresolved_background_task_ids(id),
+            ["original-task"]
+        );
+        let sink = Arc::clone(&p.sup.sink);
+        let drain = tokio::spawn(async move {
+            // Non-cooperative work keeps abort+join pending, so cancelling the
+            // shutdown must retain this exact JoinHandle for the retry.
+            assert!(sink.park(&original_task));
+            let _ = sink.done.send(());
+        });
         let previous = {
             let mut workers = p.sup.workers.lock().await;
             std::mem::replace(&mut workers.get_mut(id).unwrap().drain_task, drain)
         };
         previous.abort();
         let _ = previous.await;
-        inbound_tx
-            .send(Event::BackgroundTaskStarted {
-                task_id: "original-task".into(),
-                tool_call_id: None,
-                description: "work".into(),
-                workflow: None,
-            })
-            .await
-            .unwrap();
         p.entered().await;
+        assert!(
+            p.sup.workers.try_lock().is_ok(),
+            "join-only gate holds no worker fence"
+        );
+        assert!(
+            p.sup.lifecycle.try_lock().is_ok(),
+            "join-only gate holds no lifecycle fence"
+        );
         let shutdown = {
             let sup = Arc::clone(&p.sup);
             tokio::spawn(async move { sup.shutdown(id).await })
@@ -2444,8 +2499,6 @@ mod tests {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         done: tokio::sync::mpsc::UnboundedSender<()>,
-        /// Signalled once a teardown has queried the open work to finish.
-        swept: tokio::sync::mpsc::UnboundedSender<()>,
     }
 
     impl GatedSink {
@@ -2484,9 +2537,7 @@ mod tests {
             }
         }
         fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
-            let ids = self.inner.unresolved_background_task_ids(session_id);
-            let _ = self.swept.send(());
-            ids
+            self.inner.unresolved_background_task_ids(session_id)
         }
         fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
             self.inner.unresolved_background_agent_ids(session_id)
@@ -2499,7 +2550,6 @@ mod tests {
         store: Arc<crate::acp::event_store::EventStore>,
         entered: tokio::sync::mpsc::UnboundedReceiver<()>,
         done: tokio::sync::mpsc::UnboundedReceiver<()>,
-        swept: tokio::sync::mpsc::UnboundedReceiver<()>,
         release: std::sync::mpsc::Sender<()>,
         _keep: (
             tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
@@ -2511,7 +2561,6 @@ mod tests {
         let (inner, store, rx, store_tmp) = channel_sink();
         let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done) = tokio::sync::mpsc::unbounded_channel();
-        let (swept_tx, swept) = tokio::sync::mpsc::unbounded_channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         let sup = Arc::new(Supervisor::new(Arc::new(GatedSink {
             inner,
@@ -2519,14 +2568,12 @@ mod tests {
             entered: entered_tx,
             release: std::sync::Mutex::new(release_rx),
             done: done_tx,
-            swept: swept_tx,
         })));
         Parked {
             sup,
             store,
             entered,
             done,
-            swept,
             release,
             _keep: (rx, store_tmp),
         }
@@ -2553,14 +2600,7 @@ mod tests {
         }
     }
 
-    /// A start the drain is publishing when the reaper runs must not land
-    /// after the final sweep, or the stopped session stays busy for good.
-    /// Checkpoints before the gate opens: the drain is parked mid-publish, and
-    /// the reaper took the teardown (handle removed, entry `Stopping`) and is
-    /// still running. A reaper that does not wait for the drain then sweeps
-    /// while the drain is parked, which the sink reports. The reaper is waiting
-    /// on the drain when no sweep shows within the observation window. The
-    /// assertion follows the acknowledgment that the parked publish returned.
+    /// Publication holds its owner through persistence, before the reaper's final sweep.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
     async fn a_start_in_flight_in_the_drain_cannot_outlive_the_reap_sweep() {
@@ -2591,36 +2631,28 @@ mod tests {
             .await
             .unwrap();
         p.entered().await;
+        assert!(
+            p.sup.workers.try_lock().is_err(),
+            "publication retains its installed worker"
+        );
+        assert!(
+            p.sup.lifecycle.try_lock().is_err(),
+            "publication retains its lifecycle fence"
+        );
 
         let reaper = {
             let sup = Arc::clone(&p.sup);
             tokio::spawn(async move { sup.reap_user_stopped().await })
         };
-        // Checkpoint: the reaper owns the teardown. The deadline only bounds a
-        // failure.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while lock_recover(&p.sup.lifecycle).phase(id) != WorkerPhase::Stopping {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the reaper never took the teardown"
-            );
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !p.sup.workers.lock().await.contains_key(id),
-            "the reaper removed the worker handle"
-        );
-        // Observation window: a reaper that skips the drain wait sweeps now.
-        let swept_while_parked = tokio::time::timeout(Duration::from_millis(300), p.swept.recv())
-            .await
-            .is_ok();
         p.release_and_wait().await;
-        reaper.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(
             p.store.unresolved_background_task_ids(id).is_empty(),
-            "a start published after the sweep stays open for good \
-             (swept while the drain was parked: {swept_while_parked})"
+            "the final sweep must finish the already-persisted start"
         );
         assert!(
             p.store

@@ -4,7 +4,7 @@
 // FAKE_ACP_SCRIPT names a JSON file: { turns: [{ updates: [...session/update], stopReason }] }.
 // Each session/prompt consumes one turn; afterwards prompts get a default one-chunk turn. Pseudo
 // updates: wait_for_release (waits for `<script>.release`), wait_ms, permission_request and
-// elicitation_request (sent as real client requests and awaited).
+// elicitation_request (real client requests; waitForResponse:false leaves them pending).
 
 import { createInterface } from "node:readline";
 import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
@@ -303,7 +303,7 @@ async function emitSessionUpdates(sessionId, updates) {
       continue;
     }
     if (u && u.sessionUpdate === "permission_request") {
-      const permissionResponse = await sendRequest("session/request_permission", {
+      const response = sendRequest("session/request_permission", {
         sessionId,
         toolCall: u.toolCall ?? {
           toolCallId: `fake-tool-call-${Date.now()}`,
@@ -311,27 +311,31 @@ async function emitSessionUpdates(sessionId, updates) {
           kind: "edit",
         },
         options: u.options ?? DEFAULT_PERMISSION_OPTIONS,
-      }).catch((err) => {
-        process.stderr.write(`[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`);
-        return undefined;
-      });
-      // `echoDecision` puts the chosen option id in the transcript.
-      if (u.echoDecision) {
-        const outcome = permissionResponse?.outcome;
-        const picked = outcome?.outcome === "selected" ? outcome.optionId : "cancelled";
-        sendNotification("session/update", {
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `permission_option=${picked}` },
-          },
+      })
+        .catch((err) => {
+          process.stderr.write(`[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`);
+          return undefined;
+        })
+        .then(async (permissionResponse) => {
+          // `echoDecision` puts the chosen option id in the transcript.
+          if (u.echoDecision) {
+            const outcome = permissionResponse?.outcome;
+            const picked = outcome?.outcome === "selected" ? outcome.optionId : "cancelled";
+            sendNotification("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: `permission_option=${picked}` },
+              },
+            });
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
         });
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
+      if (u.waitForResponse !== false) await response;
       continue;
     }
     if (u && u.sessionUpdate === "elicitation_request") {
-      await sendRequest("elicitation/create", {
+      const response = sendRequest("elicitation/create", {
         mode: "form",
         sessionId,
         message: u.message ?? "Pick one",
@@ -351,6 +355,7 @@ async function emitSessionUpdates(sessionId, updates) {
       }).catch((err) => {
         process.stderr.write(`[fakeAcpAgent] elicitation/create rejected: ${JSON.stringify(err)}\n`);
       });
+      if (u.waitForResponse !== false) await response;
       continue;
     }
     sendNotification("session/update", { sessionId, update: u });
@@ -673,6 +678,15 @@ async function handleRequest(msg) {
         sendError(id, -32000, turn.rateLimit.message ?? "rate limit reached", {
           errorKind: "rate_limit",
         });
+        return;
+      }
+      if (!wasCancelled && turn.error) {
+        sendError(
+          id,
+          typeof turn.error.code === "number" ? turn.error.code : -32603,
+          typeof turn.error.message === "string" ? turn.error.message : "Prompt failed",
+          turn.error.data,
+        );
         return;
       }
       sendResult(id, {
