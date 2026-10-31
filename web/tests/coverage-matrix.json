@@ -3835,7 +3835,7 @@
         "src/tmux/session.rs",
         "src/tmux/mod.rs"
       ],
-      "notes": "The real daemon returns HTTP 200 and the expected restarted/alive status before and immediately after an acknowledged exact-session kill, without waiting for a cache or poller refresh. A live pane stays alive; the frontend's held ensure request keeps Starting visible until release."
+      "notes": "A deferred CLI creation starts Stopped. The real daemon starts its pane, observes Error after an acknowledged pane loss, and returns HTTP 200 with restarted/alive before and immediately after a subsequent exact-session kill without waiting for a cache or poller refresh. A live pane stays alive; the frontend's held ensure request keeps Starting visible until release."
     },
     {
       "id": "modals",

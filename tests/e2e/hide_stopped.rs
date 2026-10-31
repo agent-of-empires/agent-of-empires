@@ -17,6 +17,7 @@ fn test_y_hides_a_stopped_session_in_its_group() {
     let project = h.project_path();
     let project = project.to_str().unwrap();
     h.add_session(&[project, "-t", "kept-session", "-g", "util"]);
+    h.run_cli_ok(&["session", "start", "kept-session"]);
     h.add_session(&[project, "-t", "stopped-session", "-g", "util"]);
     h.run_cli_ok(&["session", "start", "stopped-session"]);
     h.run_cli_ok(&["session", "stop", "stopped-session"]);

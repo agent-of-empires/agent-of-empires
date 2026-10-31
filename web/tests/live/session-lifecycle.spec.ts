@@ -57,7 +57,12 @@ test.describe("ensure_session restart flow", () => {
       return result.status;
     };
 
-    // The status poller flips the seeded session to Error once it sees no tmux session.
+    expect(session!.status).toBe("Stopped");
+    expect(await ensure()).toBe("restarted");
+    expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(true);
+    expect(tmux(serve.tmuxSocket, "kill-session", "-t", tmuxName).status).toBe(0);
+
+    // Establish a real lost pane before checking Error recovery.
     await expect.poll(async () => (await listSessions(serve.baseUrl))[0]?.status, { timeout: 10_000 }).toBe("Error");
     expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(false);
     expect(await ensure()).toBe("restarted");
