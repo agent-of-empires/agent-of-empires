@@ -60,6 +60,7 @@ If a provider is switched off, its items are hidden and the view says "<provider
 | Show in sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**, or opens its Session once started. Off by default. |
 | Show source reference | Shows where each suggestion comes from, such as `owner/repo#123`, above the title on web rows and before it on TUI rows. On by default. |
 | Providers | Drag to order (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch and a **Show** checkbox per kind of suggestion. A provider that uses an agent says so, since it spends your agent usage. A provider error can carry a fix button from the plugin. |
+| *Provider* source settings | The provider plugin's own settings for its suggestions, such as the GitHub plugin's ignored organizations and repositories. The same settings, saved to the same place, also appear under Settings › Plugins. |
 | Refresh every | 5 min, 15 min, 30 min, 1 h or 2 h. A hint sent to plugins; they may refresh less often. |
 | Dismissed suggestions | **Show** opens the Dismissed filter. |
 | Prompt templates and Projects | **Edit**, see below. |

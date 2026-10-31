@@ -882,6 +882,7 @@
       "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
       "components": [
         "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
         "web/src/components/settings/SuggestionTemplates.tsx",
         "web/src/components/settings/TemplateEditor.tsx",
         "web/src/components/settings/suggestionsShared.tsx",

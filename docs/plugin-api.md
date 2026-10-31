@@ -334,6 +334,8 @@ label = "Failing checks on your PRs"
 default_enabled = false
 ```
 
+Plugin [settings](#settings) whose key starts with `suggestion_` also show in Settings › Suggestions, in a "<plugin name> source settings" section unfolded even when `advanced = true`. They remain on the plugin's settings page and save to the same place.
+
 `uses_agent` (default `false`) is informational: Settings shows that the provider spends the user's agent usage, and the host changes nothing. At least one source is required. Criteria are unique, non-empty and at most 256 bytes; labels are non-empty. The block grants no session authority: it needs only `runtime.worker`, not `session.create` or `session.prompt`.
 
 | Method | Params | Result |

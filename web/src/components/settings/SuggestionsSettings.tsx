@@ -10,10 +10,11 @@ import {
   type SuggestionPrefsPatch,
   type SuggestionResult,
 } from "../../lib/api";
-import type { SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
+import type { SettingsFieldDescriptor, SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
 import { SuggestionTemplates, type TemplateFocus } from "./SuggestionTemplates";
+import { PluginSuggestionSettings } from "./PluginSettingsSections";
 
 const REFRESH_OPTIONS = [5, 15, 30, 60, 120];
 
@@ -160,9 +161,23 @@ interface Props {
   readOnly: boolean;
   onOpenSuggestions?: (dismissed: boolean) => void;
   templateFocus?: TemplateFocus;
+  /** Each provider's `suggestion_*` plugin settings; omitted where plugin settings are not editable. */
+  pluginSettings?: {
+    schema: SettingsFieldDescriptor[];
+    settings: Record<string, unknown> | null;
+    onSaveField: (section: string, field: string, value: unknown) => Promise<boolean>;
+  };
 }
 
-export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions, templateFocus }: Props) {
+export function SuggestionsSettings({
+  snapshot,
+  failed,
+  reload,
+  readOnly,
+  onOpenSuggestions,
+  templateFocus,
+  pluginSettings,
+}: Props) {
   const offline = useServerDown();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -299,6 +314,16 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
           </SortableContext>
         </DndContext>
       </section>
+
+      {pluginSettings &&
+        providers.map((provider) => (
+          <PluginSuggestionSettings
+            key={provider.id}
+            pluginId={provider.id}
+            title={`${provider.name} source settings`}
+            {...pluginSettings}
+          />
+        ))}
 
       <div className="divide-y divide-surface-700/40">
         <Row title="Refresh every" description="Providers can refresh less often if they need to.">

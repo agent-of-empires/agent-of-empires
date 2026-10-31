@@ -5,7 +5,8 @@ import { SuggestionsSettings } from "../SuggestionsSettings";
 import type { TemplateFocus } from "../SuggestionTemplates";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
 import { expandTemplate } from "../../../lib/suggestionTemplate";
-import type { SuggestionsSnapshot } from "../../../lib/types";
+import type { SettingsFieldDescriptor, SuggestionsSnapshot } from "../../../lib/types";
+import { loadSettings, resetSettingsStore, saveField, useProfileSettings } from "../../../lib/settingsStore";
 
 const api = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
@@ -19,6 +20,8 @@ const api = vi.hoisted(() => ({
   putSuggestionMapping: vi.fn(),
   deleteSuggestionMapping: vi.fn(),
   fetchProjects: vi.fn(),
+  fetchSettings: vi.fn(),
+  updateSettings: vi.fn(),
 }));
 vi.mock("../../../lib/api", () => api);
 
@@ -260,6 +263,70 @@ describe("SuggestionsSettings", () => {
     await waitFor(() => expect(select.disabled).toBe(false));
     fireEvent.change(select, { target: { value: "/p/aoe" } });
     await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
+  });
+});
+
+describe("provider source settings", () => {
+  const field = (key: string, label: string, advanced = true): SettingsFieldDescriptor => ({
+    section: "plugin:gh",
+    field: key,
+    category: "Plugins",
+    label,
+    description: "",
+    widget: { kind: "text" },
+    web_write: { policy: "allow" },
+    profile_overridable: false,
+    validation: { rule: "none" },
+    advanced,
+    default: "",
+  });
+  const SCHEMA = [
+    field("suggestion_ignore", "Ignored GitHub suggestion sources"),
+    field("token_path", "Token path", false),
+  ];
+
+  // Saves the way SettingsView's Plugins tab does: the settings store over PATCH /api/settings.
+  function PluginHarness() {
+    const { snapshot, failed, reload } = useSuggestionsSnapshot();
+    const { settings } = useProfileSettings("main");
+    return (
+      <SuggestionsSettings
+        snapshot={snapshot}
+        failed={failed}
+        reload={reload}
+        readOnly={false}
+        pluginSettings={{
+          schema: SCHEMA,
+          settings,
+          onSaveField: (section, f, value) =>
+            saveField("main", section, f, value, () => api.updateSettings({ [section]: { [f]: value } }, "main")),
+        }}
+      />
+    );
+  }
+
+  it("shows each provider's suggestion_ settings unfolded and saves them as plugin settings", async () => {
+    resetSettingsStore();
+    api.fetchSuggestions.mockResolvedValue(snapshot());
+    api.fetchSettings.mockResolvedValue({ plugins: { gh: { settings: { suggestion_ignore: "acme" } } } });
+    api.updateSettings.mockResolvedValue("committed");
+    await loadSettings("main");
+    render(<PluginHarness />);
+
+    const section = await screen.findByRole("region", { name: "GitHub source settings" });
+    expect(screen.queryByRole("region", { name: "Linear source settings" })).toBeNull();
+    expect(within(section).queryByText("Token path")).toBeNull();
+    expect(within(section).queryByText("Advanced")).toBeNull();
+    const input = within(section).getByDisplayValue("acme");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "acme, acme/widgets" } });
+    fireEvent.blur(input);
+    await waitFor(() =>
+      expect(api.updateSettings).toHaveBeenCalledWith(
+        { "plugin:gh": { suggestion_ignore: "acme, acme/widgets" } },
+        "main",
+      ),
+    );
   });
 });
 
