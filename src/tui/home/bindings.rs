@@ -763,7 +763,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "New from selection (blank session on a suggestion)",
+            desc: "New from selection (blank on suggestion)",
         }),
         palette: Some(PaletteMeta {
             title: "New session from selection",
@@ -1104,7 +1104,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Archive (toggle, any sort; dismiss on a suggestion)",
+            desc: "Archive (toggle) or dismiss suggestion",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle archive",

@@ -363,7 +363,7 @@ Each call replaces the provider's whole list. It fails with invalid-params, and 
 
 ### Suggestions API
 
-Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
 
 | Route | Body | Result |
 |---|---|---|
@@ -404,7 +404,7 @@ The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view
 
 ### Project mappings
 
-An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired.
+An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired (`DELETE` is refused in CityHall mode).
 
 `PUT` replaces the list. `projects` holds 1 to 16 distinct registered projects, each named by its path, and is stored as the registered paths. Errors: 404 `unknown_provider`, 400 `validation_failed` (empty or oversized key, bad list, a path that is not exactly one registered project), 403 `read_only`. Mutations are refused in CityHall mode.
 
