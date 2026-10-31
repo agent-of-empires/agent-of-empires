@@ -43,7 +43,7 @@ test("homepage shows 3 suggestions and View all opens the full view", async ({ p
   await mockHome(page);
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Start" })).toHaveCount(3);
-  await expect(page.getByText("GitHub · example/1 · Review requested from you · agent-of-empires")).toBeVisible();
+  await expect(page.getByText("GitHub · Review requested from you · agent-of-empires")).toBeVisible();
   await page.getByRole("link", { name: "View all (4)" }).click();
   await expect(page).toHaveURL(/\/suggestions$/);
 });
@@ -53,4 +53,22 @@ test("narrow viewport shows 2 suggestions", async ({ page }) => {
   await mockHome(page);
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Start" })).toHaveCount(2);
+});
+
+test("a long source reference keeps its number in view on a narrow row", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await mockTerminalApis(page);
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
+  const long = { ...items[0], source_ref: "agent-of-empires-organization/agent-of-empires-repository#4681" };
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items: [long], prefs } }),
+  );
+  await page.goto("/");
+  const ref = page.getByTestId("suggestion-source-ref");
+  const number = ref.getByText("#4681", { exact: true });
+  const [refBox, numberBox] = [await ref.boundingBox(), await number.boundingBox()];
+  expect(numberBox!.x + numberBox!.width).toBeLessThanOrEqual(refBox!.x + refBox!.width + 0.5);
+  expect(numberBox!.width).toBeGreaterThan(0);
 });

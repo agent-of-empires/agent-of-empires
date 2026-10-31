@@ -73,7 +73,7 @@ test("Start opens the wizard with the draft prompt and creates nothing until Lau
   await page.goto("/suggestions");
 
   await expect(page.getByRole("heading", { name: "Suggested sessions" })).toBeVisible();
-  await expect(page.getByText("GitHub · example/1 · Assigned to you · aoe")).toBeVisible();
+  await expect(page.getByText("GitHub · Assigned to you · aoe")).toBeVisible();
   await expect(page.getByText("UNTRUSTED PROVIDER BODY")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Start" }).click();
