@@ -2957,6 +2957,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
+      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3485,7 +3486,14 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
+    },
+    {
+      "id": "acp.plan-modal",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-plan-modal.spec.ts"],
+      "components": ["web/src/components/acp/PlanModal.tsx"]
     },
     {
       "id": "acp.markdown",
@@ -4876,6 +4884,23 @@
       "risk": "high",
       "specs": ["tests/live/workspaces.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
+    },
+    {
+      "id": "sidebar.session-menu-tiers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowMenuOrder.test.tsx",
+        "src/components/plugin/__tests__/PluginSessionMenu.test.tsx",
+        "tests/sidebar-context-menu.spec.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/ContextMenu.tsx",
+        "web/src/components/plugin/PluginSessionMenu.tsx"
+      ],
+      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Restart to update and Recreate container carry a second line as their description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
     },
     {
       "id": "sidebar.context-menu-clamp",
