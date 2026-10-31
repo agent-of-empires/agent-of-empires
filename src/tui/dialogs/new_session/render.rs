@@ -153,9 +153,7 @@ impl NewSessionDialog {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
         constraints.push(Constraint::Length(2)); // Group
-        if self.prompt_origin.is_some() {
-            constraints.push(Constraint::Length(self.prompt_height())); // Prompt
-        }
+        constraints.push(Constraint::Length(self.prompt_height())); // Prompt
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -464,12 +462,10 @@ impl NewSessionDialog {
         self.focusable_rects.push((fields.group, area));
         ci += 1;
 
-        if self.prompt_origin.is_some() {
-            let area = chunks[ci];
-            self.render_prompt_field(frame, area, self.focused_field == fields.prompt, theme);
-            self.focusable_rects.push((fields.prompt, area));
-            ci += 1;
-        }
+        let area = chunks[ci];
+        self.render_prompt_field(frame, area, self.focused_field == fields.prompt, theme);
+        self.focusable_rects.push((fields.prompt, area));
+        ci += 1;
 
         // Hints/errors (last chunk)
         let hint_chunk = ci;
@@ -549,7 +545,7 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
-            if self.focused_field == fields.prompt {
+            if self.focused_field == fields.prompt && self.prompt_origin.is_some() {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" view source  "));
             }
@@ -618,10 +614,12 @@ impl NewSessionDialog {
         }
     }
 
-    /// Rows the wrapped prompt needs (cursor cell included) plus the sub-line.
+    /// Rows the wrapped prompt needs (cursor cell included) plus the
+    /// provenance sub-line of a suggestion.
     fn prompt_height(&self) -> u16 {
         let chars = self.prompt.value().chars().count() + 1;
-        chars.div_ceil(PROMPT_TEXT_WIDTH).clamp(1, PROMPT_MAX_ROWS) as u16 + 1
+        chars.div_ceil(PROMPT_TEXT_WIDTH).clamp(1, PROMPT_MAX_ROWS) as u16
+            + u16::from(self.prompt_origin.is_some())
     }
 
     /// The prompt hard-wrapped at `PROMPT_TEXT_WIDTH`, scrolled to keep the
@@ -634,7 +632,8 @@ impl NewSessionDialog {
         };
         let value_style = Style::default().fg(if focused { theme.accent } else { theme.text });
         let chars: Vec<char> = prompt_display(self.prompt.value()).chars().collect();
-        let rows = (area.height as usize).saturating_sub(1);
+        let sub_line = usize::from(self.prompt_origin.is_some());
+        let rows = (area.height as usize).saturating_sub(sub_line);
         let cursor = self.prompt.cursor();
         let cursor_row = cursor / PROMPT_TEXT_WIDTH;
         let start = if focused {
@@ -675,7 +674,7 @@ impl NewSessionDialog {
             let row = cursor_row.saturating_sub(start) as u16;
             frame.set_cursor_position(Position::new(
                 area.x + 8 + col.min(area.width.saturating_sub(9)),
-                area.y + row.min(area.height.saturating_sub(2)),
+                area.y + row.min(area.height.saturating_sub(1 + sub_line as u16)),
             ));
         }
     }
@@ -1342,7 +1341,6 @@ impl NewSessionDialog {
 
         let dialog_width: u16 = HELP_DIALOG_WIDTH;
         let has_profile_selection = self.has_profile_selection();
-        let has_prompt = self.prompt_origin.is_some();
         // Base fields: Scratch, Title, Path, YOLO, Worktree, Group + close hint
         let base_height: u16 = 20;
         let dialog_height: u16 = base_height
@@ -1350,7 +1348,7 @@ impl NewSessionDialog {
             + if has_tool_selection { 3 } else { 0 }
             + if has_sandbox { 3 } else { 0 }
             + if show_sandbox_options_help { 12 } else { 0 }
-            + if has_prompt { 3 } else { 0 };
+            + 3;
 
         let block = crate::tui::dialogs::toned_dialog_block(
             " New Session Help ",
@@ -1376,7 +1374,6 @@ impl NewSessionDialog {
                 "YOLO Mode" => !self.selected_tool_always_yolo(),
                 "Sandbox" => has_sandbox,
                 "Image" | "Environment" | "Host hook env" => show_sandbox_options_help,
-                "Prompt" => has_prompt,
                 _ => true,
             };
             if !show {

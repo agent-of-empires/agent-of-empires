@@ -99,7 +99,8 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Prompt",
-        description: "First turn for the agent, prefilled by a suggestion (Ctrl+P view source)",
+        description:
+            "Optional first turn, sent once the agent is ready (Ctrl+P views a suggestion's source)",
     },
 ];
 
@@ -284,7 +285,7 @@ pub struct NewSessionDialog {
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// The title the dialog was opened with, which the user did not type.
     pub(super) suggested_title: String,
-    /// First turn for the agent; the row exists only when `prompt_origin` is set.
+    /// First turn for the agent; `prompt_origin` is set only for a suggestion.
     prompt: Input,
     prompt_origin: Option<PromptOrigin>,
     /// Overlay with `prompt_origin.source_text`, opened by Ctrl+P on the Prompt row.
@@ -1001,7 +1002,7 @@ impl NewSessionDialog {
             worktree: take(!is_host_only),
             sandbox: take(self.docker_available && !is_host_only),
             group: take(true),
-            prompt: take(self.prompt_origin.is_some()),
+            prompt: take(true),
             count: next,
         }
     }
@@ -1568,7 +1569,7 @@ impl NewSessionDialog {
                 self.sandbox_focused_field = 0;
                 return DialogResult::Continue;
             }
-            if self.focused_field == fields.prompt {
+            if self.focused_field == fields.prompt && self.prompt_origin.is_some() {
                 self.show_prompt_source = true;
                 return DialogResult::Continue;
             }
@@ -2238,6 +2239,12 @@ impl NewSessionDialog {
             &mut self.worktree_branch
         } else if self.sandbox_config_mode && self.sandbox_focused_field == 0 {
             &mut self.sandbox_image
+        } else if self.focused_field == self.field_indices().prompt {
+            // The prompt is the one multi-line input: keep newlines.
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
+            }
+            return;
         } else {
             self.current_input_mut()
         };
@@ -2337,9 +2344,8 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
-            initial_prompt: (self.prompt_origin.is_some()
-                && !self.prompt.value().trim().is_empty())
-            .then(|| self.prompt.value().to_string()),
+            initial_prompt: (!self.prompt.value().trim().is_empty())
+                .then(|| self.prompt.value().to_string()),
             suggestion: self
                 .prompt_origin
                 .as_ref()

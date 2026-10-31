@@ -7,7 +7,7 @@ use std::fs;
 const TEST_PATH: &str = ".";
 
 /// Field layout with one tool and one profile: path 0, title 1, yolo 2,
-/// worktree 3, group 4.
+/// worktree 3, group 4, prompt 5.
 fn single_tool_dialog() -> NewSessionDialog {
     NewSessionDialog::new_with_tools(vec!["claude"], TEST_PATH.to_string())
 }
@@ -136,14 +136,50 @@ fn a_suggested_prompt_is_shown_wrapped_attributed_and_editable() {
 }
 
 #[test]
-fn the_prompt_row_exists_only_for_a_suggestion_and_hostile_text_is_neutralised() {
+fn a_typed_prompt_is_submitted_without_a_suggestion_and_has_no_source() {
     let mut dialog = single_tool_dialog();
-    assert_eq!(dialog.field_indices().prompt, super::FieldIndices::ABSENT);
+    assert_ne!(dialog.field_indices().prompt, super::FieldIndices::ABSENT);
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
-        None
+        None,
+        "an empty prompt is omitted"
     );
 
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().prompt;
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("Prompt:"));
+    assert!(!screen.contains("view source"));
+    assert!(!screen.contains("not checked by AoE"));
+
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(!dialog.show_prompt_source, "no origin, nothing to show");
+
+    type_str(&mut dialog, "  fix the build ");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("  fix the build ".to_string())
+    );
+}
+
+#[test]
+fn pasting_into_the_prompt_keeps_newlines_but_other_fields_stay_single_line() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_paste("line one\nline two\r\nline three\rline four");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("line one\nline two\nline three\nline four".to_string())
+    );
+
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().title;
+    dialog.handle_paste("one\ntwo");
+    assert_eq!(dialog.title.value(), "onetwo");
+}
+
+#[test]
+fn hostile_suggestion_text_is_neutralised_and_a_blank_one_is_omitted() {
     let mut dialog = single_tool_dialog();
     dialog.set_suggestion("run \u{1b}[31mnow\nthen stop".to_string(), github_origin());
     let screen = screen_of(&mut dialog, 100, 40);
@@ -291,20 +327,20 @@ fn tab_walks_the_visible_fields_in_both_directions() {
     let mut worktree_on = single_tool_dialog();
     worktree_on.worktree_enabled = true;
     for mut dialog in [single_tool_dialog(), worktree_on] {
-        for expected in [1, 2, 3, 4, 0] {
+        for expected in [1, 2, 3, 4, 5, 0] {
             dialog.handle_key(key(KeyCode::Tab));
             assert_eq!(dialog.focused_field, expected);
         }
     }
 
     let mut dialog = multi_tool_dialog();
-    for expected in [1, 2, 3, 4, 5, 0] {
+    for expected in [1, 2, 3, 4, 5, 6, 0] {
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, expected);
     }
 
     let mut dialog = single_tool_dialog();
-    for expected in [4, 3, 2, 1, 0] {
+    for expected in [5, 4, 3, 2, 1, 0] {
         dialog.handle_key(shift_key(KeyCode::BackTab));
         assert_eq!(dialog.focused_field, expected);
     }
@@ -321,6 +357,8 @@ fn tab_walks_the_visible_fields_in_both_directions() {
         assert_eq!(dialog.focused_field, 5, "sandbox row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 6, "group row");
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 7, "prompt row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 0);
     }

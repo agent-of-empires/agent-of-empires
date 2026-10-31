@@ -248,6 +248,11 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
+/// `plain` for text shown on a single line: line breaks cannot start a second one.
+fn plain_line(s: &str) -> String {
+    plain(s).replace('\n', "\u{fffd}")
+}
+
 const NO_PROJECT: &str = "No registered project matches this suggestion";
 
 /// Resolves a prepared suggestion into a dialog `Start`; `None` when the
@@ -262,18 +267,19 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
         .iter()
         .flat_map(|s| &s.providers)
         .find(|p| p.id == key.0)
-        .map_or(key.0.as_str(), |p| p.name.as_str())
-        .to_owned();
+        .map_or(key.0.as_str(), |p| p.name.as_str());
+    // The dialog is where the user confirms this text, so it is sanitised
+    // here, once, and what they see is what is sent.
     Some(Start {
-        provider,
-        source_ref: item.map(|i| i.source_ref.clone()).unwrap_or_default(),
-        reason: item.map(|i| i.reason.clone()).unwrap_or_default(),
+        provider: plain_line(provider),
+        source_ref: item.map(|i| plain_line(&i.source_ref)).unwrap_or_default(),
+        reason: item.map(|i| plain_line(&i.reason)).unwrap_or_default(),
         source_text: item
-            .map(|i| i.preview.clone())
-            .filter(|p| !p.trim().is_empty()),
+            .filter(|i| !i.preview.trim().is_empty())
+            .map(|i| plain(&i.preview)),
         path: project.path,
-        title: prepared.title,
-        initial_prompt: prepared.initial_prompt,
+        title: plain_line(&prepared.title),
+        initial_prompt: plain(&prepared.initial_prompt),
         tool: prepared.tool,
         suggestion: Some(crate::session::SuggestionOrigin {
             provider_id: key.0.clone(),
@@ -1322,6 +1328,41 @@ mod tests {
             tool: "claude".into(),
             project: project.map(|path| PreparedProject { path: path.into() }),
         }
+    }
+
+    #[test]
+    fn start_sanitises_every_provider_string_but_keeps_prompt_newlines() {
+        let hostile = |s: &str| format!("{s}\u{1b}[31m\u{202e}x");
+        let mut it = item("a", Some("repo"), false);
+        it.source_ref = hostile("ref");
+        it.reason = hostile("why\nmore");
+        it.preview = hostile("body");
+        let snapshot = Snapshot {
+            providers: vec![Provider {
+                id: "p".into(),
+                name: hostile("GitHub"),
+                error: None,
+                enabled: true,
+                updated_at: None,
+                refreshing: false,
+            }],
+            items: vec![it],
+        };
+        let mut prep = prepared(Some("/repo"));
+        prep.title = hostile("a\nb");
+        prep.initial_prompt = format!("{}\nsecond line", hostile("go"));
+
+        let start = start_for(Some(&snapshot), &("p".into(), "a".into()), prep).unwrap();
+        let clean = |s: &str| format!("{s}\u{fffd}[31m\u{fffd}x");
+        assert_eq!(start.provider, clean("GitHub"));
+        assert_eq!(start.source_ref, clean("ref"));
+        assert_eq!(start.reason, clean("why\u{fffd}more"));
+        assert_eq!(start.source_text.as_deref(), Some(clean("body").as_str()));
+        assert_eq!(start.title, clean("a\u{fffd}b"));
+        assert_eq!(
+            start.initial_prompt,
+            format!("{}\nsecond line", clean("go"))
+        );
     }
 
     #[test]
