@@ -2282,7 +2282,9 @@ mod mouse_tests {
                 agent_integrations: vec![
                     aoe_plugin_api::agent_integration::AgentIntegrationContribution {
                         tool: "session-helper".into(),
+                        provider_versions: Vec::new(),
                         command: Some("TOKEN=local session-helper --flag".into()),
+                        replies: false,
                     },
                 ],
                 fingerprint: "fingerprint".into(),
@@ -2305,7 +2307,9 @@ mod mouse_tests {
             agent_integrations: vec![
                 aoe_plugin_api::agent_integration::AgentIntegrationContribution {
                     tool: "session-helper".into(),
+                    provider_versions: Vec::new(),
                     command: Some("x\u{1b}[2Jtail".into()),
+                    replies: false,
                 },
             ],
             manifest_hash: "sha256:hash".into(),
