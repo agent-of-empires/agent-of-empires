@@ -852,6 +852,17 @@ pub(crate) async fn create_session_with(
             "initial_prompt must not be blank",
         );
     }
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::plugin::suggestions::MAX_PROMPT_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt exceeds 64 KiB",
+        );
+    }
 
     if body.suggestion.as_ref().is_some_and(|s| {
         [&s.provider_id, &s.id]
