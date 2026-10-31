@@ -1315,7 +1315,6 @@ pub(crate) trait SessionStore: Send + Sync {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()>;
 }
@@ -1484,10 +1483,14 @@ impl SessionStore for Storage {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
+        crate::migrations::migrate_sandbox_store_for_with(
+            id,
+            Some(crate::migrations::progress::tracing_reporter()),
+            self,
+            runtime,
+        )
     }
 
     fn managed_capture_store_is_exclusive(

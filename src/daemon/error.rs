@@ -20,6 +20,8 @@ pub enum ApiErrorCode {
     ResumeFailed,
     ManagedResumeRefused(ManagedResumeCause),
     StartFailed,
+    SandboxMigrationDeferred,
+    SandboxMigrationFailed,
     PurgeFailed,
     NoRevive,
     CreationTrustChanged,
@@ -46,6 +48,8 @@ impl ApiErrorCode {
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
+            Self::SandboxMigrationDeferred => "sandbox_migration_deferred",
+            Self::SandboxMigrationFailed => "sandbox_migration_failed",
             Self::PurgeFailed => "purge_failed",
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
@@ -77,6 +81,7 @@ impl ApiErrorCode {
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
+            | Self::SandboxMigrationDeferred
             | Self::PurgeFailed
             | Self::NoRevive
             | Self::CreationTrustChanged
@@ -92,7 +97,19 @@ impl ApiErrorCode {
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::StartFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub(crate) const fn sandbox_migration_message(self) -> Option<&'static str> {
+        match self {
+            Self::SandboxMigrationDeferred => Some(
+                "Sandbox migration is pending. Stop other sandbox users, then retry. For bulk migration, stop the daemon and run `aoe migrate`.",
+            ),
+            Self::SandboxMigrationFailed => Some(
+                "Sandbox migration failed. Apply the canonical state and check daemon logs before retrying.",
+            ),
+            _ => None,
         }
     }
 
@@ -127,6 +144,8 @@ impl ApiErrorCode {
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
             b"start_failed" => Self::StartFailed,
+            b"sandbox_migration_deferred" => Self::SandboxMigrationDeferred,
+            b"sandbox_migration_failed" => Self::SandboxMigrationFailed,
             b"purge_failed" => Self::PurgeFailed,
             b"creation_not_pending" => Self::CreationNotPending,
             b"create_hook_failed" => Self::CreateHookFailed,

@@ -562,12 +562,58 @@ impl SessionStore for NativeSessionStore {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        self.run_sandbox_migration(|| {
-            crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
-        })
+        let (reporter, _progress) =
+            super::runtime::sandbox_reporter(self.state.clone(), id, self.storage.profile());
+        let result = self.run_sandbox_migration(|| {
+            crate::migrations::migrate_sandbox_store_for_with(id, Some(reporter), self, runtime)
+        });
+        // Content isolation also retires conversation bindings in this profile.
+        match (result, self.commit(&mut |_, _| Ok(()))) {
+            (Err(mut error), Err(commit_error)) => {
+                tracing::warn!(
+                    target: "server.session_store",
+                    session = %id,
+                    migration_error = %format_args!("{error:#}"),
+                    error = %format_args!("{commit_error:#}"),
+                    "post-migration commit failed"
+                );
+                if !error.is::<NativeStoreUnavailable>() {
+                    if let Some(rejection) = commit_error
+                        .downcast_ref::<crate::session::LifecycleReservationError>()
+                        .filter(|_| !error.is::<crate::session::LifecycleReservationError>())
+                    {
+                        error = error.context(*rejection);
+                    }
+                    if let Some(blocked) = commit_error
+                        .downcast_ref::<crate::session::StartBlocked>()
+                        .filter(|_| !error.is::<crate::session::StartBlocked>())
+                    {
+                        error = error.context(*blocked);
+                    }
+                    if commit_error.is::<crate::session::SessionGone>()
+                        && !error.is::<crate::session::SessionGone>()
+                    {
+                        error = error.context(crate::session::SessionGone);
+                    }
+                    if commit_error.is::<crate::session::SessionCommitApplied>()
+                        && !error.is::<crate::session::SessionCommitApplied>()
+                    {
+                        error = error.context(crate::session::SessionCommitApplied);
+                    }
+                    if commit_error.is::<NativeStoreUnavailable>()
+                        || *self.state.canonical_health.blocking_read()
+                            != crate::daemon::RuntimeHealth::Healthy
+                    {
+                        error = error.context(NativeStoreUnavailable);
+                    }
+                }
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), committed) => committed,
+        }
     }
 
     fn sandbox_registry_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
@@ -1854,6 +1900,124 @@ mod tests {
                 .is_none(),
             "resnapshot must reflect the completed reservation release without a push loop"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_migration_settlement_preserves_primary_causes_and_authority() -> Result<()> {
+        for damage in ["checkpoint", "migration", "both", "settlement"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir()?;
+            std::fs::write(
+                app.join(".schema_version"),
+                crate::migrations::current_schema_version().to_string(),
+            )?;
+            let storage = Storage::new_unwatched("migration-owner")?;
+            let mut owner = Instance::new("owner", "/tmp/migration-owner");
+            owner.source_profile = storage.profile().into();
+            owner.tool = "gemini".into();
+            owner.sandbox_store_generation = 0;
+            owner.sandbox_info = (damage != "settlement").then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "image": "test-image", "container_name": "migration-owner"
+                }))
+                .unwrap()
+            });
+            storage.update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })?;
+            let mut rows = vec![owner.clone()];
+            let peer = if damage == "checkpoint" {
+                let peer = Storage::new_unwatched("migration-peer")?;
+                let mut row = Instance::new("peer", "/tmp/migration-peer");
+                row.source_profile = peer.profile().into();
+                peer.update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })?;
+                rows.push(row);
+                Some(peer)
+            } else {
+                None
+            };
+            let state = crate::server::test_support::build_test_app_state(rows);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let previous = serde_json::to_value(&*state.instances.read().await)?;
+            let worker_state = state.clone();
+            let id = owner.id.clone();
+            let error = tokio::task::spawn_blocking(move || -> Result<anyhow::Error> {
+                let store =
+                    NativeSessionStore::open(worker_state.clone(), "migration-owner", None)?;
+                if let Some(peer) = peer.as_ref() {
+                    std::fs::write(peer.sessions_path(), b"{")?;
+                } else if damage != "settlement" {
+                    std::fs::write(app.join(".v027-sandbox-transition.json"), b"{")?;
+                }
+                if matches!(damage, "both" | "settlement") {
+                    before_next_adoption_for_test(move || {
+                        worker_state
+                            .canonical_metadata
+                            .blocking_write()
+                            .profiles
+                            .clear();
+                    });
+                }
+                Ok(store
+                    .migrate_sandbox_store(&id, &crate::containers::ContainerRuntime::docker())
+                    .expect_err("migration or its final canonical adoption must fail"))
+            })
+            .await??;
+            if damage == "checkpoint" {
+                let failure = error
+                    .downcast_ref::<
+                        crate::migrations::v027_isolate_sandbox_stores::SandboxCheckpointFailure,
+                    >()
+                    .expect("the original cohort checkpoint failure must survive final adoption");
+                assert_eq!(failure.profile.as_deref(), Some("migration-peer"));
+                assert!(error.is::<NativeStoreUnavailable>(), "{error:#}");
+                assert_eq!(
+                    std::fs::read(Storage::open_unwatched("migration-peer")?.sessions_path())?,
+                    b"{"
+                );
+            } else {
+                assert_eq!(
+                    error.chain().any(|cause| cause.is::<serde_json::Error>()),
+                    damage != "settlement",
+                    "{damage}: {error:#}"
+                );
+                assert_eq!(
+                    error.is::<crate::session::SessionCommitApplied>(),
+                    damage != "migration",
+                    "{damage}: {error:#}"
+                );
+                assert_eq!(
+                    error.is::<NativeStoreUnavailable>(),
+                    damage == "both",
+                    "{damage}: {error:#}"
+                );
+                if damage != "settlement" {
+                    assert_eq!(
+                        std::fs::read(
+                            crate::session::get_app_dir()?.join(".v027-sandbox-transition.json")
+                        )?,
+                        b"{"
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.instances.read().await)?,
+                previous,
+                "{damage} must not adopt a partial profile"
+            );
+            assert_eq!(
+                *state.canonical_health.read().await == crate::daemon::RuntimeHealth::Healthy,
+                damage == "migration",
+                "{damage}"
+            );
+            assert_eq!(storage.load()?[0].id, owner.id);
+        }
         Ok(())
     }
 

@@ -33,6 +33,7 @@ pub(crate) struct NativeRuntime {
     /// Latest advisory creation progress. Only local-owner streams are sent
     /// it, so it stays a `watch` full-state value rather than a log.
     creation_progress: watch::Sender<Arc<Vec<CreationProgress>>>,
+    sandbox_progress: watch::Sender<Vec<crate::daemon::SandboxProgress>>,
     owner_diagnostics: watch::Sender<Arc<Vec<crate::daemon::OwnerLoadDiagnostic>>>,
     purge_namespace: watch::Sender<std::sync::Weak<tokio::sync::OwnedRwLockReadGuard<()>>>,
     publish_lane: Mutex<()>,
@@ -131,6 +132,56 @@ impl RuntimeWork {
     }
 }
 
+struct SandboxProgressGuard {
+    state: Arc<AppState>,
+    operation_id: String,
+}
+
+impl Drop for SandboxProgressGuard {
+    fn drop(&mut self) {
+        self.state.runtime.sandbox_progress.send_modify(|progress| {
+            progress.retain(|item| item.operation_id != self.operation_id);
+        });
+    }
+}
+
+pub(crate) fn sandbox_reporter(
+    state: Arc<AppState>,
+    session_id: &str,
+    profile: &str,
+) -> (crate::migrations::progress::Reporter, impl Drop) {
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    state.runtime.sandbox_progress.send_modify(|progress| {
+        progress.push(crate::daemon::SandboxProgress {
+            operation_id: operation_id.clone(),
+            session_id: session_id.to_owned(),
+            profile: profile.to_owned(),
+            activity: "starting".into(),
+        });
+    });
+    let guard = SandboxProgressGuard {
+        state: state.clone(),
+        operation_id: operation_id.clone(),
+    };
+    let console = std::sync::Mutex::new(crate::migrations::progress::ConsoleProgress::default());
+    let log = crate::migrations::progress::tracing_reporter();
+    let reporter = Arc::new(move |event: crate::migrations::progress::Event| {
+        log(event.clone());
+        let mut console = console.lock().expect("sandbox progress poisoned");
+        console.apply(event);
+        let activity = console.activity().unwrap_or_else(|| "finishing".into());
+        state.runtime.sandbox_progress.send_modify(|progress| {
+            if let Some(item) = progress
+                .iter_mut()
+                .find(|item| item.operation_id == operation_id)
+            {
+                item.activity = activity.chars().take(512).collect();
+            }
+        });
+    });
+    (reporter, guard)
+}
+
 impl NativeRuntime {
     pub(crate) fn new(
         namespace: String,
@@ -143,6 +194,7 @@ impl NativeRuntime {
             tmux_socket,
             snapshots: watch::channel(None).0,
             creation_progress: watch::channel(Arc::new(Vec::new())).0,
+            sandbox_progress: watch::channel(Vec::new()).0,
             owner_diagnostics: watch::channel(Arc::new(Vec::new())).0,
             purge_namespace: watch::channel(std::sync::Weak::new()).0,
             publish_lane: Mutex::new(()),
@@ -586,6 +638,7 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
     let progress_granted = creation_progress_granted(local.as_ref());
     let mut creation_progress = state.runtime.creation_progress.subscribe();
     let mut owner_diagnostics = state.runtime.owner_diagnostics.subscribe();
+    let mut sandbox_progress = state.runtime.sandbox_progress.subscribe();
     if first_subscriber {
         state.runtime.terminal_wake.notify_one();
     }
@@ -613,6 +666,18 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
     if progress_granted {
         let current = creation_progress.borrow_and_update().clone();
         if !send_creation_progress(&mut socket, &state, &current).await {
+            return;
+        }
+    }
+    if progress_granted {
+        let frame = RuntimeFrame::<RuntimeSnapshot>::Sandbox {
+            epoch: state.runtime.epoch.clone(),
+            progress: sandbox_progress.borrow_and_update().clone(),
+        };
+        let Ok(frame) = serde_json::to_string(&frame) else {
+            return;
+        };
+        if !send_frame(&mut socket, &state, Message::Text(frame.into())).await {
             return;
         }
     }
@@ -653,6 +718,15 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
                 if changed.is_err() { break; }
                 let current = creation_progress.borrow_and_update().clone();
                 if !send_creation_progress(&mut socket, &state, &current).await { break; }
+            }
+            changed = sandbox_progress.changed(), if progress_granted => {
+                if changed.is_err() { break; }
+                let frame = RuntimeFrame::<RuntimeSnapshot>::Sandbox {
+                    epoch: state.runtime.epoch.clone(),
+                    progress: sandbox_progress.borrow_and_update().clone(),
+                };
+                let Ok(frame) = serde_json::to_string(&frame) else { break; };
+                if !send_frame(&mut socket, &state, Message::Text(frame.into())).await { break; }
             }
             changed = owner_diagnostics.changed(), if progress_granted => {
                 if changed.is_err() { break; }
@@ -965,6 +1039,238 @@ mod tests {
                 None => std::fs::remove_file(&path).unwrap(),
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_copy_stream_preserves_owner_privacy_and_long_launch_ownership(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::{RuntimeConnection, RuntimeEvent};
+        use crate::session::{Instance, Storage};
+        use anyhow::Context;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WireMessage};
+
+        async fn read_progress(
+            connection: &mut RuntimeConnection,
+            ready: impl Fn(&[crate::daemon::SandboxProgress]) -> bool,
+        ) -> anyhow::Result<Vec<crate::daemon::SandboxProgress>> {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let RuntimeEvent::Sandbox(progress) = connection.next_event().await? {
+                        if ready(&progress) {
+                            return Ok(progress);
+                        }
+                    }
+                }
+            })
+            .await
+            .context("sandbox progress did not reach the owner stream")?
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let home = dirs::home_dir().unwrap();
+        let tmux_socket = home.join("private-tmux.sock");
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", &tmux_socket);
+        let project = home.join("project");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(home.join(".gemini/sandbox/history"))?;
+        std::fs::write(home.join(".gemini/sandbox/history/owned.json"), b"legacy")?;
+        let storage = Storage::new_unwatched("test")?;
+        let mut raw = serde_json::to_value(Instance::new("legacy", project.to_str().unwrap()))?;
+        raw["source_profile"] = "test".into();
+        raw["tool"] = "gemini".into();
+        raw["sandbox_store_generation"] = 0.into();
+        raw["sandbox_info"] = serde_json::json!({
+            "enabled": true, "image": "test-image", "container_name": "legacy"
+        });
+        let mut row: Instance = serde_json::from_value(raw)?;
+        row.status = crate::session::Status::Starting;
+        let generation = row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - chrono::Duration::minutes(11),
+        )?;
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let original = crate::server::test_support::build_test_app_state_with_policy(
+            vec![row.clone()],
+            vec!["localhost".into(), "127.0.0.1".into()],
+            Vec::new(),
+            Some("sandbox-progress-token".into()),
+        );
+        let app = crate::session::get_app_dir()?.canonicalize()?;
+        let mut owned = Arc::try_unwrap(original)
+            .ok()
+            .expect("fixture has one strong state owner");
+        let work = owned.runtime.work.clone();
+        owned.runtime = NativeRuntime::new(
+            app.to_string_lossy().into_owned(),
+            Some(tmux_socket.to_string_lossy().into_owned()),
+            work,
+        );
+        let state = Arc::new(owned);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (_other_reporter, other_guard) = sandbox_reporter(state.clone(), "other", "test");
+        let socket = app.join("daemon/api.sock");
+        let router = crate::server::test_support::build_router_for_test(state.clone());
+        let server =
+            crate::server::test_support::serve_owner_router_for_test(&socket, router.clone()).await;
+        let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+        let mut connection = RuntimeConnection::connect(&endpoint, Some("test")).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let tcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let http = reqwest::Client::builder()
+            .unix_socket(socket)
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let (entered, copying) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let id = row.id.clone();
+        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = crate::server::session_store::NativeSessionStore::open(
+                worker_state.clone(),
+                "test",
+                None,
+            )?;
+            let (reporter, _guard) = sandbox_reporter(worker_state, &id, "test");
+            let entered = std::cell::RefCell::new(Some(entered));
+            crate::migrations::v027_isolate_sandbox_stores::COPY_GATE.set(Some(Box::new(
+                move |_| {
+                    if let Some(entered) = entered.borrow_mut().take() {
+                        entered.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                },
+            )));
+            let _installed = crate::migrations::progress::install(Some(reporter));
+            let result = crate::migrations::v027_isolate_sandbox_stores::migrate_instance_with(
+                &id,
+                &|_| Ok(false),
+                &|_| Ok(true),
+                Some(&store),
+            );
+            crate::migrations::v027_isolate_sandbox_stores::COPY_GATE.set(None);
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(10), copying).await??;
+        let source = home.join(".gemini/sandbox").to_string_lossy().into_owned();
+        let progress = read_progress(&mut connection, |progress| {
+            progress
+                .iter()
+                .any(|item| item.session_id == row.id && item.activity.contains(&source))
+        })
+        .await?;
+        let current = progress
+            .iter()
+            .find(|item| item.session_id == row.id)
+            .unwrap();
+        let operation = current.operation_id.clone();
+        let activity = current.activity.clone();
+        assert!(!task.is_finished(), "progress must precede copy completion");
+        let response = http
+            .post(format!("http://localhost/api/sessions/{}/stop", row.id))
+            .header(crate::daemon::RUNTIME_EPOCH_HEADER, &state.runtime.epoch)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<serde_json::Value>().await?["error"],
+            "lifecycle_busy"
+        );
+        assert!(storage.load()?[0].lifecycle_reservation_is_owned(
+            crate::session::LifecycleOperation::Launch,
+            generation
+        ));
+
+        let mut request = format!("ws://{address}/api/runtime/ws").into_client_request()?;
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer sandbox-progress-token".parse()?,
+        );
+        let (mut remote, _) = tokio_tungstenite::connect_async(request).await?;
+        let nonce = b"sandbox-owner-only".to_vec();
+        remote.send(WireMessage::Ping(nonce.clone().into())).await?;
+        let mut hello_seen = false;
+        let mut snapshot_seen = false;
+        // Initial advisory sends precede the receive loop, so Pong fences their absence.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match remote.next().await.context("non-owner stream closed")?? {
+                    WireMessage::Text(text) => {
+                        assert!(
+                            !text.contains(&activity),
+                            "non-owner received private copy activity"
+                        );
+                        let frame: RuntimeFrame = serde_json::from_str(&text)?;
+                        match frame {
+                            RuntimeFrame::Hello(info) => {
+                                assert!(!info.local_owner);
+                                hello_seen = true;
+                            }
+                            RuntimeFrame::Snapshot(_) => snapshot_seen = true,
+                            RuntimeFrame::Sandbox { .. } => {
+                                anyhow::bail!("non-owner received a sandbox progress frame");
+                            }
+                            _ => {}
+                        }
+                    }
+                    WireMessage::Pong(payload) if payload.as_ref() == nonce.as_slice() => break,
+                    WireMessage::Ping(payload) => remote.send(WireMessage::Pong(payload)).await?,
+                    other => anyhow::bail!("unexpected non-owner frame: {other:?}"),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("non-owner never passed the initial advisory-send boundary")??;
+        assert!(hello_seen && snapshot_seen);
+        remote.close(None).await?;
+        release.send(())?;
+        task.await??;
+        let progress = read_progress(&mut connection, |progress| {
+            progress.iter().all(|item| item.operation_id != operation)
+        })
+        .await?;
+        assert_eq!(
+            progress
+                .iter()
+                .map(|item| item.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["other"]
+        );
+        assert_eq!(storage.load()?[0].sandbox_store_generation, 2);
+        assert_eq!(state.instances.read().await[0].sandbox_store_generation, 2);
+        assert_eq!(
+            std::fs::read(
+                home.join(".gemini/sandbox-v2")
+                    .join(&row.id)
+                    .join("history/owned.json")
+            )?,
+            b"legacy"
+        );
+        drop(other_guard);
+        assert!(state.runtime.sandbox_progress.borrow().is_empty());
+        connection.close().await;
+        state.shutdown.cancel();
+        server.abort();
+        let _ = server.await;
+        tcp_server.abort();
+        let _ = tcp_server.await;
+        Ok(())
     }
 
     #[tokio::test]

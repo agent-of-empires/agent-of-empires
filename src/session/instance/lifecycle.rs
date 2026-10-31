@@ -66,10 +66,23 @@ pub struct LifecycleReservation {
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed
-    /// owner cannot retain the reservation forever; a late owner is still
-    /// harmless because every commit is generation-checked.
+    /// Ordinary crashed owners expire; generation checks fence late commits.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
+    /// Sandbox Launch leases share this floor with native preparation requests.
+    pub(crate) const SANDBOX_PREPARATION_WINDOW: chrono::Duration = chrono::Duration::minutes(30);
+
+    fn lifecycle_reservation_ttl(
+        &self,
+        holder: LifecycleOperation,
+        ttl: chrono::Duration,
+    ) -> chrono::Duration {
+        if holder == LifecycleOperation::Launch && self.is_sandboxed() {
+            ttl.max(Self::SANDBOX_PREPARATION_WINDOW)
+        } else {
+            ttl
+        }
+    }
 
     fn next_available_lifecycle_generation(
         &self,
@@ -80,7 +93,8 @@ impl Instance {
             return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch));
         }
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.generation == self.lifecycle_generation
+                && (now - reservation.at) < self.lifecycle_reservation_ttl(reservation.op, ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -144,7 +158,8 @@ impl Instance {
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                    && (now - reservation.at)
+                        < self.lifecycle_reservation_ttl(reservation.op, Self::LIFECYCLE_RESERVATION_TTL)
         )
     }
 
@@ -219,7 +234,7 @@ impl Instance {
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) >= ttl
+                    && (now - reservation.at) >= self.lifecycle_reservation_ttl(reservation.op, ttl)
         ) {
             self.lifecycle_reservation = None;
             true
@@ -698,6 +713,15 @@ impl Instance {
                 } else {
                     message.into()
                 }
+            } else if let Some(failure) =
+                error.downcast_ref::<crate::migrations::SandboxMigrationError>()
+            {
+                tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "sandbox migration did not complete");
+                let message = failure.api_code().sandbox_migration_message().unwrap();
+                match scope_failure {
+                    Some(_) => format!("{message}\nScope retirement remains unproven."),
+                    None => message.into(),
+                }
             } else {
                 match scope_failure {
                     Some(scope) => {
@@ -723,6 +747,101 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_preparation_reservation_outlives_ordinary_recovery_without_blocking_it() {
+        let now = Utc::now();
+        let acquired = now - chrono::Duration::minutes(11);
+        for (sandboxed, operation) in [
+            (true, LifecycleOperation::Launch),
+            (false, LifecycleOperation::Launch),
+            (true, LifecycleOperation::Stop),
+            (true, LifecycleOperation::Purge),
+        ] {
+            let mut owner = Instance::new("preparing", "/tmp/preparing");
+            owner.sandbox_info = sandboxed.then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "image": "test-image", "container_name": "preparing"
+                }))
+                .unwrap()
+            });
+            let generation = owner
+                .try_acquire_lifecycle_reservation(
+                    operation,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    acquired,
+                )
+                .unwrap();
+            let protected = sandboxed && operation == LifecycleOperation::Launch;
+            assert_eq!(owner.has_fresh_lifecycle_reservation(now), protected);
+            let mut cleanup = owner.clone();
+            assert_eq!(
+                cleanup
+                    .clear_expired_lifecycle_reservation(Instance::LIFECYCLE_RESERVATION_TTL, now),
+                !protected
+            );
+            for contender in [
+                LifecycleOperation::Launch,
+                LifecycleOperation::Capture,
+                LifecycleOperation::Stop,
+                LifecycleOperation::Purge,
+                LifecycleOperation::Restore,
+                LifecycleOperation::Trash,
+            ] {
+                let mut next = owner.clone();
+                let outcome = next.try_acquire_lifecycle_reservation(
+                    contender,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now,
+                );
+                if protected {
+                    assert_eq!(
+                        outcome,
+                        Err(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+                    );
+                    assert_eq!(next.lifecycle_reservation, owner.lifecycle_reservation);
+                    assert_eq!(next.lifecycle_generation, generation);
+                } else {
+                    assert_eq!(outcome.unwrap(), generation + 1);
+                    assert!(!next.release_lifecycle_reservation_if_owned(operation, generation));
+                }
+            }
+            if protected {
+                owner.sandbox_store_generation = 2;
+                assert!(owner.has_fresh_lifecycle_reservation(now));
+                let expired = acquired + chrono::Duration::minutes(30);
+                assert!(!owner.has_fresh_lifecycle_reservation(expired));
+                let longer = chrono::Duration::minutes(31);
+                assert!(!owner.clear_expired_lifecycle_reservation(longer, expired));
+                assert_eq!(
+                    owner.try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        longer,
+                        expired,
+                    ),
+                    Err(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+                );
+                assert!(owner.clear_expired_lifecycle_reservation(
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    expired
+                ));
+                let next = owner
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        expired,
+                    )
+                    .unwrap();
+                assert_eq!(next, generation + 1);
+                assert!(!owner.finish_lifecycle_status(
+                    LifecycleOperation::Launch,
+                    generation,
+                    Status::Idle
+                ));
+                assert!(owner.lifecycle_reservation_is_owned(LifecycleOperation::Stop, next));
+            }
+        }
+    }
 
     #[test]
     #[serial_test::serial]

@@ -10,8 +10,8 @@ pub use runtime::{
     CreationPhase, CreationProgress, MutationReceipt, OwnerLoadDiagnostic, ProfileMutation,
     ProfileSnapshot, ProjectMutation, ProjectResponse, ProjectTarget, ReloadFailureCode,
     RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame, RuntimeHealth, RuntimeInfo,
-    RuntimeSnapshot, SessionMutation, RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION,
-    RUNTIME_REVISION_HEADER,
+    RuntimeSnapshot, SandboxProgress, SessionMutation, RUNTIME_EPOCH_HEADER,
+    RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
 };
 pub(crate) use runtime::{NamespaceMutation, NamespaceOutcome};
 pub use runtime_connection::{RuntimeConnection, RuntimeConnectionError, RuntimeEvent};
@@ -48,6 +48,9 @@ pub use wire::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Sandbox copies, image pulls and launch hooks can take minutes.
+const LIFECYCLE_TIMEOUT: Duration =
+    Duration::from_secs(crate::session::Instance::SANDBOX_PREPARATION_WINDOW.num_seconds() as u64);
 /// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
 const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -142,6 +145,9 @@ pub(crate) enum LocalRuntimeError {
 }
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
+    if let Some(message) = code.sandbox_migration_message() {
+        return message;
+    }
     match code {
         ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
@@ -153,6 +159,9 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 }
 
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
+    if let Some(message) = code.and_then(ApiErrorCode::sandbox_migration_message) {
+        return message.into();
+    }
     match code {
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
@@ -366,8 +375,11 @@ impl DaemonClient {
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
-            .await
+        self.request_mutation_with_outcome(
+            self.http.post(url).json(body).timeout(LIFECYCLE_TIMEOUT),
+            epoch,
+        )
+        .await
     }
 
     pub async fn ensure_terminal(
@@ -402,7 +414,11 @@ impl DaemonClient {
             transport::path_segment(session_id)?
         );
         self.request_mutation_with_outcome(
-            self.http.post(url).query(&[("index", index)]).json(body),
+            self.http
+                .post(url)
+                .query(&[("index", index)])
+                .json(body)
+                .timeout(LIFECYCLE_TIMEOUT),
             epoch,
         )
         .await
@@ -421,8 +437,11 @@ impl DaemonClient {
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
-            .await
+        self.request_mutation_with_outcome(
+            self.http.post(url).json(body).timeout(LIFECYCLE_TIMEOUT),
+            epoch,
+        )
+        .await
     }
 
     pub async fn restart_session(
@@ -441,7 +460,10 @@ impl DaemonClient {
             outcome: RestartOutcome,
         }
         let receipt: MutationReceipt<Body> = self
-            .request_mutation_with_outcome(self.http.post(url).json(body), epoch)
+            .request_mutation_with_outcome(
+                self.http.post(url).json(body).timeout(LIFECYCLE_TIMEOUT),
+                epoch,
+            )
             .await?;
         Ok(MutationReceipt {
             cursor: receipt.cursor,
@@ -463,8 +485,12 @@ impl DaemonClient {
             mutation.route(),
         );
         let request = match mutation {
-            SessionMutation::Start(body) => self.http.post(url).json(body),
-            SessionMutation::Restart(body) => self.http.post(url).json(body),
+            SessionMutation::Start(body) => {
+                self.http.post(url).json(body).timeout(LIFECYCLE_TIMEOUT)
+            }
+            SessionMutation::Restart(body) => {
+                self.http.post(url).json(body).timeout(LIFECYCLE_TIMEOUT)
+            }
             SessionMutation::AbandonPurge(body) => self.http.post(url).json(body),
             SessionMutation::StopAuxiliary(target) => self.http.post(url).json(target),
             SessionMutation::Stop => self.http.post(url),
@@ -891,6 +917,8 @@ impl DaemonClient {
                 code,
                 Some(
                     ApiErrorCode::StartFailed
+                        | ApiErrorCode::SandboxMigrationDeferred
+                        | ApiErrorCode::SandboxMigrationFailed
                         | ApiErrorCode::ResumeFailed
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
@@ -901,6 +929,7 @@ impl DaemonClient {
                     .and_then(|value| value.to_str().ok())
                 {
                     if code == Some(ApiErrorCode::PurgeFailed)
+                        || code.is_some_and(|code| code.sandbox_migration_message().is_some())
                         || response.headers().contains_key(RUNTIME_EPOCH_HEADER)
                         || response.headers().contains_key(RUNTIME_REVISION_HEADER)
                     {
@@ -910,7 +939,9 @@ impl DaemonClient {
                             code: code.unwrap(),
                         });
                     }
-                } else if code == Some(ApiErrorCode::PurgeFailed) {
+                } else if code == Some(ApiErrorCode::PurgeFailed)
+                    || code.is_some_and(|code| code.sandbox_migration_message().is_some())
+                {
                     return Err(DaemonClientError::InvalidMutationReceipt);
                 }
             }
@@ -921,6 +952,8 @@ impl DaemonClient {
                     ApiErrorCode::LifecycleLocked
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
+                        | ApiErrorCode::SandboxMigrationDeferred
+                        | ApiErrorCode::SandboxMigrationFailed
                 )
             ) || status == StatusCode::UNAUTHORIZED
             {
@@ -1517,6 +1550,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_lifecycle_waits_past_the_default_rpc_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for operation in ["ensure", "start", "restart", "container-terminal", "tools"] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (arrived, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                let mut used = 0;
+                while !bytes[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut bytes[used..]).await.unwrap();
+                    assert!(read > 0);
+                    used += read;
+                }
+                arrived.send(()).unwrap();
+                released.await.unwrap();
+                let body = if operation == "restart" {
+                    r#"{"outcome":{"lifecycle_generation":2,"profile":"work","target":null}}"#
+                } else {
+                    r#"{"tmux_session":"ready","status":"alive","lifecycle_generation":2,"profile":"work"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{}: epoch-1\r\n{}: 17\r\n\r\n{body}",
+                    body.len(), RUNTIME_EPOCH_HEADER, RUNTIME_REVISION_HEADER,
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let client = DaemonClient::new_unix(&socket).unwrap();
+            let pending = tokio::spawn(async move {
+                let body = StartSessionBody::default();
+                match operation {
+                    "ensure" => client
+                        .ensure_agent("session", &body, "epoch-1")
+                        .await
+                        .map(|receipt| receipt.cursor),
+                    "start" => {
+                        client
+                            .mutate_session("session", &SessionMutation::Start(body), "epoch-1")
+                            .await
+                    }
+                    "restart" => client
+                        .restart_session("session", &RestartSessionBody::default(), "epoch-1")
+                        .await
+                        .map(|receipt| receipt.cursor),
+                    "container-terminal" => client
+                        .ensure_container_terminal("session", 0, &body, "epoch-1")
+                        .await
+                        .map(|receipt| receipt.cursor),
+                    "tools" => client
+                        .ensure_tool(
+                            "session",
+                            &EnsureToolBody {
+                                tool_name: "shell".into(),
+                                size: None,
+                                adoption: None,
+                            },
+                            "epoch-1",
+                        )
+                        .await
+                        .map(|receipt| receipt.cursor),
+                    _ => unreachable!(),
+                }
+            });
+            observed.await.unwrap();
+            tokio::time::pause();
+            tokio::time::advance(DEFAULT_TIMEOUT + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            release.send(()).unwrap();
+            let receipt = pending
+                .await
+                .unwrap()
+                .expect("slow preparation retains its receipt");
+            assert_eq!(
+                receipt,
+                RuntimeCursor {
+                    epoch: "epoch-1".into(),
+                    revision: 17
+                },
+                "{operation}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn empty_trash_waits_for_a_slow_batch_within_its_own_deadline() {
         let app = axum::Router::new().route(
             "/api/sessions/empty-trash",
@@ -1794,6 +1916,40 @@ mod tests {
             (409, "resume_failed", "epoch-1", "3", true, false),
             (409, "purge_failed", "epoch-1", "3", true, false),
             (409, "managed_resume_refused", "epoch-1", "3", true, false),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "epoch-1",
+                "3",
+                true,
+                false,
+            ),
+            (500, "sandbox_migration_failed", "epoch-1", "3", true, false),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "absent",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                500,
+                "sandbox_migration_failed",
+                "absent",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                409,
+                "sandbox_migration_deferred",
+                "foreign",
+                "3",
+                false,
+                true,
+            ),
+            (500, "sandbox_migration_failed", "epoch-1", "0", false, true),
             (409, "managed_resume_refused", "foreign", "3", false, true),
             (409, "managed_resume_refused", "epoch-1", "0", false, true),
             (
