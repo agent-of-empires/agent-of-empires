@@ -2534,6 +2534,7 @@ function AppContent({
                 onReorderWorkspaces={handleReorderWorkspaces}
                 onReorderGroups={reorderRepoGroups}
                 activeId={activeWorkspace?.id ?? null}
+                activeSessionId={activeSessionId}
                 open={sidebarOpen}
                 onToggle={() => setSidebarOpen(false)}
                 onSelect={handleSelectWorkspace}

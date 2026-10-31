@@ -10,7 +10,7 @@ import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { SessionRow } from "../sidebar/SessionRow";
-import type { RowBulkApi } from "../sidebar/types";
+import type { RowActivate, RowBulkApi } from "../sidebar/types";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 export function makeSession(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -102,6 +102,8 @@ interface RowOptions {
   onStart?: (sessionId: string) => void;
   onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
+  onActivate?: RowActivate;
+  activeSessionId?: string | null;
 }
 
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
@@ -114,6 +116,8 @@ function Row({
   onStart,
   onRestartForUpdate,
   onSwitchView,
+  onActivate = () => {},
+  activeSessionId = null,
 }: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
   const [canonical, setCanonical] = useState({
@@ -146,7 +150,8 @@ function Row({
         onSessionMutation={onSessionMutation}
         isActive={isActive}
         isSelected={false}
-        onActivate={() => {}}
+        onActivate={onActivate}
+        activeSessionId={activeSessionId}
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}

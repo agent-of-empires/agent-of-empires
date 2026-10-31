@@ -62,6 +62,8 @@ interface Props {
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
+  /** The session the URL currently points at; lets an expanded sibling row tell it apart from the rest of its group. */
+  activeSessionId: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
@@ -191,6 +193,7 @@ export function WorkspaceSidebar(props: Props) {
       isActive: v.workspace.id === selection.displayedActiveId,
       isSelected: selection.isSelected(v.workspace.id),
       onActivate: selection.handleRowActivate,
+      activeSessionId: props.activeSessionId,
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,

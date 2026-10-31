@@ -964,6 +964,19 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/RowBadges.tsx"]
     },
     {
+      "id": "sidebar.group-expand",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SessionRowGroupExpand.test.tsx"],
+      "components": [
+        "web/src/components/sidebar/RowBadges.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ],
+      "notes": "A worktree row that collapsed more than one session into itself can expand into a full, indented row per session behind a guide line, each with its own click-to-navigate, context menu and active-session marking, instead of leaving every session but the row's picked preferred session unreachable. The group header itself is named after that preferred (running, else first) session, falling back to the branch only when none has its own title."
+    },
+    {
       "id": "app-shell.mobile-chrome-collapse",
       "kind": "mocked-playwright",
       "risk": "medium",
