@@ -91,16 +91,8 @@ pub fn catalog<'a, 'b, 'c>(
 /// controls a browser or terminal would otherwise reorder.
 fn display_dangerous(c: char) -> bool {
     c.is_control()
-        || matches!(
-            c as u32,
-            // ZWNJ/ZWJ/LRM/RLM, the bidi controls, invisible operators,
-            // Arabic letter mark and the zero-width no-break space.
-            0x200B..=0x200F
-                | 0x202A..=0x202E
-                | 0x2060..=0x2064
-                | 0x061C
-                | 0xFEFF
-        )
+        || unicode_general_category::get_general_category(c)
+            == unicode_general_category::GeneralCategory::Format
 }
 
 /// Display form of a plugin-declared command: control and format characters
@@ -193,5 +185,7 @@ mod tests {
         assert_eq!(display_command("x\u{1b}[2Jtail"), "x\\u{1b}[2Jtail");
         // Bidi controls are escaped too, not just Cc controls.
         assert_eq!(display_command("x\u{202e}tail"), "x\\u{202e}tail");
+        // Any Unicode Format character, including tag characters, is escaped.
+        assert_eq!(display_command("x\u{E0001}tail"), "x\\u{e0001}tail");
     }
 }
