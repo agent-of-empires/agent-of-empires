@@ -3841,7 +3841,7 @@ fn session_response_carries_the_agents_solo_commands() {
     for (tool, clear, compact) in cases {
         let mut inst = make_test_instance();
         inst.tool = tool.to_string();
-        let response = SessionResponse::from_instance(&inst, false);
+        let response = session_response_from_instance(&inst, false);
         assert_eq!(
             (response.clear_aliases, response.compact_aliases),
             (
@@ -4260,7 +4260,7 @@ fn trash_body_default_keeps_kill_pane_true() {
 // `has_cleanable_worktree: true` for the delete dialog's checkbox while keeping
 // `has_managed_worktree: false` so worktree-only actions stay hidden.
 #[test]
-fn from_instance_reports_managed_worktree_for_workspace_session() {
+fn session_response_from_instance_reports_managed_worktree_for_workspace_session() {
     let mut inst = make_test_instance();
     inst.workspace_info = Some(crate::session::WorkspaceInfo {
         branch: "feature/abc".to_string(),
@@ -4293,7 +4293,7 @@ fn from_instance_reports_managed_worktree_for_workspace_session() {
 
 #[test]
 #[serial_test::serial(hook_base)]
-fn from_instance_surfaces_hook_urgent_flag() {
+fn session_response_from_instance_surfaces_hook_urgent_flag() {
     // #1640: the web Attention sort needs `Instance::is_urgent()` on the wire.
     // Write the hook-side attention.json the agent would emit and confirm it
     // round-trips, then that a session with no hook file reports urgent: false.
