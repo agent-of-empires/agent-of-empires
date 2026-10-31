@@ -2299,11 +2299,15 @@ impl HomeView {
             }
         }
         if let (Some(view), None) = (&mut self.suggestions_view, &self.command_palette) {
-            let mutations_allowed = self.session_feed.mutations_available();
-            match view.handle_key(key, mutations_allowed, &mut self.suggestions_feed) {
+            let block = self.session_feed.mutation_block();
+            match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => self.suggestions_view = None,
-                SuggestionsAction::Start(start) => self.start_suggestion(start),
+                SuggestionsAction::Start(start) => self.start_suggestion(*start),
+                SuggestionsAction::OpenSession(id) => {
+                    self.suggestions_view = None;
+                    self.jump_to_session_id(&id);
+                }
             }
             return None;
         }
@@ -8261,6 +8265,7 @@ mod tests {
             fork_seed: None,
             structured: false,
             initial_prompt: None,
+            suggestion: None,
         }
     }
 

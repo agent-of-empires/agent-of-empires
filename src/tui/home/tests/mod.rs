@@ -911,6 +911,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         fork_seed: None,
         structured: false,
         initial_prompt: None,
+        suggestion: None,
     }
 }
 

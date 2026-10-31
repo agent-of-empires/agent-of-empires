@@ -571,6 +571,7 @@ fn wizard_create_body(
         command_override: data.command_override.clone(),
         custom_instruction: None,
         initial_prompt: data.initial_prompt.clone(),
+        suggestion: data.suggestion.clone(),
         profile: Some(data.profile.clone()),
         view: if data.structured {
             crate::session::View::Structured

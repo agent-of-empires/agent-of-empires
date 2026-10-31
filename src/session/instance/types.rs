@@ -373,6 +373,13 @@ pub struct PluginCreateIdempotency {
     pub payload_hash: String,
 }
 
+/// The suggestion a session was started from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuggestionOrigin {
+    pub provider_id: String,
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

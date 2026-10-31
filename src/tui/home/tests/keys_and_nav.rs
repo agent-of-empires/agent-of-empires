@@ -1491,6 +1491,7 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
         title: "Review PR 7".to_string(),
         initial_prompt: "Inspect the diff".to_string(),
         tool: "claude".to_string(),
+        suggestion: None,
     }
 }
 

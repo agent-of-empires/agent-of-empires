@@ -2921,6 +2921,7 @@ mod tests {
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             pending_initial_turn: None,
             parent_session_id: None,
             acp_mode_id: None,

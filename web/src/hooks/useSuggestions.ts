@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  dismissSuggestion,
   createSession,
   fetchCreateBootId,
   fetchSuggestions,
@@ -19,6 +20,14 @@ import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
 import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
 
+/** A start that failed, kept on its row so a retry repeats the same kind of start. */
+export interface StartFailure {
+  message: string;
+  another: boolean;
+}
+
+const REFRESH_POLL_MS = 2000;
+const UNDO_MS = 10_000;
 const PENDING_NOTICE = "A session is still being created. Wait for it to finish.";
 
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
@@ -39,6 +48,9 @@ export function useSuggestions(
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [failures, setFailures] = useState<Record<string, StartFailure>>({});
+  // Bumped after every load, success or not, so the refresh poll re-arms itself.
+  const [loadTick, setLoadTick] = useState(0);
   const mounted = useRef(true);
   const loadSeq = useRef(0);
   const failed = useRef(false);
@@ -54,7 +66,16 @@ export function useSuggestions(
   const load = useCallback(async () => {
     const seq = ++loadSeq.current;
     apply(await fetchSuggestions(), seq);
+    if (mounted.current) setLoadTick((t) => t + 1);
   }, [apply]);
+
+  // While a provider refreshes, follow it until it answers.
+  const refreshingProvider = snapshot?.providers.some((p) => p.refreshing) ?? false;
+  useEffect(() => {
+    if (!refreshingProvider) return;
+    const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [refreshingProvider, loadTick, load]);
 
   useEffect(() => {
     mounted.current = true;
@@ -91,20 +112,25 @@ export function useSuggestions(
     if (mounted.current) setRefreshing(false);
   };
 
-  const start = async (item: SuggestionItem) => {
+  // `another` starts a further Session without claiming the suggestion's link.
+  const start = async (item: SuggestionItem, another = false) => {
     const key = suggestionKey(item);
     setBusy(key);
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
+      setFailures(({ [key]: _gone, ...rest }) => rest);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-      const prefill = toWizardPrefill(result.data, { label, title: item.title, url: item.source_url });
+      const link = another ? undefined : { provider_id: item.provider_id, id: item.id };
+      const prefill = toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }, link);
       const draft = result.data;
       // The pref is ignored when a host passes no `onStarted`. Only the user's own template
       // runs unreviewed; the provider's draft prompt always goes through the wizard.
+      // "Start another" always opens the wizard, so it never starts unreviewed.
       if (
         onStarted &&
+        !another &&
         snapshot?.prefs.start_without_review &&
         draft.project &&
         draft.templated &&
@@ -123,6 +149,7 @@ export function useSuggestions(
           sandbox: draft.sandbox,
           worktree_enabled: draft.worktree,
           initial_prompt: draft.initial_prompt,
+          suggestion: link,
           idempotency_key: newIdempotencyKey(),
         };
         const origin = await fetchCreateBootId();
@@ -149,10 +176,32 @@ export function useSuggestions(
       onPrepare(prefill);
       return;
     }
-    setNotice(result.stale ? STALE_NOTICE : result.error);
+    // A stale item is explained by the reload; any other failure stays on its row.
+    if (result.stale) setNotice(STALE_NOTICE);
+    else setFailures((f) => ({ ...f, [key]: { message: result.error, another } }));
     await load();
     if (mounted.current) setBusy(null);
   };
 
-  return { snapshot, loading, loadFailed, refreshing, busy, notice, offline, load, act, refresh, start };
+  return { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, load, act, refresh, start };
+}
+
+/** Dismiss that can be undone for 10 s; `act` is the one from {@link useSuggestions}. */
+export function useDismissUndo(act: (key: string, run: () => Promise<SuggestionResult<unknown>>) => Promise<boolean>) {
+  const [undo, setUndo] = useState<SuggestionItem | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  const dismiss = async (item: SuggestionItem, dismissed: boolean) => {
+    const ok = await act(suggestionKey(item), () => dismissSuggestion(item.provider_id, item.id, dismissed));
+    if (!ok) return;
+    clearTimeout(timer.current);
+    if (dismissed) {
+      setUndo(item);
+      timer.current = setTimeout(() => setUndo(null), UNDO_MS);
+    } else {
+      setUndo(null);
+    }
+  };
+  return { undo, dismiss, clearUndo: () => setUndo(null) };
 }
