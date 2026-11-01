@@ -2008,6 +2008,8 @@ function AppContent({
                             startedBefore={hasStartedBefore(session)}
                             acpProvider={session.acp_provider ?? null}
                             clearAliases={session.clear_aliases}
+                            compactAliases={session.compact_aliases}
+                            onStartSession={() => void handleStartSession(session.id)}
                             archivedAt={session.archived_at ?? null}
                             snoozedUntil={session.snoozed_until ?? null}
                             trashedAt={session.trashed_at ?? null}
@@ -2232,6 +2234,7 @@ function AppContent({
     if (singlePane) {
       return (
         <MobileMainPane
+          onStartSession={(id) => void handleStartSession(id)}
           readOnly={!!serverAbout?.read_only}
           view={rightPanelView}
           pluginPanes={pluginPanes}

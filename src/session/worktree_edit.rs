@@ -272,6 +272,28 @@ pub fn stop_sandbox_container(session_id: &str, is_sandboxed: bool) -> anyhow::R
     }
 }
 
+/// Stop, but retain, the container this row pinned. Unpinned or replaced containers are
+/// left running rather than guessed from the current runtime configuration.
+pub(crate) fn stop_pinned_sandbox_container(row: &super::Instance) -> anyhow::Result<()> {
+    if !row.is_sandboxed() {
+        return Ok(());
+    }
+    let recorded = row
+        .sandbox_info
+        .as_ref()
+        .and_then(|s| s.container_id.as_deref());
+    match &row.sandbox_pin {
+        Some(pin) if recorded == Some(pin.container_id.as_str()) => {
+            pin.runtime.stop_container(&pin.container_id)
+        }
+        _ => {
+            tracing::warn!(target: "containers.runtime", session = %row.id,
+                "sandbox container target is not pinned; leaving it running");
+            Ok(())
+        }
+    }
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.
@@ -498,6 +520,63 @@ pub fn rollback_worktree_branch(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn pinned_stop_targets_only_the_recorded_container() {
+        // (sandboxed, pin id, recorded id, runtime exit, runtime stderr, expect call, expect ok)
+        let cases = [
+            (true, Some("c1"), Some("c1"), 0, "", true, true),
+            (
+                true,
+                Some("c1"),
+                Some("c1"),
+                1,
+                "Error: No such container: c1",
+                true,
+                true,
+            ),
+            (
+                true,
+                Some("c1"),
+                Some("c1"),
+                1,
+                "permission denied",
+                true,
+                false,
+            ),
+            (true, None, Some("c1"), 0, "", false, true),
+            (true, Some("c1"), Some("c2"), 0, "", false, true),
+            (false, Some("c1"), Some("c1"), 0, "", false, true),
+        ];
+        for (sandboxed, pinned, recorded, code, stderr, called, ok) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (pin, calls) = crate::session::test_support::fake_sandbox_pin(
+                dir.path(),
+                pinned.unwrap_or("c1"),
+                code,
+                stderr,
+            );
+            let mut row = crate::session::Instance::new("pinned stop", "/tmp/p");
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: sandboxed,
+                container_id: recorded.map(Into::into),
+                image: "img".into(),
+                container_name: "aoe-pinned".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            row.sandbox_pin = pinned.map(|_| pin);
+            let result = stop_pinned_sandbox_container(&row);
+            let label = format!("{sandboxed} {pinned:?} {recorded:?} {code} {stderr}");
+            assert_eq!(result.is_ok(), ok, "{label}");
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            assert_eq!(log.trim(), if called { "stop c1" } else { "" }, "{label}");
+        }
+    }
 
     fn wt_info(branch: &str, main_repo: &str, managed: bool) -> WorktreeInfo {
         WorktreeInfo {

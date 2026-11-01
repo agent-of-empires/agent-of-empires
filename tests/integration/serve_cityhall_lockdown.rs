@@ -102,6 +102,7 @@ async fn sensitive_routes_are_blocked() {
         // ACP worker and agent lifecycle plus config: admin surfaces with no
         // composer equivalent.
         (Method::POST, "/api/sessions/x/acp/spawn", "{}"),
+        (Method::POST, "/api/sessions/x/acp/restart", "{}"),
         (Method::DELETE, "/api/sessions/x/acp", ""),
         (
             Method::POST,

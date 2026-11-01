@@ -1,7 +1,7 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
 mod error;
-pub use error::{ApiErrorCode, ERROR_CODE_HEADER};
+pub use error::{ApiErrorCode, ERROR_CODE_HEADER, MANAGED_RESUME_CAUSE_HEADER};
 
 pub(crate) mod lifecycle;
 mod runtime;
@@ -143,6 +143,7 @@ pub(crate) enum LocalRuntimeError {
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     match code {
+        ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
         ApiErrorCode::ResumeFailed => {
             "Resume failed after start committed; the conversation is preserved for explicit retry"
@@ -153,6 +154,7 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
     match code {
+        Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
                 .into()
@@ -890,6 +892,7 @@ impl DaemonClient {
                 Some(
                     ApiErrorCode::StartFailed
                         | ApiErrorCode::ResumeFailed
+                        | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
                 )
             ) {
@@ -911,12 +914,14 @@ impl DaemonClient {
                     return Err(DaemonClientError::InvalidMutationReceipt);
                 }
             }
-            // D1: 409 lifecycle_locked maps from status plus the single finite
-            // server-owned header without reading the body. 401 maps from status
-            // alone; neither retains a body or token in the error.
+            // Finite rejections and 401 never retain a response body.
             if matches!(
                 code,
-                Some(ApiErrorCode::LifecycleLocked | ApiErrorCode::LifecycleSuperseded)
+                Some(
+                    ApiErrorCode::LifecycleLocked
+                        | ApiErrorCode::LifecycleSuperseded
+                        | ApiErrorCode::ManagedResumeRefused(_)
+                )
             ) || status == StatusCode::UNAUTHORIZED
             {
                 return Err(DaemonClientError::Status {
@@ -1055,14 +1060,20 @@ pub(crate) async fn decode_json_bounded<T: serde::de::DeserializeOwned>(
     limit: usize,
 ) -> Result<T, DaemonClientError> {
     let body = read_bounded_body(&mut response, limit).await?;
-    serde_json::from_slice(&body).map_err(|_| DaemonClientError::AuthenticatedDecode)
+    serde_json::from_slice(&body).map_err(|error| {
+        tracing::debug!(target: "daemon.client", %error, "daemon response decode failed");
+        DaemonClientError::AuthenticatedDecode
+    })
 }
 
 pub(crate) async fn decode_text(
     mut response: reqwest::Response,
 ) -> Result<String, DaemonClientError> {
     let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
-    String::from_utf8(body).map_err(|_| DaemonClientError::AuthenticatedDecode)
+    String::from_utf8(body).map_err(|error| {
+        tracing::debug!(target: "daemon.client", %error, "daemon response decode failed");
+        DaemonClientError::AuthenticatedDecode
+    })
 }
 
 async fn read_bounded_body(
@@ -1782,6 +1793,43 @@ mod tests {
             (500, "start_failed", "epoch-1", "3", true, false),
             (409, "resume_failed", "epoch-1", "3", true, false),
             (409, "purge_failed", "epoch-1", "3", true, false),
+            (409, "managed_resume_refused", "epoch-1", "3", true, false),
+            (409, "managed_resume_refused", "foreign", "3", false, true),
+            (409, "managed_resume_refused", "epoch-1", "0", false, true),
+            (
+                409,
+                "managed_resume_refused",
+                "absent",
+                "absent",
+                false,
+                false,
+            ),
+            (
+                409,
+                "managed_resume_refused",
+                "epoch-1",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                409,
+                "managed_resume_refused",
+                "epoch-1",
+                "3, 4",
+                false,
+                true,
+            ),
+            (500, "managed_resume_refused", "epoch-1", "3", false, false),
+            (
+                409,
+                "managed_resume_refused, resume_failed",
+                "epoch-1",
+                "3",
+                false,
+                false,
+            ),
+            (409, "MANAGED_RESUME_REFUSED", "epoch-1", "3", false, false),
             (409, "purge_failed", "foreign", "3", false, true),
             (409, "purge_failed", "epoch-1", "0", false, true),
             (409, "purge_failed", "absent", "absent", false, true),
@@ -1868,6 +1916,102 @@ mod tests {
             matches!(error, DaemonClientError::Status { .. }),
             "a non-mutation request cannot adopt an error ACK"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_resume_refusal_recovers_without_reflecting_private_bodies() {
+        use axum::response::IntoResponse;
+        for (unix, authenticated, cause) in [
+            (false, false, "wrapper_contract_required"),
+            (false, true, "wrapper_contract_required"),
+            (true, false, "wrapper_contract_required"),
+            (false, false, "secret-token"),
+        ] {
+            let expected = if cause == "wrapper_contract_required" {
+                crate::session::ManagedResumeCause::WrapperContractRequired
+            } else {
+                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            };
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("api.sock");
+            let app = axum::Router::new().route(
+                "/api/sessions/{id}/start",
+                axum::routing::post(move || async move {
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        [
+                            (ERROR_CODE_HEADER, "managed_resume_refused"),
+                            (MANAGED_RESUME_CAUSE_HEADER, cause),
+                            (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                            (RUNTIME_REVISION_HEADER, "3"),
+                        ],
+                        "private-path=/secret/store native-id=secret-id credential=secret-token",
+                    )
+                        .into_response()
+                }),
+            );
+            let (client, server, url) = if unix {
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (
+                    DaemonClient::new_unix(socket).unwrap(),
+                    server,
+                    "http://localhost".into(),
+                )
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let client =
+                    DaemonClient::new(&url, authenticated.then_some("secret-token")).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server, url)
+            };
+            for committed in [false, true] {
+                let error = if committed {
+                    client
+                        .mutate_session(
+                            "sess-1",
+                            &SessionMutation::Start(StartSessionBody::default()),
+                            "epoch-1",
+                        )
+                        .await
+                        .unwrap_err()
+                } else {
+                    client
+                        .request_response(
+                            client.http.post(format!("{url}/api/sessions/sess-1/start")),
+                        )
+                        .await
+                        .unwrap_err()
+                };
+                let message = error.to_string();
+                assert!(!format!("{error:?}").contains("secret"));
+                assert!(message.contains("aoe session set-session-id"), "{message}");
+                assert!(message.contains("--store"), "{message}");
+                assert!(!message.contains("secret"), "{message}");
+                if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
+                    assert!(message.contains("session.agent_execution_as"), "{message}");
+                    assert!(message.contains("session.agent_config_dir"), "{message}");
+                }
+                assert!(
+                    message.contains("aoe session set-session-id <session> \"\""),
+                    "{message}"
+                );
+                if committed {
+                    assert!(
+                        matches!(error, DaemonClientError::Committed { cursor, code }
+                        if cursor.revision == 3 && code == ApiErrorCode::ManagedResumeRefused(expected))
+                    );
+                } else {
+                    assert!(
+                        matches!(error, DaemonClientError::Status { code: Some(code), body, .. }
+                        if code == ApiErrorCode::ManagedResumeRefused(expected) && body.is_empty())
+                    );
+                }
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[test]

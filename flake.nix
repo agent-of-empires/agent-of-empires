@@ -174,7 +174,7 @@
               inherit cargoArtifacts;
               cargoTestExtraArgs = "--package agent-of-empires";
               # Some git:: unit tests invoke the git binary directly
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git ];
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git pkgs.curl ];
             });
           };
 

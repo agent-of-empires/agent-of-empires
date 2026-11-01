@@ -114,8 +114,15 @@ describe("PluginSessionMenu", () => {
   it("shields the menu until armed, then a page item resolves with its id", () => {
     const onClose = open({ items: [{ id: "move:done", label: "Move to Done" }] });
     expect(screen.getByTestId("sidebar-context-menu")).toBeTruthy();
-    // The page's items sit under its title, apart from the dashboard's actions.
+    // The page's items sit under its title, apart from the dashboard's actions, and above
+    // Move to Trash… so the destructive item stays last.
     expect(screen.getByText("Board")).toBeTruthy();
+    const pageItem = screen.getByRole("button", { name: "Move to Done" });
+    const trash = screen.getByTestId("sidebar-context-menu-delete");
+    expect(pageItem.compareDocumentPosition(trash) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // One rule between the page's tier and Trash, not two.
+    expect(trash.previousElementSibling?.className).toContain("border-t");
+    expect(trash.previousElementSibling?.previousElementSibling?.className ?? "").not.toContain("border-t");
     expect(backdrop().className).toContain("z-[60]");
     expect(backdrop().dataset.armed).toBeUndefined();
     fireEvent.mouseDown(backdrop());

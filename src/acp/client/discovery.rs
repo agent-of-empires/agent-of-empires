@@ -149,6 +149,15 @@ pub fn discover() -> Result<DaemonEndpoint, DiscoveryError> {
     discover_env().map_or_else(discover_local, Ok)
 }
 
+/// Make `--daemon-url` retarget every later `discover_env` call.
+///
+/// # Safety
+/// Call before any other thread reads the environment.
+pub unsafe fn export_daemon_url(url: &str) {
+    // SAFETY: forwarded to the caller.
+    unsafe { env::set_var("AOE_DAEMON_URL", url) };
+}
+
 pub fn discover_env() -> Option<DaemonEndpoint> {
     let url = env::var("AOE_DAEMON_URL").ok()?;
     let url = url.trim();

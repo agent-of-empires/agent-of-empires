@@ -1009,7 +1009,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         Ok(true)
     });
     match persist_result {
-        Ok(true) => crate::tips::record_session_creations(1),
+        Ok(true) => {
+            crate::tips::record_session_creations(1);
+            tracing::info!(
+                target: "session.create",
+                session = %instance.id,
+                title = %instance.title,
+                tool = %instance.tool,
+                view = if instance.is_structured() { "structured" } else { "terminal" },
+                project_path = %instance.project_path,
+                branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+                "session created"
+            );
+        }
         Ok(false) => {
             cleanup_partial_session(
                 &path,

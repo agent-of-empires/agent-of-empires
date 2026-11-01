@@ -158,6 +158,7 @@ fn record_built_sandbox(store: &NativeSessionStore, instance: &Instance) -> Resu
             crate::session::LifecycleReservationError::Superseded
         );
         row.sandbox_info = instance.sandbox_info.clone();
+        row.sandbox_pin = instance.sandbox_pin.clone();
         Ok(())
     })?;
     store

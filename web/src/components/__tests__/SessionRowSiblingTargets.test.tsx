@@ -75,7 +75,7 @@ describe("shared-worktree row session actions (#3387)", () => {
     expect(onStop).toHaveBeenCalledWith("s2");
   });
 
-  it("Restart to apply update acts on the stale sibling only", () => {
+  it("Restart to update acts on the stale sibling only", () => {
     const onRestartForUpdate = vi.fn();
     openRowMenu(makeWorkspace("w", [sibling("s1", { status: "Idle" }), sibling("s2", { update_restart: true })]), {
       onRestartForUpdate,
@@ -84,7 +84,7 @@ describe("shared-worktree row session actions (#3387)", () => {
     expect(onRestartForUpdate).toHaveBeenCalledWith("s2");
   });
 
-  it("hides Restart to apply update when no sibling is stale", () => {
+  it("hides Restart to update when no sibling is stale", () => {
     openRowMenu(makeWorkspace("w", [sibling("s1", { status: "Idle" })]));
     expect(screen.queryByTestId("sidebar-context-menu-restart-update")).toBeNull();
   });

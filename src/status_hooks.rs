@@ -296,10 +296,22 @@ impl StatusHooks {
                 if shutdown.is_cancelled() {
                     break;
                 }
-                if let Err(error) = run_hook_command_blocking(&command, &context, &project_path, &shutdown) {
-                    if !shutdown.is_cancelled() {
+                let started = std::time::Instant::now();
+                match run_hook_command_blocking(&command, &context, &project_path, &shutdown) {
+                    Ok(status) => {
+                        tracing::info!(target: "hooks.status_hooks",
+                            session = %context.session_id,
+                            from = ?context.old_status,
+                            to = ?context.new_status,
+                            exit = ?status.code(),
+                            duration_ms = started.elapsed().as_millis() as u64,
+                            "status hook ran"
+                        );
+                    }
+                    Err(error) if !shutdown.is_cancelled() => {
                         tracing::warn!(target: "hooks.status_hooks", session_id = %context.session_id, %error, "status hook failed");
                     }
+                    Err(_) => {}
                 }
             }
         }).await {
@@ -341,13 +353,13 @@ fn run_hook_command_blocking(
     context: &StatusHookContext,
     project_path: &Path,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::process::ExitStatus> {
     match crate::process::run_status_with_timeout_process_group(
         &mut build_command(command, context, project_path),
         HOOK_COMMAND_TIMEOUT,
         Some(shutdown),
     )? {
-        Some(status) if status.success() => Ok(()),
+        Some(status) if status.success() => Ok(status),
         Some(status) => Err(std::io::Error::other(format!(
             "command exited with status {:?}",
             status.code()

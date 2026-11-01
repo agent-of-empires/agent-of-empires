@@ -813,6 +813,46 @@ impl Instance {
         }
     }
 
+    pub(super) fn resolve_launch_execution(
+        &self,
+    ) -> Result<Option<super::execution::NativeExecution>> {
+        let target = self.conversation_target();
+        match (self.resolve_native_execution(target), target) {
+            (Ok(execution), _) => Ok(Some(execution)),
+            (Err(error), Some((sid, binding, explicit)))
+                if explicit
+                    || self.status_agent().is_some()
+                    || self.default_selector_agent().is_some()
+                    || binding.is_some_and(ConversationBinding::is_known) =>
+            {
+                if !matches!(self.resume_intent, ResumeIntent::Default) {
+                    return Err(error);
+                }
+                let cause = ManagedResumeCause::from_error(&error);
+                Err(error
+                    .context(format!(
+                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
+                        self.id
+                    ))
+                    .context(ManagedResumeRefused(cause)))
+            }
+            (Err(error), _)
+                if self.default_selector_agent().is_some_and(|agent| {
+                    agent.name == "prime-agent"
+                        && self.launch_invokes_resolved_agent_directly(agent)
+                        && (target.is_some() || self.prime_agent_launch_options().is_some())
+                }) =>
+            {
+                Err(error)
+            }
+            // A user command with no native agent does not consume a stored ID.
+            (Err(error), _) => {
+                tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
+                Ok(None)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn prepare_launch_command(
         &mut self,
@@ -860,45 +900,16 @@ impl Instance {
                         ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
                     ));
             let mut handoff_prior = None;
-            let execution = match self.resolve_native_execution(self.conversation_target()) {
-                Ok(execution) => {
-                    handoff_prior = self.hand_off_prime_fork_parent(&execution)?;
-                    if validate_target {
-                        self.validate_conversation_target(
-                            &execution.binding,
-                            execution.target_session_id.as_deref(),
-                        )?;
-                    }
-                    Some(execution)
+            let execution = self.resolve_launch_execution()?;
+            if let Some(execution) = execution.as_ref() {
+                handoff_prior = self.hand_off_prime_fork_parent(execution)?;
+                if validate_target {
+                    self.validate_conversation_target(
+                        &execution.binding,
+                        execution.target_session_id.as_deref(),
+                    )?;
                 }
-                Err(error)
-                    if self.default_selector_agent().is_some_and(|agent| {
-                        agent.name == "prime-agent"
-                            && self.launch_invokes_resolved_agent_directly(agent)
-                            && (managed || self.prime_agent_launch_options().is_some())
-                    }) =>
-                {
-                    return Err(error)
-                }
-                Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
-                    return Err(error);
-                }
-                // A stored id no context can attest is a deviation, not routine: warn.
-                Err(error) if managed => {
-                    // The `managed` arm above leaves only a Default launch, which
-                    // records an id by definition.
-                    let recorded = self
-                        .agent_session_id
-                        .as_deref()
-                        .expect("a managed default launch records a conversation id");
-                    tracing::warn!(target: "session.store", error = %error, recorded, "no attestable execution context for a recorded conversation; launching with the agent's own resume flags");
-                    None
-                }
-                Err(error) => {
-                    tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
-                    None
-                }
-            };
+            }
             let prior_canonical = if handoff_prior.is_some() {
                 handoff_prior
             } else if let Some(target) = execution
@@ -2761,53 +2772,83 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn an_unattestable_recorded_conversation_warns_at_launch() {
+    fn managed_resume_refuses_unattestable_execution_without_changing_identity() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
-            ("HOME", root.path().to_str().unwrap()),
-            ("CODEX_HOME", codex_home.to_str().unwrap()),
+            ("HOME", root.path().to_path_buf()),
+            ("CODEX_HOME", codex_home),
         ]);
-        // Nothing here can attest a Codex execution identity.
-        let _codex = crate::session::test_support::install_login_shell_path_command(
-            root.path(),
-            "codex",
-            "#!/bin/sh\nexit 1\n",
-        );
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";
-        let launch = |session_id: Option<&str>, intent: ResumeIntent| {
-            let mut inst = tool_instance("codex", project.to_str().unwrap());
-            inst.agent_session_id = session_id.map(str::to_owned);
-            inst.resume_intent = intent;
-            let capture = crate::session::test_support::LogCapture::start();
-            let _ = inst.prepare_launch_command(inst.conversation_state());
-            capture.contents()
-        };
-
-        let carried = launch(Some(sid), ResumeIntent::Default);
-        let warned = carried
-            .lines()
-            .find(|line| line.contains("WARN") && line.contains("no attestable execution context"))
-            .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
-        assert!(warned.contains(sid), "the warning names the conversation");
-        assert!(!carried.contains("native execution unavailable"));
-
-        // A cleared launch still holds its stored id this early, so it must not warn.
-        for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
-            let quiet = launch(session_id, ResumeIntent::Cleared);
-            assert!(
-                !quiet.contains("no attestable execution context"),
-                "a {label} launch must stay quiet:\n{quiet}"
+        for tool in ["codex", "omp"] {
+            let _agent = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                tool,
+                "#!/bin/sh\nexit 1\n",
             );
-            assert!(
-                quiet.lines().any(|line| line.contains("DEBUG")
-                    && line.contains("native execution unavailable; using native launch flags")),
-                "expected the debug line for a {label} launch:\n{quiet}"
-            );
+            for binding in [None, Some(ConversationBinding::unknown(sid))] {
+                let mut inst = tool_instance(tool, project.to_str().unwrap());
+                inst.set_agent_conversation(Some(sid.into()), binding, None);
+                inst.omp_capture_generation = Some("original-generation".into());
+                inst.resume_probe_failed_sid = Some(sid.into());
+                let before = inst.conversation_state();
+                let result = inst.prepare_launch_command(before.clone());
+                assert!(result.is_err(), "{tool} must not delegate an unattested ID");
+                assert_eq!(inst.conversation_state(), before);
+                assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(sid));
+                assert_eq!(
+                    inst.omp_capture_generation.as_deref(),
+                    Some("original-generation")
+                );
+            }
+            if tool == "omp" {
+                let mut inst = tool_instance(tool, project.to_str().unwrap());
+                let native = inst.resolve_native_execution(None).unwrap();
+                let store = &native.binding.stores[0];
+                assert!(store.starts_with(root.path().canonicalize().unwrap()));
+                let transcript = store.join(format!("original/time_{sid}.jsonl"));
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                let foreign = root.path().join("foreign");
+                std::fs::create_dir_all(&foreign).unwrap();
+                for cwd in [&project, &foreign] {
+                    std::fs::write(
+                        &transcript,
+                        format!(
+                            "{}\n",
+                            serde_json::json!({"type":"session","id":sid,"cwd":cwd})
+                        ),
+                    )
+                    .unwrap();
+                    let binding = inst
+                        .asserted_resume_binding(sid, Some(&transcript))
+                        .unwrap();
+                    inst.set_agent_conversation(Some(sid.into()), Some(binding), None);
+                    let before = inst.conversation_state();
+                    let prepared = inst.prepare_launch_command(before.clone());
+                    if cwd == &project {
+                        let prepared = prepared.unwrap();
+                        assert!(
+                            prepared.is_existing,
+                            "a bound transcript must resume, not start fresh"
+                        );
+                        assert_eq!(
+                            prepared.execution.unwrap().omp.unwrap().layout.sessions,
+                            transcript.parent().unwrap().canonicalize().unwrap()
+                        );
+                    } else {
+                        assert!(prepared.is_err(), "a foreign working directory must refuse");
+                    }
+                    assert_eq!(inst.conversation_state(), before);
+                }
+                std::fs::remove_file(&transcript).unwrap();
+                let before = inst.conversation_state();
+                assert!(inst.prepare_launch_command(before.clone()).is_err());
+                assert_eq!(inst.conversation_state(), before);
+            }
         }
     }
 
