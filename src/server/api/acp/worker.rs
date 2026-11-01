@@ -2282,21 +2282,28 @@ mod tests {
         let checked = std::panic::AssertUnwindSafe(async {
             assert!(state.acp_supervisor.current_lease(&row.id) == Some(lease.clone()));
             assert_eq!(resumed.status, Status::Idle);
+            let mut changes = state.status_tx.subscribe();
             assert!(!request.cancellation().is_cancelled());
             assert!(!restart.is_cancelled());
 
-            // Stop cancels the original producer; that producer must then finish.
+            // Keep the producer until Stop's exact native capture has committed.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
             let owner = state.clone();
             let id = row.id.clone();
             stopping = Some(tokio::spawn(async move {
                 shutdown_acp(State(owner), Path(id)).await.into_response()
             }));
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                lease.cancellation().cancelled(),
-            )
-            .await
-            .expect("external Stop cancels the original resume reservation");
+            tokio::time::timeout_at(deadline, lease.cancellation().cancelled())
+                .await
+                .expect("external Stop cancels the original resume reservation");
+            let change = tokio::time::timeout_at(deadline, changes.recv())
+                .await
+                .expect("external Stop commits its native capture before producer completion")
+                .expect("external Stop publishes its committed status");
+            assert_eq!(change.instance_id, row.id);
+            assert_eq!(change.effective_profile, resumed.source_profile);
+            assert_eq!(change.old, Status::Idle);
+            assert_eq!(change.new, Status::Stopped);
             assert!(reservation.as_ref().unwrap().cancellation().is_cancelled());
             drop(reservation.take());
         })
@@ -2322,6 +2329,7 @@ mod tests {
                 .status(),
             StatusCode::NO_CONTENT
         );
+        assert!(state.acp_supervisor.current_lease(&row.id).is_none());
         assert!(request.cancellation().is_cancelled());
         assert!(restart.is_cancelled());
         assert!(lease.cancellation().is_cancelled());
