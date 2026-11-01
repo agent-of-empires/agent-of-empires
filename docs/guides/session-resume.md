@@ -125,8 +125,10 @@ aoe session set-session-id <session> <native-id> --store /absolute/native/store
 OMP cannot authorize resume from a native ID alone when its conversation binding
 or exact transcript path is absent. This refusal does not delete the saved
 conversation or establish that its transcript is missing or its configuration
-changed. Rebind the intended conversation with its exact existing transcript
-file, not the directory, then start or restart the session:
+changed. Manual OMP transcript rebinding is supported only for host sessions;
+it is not supported for sandboxed sessions. For a host session, rebind the intended
+conversation with its exact existing transcript file, not the directory, then
+start or restart the session:
 
 ```sh
 aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl

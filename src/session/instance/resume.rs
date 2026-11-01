@@ -63,7 +63,8 @@ impl ManagedResumeCause {
                 "Managed resume refused: OMP transcript file is not bound.\n\
                  The native session ID alone is not enough to authorize resume.\n\
                  This refusal does not delete the saved conversation.\n\
-                 Bind the original conversation using its exact existing transcript file:\n\
+                 Manual transcript rebinding is not supported for sandboxed sessions.\n\
+                 For host sessions, bind the exact existing transcript file:\n\
                  aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n\
                  For OMP, --store must name the file, not its directory.\n\
                  Then start/restart the session."
