@@ -1139,6 +1139,12 @@ async fn trash_rejects_stale_or_already_trashed_targets_without_mutation() -> an
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        if !already_trashed {
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
+            );
+        }
         assert_eq!(std::fs::read(storage.sessions_path())?, before);
         assert!(!response
             .headers()

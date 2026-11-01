@@ -604,7 +604,7 @@ pub async fn trash_session(
                 return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
             }
             if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
-                return Err(LifecycleTargetError::Busy.into());
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
             }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),

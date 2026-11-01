@@ -1202,3 +1202,40 @@ fn trash_retained_transcript_is_read_only() {
         "restore or purge restarted an agent"
     );
 }
+
+#[test]
+#[parallel]
+fn trash_reader_ctrl_c_exits() {
+    use agent_of_empires::session::{Instance, Status};
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_ctrl_c");
+    h.stop_daemon_on_drop();
+    let mut row = Instance::new("TrashQuit", h.project_path().to_str().unwrap());
+    row.trashed_at = Some(chrono::Utc::now());
+    row.status = Status::Stopped;
+    std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Right");
+    h.wait_for("TrashQuit");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashQuit"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("Trash · read-only");
+    h.send_keys("Enter");
+    h.wait_for("Esc: sessions");
+    assert!(h
+        .tmux()
+        .args(["send-keys", "C-c"])
+        .status()
+        .unwrap()
+        .success());
+    h.wait_for_exit(Duration::from_secs(5));
+}

@@ -2197,7 +2197,9 @@ impl App {
             e2e_render_ack(false)?;
             return Ok(());
         }
-        if self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay() {
+        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
+        if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
+        {
             let _ = self.home.handle_key(key, self.update_info.as_ref());
             return Ok(());
         }
@@ -3755,6 +3757,61 @@ mod tests {
             (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
             _ => false,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_reader_ctrl_c_quits_or_confirms_pending_creation() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut inst = crate::session::Instance::new("retained quit", "/tmp");
+        inst.trash();
+        inst.source_profile = "test".into();
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.selected_session = Some(inst.id.clone());
+        app.home.retained_focus = Some((inst.id.clone(), inst.lifecycle_generation));
+        assert!(app.home.retained_reader_focused());
+        let backend =
+            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 40)),
+            },
+        )
+        .unwrap();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_c, &mut terminal).await.unwrap();
+        assert!(app.should_quit);
+        app.should_quit = false;
+        app.home.pending_creation = Some(crate::tui::home::PendingCreation {
+            daemon_id: None,
+            request_key: "other-creation".into(),
+            origin_epoch: "test".into(),
+            cancel_requested: false,
+            cancel_sent: false,
+            outcome_unknown: false,
+            confirmation: None,
+            reload_retry_at: None,
+        });
+        app.handle_key(ctrl_c, &mut terminal).await.unwrap();
+        assert!(!app.should_quit);
+        assert!(app.home.confirm_dialog.is_some());
+        assert!(app.home.is_creation_pending());
     }
 
     #[tokio::test]

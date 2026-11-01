@@ -196,10 +196,10 @@ still carries that original consent, so a concurrent restore cannot silently
 turn it into an ordinary session purge.
 
 The reader folds persisted ACP events across all retained pages, including events
-recorded before a switch to terminal view. Missing or unreadable event ranges are
-marked explicitly, even when no readable transcript rows remain. It does not
-import native agent history files: their formats and availability vary by agent
-and execution environment.
+recorded before a switch to terminal view. Missing or unreadable event ranges
+trigger a global incomplete-history warning, even when no readable transcript
+rows remain. The reader does not import native agent history files: their formats
+and availability vary by agent and execution environment.
 Missing content and read failures are shown without restarting the agent.
 Destroyed tmux scrollback cannot be recovered by this reader.
 
