@@ -3328,7 +3328,7 @@
         "web/src/components/acp/ContextPrimerBanner.tsx",
         "web/src/components/acp/useFilesIndex.ts"
       ],
-      "notes": "Lagged broadcast recovery is exercised through an upgraded WebSocket by src/server/acp_ws.rs::tests::lagged_broadcast_reports_gap_and_rebuilds_control_state; the former skipped browser sketch is not counted as coverage."
+      "notes": "Primer coverage requires fresh native readiness and accepted held input before force-end. src/server/acp_ws.rs::tests::lagged_broadcast_reports_gap_and_rebuilds_control_state exercises lagged recovery through an upgraded WebSocket."
     },
     {
       "id": "acp.mode-switch-tmux-teardown",

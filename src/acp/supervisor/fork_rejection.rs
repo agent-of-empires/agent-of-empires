@@ -899,6 +899,7 @@ mod tests {
                     .expect("buffered original typed rejection is received after handle transfer")
                     .unwrap();
             }
+            let rejection = lease.retirement().fork_rejection();
             release
                 .send(if journal == Journal::BeforeFork || supersede {
                     Some(supersede)
@@ -912,6 +913,20 @@ mod tests {
                 assert!(supervisor.acknowledge_retirement(&target).is_err());
             }
             supervisor.settle_fork_rejections().await;
+            if let Some(receipt) = rejection {
+                // Buffered replay's joined drain has already started this proof's driver.
+                tokio::time::timeout(Duration::from_secs(5), receipt.wait())
+                    .await
+                    .unwrap_or_else(|_| panic!(
+                        "fork checkpoint unfinished: reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered} state={}",
+                        receipt.settlement.load(Ordering::Acquire),
+                    ));
+                assert_eq!(
+                    receipt.committed(),
+                    !supersede,
+                    "reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered}",
+                );
+            }
             crate::server::acp_events::commit_background_bindings(&state).await;
             if journal != Journal::None {
                 let captured = target.clone();
@@ -973,7 +988,7 @@ mod tests {
             assert_eq!(
                 disk.fork_pending.as_deref(),
                 expected_parent,
-                "{reply:?}/{journal:?}"
+                "reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered}"
             );
             assert_eq!(
                 disk.import_pending,

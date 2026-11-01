@@ -517,37 +517,42 @@ pub(crate) fn retire_selected(selected: &WorkerRecord) -> Result<()> {
     })
 }
 
-pub(crate) fn register_runner(record: &WorkerRecord) -> Result<tokio::net::UnixListener> {
-    with_registry_admission(&record.session_id, || {
-        anyhow::ensure!(
-            stop_intent(&record.session_id)?.is_none(),
-            "worker launch cancelled by a stop request"
-        );
-        anyhow::ensure!(
-            load_strict_unlocked(&record.session_id)?.is_none(),
-            "previous worker ownership remains"
-        );
-        anyhow::ensure!(
-            record.runner_identity.is_some(),
-            "new runner birth identity unavailable"
-        );
-        let control = crate::process::worker::control_socket_sibling(&record.socket_path);
-        anyhow::ensure!(
-            crate::process::worker::peer_pid_from_socket(&control).is_none(),
-            "worker control socket still has a live owner"
-        );
-        if control.try_exists()? {
-            std::fs::remove_file(&control)?;
-        }
-        let listener = tokio::net::UnixListener::bind(&control)?;
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))?;
-        if let Err(error) = save_unlocked(record) {
-            let _ = std::fs::remove_file(&control);
-            return Err(error);
-        }
-        Ok(listener)
-    })
+pub(crate) fn register_runner(
+    record: &WorkerRecord,
+    registry: &RegistryGuard<'_>,
+) -> Result<tokio::net::UnixListener> {
+    anyhow::ensure!(
+        registry.session_id == record.session_id,
+        "runner registration scope changed"
+    );
+    anyhow::ensure!(
+        stop_intent(&record.session_id)?.is_none(),
+        "worker launch cancelled by a stop request"
+    );
+    anyhow::ensure!(
+        load_strict_unlocked(&record.session_id)?.is_none(),
+        "previous worker ownership remains"
+    );
+    anyhow::ensure!(
+        record.runner_identity.is_some(),
+        "new runner birth identity unavailable"
+    );
+    let control = crate::process::worker::control_socket_sibling(&record.socket_path);
+    anyhow::ensure!(
+        crate::process::worker::peer_pid_from_socket(&control).is_none(),
+        "worker control socket still has a live owner"
+    );
+    if control.try_exists()? {
+        std::fs::remove_file(&control)?;
+    }
+    let listener = tokio::net::UnixListener::bind(&control)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = save_unlocked(record) {
+        let _ = std::fs::remove_file(&control);
+        return Err(error);
+    }
+    Ok(listener)
 }
 
 pub(crate) fn recover_worker(session_id: &str) -> Result<()> {
@@ -1323,7 +1328,7 @@ mod tests {
         assert!(admit_resume(id, ResumeAuthority::Automatic, &Some(first.clone())).is_err());
         assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first.clone())).is_err());
         let replacement = record.clone().with_generation(2);
-        assert!(register_runner(&replacement).is_err());
+        assert!(register_runner(&replacement, &try_registry_lock(id).unwrap().unwrap()).is_err());
         assert_eq!(
             crate::process::worker::peer_pid_from_socket(&control),
             Some(std::process::id())
@@ -1334,7 +1339,8 @@ mod tests {
         assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first)).is_err());
         assert!(stop_requested(id));
         admit_resume(id, ResumeAuthority::Explicit, &Some(latest)).unwrap();
-        let listener = register_runner(&replacement).unwrap();
+        let listener =
+            register_runner(&replacement, &try_registry_lock(id).unwrap().unwrap()).unwrap();
         assert!(!stop_requested(id));
         assert_eq!(load(id).unwrap().unwrap().generation, 2);
         let newer = request_stop(&replacement).unwrap();

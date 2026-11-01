@@ -55,10 +55,14 @@ an uncommitted refusal. This is not a cross-file atomicity guarantee.
 
 Registry admission uses nonblocking flock acquisition. An attachment's existing
 three-second absolute budget begins before registry admission and follows its
-registration, revalidation and handshake stages. Higher supervisor and lifecycle
-guards are released before waiting, and all ownership fences are checked again
-afterward. No timed blocking mutator can later acquire the flock and change
-ownership after a refusal. Contention is deferred/unknown, not absent ownership,
+registration, revalidation and handshake stages. Supervisor worker and lifecycle
+map guards are released before waiting, then all ownership fences are rechecked.
+An already-born runner's self-registration has one three-second budget and uses
+its armed lifetime shutdown future for cancellation. Its native birth guard
+precedes registry acquisition and remains held through complete native birth;
+publication uses that acquired registry guard without nested flock acquisition.
+No timed blocking mutator can change ownership after refusal.
+Contention is deferred/unknown, not absent ownership,
 native channel loss or permission to replace a conversation. The reconciler
 refunds only a charged tick, retaining prior failures; an uncharged preliminary
 probe receives no refund. These bounds do not claim arbitrary synchronous
