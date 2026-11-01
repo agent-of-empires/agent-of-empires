@@ -8,6 +8,7 @@ import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../..
 
 interface Props {
   configOptions: AcpState["configOptions"];
+  nativeAvailable: boolean;
   pendingConfigOption: AcpState["pendingConfigOption"];
   onSetConfigOption: (configId: string, value: string) => void | Promise<void>;
   /** Pinned LLM backend, or null when the host environment decides. */
@@ -66,6 +67,7 @@ function providerDescriptor(provider: string | null | undefined): ConfigOptionDe
 
 export function SessionConfigControls({
   configOptions,
+  nativeAvailable,
   pendingConfigOption,
   onSetConfigOption,
   provider,
@@ -75,6 +77,7 @@ export function SessionConfigControls({
 }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
+  const nativeLockedReason = nativeAvailable ? null : "Native input is not currently confirmed";
 
   if (!model && !effort && !onSetProvider) return null;
 
@@ -85,6 +88,7 @@ export function SessionConfigControls({
           option={model}
           pending={pendingConfigOption?.configId === model.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(model.id, value)}
+          lockedReason={nativeLockedReason}
         />
       )}
       {effort && (
@@ -92,6 +96,7 @@ export function SessionConfigControls({
           option={effort}
           pending={pendingConfigOption?.configId === effort.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(effort.id, value)}
+          lockedReason={nativeLockedReason}
         />
       )}
       {onSetProvider && (
@@ -278,7 +283,7 @@ function EffortControl(props: SubProps) {
   return useSegmented ? <EffortSegmented {...props} /> : <ModelDropdown {...props} />;
 }
 
-function EffortSegmented({ option, pending, onSelect }: SubProps) {
+function EffortSegmented({ option, pending, onSelect, lockedReason }: SubProps) {
   return (
     <div
       role="radiogroup"
@@ -295,12 +300,12 @@ function EffortSegmented({ option, pending, onSelect }: SubProps) {
             type="button"
             role="radio"
             aria-checked={isCurrent}
-            disabled={isPending}
+            disabled={!!lockedReason || isPending}
             onClick={() => {
-              if (isPending || isCurrent) return;
+              if (lockedReason || isPending || isCurrent) return;
               void onSelect(opt.value);
             }}
-            title={opt.description ?? `${option.name}: ${opt.name}`}
+            title={lockedReason ?? opt.description ?? `${option.name}: ${opt.name}`}
             data-testid={`config-option-${option.id}-value-${opt.value}`}
             className={[
               "rounded px-2 py-0.5 text-[11px] font-medium transition-colors",

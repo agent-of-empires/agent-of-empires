@@ -63,6 +63,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         vec![],
         "test-acp-session-id".into(),
         true, // in_flight_turn
+        false,
         AcpSessionId("midturn-true".into()),
         None,
         "claude".into(),
@@ -109,6 +110,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         vec![],
         "test-acp-session-id".into(),
         false, // NOT in flight
+        false,
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
@@ -175,6 +177,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         vec![],
         session_id.into(),
         true, // in_flight_turn
+        false,
         AcpSessionId("midturn-disarm".into()),
         None,
         "claude".into(),
@@ -331,6 +334,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         vec![],
         acp_session_id.clone(),
         in_flight_turn,
+        false,
         AcpSessionId(session.into()),
         None,
         "claude".into(),
@@ -356,6 +360,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         vec![],
         acp_session_id,
         false,
+        false,
         AcpSessionId(session.into()),
         None,
         "claude".into(),
@@ -371,7 +376,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
 }
 
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

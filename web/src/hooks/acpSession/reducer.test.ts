@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
 
 import {
   applyEvent,
@@ -69,14 +70,21 @@ describe("locally resolved cards", () => {
     resolved: null,
   });
 
-  it("an approval removes its card and clears the error; an unknown nonce keeps both", () => {
-    const state = { ...empty(), lastError: "stale", pendingApprovals: [approval("n-1"), approval("n-2")] };
+  it("an approval clears only its matching interaction error; an unknown nonce keeps it", () => {
+    const state = reducer(
+      { ...empty(), pendingApprovals: [approval("n-1"), approval("n-2")] },
+      {
+        kind: "error",
+        message: "stale",
+        target: { kind: "approval", nonce: "n-1" },
+      },
+    );
     const next = reducer(state, { kind: "approval_resolved_locally", nonce: "n-1" });
     expect(next.pendingApprovals.map((a) => a.nonce)).toEqual(["n-2"]);
-    expect(next.lastError).toBeNull();
+    expect(next.interactionError).toBeNull();
     const noop = reducer(state, { kind: "approval_resolved_locally", nonce: "missing" });
     expect(noop.pendingApprovals).toHaveLength(2);
-    expect(noop.lastError).toBe("stale");
+    expect(noop.interactionError?.message).toBe("stale");
   });
 
   it("an accepted elicitation drops the card and records an optimistic answer row (#2209)", () => {
@@ -105,10 +113,99 @@ describe("locally resolved cards", () => {
     );
     expect(next.optimisticRows.some((r) => r.kind === "elicitation_answered")).toBe(false);
   });
+
+  it("keeps canonical typed and legacy failures through local and remote card resolution, including a failed HTTP retry", () => {
+    const typed = {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      reported_code: -32603,
+      observed_at_ms: 100,
+    } as const;
+    for (const evidence of [undefined, null, typed]) {
+      for (const kind of ["approval", "elicitation"] as const) {
+        for (const delivery of ["local", "remote"] as const) {
+          const nonce = kind === "approval" ? "n-1" : "e-1";
+          let failed = applyEvent(
+            {
+              ...empty(),
+              pendingApprovals: [approval("n-1")],
+              pendingElicitations: [elicitation("e-1")],
+            },
+            {
+              session_id: "s",
+              seq: 1,
+              event: { PromptRuntimeError: { message: "canonical operation failed", evidence } },
+            },
+          );
+          failed = applyEvent(failed, { session_id: "s", seq: 2, event: { Stopped: { reason: "prompt_failed" } } });
+          const resolve = (state: AcpState, target: string): AcpState =>
+            delivery === "local"
+              ? reducer(
+                  state,
+                  kind === "approval"
+                    ? { kind: "approval_resolved_locally", nonce: target }
+                    : { kind: "elicitation_resolved_locally", nonce: target, resolution: { action: "decline" } },
+                )
+              : applyEvent(state, {
+                  session_id: "s",
+                  seq: 3,
+                  event:
+                    kind === "approval"
+                      ? { ApprovalResolved: { nonce: target, decision: "Allow" } }
+                      : { ElicitationResolved: { nonce: target, outcome: "Declined" } },
+                });
+          const direct = resolve(failed, nonce);
+          expect(direct.lastError).toBe("canonical operation failed");
+          expect(direct.lastErrorEvidence).toEqual(evidence ?? null);
+          const retryFailed = reducer(failed, {
+            kind: "error",
+            message: "resolution HTTP request failed",
+            target: { kind, nonce },
+          });
+          expect(retryFailed.lastError).toBe("canonical operation failed");
+          expect(retryFailed.lastErrorEvidence).toEqual(evidence ?? null);
+          expect(resolve(retryFailed, "other-nonce").interactionError?.message).toBe("resolution HTTP request failed");
+          const resolved = resolve(retryFailed, nonce);
+          expect(resolved.interactionError).toBeNull();
+          expect(resolved.lastError).toBe("canonical operation failed");
+          expect(resolved.lastErrorEvidence).toEqual(evidence ?? null);
+          const dismissedInteraction = reducer(retryFailed, { kind: "clear_error" });
+          expect(dismissedInteraction.lastError).toBe("canonical operation failed");
+          expect(dismissedInteraction.interactionError).toBeNull();
+          expect(reducer(dismissedInteraction, { kind: "clear_error" }).lastError).toBeNull();
+          const unscoped = reducer(failed, { kind: "error", message: "unrelated client request failed" });
+          expect(resolve(unscoped, nonce).interactionError?.message).toBe("unrelated client request failed");
+          const next = applyEvent(resolved, {
+            session_id: "s",
+            seq: 4,
+            event: { UserPromptSent: { text: "next explicit request", prompt_id: "p2" } },
+          });
+          expect(next.lastError).toBeNull();
+          expect(next.lastErrorEvidence).toBeNull();
+          expect(next.interactionError).toBeNull();
+          const boundaries: AcpFrame["event"][] = [
+            "SessionCleared",
+            { AgentSwitched: { from: "old", to: "new", reason: "explicit switch" } },
+          ];
+          for (const event of boundaries) {
+            const cleared = applyEvent(retryFailed, { session_id: "s", seq: 4, event });
+            expect(cleared.lastError).toBeNull();
+            expect(cleared.lastErrorEvidence).toBeNull();
+            expect(cleared.interactionError).toBeNull();
+          }
+        }
+      }
+    }
+  });
 });
 
 describe("in-flight prompt settlement", () => {
-  const sent = (id: string) => reducer(empty(), { kind: "user_prompt", id, text: "hi" });
+  const sent = (id: string) => {
+    const receipt = currentControlSnapshot(empty(), { ready: true });
+    const live = reducer(empty(), { kind: "reduced_state", state: receipt.state, seq: receipt.seq, unchanged: [] });
+    return reducer(live, { kind: "user_prompt", id, text: "hi" });
+  };
 
   it("user_prompt records the id and shows the spinner immediately", () => {
     const state = sent("p1");
@@ -188,6 +285,7 @@ describe("prompt queue", () => {
     );
     const next = reducer(local, {
       kind: "hydrate_server_queue",
+      queueAtRead: local.queuedPrompts,
       rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
     });
     expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two", "just typed"]);
@@ -196,11 +294,17 @@ describe("prompt queue", () => {
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {
     const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
     const local = run(empty(), { kind: "enqueue_prompt", id: "q1", text: "img", attachments: [image] });
-    const kept = reducer(local, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "img", [ref])] });
+    const kept = reducer(local, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("q1", 0, "img", [ref])],
+      queueAtRead: local.queuedPrompts,
+    });
     expect(kept.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
 
-    const reloaded = reducer(empty(), {
+    const fresh = empty();
+    const reloaded = reducer(fresh, {
       kind: "hydrate_server_queue",
+      queueAtRead: fresh.queuedPrompts,
       rows: [serverRow("q2", 0, "reloaded", [{ ...ref, kind: "resource", mime_type: "text/plain", name: "n.txt" }])],
     });
     expect(reloaded.queuedPrompts[0]?.attachments?.[0]).toMatchObject({
@@ -209,6 +313,56 @@ describe("prompt queue", () => {
       name: "n.txt",
       dataB64: "",
     });
+  });
+
+  it("upserts the same queued id without duplicating it or losing attachment bytes", () => {
+    const first = reducer(empty(), { kind: "enqueue_prompt", id: "same", text: "original", attachments: [image] });
+    const next = run(
+      first,
+      { kind: "confirm_queued_prompt", id: "same" },
+      { kind: "enqueue_prompt", id: "same", text: "retained after refusal" },
+      { kind: "confirm_queued_prompt", id: "same" },
+    );
+    expect(next.queuedPrompts).toHaveLength(1);
+    expect(next.queuedPrompts[0]).toMatchObject({
+      id: "same",
+      text: "retained after refusal",
+      pending: false,
+      queuedAt: first.queuedPrompts[0]!.queuedAt,
+      attachments: [image],
+    });
+  });
+
+  it("ignores a stale GET that would erase new acknowledged intent or resurrect consumed intent", () => {
+    const before = empty();
+    const acknowledged = run(
+      before,
+      { kind: "enqueue_prompt", id: "queued", text: "accepted by server" },
+      { kind: "confirm_queued_prompt", id: "queued" },
+    );
+    expect(
+      reducer(acknowledged, {
+        kind: "hydrate_server_queue",
+        rows: [],
+        queueAtRead: before.queuedPrompts,
+      }),
+    ).toBe(acknowledged);
+    const consumed = reducer(acknowledged, { kind: "dequeue_prompt", id: "queued" });
+    expect(
+      reducer(consumed, {
+        kind: "hydrate_server_queue",
+        rows: [serverRow("queued", 0, "accepted by server")],
+        queueAtRead: acknowledged.queuedPrompts,
+      }),
+    ).toBe(consumed);
+    const settled = reducer(consumed, { kind: "dequeue_prompt", id: "queued" });
+    expect(
+      reducer(settled, {
+        kind: "hydrate_server_queue",
+        rows: [serverRow("queued", 0, "accepted by server")],
+        queueAtRead: consumed.queuedPrompts,
+      }),
+    ).toBe(settled);
   });
 });
 

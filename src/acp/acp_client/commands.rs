@@ -87,5 +87,6 @@ pub(super) enum ConnectMode {
     Resume {
         acp_session_id: String,
         in_flight_turn: bool,
+        unsuccessful_main: bool,
     },
 }

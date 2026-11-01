@@ -2859,6 +2859,36 @@ impl ConversationState {
             && self.active == instance.active_execution
             && self.pi_session_path == instance.pi_session_path
     }
+
+    fn checkpoint_routes(
+        binding: &Option<ConversationBinding>,
+        resume: &Option<ConversationBinding>,
+        active: &Option<ActiveExecution>,
+    ) -> [Option<Option<bool>>; 3] {
+        let marker = |binding: &Option<ConversationBinding>| {
+            binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.exported_default_store)
+        };
+        [
+            marker(binding),
+            marker(resume),
+            active
+                .as_ref()
+                .map(|active| active.binding.exported_default_store),
+        ]
+    }
+
+    pub(crate) fn matches_checkpoint(&self, row: &Instance) -> bool {
+        self.matches(row)
+            && Self::checkpoint_routes(&self.binding, &self.resume_binding, &self.active)
+                == Self::checkpoint_routes(
+                    &row.agent_session_binding,
+                    &row.resume_binding,
+                    &row.active_execution,
+                )
+    }
 }
 
 impl Instance {

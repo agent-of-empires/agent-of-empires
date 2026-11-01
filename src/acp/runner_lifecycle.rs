@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Registry generation and kernel birth identity of one runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
@@ -138,6 +138,7 @@ struct Construction {
     id: uuid::Uuid,
     cancellation: CancellationToken,
     retirement_authorized: std::sync::atomic::AtomicBool,
+    constructor_finished: std::sync::atomic::AtomicBool,
     runner: Mutex<Option<RunnerIdentity>>,
     scopes: Mutex<Vec<crate::process::worker_registry::ScopeOwnership>>,
     admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
@@ -154,6 +155,8 @@ struct Construction {
     /// Wall-clock ms of admission, refreshed on install so a slow start
     /// does not read as idle; atomic only so tests can backdate it.
     idle_baseline_ms: std::sync::atomic::AtomicI64,
+    #[cfg(test)]
+    child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl Default for Construction {
@@ -162,6 +165,7 @@ impl Default for Construction {
             id: uuid::Uuid::new_v4(),
             cancellation: CancellationToken::new(),
             retirement_authorized: std::sync::atomic::AtomicBool::new(true),
+            constructor_finished: std::sync::atomic::AtomicBool::new(false),
             runner: Mutex::default(),
             scopes: Mutex::default(),
             admission: Mutex::default(),
@@ -177,6 +181,8 @@ impl Default for Construction {
             idle_baseline_ms: std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp_millis(),
             ),
+            #[cfg(test)]
+            child_wait_completed: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -206,6 +212,12 @@ pub(crate) struct AdapterRetirementRoute {
 }
 
 impl Lease {
+    pub(crate) fn constructor_finished(&self) -> bool {
+        self.construction
+            .constructor_finished
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// When this epoch was admitted or last became running, in ms since the Unix epoch.
     pub(crate) fn idle_baseline_ms(&self) -> i64 {
         self.construction
@@ -218,6 +230,11 @@ impl Lease {
         self.construction
             .idle_baseline_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_child_wait_completed(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
+        self.construction.child_wait_completed.subscribe()
     }
 
     /// An attach observes the original runner until installation or an explicit stop.
@@ -364,9 +381,15 @@ impl Lease {
             assert!(runner.is_none(), "one physical child per construction");
             *runner = Some(identity);
         }
+        #[cfg(test)]
+        let wait_completed = self.construction.child_wait_completed.clone();
         if identity.birth_fingerprint.is_some() {
             tokio::spawn(async move {
-                let _ = child.wait().await;
+                let outcome = child.wait().await;
+                #[cfg(test)]
+                let _ = wait_completed.send_replace(Some(outcome.is_ok()));
+                #[cfg(not(test))]
+                let _ = outcome;
             });
             return;
         }
@@ -395,7 +418,11 @@ impl Lease {
                     break;
                 }
             }
-            let _ = child.wait().await;
+            let outcome = child.wait().await;
+            #[cfg(test)]
+            let _ = wait_completed.send_replace(Some(outcome.is_ok()));
+            #[cfg(not(test))]
+            let _ = outcome;
         });
     }
 
@@ -458,11 +485,14 @@ impl Lease {
     }
 
     pub(crate) fn set_admission(&self, admission: Option<crate::acp::supervisor::LaunchAdmission>) {
-        *self
+        let mut captured = self
             .construction
             .admission
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = admission;
+            .unwrap_or_else(|error| error.into_inner());
+        if captured.is_none() {
+            *captured = admission;
+        }
     }
 
     pub(crate) fn admission(&self) -> Option<crate::acp::supervisor::LaunchAdmission> {
@@ -471,6 +501,20 @@ impl Lease {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    pub(crate) fn native_scope(
+        &self,
+    ) -> Result<Option<crate::acp::state::NativeObservationScope>, ()> {
+        let admission = self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match admission.as_ref() {
+            None => Ok(None),
+            Some(admission) => admission.native_scope.clone().map(Some).ok_or(()),
+        }
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {
@@ -1045,6 +1089,31 @@ impl LifecycleTable {
         }
         true
     }
+    pub(crate) fn finish_preserved_construction(&mut self, lease: &Lease) -> bool {
+        let Some(entry) = self.current(lease) else {
+            return false;
+        };
+        if !matches!(
+            entry.phase,
+            Phase::Starting { .. } | Phase::Respawning { .. }
+        ) || lease.is_borrowed_attach()
+            || lease.spawned_runner().is_none()
+        {
+            return false;
+        }
+        entry
+            .construction
+            .constructor_finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        if lease.cancellation().is_cancelled() {
+            entry.sweep_owed = true;
+            entry.phase = Phase::TeardownRetry {
+                identity: lease.spawned_runner(),
+                attempts: 0,
+            };
+        }
+        true
+    }
 
     /// Ask for the session's worker to stop.
     pub fn begin_stop(
@@ -1071,7 +1140,17 @@ impl LifecycleTable {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => {
                 cancel.get_or_insert_with(|| reason.to_string());
                 lease.cancellation().cancel();
-                StopDecision::CancelRequested
+                if lease.constructor_finished() {
+                    let identity = lease.spawned_runner();
+                    entry.phase = Phase::Stopping {
+                        attempts: 0,
+                        since: Instant::now(),
+                    };
+                    entry.sweep_owed = true;
+                    StopDecision::TearDown { lease, identity }
+                } else {
+                    StopDecision::CancelRequested
+                }
             }
             Phase::Running { identity } => {
                 let identity = *identity;
@@ -1082,7 +1161,17 @@ impl LifecycleTable {
                 entry.sweep_owed = true;
                 StopDecision::TearDown { lease, identity }
             }
-            Phase::Stopping { .. } | Phase::TeardownRetry { .. } => {
+            Phase::TeardownRetry { identity, attempts } => {
+                let identity = *identity;
+                let attempts = *attempts;
+                entry.phase = Phase::Stopping {
+                    attempts,
+                    since: Instant::now(),
+                };
+                entry.sweep_owed = true;
+                StopDecision::TearDown { lease, identity }
+            }
+            Phase::Stopping { .. } => {
                 entry.sweep_owed = true;
                 StopDecision::AlreadyStopping
             }
@@ -2036,18 +2125,59 @@ mod tests {
     #[test]
     fn adopt_for_stop_tracks_a_disk_only_runner() {
         let mut table = LifecycleTable::new(1);
+        let runner = identity(3, 0);
         let lease = table.adopt_for_stop(ID).unwrap();
+        assert!(lease.record_runner(runner));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(Some(identity(3, 0))));
+        table.settle(&lease, Settlement::Unproven(Some(runner)));
+        assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]
         );
+        assert!(table.is_owned(ID));
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn),
+            Err(AdmitError::TeardownPending)
+        );
+        let StopDecision::TearDown {
+            lease: stop,
+            identity: captured,
+        } = table.begin_stop(ID, "explicit_stop", false)
+        else {
+            panic!("available retirement custody must be claimable");
+        };
+        assert_eq!(stop, lease);
+        assert_eq!(captured, Some(runner));
+        assert!(table.current_lease(ID) == Some(lease.clone()));
         assert!(matches!(
-            table.begin_stop(ID, "x", false),
+            table.begin_stop(ID, "explicit_stop", false),
             StopDecision::AlreadyStopping
         ));
+        assert!(table.claim_retry(ID, Duration::from_secs(15)).is_none());
+        table.settle(&stop, Settlement::Proven);
+        assert!(
+            table.is_owned(ID),
+            "physical proof cannot discard unacknowledged stop completion"
+        );
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn),
+            Err(AdmitError::TeardownPending)
+        );
+        let retry = table
+            .claim_retry(ID, Duration::from_secs(15))
+            .expect("completion debt retains claimable original custody");
+        assert_eq!(retry.lease, lease);
+        assert_eq!(retry.identity, Some(runner));
+        retry.lease.stop_completion_done();
+        table.settle(&retry.lease, Settlement::Proven);
+        assert_eq!(table.phase(ID), WorkerPhase::Absent);
+        let successor = table.admit(ID, ResumeKind::Spawn).unwrap();
+        table.install(&successor, Some(identity(4, 1))).unwrap();
+        table.settle(&lease, Settlement::Proven);
+        assert!(table.current_lease(ID) == Some(successor));
+        assert_eq!(table.phase(ID), WorkerPhase::Running);
     }
 
     #[test]

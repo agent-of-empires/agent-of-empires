@@ -254,7 +254,8 @@ mod tests {
         attempted: std::collections::HashSet<String>,
         respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>>,
         parked: std::collections::HashSet<String>,
-        capacity_deferred: std::collections::HashSet<String>,
+        resume_deferred:
+            std::collections::HashMap<String, crate::server::acp_reconciler::ResumeDeferral>,
     }
 
     impl ReconcilerTick {
@@ -271,7 +272,7 @@ mod tests {
                 &mut cadence,
                 &mut self.respawn_history,
                 &mut self.parked,
-                &mut self.capacity_deferred,
+                &mut self.resume_deferred,
             )
             .await;
         }

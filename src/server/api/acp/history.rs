@@ -322,6 +322,7 @@ pub async fn acp_replay(
             .events
             .into_iter()
             .map(|(seq, event)| crate::server::AcpBroadcastFrame {
+                native_subject: None,
                 session_id: id.clone(),
                 seq,
                 event: Arc::new(event),

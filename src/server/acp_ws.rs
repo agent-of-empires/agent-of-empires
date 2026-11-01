@@ -115,6 +115,7 @@ async fn handle(
     };
 
     // Replay events newer than `since` immediately on connect.
+    let mut runtime_snapshots = state.runtime.subscribe_snapshots();
     let replay_count = drain_replay_into_socket(
         &mut socket,
         &state,
@@ -194,6 +195,14 @@ async fn handle(
                     break;
                 }
             }
+            changed = runtime_snapshots.changed() => {
+                if changed.is_err() { break; }
+                if !send_native_state(
+                    &state, &mut socket, &session_id, last_applied_seq, &reduced, &mut cold, true,
+                ).await {
+                    break;
+                }
+            }
             event = rx.recv() => {
                 match event {
                     Ok(frame) => {
@@ -218,7 +227,7 @@ async fn handle(
                             last_applied_seq = frame.seq;
                             let _ = reduced.apply_event(frame.seq, (*frame.event).clone());
                         }
-                        if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
+                        if !send_reduced_state(&state, &mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
                             break;
                         }
                         // Fold the same event into the transcript render model and push
@@ -274,6 +283,7 @@ async fn handle(
                         // The cold-field cache still describes what this socket
                         // holds, so an unchanged command list stays omitted.
                         if !send_reduced_state(
+                            &state,
                             &mut socket,
                             &session_id,
                             highest,
@@ -340,6 +350,7 @@ async fn drain_replay_into_socket(
             continue;
         }
         let frame = AcpBroadcastFrame {
+            native_subject: None,
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event),
@@ -359,7 +370,15 @@ async fn drain_replay_into_socket(
         sent += 1;
     }
     // Connect snapshot.
-    let _ = send_reduced_state(socket, session_id, snapshot_seq, folds.reduced, folds.cold).await;
+    let _ = send_reduced_state(
+        state,
+        socket,
+        session_id,
+        snapshot_seq,
+        folds.reduced,
+        folds.cold,
+    )
+    .await;
     // Transcript connect snapshot.
     let _ = send_transcript_snapshot(socket, session_id, snapshot_seq, folds.transcript).await;
     sent
@@ -425,6 +444,8 @@ struct ConnectionFolds<'a> {
 #[derive(Default)]
 struct ColdFieldCache {
     hashes: std::collections::HashMap<&'static str, u64>,
+    native: Option<crate::acp::state::NativeAvailabilityProjection>,
+    snapshot_seq: u64,
 }
 
 impl ColdFieldCache {
@@ -457,11 +478,64 @@ impl ColdFieldCache {
 
 /// Serialize and send the reduced control state as a `kind`-tagged `reduced_state` frame.
 async fn send_reduced_state(
+    owner: &AppState,
     socket: &mut WebSocket,
     session_id: &str,
     seq: u64,
     reduced: &AcpState,
     cold: &mut ColdFieldCache,
+) -> bool {
+    send_native_state(owner, socket, session_id, seq, reduced, cold, false).await
+}
+
+async fn send_native_state(
+    owner: &AppState,
+    socket: &mut WebSocket,
+    session_id: &str,
+    seq: u64,
+    reduced: &AcpState,
+    cold: &mut ColdFieldCache,
+    only_if_changed: bool,
+) -> bool {
+    let observation = owner
+        .session_service
+        .native_control_observation(
+            session_id,
+            reduced.native_availability,
+            reduced.native_control_seq,
+        )
+        .await;
+    if observation.is_contended() {
+        if cold.native != Some(observation.projection)
+            && !send_projected_reduced_state(
+                socket,
+                session_id,
+                seq,
+                reduced,
+                cold,
+                observation.projection,
+            )
+            .await
+        {
+            return false;
+        }
+    } else if only_if_changed && cold.native == Some(observation.projection) {
+        return true;
+    }
+    let native = owner
+        .session_service
+        .settle_native_control_observation(session_id, observation)
+        .await;
+    send_projected_reduced_state(socket, session_id, seq, reduced, cold, native).await
+}
+
+async fn send_projected_reduced_state(
+    socket: &mut WebSocket,
+    session_id: &str,
+    seq: u64,
+    reduced: &AcpState,
+    cold: &mut ColdFieldCache,
+    native: crate::acp::state::NativeAvailabilityProjection,
 ) -> bool {
     let mut state = match serde_json::to_value(reduced) {
         Ok(v) => v,
@@ -470,6 +544,28 @@ async fn send_reduced_state(
             return true;
         }
     };
+    state["connection_ready"] = serde_json::json!(native.ready);
+    state["connection_unavailable"] = serde_json::json!(native.unavailable);
+    state["prompt_wake_eligible"] = serde_json::json!(native.prompt_wake_eligible);
+    let channel_loss = native
+        .unavailable
+        .is_some_and(|unavailable| unavailable.source.is_channel_loss());
+    if channel_loss || native.control_failure.is_some() {
+        for field in ["turn_active", "cancelling", "compacting"] {
+            state[field] = serde_json::Value::Bool(false);
+        }
+    }
+    if channel_loss {
+        for field in ["pending_approvals", "pending_elicitations"] {
+            state[field] = serde_json::json!([]);
+        }
+        for field in ["in_flight_tool", "thinking", "compacting_tool_call_id"] {
+            state[field] = serde_json::Value::Null;
+        }
+    }
+    cold.native = Some(native);
+    let seq = seq.max(cold.snapshot_seq).max(reduced.last_seq);
+    cold.snapshot_seq = seq;
     let unchanged = cold.strip_unchanged(&mut state);
     let frame = serde_json::json!({
         "kind": "reduced_state",
@@ -1062,6 +1158,625 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn contended_native_observation_requalifies_at_the_same_frontier_without_holding_guards()
+    {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            None,
+            Loss,
+            Producer,
+            Incarnation,
+            Profile,
+        }
+        for (lifecycle_contention, change) in [
+            (false, Change::None),
+            (true, Change::None),
+            (false, Change::Loss),
+            (true, Change::Loss),
+            (false, Change::Producer),
+            (true, Change::Incarnation),
+            (true, Change::Profile),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut row = crate::session::Instance::new("held native turn", "/tmp");
+            row.id = "s-1".into();
+            row.view = crate::session::View::Structured;
+            row.source_profile = "default".into();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state.acp_supervisor.test_insert_worker("s-1").await;
+            let storage = Arc::new(crate::session::Storage::open_reference("default").unwrap());
+            let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+            state
+                .acp_supervisor
+                .current_lease("s-1")
+                .unwrap()
+                .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                    store: storage.clone(),
+                    generation: row.lifecycle_generation,
+                    namespace: Some(state.profile_namespace.clone()),
+                    native_scope: Some(scope.clone()),
+                }));
+            state.acp_supervisor.test_observe_native_ready("s-1").await;
+            state
+                .acp_event_store
+                .record(
+                    "s-1",
+                    1,
+                    &crate::acp::state::test_support::prompt("held until explicitly cancelled"),
+                )
+                .unwrap();
+            let original = state
+                .acp_supervisor
+                .current_native_availability("s-1")
+                .await
+                .unwrap();
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let held_lifecycle = original.lifecycle.clone();
+            let held_scope = scope.clone();
+            let blocker = tokio::task::spawn_blocking(move || {
+                if lifecycle_contention {
+                    let _held = held_lifecycle.lock().unwrap();
+                    entered_tx.send(()).unwrap();
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+                } else {
+                    let _held = held_scope.fence.lock_observation().unwrap();
+                    entered_tx.send(()).unwrap();
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+                }
+            });
+            entered.await.unwrap();
+            let (mut socket, server) = connect_test_socket(state.clone()).await;
+            let unknown = receive_kind(&mut socket, "reduced_state").await;
+            assert_eq!(unknown["seq"], 1);
+            assert_eq!(
+                unknown["state"]["connection_ready"], false,
+                "{lifecycle_contention}/{change:?}"
+            );
+            assert!(unknown["state"]["connection_unavailable"].is_null());
+            assert_eq!(unknown["state"]["prompt_wake_eligible"], false);
+            assert!(
+                state.instances.try_write().is_ok(),
+                "instances must be free while observation waits"
+            );
+            assert!(
+                state.publication.try_write().is_ok(),
+                "publication must be free while observation waits"
+            );
+            assert!(state
+                .session_service
+                .try_prompt_submission("s-1")
+                .await
+                .is_some());
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                state.acp_supervisor.current_native_availability("s-1"),
+            )
+            .await
+            .expect("worker map must be free while waiting")
+            .unwrap();
+            let cache = state.session_service.acp_control_cache.clone();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || cache.native_metadata("s-1")),
+            )
+            .await
+            .expect("cache slot must be free while waiting")
+            .unwrap();
+            if lifecycle_contention {
+                assert!(
+                    scope
+                        .fence
+                        .try_lock_observation_matching(|_| true)
+                        .unwrap()
+                        .is_some(),
+                    "lifecycle contention must not retain the native fence"
+                );
+            } else {
+                assert!(
+                    original.lifecycle.try_lock().is_ok(),
+                    "native contention must not retain lifecycle"
+                );
+            }
+            match change {
+                Change::None => {}
+                Change::Loss => original.client.test_observe_native_loss(),
+                Change::Producer => {
+                    state.acp_supervisor.test_respawn_worker("s-1").await;
+                }
+                Change::Incarnation => {
+                    let new_created = row.created_at + chrono::Duration::seconds(1);
+                    let disk = storage.clone();
+                    tokio::task::spawn_blocking(move || {
+                        disk.update(|rows, _| {
+                            rows.iter_mut()
+                                .find(|row| row.id == "s-1")
+                                .unwrap()
+                                .created_at = new_created;
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    state.instances.write().await[0].created_at = new_created;
+                }
+                Change::Profile => {
+                    let mut moved = row.clone();
+                    moved.source_profile = "superseded-profile".into();
+                    let disk = storage.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::session::Storage::new_unwatched("superseded-profile")
+                            .unwrap()
+                            .update(|rows, _| {
+                                rows.push(moved);
+                                Ok(())
+                            })
+                            .unwrap();
+                        disk.update(|rows, _| {
+                            rows.retain(|row| row.id != "s-1");
+                            Ok(())
+                        })
+                        .unwrap();
+                    })
+                    .await
+                    .unwrap();
+                    state.instances.write().await[0].source_profile = "superseded-profile".into();
+                }
+            }
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let settled = receive_kind(&mut socket, "reduced_state").await;
+            assert_eq!(
+                settled["seq"], 1,
+                "qualification does not require another ACP event"
+            );
+            assert_eq!(state.acp_event_store.highest_seq("s-1"), 1);
+            assert_eq!(settled["state"]["prompt_wake_eligible"], false);
+            match change {
+                Change::None => {
+                    assert_eq!(settled["state"]["connection_ready"], true);
+                }
+                Change::Loss => {
+                    assert_eq!(settled["state"]["connection_ready"], false);
+                    assert!(!settled["state"]["connection_unavailable"].is_null());
+                }
+                Change::Producer | Change::Incarnation | Change::Profile => {
+                    assert_eq!(settled["state"]["connection_ready"], false);
+                    assert!(settled["state"]["connection_unavailable"].is_null());
+                }
+            }
+            state.shutdown.cancel();
+            drop(socket);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn physical_owner_replacement_during_native_wait_cannot_restore_old_ready() {
+        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use crate::process::worker_registry;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::TempDir::new().unwrap();
+        let mut row = crate::session::Instance::new(
+            "owned native observation",
+            project.path().to_str().unwrap(),
+        );
+        row.id = "s-1".into();
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        row.acp_session_id = Some("same-native".into());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut original_runner = HeldAttachRunner::ready(
+            "s-1",
+            project.path(),
+            17,
+            Some("default"),
+            Some("same-native"),
+        )
+        .await;
+        let mut events = state.acp_events_tx.subscribe();
+        state
+            .acp_supervisor
+            .attach("s-1".into(), project.path().into(), Vec::new(), false, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = events.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned { .. }) {
+                    break;
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await
+        .expect("authenticated current runner establishes its native session");
+        assert_eq!(original_runner.resumed_session().await, "same-native");
+        let current = state
+            .acp_supervisor
+            .current_native_availability("s-1")
+            .await
+            .unwrap();
+        assert_eq!(current.owner, Some(original_runner.identity));
+        assert!(current.owner.unwrap().birth_fingerprint.is_some());
+        assert!(
+            state
+                .session_service
+                .native_control_projection("s-1", None, 0)
+                .await
+                .ready
+        );
+        let frontier = state.acp_event_store.highest_seq("s-1");
+        let scope = current.lease.admission().unwrap().native_scope.unwrap();
+        let held_scope = scope.clone();
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _held = held_scope.fence.lock_observation().unwrap();
+            entered_tx.send(()).unwrap();
+            let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        entered.await.unwrap();
+        let (mut socket, server) = connect_test_socket(state.clone()).await;
+        let unknown = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(unknown["seq"], frontier);
+        assert_eq!(unknown["state"]["connection_ready"], false);
+        // A genuinely different child now owns the published control route.
+        // Keep native generation, row selection and the old local lease fixed.
+        let replacement = HeldAttachRunner::ready(
+            "s-1",
+            project.path(),
+            17,
+            Some("default"),
+            Some("same-native"),
+        )
+        .await;
+        assert_ne!(replacement.identity, original_runner.identity);
+        assert_eq!(
+            replacement.identity.generation,
+            original_runner.identity.generation
+        );
+        assert!(worker_registry::is_record_live(&original_runner.record));
+        assert!(worker_registry::is_record_live(&replacement.record));
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let invalidated = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(invalidated["seq"], frontier);
+        assert_eq!(invalidated["state"]["connection_ready"], false);
+        assert_eq!(invalidated["state"]["prompt_wake_eligible"], false);
+        assert_eq!(state.acp_event_store.highest_seq("s-1"), frontier);
+        assert!(state.acp_supervisor.current_lease("s-1") == Some(current.lease.clone()));
+        assert!(
+            worker_registry::is_record_live(&original_runner.record),
+            "projection must not retire either actor"
+        );
+        assert!(worker_registry::is_record_live(&replacement.record));
+        state.acp_supervisor.test_remove_worker("s-1").await;
+        current.client.shutdown().await.unwrap();
+        state.shutdown.cancel();
+        drop(socket);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn current_loss_refreshes_the_same_frontier_and_retires_impossible_controls() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut row = crate::session::Instance::new("current native", "/tmp/current-native");
+        row.id = "s-1".into();
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state.acp_supervisor.test_insert_worker("s-1").await;
+        let storage = Arc::new(crate::session::Storage::open_reference("default").unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+        state
+            .acp_supervisor
+            .current_lease("s-1")
+            .unwrap()
+            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                store: storage,
+                generation: row.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+                native_scope: Some(scope),
+            }));
+        state.acp_supervisor.test_observe_native_ready("s-1").await;
+        let approval = crate::acp::permissions::build_approval(
+            crate::acp::state::ToolCall {
+                id: "pending".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let events = [
+            crate::acp::state::test_support::prompt("original"),
+            Event::ApprovalRequested { approval },
+            Event::ElicitationRequested {
+                elicitation: crate::acp::elicitations::Elicitation {
+                    nonce: crate::acp::approvals::Nonce("question".into()),
+                    message: "Pick".into(),
+                    title: None,
+                    description: None,
+                    tool_call_id: None,
+                    questions: Vec::new(),
+                    requested_at: chrono::Utc::now(),
+                    resolved: None,
+                },
+            },
+            Event::PromptRuntimeError {
+                message: "retained request diagnostic".into(),
+                evidence: None,
+                native_subject: None,
+            },
+            Event::Stopped {
+                reason: "prompt_failed".into(),
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record("s-1", index as u64 + 1, event)
+                .unwrap();
+        }
+        let (mut socket, server) = connect_test_socket(state.clone()).await;
+        let initial = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(initial["seq"], 5);
+        assert_eq!(
+            initial["state"]["connection_ready"], true,
+            "current Available needs no historical ready event and survives an ordinary error"
+        );
+        assert_eq!(
+            initial["state"]["pending_approvals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            initial["state"]["pending_elicitations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        receive_kind(&mut socket, "transcript_snapshot").await;
+        let current = state
+            .acp_supervisor
+            .current_native_availability("s-1")
+            .await
+            .unwrap();
+        current.client.test_observe_native_loss();
+        state.runtime.publish(&state).await.unwrap();
+        let lost = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(
+            lost["seq"], initial["seq"],
+            "health refresh does not fabricate a durable event"
+        );
+        assert_eq!(lost["state"]["connection_ready"], false);
+        assert_eq!(
+            lost["state"]["connection_unavailable"]["cause"],
+            "stdout_eof"
+        );
+        assert_eq!(lost["state"]["pending_approvals"], serde_json::json!([]));
+        assert_eq!(lost["state"]["pending_elicitations"], serde_json::json!([]));
+        assert_eq!(lost["state"]["turn_active"], false);
+        assert_eq!(
+            state.acp_event_store.replay_from("s-1", 0).len(),
+            events.len(),
+            "retiring actionable metadata synthesizes no human decisions"
+        );
+        state.shutdown.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_management_preserves_retained_work_but_neither_refusal_nor_eof_admits_input() {
+        use crate::acp::state::{AcpConnectionSource, ToolCall};
+        use crate::process::worker_registry;
+        use axum::response::IntoResponse;
+        for management_refusal in [true, false] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let mut row =
+                crate::session::Instance::new("retained native work", "/tmp/retained-work");
+            row.id = "s-1".into();
+            row.view = crate::session::View::Structured;
+            row.source_profile = "default".into();
+            row.acp_session_id = Some("retained".into());
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let commands = if management_refusal {
+                // A genuinely live retained owner with unknown protocol, not a
+                // fabricated SDK/native EOF or an unattested replacement.
+                let record = worker_registry::WorkerRecord::new(
+                    row.id.clone(),
+                    std::process::id(),
+                    worker_registry::socket_path_for(&row.id).unwrap(),
+                    "fixture".into(),
+                    "claude".into(),
+                    "/tmp/retained-work".into(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Some("retained".into()),
+                    Some("default".into()),
+                )
+                .with_generation(17);
+                assert!(record.runner_identity.is_some());
+                worker_registry::save(&record).unwrap();
+                None
+            } else {
+                let commands = state
+                    .acp_supervisor
+                    .test_insert_worker_cmd_recording("s-1")
+                    .await;
+                let storage = Arc::new(crate::session::Storage::open_reference("default").unwrap());
+                let scope =
+                    crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+                state
+                    .acp_supervisor
+                    .current_lease("s-1")
+                    .unwrap()
+                    .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                        store: storage,
+                        generation: row.lifecycle_generation,
+                        namespace: Some(state.profile_namespace.clone()),
+                        native_scope: Some(scope),
+                    }));
+                state.acp_supervisor.test_observe_native_ready("s-1").await;
+                state
+                    .acp_supervisor
+                    .current_native_availability("s-1")
+                    .await
+                    .unwrap()
+                    .client
+                    .test_observe_native_loss();
+                Some(commands)
+            };
+            let tool = ToolCall {
+                id: "active-tool".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            };
+            let events = [
+                crate::acp::state::test_support::prompt("original retained work"),
+                Event::ToolCallStarted {
+                    tool_call: tool.clone(),
+                },
+                Event::ThinkingStarted,
+                Event::ConversationCompactionStarted,
+                Event::CancelRequested {
+                    escalates_at: chrono::Utc::now(),
+                },
+                Event::ApprovalRequested {
+                    approval: crate::acp::permissions::build_approval(tool, Vec::new()),
+                },
+                Event::ElicitationRequested {
+                    elicitation: crate::acp::elicitations::Elicitation {
+                        nonce: crate::acp::approvals::Nonce("pending".into()),
+                        message: "Pick".into(),
+                        title: None,
+                        description: None,
+                        tool_call_id: None,
+                        questions: Vec::new(),
+                        requested_at: chrono::Utc::now(),
+                        resolved: None,
+                    },
+                },
+            ];
+            for (index, event) in events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record("s-1", index as u64 + 1, event)
+                    .unwrap();
+            }
+            let (mut socket, server) = connect_test_socket(state.clone()).await;
+            let snapshot = receive_kind(&mut socket, "reduced_state").await;
+            receive_kind(&mut socket, "transcript_snapshot").await;
+            let projected = &snapshot["state"];
+            assert_eq!(projected["connection_ready"], false);
+            assert_eq!(projected["prompt_wake_eligible"], false);
+            assert_eq!(projected["turn_active"], management_refusal);
+            assert_eq!(projected["cancelling"], management_refusal);
+            assert_eq!(projected["compacting"], management_refusal);
+            assert_eq!(projected["in_flight_tool"].is_object(), management_refusal);
+            assert_eq!(projected["thinking"].is_object(), management_refusal);
+            assert_eq!(
+                projected["pending_approvals"].as_array().unwrap().len(),
+                usize::from(management_refusal)
+            );
+            assert_eq!(
+                projected["pending_elicitations"].as_array().unwrap().len(),
+                usize::from(management_refusal)
+            );
+            let expected_source = if management_refusal {
+                AcpConnectionSource::RunnerRecord
+            } else {
+                AcpConnectionSource::Native
+            };
+            assert_eq!(
+                projected["connection_unavailable"]["source"],
+                serde_json::to_value(expected_source).unwrap()
+            );
+
+            // Exercise actual prompt admission, not merely copied wire fields:
+            // both projections prohibit new delivery/wake/queue/budget effects.
+            let before = state.acp_event_store.highest_seq("s-1");
+            let budget = state.acp_event_store.rate_limit_redelivery_streak("s-1");
+            let response = crate::server::api::acp_prompt(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("s-1".into()),
+                Ok(axum::Json(
+                    serde_json::from_value(serde_json::json!({
+                        "text":"must not be delivered", "prompt_id":"blocked",
+                    }))
+                    .unwrap(),
+                )),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            assert_eq!(state.acp_event_store.highest_seq("s-1"), before);
+            assert_eq!(
+                state.acp_event_store.rate_limit_redelivery_streak("s-1"),
+                budget
+            );
+            assert!(state.instances.read().await[0].queued_prompts.is_empty());
+            assert!(
+                state.acp_event_store.has_in_flight_turn("s-1"),
+                "projection must not fabricate a terminal or permission decision in history"
+            );
+            if let Some(commands) = commands {
+                assert!(commands.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    state.acp_supervisor.worker_state("s-1").await,
+                    crate::daemon::AcpWorkerState::Absent
+                );
+                let record = worker_registry::load("s-1").unwrap().unwrap();
+                assert_eq!(record.pid, std::process::id());
+                assert_eq!(record.generation, 17);
+                assert_eq!(record.stored_acp_session_id.as_deref(), Some("retained"));
+            }
+            state.shutdown.cancel();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn control_fold_skips_events_the_drain_already_applied() {
         let _home = crate::session::test_support::isolate_app_dir();
         let approval = |nonce: &str| crate::acp::approvals::Approval {
@@ -1101,6 +1816,7 @@ mod tests {
         publish(
             &state,
             AcpBroadcastFrame {
+                native_subject: None,
                 session_id: "s-1".into(),
                 seq: 7,
                 event: Arc::new(event),
@@ -1148,6 +1864,7 @@ mod tests {
             publish(
                 &state,
                 AcpBroadcastFrame {
+                    native_subject: None,
                     session_id: "s-1".into(),
                     seq,
                     event: Arc::new(event),

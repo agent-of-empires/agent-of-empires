@@ -329,7 +329,7 @@ impl ToolSession {
         }
     }
 
-    fn valid_pane_ids(session_id: &str, pane_id: &str) -> bool {
+    pub(super) fn valid_pane_ids(session_id: &str, pane_id: &str) -> bool {
         [(session_id, '$'), (pane_id, '%')]
             .into_iter()
             .all(|(id, prefix)| {
@@ -359,20 +359,6 @@ impl ToolSession {
             .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok())
             .ok_or(LegacyToolUnavailable("pane process identity unavailable"))?;
         Ok(Some(pane_pid))
-    }
-
-    pub(crate) fn server_identity() -> Result<crate::session::TmuxServerIdentity> {
-        let (socket, pid) =
-            super::configured_tmux_server_identity(&super::TmuxCommandDeadline::new())?
-                .ok_or(LegacyToolUnavailable("original tmux server is absent"))?;
-        let birth = crate::process::process_birth_identity(pid)?.ok_or(LegacyToolUnavailable(
-            "original tmux server birth is unavailable",
-        ))?;
-        anyhow::ensure!(
-            crate::process::process_birth_is_live(pid, &birth)?,
-            LegacyToolUnavailable("original tmux server is not live")
-        );
-        Ok(crate::session::TmuxServerIdentity { socket, pid, birth })
     }
 
     fn validate_server(server: &crate::session::TmuxServerIdentity) -> Result<()> {
@@ -1440,7 +1426,12 @@ mod tests {
         let mut stale = crate::session::LegacyToolAdoption {
             tmux_session: tool.name.clone(),
             identity: identity.clone(),
-            server: std::sync::Arc::new(ToolSession::server_identity().unwrap()),
+            server: panes
+                .get(tool.session_name())
+                .unwrap()
+                .server
+                .clone()
+                .expect("captured retirement server proof"),
             profile: "default".into(),
             lifecycle_generation: 0,
         };

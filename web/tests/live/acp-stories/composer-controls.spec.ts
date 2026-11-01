@@ -114,10 +114,22 @@ test("Stop cancels the turn whatever the agent is doing", async ({ page, spawnSe
     await test.step(`Stop while ${c.name}`, async () => {
       const cancelledBefore = await cancelledTurns();
       await idle.fill(c.prompt);
-      await idle.press("Enter");
+      await page.getByRole("button", { name: "Send message", exact: true }).click();
       await expect.poll(replay).toContain(c.marker);
       await expect(stopButton(page)).toBeVisible({ timeout: 15_000 });
-      await stopButton(page).click();
+      // A same-frontier refresh can disable Stop after Playwright's actionability check.
+      await page.waitForFunction(
+        () => {
+          const button = document.querySelector<HTMLButtonElement>(
+            '[data-testid="composer-actions"] button[aria-label="Stop"]',
+          );
+          if (!button || button.disabled) return false;
+          button.click();
+          return true;
+        },
+        undefined,
+        { timeout: 15_000 },
+      );
       await expect(idle).toBeVisible({ timeout: 15_000 });
       await expect(stopButton(page)).toBeHidden({ timeout: 15_000 });
       await expect.poll(cancelledTurns).toBe(cancelledBefore + 1);
