@@ -412,6 +412,8 @@ inspect Daemon state before retrying launch.
 
 CLI forks use the latest durable parent binding, including a completed
 `aoe session set-session-id`, without waiting for the filesystem watcher.
+Parent and requested project paths are compared after canonicalization, so
+equivalent symlink paths keep the existing binding.
 For a single repository, base selectors accept its principal identity and the
 input worktree's path or name. Both aliases target the same repository.
 

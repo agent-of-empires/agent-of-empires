@@ -10551,6 +10551,14 @@ async fn creation_boundary_cli_fork_reads_the_pinned_binding_across_agent_accoun
         };
         assert_eq!(*parent, binding);
     }
+    let other_project = tempfile::tempdir().unwrap();
+    let body = create_body_from_json(serde_json::json!({
+        "path": other_project.path(), "profile": "test", "tool": "claude", "cli": {},
+    }));
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::CONFLICT);
     {
         let canonical = state.instances.read().await;
         assert_eq!(canonical[0].status, Status::Running);

@@ -78,6 +78,14 @@ fn fork_from_seeds_child_with_fork_intent() {
     let h = TuiTestHarness::new("fork_cli_happy");
     let project = h.project_path();
     seed_parent(&h, &project, "ForkParent", "claude");
+    #[cfg(unix)]
+    {
+        let alias = h.home_path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        patch_session(&h, "ForkParent", |parent| {
+            parent["project_path"] = json!(alias);
+        });
+    }
     let before = h.read_sessions();
     let parent_before = session_by_title(&before, "ForkParent").clone();
 
@@ -95,6 +103,11 @@ fn fork_from_seeds_child_with_fork_intent() {
     ]);
     let sessions = h.read_sessions();
     let child = session_by_title(&sessions, "ForkChild");
+    assert_eq!(
+        child["project_path"],
+        json!(project.canonicalize().unwrap()),
+        "forked child must use the canonical project directory"
+    );
     let child_agent_id = child["agent_session_id"]
         .as_str()
         .expect("forked child must pre-pin a fresh agent_session_id");

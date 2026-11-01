@@ -159,35 +159,39 @@ pub(super) async fn resolve_canonical_fork_seed(
         };
         let worker_state = state.clone();
         let source_id = source_id.to_owned();
-        let (source, _lifecycle) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            use crate::session::SessionStore;
-            let native = crate::server::session_store::NativeSessionStore::open(
-                worker_state,
-                &profile,
-                None,
-            )
-            .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
-            identity
-                .verify_storage(native.storage())
+        let requested_path = body.path.clone();
+        let (source, _lifecycle, same_project) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                use crate::session::SessionStore;
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    worker_state,
+                    &profile,
+                    None,
+                )
                 .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
-            let lifecycle = native
-                .storage()
-                .acquire_instance_lifecycle_lock(&source_id)
-                .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
-            let mut source = native
-                .load()?
-                .into_iter()
-                .find(|row| row.id == source_id)
-                .ok_or(crate::session::SessionGone)?;
-            source.source_profile = profile;
-            Ok((source, lifecycle))
-        })
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
-        .map_err(|error| {
-            super::lifecycle::lifecycle_rejection(state, &error)
-                .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
-        })?;
+                identity
+                    .verify_storage(native.storage())
+                    .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+                let lifecycle = native
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&source_id)
+                    .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+                let mut source = native
+                    .load()?
+                    .into_iter()
+                    .find(|row| row.id == source_id)
+                    .ok_or(crate::session::SessionGone)?;
+                source.source_profile = profile;
+                let same_project = std::fs::canonicalize(&source.project_path)?
+                    == std::fs::canonicalize(requested_path)?;
+                Ok((source, lifecycle, same_project))
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+            .map_err(|error| {
+                super::lifecycle::lifecycle_rejection(state, &error)
+                    .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
+            })?;
         if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
             return Err((
                 StatusCode::CONFLICT,
@@ -196,7 +200,7 @@ pub(super) async fn resolve_canonical_fork_seed(
                 .into_response());
         }
         if source.effective_profile() != body.profile.as_deref().unwrap_or(&state.served_profile())
-            || source.project_path != body.path
+            || !same_project
         {
             return Err(StatusCode::CONFLICT.into_response());
         }
