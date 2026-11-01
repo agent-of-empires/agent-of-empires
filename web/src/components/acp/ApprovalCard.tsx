@@ -14,10 +14,10 @@
 // chrome still wins the header, but not the action area: holding cannot
 // express which answer was meant.
 //
-// Optimistic state shows a spinner until the server's broadcast removes
-// the approval from AcpState.pendingApprovals.
+// Submitting disables actions until the hook confirms resolution or rejects
+// to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
@@ -26,12 +26,13 @@ import { PlanModal } from "./PlanModal";
 
 interface Props {
   approval: Approval;
+  canDecide: boolean;
   onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<void>;
 }
 
 const LONG_PRESS_MS = 800;
 
-export function ApprovalCard({ approval, onResolve }: Props) {
+export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
   const offline = useServerDown();
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [progress, setProgress] = useState(0);
@@ -40,6 +41,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const holdGeneration = useRef(0);
+  const decisionsEnabled = canDecide && !offline && phase !== "submitting";
+  const decisionAllowedRef = useRef(decisionsEnabled);
+  const [previousDecisionsEnabled, setPreviousDecisionsEnabled] = useState(decisionsEnabled);
 
   const raw = approval.tool_call.args_preview;
   const options = approval.options ?? [];
@@ -62,6 +66,13 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const showEmptyArgsState = raw.trim() === "";
   const Header = canExpand ? "button" : "div";
 
+  // Reset only the hold presentation; a permission change must not close the plan.
+  if (previousDecisionsEnabled !== decisionsEnabled) {
+    setPreviousDecisionsEnabled(decisionsEnabled);
+    setHeld(null);
+    setProgress(0);
+  }
+
   useEffect(() => {
     return () => {
       if (pressTimer.current) clearTimeout(pressTimer.current);
@@ -71,6 +82,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 
   const submit = useCallback(
     async (decision: ApprovalDecision, optionId?: string) => {
+      if (!decisionAllowedRef.current) return;
       setPhase("submitting");
       try {
         await onResolve(decision, optionId);
@@ -81,7 +93,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     [onResolve],
   );
 
-  const clearHoldTimers = () => {
+  const clearHoldTimers = useCallback(() => {
     if (pressTimer.current) {
       clearTimeout(pressTimer.current);
       pressTimer.current = null;
@@ -90,32 +102,23 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       clearInterval(progressTimer.current);
       progressTimer.current = null;
     }
-  };
+  }, []);
 
-  // `held` names the button currently under a hold, so a destructive
-  // answer list can put the ring on whichever option is being pressed
-  // rather than on a single Allow button.
-  //
-  // At most one hold exists at a time. Two fingers on two options would
-  // otherwise leave the first timer armed with its own captured option,
-  // running the answer the user moved away from, so starting a hold
-  // cancels any hold already running.
-  //
-  // `holdGeneration` covers what `clearTimeout` cannot: a timer that
-  // fired just before the finger lifted, whose callback is already
-  // queued. It finds a newer generation and submits nothing.
+  // One hold owns the timers. Generations retire callbacks queued before
+  // another hold, pointer release, or authority change.
   const startLongPress = (key: string, run: () => void) => {
-    if (phase !== "pending") return;
+    if (!decisionAllowedRef.current) return;
     clearHoldTimers();
     holdGeneration.current += 1;
     const generation = holdGeneration.current;
     setHeld(key);
     setProgress(0);
     progressTimer.current = setInterval(() => {
+      if (holdGeneration.current !== generation || !decisionAllowedRef.current) return;
       setProgress((p) => Math.min(100, p + (100 / LONG_PRESS_MS) * 30));
     }, 30);
     pressTimer.current = setTimeout(() => {
-      if (holdGeneration.current !== generation) return;
+      if (holdGeneration.current !== generation || !decisionAllowedRef.current) return;
       clearHoldTimers();
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
@@ -129,14 +132,25 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     }, LONG_PRESS_MS);
   };
 
-  // Releasing retires the generation as well as the timers, so an
-  // ambiguous multi-touch resolves nothing rather than the wrong thing.
-  const cancelLongPress = () => {
+  const cancelLongPress = useCallback(() => {
     holdGeneration.current += 1;
     clearHoldTimers();
     setHeld(null);
     setProgress(0);
-  };
+  }, [clearHoldTimers]);
+
+  // Only native decisions need authority. Retire a withdrawn hold before paint,
+  // including callbacks already queued when the current receipt changed.
+  useLayoutEffect(() => {
+    decisionAllowedRef.current = decisionsEnabled;
+    if (!decisionsEnabled) {
+      holdGeneration.current += 1;
+      clearHoldTimers();
+    }
+    return () => {
+      decisionAllowedRef.current = false;
+    };
+  }, [decisionsEnabled, clearHoldTimers]);
 
   return (
     <div
@@ -190,7 +204,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
+        <p className="px-3 pt-2 text-rose-400 text-xs">Could not submit approval. Tap to retry.</p>
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
@@ -208,6 +222,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {planOpen && approval.plan && (
         <PlanModal
           plan={approval.plan}
+          canDecide={canDecide}
           submitting={phase === "submitting"}
           offline={offline}
           options={isChoice ? options : undefined}
@@ -234,7 +249,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
                     : "border-surface-700 bg-surface-800 hover:border-brand-600/60 hover:bg-brand-700/10",
                   phase === "submitting" ? "cursor-wait opacity-60" : "",
                 ].join(" ")}
-                disabled={offline || phase === "submitting"}
+                disabled={!decisionsEnabled}
                 // Mouse-leave and touch-cancel abort the hold, so a slip
                 // never runs a destructive answer.
                 onClick={needsHold ? undefined : pick}
@@ -266,9 +281,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             className={[
               "relative flex flex-1 items-center justify-center gap-1.5 overflow-hidden",
               "rounded-md text-white text-xs font-medium py-2 px-3",
-              phase === "pending" ? "bg-rose-600 hover:bg-rose-500" : "bg-rose-700 opacity-70 cursor-wait",
+              phase === "submitting" ? "bg-rose-700 opacity-70 cursor-wait" : "bg-rose-600 hover:bg-rose-500",
             ].join(" ")}
-            disabled={offline || (phase !== "pending" && phase !== "rolled-back")}
+            disabled={!decisionsEnabled}
             onMouseDown={() => startLongPress("allow", () => void submit("Allow"))}
             onMouseUp={cancelLongPress}
             onMouseLeave={cancelLongPress}
@@ -291,9 +306,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
                 "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
+                phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
               ].join(" ")}
-              disabled={offline || phase !== "pending"}
+              disabled={!decisionsEnabled}
               onClick={() => void submit("Allow")}
             >
               <Check className="h-3.5 w-3.5" />
@@ -310,7 +325,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               ]
                 .filter(Boolean)
                 .join(" ")}
-              disabled={offline || phase === "submitting"}
+              disabled={!decisionsEnabled}
               onClick={() => void submit("AllowAlways")}
               title={offline ? OFFLINE_TITLE : "Allow this tool for the whole session"}
             >
@@ -330,7 +345,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
           ]
             .filter(Boolean)
             .join(" ")}
-          disabled={offline || phase === "submitting"}
+          disabled={!decisionsEnabled}
           // Dismiss answers nothing, so it cancels rather than denying:
           // a Deny would be mapped onto the first reject-kind option and
           // sent as the user's answer. See #3741.

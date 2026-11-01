@@ -900,12 +900,66 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
-fn report_lock_contention_for_test(path: &Path) {
+struct SharedLockContentionObserver {
+    path: PathBuf,
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+static SHARED_LOCK_CONTENTION_OBSERVER: std::sync::Mutex<Option<SharedLockContentionObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct SharedLockContentionGuard;
+
+#[cfg(test)]
+impl Drop for SharedLockContentionGuard {
+    fn drop(&mut self) {
+        let observer = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap().take();
+        drop(observer);
+    }
+}
+
+#[cfg(test)]
+impl Storage {
+    pub(crate) fn observe_shared_lock_contention_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) -> SharedLockContentionGuard {
+        let path = self
+            .sessions_path
+            .parent()
+            .unwrap()
+            .join(STORAGE_LOCK_FILENAME);
+        let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+        assert!(slot.is_none(), "one scoped shared-flock observer");
+        *slot = Some(SharedLockContentionObserver {
+            path,
+            sender: Some(sender),
+        });
+        SharedLockContentionGuard
+    }
+}
+
+#[cfg(test)]
+fn report_lock_contention_for_test(path: &Path, shared_flock: bool) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
         if let Some(sender) = slot.borrow_mut().take() {
             let _ = sender.send(path.to_path_buf());
         }
     });
+    if shared_flock {
+        let sender = {
+            let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+            // Keep the registration until Drop so an old guard cannot clear a newer one.
+            slot.as_mut()
+                .filter(|observer| observer.path == path)
+                .and_then(|observer| observer.sender.take())
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
 }
 
 pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
@@ -918,7 +972,7 @@ pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<
             fs::write(marker, path.as_os_str().as_encoded_bytes())?;
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, false);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -967,7 +1021,7 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
             return Err(e.into());
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, true);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -1231,6 +1285,118 @@ pub struct Storage {
     file_watch: Arc<FileWatchService>,
 }
 
+/// A channel-local binding to the profile and the current sessions-file name.
+pub(crate) struct NativeInputStore {
+    storage: Storage,
+    sessions_directory: super::anchored_fs::AnchoredDir,
+    sessions_leaf: PathBuf,
+    lifecycle_leaf: std::ffi::OsString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeInputRevision {
+    profile_identity: (u64, u64),
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
+    size: nix::libc::off_t,
+    modified: (nix::libc::time_t, nix::libc::c_long),
+    changed: (nix::libc::time_t, nix::libc::c_long),
+}
+
+impl NativeInputStore {
+    pub(crate) fn profile(&self) -> &str {
+        self.storage.profile()
+    }
+
+    pub(crate) fn acquire_lifecycle_lock(&self) -> Result<StorageFlock> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, path) = files.directory.open_lock(&self.lifecycle_leaf)?;
+        acquire_open_storage_flock(file, &path)
+    }
+
+    pub(crate) fn try_acquire_lifecycle_lock(&self) -> Result<Option<StorageFlock>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files.directory.open_lock(&self.lifecycle_leaf)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(StorageFlock { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Inspect the current directory entry, never a retained data-file descriptor.
+    pub(crate) fn revision(&self) -> Result<NativeInputRevision> {
+        self.storage.verify_bound_profile()?;
+        let stat = self
+            .sessions_directory
+            .entry_stat(&self.sessions_leaf)?
+            .context("native input sessions file is missing")?;
+        anyhow::ensure!(
+            stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFREG && stat.st_size >= 0,
+            "native input sessions file is not regular"
+        );
+        Ok(NativeInputRevision {
+            profile_identity: self.storage.bound_profile_identity()?,
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            size: stat.st_size,
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            changed: (stat.st_ctime, stat.st_ctime_nsec),
+        })
+    }
+
+    pub(crate) fn load_complete(&self) -> Result<(NativeInputRevision, Vec<Instance>)> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, path) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        let _flock = acquire_open_storage_shared_flock(file, &path)?;
+        self.read_complete_locked()
+    }
+
+    /// The producer must never wait on the profile-wide writer while holding
+    /// global worker/lifecycle exclusion, even after obtaining its native flock.
+    pub(crate) fn try_load_complete(&self) -> Result<Option<(NativeInputRevision, Vec<Instance>)>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let _flock = StorageFlock { file };
+        self.read_complete_locked().map(Some)
+    }
+
+    fn read_complete_locked(&self) -> Result<(NativeInputRevision, Vec<Instance>)> {
+        let revision = self.revision()?;
+        let rows = self.storage.load_instances_complete()?;
+        anyhow::ensure!(
+            revision == self.revision()?,
+            "native input sessions revision changed while reading"
+        );
+        Ok((revision, rows))
+    }
+}
+
 pub(crate) type SessionMutation<'a> =
     dyn FnMut(&mut Vec<Instance>, &mut Vec<Group>) -> Result<()> + 'a;
 
@@ -1259,6 +1425,12 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Canonical post-launch metadata checkpoint on this already bound store.
+    /// The mutation must fence its original physical context, producer and full
+    /// selection. Launch-only presentation fields are not metadata authority.
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,
@@ -1848,6 +2020,30 @@ impl Storage {
         Self::open(profile, FileWatchService::noop())
     }
 
+    pub(crate) fn bind_native_input(self, instance_id: &str) -> Result<NativeInputStore> {
+        super::validate_instance_id(instance_id)?;
+        self.verify_bound_profile()?;
+        let resolved = resolve_symlink_chain(&self.sessions_path)?;
+        let sessions_directory = super::anchored_fs::AnchoredDir::open_reference(
+            resolved.parent().context("sessions path needs a parent")?,
+        )?;
+        let leaf = resolved.file_name().context("sessions path needs a leaf")?;
+        let files = self.files.as_deref().context("unbound input store")?;
+        anyhow::ensure!(
+            sessions_directory
+                .bind_file(leaf)?
+                .same_target(&files.sessions)?,
+            "native input sessions binding changed"
+        );
+        self.verify_bound_profile()?;
+        Ok(NativeInputStore {
+            storage: self,
+            sessions_directory,
+            sessions_leaf: PathBuf::from(leaf),
+            lifecycle_leaf: format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock").into(),
+        })
+    }
+
     /// Serialize launch/restart and explicit resume-target mutation for one
     /// instance across every process using this profile.
     ///
@@ -2407,7 +2603,7 @@ impl Storage {
     {
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
-            report_lock_contention_for_test(&self.sessions_path)
+            report_lock_contention_for_test(&self.sessions_path, false)
         })
         .unwrap_or_else(|error| error.into_inner());
         #[cfg(not(test))]
@@ -4083,6 +4279,51 @@ mod tests {
     use crate::session::GroupTree;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn native_input_store_tracks_current_link_target_and_rejects_profile_retargeting() -> Result<()>
+    {
+        use std::os::unix::fs::symlink;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let target = tempdir()?;
+        let source = Storage::new_unwatched("input-store-source")?;
+        let replacement = Storage::new_unwatched("input-store-replacement")?;
+        let row = Instance::new("retained input", "/tmp/retained-input");
+        source.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        replacement.update(|rows, _| {
+            rows.push(Instance::new("replacement input", "/tmp/replacement-input"));
+            Ok(())
+        })?;
+        let resolved = target.path().join("shared-sessions.json");
+        fs::rename(source.sessions_path(), &resolved)?;
+        symlink(&resolved, source.sessions_path())?;
+        let alias = get_profile_dir_path("input-store-alias")?;
+        symlink(get_profile_dir_path("input-store-source")?, &alias)?;
+        let input = Storage::open_reference("input-store-alias")?.bind_native_input(&row.id)?;
+        let _lifecycle = input.acquire_lifecycle_lock()?;
+        let (before, rows) = input.load_complete()?;
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(before, input.revision()?);
+        let mut renamed = row.clone();
+        renamed.title = "display only".into();
+        atomic_write(&resolved, &serde_json::to_vec(&vec![renamed])?)?;
+        assert_ne!(before, input.revision()?);
+        let (_, rows) = input.load_complete()?;
+        assert_eq!(rows[0].title, "display only");
+        let source_bytes = fs::read(&resolved)?;
+        let replacement_bytes = fs::read(replacement.sessions_path())?;
+        fs::remove_file(&alias)?;
+        symlink(get_profile_dir_path("input-store-replacement")?, &alias)?;
+        assert!(input.revision().is_err());
+        assert!(input.load_complete().is_err());
+        assert_eq!(fs::read(&resolved)?, source_bytes);
+        assert_eq!(fs::read(replacement.sessions_path())?, replacement_bytes);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

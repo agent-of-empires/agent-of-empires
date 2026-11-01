@@ -174,8 +174,7 @@ impl EventStore {
         }
     }
 
-    /// The first prompt and the agent prose of its turn (up to the first
-    /// `Stopped`, whatever the reason), capped at `max_agent_bytes`.
+    /// The first prompt and its turn's prose, capped at `max_agent_bytes`.
     pub fn first_turn_context(
         &self,
         session_id: &str,
@@ -204,7 +203,12 @@ impl EventStore {
                 {
                     agent.push_str(&text);
                 }
-                Event::Stopped { .. } if first_prompt.is_some() => break,
+                Event::Stopped { .. } | Event::AgentStartupError { .. }
+                    if first_prompt.is_some() =>
+                {
+                    break
+                }
+                event if first_prompt.is_some() && event.is_channel_loss() => break,
                 _ => {}
             }
         }
@@ -219,11 +223,12 @@ impl EventStore {
         Some((first_prompt, agent))
     }
 
-    /// Nonces of `ApprovalRequested` events with no later `ApprovalResolved`.
+    /// Nonces whose responders were neither resolved nor invalidated by loss.
     pub fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(
             &self.conn(),
-            "SELECT json_extract(event_json, '$.ApprovalRequested.approval.nonce') AS nonce
+            concat!(
+                "SELECT json_extract(event_json, '$.ApprovalRequested.approval.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'ApprovalRequested'
@@ -233,7 +238,17 @@ impl EventStore {
                    WHERE session_id = ?1
                      AND discriminant = 'ApprovalResolved'
                )
-             ORDER BY seq ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ",
+                native_channel_loss_sql!("loss.event_json"),
+                "
+                     AND loss.seq > acp_events.seq
+               )
+             ORDER BY seq ASC"
+            ),
             "unresolved_approval_nonces",
             session_id,
         )
@@ -357,7 +372,8 @@ impl EventStore {
     pub fn pending_approval_requests(&self, session_id: &str) -> Vec<Approval> {
         query_strings(
             &self.conn(),
-            "SELECT event_json
+            concat!(
+                "SELECT event_json
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'ApprovalRequested'
@@ -367,7 +383,17 @@ impl EventStore {
                    WHERE session_id = ?1
                      AND discriminant = 'ApprovalResolved'
                )
-             ORDER BY seq ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ",
+                native_channel_loss_sql!("loss.event_json"),
+                "
+                     AND loss.seq > acp_events.seq
+               )
+             ORDER BY seq ASC"
+            ),
             "pending_approval_requests",
             session_id,
         )
@@ -381,11 +407,11 @@ impl EventStore {
         .collect()
     }
 
-    /// Nonces of `ElicitationRequested` events with no matching `ElicitationResolved`.
+    /// Elicitation nonces whose responders remain available.
     pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(
             &self.conn(),
-            "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
+            concat!("SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
                AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
@@ -394,7 +420,14 @@ impl EventStore {
                    FROM acp_events
                    WHERE session_id = ?1
                      AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
-               )",
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ", native_channel_loss_sql!("loss.event_json"), "
+                     AND loss.seq > acp_events.seq
+               )"),
             "unresolved_elicitation_nonces",
             session_id,
         )
@@ -409,7 +442,8 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL",
+                   AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                     OR json_extract(event_json, '$.UserDiffCommentsPrompt') IS NOT NULL)",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -419,11 +453,16 @@ impl EventStore {
         .flatten()?;
         let terminator = logged(
             conn.query_row(
-                "SELECT MIN(seq) FROM acp_events
+                concat!(
+                    "SELECT MIN(seq) FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
                    AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                     OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")"
+                ),
                 params![session_id, prompt_seq],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -431,6 +470,33 @@ impl EventStore {
             session_id,
         )?;
         Some(terminator.is_none())
+    }
+
+    /// A native prompt completion may be adopted only for an open main turn.
+    /// Background work is restored independently and does not reopen its parent.
+    pub fn has_in_flight_main_turn(&self, session_id: &str) -> bool {
+        self.latest_prompt_state(session_id) == Some(true)
+    }
+
+    /// Restore the unsuccessful-main fence, not display activity or replay
+    /// permission. Ambient/administrative stops and diagnostics cannot erase a
+    /// real failure; a new input, conversation boundary or genuine outcome can.
+    pub fn has_unsuccessful_main_outcome(&self, session_id: &str) -> bool {
+        logged(
+            self.conn().query_row(
+                "SELECT COALESCE(json_extract(event_json, '$.Stopped.reason')
+                    IN ('prompt_failed', 'rate_limited', ?2), 0)
+                 FROM acp_events WHERE session_id = ?1 AND (
+                    discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt', 'SessionCleared', 'AgentSwitched')
+                    OR (discriminant = 'Stopped' AND json_extract(event_json, '$.Stopped.reason')
+                        IN ('prompt_failed', 'rate_limited', ?2, 'prompt_complete',
+                            'cancelled', 'max_tokens', 'refusal', 'max_turn_requests')))
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id, crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON],
+                |row| row.get::<_, bool>(0),
+            ).optional(),
+            "unsuccessful main outcome", session_id,
+        ).flatten().unwrap_or(false)
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
@@ -530,10 +596,15 @@ impl EventStore {
         let conn = self.conn();
         let epoch_start: i64 = logged(
             conn.query_row(
-                "SELECT MAX(seq) FROM acp_events
+                concat!(
+                    "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
                    AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                     OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")"
+                ),
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -659,11 +730,12 @@ mod tests {
         };
         let startup_error = Event::AgentStartupError {
             message: "boom".into(),
+            native_subject: None,
         };
-        // (events, in flight)
+        // (events, any native work, adoptable main prompt)
         let cases = [
-            (vec![], false),
-            (vec![user_prompt("go"), agent_chunk("thinking")], true),
+            (vec![], false, false),
+            (vec![user_prompt("go"), agent_chunk("thinking")], true, true),
             (
                 vec![
                     user_prompt("go"),
@@ -671,8 +743,9 @@ mod tests {
                     stopped("prompt_complete"),
                 ],
                 false,
+                false,
             ),
-            (vec![user_prompt("go"), startup_error], false),
+            (vec![user_prompt("go"), startup_error], false, false),
             (
                 vec![
                     user_prompt("first"),
@@ -681,16 +754,40 @@ mod tests {
                     agent_chunk("mid"),
                 ],
                 true,
+                true,
             ),
             (
                 vec![user_prompt("go"), stopped("prompt_complete"), progress()],
                 true,
+                false,
+            ),
+            (
+                vec![user_prompt("go"), stopped("rate_limited"), progress()],
+                true,
+                false,
+            ),
+            (
+                vec![
+                    user_prompt("completed main"),
+                    stopped("prompt_complete"),
+                    progress(),
+                    Event::UserDiffCommentsPrompt {
+                        intro: "review changes".into(),
+                        outro: String::new(),
+                        is_multi_repo: false,
+                        comments: Vec::new(),
+                        assembled_markdown: "review these changes".into(),
+                    },
+                ],
+                true,
+                true,
             ),
         ];
-        for (i, (events, in_flight)) in cases.into_iter().enumerate() {
+        for (i, (events, in_flight, main_active)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
             record_from(&store, &id, 1, events);
             assert_eq!(store.has_in_flight_turn(&id), in_flight, "case {i}");
+            assert_eq!(store.has_in_flight_main_turn(&id), main_active, "case {i}");
         }
 
         let completed = Event::BackgroundAgentCompleted {
@@ -719,6 +816,92 @@ mod tests {
         assert!(
             !store.has_in_flight_turn("stale"),
             "a silent background agent is gone"
+        );
+    }
+
+    #[test]
+    fn unsuccessful_main_outcome_survives_ambient_progress_until_a_genuine_boundary() {
+        let (_tmp, store) = open_store(1000);
+        for reason in [
+            "prompt_failed",
+            "rate_limited",
+            crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+        ] {
+            let boundaries = [
+                user_prompt("next explicit prompt"),
+                Event::UserDiffCommentsPrompt {
+                    intro: "review".into(),
+                    outro: String::new(),
+                    is_multi_repo: false,
+                    comments: Vec::new(),
+                    assembled_markdown: "review changes".into(),
+                },
+                stopped("prompt_complete"),
+                Event::SessionCleared,
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "explicit".into(),
+                },
+            ];
+            for (index, boundary) in boundaries.into_iter().enumerate() {
+                let id = format!("failed-{reason}-{index}");
+                let prefix = [
+                    user_prompt("original"),
+                    stopped(reason),
+                    Event::BackgroundAgentProgress {
+                        agent_id: "survivor".into(),
+                        status: BackgroundAgentStatus::Running,
+                        tool_count: 1,
+                        tools: Vec::new(),
+                        last_tool: None,
+                        last_text: None,
+                        at: chrono::Utc::now(),
+                    },
+                    agent_chunk("ambient progress after the failed turn"),
+                    stopped("agent_idle"),
+                    Event::PromptRuntimeError {
+                        message: "a later diagnostic is not a main outcome".into(),
+                        evidence: None,
+                        native_subject: None,
+                    },
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "same-native".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    },
+                ];
+                record_from(&store, &id, 1, prefix);
+                assert!(store.has_unsuccessful_main_outcome(&id));
+                assert!(!store.has_in_flight_main_turn(&id));
+                assert!(
+                    store.has_in_flight_turn(&id),
+                    "surviving background work is independent"
+                );
+                store.record(&id, 8, &boundary).unwrap();
+                assert!(
+                    !store.has_unsuccessful_main_outcome(&id),
+                    "genuine boundary {index} supersedes {reason}"
+                );
+            }
+        }
+        record_from(
+            &store,
+            "diagnostic-only",
+            1,
+            [
+                user_prompt("unfinished main"),
+                Event::PromptRuntimeError {
+                    message: "diagnostic before terminal".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert!(store.has_in_flight_main_turn("diagnostic-only"));
+        assert!(
+            !store.has_unsuccessful_main_outcome("diagnostic-only"),
+            "a diagnostic is not a completed main outcome"
         );
     }
 
@@ -775,6 +958,8 @@ mod tests {
             [
                 Event::AcpSessionAssigned {
                     acp_session_id: "acp-1".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 },
                 Event::ModesAvailable {
                     current_mode_id: "default".into(),
@@ -865,6 +1050,112 @@ mod tests {
         assert_eq!(store.unresolved_elicitation_nonces("s-1"), [e_b]);
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
         assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
+
+        // A failed request leaves the actual responders actionable. Native loss
+        // retires those controls without fabricating any human decision, and a
+        // later ready announcement must not resurrect the old nonces.
+        record_from(
+            &store,
+            "s-1",
+            9,
+            [
+                Event::PromptRuntimeError {
+                    message: "ordinary request failure".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+                Event::Stopped {
+                    reason: "prompt_failed".into(),
+                },
+            ],
+        );
+        assert_eq!(store.pending_approval_requests("s-1").len(), 2);
+        assert_eq!(store.unresolved_elicitation_nonces("s-1").len(), 1);
+        record_from(
+            &store,
+            "s-1",
+            11,
+            [
+                Event::AcpConnectionUnavailable {
+                    source: crate::acp::state::AcpConnectionSource::Native,
+                    cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+                    phase: crate::acp::state::AcpConnectionPhase::Established,
+                    native_subject: None,
+                },
+                Event::AcpSessionAssigned {
+                    acp_session_id: "retained".into(),
+                    connection_ready: true,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert!(store.unresolved_approval_nonces("s-1").is_empty());
+        assert!(store.pending_approval_requests("s-1").is_empty());
+        assert!(store.unresolved_elicitation_nonces("s-1").is_empty());
+        let after_loss = Nonce::new();
+        record_from(
+            &store,
+            "s-1",
+            13,
+            [approval("new-owned-control"), elicitation(&after_loss)],
+        );
+        assert_eq!(
+            store.unresolved_approval_nonces("s-1"),
+            [Nonce("new-owned-control".into())]
+        );
+        assert_eq!(store.pending_approval_requests("s-1").len(), 1);
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), [after_loss]);
+
+        // A refused management attachment does not end the retained native
+        // turn or resolve its callbacks. Only observed channel loss does.
+        let management_elicitation = Nonce::new();
+        record_from(
+            &store,
+            "management",
+            1,
+            [
+                user_prompt("retained work"),
+                approval("retained-approval"),
+                elicitation(&management_elicitation),
+                Event::MonitorArmed {
+                    description: Some("retained monitor".into()),
+                },
+                Event::ToolCallStarted {
+                    tool_call: tool_call("retained-tool"),
+                },
+                Event::AcpConnectionUnavailable {
+                    source: crate::acp::state::AcpConnectionSource::RunnerRecord,
+                    cause: crate::acp::state::AcpConnectionCause::ControlProtocolUnknown,
+                    phase: crate::acp::state::AcpConnectionPhase::Establishing,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert!(store.has_in_flight_turn("management"));
+        assert!(store.has_open_tool_call_in_epoch("management"));
+        assert_eq!(store.pending_approval_requests("management").len(), 1);
+        assert_eq!(
+            store.unresolved_elicitation_nonces("management"),
+            [management_elicitation]
+        );
+        assert!(store.latest_active_monitor("management").is_some());
+        store
+            .record(
+                "management",
+                7,
+                &Event::AcpConnectionUnavailable {
+                    source: crate::acp::state::AcpConnectionSource::Native,
+                    cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+                    phase: crate::acp::state::AcpConnectionPhase::Established,
+                    native_subject: None,
+                },
+            )
+            .unwrap();
+        assert!(!store.has_in_flight_turn("management"));
+        assert!(!store.has_open_tool_call_in_epoch("management"));
+        assert!(store.pending_approval_requests("management").is_empty());
+        assert!(store.unresolved_elicitation_nonces("management").is_empty());
+        assert!(store.latest_active_monitor("management").is_none());
 
         // A background launch with no matching completion is orphaned.
         let (_tmp, store) = open_store(1000);

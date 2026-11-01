@@ -1,5 +1,8 @@
 //! Canonical runtime subscription. Disconnects retain the last displayed state.
 
+#[cfg(test)]
+use std::future::Future;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -49,9 +52,6 @@ pub(crate) enum SessionRequest {
         adoption: Option<crate::session::LegacyToolAdoption>,
     },
     EnsureAgent {
-        size: Option<TerminalSize>,
-    },
-    StartAgent {
         size: Option<TerminalSize>,
     },
     CancelCreation,
@@ -169,12 +169,369 @@ pub(crate) struct NativeLease {
     grant: Arc<AtomicU64>,
     generation: u64,
     cancelled: Arc<AtomicBool>,
+    scope: Arc<std::sync::OnceLock<NativeInputScope>>,
+    latest: Option<tokio::sync::watch::Receiver<Option<SessionFeedResult>>>,
+    preparation: Option<Arc<NativePreparationScope>>,
+}
+
+struct NativePreparationScope {
+    id: String,
+    epoch: String,
+    identity: crate::daemon::NativePreparationIdentity,
+    auxiliary: Option<AuxiliaryTarget>,
+    pane: crate::session::PaneObservation,
+    profile_binding: Option<Arc<crate::session::Storage>>,
+}
+
+impl std::fmt::Debug for NativePreparationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePreparationScope")
+            .field("id", &self.id)
+            .field("identity", &self.identity)
+            .field("auxiliary", &self.auxiliary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativePreparationScope {
+    fn owner<'a>(
+        &self,
+        snapshot: &'a RuntimeSnapshot,
+    ) -> Option<&'a crate::daemon::SessionResponse> {
+        (snapshot.cursor.epoch == self.epoch)
+            .then(|| {
+                snapshot.contents.sessions.iter().find(|row| {
+                    row.id == self.id
+                        && row.created_at == self.identity.created_at
+                        && row.profile == self.identity.profile
+                })
+            })
+            .flatten()
+    }
+
+    fn matches_initial(&self, snapshot: &RuntimeSnapshot) -> bool {
+        self.owner(snapshot).is_some_and(|row| {
+            let pane = self
+                .auxiliary
+                .as_ref()
+                .map_or(Some(&row.agent_pane), |target| {
+                    row.auxiliary
+                        .iter()
+                        .find(|observation| observation.target == *target)
+                        .map(|observation| &observation.pane)
+                });
+            let fixed = self.pane.physical.is_some() || self.pane.legacy_tool.is_some();
+            row.lifecycle_generation == self.identity.lifecycle_generation
+                && (!fixed
+                    || pane.is_some_and(|pane| {
+                        (self.pane.physical.is_some()
+                            || pane.tmux_session == self.pane.tmux_session)
+                            && pane.physical == self.pane.physical
+                            && pane.legacy_tool == self.pane.legacy_tool
+                    }))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NativeInputScope {
+    id: String,
+    epoch: String,
+    created_at: String,
+    auxiliary: Option<AuxiliaryTarget>,
+    target: Arc<crate::daemon::TerminalTarget>,
+    checked_revision: AtomicU64,
+    input_fence: std::sync::Mutex<Option<Arc<crate::session::NativeInputFence>>>,
+}
+
+impl NativeInputScope {
+    fn matches(&self, snapshot: &RuntimeSnapshot) -> bool {
+        snapshot.cursor.epoch == self.epoch
+            && snapshot.contents.sessions.iter().any(|row| {
+                if row.id != self.id
+                    || row.profile != self.target.profile
+                    || row.lifecycle_generation != self.target.lifecycle_generation
+                    || row.created_at != self.created_at
+                {
+                    return false;
+                }
+                let pane = match &self.auxiliary {
+                    None => &row.agent_pane,
+                    Some(target) => {
+                        let Some(observation) = row
+                            .auxiliary
+                            .iter()
+                            .find(|observation| observation.target == *target)
+                        else {
+                            return false;
+                        };
+                        &observation.pane
+                    }
+                };
+                pane.state == crate::session::PanePresence::Alive
+                    && pane.legacy_tool.is_none()
+                    && self.target.physical.is_some()
+                    && pane.physical == self.target.physical
+            })
+    }
+
+    fn accepts(&self, snapshot: &RuntimeSnapshot) -> bool {
+        if snapshot.cursor.epoch != self.epoch {
+            return false;
+        }
+        if self.checked_revision.load(Ordering::SeqCst) == snapshot.cursor.revision {
+            return true;
+        }
+        if !self.matches(snapshot) {
+            return false;
+        }
+        self.checked_revision
+            .store(snapshot.cursor.revision, Ordering::SeqCst);
+        true
+    }
 }
 
 impl NativeLease {
     pub(crate) fn is_valid(&self) -> bool {
+        if self.cancelled.load(Ordering::SeqCst)
+            || self.grant.load(Ordering::SeqCst) != self.generation
+        {
+            return false;
+        }
+        if let Some(scope) = self.scope.get() {
+            let current = self.latest.as_ref().is_some_and(|latest| {
+                matches!(&*latest.borrow(), Some(SessionFeedResult::Snapshot(snapshot))
+                    if scope.accepts(snapshot))
+            });
+            if !current {
+                self.cancel_continuation();
+                return false;
+            }
+        }
+        if self.scope.get().is_none() {
+            if let Some(preparation) = &self.preparation {
+                let current = self.latest.as_ref().is_some_and(|latest| {
+                    matches!(&*latest.borrow(), Some(SessionFeedResult::Snapshot(snapshot))
+                        if preparation.owner(snapshot).is_some())
+                });
+                if !current {
+                    self.cancel_continuation();
+                    return false;
+                }
+            }
+        }
         !self.cancelled.load(Ordering::SeqCst)
             && self.grant.load(Ordering::SeqCst) == self.generation
+    }
+
+    fn can_dispatch(&self) -> bool {
+        let current = self.is_valid()
+            && self.preparation.as_ref().is_none_or(|preparation| {
+                preparation
+                    .profile_binding
+                    .as_ref()
+                    .is_none_or(|storage| preparation.identity.matches_source(storage))
+                    && self.latest.as_ref().is_some_and(|latest| {
+                        matches!(&*latest.borrow(), Some(SessionFeedResult::Snapshot(snapshot))
+                    if preparation.matches_initial(snapshot))
+                    })
+            });
+        if !current {
+            self.cancel_continuation();
+        }
+        current
+    }
+
+    pub(crate) fn preparation_profile_identity(&self) -> Option<(u64, u64)> {
+        self.preparation
+            .as_ref()
+            .and_then(|preparation| preparation.identity.profile_identity)
+    }
+
+    fn bind(
+        &self,
+        id: &str,
+        auxiliary: Option<AuxiliaryTarget>,
+        target: Arc<crate::daemon::TerminalTarget>,
+        snapshot: &RuntimeSnapshot,
+        latest: Option<&SessionFeedResult>,
+    ) -> bool {
+        if self.cancelled.load(Ordering::SeqCst)
+            || self.grant.load(Ordering::SeqCst) != self.generation
+        {
+            return false;
+        }
+        if self.preparation.as_ref().is_some_and(|preparation| {
+            preparation
+                .profile_binding
+                .as_ref()
+                .is_some_and(|storage| !preparation.identity.matches_source(storage))
+        }) {
+            return false;
+        }
+        if self.preparation.as_ref().is_some_and(|preparation| {
+            preparation.id != id
+                || preparation.auxiliary != auxiliary
+                || preparation.owner(snapshot).is_none()
+        }) {
+            return false;
+        }
+        if let Some(scope) = self.scope.get() {
+            return scope.id == id
+                && scope.auxiliary == auxiliary
+                && scope.target.lifecycle_generation == target.lifecycle_generation
+                && scope.target.profile == target.profile
+                && scope.target.physical == target.physical
+                && scope.matches(snapshot)
+                && matches!(latest, Some(SessionFeedResult::Snapshot(latest)) if scope.matches(latest));
+        }
+        let Some(row) = snapshot.contents.sessions.iter().find(|row| row.id == id) else {
+            return false;
+        };
+        let scope = NativeInputScope {
+            id: id.to_owned(),
+            epoch: snapshot.cursor.epoch.clone(),
+            created_at: row.created_at.clone(),
+            auxiliary,
+            target,
+            checked_revision: AtomicU64::new(snapshot.cursor.revision),
+            input_fence: std::sync::Mutex::new(None),
+        };
+        if !scope.matches(snapshot) {
+            return false;
+        }
+        let Some(SessionFeedResult::Snapshot(latest)) = latest else {
+            return false;
+        };
+        if !scope.matches(latest) {
+            return false;
+        }
+        scope
+            .checked_revision
+            .store(latest.cursor.revision, Ordering::SeqCst);
+        self.scope.set(scope).is_ok()
+    }
+
+    pub(crate) fn target(&self) -> Option<&Arc<crate::daemon::TerminalTarget>> {
+        self.scope.get().map(|scope| &scope.target)
+    }
+
+    pub(crate) fn input_fence(
+        &self,
+        agent: bool,
+    ) -> anyhow::Result<Arc<crate::session::NativeInputFence>> {
+        use crate::session::NativeInputError;
+        anyhow::ensure!(self.is_valid(), NativeInputError::Ownership);
+        let scope = self.scope.get().ok_or(NativeInputError::Ownership)?;
+        let expected_profile = self
+            .preparation
+            .as_ref()
+            .map(|preparation| {
+                preparation
+                    .identity
+                    .profile_identity
+                    .ok_or(NativeInputError::Ownership)
+            })
+            .transpose()?;
+        let capture = || {
+            let created = chrono::DateTime::parse_from_rfc3339(&scope.created_at)
+                .map_err(|_| NativeInputError::Ownership)?
+                .with_timezone(&chrono::Utc);
+            crate::session::NativeInputFence::capture(
+                &scope.target.profile,
+                &scope.id,
+                created,
+                scope.target.lifecycle_generation,
+                agent,
+                expected_profile,
+            )
+        };
+        // Programmatic Agent admission has its own stronger policy; never
+        // recycle a raw-human fence that deliberately has no Agent readiness rule.
+        if agent {
+            return capture();
+        }
+        let mut cached = scope
+            .input_fence
+            .lock()
+            .map_err(|_| NativeInputError::Ownership)?;
+        if let Some(fence) = cached.as_ref() {
+            return Ok(fence.clone());
+        }
+        let fence = capture()?;
+        *cached = Some(fence.clone());
+        Ok(fence)
+    }
+
+    /// Capture before handing any bytes to a worker queue; effects recheck native custody.
+    pub(crate) fn input_session(&self) -> anyhow::Result<Arc<crate::tmux::Session>> {
+        use crate::session::NativeInputError;
+        let fence = self.input_fence(false)?;
+        let scope = self.scope.get().ok_or(NativeInputError::Ownership)?;
+        let physical = scope
+            .target
+            .physical
+            .clone()
+            .ok_or(NativeInputError::Ownership)?;
+        let session = crate::tmux::Session::from_observation(&scope.target.tmux_session, physical)
+            .with_native_input_fence(fence)
+            .capture_input_channel();
+        anyhow::ensure!(self.is_valid(), NativeInputError::Ownership);
+        Ok(Arc::new(session))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bound_for_test(
+        instance: &crate::session::Instance,
+        auxiliary: Option<AuxiliaryTarget>,
+        target: Arc<crate::daemon::TerminalTarget>,
+    ) -> Self {
+        let pane = crate::session::PaneObservation {
+            state: crate::session::PanePresence::Alive,
+            tmux_session: Some(target.tmux_session.clone()),
+            physical: target.physical.clone(),
+            legacy_tool: None,
+        };
+        let observations: Vec<_> = auxiliary
+            .iter()
+            .map(|target| crate::session::AuxiliaryObservation {
+                target: target.clone(),
+                pane: pane.clone(),
+            })
+            .collect();
+        let row = serde_json::from_value(serde_json::json!({
+            "id": instance.id, "profile": target.profile,
+            "created_at": instance.created_at.to_rfc3339(),
+            "lifecycle_generation": instance.lifecycle_generation,
+            "status": instance.status,
+            "agent_pane": if auxiliary.is_none() { pane } else { Default::default() },
+            "auxiliary": observations,
+        }))
+        .expect("bound native fixture row");
+        let snapshot = Arc::new(RuntimeSnapshot {
+            cursor: RuntimeCursor {
+                epoch: "native-input-test".into(),
+                revision: 1,
+            },
+            contents: crate::daemon::RuntimeContents {
+                health: crate::daemon::RuntimeHealth::Healthy,
+                capabilities: crate::daemon::RuntimeCapabilities {
+                    mutations: true,
+                    native_interaction: true,
+                },
+                default_profile: target.profile.clone(),
+                sessions: vec![row],
+                profiles: vec![],
+                workspace_ordering: vec![],
+                global_projects: vec![],
+            },
+        });
+        let latest = SessionFeedResult::Snapshot(snapshot.clone());
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(latest.clone()));
+        let mut lease = Self::valid_for_test();
+        lease.latest = Some(receiver);
+        assert!(lease.bind(&instance.id, auxiliary, target, &snapshot, Some(&latest)));
+        lease
     }
 
     pub(crate) fn cancel_continuation(&self) {
@@ -187,13 +544,16 @@ impl NativeLease {
             grant: Arc::new(AtomicU64::new(1)),
             generation: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            preparation: None,
+            latest: None,
         }
     }
 }
 
 pub(crate) struct NativePreparation {
     pub lease: NativeLease,
-    pub result: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    pub result: tokio::sync::oneshot::Receiver<Result<Arc<crate::daemon::TerminalTarget>, String>>,
 }
 
 enum CommandRequest {
@@ -220,8 +580,8 @@ struct PendingTerminal {
     /// `None` means the session's own agent pane, which the snapshot reports
     /// through `agent_pane` rather than the auxiliary list.
     target: Option<AuxiliaryTarget>,
-    cancelled: Arc<AtomicBool>,
-    result: tokio::sync::oneshot::Sender<Result<String, String>>,
+    native: NativeLease,
+    result: tokio::sync::oneshot::Sender<Result<Arc<crate::daemon::TerminalTarget>, String>>,
 }
 
 struct DeferredNativePreparation {
@@ -386,8 +746,18 @@ async fn run_command_writer(
         };
         let allowed = request.native.as_ref().map_or_else(
             || grant.load(Ordering::SeqCst) == request.lease,
-            NativeLease::is_valid,
+            NativeLease::can_dispatch,
         );
+        let expected = if allowed {
+            request.native.as_ref().and_then(|native| {
+                native
+                    .preparation
+                    .as_ref()
+                    .map(|preparation| preparation.identity.clone())
+            })
+        } else {
+            None
+        };
         if allowed && matches!(&request.request, CommandRequest::Create(_)) {
             let SessionCommand {
                 request: CommandRequest::Create(body),
@@ -474,7 +844,12 @@ async fn run_command_writer(
                         let receipt = match target {
                             AuxiliaryTarget::Host { index } => {
                                 client
-                                    .ensure_terminal(&id, index, &StartSessionBody { size }, &epoch)
+                                    .ensure_terminal(
+                                        &id,
+                                        index,
+                                        &StartSessionBody { expected, size },
+                                        &epoch,
+                                    )
                                     .await
                             }
                             AuxiliaryTarget::Container { index } => {
@@ -482,7 +857,7 @@ async fn run_command_writer(
                                     .ensure_container_terminal(
                                         &id,
                                         index,
-                                        &StartSessionBody { size },
+                                        &StartSessionBody { expected, size },
                                         &epoch,
                                     )
                                     .await
@@ -492,6 +867,7 @@ async fn run_command_writer(
                                     .ensure_tool(
                                         &id,
                                         &EnsureToolBody {
+                                            expected,
                                             tool_name,
                                             size,
                                             adoption,
@@ -504,56 +880,10 @@ async fn run_command_writer(
                         receipt.map(CommandReply::Terminal)
                     }
                     SessionRequest::EnsureAgent { size } => client
-                        .ensure_agent(&id, &StartSessionBody { size }, &epoch)
+                        .ensure_agent(&id, &StartSessionBody { expected, size }, &epoch)
                         .await
                         .map(CommandReply::Terminal),
-                    SessionRequest::StartAgent { size } => match client
-                        .mutate_session(
-                            &id,
-                            &SessionMutation::Start(StartSessionBody { size }),
-                            &epoch,
-                        )
-                        .await
-                    {
-                        Ok(cursor) => match client
-                            .ensure_agent(&id, &StartSessionBody::default(), &epoch)
-                            .await
-                        {
-                            Ok(mut receipt) => {
-                                receipt.cursor.revision =
-                                    receipt.cursor.revision.max(cursor.revision);
-                                Ok(CommandReply::Terminal(receipt))
-                            }
-                            Err(error) => {
-                                let mut cursor = cursor;
-                                if let crate::daemon::DaemonClientError::Committed {
-                                    cursor: committed,
-                                    ..
-                                } = &error
-                                {
-                                    cursor.revision = cursor.revision.max(committed.revision);
-                                }
-                                let mut failure = match error {
-                                    error @ crate::daemon::DaemonClientError::Committed {
-                                        code: crate::daemon::ApiErrorCode::ManagedResumeRefused(_),
-                                        ..
-                                    } => CommandFailure::Rejected(error.to_string()),
-                                    error => CommandFailure::submitted(error),
-                                };
-                                match &mut failure {
-                                    CommandFailure::Rejected(message)
-                                    | CommandFailure::Unknown(message) => {
-                                        message.insert_str(
-                                            0,
-                                            "Session started; pane preparation failed: ",
-                                        );
-                                    }
-                                }
-                                Ok(CommandReply::CommittedFailure { cursor, failure })
-                            }
-                        },
-                        Err(error) => Err(error),
-                    },
+
                     SessionRequest::CancelCreation => client
                         .cancel_creation(&id, &epoch)
                         .await
@@ -604,6 +934,8 @@ pub struct SessionFeed {
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
     native_grant: Arc<AtomicU64>,
+    /// One preview channel's native witness; forwarded mouse/key actions reuse it.
+    preview_input: std::sync::Mutex<Option<NativeLease>>,
     /// CityHall client mode is a handshake property rather than a per-revision
     /// grant, so it is recorded once per connection and read by the local-write
     /// gate on the home view.
@@ -640,6 +972,7 @@ impl SessionFeed {
             diagnostics_receiver,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
+            preview_input: std::sync::Mutex::new(None),
             cityhall: Arc::new(AtomicBool::new(false)),
             commands: None,
             pending: HashMap::new(),
@@ -796,6 +1129,9 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation: self.native_grant.load(Ordering::SeqCst),
             cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            preparation: None,
+            latest: Some(self.receiver.clone()),
         }
     }
 
@@ -819,6 +1155,68 @@ impl SessionFeed {
                 .commands
                 .as_ref()
                 .is_some_and(|commands| !commands.is_closed())
+    }
+
+    /// A fresh human key aimed at an already displayed pane does not authorize
+    /// starting anything. Bind the applied physical observation before queuing it.
+    pub(crate) fn preview_input_lease(&self, id: &str, name: &str) -> Option<NativeLease> {
+        if !self.native_interaction_available() || !self.current_snapshot_applied() {
+            return None;
+        }
+        let mut cached = self.preview_input.lock().ok()?;
+        if let Some(lease) = cached.as_ref() {
+            if lease
+                .scope
+                .get()
+                .is_some_and(|scope| scope.id == id && scope.target.tmux_session == name)
+                && lease.is_valid()
+            {
+                return Some(lease.clone());
+            }
+        }
+        let snapshot = self.applied.as_ref()?;
+        let row = snapshot.contents.sessions.iter().find(|row| row.id == id)?;
+        let (auxiliary, pane) = if row.agent_pane.tmux_session.as_deref() == Some(name) {
+            (None, &row.agent_pane)
+        } else {
+            let observation = row
+                .auxiliary
+                .iter()
+                .find(|observation| observation.pane.tmux_session.as_deref() == Some(name))?;
+            (Some(observation.target.clone()), &observation.pane)
+        };
+        if pane.state != crate::session::PanePresence::Alive
+            || pane.legacy_tool.is_some()
+            || pane.physical.is_none()
+        {
+            return None;
+        }
+        let target = Arc::new(crate::daemon::TerminalTarget {
+            tmux_session: name.to_owned(),
+            status: crate::daemon::TerminalTargetStatus::Alive,
+            lifecycle_generation: row.lifecycle_generation,
+            profile: row.profile.clone(),
+            physical: pane.physical.clone(),
+        });
+        let lease = NativeLease {
+            grant: self.native_grant.clone(),
+            generation: self.native_grant.load(Ordering::SeqCst),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            preparation: None,
+            latest: Some(self.receiver.clone()),
+        };
+        if !lease.bind(
+            id,
+            auxiliary,
+            target,
+            snapshot,
+            self.receiver.borrow().as_ref(),
+        ) {
+            return None;
+        }
+        *cached = Some(lease.clone());
+        Some(lease)
     }
 
     pub(crate) fn can_submit(&self, id: &str) -> bool {
@@ -1274,47 +1672,124 @@ impl SessionFeed {
         settled
     }
 
-    /// Prepare the session's own agent pane. Readiness is confirmed by the
-    /// applied snapshot's agent observation, like an auxiliary's.
-    pub(crate) fn ensure_agent(
-        &mut self,
-        id: String,
-        size: Option<(u16, u16)>,
-    ) -> anyhow::Result<NativePreparation> {
-        self.prepare_agent(id, size, false)
-    }
-
-    pub(crate) fn start_agent(
-        &mut self,
-        id: String,
-        size: Option<(u16, u16)>,
-    ) -> anyhow::Result<NativePreparation> {
-        self.prepare_agent(id, size, true)
-    }
-
-    fn prepare_agent(
-        &mut self,
-        id: String,
-        size: Option<(u16, u16)>,
-        start: bool,
-    ) -> anyhow::Result<NativePreparation> {
+    /// Freeze the original role and owner before queueing any native preparation.
+    fn preparation_lease(
+        &self,
+        id: &str,
+        auxiliary: Option<AuxiliaryTarget>,
+    ) -> anyhow::Result<NativeLease> {
         let generation = self.native_grant.load(Ordering::SeqCst);
         anyhow::ensure!(generation & 1 == 1, "Native interaction is unavailable");
-        // No row-membership check here: the applied snapshot can trail by a frame
-        // while the row is already known locally, and the daemon validates the id
-        // itself. Only the epoch must match, so the receipt can be fenced.
+        let snapshot = self
+            .applied
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Runtime snapshot is not current"))?;
+        let row = snapshot
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Native preparation requires the original session snapshot")
+            })?;
+        let created_at: chrono::DateTime<chrono::Utc> = row.created_at.parse()?;
+        let profile_binding = crate::session::Storage::open_reference(&row.profile)
+            .ok()
+            .map(Arc::new);
+        let pane = auxiliary
+            .as_ref()
+            .and_then(|target| {
+                row.auxiliary
+                    .iter()
+                    .find(|observation| observation.target == *target)
+                    .map(|observation| &observation.pane)
+            })
+            .or_else(|| auxiliary.is_none().then_some(&row.agent_pane))
+            .cloned()
+            .unwrap_or_default();
+        // A living physical owner needs no selected-context read. If it disappears,
+        // this intent must refuse rather than silently prepare a replacement.
+        let selection = if auxiliary.is_none() && pane.state != crate::session::PanePresence::Alive
+        {
+            profile_binding.as_ref().and_then(|storage| {
+                let rows = storage.load_instances_complete().ok()?;
+                let mut owners = rows.iter().filter(|candidate| candidate.id == row.id);
+                let owner = owners.next()?;
+                if owners.next().is_some()
+                    || owner.created_at != created_at
+                    || owner.lifecycle_generation != row.lifecycle_generation
+                    || owner.source_profile != row.profile
+                {
+                    return None;
+                }
+                owner.native_preparation_selection().ok()
+            })
+        } else {
+            None
+        };
+        let preparation = Arc::new(NativePreparationScope {
+            id: id.to_owned(),
+            epoch: snapshot.cursor.epoch.clone(),
+            identity: crate::daemon::NativePreparationIdentity {
+                created_at: row.created_at.clone(),
+                lifecycle_generation: row.lifecycle_generation,
+                profile: row.profile.clone(),
+                profile_identity: profile_binding
+                    .as_ref()
+                    .and_then(|storage| storage.bound_profile_identity().ok()),
+                selection,
+            },
+            auxiliary: auxiliary.clone(),
+            pane,
+            profile_binding,
+        });
+        let latest = self.receiver.borrow();
         anyhow::ensure!(
-            self.applied.as_ref().is_some_and(|applied| {
-                matches!(&*self.sender.borrow(), Some(SessionFeedResult::Snapshot(latest))
-                    if latest.cursor.epoch == applied.cursor.epoch)
-            }),
-            "Runtime snapshot is not current"
+            matches!(latest.as_ref(), Some(SessionFeedResult::Snapshot(latest))
+                if preparation.matches_initial(latest)),
+            "Native preparation scope changed before admission"
         );
         let lease = NativeLease {
             grant: self.native_grant.clone(),
             generation,
             cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            latest: Some(self.receiver.clone()),
+            preparation: Some(preparation.clone()),
         };
+        if preparation.pane.state == crate::session::PanePresence::Alive
+            && preparation.pane.legacy_tool.is_none()
+        {
+            if let (Some(name), Some(physical)) =
+                (&preparation.pane.tmux_session, &preparation.pane.physical)
+            {
+                anyhow::ensure!(
+                    lease.bind(
+                        id,
+                        auxiliary,
+                        Arc::new(TerminalTarget {
+                            tmux_session: name.clone(),
+                            status: crate::daemon::TerminalTargetStatus::Alive,
+                            lifecycle_generation: row.lifecycle_generation,
+                            profile: row.profile.clone(),
+                            physical: Some(physical.clone()),
+                        }),
+                        snapshot,
+                        latest.as_ref()
+                    ),
+                    "Original native target is no longer current"
+                );
+            }
+        }
+        Ok(lease)
+    }
+
+    pub(crate) fn ensure_agent(
+        &mut self,
+        id: String,
+        size: Option<(u16, u16)>,
+    ) -> anyhow::Result<NativePreparation> {
+        let lease = self.preparation_lease(&id, None)?;
         let size = size.and_then(|(cols, rows)| {
             Some(TerminalSize {
                 cols: std::num::NonZeroU16::new(cols)?,
@@ -1324,48 +1799,11 @@ impl SessionFeed {
         let (ready, result) = tokio::sync::oneshot::channel();
         self.enqueue(
             id,
-            if start {
-                SessionRequest::StartAgent { size }
-            } else {
-                SessionRequest::EnsureAgent { size }
-            },
+            SessionRequest::EnsureAgent { size },
             Some(lease.clone()),
             Some(PendingTerminal {
                 target: None,
-                cancelled: lease.cancelled.clone(),
-                result: ready,
-            }),
-        )?;
-        Ok(NativePreparation { lease, result })
-    }
-
-    pub(crate) fn restart_agent(
-        &mut self,
-        id: String,
-        body: crate::daemon::RestartSessionBody,
-    ) -> anyhow::Result<NativePreparation> {
-        let generation = self.native_grant.load(Ordering::SeqCst);
-        anyhow::ensure!(generation & 1 == 1, "Native interaction is unavailable");
-        anyhow::ensure!(
-            self.applied.as_ref().is_some_and(|applied| {
-                matches!(&*self.sender.borrow(), Some(SessionFeedResult::Snapshot(latest))
-                if latest.cursor.epoch == applied.cursor.epoch)
-            }),
-            "Runtime snapshot is not current"
-        );
-        let lease = NativeLease {
-            grant: self.native_grant.clone(),
-            generation,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
-        let (ready, result) = tokio::sync::oneshot::channel();
-        self.enqueue(
-            id,
-            SessionRequest::Mutation(SessionMutation::Restart(body)),
-            Some(lease.clone()),
-            Some(PendingTerminal {
-                target: None,
-                cancelled: lease.cancelled.clone(),
+                native: lease.clone(),
                 result: ready,
             }),
         )?;
@@ -1391,24 +1829,7 @@ impl SessionFeed {
             adoption.is_none() || matches!(&target, AuxiliaryTarget::Tool { .. }),
             "Only a tool can adopt a legacy pane"
         );
-        let generation = self.native_grant.load(Ordering::SeqCst);
-        anyhow::ensure!(generation & 1 == 1, "Native interaction is unavailable");
-        // Only the epoch is checked at admission: the applied snapshot can trail
-        // by a frame while the row is already known locally, and the daemon
-        // validates the id itself. Readiness still requires a snapshot that
-        // reports this target alive, which is what fences the receipt.
-        anyhow::ensure!(
-            self.applied.as_ref().is_some_and(|applied| {
-                matches!(&*self.sender.borrow(), Some(SessionFeedResult::Snapshot(latest))
-                    if latest.cursor.epoch == applied.cursor.epoch)
-            }),
-            "Runtime snapshot is not current"
-        );
-        let lease = NativeLease {
-            grant: self.native_grant.clone(),
-            generation,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+        let lease = self.preparation_lease(&id, Some(target.clone()))?;
         let size = size.and_then(|(cols, rows)| {
             Some(TerminalSize {
                 cols: std::num::NonZeroU16::new(cols)?,
@@ -1426,7 +1847,7 @@ impl SessionFeed {
             Some(lease.clone()),
             Some(PendingTerminal {
                 target: Some(target),
-                cancelled: lease.cancelled.clone(),
+                native: lease.clone(),
                 result: ready,
             }),
         )?;
@@ -1509,8 +1930,10 @@ impl SessionFeed {
         }
         let (result, receiver) = tokio::sync::oneshot::channel();
         let marks_unread = matches!(&request, SessionRequest::Mutation(SessionMutation::Unread(body)) if body.unread);
-        let is_engagement = matches!(&request, SessionRequest::Mutation(SessionMutation::Access))
-            || matches!(&request, SessionRequest::Mutation(SessionMutation::Unread(body)) if !body.unread);
+        let is_engagement = matches!(
+            &request,
+            SessionRequest::Mutation(SessionMutation::Access | SessionMutation::InputRecency(_))
+        ) || matches!(&request, SessionRequest::Mutation(SessionMutation::Unread(body)) if !body.unread);
         commands
             .try_send(SessionCommand {
                 request: CommandRequest::Session {
@@ -1653,79 +2076,22 @@ impl SessionFeed {
                         return true;
                     }
                     if let Some(terminal) = pending.terminal.take() {
-                        if terminal.cancelled.load(Ordering::SeqCst) {
-                            let _ = terminal.result.send(Err("Native continuation cancelled".into()));
-                            return false;
-                        }
-                        let PendingTerminal {
-                            target,
-                            result: terminal,
-                            ..
-                        } = terminal;
-                        let alive = snapshot
-                            .contents
-                            .sessions
-                            .iter()
-                            .find(|row| row.id == *id)
-                            .is_some_and(|row| {
-                                match &target {
-                                    None => match reply {
-                                        CommandReply::Restart(receipt) => row.lifecycle_generation == receipt.outcome.lifecycle_generation
-                                            && row.profile == receipt.outcome.profile
-                                            && row.agent_pane.state == crate::session::PanePresence::Alive
-                                            && receipt.outcome.target.as_ref().is_some_and(|target|
-                                                row.agent_pane.tmux_session.as_deref() == Some(target.tmux_session.as_str()))
-                                            && matches!(row.status.as_str(), "Running" | "Waiting" | "Idle"),
-                                        CommandReply::Terminal(receipt) => {
-                                            let identity_matches = row.lifecycle_generation
-                                                == receipt.outcome.lifecycle_generation
-                                                && row.profile == receipt.outcome.profile;
-                                            let status_ok = matches!(
-                                                row.status.as_str(),
-                                                "Running" | "Waiting" | "Idle" | "Starting"
-                                            );
-                                            let pane_ok = match row.agent_pane.state {
-                                                crate::session::PanePresence::Alive => {
-                                                    row.agent_pane.tmux_session.as_deref()
-                                                        == Some(receipt.outcome.tmux_session.as_str())
-                                                }
-                                                crate::session::PanePresence::Absent
-                                                | crate::session::PanePresence::Unknown => {
-                                                    row.status == "Starting"
-                                                }
-                                                crate::session::PanePresence::Dead => false,
-                                            };
-                                            identity_matches && status_ok && pane_ok
-                                        }
-                                        _ => false,
-                                    },
-                                    Some(target) => row
-                                        .auxiliary
-                                        .iter()
-                                        .find(|observation| observation.target == *target)
-                                        .map(|observation| &observation.pane)
-                                        .is_some_and(|pane| {
-                                            pane.state == crate::session::PanePresence::Alive
-                                                && pane.legacy_tool.is_none()
-                                                && matches!(reply, CommandReply::Terminal(receipt)
-                                                    if row.lifecycle_generation == receipt.outcome.lifecycle_generation
-                                                        && row.profile == receipt.outcome.profile
-                                                        && pane.tmux_session.as_deref()
-                                                            == Some(receipt.outcome.tmux_session.as_str()))
-                                        }),
-                                }
-                            });
-                        if !alive {
-                            let _ = terminal.send(Err(
-                                "Prepared target no longer matches the applied snapshot".into(),
-                            ));
-                        } else {
-                            let name = match pending.reply.take() {
-                                Some(CommandReply::Terminal(receipt)) => Some(receipt.outcome.tmux_session),
-                                Some(CommandReply::Restart(receipt)) => receipt.outcome.target.map(|target| target.tmux_session),
-                                _ => None,
-                            };
-                            let _ = terminal.send(name.ok_or_else(|| "Prepared target unavailable".into()));
+                        let PendingTerminal { target, native, result } = terminal;
+                        let prepared = match pending.reply.take() {
+                            Some(CommandReply::Terminal(receipt)) => Some(receipt.outcome),
+                            _ => None,
+                        }.map(Arc::new);
+                        match prepared {
+                            Some(prepared) if native.bind(id, target, prepared.clone(),
+                                snapshot, latest.as_ref()) => {
+                                let _ = result.send(Ok(native.target().expect("bound native scope").clone()));
+                            }
+                            _ => {
+                                native.cancel_continuation();
+                                let _ = result.send(Err(
+                                    "Prepared target no longer matches the current physical snapshot".into(),
+                                ));
+                            }
                         }
                     }
                     if let Some(reply) = pending.reply.take() {
@@ -1846,7 +2212,8 @@ impl SessionFeed {
             assert!(matches!(
                 command.request,
                 CommandRequest::Session {
-                    request: SessionRequest::EnsureAuxiliary { .. },
+                    request: SessionRequest::EnsureAgent { .. }
+                        | SessionRequest::EnsureAuxiliary { .. },
                     ..
                 }
             ));
@@ -1885,37 +2252,6 @@ impl SessionFeed {
                     "CAS refused stale legacy identity".into()
                 )))
                 .is_ok());
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn restart_driver_for_test(
-        &mut self,
-    ) -> impl FnMut(
-        Result<MutationReceipt<crate::daemon::RestartOutcome>, String>,
-    ) -> Option<(String, crate::daemon::RestartSessionBody)> {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
-        self.commands = Some(sender);
-        set_grant(&self.grant, true);
-        set_grant(&self.native_grant, true);
-        move |result| {
-            let command = receiver.try_recv().ok()?;
-            assert!(command
-                .result
-                .send(
-                    result
-                        .map(CommandReply::Restart)
-                        .map_err(CommandFailure::Rejected)
-                )
-                .is_ok());
-            let CommandRequest::Session {
-                id,
-                request: SessionRequest::Mutation(SessionMutation::Restart(body)),
-            } = command.request
-            else {
-                panic!("expected restart");
-            };
-            Some((id, body))
         }
     }
 
@@ -2001,6 +2337,19 @@ impl SessionFeed {
     }
 
     #[cfg(test)]
+    pub(crate) fn command_writer_for_test(
+        &mut self,
+        client: crate::daemon::DaemonClient,
+        epoch: String,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let (sender, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        set_grant(&self.native_grant, true);
+        run_command_writer(client, epoch, self.grant.clone(), receiver, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn command_driver_for_test(
         &mut self,
     ) -> impl FnMut(Result<RuntimeCursor, String>) -> Option<(String, SessionMutation)> {
@@ -2025,6 +2374,48 @@ impl SessionFeed {
                 panic!("expected session mutation");
             };
             Some((id, mutation))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_dispatch_driver_for_test<F>(
+        &mut self,
+        mut dispatch: F,
+    ) -> impl FnMut() -> Option<String>
+    where
+        F: FnMut(&str, &SessionMutation) -> Result<RuntimeCursor, String>,
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        let grant = self.grant.clone();
+        move || {
+            let command = receiver.try_recv().ok()?;
+            let allowed = command.native.as_ref().map_or_else(
+                || grant.load(Ordering::SeqCst) == command.lease,
+                NativeLease::is_valid,
+            );
+            let CommandRequest::Session {
+                id,
+                request: SessionRequest::Mutation(mutation),
+            } = command.request
+            else {
+                panic!("expected session mutation");
+            };
+            let result = if allowed {
+                dispatch(&id, &mutation)
+            } else {
+                Err("Request not submitted: runtime permission changed or continuation was cancelled".into())
+            };
+            assert!(command
+                .result
+                .send(
+                    result
+                        .map(CommandReply::Mutation)
+                        .map_err(CommandFailure::Rejected)
+                )
+                .is_ok());
+            Some(id)
         }
     }
 
@@ -2455,15 +2846,44 @@ mod tests {
         (feed, requests)
     }
 
+    fn native_physical_fixture() -> Arc<crate::session::LegacyToolObservation> {
+        let pid = std::process::id();
+        Arc::new(crate::session::LegacyToolObservation {
+            identity: crate::session::LegacyToolIdentity {
+                session_id: "$1".into(),
+                pane_id: "%1".into(),
+                pane_pid: Some(pid),
+            },
+            server: Arc::new(crate::session::TmuxServerIdentity {
+                socket: "/fixture-tmux.sock".into(),
+                pid,
+                birth: crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .unwrap(),
+            }),
+        })
+    }
+
     fn native_identity_snapshot(revision: u64) -> Arc<RuntimeSnapshot> {
         let mut snapshot = snapshot("test", revision);
         Arc::make_mut(&mut snapshot).contents.sessions.push(serde_json::from_value(serde_json::json!({
             "id": "session", "profile": "test", "lifecycle_generation": 4,
             "created_at": "2026-01-01T00:00:00Z", "status": "Idle",
-            "agent_pane": {"state": "alive", "tmux_session": "native-owned"},
-            "auxiliary": [{"target": {"kind": "host", "index": 0}, "state": "alive", "tmux_session": "native-owned"}],
+            "agent_pane": {"state": "alive", "tmux_session": "native-owned", "physical": native_physical_fixture()},
+            "auxiliary": [{"target": {"kind": "host", "index": 0}, "state": "alive", "tmux_session": "native-owned", "physical": native_physical_fixture()}],
         })).unwrap());
         snapshot
+    }
+
+    fn feed_with_native_identity(
+        id: &str,
+    ) -> (SessionFeed, tokio::sync::mpsc::Receiver<SessionCommand>) {
+        let (mut feed, requests) = feed_with_native_lane();
+        let mut initial = native_identity_snapshot(1);
+        Arc::make_mut(&mut initial).contents.sessions[0].id = id.to_owned();
+        feed.publish_for_test(SessionFeedResult::Snapshot(initial.clone()));
+        feed.mark_snapshot_applied(initial);
+        (feed, requests)
     }
 
     #[test]
@@ -2493,10 +2913,6 @@ mod tests {
                 }
                 .unwrap();
                 assert!(feed.ensure_agent("session".into(), None).is_err());
-                assert!(feed.start_agent("session".into(), None).is_err());
-                assert!(feed
-                    .restart_agent("session".into(), Default::default())
-                    .is_err());
                 assert!(feed
                     .submit("session".into(), SessionMutation::Stop)
                     .is_err());
@@ -2557,6 +2973,7 @@ mod tests {
                             revision: 4,
                         },
                         outcome: TerminalTarget {
+                            physical: Some(native_physical_fixture()),
                             tmux_session: "native-owned".into(),
                             status: crate::daemon::TerminalTargetStatus::Exists,
                             lifecycle_generation: 4,
@@ -2570,7 +2987,10 @@ mod tests {
                 feed.publish_for_test(SessionFeedResult::Snapshot(ready.clone()));
                 feed.mark_snapshot_applied(ready);
                 assert!(feed.drain_command_errors().is_empty());
-                assert_eq!(prepared.result.try_recv().unwrap().unwrap(), "native-owned");
+                assert_eq!(
+                    prepared.result.try_recv().unwrap().unwrap().tmux_session,
+                    "native-owned"
+                );
                 assert!(requests.try_recv().is_err());
                 assert!(feed.can_submit("session"));
             }
@@ -2692,15 +3112,19 @@ mod tests {
             assert!(feed.ensure_agent("session".into(), None).is_err());
             assert!(requests.try_recv().is_err());
         }
-        for parent in 0..3 {
+        for parent in 0..2 {
             let (mut feed, mut requests) = feed_with_native_lane();
             let current = native_identity_snapshot(1);
             feed.publish_for_test(SessionFeedResult::Snapshot(current.clone()));
             feed.mark_snapshot_applied(current);
             let _preparation = match parent {
-                0 => feed.start_agent("session".into(), None),
-                1 => feed.restart_agent("session".into(), Default::default()),
-                _ => feed.ensure_agent("session".into(), None),
+                0 => feed.ensure_agent("session".into(), None),
+                _ => feed.ensure_auxiliary(
+                    "session".into(),
+                    AuxiliaryTarget::Host { index: 0 },
+                    None,
+                    None,
+                ),
             }
             .unwrap();
             let _parent = requests.try_recv().unwrap();
@@ -2755,12 +3179,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_native_outcome_still_queues_the_resolution_error() {
         use crate::daemon::DaemonClientError;
-        let (mut feed, mut requests) = feed_with_native_lane();
+        let (mut feed, mut requests) = feed_with_native_identity("native");
         let mut preparation = feed
-            .restart_agent(
-                "native".into(),
-                crate::daemon::RestartSessionBody::default(),
-            )
+            .ensure_agent("native".into(), None)
             .expect("the native command is admitted");
         requests
             .try_recv()
@@ -2801,12 +3222,9 @@ mod tests {
     #[tokio::test]
     async fn a_refused_native_command_is_not_queued() {
         use crate::daemon::DaemonClientError;
-        let (mut feed, mut requests) = feed_with_native_lane();
+        let (mut feed, mut requests) = feed_with_native_identity("native");
         let mut preparation = feed
-            .restart_agent(
-                "native".into(),
-                crate::daemon::RestartSessionBody::default(),
-            )
+            .ensure_agent("native".into(), None)
             .expect("the native command is admitted");
         requests
             .try_recv()
@@ -3071,13 +3489,8 @@ mod tests {
     #[test]
     fn local_cancellation_does_not_hide_an_unknown_native_outcome() {
         for close_reply in [false, true] {
-            let (mut feed, mut requests) = feed_with_native_lane();
-            let mut preparation = feed
-                .restart_agent(
-                    "native".into(),
-                    crate::daemon::RestartSessionBody::default(),
-                )
-                .unwrap();
+            let (mut feed, mut requests) = feed_with_native_identity("native");
+            let mut preparation = feed.ensure_agent("native".into(), None).unwrap();
             preparation.lease.cancel_continuation();
             let command = requests.try_recv().unwrap();
             if close_reply {
@@ -3518,47 +3931,28 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn stopped_native_attach_starts_then_ensures_without_restart() {
+    async fn native_attach_ensures_agent_without_start_or_restart() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = axum::Router::new()
-            .route(
-                "/api/sessions/id/start",
-                axum::routing::post({
-                    let seen = seen.clone();
-                    move || {
-                        seen.lock().unwrap().push("start");
-                        async {
-                            (
-                                [
-                                    (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
-                                    (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
-                                ],
-                                "",
-                            )
-                        }
+        let app = axum::Router::new().route(
+            "/api/sessions/id/ensure",
+            axum::routing::post({
+                let seen = seen.clone();
+                move || {
+                    seen.lock().unwrap().push("ensure");
+                    async {
+                        (
+                            [
+                                (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                (crate::daemon::RUNTIME_REVISION_HEADER, "3"),
+                            ],
+                            axum::Json(
+                                serde_json::json!({"tmux_session": "pane", "status": "alive"}),
+                            ),
+                        )
                     }
-                }),
-            )
-            .route(
-                "/api/sessions/id/ensure",
-                axum::routing::post({
-                    let seen = seen.clone();
-                    move || {
-                        seen.lock().unwrap().push("ensure");
-                        async {
-                            (
-                                [
-                                    (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
-                                    (crate::daemon::RUNTIME_REVISION_HEADER, "3"),
-                                ],
-                                axum::Json(
-                                    serde_json::json!({"tmux_session": "pane", "status": "alive"}),
-                                ),
-                            )
-                        }
-                    }
-                }),
-            );
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3575,7 +3969,7 @@ mod tests {
         tx.send(SessionCommand {
             request: CommandRequest::Session {
                 id: "id".into(),
-                request: SessionRequest::StartAgent { size: None },
+                request: SessionRequest::EnsureAgent { size: None },
             },
             lease: 1,
             native: Some(NativeLease::valid_for_test()),
@@ -3590,81 +3984,57 @@ mod tests {
             .unwrap();
         assert!(matches!(reply, CommandReply::Terminal(receipt)
             if receipt.outcome.tmux_session == "pane" && receipt.cursor.revision == 3));
-        assert_eq!(*seen.lock().unwrap(), ["start", "ensure"]);
+        assert_eq!(*seen.lock().unwrap(), ["ensure"]);
         drop(tx);
         writer.await.unwrap();
         server.abort();
     }
 
     #[tokio::test]
-    async fn committed_start_remains_fenced_when_pane_preparation_fails() {
+    async fn agent_ensure_failures_preserve_refusal_quarantine_and_commit_fences() {
         use axum::response::IntoResponse;
-        for (start_refused, ensure_status, committed_revision) in [
-            (false, axum::http::StatusCode::FORBIDDEN, None),
-            (false, axum::http::StatusCode::CONFLICT, None),
-            (false, axum::http::StatusCode::INTERNAL_SERVER_ERROR, None),
-            (false, axum::http::StatusCode::OK, None),
-            (true, axum::http::StatusCode::FORBIDDEN, None),
-            (false, axum::http::StatusCode::CONFLICT, Some("1")),
-            (false, axum::http::StatusCode::CONFLICT, Some("3")),
+        for (ensure_status, committed_revision) in [
+            (axum::http::StatusCode::FORBIDDEN, None),
+            (axum::http::StatusCode::CONFLICT, None),
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, None),
+            (axum::http::StatusCode::OK, None),
+            (axum::http::StatusCode::CONFLICT, Some("1")),
+            (axum::http::StatusCode::CONFLICT, Some("2")),
+            (axum::http::StatusCode::CONFLICT, Some("3")),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let app = axum::Router::new()
-                .route(
-                    "/api/sessions/id/start",
-                    axum::routing::post({
-                        let seen = seen.clone();
-                        move || {
-                            seen.lock().unwrap().push("start");
-                            async move {
-                                if start_refused {
-                                    return (axum::http::StatusCode::CONFLICT, "refused")
-                                        .into_response();
-                                }
-                                (
-                                    [
-                                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
-                                        (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
-                                    ],
-                                    "",
-                                )
-                                    .into_response()
-                            }
-                        }
-                    }),
-                )
-                .route(
-                    "/api/sessions/id/ensure",
-                    axum::routing::post({
-                        let seen = seen.clone();
-                        move || {
-                            seen.lock().unwrap().push("ensure");
-                            async move {
-                                if let Some(revision) = committed_revision {
-                                    return (
-                                        ensure_status,
-                                        [
-                                            (
-                                                crate::daemon::ERROR_CODE_HEADER,
-                                                "managed_resume_refused",
-                                            ),
-                                            (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
-                                            (crate::daemon::RUNTIME_REVISION_HEADER, revision),
-                                        ],
-                                        "private pane refusal detail",
-                                    )
-                                        .into_response();
-                                }
-                                (
+            let app = axum::Router::new().route(
+                "/api/sessions/id/ensure",
+                axum::routing::post({
+                    let seen = seen.clone();
+                    move || {
+                        seen.lock().unwrap().push("ensure");
+                        async move {
+                            if let Some(revision) = committed_revision {
+                                return (
                                     ensure_status,
-                                    [(crate::daemon::ERROR_CODE_HEADER, "resume_failed")],
-                                    "pane preparation refused",
+                                    [
+                                        (
+                                            crate::daemon::ERROR_CODE_HEADER,
+                                            "managed_resume_refused",
+                                        ),
+                                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                        (crate::daemon::RUNTIME_REVISION_HEADER, revision),
+                                    ],
+                                    "private pane refusal detail",
                                 )
-                                    .into_response()
+                                    .into_response();
                             }
+                            (
+                                ensure_status,
+                                [(crate::daemon::ERROR_CODE_HEADER, "resume_failed")],
+                                "pane preparation refused",
+                            )
+                                .into_response()
                         }
-                    }),
-                );
+                    }
+                }),
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = crate::daemon::DaemonClient::new(
                 &format!("http://{}", listener.local_addr().unwrap()),
@@ -3672,8 +4042,8 @@ mod tests {
             )
             .unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let (mut feed, mut requests) = feed_with_native_lane();
-            let mut preparation = feed.start_agent("id".into(), None).unwrap();
+            let (mut feed, mut requests) = feed_with_native_identity("id");
+            let mut preparation = feed.ensure_agent("id".into(), None).unwrap();
             let mut command = requests.recv().await.unwrap();
             let (completed, completion) = tokio::sync::oneshot::channel();
             let original = std::mem::replace(&mut command.result, completed);
@@ -3693,36 +4063,42 @@ mod tests {
             if let Some(revision) = committed_revision {
                 assert!(matches!(&reply,
                     Ok(CommandReply::CommittedFailure { cursor, failure: CommandFailure::Rejected(_) })
-                    if cursor.revision == revision.parse::<u64>().unwrap().max(2)));
+                    if cursor.revision == revision.parse::<u64>().unwrap()));
+            } else {
+                assert!(
+                    matches!(
+                        &reply,
+                        Err(CommandFailure::Unknown(_))
+                            if ensure_status.is_server_error() || ensure_status.is_success()
+                    ) || matches!(
+                        &reply,
+                        Err(CommandFailure::Rejected(_)) if ensure_status.is_client_error()
+                    )
+                );
             }
             original.send(reply).unwrap();
-            assert!(feed.drain_command_errors().is_empty());
-            if start_refused {
-                assert!(preparation.result.try_recv().unwrap().is_err());
-                assert!(feed.can_submit("id"));
-                assert_eq!(*seen.lock().unwrap(), ["start"]);
-            } else {
-                assert!(matches!(
-                    preparation.result.try_recv(),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                ));
-                assert!(!feed.can_submit("id"));
-                if committed_revision == Some("3") {
-                    feed.mark_snapshot_applied(snapshot("test", 2));
+            let mut errors = feed.drain_command_errors();
+            if let Some(revision) = committed_revision {
+                let revision = revision.parse::<u64>().unwrap();
+                if revision > 1 {
+                    assert!(errors.is_empty());
+                    assert!(matches!(
+                        preparation.result.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ));
+                    assert!(!feed.can_submit("id"));
+                    feed.mark_snapshot_applied(snapshot("test", revision - 1));
                     assert!(feed.drain_command_errors().is_empty());
                     assert!(!feed.can_submit("id"));
+                    feed.mark_snapshot_applied(snapshot("test", revision));
+                    errors = feed.drain_command_errors();
                 }
-                let revision = committed_revision
-                    .map(|value| value.parse::<u64>().unwrap().max(2))
-                    .unwrap_or(2);
-                feed.mark_snapshot_applied(snapshot("test", revision));
-                let errors = feed.drain_command_errors();
-                assert!(preparation.result.try_recv().unwrap().is_err());
-                let unknown = ensure_status.is_server_error() || ensure_status.is_success();
-                assert_eq!(feed.can_submit("id"), !unknown);
-                assert_eq!(errors.iter().any(|error| error.outcome_unknown), unknown);
-                assert_eq!(*seen.lock().unwrap(), ["start", "ensure"]);
             }
+            assert!(preparation.result.try_recv().unwrap().is_err());
+            let unknown = ensure_status.is_server_error() || ensure_status.is_success();
+            assert_eq!(feed.can_submit("id"), !unknown);
+            assert_eq!(errors.iter().any(|error| error.outcome_unknown), unknown);
+            assert_eq!(*seen.lock().unwrap(), ["ensure"]);
             drop(commands);
             writer.await.unwrap();
             server.abort();
@@ -3840,9 +4216,10 @@ mod tests {
         let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
             "id": "session",
             "profile": "test",
+            "created_at": "2026-01-01T00:00:00Z",
             "lifecycle_generation": 4,
             "status": "Running",
-            "agent_pane": {"state": "alive", "tmux_session": "agent-4"}
+            "agent_pane": {"state": "alive", "tmux_session": "agent-4", "physical": native_physical_fixture()}
         }))
         .unwrap();
         let mut initial = snapshot("test", 1);
@@ -3870,6 +4247,7 @@ mod tests {
                     revision: 2,
                 },
                 outcome: TerminalTarget {
+                    physical: Some(native_physical_fixture()),
                     tmux_session: "agent-3".into(),
                     status: crate::daemon::TerminalTargetStatus::Alive,
                     lifecycle_generation: 3,
@@ -3887,10 +4265,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_agent_accepts_starting_snapshot_before_pane_observation() {
+    fn ensure_agent_accepts_starting_snapshot_after_pane_observation() {
         let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
             "id": "session",
             "profile": "test",
+            "created_at": "2026-01-01T00:00:00Z",
             "lifecycle_generation": 4,
             "status": "Starting"
         }))
@@ -3919,6 +4298,7 @@ mod tests {
                     revision: 2,
                 },
                 outcome: TerminalTarget {
+                    physical: Some(native_physical_fixture()),
                     tmux_session: "agent-4".into(),
                     status: crate::daemon::TerminalTargetStatus::Alive,
                     lifecycle_generation: 4,
@@ -3928,12 +4308,56 @@ mod tests {
             .unwrap();
         let mut next = initial;
         Arc::make_mut(&mut next).cursor.revision = 2;
+        Arc::make_mut(&mut next).contents.sessions[0].agent_pane =
+            crate::session::PaneObservation {
+                state: crate::session::PanePresence::Alive,
+                tmux_session: Some("agent-4".into()),
+                physical: Some(native_physical_fixture()),
+                legacy_tool: None,
+            };
         feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
         assert!(feed.drain_command_errors().is_empty());
         feed.mark_snapshot_applied(next);
         assert!(feed.drain_command_errors().is_empty());
         assert!(prepared.result.try_recv().unwrap().is_ok());
     }
+    #[test]
+    fn queued_live_preparation_accepts_renamed_label_without_rebinding_physical_owner() {
+        let (mut feed, mut requests) = feed_with_native_identity("session");
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        let command = requests.try_recv().unwrap();
+        let original = prepared.lease.target().unwrap().clone();
+        let mut renamed = native_identity_snapshot(2);
+        Arc::make_mut(&mut renamed).contents.sessions[0]
+            .agent_pane
+            .tmux_session = Some("renamed-native-label".into());
+        feed.publish_for_test(SessionFeedResult::Snapshot(renamed.clone()));
+        feed.mark_snapshot_applied(renamed);
+        assert!(
+            prepared.lease.can_dispatch(),
+            "name-only metadata refused queued work"
+        );
+        command
+            .result
+            .send(Ok(CommandReply::Terminal(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                },
+                outcome: TerminalTarget {
+                    tmux_session: "renamed-native-label".into(),
+                    physical: original.physical.clone(),
+                    lifecycle_generation: original.lifecycle_generation,
+                    profile: original.profile.clone(),
+                    status: crate::daemon::TerminalTargetStatus::Alive,
+                },
+            })))
+            .unwrap();
+        assert!(feed.drain_command_errors().is_empty());
+        let accepted = prepared.result.try_recv().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&accepted, &original));
+    }
+
     #[test]
     fn native_preparation_requires_current_permission_and_an_applied_live_target() {
         use crate::session::PanePresence;
@@ -3945,6 +4369,7 @@ mod tests {
             Deleted,
             Profile,
             Generation,
+            Physical,
             Presence(PanePresence),
             TargetName(Option<&'static str>),
         }
@@ -3955,6 +4380,7 @@ mod tests {
             Invalidation::Deleted,
             Invalidation::Profile,
             Invalidation::Generation,
+            Invalidation::Physical,
             Invalidation::Presence(PanePresence::Absent),
             Invalidation::Presence(PanePresence::Dead),
             Invalidation::Presence(PanePresence::Unknown),
@@ -3967,9 +4393,10 @@ mod tests {
             let mut initial = snapshot("test", 1);
             let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
                 "id": "session", "profile": "test", "lifecycle_generation": 4,
+                "created_at": "2026-01-01T00:00:00Z",
                 "auxiliary": [{
                     "target": target, "state": "alive",
-                    "tmux_session": "daemon-owned-target"
+                    "tmux_session": "daemon-owned-target", "physical": native_physical_fixture()
                 }]
             }))
             .unwrap();
@@ -4003,6 +4430,13 @@ mod tests {
                 Invalidation::Generation => {
                     Arc::make_mut(&mut next).contents.sessions[0].lifecycle_generation += 1;
                 }
+                Invalidation::Physical => {
+                    let row = &mut Arc::make_mut(&mut next).contents.sessions[0];
+                    let mut value = serde_json::to_value(&*row).unwrap();
+                    value["auxiliary"][0]["physical"]["identity"]["pane_id"] =
+                        serde_json::json!("%99");
+                    *row = serde_json::from_value(value).unwrap();
+                }
                 Invalidation::TargetName(name) => {
                     let row = &mut Arc::make_mut(&mut next).contents.sessions[0];
                     let mut value = serde_json::to_value(&*row).unwrap();
@@ -4026,6 +4460,7 @@ mod tests {
                     revision: 2,
                 },
                 outcome: TerminalTarget {
+                    physical: Some(native_physical_fixture()),
                     tmux_session: "daemon-owned-target".into(),
                     status: crate::daemon::TerminalTargetStatus::Exists,
                     lifecycle_generation: 4,
@@ -4054,7 +4489,10 @@ mod tests {
             let ready = prepared.result.try_recv().unwrap();
             assert_eq!(
                 ready.is_ok(),
-                matches!(invalidation, Invalidation::None),
+                matches!(
+                    invalidation,
+                    Invalidation::None | Invalidation::TargetName(_)
+                ),
                 "{invalidation:?}"
             );
             assert!(feed.can_submit("session"));

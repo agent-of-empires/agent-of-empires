@@ -6,7 +6,10 @@ use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest, JsonRpcResponse
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use super::connection::ConnectionState;
+use super::session_identity::{spawn_native_request, OrderedRequestResult};
 use super::spawn::scrub_stderr_secrets;
+use std::sync::Arc;
 
 /// Wire request not yet exposed by the Rust ACP schema. Unsupported adapters
 /// return `method_not_found`, after which normal process cleanup continues.
@@ -49,42 +52,45 @@ pub(super) const ACP_DELETE_ERROR_MSG_MAX: usize = 256;
 pub(super) const ACP_SESSION_DELETE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
 
-/// Dispatched from the connect task's cmd_rx arm. The wait is spawned so the
-/// select arm keeps polling other commands, and bounded so a wedged adapter
-/// still resolves the oneshot before the caller's outer guard (#1404).
+/// SDK-owned cleanup scope: preserves the existing bounded deadline, and
+/// distinguishes actual peer rejection from native loss or a missing response.
 pub(super) fn handle_delete_session_cmd(
     connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
     acp_session_id: String,
     respond_to: oneshot::Sender<DeleteSessionOutcome>,
 ) {
     let target = agent_client_protocol::schema::v1::SessionId::from(acp_session_id);
-    // `block_task()` is safe to await from a spawned task: it waits on the
-    // per-request oneshot the main connection task feeds, so the dispatch loop
-    // keeps running while this future is parked.
-    let sent = connection.send_request(DeleteSessionRequest {
+    let request = DeleteSessionRequest {
         session_id: target,
         meta: serde_json::Value::Object(serde_json::Map::new()),
-    });
-    tokio::spawn(async move {
-        let outcome =
-            match tokio::time::timeout(ACP_SESSION_DELETE_TIMEOUT, sent.block_task()).await {
-                Ok(Ok(_resp)) => DeleteSessionOutcome::Deleted,
-                Ok(Err(err)) => {
-                    if err.code == ErrorCode::MethodNotFound {
-                        DeleteSessionOutcome::UnsupportedMethod
-                    } else {
-                        // Scrub first: a leaked `sk-...` or PAT in the
-                        // adapter's own error string must not reach the log.
-                        let scrubbed = scrub_stderr_secrets(&err.message);
-                        DeleteSessionOutcome::Failed(format!(
-                            "acp error {}: {}",
-                            i32::from(err.code),
-                            truncate_for_log(&scrubbed, ACP_DELETE_ERROR_MSG_MAX)
-                        ))
-                    }
-                }
-                Err(_) => DeleteSessionOutcome::TimedOut,
-            };
+    };
+    let _ = spawn_native_request(connection, state, request, move |request| async move {
+        let outcome = match tokio::time::timeout(ACP_SESSION_DELETE_TIMEOUT, request.wait()).await {
+            Ok(OrderedRequestResult::Correlated(Ok(_))) => DeleteSessionOutcome::Deleted,
+            Ok(OrderedRequestResult::Correlated(Err(error)))
+                if error.code == ErrorCode::MethodNotFound =>
+            {
+                DeleteSessionOutcome::UnsupportedMethod
+            }
+            Ok(
+                OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error),
+            ) => {
+                let scrubbed = scrub_stderr_secrets(&error.message);
+                DeleteSessionOutcome::Failed(format!(
+                    "acp error {}: {}",
+                    i32::from(error.code),
+                    truncate_for_log(&scrubbed, ACP_DELETE_ERROR_MSG_MAX),
+                ))
+            }
+            Ok(OrderedRequestResult::Unavailable(_)) => {
+                DeleteSessionOutcome::Failed("ACP connection unavailable".into())
+            }
+            Ok(OrderedRequestResult::Abandoned) => {
+                DeleteSessionOutcome::Failed("Delete response was not observed".into())
+            }
+            Err(_) => DeleteSessionOutcome::TimedOut,
+        };
         let _ = respond_to.send(outcome);
     });
 }

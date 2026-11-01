@@ -207,11 +207,7 @@ impl HomeView {
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(
-            tmux_name,
-            capture_wake,
-            lease,
-        ));
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(capture_wake, lease));
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

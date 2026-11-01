@@ -3,6 +3,8 @@ import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent, WorkflowRun } from "../../../lib/acpTypes";
+import { applyEvent, applyReducedState, emptyAcpState } from "../../../lib/acpTypes";
+import { currentControlSnapshot } from "../../../../tests/helpers/acpControlSnapshot";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -88,6 +90,71 @@ describe("BackgroundAgentsPanel", () => {
     tasksMock.mockReturnValue([]);
     const finished = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(runDot(finished.container)).not.toContain("animate-pulse");
+    runsMock.mockReturnValue({});
+  });
+
+  it("keeps the current run live when covered history reuses its task id, while retaining the old run", () => {
+    const current = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 20,
+      event: {
+        BackgroundTaskStarted: {
+          task_id: "reused-task",
+          tool_call_id: "current-tool",
+          description: "current workflow",
+          workflow: { run_id: "current-run", name: "Current workflow", summary: "Waiting for its next phase" },
+        },
+      },
+    });
+    const snapshot = currentControlSnapshot(current, { ready: true }, 20);
+    let replay = applyReducedState(emptyAcpState(), snapshot.state, [], snapshot.seq);
+    replay = applyEvent(replay, {
+      session_id: "s-1",
+      seq: 5,
+      event: {
+        BackgroundTaskStarted: {
+          task_id: "reused-task",
+          tool_call_id: "historical-tool",
+          description: "old workflow",
+          workflow: { run_id: "historical-run", name: "Historical workflow", summary: null },
+        },
+      },
+    });
+    replay = applyEvent(replay, {
+      session_id: "s-1",
+      seq: 6,
+      event: {
+        BackgroundTaskFinished: { task_id: "reused-task", ended_at: "2026-05-21T00:01:00Z" },
+      },
+    });
+    const endedAt = "2026-05-21T00:00:30Z";
+    agentsMock.mockReturnValue([
+      agent({
+        agentId: "current-agent",
+        toolCallId: "current-tool",
+        workflow: { run_id: "current-run", name: "Current workflow", phase: "Draft" },
+        status: "completed",
+        endedAt,
+      }),
+      agent({
+        agentId: "historical-agent",
+        toolCallId: "historical-tool",
+        description: "Retained historical work",
+        workflow: { run_id: "historical-run", name: "Historical workflow", phase: "Draft" },
+        status: "completed",
+        endedAt,
+      }),
+    ]);
+    tasksMock.mockReturnValue(replay.backgroundTasks);
+    runsMock.mockReturnValue(replay.workflowRuns);
+    const panel = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const runHeader = (name: string) =>
+      [...panel.container.querySelectorAll("button")].find((button) => button.textContent?.includes(name))!;
+    expect(runHeader("Current workflow").querySelector("span")!.className).toContain("animate-pulse");
+    expect(runHeader("Historical workflow").querySelector("span")!.className).not.toContain("animate-pulse");
+    expect(panel.container.textContent).toContain("Retained historical work");
+    panel.unmount();
+    tasksMock.mockReturnValue([]);
     runsMock.mockReturnValue({});
   });
 

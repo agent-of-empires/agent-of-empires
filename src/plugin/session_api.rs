@@ -71,6 +71,14 @@ async fn clear_revival_pending(session_service: &SessionService, id: &str) {
     }
 }
 
+fn resume_admission_refused(status: axum::http::StatusCode) -> DispatchError {
+    DispatchError::with_kind(
+        if status.is_server_error() { codes::SERVICE_UNAVAILABLE } else { codes::FAILED_PRECONDITION },
+        "worker_not_ready",
+        "The structured session resume was refused or could not be confirmed; check its current state before retrying",
+    )
+}
+
 /// Whether `method` belongs to this module's async dispatch.
 pub(crate) fn handles(method: &str) -> bool {
     matches!(
@@ -661,6 +669,14 @@ async fn sessions_turn_send(
             .admit_prompt_submission(&caller, &req.session_id)
             .await
             .map_err(|e| map_send_error(e.into()))?;
+        if let Some(unavailability) = deps.session_service
+            .prompt_native_unavailability(&req.session_id).await
+        {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ));
+        }
 
         // A target not currently counted (archived, snoozed, or not in one of the counted
         // statuses) re-occupies a slot the instant it becomes counted. Mark it pending here,
@@ -705,12 +721,27 @@ async fn sessions_turn_send(
             }
         };
 
-        let woke_idle_dormant = match deps
+        let (woke_idle_dormant, resume_reservation) = match deps
             .session_service
             .touch_and_wake_on_prompt(&req.session_id, false)
             .await
         {
-            PromptTouch::Touched { idle_dormant } => idle_dormant,
+            PromptTouch::Touched { idle_dormant, resume_reservation } => (idle_dormant, resume_reservation),
+            PromptTouch::Unavailable(unavailability) => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+                ));
+            }
+            PromptTouch::AdmissionRefused(response) => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(resume_admission_refused(response.status()));
+            }
             PromptTouch::WorkerNotReady | PromptTouch::RevivalRefused => {
                 if marked_pending {
                     clear_revival_pending(&deps.session_service, &req.session_id).await;
@@ -732,6 +763,15 @@ async fn sessions_turn_send(
             .session_service
             .prompt_dispatch_under_submission(&req.session_id, &req.text, woke_idle_dormant, false)
             .await;
+        if let crate::acp::dispatch::PromptDispatch::Unavailable { unavailability } = dispatch {
+            if marked_pending {
+                clear_revival_pending(&deps.session_service, &req.session_id).await;
+            }
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ));
+        }
         // A cold worker is not a refusal on this path: `send_turn` resumes it
         // and waits, which is how a scheduler wakes a session it created. The
         // turn gates are, because a second prompt at a busy non-steerable
@@ -757,7 +797,7 @@ async fn sessions_turn_send(
             .send_turn(
                 &caller,
                 &req.session_id,
-                SendTurnRequest { resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
+                SendTurnRequest { resume_reservation, resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
                 attachments: &[],
                 woke_idle_dormant,
                 prompt_id: None,
@@ -923,16 +963,40 @@ async fn deliver_structured(
         .admit_prompt_submission(&caller, id)
         .await
         .map_err(|e| map_send_error(e.into()))?;
-    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+    let (woke_idle_dormant, resume_reservation) = match service
+        .touch_and_wake_on_prompt(id, false)
+        .await
+    {
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ))
+        }
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
+        PromptTouch::AdmissionRefused(response) => {
+            return Err(resume_admission_refused(response.status()))
+        }
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
     };
+    let prepared_resume = resume_reservation.is_some();
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service
         .prompt_dispatch_under_submission(id, &req.message, woke_idle_dormant, false)
         .await;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "native_channel_unavailable",
+            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+        ));
+    }
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
@@ -948,9 +1012,22 @@ async fn deliver_structured(
                 )
                 .await
                 .ok_or_else(session_not_found)?;
+            if let Some(reservation) = resume_reservation {
+                if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
+                    service,
+                    id,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                    Some(reservation),
+                )
+                .await
+                {
+                    tracing::warn!(target: "plugin.session", session = %id, %error,
+                        "queued message retained; prepared wake was refused");
+                }
+            }
             return Ok(MessageSendResponse {
                 disposition: MessageDisposition::Queued,
-                revived: woke_idle_dormant,
+                revived: woke_idle_dormant || prepared_resume,
             });
         }
     }
@@ -959,6 +1036,7 @@ async fn deliver_structured(
             &caller,
             id,
             SendTurnRequest {
+                resume_reservation,
                 resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                 text: &req.message,
                 attachments: &[],
@@ -969,7 +1047,9 @@ async fn deliver_structured(
             },
         )
         .await;
-    service.clear_pending_initial_turn(id).await;
+    if !matches!(sent, Err(SendTurnError::Unavailable(_))) {
+        service.clear_pending_initial_turn(id).await;
+    }
     sent.map_err(map_send_error)?;
     Ok(MessageSendResponse {
         disposition: if dispatch == PromptDispatch::Steered {
@@ -977,7 +1057,7 @@ async fn deliver_structured(
         } else {
             MessageDisposition::Sent
         },
-        revived: woke_idle_dormant || !was_running,
+        revived: woke_idle_dormant || prepared_resume || !was_running,
     })
 }
 
@@ -1051,6 +1131,11 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "worker_not_ready",
             "worker not ready; retry",
         ),
+        SendTurnError::Unavailable(unavailability) => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "native_channel_unavailable",
+            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+        ),
         // Unreachable: this plugin surface never sets `no_revive`.
         SendTurnError::RevivalRefused => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
@@ -1066,6 +1151,95 @@ mod tests {
     use super::*;
     use crate::plugin::automation_policy::AutomationPolicy;
     use crate::session::{Instance, Status};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_refusal_preserves_plugin_prompt_stop_fence_and_native_generation() {
+        use crate::process::worker_registry;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("plugin-stopped-capacity", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Stopped;
+        row.lifecycle_generation = 27;
+        row.idle_dormant_since = Some(chrono::Utc::now());
+        row.acp_session_id = Some("retained-native-plugin".into());
+        row.agent_name = Some("claude".into());
+        row.created_by_plugin = Some("cron".into());
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            launcher,
+        );
+        seed_native_rows(&state).await;
+        state
+            .acp_supervisor
+            .test_insert_worker("occupied-plugin-slot")
+            .await;
+        let record = worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            project.path().join("stopped.sock"),
+            "claude".into(),
+            "claude".into(),
+            project.path().to_owned(),
+            None,
+            vec![],
+            vec![],
+            row.acp_session_id.clone(),
+            Some("default".into()),
+        )
+        .with_generation(71);
+        worker_registry::save(&record).unwrap();
+        let intent = worker_registry::request_stop(&record).unwrap();
+        worker_registry::delete(&row.id).unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let deps = Arc::new(SessionRpcDeps {
+            session_service: Arc::clone(&state.session_service),
+            policy: Arc::new(AutomationPolicy::open(&policy_dir.path().join("policy.db")).unwrap()),
+            profile: "default".into(),
+            cityhall_mode: false,
+        });
+        let error = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": row.id, "text": "keep this stopped intent" }),
+        )
+        .await
+        .expect_err("the real ACP capacity admission refuses this wake");
+        assert_eq!(error.code, codes::SERVICE_UNAVAILABLE);
+        assert_eq!(kind(&error), "worker_not_ready");
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(worker_registry::stop_intent(&row.id).unwrap(), Some(intent));
+        let memory = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|saved| saved.id == row.id)
+            .unwrap()
+            .clone();
+        let persisted = crate::session::Storage::open_reference("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|saved| saved.id == row.id)
+            .unwrap();
+        for saved in [&memory, &persisted] {
+            assert_eq!(saved.status, row.status);
+            assert_eq!(saved.lifecycle_generation, row.lifecycle_generation);
+            assert_eq!(saved.idle_dormant_since, row.idle_dormant_since);
+            assert_eq!(saved.acp_session_id, row.acp_session_id);
+            assert!(!saved.plugin_revival_pending);
+        }
+        assert_eq!(
+            state.acp_supervisor.worker_state(&row.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
 
     fn ctx_with(caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
@@ -1737,6 +1911,123 @@ mod tests {
             );
             assert!(inst.last_accessed_at.is_some(), "{label}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn message_send_successfully_revives_stopped_nondormant_native_conversation() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::test_support::ScriptedAcpAgent;
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stopped native message", project.path().to_str().unwrap());
+        row.id = "plugin-stopped-nondormant-success".into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.agent_name = Some("claude-code".into());
+        row.status = Status::Stopped;
+        row.idle_dormant_since = None;
+        row.acp_session_id = Some("retained-native-plugin-conversation".into());
+        let agent = ScriptedAcpAgent::new();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            agent.launcher(false),
+        );
+        seed_native_rows(&state).await;
+        let policy_dir = tempfile::tempdir().unwrap();
+        let deps = Arc::new(SessionRpcDeps {
+            session_service: state.session_service.clone(),
+            policy: Arc::new(
+                AutomationPolicy::open(&policy_dir.path().join("plugin_events.db")).unwrap(),
+            ),
+            profile: "default".into(),
+            cityhall_mode: false,
+        });
+        assert_eq!(
+            state.acp_supervisor.worker_state(&row.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            dispatch(
+                &deps,
+                &ctx_with(&["session.message"]),
+                "sessions.message.send",
+                &message_params(&row.id, "resume this retained conversation once"),
+            ),
+        )
+        .await;
+        let succeeded = matches!(&result, Ok(Ok(_)));
+        if succeeded {
+            agent.wait_for_call("session/prompt", 1).await;
+            agent.started().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !state.acp_event_store.replay_from(&row.id, 0).iter().any(|(_, event)|
+                    matches!(event, Event::Stopped { reason } if reason == "prompt_complete")) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the actual SDK prompt completed, not merely a forwarded command");
+        }
+        let calls = agent.calls();
+        let events = state.acp_event_store.replay_from(&row.id, 0);
+        if succeeded {
+            state
+                .acp_supervisor
+                .shutdown_and_wait(&row.id, Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        agent.settle(&state.acp_supervisor, &row.id).await;
+        drop(agent);
+        let response = result
+            .expect("bounded plugin dispatch")
+            .expect("successful native resumed message");
+        assert_eq!(
+            response,
+            serde_json::json!({ "disposition": "sent", "revived": true })
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/new")
+                .count(),
+            0
+        );
+        let loads: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "session/load")
+            .collect();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "session/prompt")
+            .collect();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            loads[0]["params"]["sessionId"].as_str(),
+            row.acp_session_id.as_deref()
+        );
+        assert_eq!(
+            prompts[0]["params"]["sessionId"],
+            loads[0]["params"]["sessionId"]
+        );
+        assert_eq!(prompts[0]["native_pid"], loads[0]["native_pid"]);
+        assert!(events.iter().any(|(_, event)| matches!(event,
+            Event::AcpSessionAssigned { acp_session_id, .. } if Some(acp_session_id) == row.acp_session_id.as_ref())));
+        assert!(!events.iter().any(|(_, event)| matches!(
+            event,
+            Event::AgentStartupError { .. } | Event::SessionContextReset { .. }
+        )));
     }
 
     #[tokio::test]

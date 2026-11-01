@@ -81,6 +81,43 @@ fn resolve_structured_seed(
     }
 }
 
+fn structured_seed_for(
+    instance: &Instance,
+    agent_name: &str,
+    selected_session_id: Option<&str>,
+) -> (
+    StructuredSeed,
+    Option<crate::session::capture::ClaudeStorePin>,
+) {
+    let claude_store_pin = instance.selected_claude_store_pin();
+    let resume_sid = selected_session_id.or(instance.agent_session_id.as_deref());
+    let transcript_present = instance.is_sandboxed()
+        || resume_sid
+            .map(|sid| {
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                    &instance.resolved_host_environment(),
+                    claude_store_pin
+                        .as_ref()
+                        .map(|pin| pin.store.as_path())
+                        .or(instance
+                            .declared_agent_config_dir_for(&instance.tool)
+                            .as_deref()),
+                )
+            })
+            .unwrap_or(false);
+    let seed = resolve_structured_seed(
+        &instance.tool,
+        agent_name,
+        instance.acp_session_id.as_deref(),
+        resume_sid,
+        instance.import_pending == Some(true),
+        transcript_present,
+    );
+    (seed, claude_store_pin)
+}
+
 fn adopt_persisted_structured_instance(
     cached: Instance,
     mut persisted: Instance,
@@ -160,11 +197,18 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-    if let Err(resp) =
-        commit_structured_view(&state, &mut instance, selected_binding.as_ref(), namespace).await
+    let import_terminal = match commit_structured_view(
+        &state,
+        &mut instance,
+        selected_binding.as_ref(),
+        &agent_name,
+        namespace,
+    )
+    .await
     {
-        return resp;
-    }
+        Ok(import_terminal) => import_terminal,
+        Err(response) => return response,
+    };
     tracing::info!(
         target: "acp.switch",
         session = %id,
@@ -172,7 +216,13 @@ pub async fn acp_enable(
         agent = %agent_name,
         "view switched"
     );
-    spawn_enabled_worker(state.clone(), instance, agent_name, selected_conversation);
+    spawn_enabled_worker(
+        state.clone(),
+        instance,
+        agent_name,
+        selected_conversation,
+        import_terminal,
+    );
     view_response(&state, id, View::Structured).await
 }
 
@@ -181,13 +231,15 @@ async fn commit_structured_view(
     state: &Arc<AppState>,
     instance: &mut Instance,
     selected_binding: Option<&crate::session::ConversationBinding>,
+    agent_name: &str,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
-) -> Result<(), Response> {
+) -> Result<bool, Response> {
     let inst_for_transition = instance.clone();
     let profile = instance.source_profile.clone();
     let commit_state = state.clone();
     let binding_for_transition = selected_binding.cloned();
-    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+    let agent_for_transition = agent_name.to_owned();
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, bool)> {
         let _namespace = namespace;
         use crate::session::SessionStore;
         let storage = crate::server::session_store::NativeSessionStore::open(
@@ -198,15 +250,33 @@ async fn commit_structured_view(
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
             })?;
+        let source_conversation = inst_for_transition.conversation_state();
+        let matches_source = |row: &Instance| {
+            row.created_at == inst_for_transition.created_at
+                && row.effective_profile() == profile
+                && row.lifecycle_generation == inst_for_transition.lifecycle_generation
+                && row.view == inst_for_transition.view
+                && row.terminal_handoff.is_none()
+                && row.project_path == inst_for_transition.project_path
+                && row.agent_name == inst_for_transition.agent_name
+                && row.agent_provider == inst_for_transition.agent_provider
+                && row.acp_session_id == inst_for_transition.acp_session_id
+                && row.fork_pending == inst_for_transition.fork_pending
+                && row.import_pending == inst_for_transition.import_pending
+                && source_conversation.matches_checkpoint(row)
+        };
         let current = storage.load()?.into_iter()
             .find(|row| row.id == inst_for_transition.id)
             .ok_or(crate::session::SessionGone)?;
         current.ensure_startable()?;
         anyhow::ensure!(
-            current.lifecycle_generation == inst_for_transition.lifecycle_generation
-                && current.view == inst_for_transition.view
-                && current.terminal_handoff.is_none(),
+            matches_source(&current),
             crate::session::LifecycleReservationError::Superseded
+        );
+        let (seed, _) = structured_seed_for(
+            &current,
+            &agent_for_transition,
+            current.selected_claude_conversation().map(|(sid, _)| sid),
         );
         let generation = current.lifecycle_generation.checked_add(1)
             .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
@@ -227,9 +297,7 @@ async fn commit_structured_view(
                 anyhow::bail!("session disappeared during terminal-to-ACP transition");
             };
             anyhow::ensure!(
-                slot.lifecycle_generation == inst_for_transition.lifecycle_generation
-                    && slot.view == inst_for_transition.view
-                    && slot.terminal_handoff.is_none(),
+                matches_source(slot),
                 crate::session::LifecycleReservationError::Superseded
             );
             slot.ensure_startable()?;
@@ -239,21 +307,26 @@ async fn commit_structured_view(
                 slot.agent_session_id = Some(binding.session_id.clone());
                 slot.agent_session_binding = Some(binding.clone());
             }
+            slot.acp_session_id.clone_from(&seed.stored_acp_session_id);
+            if seed.seed_history_replay {
+                slot.import_pending = Some(true);
+            }
             // Structured status is event-driven and the tmux poller skips
             // structured rows, so a Running/Waiting status would never settle.
             slot.status = Status::Idle;
             slot.idle_dormant_since = None;
             slot.idle_entered_at = None;
             slot.last_error = None;
+            slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
-            Ok(slot.lifecycle_generation)
+            Ok((slot.lifecycle_generation, seed.import_terminal))
         })
     })
     .await;
     let id = instance.id.clone();
-    let lifecycle_generation = match transition {
-        Ok(Ok(generation)) => generation,
+    let (lifecycle_generation, import_terminal) = match transition {
+        Ok(Ok(committed)) => committed,
         Ok(Err(error)) => {
             tracing::error!(target: "acp.switch", session = %id, "terminal-to-ACP transition failed: {error:#}");
             return Err(internal_error(
@@ -276,7 +349,7 @@ async fn commit_structured_view(
         tracing::error!(target: "acp.switch", session = %id, %error, "view publication failed");
         internal_error("failed to publish structured view")
     })?;
-    Ok(())
+    Ok(import_terminal)
 }
 
 /// Spawn the worker in the background so the response does not wait on a
@@ -287,6 +360,7 @@ fn spawn_enabled_worker(
     expected: Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
+    import_terminal: bool,
 ) {
     let session_id = expected.id.clone();
     let work = state.runtime.work.clone();
@@ -304,6 +378,7 @@ fn spawn_enabled_worker(
             &expected,
             agent_name.clone(),
             selected_conversation,
+            import_terminal,
             exclusion,
         )
         .await
@@ -339,6 +414,7 @@ async fn deferred_enable_request(
     expected: &Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
+    import_terminal: bool,
     exclusion: crate::acp::sandbox::LaunchExclusion,
 ) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
     let session_id = expected.id.as_str();
@@ -350,34 +426,10 @@ async fn deferred_enable_request(
             && row.source_profile == expected.source_profile
             && row.ensure_startable().is_ok()
     })?;
-    let claude_store_pin = instance.selected_claude_store_pin();
-    let resume_sid = selected_conversation
-        .as_ref()
-        .map(|(sid, _)| sid.as_str())
-        .or(instance.agent_session_id.as_deref());
-    let transcript_present = instance.is_sandboxed()
-        || resume_sid
-            .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &instance.project_path,
-                    sid,
-                    &instance.resolved_host_environment(),
-                    claude_store_pin
-                        .as_ref()
-                        .map(|pin| pin.store.as_path())
-                        .or(instance
-                            .declared_agent_config_dir_for(&instance.tool)
-                            .as_deref()),
-                )
-            })
-            .unwrap_or(false);
-    let seed = resolve_structured_seed(
-        &instance.tool,
+    let (seed, claude_store_pin) = structured_seed_for(
+        &instance,
         &agent_name,
-        instance.acp_session_id.as_deref(),
-        resume_sid,
-        instance.import_pending == Some(true),
-        transcript_present,
+        selected_conversation.as_ref().map(|(sid, _)| sid.as_str()),
     );
     let (native, exclusion) = match launch_store_for(state, &instance, exclusion).await {
         Ok(store) => store,
@@ -419,6 +471,7 @@ async fn deferred_enable_request(
                 store: native,
                 generation: expected.lifecycle_generation,
                 namespace: Some(state.profile_namespace.clone()),
+                native_scope: None,
             }),
             stored_acp_session_id: seed.stored_acp_session_id,
             seed_history_replay: seed.seed_history_replay,
@@ -426,7 +479,7 @@ async fn deferred_enable_request(
                 || instance.agent_session_id.is_some()
                 || instance.pi_session_path.is_some()
                 || selected_conversation.is_some(),
-            sandbox_continuation: if seed.import_terminal {
+            sandbox_continuation: if import_terminal || seed.import_terminal {
                 crate::acp::supervisor::SandboxContinuation::ImportTerminal
             } else {
                 crate::acp::supervisor::SandboxContinuation::Persisted
@@ -650,6 +703,7 @@ fn handoff_key(row: &Instance) -> anyhow::Result<HandoffKey> {
 fn claim_handoff_in(
     mut owner: TerminalHandoff,
     expected: HandoffKey,
+    state: &AppState,
 ) -> anyhow::Result<TerminalHandoff> {
     use crate::session::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
     let profile = owner.store().storage().profile().to_owned();
@@ -664,7 +718,14 @@ fn claim_handoff_in(
         .store()
         .storage()
         .acquire_instance_lifecycle_lock(&id)?;
-    owner.update_owned(|rows| {
+    let target = state.acp_supervisor.capture_retirement(&id)?;
+    let observation_storage = crate::session::Storage::open_reference(&profile)?;
+    anyhow::ensure!(
+        observation_storage.bound_profile_identity()? == identity,
+        LifecycleReservationError::Superseded
+    );
+    let mut prepared_scope = None;
+    let claimed = owner.update_owned(|rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -684,11 +745,44 @@ fn claim_handoff_in(
             .as_mut()
             .expect("validated handoff")
             .generation = generation;
+        if target.lease.as_ref().is_some_and(|lease| {
+            lease
+                .retirement()
+                .has_handoff_identity_scope(expected, target.identity, row)
+        }) && row.terminal_handoff.as_ref().is_some_and(|intent| {
+            intent.stage == HandoffStage::RetirementPending
+                && intent.source_conversation.matches(row)
+                && matches!((&intent.runner, target.identity),
+                    (crate::session::purge_owners::RunnerCapture::Captured {
+                        pid, generation, birth_fingerprint, ..
+                    }, Some(actor)) if *pid == actor.pid && *generation == actor.generation
+                        && *birth_fingerprint == actor.birth_fingerprint)
+        }) {
+            if let (Some(lease), Some(actor)) = (&target.lease, target.identity) {
+                prepared_scope = Some(
+                    lease.retirement().prepare_handoff_identity_scope(
+                        row,
+                        &observation_storage,
+                        actor,
+                        lease
+                            .native_scope()
+                            .map_err(|_| anyhow::anyhow!("native source unavailable"))?
+                            .map(|scope| scope.context),
+                    )?,
+                );
+            }
+        }
         Ok(HandoffKey {
             id: expected.id,
             generation,
         })
-    })?;
+    });
+    if owner.key.is_some() {
+        if let (Some(lease), Some(scope)) = (&target.lease, prepared_scope) {
+            lease.retirement().record_handoff_identity_scope(scope);
+        }
+    }
+    claimed?;
     Ok(owner)
 }
 
@@ -755,7 +849,13 @@ fn reserve_handoff_in(
         _ => None,
     };
     let intent_id = uuid::Uuid::new_v4();
-    owner.update_owned(|rows| {
+    let observation_storage = crate::session::Storage::open_reference(&profile)?;
+    anyhow::ensure!(
+        observation_storage.bound_profile_identity()? == identity,
+        LifecycleReservationError::Superseded
+    );
+    let mut prepared_scope = None;
+    let reserved = owner.update_owned(|rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == expected.id)
@@ -801,11 +901,30 @@ fn reserve_handoff_in(
             launch_started: false,
             launch: None,
         }));
+        if let (Some(lease), Some(identity)) = (&target.lease, target.identity) {
+            prepared_scope = Some(
+                lease.retirement().prepare_handoff_identity_scope(
+                    row,
+                    &observation_storage,
+                    identity,
+                    lease
+                        .native_scope()
+                        .map_err(|_| anyhow::anyhow!("native source unavailable"))?
+                        .map(|scope| scope.context),
+                )?,
+            );
+        }
         Ok(HandoffKey {
             id: intent_id,
             generation,
         })
-    })?;
+    });
+    if owner.key.is_some() {
+        if let (Some(lease), Some(scope)) = (&target.lease, prepared_scope) {
+            lease.retirement().record_handoff_identity_scope(scope);
+        }
+    }
+    reserved?;
     Ok(owner)
 }
 
@@ -815,7 +934,8 @@ fn record_retired_handoff_in(
     key: HandoffKey,
     completed_runner: crate::session::purge_owners::RunnerCapture,
     final_event_seq: u64,
-    final_context_event: Option<crate::acp::Event>,
+    receipt: Option<Arc<crate::acp::supervisor::QualifiedBindingReceipt>>,
+    target: &crate::acp::supervisor::RetirementTarget,
 ) -> anyhow::Result<()> {
     use crate::session::{
         LifecycleOperation, LifecycleReservationError, TerminalHandoffContext, TerminalHandoffStage,
@@ -833,12 +953,57 @@ fn record_retired_handoff_in(
             intent.stage == TerminalHandoffStage::RetirementPending
                 && row.view == View::Structured
                 && row.tool == intent.source_conversation.tool
-                && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation),
+                && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation)
+                && intent.source_conversation.matches_checkpoint(row),
             LifecycleReservationError::Superseded
         );
-        if let Some(event) = final_context_event.as_ref() {
-            let change = crate::server::acp_events::derive_acp_session_change(event);
-            crate::server::acp_events::apply_acp_session_change(row, session_id, change.as_ref());
+        if let Some(receipt) = receipt
+            .as_ref()
+            .filter(|_| matches!(intent.context, HandoffContext::Keep { .. }))
+        {
+            let lease = target
+                .lease
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let source = lease
+                .native_scope()
+                .map_err(|_| LifecycleReservationError::Superseded)?
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                receipt.producer == lease.epoch()
+                    && Some(receipt.owner) == target.identity
+                    && receipt.owner.birth_fingerprint.is_some()
+                    && receipt.source_context == source.context
+                    && lease.retirement().handoff_identity_scope_matches(row)
+                    && lease
+                        .retirement()
+                        .binding_checkpoint()
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.source_context == source.context
+                            && checkpoint
+                                .destination
+                                .choice
+                                .as_ref()
+                                .is_some_and(|choice| choice.matches(row)))
+                    && crate::server::acp_events::receipt_source_route_matches(
+                        receipt,
+                        &intent.source_conversation,
+                        source.choice.as_deref()
+                    ),
+                LifecycleReservationError::Superseded
+            );
+            crate::server::acp_events::apply_acp_session_change(
+                row,
+                session_id,
+                Some(&receipt.change),
+                true,
+            );
+            row.attest_launch_default_store(receipt.store.as_ref());
+            if let crate::acp::state::AcpSessionChange::Assigned(assigned) = &receipt.change {
+                if receipt.store.is_some() {
+                    row.record_observed_acp_store(assigned, receipt.store.as_ref());
+                }
+            }
         }
         let terminal = match &intent.context {
             TerminalHandoffContext::Keep { native_store } => {
@@ -1075,7 +1240,7 @@ async fn terminal_handoff_request(state: Arc<AppState>, id: String) -> Response 
                 .acp_event_store
                 .handoff_context_event(&id, 0, source_event_seq)
             {
-                Ok(Some((_, crate::acp::Event::AcpSessionAssigned { acp_session_id })))
+                Ok(Some((_, crate::acp::Event::AcpSessionAssigned { acp_session_id, .. })))
                     if instance.acp_session_id.as_deref() == Some(acp_session_id.as_str()) => {}
                 Ok(Some(_)) => {
                     return handoff_unavailable(&anyhow::anyhow!(
@@ -1205,9 +1370,12 @@ fn drive_terminal_handoff(
             match intent.stage {
                 _ if !claimed => {
                     let unclaimed = TerminalHandoff::new(native, id.clone(), driver.clone());
+                    let claim_state = state.clone();
                     owner = Some(
-                        tokio::task::spawn_blocking(move || claim_handoff_in(unclaimed, key))
-                            .await??,
+                        tokio::task::spawn_blocking(move || {
+                            claim_handoff_in(unclaimed, key, &claim_state)
+                        })
+                        .await??,
                     );
                     claimed = true;
                 }
@@ -1246,10 +1414,13 @@ fn drive_terminal_handoff(
                             .await?;
                     }
                     let final_seq = state.acp_event_store.highest_seq_checked(&id)?;
-                    let final_event = state
-                        .acp_event_store
-                        .handoff_context_event(&id, intent.source_event_seq, final_seq)?
-                        .map(|(_, event)| event);
+                    let receipt = target.binding_receipt();
+                    anyhow::ensure!(
+                        receipt.is_none()
+                            || state.acp_supervisor.binding_producer_is_current(&target),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    let receipt_target = target.clone();
                     held.native
                         .as_mut()
                         .expect("owned store")
@@ -1268,7 +1439,8 @@ fn drive_terminal_handoff(
                                 key,
                                 completed,
                                 final_seq,
-                                final_event,
+                                receipt,
+                                &receipt_target,
                             )?;
                             Ok(held)
                         })
@@ -1595,10 +1767,15 @@ mod tests {
         let mut request = spawn_request(&row.id);
         request.source_profile = Some(row.source_profile.clone());
         request.expected_lifecycle_generation = row.lifecycle_generation;
+        let storage =
+            Arc::new(crate::session::Storage::open_unwatched(&row.source_profile).unwrap());
+        let native_scope =
+            Some(crate::acp::state::NativeObservationScope::capture(row, &storage).unwrap());
         request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission {
-            store: Arc::new(crate::session::Storage::open_unwatched(&row.source_profile).unwrap()),
+            store: storage,
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope,
         });
         lease.set_admission(request.launch_admission.clone());
         let supervisor = state.acp_supervisor.clone();
@@ -1715,12 +1892,17 @@ mod tests {
             )
             .await?;
         let lease = producer.lease().clone();
+        let storage = Arc::new(crate::session::Storage::open_unwatched(
+            &row.source_profile,
+        )?);
+        let native_scope = Some(crate::acp::state::NativeObservationScope::capture(
+            &row, &storage,
+        )?);
         lease.set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-            store: Arc::new(crate::session::Storage::open_unwatched(
-                &row.source_profile,
-            )?),
+            store: storage,
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope,
         }));
         let cancellation = lease.cancellation().clone();
         let disabling = acp_disable(State(state.clone()), Path(row.id.clone()));
@@ -2476,12 +2658,14 @@ mod tests {
         producer_events
             .send(Event::AcpSessionAssigned {
                 acp_session_id: initial_sid.into(),
+                connection_ready: false,
+                native_subject: None,
             })
             .await?;
         let initial_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
         assert_eq!(initial_frame.worker_generation, Some(lease.epoch()));
         assert!(
-            matches!(initial_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id } if acp_session_id == initial_sid)
+            matches!(initial_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == initial_sid)
         );
         assert_eq!(
             state
@@ -2544,34 +2728,50 @@ mod tests {
         std::fs::write(&final_transcript, &final_bytes)?;
         worker_registry::update_stored_acp_session_id(&row.id, pid, final_sid)?;
         producer_events
+            .send(Event::AgentMessageChunk {
+                text: "old producer traffic is not new-root turn authority".into(),
+                message_id: None,
+            })
+            .await?;
+        producer_events
+            .send(Event::Stopped {
+                reason: "prompt_complete".into(),
+            })
+            .await?;
+        producer_events
             .send(Event::AcpSessionAssigned {
                 acp_session_id: final_sid.into(),
+                connection_ready: true,
+                native_subject: None,
             })
             .await?;
         let final_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
         assert_eq!(final_frame.worker_generation, Some(lease.epoch()));
         assert!(
-            matches!(final_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id } if acp_session_id == final_sid)
+            matches!(final_frame.event.as_ref(), Event::AcpSessionAssigned {
+                acp_session_id, connection_ready: false, ..
+            } if acp_session_id == final_sid)
         );
-        assert!(final_frame.seq > intent.source_event_seq);
-        producer_events
-            .send(Event::AgentMessageChunk {
-                text: "original producer finished materializing its native context".into(),
-                message_id: None,
-            })
-            .await?;
-        let tail_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
-        assert_eq!(tail_frame.worker_generation, Some(lease.epoch()));
-        assert!(tail_frame.seq > final_frame.seq);
-        assert!(matches!(
-            tail_frame.event.as_ref(),
-            Event::AgentMessageChunk { .. }
-        ));
+        assert_eq!(
+            final_frame.seq,
+            initial_frame.seq + 1,
+            "old-root turn/status traffic must not allocate or persist new-root events"
+        );
+        assert!(
+            lease
+                .native_scope()
+                .unwrap()
+                .unwrap()
+                .fence
+                .lock_observation()
+                .is_err(),
+            "metadata custody must never heal the native-control fence"
+        );
         assert!(matches!(
             state.acp_event_store.handoff_context_event(
-                &row.id, intent.source_event_seq, tail_frame.seq,
+                &row.id, intent.source_event_seq, final_frame.seq,
             )?,
-            Some((seq, Event::AcpSessionAssigned { acp_session_id }))
+            Some((seq, Event::AcpSessionAssigned { acp_session_id, .. }))
                 if seq == final_frame.seq && acp_session_id == final_sid
         ));
         let record =
@@ -2781,10 +2981,8 @@ mod tests {
             .all(|(signalled, _)| *signalled == pid));
         let completed = intent.completed_runner(&row.id, &target)?;
         let final_seq = state.acp_event_store.highest_seq_checked(&row.id)?;
-        let final_event = state
-            .acp_event_store
-            .handoff_context_event(&row.id, floor, final_seq)?
-            .map(|(_, event)| event);
+        let receipt = target.binding_receipt();
+        let receipt_target = target.clone();
         let save_id = row.id.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let _title = crate::session::acquire_session_title_lock(&save_id)?;
@@ -2798,7 +2996,8 @@ mod tests {
                 key,
                 completed,
                 final_seq,
-                final_event,
+                receipt,
+                &receipt_target,
             )?;
             commit_terminal_in(owner.store(), &save_id, key)?;
             // Release exclusion before the owner's tracked exact-generation cleanup.
@@ -3344,7 +3543,20 @@ mod tests {
     #[serial_test::serial]
     async fn enabling_a_stopped_terminal_clears_only_its_observed_native_park() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for case in ["fresh", "superseded", "overflow"] {
+        crate::tmux::test_helpers::require_tmux!();
+        for case in [
+            "fresh",
+            "superseded",
+            "overflow",
+            "recreated",
+            "source_sid",
+            "choice",
+            "provenance",
+            "route",
+            "import",
+            "fork",
+            "provider",
+        ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let project = tempfile::tempdir().unwrap();
             let mut row = Instance::new(case, project.path().to_str().unwrap());
@@ -3355,9 +3567,69 @@ mod tests {
             row.agent_name = Some("claude".into());
             row.mark_idle_dormant();
             row.lifecycle_generation = if case == "overflow" { u64::MAX } else { 14 };
+            if matches!(case, "choice" | "provenance" | "route") {
+                row.resume_intent = ResumeIntent::Use("selected".into());
+                row.resume_binding = Some(crate::session::ConversationBinding {
+                    session_id: "selected".into(),
+                    execution: Some(crate::session::ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![project.path().join("selected-store")],
+                        configuration: Vec::new(),
+                        cwd: project.path().to_owned(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                        exported_default_store: Some(false),
+                    }),
+                    provenance: crate::session::ConversationProvenance::Asserted,
+                    transcript_path: None,
+                });
+            }
+            let terminal = row.tmux_session().unwrap();
+            let _terminal_guard =
+                crate::tmux::test_helpers::TmuxTestSession::from_name(terminal.name());
+            terminal
+                .create(&row.project_path, Some("exec sleep 60"), "default")
+                .unwrap();
+            let pane = crate::tmux::test_helpers::only_pane_id(terminal.name());
+            crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&pane, "#{pane_dead}"),
+                "0"
+            );
+            let terminal_pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
+                .parse::<u32>()
+                .unwrap();
+            let terminal_birth = crate::process::process_birth_identity(terminal_pid)
+                .unwrap()
+                .expect("the managed terminal is physically alive before the transition");
             let mut persisted = row.clone();
-            if case == "superseded" {
-                persisted.lifecycle_generation += 1;
+            match case {
+                "superseded" => persisted.lifecycle_generation += 1,
+                "recreated" => persisted.created_at += chrono::Duration::seconds(1),
+                "source_sid" => persisted.acp_session_id = Some("replacement".into()),
+                "choice" => {
+                    persisted.resume_intent = ResumeIntent::Use("replacement".into());
+                    persisted.resume_binding.as_mut().unwrap().session_id = "replacement".into();
+                }
+                "provenance" => {
+                    persisted.resume_binding.as_mut().unwrap().provenance =
+                        crate::session::ConversationProvenance::Observed
+                }
+                "route" => {
+                    persisted
+                        .resume_binding
+                        .as_mut()
+                        .unwrap()
+                        .execution
+                        .as_mut()
+                        .unwrap()
+                        .exported_default_store = Some(true);
+                    assert_eq!(row.resume_binding, persisted.resume_binding);
+                }
+                "import" => persisted.import_pending = Some(true),
+                "fork" => persisted.fork_pending = Some("replacement-parent".into()),
+                "provider" => persisted.agent_provider = Some("vertex".into()),
+                _ => {}
             }
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
@@ -3385,19 +3657,41 @@ mod tests {
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let mut working = row.clone();
             let namespace = state.profile_namespace.clone().read_owned().await;
-            let result = commit_structured_view(&state, &mut working, None, namespace).await;
+            let result =
+                commit_structured_view(&state, &mut working, None, "claude", namespace).await;
             let storage = crate::session::Storage::open_unwatched("default").unwrap();
             if case != "fresh" {
                 assert!(result.is_err(), "{case}");
                 let stored = storage.load().unwrap().remove(0);
+                assert_eq!(
+                    serde_json::to_value(&stored).unwrap(),
+                    serde_json::to_value(&persisted).unwrap(),
+                    "a changed source choice must remain untouched: {case}",
+                );
                 assert_eq!(stored.view, View::Terminal);
                 assert_eq!(stored.lifecycle_generation, persisted.lifecycle_generation);
                 assert_eq!(stored.status, Status::Stopped);
                 assert!(stored.is_idle_dormant());
-                assert_eq!(births.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    crate::tmux::test_helpers::only_pane_id(terminal.name()),
+                    pane
+                );
+                assert_eq!(
+                    crate::tmux::test_helpers::pane_field(&pane, "#{pane_dead}"),
+                    "0"
+                );
+                assert_eq!(
+                    crate::process::process_birth_identity(terminal_pid).unwrap(),
+                    Some(terminal_birth),
+                    "refusal must not kill or replace the original terminal: {case}",
+                );
                 continue;
             }
             assert!(result.is_ok());
+            assert!(
+                !terminal.exists_live(),
+                "the accepted transition terminates its real pane"
+            );
             assert_eq!(working.view, View::Structured);
             assert_eq!(working.status, Status::Idle);
             assert!(!working.is_idle_dormant());
@@ -3407,7 +3701,7 @@ mod tests {
                     .await
                     .unwrap();
             let (request, reservation) =
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
+                deferred_enable_request(&state, &working, "claude".into(), None, false, exclusion)
                     .await
                     .expect("fresh enable target")
                     .unwrap();
@@ -3429,11 +3723,16 @@ mod tests {
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
                     .unwrap();
-            assert!(
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
-                    .await
-                    .is_none()
-            );
+            assert!(deferred_enable_request(
+                &state,
+                &working,
+                "claude".into(),
+                None,
+                false,
+                exclusion
+            )
+            .await
+            .is_none());
             let retained = storage.load().unwrap().remove(0);
             assert_eq!(retained.lifecycle_generation, stopped.lifecycle_generation);
             assert_eq!(retained.status, Status::Stopped);
@@ -3470,7 +3769,13 @@ mod tests {
 
         let inst_lock = state.instance_lock(&id).await;
         let guard = inst_lock.lock().await;
-        spawn_enabled_worker(state.clone(), inst.clone(), "claude".to_string(), None);
+        spawn_enabled_worker(
+            state.clone(),
+            inst.clone(),
+            "claude".to_string(),
+            None,
+            false,
+        );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
             state.clone(),
@@ -3518,7 +3823,7 @@ mod tests {
 
         let namespace = state.profile_namespace.clone().read_owned().await;
         assert!(
-            commit_structured_view(&state, &mut working, None, namespace)
+            commit_structured_view(&state, &mut working, None, "claude", namespace)
                 .await
                 .is_ok()
         );

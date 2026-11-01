@@ -308,6 +308,7 @@ fn test_agent_row_marks_running_paired_terminal() {
                     },
                     tmux_session: running.then(|| term.clone()),
                     legacy_tool: None,
+                    physical: None,
                 },
             }];
         });

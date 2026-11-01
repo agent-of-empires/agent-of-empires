@@ -85,7 +85,7 @@ pub(crate) async fn attach_project(
     // workers or touching git; attach_planned repeats it under lifecycle exclusion.
     let plan_id = id.to_owned();
     let repo = repo_path.to_path_buf();
-    let (instance, plan, restarts) = run_blocking(state, &profile, id, move |storage| {
+    let (mut instance, plan, restarts) = run_blocking(state, &profile, id, move |storage| {
         let instance = storage
             .load()?
             .into_iter()
@@ -110,15 +110,27 @@ pub(crate) async fn attach_project(
         }
     })?;
     if restarts && was_running {
-        state
-            .acp_supervisor
-            .shutdown_and_wait(id, std::time::Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                AttachError::Rejected(anyhow::anyhow!(
-                    "could not stop the current worker: {error}"
-                ))
-            })?;
+        crate::server::acp_events::retire_native_worker(
+            state,
+            id,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(|error| {
+            AttachError::Rejected(anyhow::anyhow!(
+                "could not stop the current worker: {error}"
+            ))
+        })?;
+        let refresh_id = id.to_owned();
+        instance = run_blocking(state, &profile, id, move |storage| {
+            storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == refresh_id)
+                .ok_or_else(|| crate::session::SessionGone.into())
+        })
+        .await
+        .map_err(AttachError::Rejected)?;
     }
     let quiesced = if restarts {
         let instance = instance.clone();

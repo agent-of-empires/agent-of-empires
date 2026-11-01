@@ -10,7 +10,6 @@ import {
   replayFrames,
   replayJson,
   script,
-  seedAcpSession,
   startAcpSession,
   waitForReplayContains,
 } from "../helpers/acp";
@@ -156,16 +155,32 @@ test.describe("mid-turn prompts", () => {
   });
 });
 
-// force_end_turn and user prompts are published straight to the event store, so this needs no live worker.
 // Replay paging is pinned by Rust event_store::replay tests (forward_pages_reassemble_the_full_replay).
 test.describe("event store", () => {
   test("structured view/context-primer renders the seeded turn", async ({ spawnServe }) => {
     const primerText = "primer-fixture-prompt-1224";
-    const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "acp-primer" });
-    await postAcp(serve.baseUrl, sessionId, "/enable");
-    await postPrompt(serve.baseUrl, sessionId, primerText);
-    // The synthetic Stopped closes the turn so the primer renders it complete.
-    await postAcp(serve.baseUrl, sessionId, "/force_end_turn");
+    const activeChunk = "primer-turn-active";
+    const { serve, sessionId } = await startAcpSession(spawnServe, {
+      title: "acp-primer",
+      fakeAcpScript: script(endTurn(chunk(activeChunk), HOLD)),
+    });
+    await expect
+      .poll(
+        async () =>
+          (await replayFrames(serve.baseUrl, sessionId)).some(
+            (frame) =>
+              (frame as { event?: { AcpSessionAssigned?: { connection_ready?: boolean } } }).event?.AcpSessionAssigned
+                ?.connection_ready === true,
+          ),
+        { timeout: 15_000, intervals: [100, 200, 500, 1000] },
+      )
+      .toBe(true);
+    const prompt = await postPrompt(serve.baseUrl, sessionId, primerText);
+    expect(prompt.status).toBe(202);
+    expect(((await prompt.json()) as { disposition?: string }).disposition).toBe("sent");
+    await waitForReplayContains(serve.baseUrl, sessionId, [primerText, activeChunk], { mode: "all" });
+    const forced = await postAcp(serve.baseUrl, sessionId, "/force_end_turn");
+    expect(forced.status).toBe(202);
 
     let highestSeq = 0;
     await expect

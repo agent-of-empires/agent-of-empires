@@ -5,6 +5,7 @@
 import type { Page } from "@playwright/test";
 import { test, expect, pressShortcut, observeFor } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
+import { copiedBy } from "./helpers/clipboard";
 import { mockSessionsList } from "./helpers/sessions";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
@@ -57,6 +58,55 @@ test("plan modal takes focus, contains Tab, and returns focus on Escape", async 
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(opener).toBeFocused();
+});
+
+test("plan reading survives Unknown authority and revocation without enabling native decisions", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const mock = await mockAcpSession(page, {
+    title: TITLE,
+    nativeAvailable: false,
+    reducedState: { pending_approvals: [approval] },
+  });
+  const decisions: string[] = [];
+  await page.route("**/api/sessions/*/acp/approvals/*", async (route) => {
+    decisions.push(route.request().postData() ?? "");
+    await route.fulfill({ status: 200, json: {} });
+  });
+  await openStructuredSession(page, mock);
+  const opener = page.getByRole("button", { name: "View plan", exact: true });
+  await expect(opener).toBeEnabled();
+  await opener.click();
+  const dialog = page.getByRole("dialog", { name: "Plan", exact: true });
+  await expect(dialog).toBeVisible();
+  for (const name of ["Allow", "Always", "Deny"]) {
+    await expect(dialog.getByRole("button", { name, exact: true })).toBeDisabled();
+  }
+
+  // Keep the modal open across genuine current receipts, not historical events.
+  mock.setNativeState({ ready: true }, 10);
+  await expect(dialog.getByRole("button", { name: "Allow", exact: true })).toBeEnabled();
+  mock.setNativeState({ ready: false }, 11);
+  for (const name of ["Allow", "Always", "Deny"]) {
+    await expect(dialog.getByRole("button", { name, exact: true })).toBeDisabled();
+  }
+  const raw = dialog.getByRole("tab", { name: "Raw", exact: true });
+  await expect(raw).toBeEnabled();
+  await raw.click();
+  await expect(raw).toHaveAttribute("aria-selected", "true");
+  await expect(dialog.getByRole("tabpanel")).toHaveText(PLAN);
+  expect(await copiedBy(page, () => dialog.getByRole("button", { name: "Copy plan", exact: true }).click())).toBe(PLAN);
+  await expect(dialog.getByRole("button", { name: "Close", exact: true })).toBeEnabled();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await expect(opener).toBeEnabled();
+  const card = page.getByRole("alertdialog");
+  for (const name of ["Allow", "Always", "Deny"]) {
+    await expect(card.getByRole("button", { name, exact: true })).toBeDisabled();
+  }
+  expect(decisions).toEqual([]);
 });
 
 test("the command palette keeps Tab and Escape while it covers the plan modal", async ({ page }) => {

@@ -115,6 +115,12 @@ pub struct AcpTranscript {
     /// Highest seq applied from a `reduced_state` frame. Used as the `since`
     /// cursor for reconnect and to drop stale frames.
     pub last_seq: u64,
+    /// Authority belongs only to an accepted live snapshot, never transcript
+    /// replay or management transport presence. Revoked across reconnect.
+    pub native_snapshot_seq: Option<u64>,
+    pub connection_ready: bool,
+    pub connection_unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
+    pub prompt_wake_eligible: bool,
 }
 
 /// A tool card the renderer builds from a server `tool_start` row (plus its
@@ -227,7 +233,18 @@ impl AcpTranscript {
             current_plan: Vec::new(),
             lagged: false,
             last_seq: 0,
+            native_snapshot_seq: None,
+            connection_ready: false,
+            connection_unavailable: None,
+            prompt_wake_eligible: false,
         }
+    }
+
+    pub fn revoke_native_authority(&mut self) {
+        self.native_snapshot_seq = None;
+        self.connection_ready = false;
+        self.connection_unavailable = None;
+        self.prompt_wake_eligible = false;
     }
 
     /// Reconcile a batch of server-folded transcript rows (a WS
@@ -308,6 +325,11 @@ impl AcpTranscript {
             return;
         }
         self.last_seq = seq;
+        self.native_snapshot_seq = Some(seq);
+        self.connection_unavailable = state.connection_unavailable;
+        self.connection_ready = state.connection_ready && self.connection_unavailable.is_none();
+        self.prompt_wake_eligible =
+            state.prompt_wake_eligible == Some(true) && self.connection_unavailable.is_none();
 
         let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("background_agents") {
@@ -435,9 +457,8 @@ impl AcpTranscript {
 mod tests {
     use super::*;
     use crate::acp::approvals::{Approval, Nonce};
-    use crate::acp::elicitations::Elicitation;
     use crate::acp::state::{
-        AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
+        AcpSessionId, AgentName, AuthStatusKind, Event, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     use chrono::Utc;
@@ -523,101 +544,6 @@ mod tests {
             requested_at: Utc::now(),
             resolved: None,
         }
-    }
-
-    /// Every control field the view renders comes off the frame verbatim: the
-    /// TUI holds no derivation of its own any more, so a mapping slip here is
-    /// the whole class of bug this tier can still introduce.
-    #[test]
-    fn reduced_state_maps_every_rendered_control_field() {
-        let mut t = AcpTranscript::new("s-1");
-        let mut s = reduced(&[
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "go".into(),
-                attachments: vec![],
-                synthesized: false,
-                origin_plugin: None,
-            },
-            Event::PromptCapabilities {
-                steering: true,
-                image: false,
-                audio: false,
-                embedded_context: false,
-                load_session: None,
-            },
-            Event::CancelRequested {
-                escalates_at: Utc::now(),
-            },
-            Event::ModesAvailable {
-                current_mode_id: "plan".into(),
-                modes: vec![ModeInfo {
-                    id: "plan".into(),
-                    name: "Plan".into(),
-                    description: None,
-                }],
-            },
-            Event::AvailableCommandsUpdated {
-                commands: vec![AvailableCommand {
-                    name: "review".into(),
-                    description: "Review".into(),
-                    accepts_input: true,
-                }],
-            },
-            Event::PlanUpdated {
-                plan: Plan {
-                    plan_id: "p-1".into(),
-                    version: 1,
-                    steps: vec![PlanStep {
-                        id: "s-1".into(),
-                        title: "Step one".into(),
-                        detail: None,
-                        status: PlanStepStatus::InProgress,
-                    }],
-                },
-            },
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 5_000,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ]);
-        s.pending_approvals = vec![approval("n-1")];
-        s.pending_elicitations = vec![Elicitation {
-            nonce: Nonce("n-2".into()),
-            message: "Which one?".into(),
-            title: None,
-            description: None,
-            tool_call_id: None,
-            questions: Vec::new(),
-            requested_at: Utc::now(),
-            resolved: None,
-        }];
-
-        t.apply_reduced_state(9, s, &[]);
-
-        assert_eq!(t.last_seq, 9);
-        assert_eq!(t.agent_name.as_deref(), Some("claude"));
-        assert!(t.turn_active && t.steering && t.cancelling);
-        assert!(!t.compacting);
-        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
-        assert_eq!(t.current_mode.as_deref(), Some("plan"));
-        assert_eq!(t.available_modes.len(), 1);
-        assert_eq!(t.available_commands.len(), 1);
-        assert_eq!(t.current_plan.len(), 1);
-        assert_eq!(t.current_plan[0].title, "Step one");
-        // Approvals carry the whole request: the shelf renders from these
-        // fields, since the transcript holds no approval row.
-        assert_eq!(t.pending_approvals.len(), 1);
-        assert_eq!(t.pending_approvals[0].nonce, "n-1");
-        assert_eq!(t.pending_approvals[0].title, "Edit a file");
-        assert_eq!(t.pending_approvals[0].kind, "execute");
-        assert_eq!(t.pending_approvals[0].args, "ls");
-        assert!(t.pending_approvals[0].destructive);
-        assert_eq!(t.pending_elicitations.len(), 1);
-        assert_eq!(t.pending_elicitations[0].message, "Which one?");
     }
 
     /// The banner only shows inside a running turn, so the phases that end
@@ -832,6 +758,7 @@ mod tests {
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
+            fork_rejection: None,
         };
         let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),

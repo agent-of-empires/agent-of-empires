@@ -18,9 +18,9 @@ use crate::acp::event_store::EventStore;
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
-pub(crate) use rate_limit::install_rate_limit_continuation;
 #[cfg(test)]
-pub(crate) use rate_limit::ContinuationOutcome;
+pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
+pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
@@ -59,12 +59,12 @@ fn forget_session_budget(
     attempted: &mut HashSet<String>,
     parked: &mut HashSet<String>,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     attempted.remove(id);
     parked.remove(id);
     respawn_history.remove(id);
-    capacity_deferred.remove(id);
+    resume_deferred.remove(id);
 }
 
 /// Banner for a parked session. A missing project path embeds the
@@ -83,10 +83,35 @@ fn park_message(project_path: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResumeDeferral {
+    entry: DeferredResume,
+}
+
+#[derive(Debug, Clone)]
+enum DeferredResume {
+    Capacity,
+    Unavailable {
+        scope: crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+impl ResumeDeferral {
+    pub(crate) fn capacity() -> Self {
+        Self {
+            entry: DeferredResume::Capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
     /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
     Retry,
+    /// No admission occurred; refund only the attempt charged by this tick.
+    RegistryBusy,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -97,6 +122,64 @@ enum ResumeOutcome {
         source_profile: String,
         lifecycle_generation: u64,
     },
+    Unavailable {
+        scope: Option<crate::acp::state::NativeObservationScope>,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+#[cfg(test)]
+type ResumeDispatchGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static RESUME_DISPATCH_GATE: std::sync::Mutex<Option<ResumeDispatchGate>> =
+    std::sync::Mutex::new(None);
+
+fn refund_tick_budget(respawn_history: &mut HashMap<String, Vec<Instant>>, id: &str) {
+    if let Some(entries) = respawn_history.get_mut(id) {
+        entries.pop();
+        if entries.is_empty() {
+            respawn_history.remove(id);
+        }
+    }
+}
+
+async fn defer_control_refusal(
+    state: &Arc<AppState>,
+    id: &str,
+    scope: crate::acp::state::NativeObservationScope,
+    refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+    originating_epoch: Option<u64>,
+    deferred: &mut HashMap<String, ResumeDeferral>,
+) {
+    let same = deferred.get(id).is_some_and(|entry| match &entry.entry {
+        DeferredResume::Unavailable {
+            scope: previous,
+            refusal: previous_refusal,
+            ..
+        } => previous.context == scope.context && *previous_refusal == refusal,
+        DeferredResume::Capacity => false,
+    });
+    if !same
+        && state
+            .acp_supervisor
+            .publish_control_refusal(id, &scope, refusal, originating_epoch)
+            .await
+    {
+        deferred.insert(
+            id.to_owned(),
+            ResumeDeferral {
+                entry: DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            },
+        );
+    }
 }
 
 /// When each cadence-gated pass last ran.
@@ -125,7 +208,7 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 }
 
 /// Eligible for a reconciler-driven worker.
-fn is_resumable(i: &Instance) -> bool {
+pub(super) fn is_resumable(i: &Instance) -> bool {
     is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
 }
 
@@ -173,9 +256,10 @@ pub async fn reconcile_acp_workers(
     cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     let supervisor = &state.acp_supervisor;
+    supervisor.settle_fork_rejections().await;
     supervisor.retry_pending_teardowns().await;
     crate::server::api::recover_pending_terminal_handoffs(
         state,
@@ -189,8 +273,9 @@ pub async fn reconcile_acp_workers(
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.
     for id in supervisor.reap_user_stopped().await {
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
+    crate::server::acp_events::commit_background_bindings(state).await;
     for id in supervisor.take_respawn_requests() {
         // A teardown in flight settles later; the request waits for it, or the
         // loop below would pin the session as attempted.
@@ -201,11 +286,36 @@ pub async fn reconcile_acp_workers(
             supervisor.request_respawn(&id);
             continue;
         }
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
-    // Pre-session startup failures re-arm under the ordinary budget.
-    for id in supervisor.take_startup_failures() {
-        attempted.remove(&id);
+    for (id, failure) in supervisor.take_startup_failures() {
+        match failure {
+            crate::acp::supervisor::StartupFailure::Retry => {
+                attempted.remove(&id);
+            }
+            crate::acp::supervisor::StartupFailure::ForkRejected(receipt) => {
+                let matches = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .is_some_and(|row| receipt.matches_postimage(row));
+                if matches && !supervisor.fork_rejection_superseded(&id, &receipt) {
+                    let current = state
+                        .session_service
+                        .native_control_projection(&id, None, 0)
+                        .await;
+                    if current
+                        .context()
+                        .is_none_or(|context| context == receipt.context())
+                    {
+                        attempted.insert(id.clone());
+                        parked.insert(id);
+                    }
+                }
+            }
+        }
     }
     for id in supervisor.take_respawned_in_place() {
         resume::requeue_interrupted_monitor(state, &id).await;
@@ -219,15 +329,12 @@ pub async fn reconcile_acp_workers(
     if due(&mut cadence.terminal_repair, idle::TERMINAL_REPAIR_INTERVAL) {
         idle::repair_missing_terminal(state).await;
     }
-    // Before the snapshot so a released park respawns this same tick.
-    let released_from_park = if due(
+    if due(
         &mut cadence.rate_limit,
         rate_limit::RATE_LIMIT_RESUME_INTERVAL,
     ) {
-        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await
-    } else {
-        HashSet::new()
-    };
+        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await;
+    }
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
     let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
@@ -249,7 +356,7 @@ pub async fn reconcile_acp_workers(
     attempted.retain(|id| live.contains(id));
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
-    capacity_deferred.retain(|id| live.contains(id));
+    resume_deferred.retain(|id, _| live.contains(id));
 
     // Must precede scheduling: capacity counts registry entries, so dead
     // entries would block legitimate spawns.
@@ -261,6 +368,99 @@ pub async fn reconcile_acp_workers(
     let mut tasks = Vec::new();
     for mut target in targets {
         let id = target.id.clone();
+        match supervisor.resume_deferred(&id).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(error) => {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "retained construction remains governed by its existing lease");
+                continue;
+            }
+        }
+        let worker_state = supervisor.worker_state(&id).await;
+        let previous = resume_deferred
+            .get(&id)
+            .and_then(|entry| match &entry.entry {
+                DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                } => Some((scope.clone(), *refusal, *originating_epoch)),
+                DeferredResume::Capacity => None,
+            });
+        if worker_state == AcpWorkerState::Absent
+            || (worker_state == AcpWorkerState::Resuming && previous.is_some())
+        {
+            if let Err(error) = target
+                .freeze_native_scope(previous.as_ref().map(|(scope, _, _)| scope.clone()))
+                .await
+            {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "native scope changed before resume admission");
+                continue;
+            }
+            let scope = target
+                .native_scope
+                .as_ref()
+                .expect("frozen native scope")
+                .clone();
+            let previous = previous.filter(|(old, _, _)| old.context == scope.context);
+            let probe_id = id.clone();
+            let refusal = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let registry = crate::process::worker_registry::try_registry_lock(&probe_id)?
+                    .ok_or(crate::process::worker_registry::RegistryBusy)?;
+                if let Some((_, refusal, epoch)) = previous {
+                    if registry.refusal_still_applies(&refusal) {
+                        return Ok(Some((refusal, epoch)));
+                    }
+                }
+                Ok(registry
+                    .control_admission()
+                    .err()
+                    .map(|refusal| (refusal, None)))
+            })
+            .await;
+            match refusal {
+                Ok(Ok(Some((refusal, epoch)))) => {
+                    defer_control_refusal(state, &id, scope, refusal, epoch, resume_deferred).await;
+                    attempted.remove(&id);
+                    continue;
+                }
+                Ok(Ok(None)) => {
+                    if resume_deferred.get(&id).is_some_and(|entry| {
+                        matches!(&entry.entry, DeferredResume::Unavailable { .. })
+                    }) {
+                        resume_deferred.remove(&id);
+                        attempted.remove(&id);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                        "control admission deferred without charging resume budget");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                        "control admission observation failed");
+                    continue;
+                }
+            }
+        }
+        if let Some(park) = query_store(
+            &state.acp_event_store,
+            &id,
+            "rate-limit hold",
+            |store, id| store.rate_limit_park(id),
+        )
+        .await
+        .flatten()
+        {
+            if park.cap_reached && with_queued_prompts.contains(&id) {
+                rate_limit::schedule_capped_queue(state, &id, park.seq).await;
+            }
+            attempted.insert(id.clone());
+            continue;
+        }
         if attempted.contains(&id) {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
@@ -269,12 +469,12 @@ pub async fn reconcile_acp_workers(
             {
                 continue;
             }
-            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+            forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
         }
         match supervisor.worker_state(&id).await {
             AcpWorkerState::Running | AcpWorkerState::Resuming => {
-                // Already owned; a live worker is also the user's retry, so un-park.
-                forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+                // Current ownership clears crash bookkeeping only after quota hold ends.
+                forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
                 attempted.insert(id);
                 continue;
             }
@@ -287,27 +487,6 @@ pub async fn reconcile_acp_workers(
         if parked.contains(&id) {
             attempted.insert(id);
             continue;
-        }
-        // A rate-limit park (#3514) is left to the auto-resume pass; a cap park
-        // (#3688) is released by a queued prompt.
-        if !released_from_park.contains(&id) {
-            let park = query_store(&state.acp_event_store, &id, "rate-limit park", |s, id| {
-                s.rate_limit_park(id)
-            })
-            .await
-            .flatten();
-            if let Some(park) =
-                park.filter(|p| !p.cap_reached || !with_queued_prompts.contains(&id))
-            {
-                tracing::debug!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    cap_reached = park.cap_reached,
-                    "holding respawn: session is parked on a rate limit"
-                );
-                attempted.insert(id);
-                continue;
-            }
         }
         if record_and_check_respawn_budget(respawn_history, &id, Instant::now()) {
             tracing::warn!(
@@ -357,6 +536,13 @@ pub async fn reconcile_acp_workers(
     let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
+    #[cfg(test)]
+    let gate = { RESUME_DISPATCH_GATE.lock().unwrap().take() };
+    #[cfg(test)]
+    if let Some((entered, release)) = gate {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
     for target in tasks {
         let state = Arc::clone(state);
         let sem = Arc::clone(&semaphore);
@@ -371,6 +557,10 @@ pub async fn reconcile_acp_workers(
 
     while let Some(result) = set.join_next().await {
         match result {
+            Ok((id, ResumeOutcome::RegistryBusy)) => {
+                refund_tick_budget(respawn_history, &id);
+                attempted.remove(&id);
+            }
             Ok((id, ResumeOutcome::Retry)) => {
                 if !parked.contains(&id) {
                     attempted.remove(&id);
@@ -385,16 +575,15 @@ pub async fn reconcile_acp_workers(
                 },
             )) => {
                 // Refund only this tick's budget entry so prior crash history survives.
-                if let Some(entries) = respawn_history.get_mut(&id) {
-                    entries.pop();
-                    if entries.is_empty() {
-                        respawn_history.remove(&id);
-                    }
-                }
+                refund_tick_budget(respawn_history, &id);
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
-                if capacity_deferred.insert(id.clone()) {
+                if !resume_deferred
+                    .get(&id)
+                    .is_some_and(|entry| matches!(&entry.entry, DeferredResume::Capacity))
+                {
+                    resume_deferred.insert(id.clone(), ResumeDeferral::capacity());
                     crate::server::api::publish_startup_error_if_current(
                         state,
                         &id,
@@ -405,8 +594,30 @@ pub async fn reconcile_acp_workers(
                     .await;
                 }
             }
+            Ok((
+                id,
+                ResumeOutcome::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            )) => {
+                refund_tick_budget(respawn_history, &id);
+                attempted.remove(&id);
+                if let Some(scope) = scope {
+                    defer_control_refusal(
+                        state,
+                        &id,
+                        scope,
+                        refusal,
+                        originating_epoch,
+                        resume_deferred,
+                    )
+                    .await;
+                }
+            }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
-                capacity_deferred.remove(&id);
+                resume_deferred.remove(&id);
             }
             Err(e) => {
                 tracing::error!(target: "acp.supervisor", "resume task panicked: {e}");
@@ -447,7 +658,10 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             .iter()
             .filter(|i| {
                 !i.queued_prompts.is_empty()
-                    && i.status == crate::session::Status::Idle
+                    && matches!(
+                        i.status,
+                        crate::session::Status::Idle | crate::session::Status::Error
+                    )
                     && is_untriaged_structured(i)
             })
             .map(|i| (i.id.clone(), i.is_idle_dormant()))
@@ -558,6 +772,600 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
+    use crate::acp::Event;
+
+    #[derive(Clone, Copy)]
+    enum ConstructorOutcome {
+        Resume,
+        SupervisorStop,
+        HttpStop,
+        CliStop,
+    }
+
+    async fn owned_constructor_registry_deferral_recovers(
+        installation_ready: bool,
+        outcome: ConstructorOutcome,
+    ) {
+        use crate::acp::runner_lifecycle::{ProcessControl as _, SystemProcessControl};
+        use crate::acp::supervisor::test_support::{
+            pause_owned_installation, runner_record, ScriptedAcpAgent,
+        };
+        let stop_deferred = !matches!(outcome, ConstructorOutcome::Resume);
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let id = "owned-constructor-registry-deferral";
+        let mut row = test_fixtures::structured_instance(id, project.path().to_str().unwrap());
+        row.agent_name = Some("claude-code".into());
+        row.acp_mode_id = Some("plan".into());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let agent = ScriptedAcpAgent::new();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row],
+            agent.launcher(true),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        struct Listener(tokio::task::JoinHandle<()>);
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _listener = if stop_deferred {
+            let subscribers = state.acp_events_tx.receiver_count();
+            let listener = Listener(tokio::spawn(crate::server::acp_events::acp_event_listener(
+                state.clone(),
+            )));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.acp_events_tx.receiver_count() <= subscribers {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the real observation listener subscribed before construction");
+            Some(listener)
+        } else {
+            None
+        };
+        let (registration, installation, release) = if installation_ready {
+            let (waiting, release) = pause_owned_installation();
+            (None, Some(waiting), release)
+        } else {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            *crate::acp::acp_client::OWNED_REGISTRATION_GATE
+                .lock()
+                .unwrap() = Some((entered, released));
+            (Some(waiting), None, release)
+        };
+        let prior = vec![Instant::now() - Duration::from_secs(1)];
+        let mut tick = Tick::default();
+        tick.respawn_history.insert(id.into(), prior.clone());
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tick.run(&state).await;
+                tick
+            }
+        });
+        let (owner, original_client) = if let Some(waiting) = registration {
+            let owner = tokio::time::timeout(Duration::from_secs(15), waiting)
+                .await
+                .expect("real owned child reached registration-observation boundary")
+                .unwrap();
+            (owner, None)
+        } else {
+            let client = tokio::time::timeout(Duration::from_secs(15), installation.unwrap())
+                .await
+                .expect("real SDK client reached installation boundary")
+                .unwrap();
+            let owner = agent.owned_runner();
+            assert_eq!(client.runner_pid(), Some(owner.pid));
+            (owner, Some(client))
+        };
+        let native = agent.started().await;
+        if installation_ready {
+            agent.wait_for_call("session/new", 1).await;
+        }
+        if stop_deferred && installation_ready {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let (registry, record) = agent.registered_runner(id).await;
+                    let established = record.stored_acp_session_id.is_some()
+                        && original_client
+                            .as_ref()
+                            .is_some_and(|client| client.connection_ready());
+                    drop(registry);
+                    if established {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the original native session-ready receipt arrived before the refused install");
+        }
+        if installation_ready
+            && matches!(
+                outcome,
+                ConstructorOutcome::HttpStop | ConstructorOutcome::CliStop
+            )
+        {
+            // The real SDK command loop runs only after commit_session queued its assignment.
+            original_client
+                .as_ref()
+                .unwrap()
+                .test_flush_commands()
+                .await;
+            assert!(
+                !state
+                    .acp_event_store
+                    .replay_from(id, 0)
+                    .iter()
+                    .any(|(_, event)| matches!(event, Event::AcpSessionAssigned { .. })),
+                "the genuine SDK assignment must still be only in the original inbound receiver"
+            );
+        }
+        let (registry, registered) = agent.registered_runner(id).await;
+        assert!(owner.owns_record(&registered));
+        release.send(()).unwrap();
+        let mut tick = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("the original bounded construction attempt returned")
+            .unwrap();
+        let after_attempt = tick.respawn_history.get(id).cloned();
+        assert!(SystemProcessControl::default().is_alive(owner));
+        let calls_while_refused = agent.calls();
+        tokio::time::timeout(Duration::from_secs(20), tick.run(&state))
+            .await
+            .unwrap();
+        let after_uncharged_tick = tick.respawn_history.get(id).cloned();
+        drop(registry);
+        if stop_deferred {
+            let before_stop_generation = state.instances.read().await[0].lifecycle_generation;
+            let mut cli_stop = None;
+            let stopped = tokio::time::timeout(Duration::from_secs(8), async {
+                match outcome {
+                    ConstructorOutcome::SupervisorStop => state
+                        .acp_supervisor
+                        .shutdown_and_wait(id, Duration::from_secs(5))
+                        .await
+                        .map_err(|error| error.to_string()),
+                    ConstructorOutcome::HttpStop => {
+                        let response = crate::server::api::sessions::stop_session(
+                            axum::extract::State(state.clone()),
+                            axum::extract::Path(id.to_owned()),
+                        )
+                        .await;
+                        let response = axum::response::IntoResponse::into_response(response);
+                        if response.status().is_success() {
+                            Ok(())
+                        } else {
+                            let status = response.status();
+                            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                                .await
+                                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                                .unwrap_or_else(|error| {
+                                    format!("<response body read failed: {error}>")
+                                });
+                            Err(format!("HTTP Stop returned {status}: {body}"))
+                        }
+                    }
+                    ConstructorOutcome::CliStop => {
+                        let count = crate::cli::acp::stop_all_workers(5)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        assert_eq!(count, 1, "the real CLI stop owns only this isolated runner");
+                        cli_stop = Some(
+                            crate::process::worker_registry::stop_intent(id)
+                                .unwrap()
+                                .expect("CLI published the exact original stop intent"),
+                        );
+                        Ok(())
+                    }
+                    ConstructorOutcome::Resume => unreachable!("stop branch"),
+                }
+            })
+            .await;
+            let cli_custody_settled = if matches!(outcome, ConstructorOutcome::CliStop) {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            tick.run(&state).await;
+                            if !state.acp_supervisor.is_owned(id).await {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .is_ok(),
+                )
+            } else {
+                None
+            };
+            let still_alive = SystemProcessControl::default().is_alive(owner);
+            let native_reaped = if matches!(&stopped, Ok(Ok(()))) {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !agent.native_reaped() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                agent.native_reaped()
+            };
+            let record_absent = runner_record(id).await.is_none();
+            let calls = agent.calls();
+            let expected_sid = registered.stored_acp_session_id.as_deref();
+            let selected_identity_preserved =
+                if matches!(outcome, ConstructorOutcome::SupervisorStop) {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                let cached = state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .and_then(|row| row.acp_session_id.clone());
+                                let durable = crate::session::Storage::new_unwatched("default")
+                                    .unwrap()
+                                    .load()
+                                    .unwrap()
+                                    .into_iter()
+                                    .find(|row| row.id == id)
+                                    .and_then(|row| row.acp_session_id);
+                                if cached.as_deref() == expected_sid
+                                    && durable.as_deref() == expected_sid
+                                {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .is_ok(),
+                    )
+                };
+            let stopped_events = state.acp_event_store.replay_from(id, 0);
+            let assigned_before_cleanup = stopped_events.iter().any(
+                |(_, event)| matches!(event, Event::AcpSessionAssigned { acp_session_id, connection_ready: false, .. }
+                    if Some(acp_session_id.as_str()) == expected_sid),
+            );
+            let any_assignment_before_cleanup = stopped_events
+                .iter()
+                .any(|(_, event)| matches!(event, Event::AcpSessionAssigned { .. }));
+            let stop_generation_advanced = if matches!(outcome, ConstructorOutcome::HttpStop) {
+                Some(
+                    crate::session::Storage::new_unwatched("default")
+                        .unwrap()
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .lifecycle_generation
+                        > before_stop_generation,
+                )
+            } else {
+                None
+            };
+            let cli_stop_preserved = cli_stop.as_ref().map(|original| {
+                crate::process::worker_registry::stop_intent(id)
+                    .unwrap()
+                    .as_ref()
+                    == Some(original)
+            });
+            let memory_sid = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.acp_session_id.clone());
+            let disk_sid = crate::session::Storage::open_reference("default")
+                .and_then(|storage| storage.load())
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.acp_session_id)
+                })
+                .map_err(|error| format!("{error:#}"));
+            let health = state.canonical_health.read().await.clone();
+            let diagnostics = format!("expected_sid={expected_sid:?}; memory_sid={memory_sid:?}; disk_sid={disk_sid:?}; health={health:?}");
+            agent.settle(&state.acp_supervisor, id).await;
+            drop(agent);
+            assert!(matches!(stopped, Ok(Ok(()))),
+                "Stop must claim a deferred owned constructor without a vanished producer: {stopped:?}; {diagnostics}");
+            assert!(
+                !still_alive,
+                "the accepted stop must physically retire the original runner"
+            );
+            assert!(
+                native_reaped,
+                "Stop must retire and reap the captured native process before fixture cleanup"
+            );
+            assert!(
+                record_absent,
+                "Stop must settle the original runner's registry record"
+            );
+            if let Some(advanced) = stop_generation_advanced {
+                assert!(
+                    advanced,
+                    "the actual HTTP Stop must commit its newer native generation"
+                );
+            }
+            if let Some(settled) = cli_custody_settled {
+                assert!(settled, "the real daemon tick must settle a CLI-killed deferred constructor without an installed handle");
+                assert_eq!(
+                    cli_stop_preserved,
+                    Some(true),
+                    "settling the dead original must preserve its exact CLI stop token"
+                );
+                assert!(
+                    calls.iter().all(|call| !matches!(
+                        call["method"].as_str(),
+                        Some("session/load" | "session/prompt")
+                    )),
+                    "CLI settlement must not replay native work"
+                );
+            }
+            if expected_sid.is_some() {
+                assert!(assigned_before_cleanup,
+                    "Stop must drain the original queued native identity without publishing false readiness");
+            } else {
+                assert!(
+                    !any_assignment_before_cleanup,
+                    "a never-established constructor must not fabricate a conversation receipt"
+                );
+            }
+            if let Some(preserved) = selected_identity_preserved {
+                assert!(preserved,
+                    "the native controller must preserve the original queued SID in memory and on disk before fixture cleanup; {diagnostics}");
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/new")
+                    .count(),
+                if installation_ready { 1 } else { 0 }
+            );
+        } else {
+            tokio::time::timeout(Duration::from_secs(20), tick.run(&state))
+                .await
+                .unwrap();
+            let sent = tokio::time::timeout(
+                Duration::from_secs(3),
+                state.acp_supervisor.send_prompt(
+                    id,
+                    "same owned conversation after registry refusal",
+                    &[],
+                ),
+            )
+            .await;
+            let delivered = matches!(&sent, Ok(Ok(())));
+            if delivered {
+                agent.wait_for_call("session/prompt", 1).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !state.acp_event_store.replay_from(id, 0).iter().any(|(_, event)|
+                        matches!(event, Event::Stopped { reason } if reason == "prompt_complete")) {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                agent.wait_for_call("session/set_mode", 1).await;
+                if let Some(original) = original_client.as_ref() {
+                    state
+                        .acp_supervisor
+                        .test_assert_installed_client(id, original)
+                        .await;
+                }
+                assert_eq!(agent.started().await, native);
+            }
+            let retained = runner_record(id).await;
+            let calls = agent.calls();
+            let active_owner = state.acp_supervisor.running_identity(id);
+            if delivered {
+                state
+                    .acp_supervisor
+                    .shutdown_and_wait(id, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            }
+            agent.settle(&state.acp_supervisor, id).await;
+            drop(agent);
+            assert!(
+                delivered,
+                "the next real reconcile must install a usable same-actor worker: {sent:?}"
+            );
+            assert_eq!(active_owner, Some(owner));
+            let retained = retained.unwrap();
+            assert!(owner.owns_record(&retained));
+            let sid = retained
+                .stored_acp_session_id
+                .as_deref()
+                .expect("genuine initial session established");
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "initialize")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/new")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/load")
+                    .count(),
+                0
+            );
+            let modes: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_mode")
+                .collect();
+            assert_eq!(modes.len(), 1);
+            assert_eq!(modes[0]["params"]["modeId"], "plan");
+            let prompts: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/prompt")
+                .collect();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0]["params"]["sessionId"], sid);
+            assert!(calls
+                .iter()
+                .all(|call| call["native_pid"].as_u64() == Some(native.0 as u64)));
+        }
+        assert_eq!(
+            after_attempt,
+            Some(prior.clone()),
+            "refund only the charged attempt"
+        );
+        assert_eq!(
+            after_uncharged_tick,
+            Some(prior),
+            "deferred ownership is not a successful retry or a history reset"
+        );
+        assert_eq!(
+            calls_while_refused
+                .iter()
+                .filter(|call| call["method"] == "session/new")
+                .count(),
+            if installation_ready { 1 } else { 0 },
+            "registration continuation must preserve the not-yet-established original New"
+        );
+        assert!(!state
+            .acp_event_store
+            .replay_from(id, 0)
+            .iter()
+            .any(|(_, event)| matches!(
+                event,
+                Event::AgentStartupError { .. } | Event::SessionContextReset { .. }
+            )));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_registration_contention_reconciles_original_authorized_new_once() {
+        owned_constructor_registry_deferral_recovers(false, ConstructorOutcome::Resume).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_installation_contention_reconciles_original_client_and_mode_once() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::Resume).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_physically_retires_a_deferred_owned_constructor_without_reinstallation() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::SupervisorStop)
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_stop_preserves_original_inbound_assignment_across_its_native_commit() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::HttpStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_stop_settles_handleless_owned_constructor_and_preserves_its_native_binding() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::CliStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_stop_settles_handleless_registration_without_establishing_a_conversation() {
+        owned_constructor_registry_deferral_recovers(false, ConstructorOutcome::CliStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_contention_preserves_prior_budget_and_refunds_only_charged_dispatch() {
+        for charged in [false, true] {
+            let id = "registry-budget";
+            let (_home, state, _project) = test_state(id);
+            let mut tick = Tick::default();
+            let prior = vec![
+                Instant::now() - Duration::from_secs(2),
+                Instant::now() - Duration::from_secs(1),
+            ];
+            tick.respawn_history.insert(id.to_owned(), prior.clone());
+            let entry = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(
+                    crate::process::worker_registry::record_path(id)
+                        .unwrap()
+                        .with_extension("lock"),
+                )
+                .unwrap();
+            let (release, entered) = if charged {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                *RESUME_DISPATCH_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+                (Some(release_tx), Some(entered_rx))
+            } else {
+                fs2::FileExt::lock_exclusive(&entry).unwrap();
+                (None, None)
+            };
+            let tick_state = Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                tick.run(&tick_state).await;
+                tick
+            });
+            if let Some(entered) = entered {
+                tokio::time::timeout(Duration::from_secs(5), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                fs2::FileExt::lock_exclusive(&entry).unwrap();
+                release.unwrap().send(()).unwrap();
+            }
+            let tick = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tick.respawn_history.get(id),
+                Some(&prior),
+                "charged={charged}"
+            );
+            assert!(
+                !tick.attempted.contains(id),
+                "the refused observation remains retryable"
+            );
+            assert!(
+                !tick.parked.contains(id),
+                "contention is not a crash-loop decision"
+            );
+            assert_eq!(startup_errors(&state, id), 0);
+            assert_eq!(
+                state.acp_supervisor.worker_state(id).await,
+                AcpWorkerState::Absent
+            );
+            assert!(
+                state.acp_event_store.replay_from(id, 0).is_empty(),
+                "registry contention does not fabricate a native-loss event"
+            );
+            drop(entry);
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -729,6 +1537,176 @@ mod tests {
         assert!(!record_and_check_respawn_budget(&mut history, "other", now));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_legacy_refusal_never_dials_or_spends_reconciler_budget() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        for shape in ["missing", "null", "v3"] {
+            let id = "s-retained-legacy";
+            let (_home, state, project) = test_state(id);
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            test_fixtures::enable_auto_resume(true);
+            let long_ago = chrono::Utc::now() - chrono::Duration::days(3);
+            for (seq, event) in [
+                (
+                    1,
+                    crate::acp::state::test_support::prompt("interrupted explicit intent"),
+                ),
+                (
+                    2,
+                    Event::RateLimit {
+                        info: crate::acp::state::RateLimitInfo {
+                            status: "limited".into(),
+                            resets_at: Some(long_ago),
+                            kind: "usage".into(),
+                        },
+                    },
+                ),
+                (
+                    3,
+                    Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                ),
+            ] {
+                state
+                    .acp_event_store
+                    .record_at(id, seq, &event, long_ago.timestamp_millis())
+                    .unwrap();
+            }
+            state.acp_supervisor.hydrate_seqs([(id.into(), 3)]);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                socket.clone(),
+                "retained-agent".into(),
+                "claude".into(),
+                project.path().into(),
+                None,
+                vec![],
+                vec![],
+                Some("retained-native-history".into()),
+                Some("default".into()),
+            )
+            .with_generation(19);
+            record.control_protocol_version = (shape == "v3").then_some(3);
+            worker_registry::save(&record).unwrap();
+            let path = worker_registry::record_path(id).unwrap();
+            if shape == "null" {
+                let mut legacy = serde_json::to_value(&record).unwrap();
+                legacy["control_protocol_version"] = serde_json::Value::Null;
+                crate::session::atomic_write(&path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(
+                crate::process::worker::control_socket_sibling(&socket),
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let prior = vec![Instant::now()];
+            let mut tick = Tick::default();
+            tick.respawn_history.insert(id.into(), prior.clone());
+            tick.attempted.insert(id.into());
+            let park_seq = state.acp_event_store.rate_limit_park(id).unwrap().seq;
+            let streak = state.acp_event_store.rate_limit_redelivery_streak(id);
+            let queued = state.session_service.queued_prompts_snapshot(id).await;
+            rate_limit::reap_rate_limit_resumes(&state, &mut tick.attempted, &tick.parked).await;
+            drop(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    state.session_service.prompt_submission(id),
+                )
+                .await
+                .expect("the scheduled quota refusal releases submission ownership"),
+            );
+            assert_eq!(
+                state.acp_event_store.rate_limit_park(id).unwrap().seq,
+                park_seq
+            );
+            assert_eq!(
+                state.acp_event_store.rate_limit_redelivery_streak(id),
+                streak
+            );
+            assert_eq!(
+                state.session_service.queued_prompts_snapshot(id).await,
+                queued
+            );
+            assert_eq!(state.acp_event_store.replay_from(id, 0).len(), 3);
+            assert!(state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none());
+            for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
+                tick.run(&state).await;
+                drop(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        state.session_service.prompt_submission(id),
+                    )
+                    .await
+                    .expect("the tick's quota task settles before negative assertions"),
+                );
+                assert_eq!(
+                    state.acp_event_store.rate_limit_park(id).unwrap().seq,
+                    park_seq,
+                    "{shape}"
+                );
+                assert_eq!(
+                    state.acp_event_store.rate_limit_redelivery_streak(id),
+                    streak,
+                    "{shape}"
+                );
+                assert_eq!(
+                    state.session_service.queued_prompts_snapshot(id).await,
+                    queued,
+                    "{shape}"
+                );
+                assert_eq!(tick.respawn_history.get(id), Some(&prior), "{shape}");
+                assert!(
+                    !tick.attempted.contains(id) && !tick.parked.contains(id),
+                    "{shape}"
+                );
+                assert!(tick.resume_deferred.contains_key(id), "{shape}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    before,
+                    "legacy metadata is not rewritten"
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "metadata refusal must precede any connected-peer or RPC attempt"
+                );
+            }
+            let events = state.acp_event_store.replay_from(id, 0);
+            assert_eq!(
+                events.len(),
+                4,
+                "one stable refusal and no automatic redelivery breadcrumb"
+            );
+            assert!(matches!(
+                &events[3].1,
+                Event::AcpConnectionUnavailable { .. }
+            ));
+            assert_eq!(
+                state
+                    .session_service
+                    .fold_control_state(id)
+                    .await
+                    .connection_unavailable
+                    .unwrap()
+                    .cause,
+                if shape == "v3" {
+                    crate::acp::state::AcpConnectionCause::ControlProtocolIncompatible
+                } else {
+                    crate::acp::state::AcpConnectionCause::ControlProtocolUnknown
+                }
+            );
+        }
+    }
+
     /// A late restart marker (#3103) re-arms and is consumed; without one an
     /// attempted id stays pinned, or the crash-loop budget would be void.
     #[tokio::test]
@@ -740,7 +1718,7 @@ mod tests {
             let mut tick = Tick::default();
             tick.attempted.insert(id.to_string());
             if with_marker {
-                crate::process::worker_registry::mark_restart_pending(id, 5);
+                crate::process::worker_registry::mark_restart_pending(id, 5).unwrap();
             }
             tick.run(&state).await;
 
@@ -788,7 +1766,7 @@ mod tests {
         for _ in 0..3 {
             tick.run(&state).await;
             assert!(!tick.attempted.contains("s-cap"));
-            assert!(tick.capacity_deferred.contains("s-cap"));
+            assert!(tick.resume_deferred.contains_key("s-cap"));
             assert!(!tick.parked.contains("s-cap"));
         }
         assert_eq!(tick.respawn_history.get("s-cap").map(Vec::len), Some(2));
@@ -806,7 +1784,7 @@ mod tests {
             state.acp_supervisor.test_insert_worker("occupant").await;
             let mut tick = Tick::default();
             tick.run(&state).await;
-            assert!(tick.capacity_deferred.contains(id), "precondition");
+            assert!(tick.resume_deferred.contains_key(id), "precondition");
 
             if slot_freed {
                 state.acp_supervisor.test_remove_worker("occupant").await;
@@ -815,7 +1793,7 @@ mod tests {
             }
             tick.run(&state).await;
             assert!(
-                !tick.capacity_deferred.contains(id),
+                !tick.resume_deferred.contains_key(id),
                 "slot_freed={slot_freed}"
             );
             assert_eq!(capacity_startup_errors(&state, id), 1);

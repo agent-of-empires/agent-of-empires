@@ -18,8 +18,20 @@ test("one startup line names the Agent and counts", async ({ page }) => {
   await expect(line.getByTestId("startup-wait-elapsed")).toHaveText(/^0:0[0-9]$/);
 });
 
-test("a stopped Session says the queue sends when its Agent starts, and offers to start it", async ({ page }) => {
-  const mock = await mockAcpSession(page, { title: "story-absent", workerState: "absent" });
+test("a stopped Session offers an explicit Start without granting native send permission", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-absent",
+    workerState: "absent",
+    acpSessionId: "retained-session",
+    sessionFields: { status: "Stopped" },
+    nativeAvailable: false,
+    promptWakeEligible: false,
+  });
+  const starts: string[] = [];
+  await page.route("**/api/sessions/*/start", (r) => {
+    starts.push(r.request().method());
+    return r.fulfill({ json: { message: "Session started" } });
+  });
   const at = new Date().toISOString();
   await page.route("**/api/sessions/*/queue", (r) =>
     r.fulfill({
@@ -30,9 +42,51 @@ test("a stopped Session says the queue sends when its Agent starts, and offers t
     }),
   );
   await openStructuredSession(page, mock);
-  await expect(page.getByTestId("queued-strip-header")).toHaveText("Queued (2)· sends when the Agent starts");
-  await expect(page.getByTestId("queued-send-now").first()).toHaveText("Start and send");
+  await expect(page.getByRole("button", { name: "first", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "second", exact: true })).toBeVisible();
+  const start = page.getByTestId("queued-send-now").first();
+  await expect(start).toHaveText("Start and send");
+  await expect(start).toBeEnabled();
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+  expect(starts).toEqual([]);
+  expect(mock.promptBodies).toEqual([]);
+  await start.click();
+  await expect.poll(() => starts).toEqual(["POST"]);
+  expect(mock.promptBodies).toEqual([]);
+});
+
+test("socket-open with unknown native authority cannot send queued intent before a governor receipt", async ({
+  page,
+}) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-unknown-authority",
+    workerState: "running",
+    acpSessionId: "retained-session",
+    nativeAvailable: false,
+    promptWakeEligible: false,
+  });
+  const at = new Date().toISOString();
+  await page.route("**/api/sessions/*/queue", (r) =>
+    r.fulfill({
+      json: [
+        { id: "q1", seq: 1, text: "first", created_at: at },
+        { id: "q2", seq: 2, text: "second", created_at: at },
+      ],
+    }),
+  );
+  await openStructuredSession(page, mock);
+  const queuedSend = page.getByTestId("queued-send-now");
+  await expect(queuedSend).toHaveCount(2);
+  await expect(queuedSend.nth(0)).toBeDisabled();
+  await expect(queuedSend.nth(1)).toBeDisabled();
+  expect(mock.promptBodies).toEqual([]);
+  mock.setNativeState({ ready: false, wakeEligible: true });
+  await expect(queuedSend.nth(0)).toBeEnabled();
+  await expect(queuedSend.nth(1)).toBeEnabled();
+  expect(mock.promptBodies).toEqual([]);
+  await queuedSend.nth(0).click();
+  await expect.poll(() => mock.promptBodies.length).toBe(1);
+  expect(mock.promptBodies[0]?.text).toBe("first");
 });
 
 test("an older Session resuming never shows the startup line, even before its events load", async ({ page }) => {

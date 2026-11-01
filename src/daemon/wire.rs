@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::session::SessionScope;
+use crate::session::{Instance, SessionScope};
 
 /// One repository's branch base in a creation request.
 #[derive(Serialize, Deserialize)]
@@ -336,10 +336,52 @@ pub struct TerminalSize {
     pub rows: std::num::NonZeroU16,
 }
 
+/// Preconditions captured when one native preparation is admitted, before it is queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePreparationIdentity {
+    pub created_at: String,
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<(u64, u64)>,
+    /// Missing means unknown and cannot authorize preparation of an absent Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<[u8; 32]>,
+}
+
+impl NativePreparationIdentity {
+    pub(crate) fn from_instance(instance: &Instance, profile_identity: (u64, u64)) -> Self {
+        Self {
+            created_at: instance.created_at.to_rfc3339(),
+            lifecycle_generation: instance.lifecycle_generation,
+            profile: instance.source_profile.clone(),
+            profile_identity: Some(profile_identity),
+            selection: instance.native_preparation_selection().ok(),
+        }
+    }
+
+    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        self.created_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .ok()
+            == Some(instance.created_at)
+            && self.lifecycle_generation == instance.lifecycle_generation
+            && self.profile == instance.source_profile
+    }
+
+    pub(crate) fn matches_source(&self, storage: &crate::session::Storage) -> bool {
+        self.profile_identity.is_some()
+            && storage.verify_bound_profile().is_ok()
+            && self.profile_identity == storage.bound_profile_identity().ok()
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct StartSessionBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TerminalSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<NativePreparationIdentity>,
 }
 
 /// Explicit relaunch; omitted launch settings preserve the authoritative values.
@@ -418,6 +460,8 @@ pub struct EnsureToolBody {
     pub size: Option<TerminalSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adoption: Option<crate::session::LegacyToolAdoption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<NativePreparationIdentity>,
 }
 
 #[cfg(test)]
@@ -482,6 +526,20 @@ pub struct TerminalTarget {
     /// Source profile observed under the same lock.
     #[serde(default)]
     pub profile: String,
+    /// Physical pane and server observed by this preparation, independent of Status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<std::sync::Arc<crate::session::LegacyToolObservation>>,
+}
+
+/// A completed native input may stamp recency, but cannot wake or rewrite its row.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputRecencyBody {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -904,6 +962,8 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the

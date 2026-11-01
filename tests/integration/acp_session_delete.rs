@@ -78,7 +78,10 @@ async fn drive_handshake_and_capture_session_id(
             Ok(Some(evt)) => evt,
             Ok(None) | Err(_) => continue,
         };
-        if let Event::AcpSessionAssigned { acp_session_id: id } = &evt {
+        if let Event::AcpSessionAssigned {
+            acp_session_id: id, ..
+        } = &evt
+        {
             acp_session_id = Some(id.clone());
         }
         if matches!(evt, Event::Stopped { .. }) {

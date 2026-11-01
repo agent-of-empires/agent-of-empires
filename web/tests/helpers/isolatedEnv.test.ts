@@ -42,6 +42,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_PROJECT_FIFO_TEST_ENTERED: `${HOST}/fifo-test-entered`,
   AOE_PRIME_CENSUS_CHILD: "1",
   AOE_RUNNER_EXPIRY_CHILD: "host-test-child",
+  AOE_TEST_ACP_RUNNER_EXE: `${HOST}/host-aoe-runner`,
   AOE_TUI_TEST_CHILD: "host-test-child",
   AOE_TUI_TEST_ENTERED: `${HOST}/test-entered`,
   AOE_UDS_UMASK_TEST_CHILD: "1",
