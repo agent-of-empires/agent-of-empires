@@ -784,6 +784,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 path: owner.project_path.clone(),
                 profile: Some("default".into()),
                 scratch: false,
+                generated_worktree_branch: None,
+                create_new_branch: false,
             };
             let review = sdk.review_creation_trust(&request, &epoch).await.unwrap();
             let wire = serde_json::to_string(&review).unwrap();
@@ -801,7 +803,9 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
             )
             .unwrap();
             assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
-                Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. }) if body.is_empty()));
+                Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. })
+                    if !["secret-before-review", "secret-after-review", "secret-header"]
+                        .iter().any(|secret| body.contains(secret))));
             assert!(!app.join("trusted_repos.toml").exists());
             let repo = git2::Repository::open(&source).unwrap();
             assert!(repo
@@ -835,7 +839,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
             };
             let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
             assert!(
-                matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty())
+                matches!(&result, Err(DaemonClientError::Status { status, code: Some(ApiErrorCode::CreationCancelled), .. }) if *status == reqwest::StatusCode::CONFLICT),
+                "{result:?}"
             );
             result
         } else {
@@ -982,7 +987,13 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     };
     let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
     assert!(
-        matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty()),
+        matches!(
+            &result,
+            Err(DaemonClientError::Status {
+                code: Some(ApiErrorCode::CreationCancelled),
+                ..
+            })
+        ),
         "expected a cancelled creation, got {result:?}"
     );
 
@@ -2390,6 +2401,7 @@ fn migration_contention_does_not_block_runtime_publication() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows_path = app.join("profiles/default/sessions.json");
     let mut rows: Vec<serde_json::Value> =
@@ -2532,6 +2544,7 @@ exit 0
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows_path = app.join("profiles/default/sessions.json");
     let mut rows: Vec<serde_json::Value> =
@@ -2633,6 +2646,7 @@ fn read_only_terminal_view_does_not_create_shell() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(app.join("profiles/default/sessions.json")).unwrap())

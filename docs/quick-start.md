@@ -28,7 +28,22 @@ If startup or connection fails, the TUI shows the diagnostic and masks daemon-ow
 
 ## Your first session
 
-Press `n` and fill in the path to your project (or leave `.`), or run `aoe add /path/to/project`. The session appears in the dashboard as **Idle**. Select it and press `Enter` to attach; you are now inside a tmux session running the agent. `Ctrl+b d` detaches back to the TUI. If aoe itself runs inside tmux, attaching switches your client to the agent's session and `Ctrl+b L` switches back.
+Press `n` and fill in your project path (or leave `.`), or run `aoe add /path/to/project`.
+The CLI asks the Daemon to provision and save the session. A terminal-view session stays
+**Stopped** until you pass `--launch` or select it in the TUI and press `Enter`.
+`Ctrl+b d` detaches back to the TUI. Inside tmux, attaching switches your client to the
+agent's tmux session; `Ctrl+b L` switches back.
+
+`aoe add` starts a local Daemon when needed. Use `--no-autostart` to require one already
+running. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the selected
+Daemon, never locally if that connection fails. Pass an absolute path on that host,
+or `--scratch`; registered `--project` names and agent settings also come from that host.
+`--hook-env KEY` explicitly reads that client variable; no other client environment is sent.
+
+During creation, hook progress appears on stderr. `Ctrl+C` requests cancellation and waits
+for the Daemon's result. If the connection is lost, the CLI checks canonical state without
+resubmitting creation. An unknown result includes a request key: inspect the Daemon's
+session list before creating again.
 
 Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 

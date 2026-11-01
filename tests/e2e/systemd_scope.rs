@@ -243,10 +243,13 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
         env_var(&agent, "INVOCATION_ID"),
         env_var(&pane, "INVOCATION_ID")
     );
-    let listed = systemd_unit_in_list(&h, &id);
-    let listed = listed
-        .as_str()
-        .expect("a live scoped session exposes its expected namespace pattern");
+    let listed = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        let listed = systemd_unit_in_list(&h, &id);
+        listed
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("Daemon has not observed the running scope: {listed}"))
+    });
     assert!(
         cgroup.contains(listed.strip_suffix("*.scope").unwrap()),
         "listed {listed}, actual cgroup {cgroup}"

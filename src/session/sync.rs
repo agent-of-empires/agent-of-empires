@@ -591,11 +591,6 @@ fn drain_and_persist_session_ids_inner(
 /// ticks (`POLL_INITIAL_INTERVAL`) while keeping the foreground bounded.
 pub(crate) const CLI_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Bound for `aoe add --launch`, which drains only after `tmux attach`
-/// returns: the poller observed for the whole attached session, so the id is
-/// almost always already queued and this only covers a detach before tick 1.
-pub(crate) const CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// How often the bounded CLI capture re-drains the poller while waiting. Short
 /// enough to land the id promptly once the poller observes it, coarse enough
 /// not to busy-spin the storage flock between the poller's ~2s ticks.

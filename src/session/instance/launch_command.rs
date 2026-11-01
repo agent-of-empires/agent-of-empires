@@ -1033,6 +1033,15 @@ impl Instance {
         prepared: PreparedLaunch,
         publication: Option<PrimeRootPublication>,
     ) -> Result<PreparedLaunch> {
+        if publication.is_none()
+            && prepared
+                .execution
+                .as_ref()
+                .and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()))
+                .is_none()
+        {
+            return Ok(prepared);
+        }
         // Preserve the already adopted child across the second preparation.
         if !prepared.is_existing && self.stored_fork_child().is_none() {
             self.set_agent_conversation(

@@ -66,6 +66,7 @@ pub(crate) struct StructuredSessionSpec {
     pub fork_seed: Option<crate::session::ForkSeed>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
+    pub cli: Option<crate::daemon::CliCreationOptions>,
 }
 
 /// Created session and transient warnings; HTTP row authority is the runtime snapshot.
@@ -73,6 +74,10 @@ pub(crate) struct SpawnOutcome {
     pub instance: Instance,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CliDuplicateSession(anyhow::Error);
 
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
@@ -152,6 +157,7 @@ pub(crate) async fn spawn_structured_session(
             import_binding,
             fork_seed,
             progress,
+            cli,
         } = spec;
 
 
@@ -190,6 +196,14 @@ pub(crate) async fn spawn_structured_session(
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
 
+        let sandbox_readiness = if cli.is_some()
+            && view == crate::session::View::Terminal
+            && hook_plan.on_create().is_empty()
+        {
+            builder::SandboxReadiness::InstalledOnly
+        } else {
+            builder::SandboxReadiness::RequireRunning
+        };
         let params = InstanceParams {
             title,
             title_typed,
@@ -227,6 +241,10 @@ pub(crate) async fn spawn_structured_session(
             },
             scratch,
             fork_seed,
+            generated_name: cli.as_ref().is_some_and(|options| options.generated_name),
+            no_submodules: cli.as_ref().is_some_and(|options| options.no_submodules),
+            tie_workdir_to_name: cli.is_some(),
+            worktree_path_id: cli.as_ref().and_then(|options| options.worktree_path_id.clone()),
         };
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
@@ -247,9 +265,22 @@ pub(crate) async fn spawn_structured_session(
         };
         let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
-        let mut plan = builder::plan_instance(params, &title_refs, &branch_refs, &profile)?;
+        let mut plan = builder::plan_instance(
+            params,
+            sandbox_readiness,
+            &title_refs,
+            &branch_refs,
+            &profile,
+        )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
+            let rows = worker_state.instances.blocking_read();
+            let parent = super::api::sessions::resolve_cli_session(&rows, &profile, parent)?;
+            anyhow::ensure!(parent.parent_session_id.is_none(), "Cannot create a sub-session of a sub-session");
+            instance.parent_session_id = Some(parent.id.clone());
+            instance.group_path = parent.group_path.clone();
+        }
         instance.file_watch = Some(worker_state.file_watch.clone());
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
@@ -324,6 +355,9 @@ pub(crate) async fn spawn_structured_session(
             instance.status = Status::Creating;
             store.update(|rows, groups| {
                 anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
+                if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
+                    return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
+                }
                 rows.push(instance.clone());
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
                 Ok(())
@@ -342,9 +376,10 @@ pub(crate) async fn spawn_structured_session(
             }
         };
         let mut instance = build_result.instance;
-        let build_warnings = build_result.warnings;
+        let mut build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let mut validation_error = None;
         let agent_effort = if provision_error.is_none() {
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
@@ -384,6 +419,36 @@ pub(crate) async fn spawn_structured_session(
                 );
             instance.agent_model = resolved_model;
             instance.acp_effort = explicit_effort;
+            if cli.is_some() && instance.is_structured() {
+                use crate::session::builder::structured::{
+                    preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                    StructuredChoiceError,
+                };
+                let choice = StructuredChoice {
+                    tool: &instance.tool,
+                    agent_name: instance.agent_name.as_deref(),
+                    command_override: &instance.command,
+                    sandboxed: instance.is_sandboxed(),
+                    project_path: Some(std::path::Path::new(&instance.project_path)),
+                    preparation_hooks: &|| preparation_hooks_apply(
+                        &config.hooks,
+                        std::path::Path::new(&original_path),
+                        scratch,
+                        trust_hooks,
+                    ),
+                };
+                if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
+                    if matches!(error, StructuredChoiceError::NotCapable(_))
+                        || instance.agent_name.is_some()
+                        || instance.acp_effort.is_some()
+                    {
+                        validation_error = Some(anyhow::Error::new(error));
+                    } else {
+                        build_warnings.push(format!("{error}; using terminal view"));
+                        instance.view = crate::session::View::Terminal;
+                    }
+                }
+            }
             // Don't trust the client's capability decision.
             if instance.is_structured() {
                 let resolved = instance
@@ -522,7 +587,7 @@ pub(crate) async fn spawn_structured_session(
             rollback(native, instance, provisioning_failed);
             return Err(error);
         }
-        let creation = match provision_error {
+        let creation = match provision_error.or(validation_error) {
             Some(error) => Err(error),
             None => creation_guard
                 .check()
@@ -560,6 +625,30 @@ pub(crate) async fn spawn_structured_session(
         if let Err(error) = creation {
             rollback(native, instance, provisioning_failed);
             return Err(error);
+        }
+
+        if cli.is_some() && !instance.is_structured() {
+            if let Err(error) = creation_guard.commit() {
+                rollback(native, instance, false);
+                return Err(error.into());
+            }
+            let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+            let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let _guard = lock.blocking_lock();
+            store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    crate::session::LifecycleReservationError::Superseded);
+                row.sandbox_info = instance.sandbox_info.clone();
+                row.status = Status::Stopped;
+                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+                instance = row.clone();
+                Ok(())
+            })?;
+            native.adopt_runtime_fields(&instance)?;
+            crate::tips::record_session_creations(1);
+            return Ok((instance, build_warnings, agent_effort, native, creation_profile, None));
         }
 
         if let Some(progress) = progress.as_deref() {
@@ -665,16 +754,6 @@ pub(crate) async fn spawn_structured_session(
         }
 
         crate::tips::record_session_creations(1);
-        tracing::info!(
-            target: "session.create",
-            session = %instance.id,
-            title = %instance.title,
-            tool = %instance.tool,
-            view = if instance.is_structured() { "structured" } else { "terminal" },
-            project_path = %instance.project_path,
-            branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
-            "session created"
-        );
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
@@ -688,6 +767,16 @@ pub(crate) async fn spawn_structured_session(
 
     match result {
         Ok(Ok((instance, warnings, agent_effort, native, creation_profile, acp_reservation))) => {
+            tracing::info!(
+                target: "session.create",
+                session = %instance.id,
+                title = %instance.title,
+                tool = %instance.tool,
+                view = if instance.is_structured() { "structured" } else { "terminal" },
+                project_path = %instance.project_path,
+                branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+                "session created"
+            );
             let native = Arc::new(native);
             let acp_spawn_target = if instance.is_structured() && acp_reservation.is_some() {
                 Some((
@@ -1065,6 +1154,7 @@ mod tests {
             import_binding: None,
             fork_seed: None,
             progress: None,
+            cli: None,
         };
         let result = spawn_structured_session(&state.session_service, spec).await;
         assert!(

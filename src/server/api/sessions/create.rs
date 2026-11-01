@@ -127,7 +127,7 @@ pub(super) fn create_body_has_conflicting_sources(body: &CreateSessionBody) -> b
         == 2
 }
 
-async fn resolve_canonical_fork_seed(
+pub(super) async fn resolve_canonical_fork_seed(
     state: &Arc<AppState>,
     body: &CreateSessionBody,
     source_id: &str,
@@ -138,6 +138,82 @@ async fn resolve_canonical_fork_seed(
     }
     let lock = state.instance_lock(source_id).await;
     let _guard = lock.lock().await;
+    if body.cli.is_some() {
+        let (profile, identity) = {
+            let instances = state.instances.read().await;
+            let source = instances
+                .iter()
+                .find(|row| row.id == source_id)
+                .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+            let cache = state
+                .runtime_read_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let identity = cache
+                .inventory
+                .iter()
+                .find(|profile| profile.name == source.source_profile)
+                .map(|profile| profile.identity)
+                .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+            (source.source_profile.clone(), identity)
+        };
+        let worker_state = state.clone();
+        let source_id = source_id.to_owned();
+        let requested_path = body.path.clone();
+        let (source, _lifecycle, same_project) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                use crate::session::SessionStore;
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    worker_state,
+                    &profile,
+                    None,
+                )
+                .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+                identity
+                    .verify_storage(native.storage())
+                    .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+                let lifecycle = native
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&source_id)
+                    .map_err(|error| error.context(crate::session::NativeStoreUnavailable))?;
+                let mut source = native
+                    .load()?
+                    .into_iter()
+                    .find(|row| row.id == source_id)
+                    .ok_or(crate::session::SessionGone)?;
+                source.source_profile = profile;
+                let same_project = std::fs::canonicalize(&source.project_path)?
+                    == std::fs::canonicalize(requested_path)?;
+                Ok((source, lifecycle, same_project))
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+            .map_err(|error| {
+                super::lifecycle::lifecycle_rejection(state, &error)
+                    .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
+            })?;
+        if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+            return Err((
+                StatusCode::CONFLICT,
+                crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            )
+                .into_response());
+        }
+        if source.effective_profile() != body.profile.as_deref().unwrap_or(&state.served_profile())
+            || !same_project
+        {
+            return Err(StatusCode::CONFLICT.into_response());
+        }
+        if body.view != crate::session::View::Terminal {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+        return crate::session::fork::terminal_fork_seed(
+            source.fork_parent_ref().ok().flatten(),
+            crate::session::capture::generate_session_uuid(),
+            source.is_sandboxed(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST.into_response());
+    }
     let instances = state.instances.read().await;
     let source = instances
         .iter()
@@ -362,6 +438,13 @@ pub async fn review_creation_trust(
         Some(profile) => profile,
         None => state.served_profile().to_string(),
     };
+    let titles: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .map(|row| row.title.clone())
+        .collect();
     let result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<crate::daemon::CreationTrustReview> {
             use crate::session::config::repo_config::{self, TrustSurface};
@@ -390,6 +473,27 @@ pub async fn review_creation_trust(
                     .collect(),
                 TrustSurface::Absent => Vec::new(),
             };
+            let (suggested_title, worktree_path_id) =
+                if let Some(branch) = body.generated_worktree_branch {
+                    anyhow::ensure!(
+                        !body.scratch && !branch.trim().is_empty(),
+                        "Generated title needs a worktree branch"
+                    );
+                    let config = repo_config::resolve_config_with_repo(&profile, path)?;
+                    let token = uuid::Uuid::new_v4().to_string();
+                    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                    let title = crate::session::builder::generated_worktree_title(
+                        path,
+                        &branch,
+                        body.create_new_branch,
+                        &config,
+                        &refs,
+                        &token[..8],
+                    )?;
+                    (Some(title), Some(token))
+                } else {
+                    (None, None)
+                };
             Ok(crate::daemon::CreationTrustReview {
                 fingerprint,
                 merged_hooks: repo_config::apply_repo_hook_overrides(base, &repo_hooks),
@@ -397,6 +501,8 @@ pub async fn review_creation_trust(
                 mcp_summaries,
                 hooks_need_trust,
                 mcp_need_trust,
+                suggested_title,
+                worktree_path_id,
             })
         },
     )
@@ -673,7 +779,7 @@ pub async fn create_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
@@ -707,22 +813,21 @@ pub async fn create_session(
         };
         if let Some((id, unfinished)) = existing {
             if unfinished {
-                return api_error(StatusCode::CONFLICT, "create_outcome_unknown",
+                return crate::server::api::api_error_with_code_header(crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
                     "The prior creation is not finalized. Check its outcome before launching it again.");
             }
             return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
         if let Some(failure) = state.create_progress.recent_failure(key) {
-            return api_error(failure.status, failure.code, failure.message);
+            return create_failure_response(failure);
         }
         if body
             .retry_origin
             .as_deref()
             .is_some_and(|origin| origin != state.create_progress.boot_id())
         {
-            return api_error(
-                StatusCode::CONFLICT,
-                "create_outcome_unknown",
+            return crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
                 "The server restarted before confirming this session, so whether it was created is unknown. Check the session list before launching it again.",
             );
         }
@@ -741,6 +846,30 @@ pub async fn create_session(
     };
     let namespace = state.profile_namespace.read().await;
     let default_profile = state.served_profile().to_string();
+    let (mut body, cli_warnings) = match super::cli_create::resolve_cli_creation(
+        &state,
+        body,
+        &default_profile,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) if error.is::<crate::server::session_spawn::SessionBuildPanicked>() => {
+            tracing::error!(target: "http.api.sessions", %error, "CLI creation resolution failed");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            );
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                error.to_string(),
+            )
+        }
+    };
 
     if state.cityhall_mode {
         // CityHall derives execution and outbound effects from operator policy.
@@ -846,10 +975,23 @@ pub async fn create_session(
         );
     }
 
-    // Validate user inputs for shell injection. `path` is server-provisioned
-    // for scratch sessions, so skip it there.
-    let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
-    if !body.scratch {
+    // CLI arguments are parsed and shell-quoted on the Daemon; other callers retain their gate.
+    let mut shell_checks: Vec<(&str, &str)> = Vec::new();
+    if body.cli.is_some() {
+        body.extra_args = match shell_words::split(&body.extra_args) {
+            Ok(args) => shell_words::join(args),
+            Err(error) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_failed",
+                    error.to_string(),
+                )
+            }
+        };
+    } else {
+        shell_checks.push((body.extra_args.as_str(), "extra_args"));
+    }
+    if !body.scratch && body.cli.is_none() {
         shell_checks.push((body.path.as_str(), "path"));
     }
     if let Err(msg) = super::validate_shell_fields(&shell_checks) {
@@ -1185,6 +1327,7 @@ pub async fn create_session(
         created_by_plugin: None,
         plugin_create_idempotency: None,
         pending_initial_turn: None,
+        cli: body.cli,
         acp_mode_id: None,
         view: body.view,
         agent_name: body.agent_name,
@@ -1230,8 +1373,9 @@ pub async fn create_session(
             if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
                 let _ = wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await;
             }
-            created_session_response(&state, &instance.id, outcome.warnings, StatusCode::CREATED)
-                .await
+            let mut warnings = outcome.warnings;
+            warnings.extend(cli_warnings);
+            created_session_response(&state, &instance.id, warnings, StatusCode::CREATED).await
         }
         Err(e) => {
             // A failed creation can still have committed and rolled back
@@ -1287,8 +1431,19 @@ pub async fn create_session(
                 return response;
             }
             let failure = create_failure(&e).expect("hooks_need_trust returned above");
-            api_error(failure.status, failure.code, failure.message)
+            create_failure_response(failure)
         }
+    }
+}
+
+fn create_failure_response(
+    failure: crate::server::create_progress::CreateFailure,
+) -> axum::response::Response {
+    let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
+    if failure.code == code.as_str() {
+        crate::server::api::api_error_with_code_header(code, failure.message)
+    } else {
+        api_error(failure.status, failure.code, failure.message)
     }
 }
 
@@ -1296,6 +1451,24 @@ pub async fn create_session(
 /// caller resubmits with the same key.
 fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
     use crate::server::create_progress::CreateFailure;
+    if let Some(refusal) = e.downcast_ref::<crate::session::HostHookApprovalRequired>() {
+        let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
+        return Some(CreateFailure {
+            status: code.status(),
+            code: code.as_str(),
+            message: refusal.to_string(),
+        });
+    }
+    if let Some(
+        refusal @ crate::session::builder::structured::StructuredChoiceError::AdapterMissing(_),
+    ) = e.downcast_ref::<crate::session::builder::structured::StructuredChoiceError>()
+    {
+        return Some(CreateFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "acp_adapter_missing",
+            message: refusal.to_string(),
+        });
+    }
     // A refusal the caller corrects and resends under the same idempotency key must not
     // be frozen into the replay map: recording it would make every later attempt on that
     // key short-circuit on the first refusal for a whole FAILURE_TTL. `HooksNeedTrust` is
@@ -1390,16 +1563,12 @@ async fn created_session_response(
     crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
-/// Pick the client-facing message for a failed session creation.
-///
-/// The full error is always logged server-side; this only governs what
-/// reaches the browser. We whitelist the well-typed `GitError` variants
-/// that carry a clear, actionable, credential-free message (a branch name
-/// or a worktree path the user chose) and let everything else fall back to
-/// the generic string. This keeps raw git stderr, libgit2 internals, IO
-/// paths, and arbitrary `bail!` strings off the wire even though the
-/// duplicate-worktree case now surfaces its real message.
+/// Expose typed title/path collisions and actionable Git errors.
+/// Raw command output, internal paths and arbitrary errors stay in the Daemon log.
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
+    if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
+        return duplicate.to_string();
+    }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
             GitError::WorktreeAlreadyExists(_)

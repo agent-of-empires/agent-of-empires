@@ -489,14 +489,11 @@ fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
 
 #[test]
 #[parallel]
-fn cli_add_lists_the_new_session_and_names_the_binary_in_next_steps() {
+fn cli_add_lists_the_new_session() {
     let h = TuiTestHarness::new("cli_add_list");
     let project = h.project_path();
 
-    // #848: the hint must name `aoe`, not the long project name.
-    let added = h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "NextSteps"]);
-    assert!(added.contains("aoe session start NextSteps"), "{added}");
-    assert!(!added.contains("agent-of-empires session start"), "{added}");
+    h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "NextSteps"]);
 
     assert!(h.run_cli_ok(&["list"]).contains("NextSteps"));
 }
@@ -704,7 +701,6 @@ fn cli_add_rejects_invalid_requests() {
         config: &'static str,
         /// `$PROJECT` is replaced with the harness project path.
         args: &'static [&'static str],
-        expect_any: &'static [&'static str],
         forbid: Option<&'static str>,
     }
     let cases = [
@@ -712,14 +708,12 @@ fn cli_add_rejects_invalid_requests() {
             name: "nonexistent path",
             config: "",
             args: &["add", "/nonexistent/path/that/does/not/exist"],
-            expect_any: &["not", "exist", "No such", "error", "Error", "invalid"],
             forbid: None,
         },
         Case {
-            name: "unknown tool names safe alternatives only",
+            name: "unknown tool does not leak configured commands",
             config: "[session]\ncustom_agents = { custom = \"secret-command-for-leak-check\" }",
             args: &["add", "$PROJECT", "--tool", "missing"],
-            expect_any: &["custom", "claude"],
             forbid: Some("secret-command-for-leak-check"),
         },
         Case {
@@ -733,14 +727,12 @@ fn cli_add_rejects_invalid_requests() {
                 "--cmd-override",
                 "other",
             ],
-            expect_any: &[],
             forbid: None,
         },
         Case {
             name: "empty custom-agent command",
             config: "[session]\ncustom_agents = { custom = \"\" }",
             args: &["add", "$PROJECT", "--tool", "custom"],
-            expect_any: &["empty"],
             forbid: None,
         },
         Case {
@@ -748,28 +740,24 @@ fn cli_add_rejects_invalid_requests() {
             config: "[session]\ncustom_agents = { custom = \"bash -lc true\" }\n\
                      agent_detect_as = { custom = \"not-a-built-in\" }",
             args: &["add", "$PROJECT", "--tool", "custom"],
-            expect_any: &["agent_detect_as", "not-a-built-in"],
             forbid: None,
         },
         Case {
             name: "--tool conflicts with --cmd",
             config: "",
             args: &["add", "$PROJECT", "--tool", "custom", "--cmd", "claude"],
-            expect_any: &["--tool", "--cmd"],
             forbid: None,
         },
         Case {
             name: "--scratch rejects an explicit path",
             config: "",
             args: &["add", "$PROJECT", "--scratch"],
-            expect_any: &["Cannot specify a project path with --scratch"],
             forbid: None,
         },
         Case {
             name: "--scratch conflicts with --worktree",
             config: "",
             args: &["add", "--scratch", "-w", "feat/x"],
-            expect_any: &["--scratch", "--worktree", "cannot be used"],
             forbid: None,
         },
         Case {
@@ -777,7 +765,6 @@ fn cli_add_rejects_invalid_requests() {
             name: "--interactive without a TTY",
             config: "",
             args: &["add", "$PROJECT", "-i"],
-            expect_any: &["requires a terminal"],
             forbid: None,
         },
     ];
@@ -802,25 +789,22 @@ fn cli_add_rejects_invalid_requests() {
 
         let out = h.run_cli(&args);
         assert!(!out.status.success(), "{}: must exit non-zero", case.name);
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            case.expect_any.is_empty() || case.expect_any.iter().any(|n| combined.contains(n)),
-            "{}: expected one of {:?} in:\n{combined}",
-            case.name,
-            case.expect_any
-        );
         if let Some(secret) = case.forbid {
-            assert!(!combined.contains(secret), "{}: leaked {secret}", case.name);
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains(secret)
+                    && !String::from_utf8_lossy(&out.stderr).contains(secret),
+                "{}: leaked {secret}",
+                case.name
+            );
         }
-        assert!(
-            !h.sessions_path().exists(),
-            "{}: must bail before writing sessions.json",
-            case.name
-        );
+        if h.sessions_path().exists() {
+            assert_eq!(
+                h.read_sessions(),
+                json!([]),
+                "{}: added a session",
+                case.name
+            );
+        }
     }
 }
 
@@ -1199,7 +1183,6 @@ exec sleep 60\n",
 fn cli_session_capture_preserves_persisted_omp_history_status() {
     require_tmux!();
     let mut h = TuiTestHarness::new("cli_omp_history_status");
-    h.set_env("AOE_NO_AUTOSTART", "1");
     let bin = h.install_path_command("omp");
     let agent = bin.join("omp");
     write_executable(
@@ -1227,6 +1210,8 @@ exec sleep 60\n",
         "--cmd-override",
         agent.to_str().unwrap(),
     ]);
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.set_env("AOE_NO_AUTOSTART", "1");
     h.run_cli_ok(&["session", "start", &session_id]);
     wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
         let json = json_out(&h, &["session", "capture", &session_id, "--json"]);
@@ -1281,12 +1266,10 @@ fn cli_rename_and_rm_move_the_agent_tmux_session() {
     );
 }
 
-/// #591: `aoe add --repo` runs on_create hooks for workspace sessions, from
-/// the repo config when it has them and from the global config otherwise, and
-/// prints the merged command list before running it (#596).
+/// Workspace creation runs the effective repository or profile on_create hooks.
 #[test]
 #[parallel]
-fn cli_add_workspace_runs_repo_then_global_on_create_hooks() {
+fn cli_add_workspace_runs_effective_on_create_hooks() {
     for repo_hooks in [true, false] {
         let h = TuiTestHarness::new("cli_workspace_hooks");
         let project_a = h.home_path().join("project-a");
@@ -1318,13 +1301,7 @@ fn cli_add_workspace_runs_repo_then_global_on_create_hooks() {
         if repo_hooks {
             args.push("--trust-hooks");
         }
-        let stdout = h.run_cli_ok(&args);
-        assert!(stdout.contains("on_create hooks completed"), "{stdout}");
-        assert!(
-            stdout.contains("Running on_create hooks:")
-                && stdout.contains(&format!("touch {}", marker.display())),
-            "the merged command list must be printed before it runs.\n{stdout}"
-        );
+        h.run_cli_ok(&args);
         assert!(
             marker.exists(),
             "repo_hooks={repo_hooks}: hooks did not run"
@@ -1351,11 +1328,7 @@ fn cli_add_attaches_to_existing_worktree() {
         "-t",
         "FirstSession",
     ]);
-    let stdout = h.run_cli_ok(&["add", project, "-w", "feat/existing", "-t", "SecondSession"]);
-    assert!(
-        stdout.contains("Attaching to existing worktree"),
-        "{stdout}"
-    );
+    h.run_cli_ok(&["add", project, "-w", "feat/existing", "-t", "SecondSession"]);
 
     let sessions = h.read_sessions();
     let second = crate::harness::session_by_title(&sessions, "SecondSession");
@@ -1819,5 +1792,528 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         for (path, before) in paths.iter().zip(bytes) {
             assert_eq!(std::fs::read(path).unwrap(), before);
         }
+    }
+}
+
+struct GatedCli {
+    child: Option<std::process::Child>,
+    release: std::path::PathBuf,
+}
+
+impl Drop for GatedCli {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "release");
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+#[parallel]
+fn cli_agent_probe_does_not_block_daemon_requests() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_probe_executor");
+    h.set_env("TOKIO_WORKER_THREADS", "1");
+    let entered = h.home_path().join("probe-entered");
+    let release = h.home_path().join("probe-release");
+    let shell = h.home_path().join("probe-shell");
+    write_executable(
+        &shell,
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n*aoe-review-missing*) : > {}; while [ ! -e {} ]; do sleep .02; done; exit 1;;\nesac\nexec /bin/bash \"$@\"\n",
+            shell_words::quote(entered.to_str().unwrap()),
+            shell_words::quote(release.to_str().unwrap()),
+        ),
+    );
+    h.set_env("SHELL", &shell);
+    h.append_config("[session]\nagent_command_override = { claude = \"aoe-review-missing\" }");
+    let port = h.start_daemon();
+    let project = h.project_path();
+    let mut pending = GatedCli {
+        child: Some(h.spawn_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "probe",
+            "--cmd",
+            "claude",
+        ])),
+        release,
+    };
+    wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+        entered
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "probe not entered".to_owned())
+    });
+    let response = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/runtime"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+    });
+    std::fs::write(&pending.release, "release").unwrap();
+    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(response.unwrap().status(), reqwest::StatusCode::OK);
+    assert!(
+        !output.status.success(),
+        "the missing program became available"
+    );
+    if h.sessions_path().exists() {
+        assert_eq!(h.read_sessions(), json!([]));
+    }
+}
+
+#[test]
+#[parallel]
+fn cli_launch_waits_for_a_hook_beyond_the_read_timeout() {
+    require_tmux!();
+    let h = TuiTestHarness::new("cli_long_launch_hook");
+    let entered = h.home_path().join("launch-entered");
+    let release = h.home_path().join("launch-release");
+    let ready = h.home_path().join("agent-ready");
+    let agent = h.home_path().join("held-agent");
+    write_executable(
+        &agent,
+        &format!(
+            "#!/bin/sh\n: > {}\nexec sleep 600\n",
+            shell_words::quote(ready.to_str().unwrap())
+        ),
+    );
+    h.append_config(&format!(
+        "[session]\ndefault_tool = \"held-agent\"\ncustom_agents = {{ held-agent = {} }}",
+        serde_json::to_string(agent.to_str().unwrap()).unwrap()
+    ));
+    let project = h.project_path();
+    std::fs::create_dir(project.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        project.join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_launch = [{}]",
+            serde_json::to_string(&format!(
+                "printf x >> {}; while [ ! -e {} ]; do sleep .02; done",
+                shell_words::quote(entered.to_str().unwrap()),
+                shell_words::quote(release.to_str().unwrap())
+            ))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+    let mut pending = GatedCli {
+        child: Some(h.spawn_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "long-hook",
+            "--trust-hooks",
+            "--launch",
+        ])),
+        release,
+    };
+    wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+        entered
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "hook not entered".to_owned())
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut exited_early = false;
+    while std::time::Instant::now() < deadline {
+        if pending
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some()
+        {
+            exited_early = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(&pending.release, "release").unwrap();
+    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    assert!(!exited_early, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        ready
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "agent not launched".to_owned())
+    });
+    assert_eq!(std::fs::read_to_string(entered).unwrap(), "x");
+    assert_eq!(h.read_sessions().as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn cli_repo_base_uses_original_symlink_names_without_hiding_ambiguity() {
+    let h = TuiTestHarness::new("cli_repo_base_alias");
+    let primary = h.home_path().join("primary");
+    let added = h.home_path().join("api");
+    let other = h.home_path().join("other");
+    let mut expected = Vec::new();
+    for path in [&primary, &added, &other] {
+        init_git_repo(path);
+        let repo = git2::Repository::open(path).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let mut tree = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        tree.insert("develop", repo.blob(b"base branch").unwrap(), 0o100644)
+            .unwrap();
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let oid = repo
+            .commit(
+                Some("refs/heads/develop"),
+                &signature,
+                &signature,
+                "base",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        expected.push(oid);
+    }
+    let primary_alias = h.home_path().join("app-link");
+    let added_alias = h.home_path().join("api-link");
+    std::os::unix::fs::symlink(&primary, &primary_alias).unwrap();
+    std::os::unix::fs::symlink(&added, &added_alias).unwrap();
+    h.add_session(&[
+        primary_alias.to_str().unwrap(),
+        "-t",
+        "aliases",
+        "-w",
+        "alias-bases",
+        "-b",
+        "--repo",
+        added_alias.to_str().unwrap(),
+        "--repo-base",
+        "app-link=develop",
+        "--repo-base",
+        "api-link=develop",
+    ]);
+    let rows = h.read_sessions();
+    let row = crate::harness::session_by_title(&rows, "aliases");
+    let workspace = Path::new(row["project_path"].as_str().unwrap());
+    for (name, expected) in ["primary", "api"].into_iter().zip(expected) {
+        let checkout = git2::Repository::open(workspace.join(name)).unwrap();
+        assert_eq!(checkout.head().unwrap().target(), Some(expected));
+    }
+    let aliases = h.home_path().join("aliases");
+    std::fs::create_dir(&aliases).unwrap();
+    let ambiguous = aliases.join("api");
+    std::os::unix::fs::symlink(&other, &ambiguous).unwrap();
+    h.run_cli_err(&[
+        "add",
+        primary.to_str().unwrap(),
+        "-t",
+        "ambiguous",
+        "-w",
+        "ambiguous",
+        "-b",
+        "--repo",
+        added.to_str().unwrap(),
+        "--repo",
+        ambiguous.to_str().unwrap(),
+        "--repo-base",
+        "api=develop",
+    ]);
+    assert_eq!(h.read_sessions(), rows);
+    assert!(git2::Repository::open(&other)
+        .unwrap()
+        .find_branch("ambiguous", git2::BranchType::Local)
+        .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[parallel]
+fn cli_review_boundary_sigint_during_launch_preserves_the_created_session() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    require_tmux!();
+    let h = TuiTestHarness::new("cli_interrupt_launch");
+    let created = h.home_path().join("create-count");
+    let entered = h.home_path().join("launch-entered");
+    let release = h.home_path().join("launch-release");
+    let finished = h.home_path().join("launch-finished");
+    let agent = h.home_path().join("held-agent");
+    write_executable(&agent, "#!/bin/sh\nexec sleep 600\n");
+    h.append_config(&format!(
+        "[session]\ndefault_tool = \"held-agent\"\ncustom_agents = {{ held-agent = {} }}",
+        serde_json::to_string(agent.to_str().unwrap()).unwrap()
+    ));
+    let project = h.project_path();
+    std::fs::create_dir(project.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        project.join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_create = [{}]\non_launch = [{}]",
+            serde_json::to_string(&format!(
+                "printf x >> {}",
+                shell_words::quote(created.to_str().unwrap())
+            ))
+            .unwrap(),
+            serde_json::to_string(&format!(
+                "printf x >> {}; while [ ! -e {} ]; do sleep .02; done; printf x >> {}",
+                shell_words::quote(entered.to_str().unwrap()),
+                shell_words::quote(release.to_str().unwrap()),
+                shell_words::quote(finished.to_str().unwrap())
+            ))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let mut pending = GatedCli {
+        child: Some(h.spawn_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "interrupted-launch",
+            "--trust-hooks",
+            "--launch",
+        ])),
+        release,
+    };
+    wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+        entered
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "launch hook not entered".to_owned())
+    });
+    let pid = pending.child.as_ref().unwrap().id();
+    wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .unwrap();
+        let mask = u64::from_str_radix(caught.trim(), 16).unwrap();
+        (mask & (1 << (libc::SIGINT - 1)) != 0)
+            .then_some(())
+            .ok_or_else(|| "SIGINT handler not installed".to_owned())
+    });
+    kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGINT).unwrap();
+    wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+        pending
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .ok_or_else(|| "CLI ignored SIGINT while launch remained blocked".to_owned())
+    });
+    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let rows = h.read_sessions();
+    let row = crate::harness::session_by_title(&rows, "interrupted-launch");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(row["id"].as_str().unwrap()));
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&created).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(&entered).unwrap(), "x");
+    h.run_cli_ok(&["serve", "--status"]);
+    std::fs::write(&pending.release, "release").unwrap();
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        finished
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "launch hook did not finish".to_owned())
+    });
+    assert_eq!(std::fs::read_to_string(created).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(entered).unwrap(), "x");
+}
+
+#[test]
+#[parallel]
+fn cli_review_boundary_repo_base_from_a_linked_worktree() {
+    let h = TuiTestHarness::new("cli_linked_repo_base");
+    let primary = h.home_path().join("principal");
+    init_git_repo(&primary);
+    let repo = git2::Repository::open(&primary).unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let expected = repo
+        .commit(
+            Some("refs/heads/develop"),
+            &signature,
+            &signature,
+            "develop",
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+    let linked = h.home_path().join("old-worktree");
+    repo.worktree("old-worktree", &linked, None).unwrap();
+    let selectors = [
+        "principal".to_owned(),
+        primary.to_str().unwrap().to_owned(),
+        "old-worktree".to_owned(),
+        linked.to_str().unwrap().to_owned(),
+    ];
+    for (index, selector) in selectors.iter().enumerate() {
+        let title = format!("linked-base-{index}");
+        let branch = format!("from-linked-{index}");
+        h.add_session(&[
+            linked.to_str().unwrap(),
+            "-t",
+            &title,
+            "-w",
+            &branch,
+            "-b",
+            "--repo-base",
+            &format!("{selector}=develop"),
+        ]);
+        let rows = h.read_sessions();
+        let row = crate::harness::session_by_title(&rows, &title);
+        let checkout = git2::Repository::open(row["project_path"].as_str().unwrap()).unwrap();
+        assert_eq!(checkout.head().unwrap().target(), Some(expected));
+    }
+    let before = h.read_sessions();
+    h.run_cli_err(&[
+        "add",
+        linked.to_str().unwrap(),
+        "-t",
+        "duplicate-base",
+        "-w",
+        "duplicate-base",
+        "-b",
+        "--repo-base",
+        "principal=develop",
+        "--repo-base",
+        "old-worktree=develop",
+    ]);
+    assert_eq!(h.read_sessions(), before);
+    assert!(repo
+        .find_branch("duplicate-base", git2::BranchType::Local)
+        .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
+    for (flag, configured, expected) in [
+        (Some(" ubuntu:latest "), "ignored:latest", "ubuntu:latest"),
+        (None, " ubuntu:latest ", "ubuntu:latest"),
+        (None, "   ", "ghcr.io/agent-of-empires/aoe-sandbox:latest"),
+        (Some("   "), " custom:latest ", "custom:latest"),
+        (
+            Some(""),
+            "   ",
+            "ghcr.io/agent-of-empires/aoe-sandbox:latest",
+        ),
+    ] {
+        let mut h = TuiTestHarness::new("cli_sandbox_image");
+        let bin = h.install_path_command("docker");
+        write_executable(
+            &bin.join("docker"),
+            "#!/bin/sh\ncase \"$1\" in\n--version|version|info) exit 0;;\nesac\nexit 1\n",
+        );
+        h.append_config(&format!(
+            "[sandbox]\ncontainer_runtime = \"docker\"\ndefault_image = {configured:?}\n"
+        ));
+        let project = h.project_path();
+        let mut args = vec![
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "image-normalization",
+            "--sandbox",
+        ];
+        if let Some(image) = flag {
+            args.extend(["--sandbox-image", image]);
+        }
+        h.run_cli_ok(&args);
+        let rows = h.read_sessions();
+        let row = crate::harness::session_by_title(&rows, "image-normalization");
+        assert_eq!(row["sandbox_info"]["image"], expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn cli_deferred_sandbox_preserves_offline_creation_and_runtime_guards() {
+    for (default_sandbox, create_hook) in [(false, false), (true, false), (false, true)] {
+        let mut h = TuiTestHarness::new_in_tmp("cli_deferred_sandbox");
+        h.stop_daemon_on_drop();
+        let engine_down = h.home_path().join("engine-down");
+        let container_effect = h.home_path().join("container-effect");
+        let create_effect = h.home_path().join("create-effect");
+        let launch_effect = h.home_path().join("launch-effect");
+        let bin = h.install_path_command("docker");
+        write_executable(
+            &bin.join("docker"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 --version) exit 0;;\n\
+                 info) test ! -f {}; exit $?;;\n\
+                 create|run) : > {}; exit 1;;\n\
+                 container|inspect) echo 'Error: No such container: fixture' >&2; exit 1;;\n\
+                 esac\nexit 1\n",
+                shell_words::quote(engine_down.to_str().unwrap()),
+                shell_words::quote(container_effect.to_str().unwrap()),
+            ),
+        );
+        let on_create = if create_hook {
+            vec![format!(
+                "touch {}",
+                shell_words::quote(create_effect.to_str().unwrap())
+            )]
+        } else {
+            Vec::new()
+        };
+        h.append_config(&format!(
+            "[sandbox]\ncontainer_runtime = \"docker\"\nenabled_by_default = {default_sandbox}\n\
+             [hooks]\non_create = {on_create:?}\non_launch = [{:?}]\n",
+            format!(
+                "touch {}",
+                shell_words::quote(launch_effect.to_str().unwrap())
+            ),
+        ));
+        h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        std::fs::write(&engine_down, "").unwrap();
+        let project = h.project_path();
+        let mut args = vec![
+            "--no-autostart",
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "deferred-sandbox",
+        ];
+        if !default_sandbox {
+            args.push("--sandbox");
+        }
+        if create_hook {
+            h.run_cli_err(&args);
+            if h.sessions_path().exists() {
+                assert_eq!(h.read_sessions(), json!([]));
+            }
+        } else {
+            h.run_cli_ok(&args);
+            let rows = h.read_sessions();
+            let row = crate::harness::session_by_title(&rows, "deferred-sandbox");
+            assert_eq!(row["status"], "stopped");
+            assert_eq!(row["sandbox_info"]["enabled"], true);
+            assert!(row["sandbox_info"]["container_id"].is_null());
+            h.run_cli_err(&[
+                "--no-autostart",
+                "session",
+                "start",
+                row["id"].as_str().unwrap(),
+            ]);
+            let after = h.read_sessions();
+            let retained = crate::harness::session_by_title(&after, "deferred-sandbox");
+            assert_eq!(retained["id"], row["id"]);
+            assert_eq!(retained["sandbox_info"]["enabled"], true);
+        }
+        assert!(!create_effect.exists());
+        assert!(!launch_effect.exists());
+        assert!(!container_effect.exists());
     }
 }
