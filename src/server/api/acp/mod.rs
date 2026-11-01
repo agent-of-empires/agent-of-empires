@@ -40,7 +40,7 @@ pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
 };
 pub use worker::{
-    get_option_catalog, list_acp_agents, shutdown_acp, spawn_acp, switch_acp_agent,
+    get_option_catalog, list_acp_agents, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
 };
 
@@ -75,6 +75,9 @@ pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) ->
             StatusCode::CONFLICT,
             "structured view worker already running for session".to_string(),
         ),
+        SupervisorError::RestartInProgress(_) => {
+            (StatusCode::CONFLICT, format!("restart_in_progress: {err}"))
+        }
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
@@ -274,6 +277,25 @@ async fn pick_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_handoff_test_state(
+        prior: Vec<crate::session::Instance>,
+        app_dir: &std::path::Path,
+    ) -> Arc<AppState> {
+        let db_path = app_dir.join(format!("acp-events-{}.db", prior[0].id));
+        let event_store = Arc::new(
+            crate::acp::event_store::EventStore::open(&db_path, 100).expect("event store"),
+        );
+        crate::server::test_support::build_test_app_state_impl_with_event_store(
+            prior,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(event_store),
+            |_| {},
+            |supervisor| supervisor,
+        )
+    }
 
     /// A failed selector persistence retires the changed worker.
     #[tokio::test]
@@ -534,11 +556,11 @@ mod tests {
                         switch_acp_agent(
                             State(state),
                             Path(id),
-                            Json(crate::acp::protocol::SwitchAgentRequest {
+                            Ok(Json(crate::acp::protocol::SwitchAgentRequest {
                                 target: "codex".to_string(),
                                 model: None,
                                 reason: None,
-                            }),
+                            })),
                         )
                         .await
                         .into_response()
@@ -604,11 +626,14 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
+            } else {
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    &inst.source_profile,
+                    vec![inst.clone()],
+                );
             }
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
-            if which == "disable" {
-                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            }
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
             let delivering = state.session_service.prompt_submission(&id).await;
             let mut claims = state.session_service.watch_submission_claims();
@@ -620,11 +645,11 @@ mod tests {
                         "switch" => switch_acp_agent(
                             state,
                             id,
-                            Json(crate::acp::protocol::SwitchAgentRequest {
+                            Ok(Json(crate::acp::protocol::SwitchAgentRequest {
                                 target: "codex".to_string(),
                                 model: None,
                                 reason: None,
-                            }),
+                            })),
                         )
                         .await
                         .into_response(),
@@ -760,7 +785,7 @@ mod tests {
                             Ok(())
                         })
                         .unwrap();
-                    let state = crate::server::test_support::build_test_app_state(vec![cached]);
+                    let state = terminal_handoff_test_state(vec![cached], temp.path());
                     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
                     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -879,7 +904,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let state = crate::server::test_support::build_test_app_state(rows);
+        let state = terminal_handoff_test_state(rows, temp.path());
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (contended_tx, contended_rx) = tokio::sync::oneshot::channel();
         let _contention = storage.observe_shared_lock_contention_for_test(contended_tx);

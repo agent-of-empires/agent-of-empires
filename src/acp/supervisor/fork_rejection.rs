@@ -914,6 +914,24 @@ mod tests {
             supervisor.settle_fork_rejections().await;
             crate::server::acp_events::commit_background_bindings(&state).await;
             if journal != Journal::None {
+                let captured = target.clone();
+                let owner = Arc::clone(supervisor);
+                let native = store.clone();
+                let id = row.id.clone();
+                let takeover = tokio::task::spawn_blocking(move || {
+                    let _native = native
+                        .storage()
+                        .acquire_instance_lifecycle_lock(&id)
+                        .unwrap();
+                    owner.register_delegated_binding_retirement(&captured, None)
+                })
+                .await
+                .unwrap();
+                assert!(
+                    matches!(takeover, Err(SupervisorError::TeardownPending(_))),
+                    "a restart checkpoint cannot take a journal's existing ACK"
+                );
+                crate::server::acp_events::commit_background_bindings(&state).await;
                 assert_eq!(
                     supervisor
                         .lifecycle
@@ -940,7 +958,10 @@ mod tests {
                 }
                 supervisor.acknowledge_retirement(&target).unwrap();
             }
-            let disk = store.load().unwrap();
+            let disk = tokio::task::spawn_blocking(move || store.storage().load())
+                .await
+                .unwrap()
+                .unwrap();
             let disk = disk.iter().find(|item| item.id == row.id).unwrap();
             let expected_parent = if supersede {
                 Some("replacement-parent")
@@ -1025,7 +1046,10 @@ mod tests {
         assert!(crate::process::worker_registry::load_strict(&row.id)
             .unwrap()
             .is_none());
-        let disk = store.load().unwrap();
+        let disk = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .unwrap()
+            .unwrap();
         let disk = disk.iter().find(|value| value.id == row.id).unwrap();
         assert_eq!(disk.fork_pending, row.fork_pending);
         assert_eq!(disk.import_pending, row.import_pending);
@@ -1086,7 +1110,10 @@ mod tests {
             crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(runner.identity),
             "releasing an observer must preserve its original healthy peer"
         );
-        let disk = store.load().unwrap();
+        let disk = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .unwrap()
+            .unwrap();
         let disk = disk.iter().find(|value| value.id == row.id).unwrap();
         assert_eq!(disk.fork_pending, row.fork_pending);
         assert_eq!(disk.import_pending, row.import_pending);

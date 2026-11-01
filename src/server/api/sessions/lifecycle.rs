@@ -1681,6 +1681,16 @@ pub(crate) async fn resume_structured_stop(
     kind: Option<crate::acp::supervisor::ResumeKind>,
 ) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
 {
+    resume_structured_stop_with_restart(state, expected, kind, None).await
+}
+
+pub(crate) async fn resume_structured_stop_with_restart(
+    state: &Arc<AppState>,
+    expected: Instance,
+    kind: Option<crate::acp::supervisor::ResumeKind>,
+    restart: Option<&crate::acp::supervisor::RestartRequestGuard>,
+) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
+{
     use crate::process::worker_registry::{self, ResumeAuthority};
     use crate::session::SessionStore;
     if expected.status != Status::Stopped && !expected.is_idle_dormant() {
@@ -1766,10 +1776,9 @@ pub(crate) async fn resume_structured_stop(
         _ => {
             state
                 .acp_supervisor
-                .shutdown_retained_stop_and_wait(
+                .retire_captured_for_resume_and_wait(
                     &expected.id,
                     &target,
-                    None,
                     std::time::Duration::from_secs(5),
                 )
                 .await
@@ -1804,7 +1813,7 @@ pub(crate) async fn resume_structured_stop(
     });
     let mut reservation = state
         .acp_supervisor
-        .reserve_spawn(&expected.id, kind, ResumeAuthority::Explicit)
+        .reserve_spawn_with_restart(&expected.id, kind, ResumeAuthority::Explicit, restart)
         .await
         .map_err(|error| {
             crate::server::api::acp::supervisor_error_response("resume failed", &error)
