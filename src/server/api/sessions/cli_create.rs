@@ -267,15 +267,20 @@ fn resolve_host_creation(
     body.sandbox |= config.sandbox.enabled_by_default
         && crate::containers::get_container_runtime().is_available();
     if body.sandbox {
-        body.sandbox_image = Some(match body.sandbox_image.take() {
-            Some(mut image) => {
+        let explicit = body
+            .sandbox_image
+            .take()
+            .map(|mut image| {
                 image.truncate(image.trim_end().len());
                 let leading = image.len() - image.trim_start().len();
                 if leading != 0 {
                     image.drain(..leading);
                 }
                 image
-            }
+            })
+            .filter(|image| !image.is_empty());
+        body.sandbox_image = Some(match explicit {
+            Some(image) => image,
             None => {
                 let configured = config.sandbox.default_image.trim();
                 if configured.is_empty() {

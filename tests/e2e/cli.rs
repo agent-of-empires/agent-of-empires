@@ -2201,6 +2201,12 @@ fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
         (Some(" ubuntu:latest "), "ignored:latest", "ubuntu:latest"),
         (None, " ubuntu:latest ", "ubuntu:latest"),
         (None, "   ", "ghcr.io/agent-of-empires/aoe-sandbox:latest"),
+        (Some("   "), " custom:latest ", "custom:latest"),
+        (
+            Some(""),
+            "   ",
+            "ghcr.io/agent-of-empires/aoe-sandbox:latest",
+        ),
     ] {
         let mut h = TuiTestHarness::new("cli_sandbox_image");
         let bin = h.install_path_command("docker");
