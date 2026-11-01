@@ -600,6 +600,12 @@ pub async fn trash_session(
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if row.is_trashed() {
+                return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
+            }
+            if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
+            }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;

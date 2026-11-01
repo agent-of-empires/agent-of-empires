@@ -144,6 +144,10 @@ impl HomeView {
             ));
             return;
         }
+        if let Some(blocked) = self.start_blocked(session_id) {
+            self.info_dialog = Some(InfoDialog::new("Respond Failed", &blocked.to_string()));
+            return;
+        }
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };
@@ -165,6 +169,13 @@ impl HomeView {
                     "Respond Failed",
                     &format!("Failed to resolve session: {}", e),
                 ));
+                return;
+            }
+        };
+        let _input_lock = match inst.lock_for_input() {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
                 return;
             }
         };

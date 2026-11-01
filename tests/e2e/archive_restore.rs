@@ -668,3 +668,574 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
         "the rewound install converges on the build's version"
     );
 }
+
+#[test]
+#[parallel]
+fn trash_retained_transcript_is_read_only() {
+    use crate::harness::{app_dir_in, wait_until};
+    use agent_of_empires::{
+        acp::{
+            event_store::EventStore,
+            state::{Event, ToolCall},
+        },
+        session::{Instance, Status},
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_retained");
+    h.stop_daemon_on_drop();
+    h.append_config("[session]\nlive_send_on_view_switch = true\nshow_diagnostics_pane = true");
+    let project = h.project_path();
+    let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
+    retained.trashed_at = Some(chrono::Utc::now());
+    retained.status = Status::Stopped;
+    retained.mark_unread();
+    let id = retained.id.clone();
+    let mut empty = Instance::new("TrashEmpty", project.to_str().unwrap());
+    empty.trashed_at = Some(chrono::Utc::now());
+    empty.archived_at = empty.trashed_at;
+    empty.status = Status::Stopped;
+    let empty_id = empty.id.clone();
+    std::fs::write(
+        h.sessions_path(),
+        serde_json::to_vec(&[retained, empty]).unwrap(),
+    )
+    .unwrap();
+    let app_dir = app_dir_in(h.home_path());
+    let store = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    store
+        .record(
+            &id,
+            1,
+            &Event::AvailableCommandsUpdated {
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            8,
+            &Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "unfinished-tool".into(),
+                    name: "RetainedPendingTool".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: chrono::Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+    for seq in 10..=1014 {
+        let event = if seq == 1008 {
+            Event::ToolCallContent {
+                tool_call_id: "retained-tool".into(),
+                content: (0..40)
+                    .map(|i| format!("success-output-{i:02}\n"))
+                    .collect::<String>()
+                    + "SUCCESS-OUTPUT-END",
+            }
+        } else {
+            Event::AgentMessageChunk {
+                text: format!("retained-{seq:04}\n\n"),
+                message_id: None,
+            }
+        };
+        store.record(&id, seq, &event).unwrap();
+    }
+    store
+        .record(
+            &id,
+            1015,
+            &Event::ToolCallCompleted {
+                tool_call_id: "retained-tool".into(),
+                is_error: false,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1016,
+            &Event::ToolCallContent {
+                tool_call_id: "failed-tool".into(),
+                content: (0..40)
+                    .map(|i| format!("error-output-{i:02}\n"))
+                    .collect::<String>()
+                    + "ERROR-OUTPUT-END",
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1017,
+            &Event::ToolCallCompleted {
+                tool_call_id: "failed-tool".into(),
+                is_error: true,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
+    for (seq, content) in [
+        (1018, "superseded unfinished output".to_string()),
+        (1019, "a".repeat(62) + "♥️x\nUNFINISHED-OUTPUT-END"),
+    ] {
+        store
+            .record(
+                &id,
+                seq,
+                &Event::ToolCallContent {
+                    tool_call_id: "unfinished-tool".into(),
+                    content,
+                },
+            )
+            .unwrap();
+    }
+    store
+        .record(
+            &id,
+            1020,
+            &Event::ToolCallContent {
+                tool_call_id: "media-tool".into(),
+                content: "MEDIA-RETAINED-TEXT".into(),
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1021,
+            &Event::ToolCallCompleted {
+                tool_call_id: "media-tool".into(),
+                is_error: false,
+                content: String::new(),
+                output: vec![agent_of_empires::acp::state::ToolOutputBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: None,
+                    uri: None,
+                }],
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
+    for seq in [1, 3] {
+        store
+            .record(
+                &empty_id,
+                seq,
+                &Event::AvailableCommandsUpdated {
+                    commands: Vec::new(),
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+    let launch_marker = h.home_path().join("agent-launched");
+    let bin = h.install_path_command("claude");
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\nprintf started >> {}\n",
+            shell_words::quote(launch_marker.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    let clipboard = h.home_path().join("copied");
+    for command in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+        let bin = h.install_path_command(command);
+        std::fs::write(
+            bin.join(command),
+            format!(
+                "#!/bin/sh\ncat > {}\n",
+                shell_words::quote(clipboard.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+    }
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Right");
+    h.wait_for("TrashRetained");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashRetained"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.send_keys("S-PageUp");
+    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
+    h.assert_screen_contains("Trash · read-only");
+    h.send_keys("S-PageDown");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Earlier"))
+        .unwrap();
+    let x =
+        unicode_width::UnicodeWidthStr::width(&line[..line.find("Earlier").unwrap()]) as u16 + 1;
+    h.send_mouse_click(0, x, y as u16 + 1);
+    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
+    h.assert_screen_contains("Trash · read-only");
+    h.send_keys("S-PageDown");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.send_keys("Enter");
+    h.wait_for("Esc: sessions");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("CPU ") && line.contains("Mem "))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 5, row);
+    h.wait_for("System Health");
+    h.send_keys("Enter");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.wait_for("ERROR-OUTPUT-END");
+    h.assert_screen_contains("history is incomplete");
+    h.assert_screen_contains("Trash · read-only");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.wait_for("♥️x");
+    h.assert_screen_contains("completion unavailable");
+    h.assert_screen_not_contains("superseded unfinished output");
+    for marker in ["♥️x", "MEDIA-RETAINED-TEXT"] {
+        h.wait_for(marker);
+        let screen = h.capture_screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(marker))
+            .unwrap();
+        let x =
+            unicode_width::UnicodeWidthStr::width(&line[..line.find(marker).unwrap()]) as u16 + 1;
+        let width = unicode_width::UnicodeWidthStr::width(marker) as u16;
+        h.send_mouse_drag((x, y as u16 + 1), (x + width, y as u16 + 1));
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+            (copied == marker)
+                .then_some(())
+                .ok_or_else(|| format!("expected {marker:?} in clipboard, got {copied:?}"))
+        });
+    }
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("trash-unfinished.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-unfinished.txt"), h.capture_screen()).unwrap();
+    }
+    let before = h.read_sessions();
+    let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    events
+        .record(
+            &id,
+            1022,
+            &Event::AgentMessageChunk {
+                text: "LATE-RETAINED-OUTPUT\n\n".into(),
+                message_id: Some("late".into()),
+            },
+        )
+        .unwrap();
+    drop(events);
+    h.wait_for("LATE-RETAINED-OUTPUT");
+    h.assert_screen_contains("Esc: sessions");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("LATE-RETAINED-OUTPUT"))
+        .unwrap();
+    let x =
+        unicode_width::UnicodeWidthStr::width(&line[..line.find("LATE-RETAINED-OUTPUT").unwrap()])
+            as u16
+            + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 19, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "LATE-RETAINED-OUTPUT")
+            .then_some(())
+            .ok_or_else(|| format!("expected fresh retained output, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-late-output.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-late-output.txt"), h.capture_screen()).unwrap();
+    }
+    let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    events
+        .record(
+            &id,
+            1024,
+            &Event::ConversationSummary {
+                text: "CONCURRENT-TEARDOWN-SUMMARY".into(),
+                summarized_until_seq: 1022,
+            },
+        )
+        .unwrap();
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.assert_screen_not_contains("◼");
+    events
+        .record(
+            &id,
+            1023,
+            &Event::Stopped {
+                reason: "user_stopped".into(),
+            },
+        )
+        .unwrap();
+    drop(events);
+    h.wait_for_absent("completion unavailable", Duration::from_secs(45));
+    h.assert_screen_contains("CONCURRENT-TEARDOWN-SUMMARY");
+    h.assert_screen_contains("Esc: sessions");
+    h.send_keys("Home");
+    h.wait_for("◼");
+    let marker = "UNFINISHED-OUTPUT-END";
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(marker))
+        .unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..line.find(marker).unwrap()]) as u16 + 1;
+    h.send_mouse_drag(
+        (x, y as u16 + 1),
+        (x + marker.len() as u16 - 1, y as u16 + 1),
+    );
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == marker)
+            .then_some(())
+            .ok_or_else(|| format!("expected stopped retained output, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-late-stop.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-late-stop.txt"), h.capture_screen()).unwrap();
+    }
+    h.send_keys("End");
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    for _ in 0..10 {
+        let previous = h.capture_screen();
+        if previous.contains("SUCCESS-OUTPUT-END") {
+            break;
+        }
+        h.send_keys("PageUp");
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            (h.capture_screen() != previous)
+                .then_some(())
+                .ok_or_else(|| "waiting for retained scroll".to_string())
+        });
+    }
+    h.wait_for("SUCCESS-OUTPUT-END");
+    let screen = wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let screen = h.capture_screen();
+        let middle = screen.lines().count() / 2;
+        let row = screen
+            .lines()
+            .position(|line| line.contains("SUCCESS-OUTPUT-END"))
+            .ok_or_else(|| "waiting for retained tool tail".to_string())?;
+        if row.abs_diff(middle) <= 1 {
+            return Ok(screen);
+        }
+        h.send_keys(if row < middle { "Up" } else { "Down" });
+        Err("moving retained tool tail away from autoscroll edges".to_string())
+    });
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("SUCCESS-OUTPUT-END"))
+        .unwrap();
+    let byte = line.find("SUCCESS-OUTPUT-END").unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 17, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "SUCCESS-OUTPUT-END")
+            .then_some(())
+            .ok_or_else(|| format!("expected full retained tool tail, got {copied:?}"))
+    });
+    h.send_keys("C-q");
+    h.wait_for("Enter: read");
+    h.send_keys("Enter");
+    h.send_keys("q");
+    h.send_keys("Home");
+    h.wait_for("retained-0010");
+    h.type_text("must_not_send");
+    h.send_paste("must_not_send");
+    h.send_keys("Tab");
+    h.assert_screen_not_contains("Message the agent");
+    h.assert_screen_not_contains("Live send failed");
+    let top = h.capture_screen();
+    let (y, line) = top
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("retained-0010"))
+        .unwrap();
+    let byte = line.find("retained-0010").unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 12, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "retained-0010")
+            .then_some(())
+            .ok_or_else(|| format!("expected retained text in isolated clipboard, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("trash-readonly.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-readonly.txt"), h.capture_screen()).unwrap();
+    }
+    h.send_keys("PageDown");
+    h.wait_for_absent("retained-0010", Duration::from_secs(5));
+    h.send_keys("Escape");
+    for key in ["Tab", "t", "m", "r"] {
+        h.send_keys(key);
+    }
+    h.assert_screen_contains("Trash · read-only");
+    h.assert_screen_not_contains("Reviving");
+    h.assert_screen_not_contains("LIVE");
+    let after = h.read_sessions();
+    assert_eq!(
+        before, after,
+        "inspection must not mutate retained sessions"
+    );
+    assert!(!launch_marker.exists(), "inspection launched an agent");
+    let workers = h.run_cli_ok(&["ps", "--acp", "--dead", "--json"]);
+    let workers: serde_json::Value = serde_json::from_str(&workers).unwrap();
+    assert_eq!(workers, serde_json::json!([]));
+    let sessions = h
+        .tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .unwrap();
+    let sessions = String::from_utf8_lossy(&sessions.stdout);
+    assert!(
+        !sessions.lines().any(|name| name.starts_with("aoe_dev_")),
+        "{sessions}"
+    );
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashEmpty"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("No readable retained ACP content");
+    h.assert_screen_contains("Trash · read-only");
+    h.assert_screen_contains("history is incomplete");
+    h.send_keys("d");
+    h.wait_for("Yes");
+    h.run_cli_ok(&["session", "restore", &empty_id]);
+    h.wait_for("Session Changed");
+    h.send_keys("y");
+    let restored = h.read_sessions();
+    let restored = restored
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == empty_id)
+        .expect("peer-restored session must survive old confirmation");
+    assert!(restored["trashed_at"].is_null());
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-purge-cancelled.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("trash-purge-cancelled.txt"),
+            h.capture_screen(),
+        )
+        .unwrap();
+    }
+    h.send_keys("Enter");
+    h.wait_for_absent("No readable retained ACP content", Duration::from_secs(5));
+    h.wait_for("Archived (");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashRetained"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.run_cli_ok(&["rm", &id, "--purge"]);
+    h.wait_for_absent("TrashRetained", Duration::from_secs(5));
+    h.wait_for_absent("CONCURRENT-TEARDOWN-SUMMARY", Duration::from_secs(5));
+    assert!(
+        !launch_marker.exists(),
+        "restore or purge restarted an agent"
+    );
+}
+
+#[test]
+#[parallel]
+fn trash_reader_ctrl_c_exits() {
+    use agent_of_empires::session::{Instance, Status};
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_ctrl_c");
+    h.stop_daemon_on_drop();
+    let mut row = Instance::new("TrashQuit", h.project_path().to_str().unwrap());
+    row.trashed_at = Some(chrono::Utc::now());
+    row.status = Status::Stopped;
+    std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Right");
+    h.wait_for("TrashQuit");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashQuit"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("Trash · read-only");
+    h.send_keys("Enter");
+    h.wait_for("Esc: sessions");
+    assert!(h
+        .tmux()
+        .args(["send-keys", "C-c"])
+        .status()
+        .unwrap()
+        .success());
+    h.wait_for_exit(Duration::from_secs(5));
+}

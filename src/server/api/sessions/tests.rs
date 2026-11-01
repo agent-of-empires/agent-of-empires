@@ -1108,6 +1108,53 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 
 #[tokio::test]
 #[serial_test::serial]
+async fn trash_rejects_stale_or_already_trashed_targets_without_mutation() -> anyhow::Result<()> {
+    for already_trashed in [false, true] {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("stale trash", "/tmp/stale-trash");
+        row.source_profile = "receipt".into();
+        let expected_generation = row.lifecycle_generation;
+        row.lifecycle_generation += 1;
+        if already_trashed {
+            row.trash();
+        }
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let storage = Storage::new("receipt", state.file_watch.clone())?;
+        storage.update(|rows, _| {
+            rows.push(row);
+            Ok(())
+        })?;
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let before = std::fs::read(storage.sessions_path())?;
+        let response = trash_session(
+            State(state.clone()),
+            Path(id),
+            Some(Json(TrashSessionBody {
+                kill_pane: true,
+                expected_generation: (!already_trashed).then_some(expected_generation),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        if !already_trashed {
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
+            );
+        }
+        assert_eq!(std::fs::read(storage.sessions_path())?, before);
+        assert!(!response
+            .headers()
+            .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn lifecycle_requests_reject_a_peer_reservation_without_acknowledging_it(
 ) -> anyhow::Result<()> {
     use crate::session::LifecycleOperation;
@@ -1161,7 +1208,10 @@ async fn lifecycle_requests_reject_a_peer_reservation_without_acknowledging_it(
             "trash" => trash_session(
                 State(state.clone()),
                 Path(id.clone()),
-                Some(Json(TrashSessionBody { kill_pane: false })),
+                Some(Json(TrashSessionBody {
+                    kill_pane: false,
+                    ..Default::default()
+                })),
             )
             .await
             .into_response(),
@@ -1793,7 +1843,10 @@ async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> a
             trash_session(
                 State(state.clone()),
                 Path(id.clone()),
-                Some(Json(TrashSessionBody { kill_pane: true })),
+                Some(Json(TrashSessionBody {
+                    kill_pane: true,
+                    ..Default::default()
+                })),
             )
             .await
             .into_response()
@@ -1895,7 +1948,10 @@ async fn trash_restore_receipts_publish_complete_peer_bundles() -> anyhow::Resul
                 trash_session(
                     State(worker_state),
                     Path(worker_id),
-                    Some(Json(TrashSessionBody { kill_pane: false })),
+                    Some(Json(TrashSessionBody {
+                        kill_pane: false,
+                        ..Default::default()
+                    })),
                 )
                 .await
                 .into_response()

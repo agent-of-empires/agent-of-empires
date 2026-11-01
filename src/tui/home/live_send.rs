@@ -2423,19 +2423,21 @@ impl Drop for OneshotSlot {
     }
 }
 
-/// Forward a single translated key to a tmux pane with a one-shot `tmux send-keys` fork on
-/// a detached thread, for the passive-preview wheel forward where there is no
-/// `LiveSendWorker` to enqueue onto and `dispatch_via_fork` would block the UI thread.
-/// Fire-and-forget: a dropped notch is harmless and a failed fork is logged. Scroll notches
-/// carry no ordering relationship, so racing forks are fine within
-/// `MAX_INFLIGHT_ONESHOT`.
-pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
+/// Forward passive-preview input off the UI thread under its native lease.
+/// Bound concurrent forks so excess input cannot pile up threads.
+pub(super) fn send_key_oneshot(
+    tmux_name: &str,
+    key: TmuxKey,
+    lease: crate::tui::session_feed::NativeLease,
+) -> bool {
     use std::sync::atomic::Ordering;
-    // Reserve a slot first; if we are already at the cap, drop this notch
-    // rather than pile another thread on.
+    if !lease.is_valid() {
+        return false;
+    }
+    // Reserve a bounded dispatch slot.
     if INFLIGHT_ONESHOT.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ONESHOT {
         INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
-        return;
+        return false;
     }
     let tmux_name = tmux_name.to_string();
     let action = match key {
@@ -2445,15 +2447,14 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
         TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
-    // `Builder::spawn` returns the OS error instead of panicking, so a thread-creation
-    // failure under load can't take down the calling UI thread. The `OneshotSlot` guard
-    // inside the closure releases the slot on completion or panic; a spawn that never
-    // starts releases it here.
+    // The guard releases the slot on completion or panic; failed spawn releases it here.
     let spawned = std::thread::Builder::new()
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
             let _slot = OneshotSlot;
-            // A wheel notch is never a paste, so the vt fast path stays open.
+            if !lease.is_valid() {
+                return;
+            }
             if let Err(err) = dispatch_via_fork(&tmux_name, &action, false, None) {
                 tracing::warn!(
                     target: "tui.live_send",
@@ -2469,7 +2470,9 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
             target: "tui.live_send",
             "could not spawn wheel-forward thread; notch dropped",
         );
+        return false;
     }
+    true
 }
 
 /// Send a literal string through one `tmux send-keys -l --` fork, for the head of a payload

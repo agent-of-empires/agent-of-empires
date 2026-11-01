@@ -719,7 +719,7 @@ fn render_transcript(
         );
     }
 
-    let text = wrapped_transcript(state, theme, text_area.width);
+    let text = wrapped_transcript(state, theme, text_area.width, ToolOutputMode::Compact);
     // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
@@ -867,14 +867,26 @@ pub struct TranscriptGeometry {
     pub total_lines: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ToolOutputMode<'a> {
+    Compact,
+    Retained(&'a [crate::acp::transcript::UnfinishedToolOutput]),
+}
+
 /// The transcript pre-wrapped at `width`: the single source of transcript
 /// geometry for painting, scroll clamping, and selection.
-pub(crate) fn wrapped_transcript(
+pub(super) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
+    tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    let lines = transcript_lines(&state.transcript, theme, state.path_roots.as_ref());
+    let lines = transcript_lines(
+        &state.transcript,
+        theme,
+        state.path_roots.as_ref(),
+        tool_output,
+    );
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
         wrap_line_into(own_line(line), width, &mut wrapped);
@@ -930,55 +942,80 @@ fn own_line(line: Line<'_>) -> Line<'static> {
 
 /// Word-wrap a styled line at the last space, hard-breaking long words.
 /// Unlike `markdown::wrap_line_into`, tabs are not expanded.
-fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
-    use unicode_width::UnicodeWidthChar;
-
+pub(super) fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+    use ratatui::buffer::CellWidth;
+    use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1) as usize;
-    if line.width() <= width {
+    let painted_width: usize = line
+        .spans
+        .iter()
+        .map(|span| crate::tui::components::text::rendered_width(&span.content))
+        .sum();
+    if painted_width <= width {
         out.push(line);
         return;
     }
-    let chars: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-        .collect();
-    let mut row: Vec<(char, Style)> = Vec::new();
-    let mut row_width = 0usize;
-    let mut last_space: Option<usize> = None;
-    let flush = |row: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (c, style) in row.drain(..) {
-            match spans.last_mut() {
-                Some(last) if last.style == style => last.content.to_mut().push(c),
-                _ => spans.push(Span::styled(c.to_string(), style)),
-            }
+    let emit = |glyphs: &[(usize, std::ops::Range<usize>, usize)], out: &mut Vec<Line<'static>>| {
+        if glyphs.is_empty() {
+            return;
         }
-        out.push(Line::from(spans));
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while i < glyphs.len() {
+            let source = glyphs[i].0;
+            let start = glyphs[i].1.start;
+            let mut end = glyphs[i].1.end;
+            i += 1;
+            while i < glyphs.len() && glyphs[i].0 == source {
+                end = glyphs[i].1.end;
+                i += 1;
+            }
+            spans.push(Span::styled(
+                line.spans[source].content[start..end].to_owned(),
+                line.spans[source].style,
+            ));
+        }
+        let mut wrapped = Line::from(spans).style(line.style);
+        wrapped.alignment = line.alignment;
+        out.push(wrapped);
     };
-    for (c, style) in chars {
-        let cw = c.width().unwrap_or(0);
-        if row_width + cw > width && !row.is_empty() {
-            if let Some(cut) = last_space {
-                // The break space is dropped, like a terminal word wrap.
-                let tail: Vec<(char, Style)> = row.split_off(cut + 1);
-                row.truncate(cut);
-                flush(&mut row, out);
-                row = tail;
-                row_width = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+    let mut row: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
+    let mut row_width = 0;
+    let mut last_space = None;
+    for (span_index, span) in line.spans.iter().enumerate() {
+        for (byte, grapheme) in span.content.grapheme_indices(true) {
+            let cells = if grapheme.contains(char::is_control) {
+                0
             } else {
-                flush(&mut row, out);
-                row_width = 0;
+                grapheme.cell_width() as usize
+            };
+            while row_width + cells > width && row_width > 0 {
+                if let Some(cut) = last_space {
+                    emit(&row[..cut], out);
+                    row.drain(..=cut);
+                } else {
+                    emit(&row, out);
+                    row.clear();
+                }
+                row_width = row.iter().map(|glyph| glyph.2).sum();
+                last_space = row.iter().rposition(|(index, range, _)| {
+                    &line.spans[*index].content[range.clone()] == " "
+                });
             }
-            last_space = None;
+            if grapheme == " " {
+                last_space = Some(row.len());
+            }
+            row.push((span_index, byte..byte + grapheme.len(), cells));
+            row_width += cells;
+            if cells > width {
+                emit(&row, out);
+                row.clear();
+                row_width = 0;
+                last_space = None;
+            }
         }
-        if c == ' ' {
-            last_space = Some(row.len());
-        }
-        row.push((c, style));
-        row_width += cw;
     }
-    flush(&mut row, out);
+    emit(&row, out);
 }
 
 fn render_status(
@@ -1344,6 +1381,7 @@ fn transcript_lines(
     transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
+    tool_output: ToolOutputMode,
 ) -> Vec<Line<'static>> {
     let rows = &transcript.server_rows;
     // One card per tool call at its start row; the last terminal row wins.
@@ -1394,8 +1432,17 @@ fn transcript_lines(
                 out.push(Line::default());
             }
             TranscriptRowKind::ToolStart => {
-                let card = tool_card_from_rows(row, &completions);
-                out.extend(render_tool_lines(&card, theme, path_roots));
+                if matches!(tool_output, ToolOutputMode::Retained(_)) {
+                    let completion = row
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| completions.get(id))
+                        .copied();
+                    out.extend(retained_tool_lines(row, completion, theme, path_roots));
+                } else {
+                    let card = tool_card_from_rows(row, &completions);
+                    out.extend(render_tool_lines(&card, theme, path_roots));
+                }
                 out.push(Line::default());
             }
             TranscriptRowKind::ToolComplete
@@ -1445,6 +1492,19 @@ fn transcript_lines(
         }
         i += 1;
     }
+    if let ToolOutputMode::Retained(outputs) = tool_output {
+        for output in outputs {
+            out.push(Line::styled(
+                format!(
+                    "Retained tool output · completion unavailable · {}",
+                    output.tool_call_id
+                ),
+                Style::default().fg(theme.hint),
+            ));
+            out.extend(styled_output_lines(&output.text));
+            out.push(Line::default());
+        }
+    }
     if out.is_empty() {
         out.push(Line::from(Span::styled(
             "(no events yet, waiting for the agent…)",
@@ -1472,6 +1532,60 @@ fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
         format!("· {text}"),
         Style::default().add_modifier(modifier),
     ))
+}
+
+fn retained_tool_lines(
+    start: &TranscriptRow,
+    completion: Option<&TranscriptRow>,
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Vec<Line<'static>> {
+    let marker = match completion.map(|row| row.kind) {
+        Some(TranscriptRowKind::ToolComplete) => "✓ ",
+        Some(TranscriptRowKind::ToolError) => "✗ ",
+        Some(TranscriptRowKind::ToolStopped) => "◼ ",
+        _ => "",
+    };
+    let mut lines = vec![Line::styled(
+        format!("tool {marker}· {}", start.text),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(tool) = &start.tool {
+        lines.extend(styled_output_lines(&tool.args_preview));
+        for diff in &tool.diffs {
+            let path = relative_display_path(&diff.path, path_roots);
+            if let Some(before) = &diff.old_text {
+                lines.push(Line::from(format!("Before: {path}")));
+                lines.extend(styled_output_lines(before));
+            }
+            if let Some(after) = &diff.new_text {
+                lines.push(Line::from(format!("After: {path}")));
+                lines.extend(styled_output_lines(after));
+            }
+        }
+    }
+    if let Some(completion) = completion {
+        if completion.async_subagent {
+            lines.push(Line::from("runs in background"));
+        } else if completion.output.is_empty() {
+            lines.extend(styled_output_lines(&completion.text));
+        } else {
+            let has_text = completion.output.iter().any(|block| match block {
+                ToolOutputBlock::Text { text }
+                | ToolOutputBlock::Resource {
+                    text: Some(text), ..
+                } => !text.is_empty(),
+                _ => false,
+            });
+            if !has_text && !completion.text.is_empty() {
+                lines.extend(styled_output_lines(&completion.text));
+            }
+            lines.extend(styled_output_lines(&summarize_output_blocks(
+                &completion.output,
+            )));
+        }
+    }
+    lines
 }
 
 fn tool_card_from_rows(
@@ -2151,6 +2265,69 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_preserves_painted_and_copied_graphemes() {
+        use crate::tui::components::text::line_columns;
+        for (text, width) in [
+            ("a".repeat(31) + "♥️x", 32),
+            ("a".repeat(30) + "ｶﾞx", 32),
+            ("a".repeat(31) + "e\u{301}x", 32),
+            ("a".repeat(31) + "👩‍💻x", 32),
+            (" bbb界".into(), 4),
+            ("界a".into(), 1),
+        ] {
+            let mut rows = Vec::new();
+            wrap_line_into(Line::from(text.clone()), width, &mut rows);
+            let copied = rows
+                .iter()
+                .map(|row| line_columns(row, width).slice(0, width))
+                .collect::<String>();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                width,
+                rows.len() as u16,
+            ))
+            .unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new(Text::from(rows)), frame.area()))
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width == 1 {
+                assert_eq!(copied, "a");
+                assert!(painted.contains('a'));
+            } else {
+                assert_eq!(copied, text.trim_start(), "width={width}, screen={painted}");
+                assert!(painted.contains('x') || painted.contains('界'));
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_original_span_boundaries_and_line_style() {
+        let style = Style::default().fg(Color::Red);
+        let line = Line::from(vec![
+            Span::styled("a".repeat(31) + "♥", style),
+            Span::styled("\u{fe0f}x", style),
+        ])
+        .style(Style::default().bg(Color::Blue));
+        let mut rows = Vec::new();
+        wrap_line_into(line, 32, &mut rows);
+        assert_eq!(
+            rows[0].spans.len(),
+            2,
+            "separate styled grapheme streams must not be merged"
+        );
+        assert_eq!(rows[0].style.bg, Some(Color::Blue));
+        assert_eq!(rows[1].style.bg, Some(Color::Blue));
+        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(rows[1].to_string(), "x");
+    }
+
+    #[test]
     fn wrap_line_rows_and_styles() {
         let rows = |line: Line<'static>, width| {
             let mut out = Vec::new();
@@ -2370,7 +2547,12 @@ mod tests {
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
         ]);
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &t,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
         assert!(
             out.contains("for #4656.") && out.contains("The waiter has the lock."),
@@ -2418,7 +2600,12 @@ mod tests {
                 text: String::new(),
             },
         ]);
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &t,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
