@@ -1,8 +1,9 @@
 //! `TranscriptModel`: the server-side render model for the structured-view transcript.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
@@ -107,15 +108,29 @@ fn session_notice_text(severity: &str, title: &str, description: &Option<String>
     }
 }
 
+/// Projection lifecycle is independent of whether its start row is in this page.
+#[derive(Debug, Clone)]
+enum ToolLifecycle {
+    Buffered(String),
+    Open(String),
+    Terminal(String),
+}
+
+impl ToolLifecycle {
+    fn finish(&mut self) -> String {
+        match std::mem::replace(self, Self::Terminal(String::new())) {
+            Self::Buffered(output) | Self::Open(output) | Self::Terminal(output) => output,
+        }
+    }
+}
+
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
     rows: Vec<TranscriptRow>,
     row_ids: HashSet<String>,
-    /// Tool calls that reached a terminal row, so nothing closes them twice.
-    terminal_tools: HashSet<String>,
-    /// Streamed `ToolCallContent`, keyed by tool call id.
-    tool_outputs: HashMap<String, String>,
+    /// Tool lifecycle and buffered output, in opening order, including skipped starts.
+    tools: IndexMap<String, ToolLifecycle>,
     /// Tool calls surfaced as an elicitation (AskUserQuestion); their cards are suppressed.
     elicitation_tool_ids: HashSet<String>,
     /// Group of the still-open run of consecutive message chunks.
@@ -145,17 +160,34 @@ impl TranscriptModel {
         self.last_seq
     }
 
-    /// Note an event that precedes this fold without rendering it, so a chunk
-    /// that opens the fold still knows which message it follows, and a
-    /// completion still finds its elicitation suppressed.
+    /// Observe the prefix without allocating rows. Tool lifecycle and streamed
+    /// output still belong to the fold; message and elicitation context survives.
     pub fn observe_prior(&mut self, event: &Event) {
         match event {
+            Event::ToolCallStarted { tool_call }
+                if !self.elicitation_tool_ids.contains(&tool_call.id) =>
+            {
+                self.track_tool_start(&tool_call.id, true);
+            }
+            Event::ToolCallUpdated { tool_call_id, .. }
+                if !self.elicitation_tool_ids.contains(tool_call_id) =>
+            {
+                self.track_tool_start(tool_call_id, false);
+            }
+            Event::ToolCallContent {
+                tool_call_id,
+                content,
+            } => {
+                self.buffer_tool_output(tool_call_id, content);
+            }
             Event::ElicitationRequested { elicitation } => {
                 if let Some(id) = &elicitation.tool_call_id {
                     self.elicitation_tool_ids.insert(id.clone());
+                    self.finish_tool(id);
                 }
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
+                self.finish_tool(tool_call_id);
                 self.elicitation_tool_ids.remove(tool_call_id);
             }
             Event::AgentMessageChunk {
@@ -164,6 +196,16 @@ impl TranscriptModel {
             } => self.last_message_id = Some(id.clone()),
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
                 self.last_message_id = None;
+            }
+            Event::Stopped { .. }
+            | Event::AgentStartupError { .. }
+            | Event::IncompatibleAgent { .. }
+            | Event::AgentSwitched { .. } => {
+                for tool in self.tools.values_mut() {
+                    if matches!(tool, ToolLifecycle::Open(_)) {
+                        drop(tool.finish());
+                    }
+                }
             }
             _ => {}
         }
@@ -258,10 +300,18 @@ impl TranscriptModel {
                 async_subagent,
             } => {
                 if self.elicitation_tool_ids.remove(tool_call_id) {
+                    self.finish_tool(tool_call_id);
                     return Vec::new();
                 }
-                let mut deltas =
-                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None);
+                let mut deltas = if matches!(
+                    self.tools.get(tool_call_id),
+                    Some(ToolLifecycle::Open(_) | ToolLifecycle::Terminal(_))
+                ) {
+                    Vec::new()
+                } else {
+                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None)
+                };
+                self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, *is_error, content);
                 row.at = *completed_at;
                 row.output = output.clone();
@@ -274,8 +324,7 @@ impl TranscriptModel {
                 content,
             } => {
                 // Each content frame replaces the previous snapshot.
-                self.tool_outputs
-                    .insert(tool_call_id.clone(), content.clone());
+                self.buffer_tool_output(tool_call_id, content);
                 Vec::new()
             }
             Event::ToolCallUpdated {
@@ -296,6 +345,7 @@ impl TranscriptModel {
                     return Vec::new();
                 };
                 self.elicitation_tool_ids.insert(tool_call_id.clone());
+                self.finish_tool(tool_call_id);
                 self.remove_rows_for_tool(tool_call_id)
             }
             Event::ElicitationResolved { nonce, answers, .. } => {
@@ -451,12 +501,64 @@ impl TranscriptModel {
         }
     }
 
+    fn track_tool_start(&mut self, id: &str, reopen_terminal: bool) {
+        let moved = match self.tools.get_full_mut(id) {
+            Some((index, _, tool @ ToolLifecycle::Buffered(_))) => {
+                let output = tool.finish();
+                *tool = ToolLifecycle::Open(output);
+                Some(index)
+            }
+            Some((index, _, tool @ ToolLifecycle::Terminal(_))) if reopen_terminal => {
+                *tool = ToolLifecycle::Open(String::new());
+                Some(index)
+            }
+            Some(_) => None,
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Open(String::new()));
+                None
+            }
+        };
+        if let Some(index) = moved {
+            self.tools.move_index(index, self.tools.len() - 1);
+        }
+    }
+
+    fn buffer_tool_output(&mut self, id: &str, content: &str) {
+        match self.tools.get_mut(id) {
+            Some(
+                ToolLifecycle::Buffered(output)
+                | ToolLifecycle::Open(output)
+                | ToolLifecycle::Terminal(output),
+            ) => {
+                output.clear();
+                output.push_str(content);
+            }
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Buffered(content.to_owned()));
+            }
+        }
+    }
+
+    fn finish_tool(&mut self, id: &str) -> String {
+        match self.tools.get_mut(id) {
+            Some(tool) => tool.finish(),
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Terminal(String::new()));
+                String::new()
+            }
+        }
+    }
+
     fn on_tool_started(&mut self, tool_call: &ToolCall) -> Vec<TranscriptDelta> {
         if self.elicitation_tool_ids.contains(&tool_call.id) {
             return Vec::new();
         }
+        self.track_tool_start(&tool_call.id, true);
+        self.turn_has_output = true;
         let Some(idx) = self.find_tool_start(&tool_call.id) else {
-            self.turn_has_output = true;
             return vec![self.append(tool_start_row(tool_call.clone()))];
         };
         let row = &mut self.rows[idx];
@@ -475,6 +577,9 @@ impl TranscriptModel {
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
+        if self.elicitation_tool_ids.contains(tool_call_id) {
+            return Vec::new();
+        }
         // A non-empty diff list replaces wholesale; none or empty keeps earlier diffs.
         let diffs = diffs.filter(|d| !d.is_empty());
         let synthesized = self.ensure_tool_start(
@@ -523,6 +628,7 @@ impl TranscriptModel {
         if self.find_tool_start(tool_call_id).is_some() {
             return Vec::new();
         }
+        self.track_tool_start(tool_call_id, false);
         self.turn_has_output = true;
         let tool = ToolCall {
             id: tool_call_id.to_string(),
@@ -548,7 +654,7 @@ impl TranscriptModel {
         content: &str,
     ) -> TranscriptRow {
         // Completion content wins, then streamed output, then a status word.
-        let buffered = self.tool_outputs.remove(tool_call_id).unwrap_or_default();
+        let buffered = self.finish_tool(tool_call_id);
         let text = if !content.is_empty() {
             content.to_string()
         } else if !buffered.is_empty() {
@@ -565,7 +671,6 @@ impl TranscriptModel {
         } else {
             base_id
         };
-        self.terminal_tools.insert(tool_call_id.to_string());
         let kind = if is_error {
             TranscriptRowKind::ToolError
         } else {
@@ -579,30 +684,26 @@ impl TranscriptModel {
     /// Close every `tool_start` without a terminal row with a `tool_stopped`
     /// carrying any buffered output.
     fn sweep_open_tools(&mut self, seq: u64) -> Vec<TranscriptDelta> {
-        let mut seen = self.terminal_tools.clone();
-        let open: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|row| row.kind == TranscriptRowKind::ToolStart)
-            .filter_map(|row| row.tool_call_id.clone())
-            .filter(|id| seen.insert(id.clone()))
-            .collect();
         let now = Utc::now();
-        open.into_iter()
-            .map(|id| {
-                self.terminal_tools.insert(id.clone());
-                let buffered = self.tool_outputs.remove(&id).unwrap_or_default();
-                let mut row = TranscriptRow::new(
-                    format!("stopped-{id}-{seq}"),
-                    format!("tool-{id}"),
-                    TranscriptRowKind::ToolStopped,
-                    buffered,
-                );
-                row.at = now;
-                row.tool_call_id = Some(id);
-                self.append(row)
-            })
-            .collect()
+        let mut deltas = Vec::new();
+        for index in 0..self.tools.len() {
+            let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
+            if !matches!(tool, ToolLifecycle::Open(_)) {
+                continue;
+            }
+            let buffered = tool.finish();
+            let id = id.clone();
+            let mut row = TranscriptRow::new(
+                format!("stopped-{id}-{seq}"),
+                format!("tool-{id}"),
+                TranscriptRowKind::ToolStopped,
+                buffered,
+            );
+            row.at = now;
+            row.tool_call_id = Some(id);
+            deltas.push(self.append(row));
+        }
+        deltas
     }
 
     fn remove_rows_for_tool(&mut self, tool_call_id: &str) -> Vec<TranscriptDelta> {
@@ -1220,7 +1321,7 @@ mod tests {
                 "case {i}"
             );
             assert!(
-                !m.tool_outputs.contains_key("t"),
+                matches!(m.tools.get("t"), Some(ToolLifecycle::Terminal(output)) if output.is_empty()),
                 "case {i}: buffer drained"
             );
         }
@@ -1475,7 +1576,213 @@ mod tests {
                     m.apply_event(i as u64 + 1, e);
                 }
             }
-            assert_eq!(kinds(&m), kinds(&full), "split at {split}");
+            let expected = if split == events.len() - 1 {
+                vec![TranscriptRowKind::ToolComplete]
+            } else {
+                kinds(&full)
+            };
+            assert_eq!(kinds(&m), expected, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn prefix_tool_lifecycle_retains_output_and_order_without_rendering_old_rows() {
+        use TranscriptRowKind as K;
+        for (label, prefix, suffix, expected) in [
+            (
+                "open",
+                vec![
+                    started(tool("t", "T")),
+                    content("t", "old"),
+                    content("t", "latest"),
+                ],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "t", "latest")],
+            ),
+            (
+                "completed",
+                vec![started(tool("t", "T")), completed("t", false, "done")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "already stopped",
+                vec![started(tool("t", "T")), stopped("cancelled")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "update first",
+                vec![updated("t", Some("Read"), None, None)],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "t", "")],
+            ),
+            (
+                "content alone",
+                vec![content("t", "buffered")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "closed metadata update",
+                vec![started(tool("t", "T")), completed("t", false, "done")],
+                vec![
+                    updated("t", Some("Renamed"), None, None),
+                    stopped("cancelled"),
+                ],
+                vec![(K::ToolStart, "t", "Renamed")],
+            ),
+            (
+                "ordered reuse",
+                vec![
+                    started(tool("b", "B")),
+                    started(tool("a", "A")),
+                    completed("b", false, ""),
+                    started(tool("c", "C")),
+                    started(tool("b", "B again")),
+                ],
+                vec![stopped("cancelled")],
+                vec![
+                    (K::ToolStopped, "a", ""),
+                    (K::ToolStopped, "c", ""),
+                    (K::ToolStopped, "b", ""),
+                ],
+            ),
+            (
+                "elicitation",
+                vec![
+                    started(tool("q", "AskUserQuestion")),
+                    elicitation_requested("q"),
+                    content("q", "not a tool result"),
+                ],
+                vec![
+                    updated("q", Some("Question"), None, None),
+                    stopped("cancelled"),
+                ],
+                vec![],
+            ),
+            (
+                "elicitation id reused",
+                vec![
+                    started(tool("q", "AskUserQuestion")),
+                    elicitation_requested("q"),
+                    completed("q", false, "answered"),
+                    started(tool("q", "Bash")),
+                ],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "q", "")],
+            ),
+            (
+                "content before live start",
+                vec![content("t", "prefix output")],
+                vec![started(tool("t", "Bash")), stopped("cancelled")],
+                vec![
+                    (K::ToolStart, "t", "Bash"),
+                    (K::ToolStopped, "t", "prefix output"),
+                ],
+            ),
+            (
+                "new start drops old trailing output",
+                vec![
+                    started(tool("t", "T")),
+                    completed("t", false, "done"),
+                    content("t", "old trailing output"),
+                ],
+                vec![started(tool("t", "Bash")), stopped("cancelled")],
+                vec![(K::ToolStart, "t", "Bash"), (K::ToolStopped, "t", "")],
+            ),
+        ] {
+            let mut model = TranscriptModel::new();
+            for event in &prefix {
+                model.observe_prior(event);
+                assert!(model.rows().is_empty(), "{label}: prefix stays unrendered");
+            }
+            for (index, event) in suffix.iter().enumerate() {
+                let seq = 100 + index as u64;
+                model.apply_event(seq, event);
+                assert!(
+                    model.apply_event(seq, event).is_empty(),
+                    "{label}: replay overlap"
+                );
+            }
+            let actual: Vec<_> = model
+                .rows()
+                .iter()
+                .map(|row| {
+                    let id = row
+                        .tool_call_id
+                        .as_deref()
+                        .or_else(|| row.tool.as_ref().map(|tool| tool.id.as_str()))
+                        .unwrap();
+                    (row.kind, id, row.text.as_str())
+                })
+                .collect();
+            assert_eq!(actual, expected, "{label}");
+            let terminals: Vec<_> = model
+                .rows()
+                .iter()
+                .map(|row| (row.id.clone(), row.at))
+                .collect();
+            model.apply_event(1000, &stopped("prompt_complete"));
+            assert_eq!(
+                model
+                    .rows()
+                    .iter()
+                    .map(|row| (row.id.clone(), row.at))
+                    .collect::<Vec<_>>(),
+                terminals,
+                "{label}: no second terminal or ticking end time"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_start_completion_emits_only_its_correlated_terminal() {
+        for (is_error, final_content, expected) in [
+            (false, "", "latest streamed output"),
+            (true, "final result", "final result"),
+        ] {
+            let mut model = TranscriptModel::new();
+            for event in [
+                started(tool("t", "Bash")),
+                content("t", "old snapshot"),
+                content("t", "latest streamed output"),
+            ] {
+                model.observe_prior(&event);
+            }
+            assert!(model.rows().is_empty());
+            let output = vec![ToolOutputBlock::Text {
+                text: "structured output".into(),
+            }];
+            let deltas = model.apply_event(
+                10,
+                &Event::ToolCallCompleted {
+                    tool_call_id: "t".into(),
+                    is_error,
+                    content: final_content.into(),
+                    output: output.clone(),
+                    completed_at: at(200),
+                    async_subagent: true,
+                },
+            );
+            assert!(matches!(deltas.as_slice(), [TranscriptDelta::Append(_)]));
+            let terminal = &model.rows()[0];
+            assert_eq!(
+                terminal.kind,
+                if is_error {
+                    TranscriptRowKind::ToolError
+                } else {
+                    TranscriptRowKind::ToolComplete
+                }
+            );
+            assert_eq!(terminal.tool_call_id.as_deref(), Some("t"));
+            assert_eq!(terminal.text, expected);
+            assert_eq!(terminal.at, at(200));
+            assert_eq!(terminal.output, output);
+            assert!(terminal.async_subagent);
+            assert!(model
+                .apply_event(11, &stopped("prompt_complete"))
+                .is_empty());
         }
     }
 
@@ -1591,7 +1898,9 @@ mod tests {
             (swept.kind, swept.text.as_str()),
             (TranscriptRowKind::ToolStopped, "partial out")
         );
-        assert!(!m.tool_outputs.contains_key("open-1"));
+        assert!(
+            matches!(m.tools.get("open-1"), Some(ToolLifecycle::Terminal(output)) if output.is_empty())
+        );
 
         let mut m = fold([
             started(tool("a", "A")),
@@ -1627,8 +1936,35 @@ mod tests {
         ];
         for closer in closers {
             let label = format!("{closer:?}");
-            let m = fold([started(tool("t1", "T")), closer]);
+            let m = fold([started(tool("t1", "T")), closer.clone()]);
             assert_eq!(count(&m, TranscriptRowKind::ToolStopped), 1, "{label}");
+            let mut partial = TranscriptModel::new();
+            partial.observe_prior(&started(tool("t1", "T")));
+            partial.observe_prior(&content("t1", "buffered before cursor"));
+            assert!(partial.rows().is_empty(), "{label}");
+            partial.apply_event(10, &closer);
+            let stopped_rows = partial
+                .rows()
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::ToolStopped)
+                .collect::<Vec<_>>();
+            assert_eq!(stopped_rows.len(), 1, "{label}");
+            assert_eq!(
+                stopped_rows[0].tool_call_id.as_deref(),
+                Some("t1"),
+                "{label}"
+            );
+            assert_eq!(stopped_rows[0].text, "buffered before cursor", "{label}");
+            let mut closed_prefix = TranscriptModel::new();
+            closed_prefix.observe_prior(&started(tool("t1", "T")));
+            closed_prefix.observe_prior(&closer);
+            assert!(closed_prefix.rows().is_empty(), "{label}");
+            assert!(
+                closed_prefix
+                    .apply_event(10, &stopped("cancelled"))
+                    .is_empty(),
+                "{label}"
+            );
         }
     }
 
