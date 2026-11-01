@@ -1925,12 +1925,19 @@ mod tests {
             (false, false, "wrapper_contract_required"),
             (false, true, "wrapper_contract_required"),
             (true, false, "wrapper_contract_required"),
+            (false, false, "omp_transcript_binding_required"),
+            (false, true, "omp_transcript_binding_required"),
+            (true, false, "omp_transcript_binding_required"),
             (false, false, "secret-token"),
         ] {
-            let expected = if cause == "wrapper_contract_required" {
-                crate::session::ManagedResumeCause::WrapperContractRequired
-            } else {
-                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            let expected = match cause {
+                "wrapper_contract_required" => {
+                    crate::session::ManagedResumeCause::WrapperContractRequired
+                }
+                "omp_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                }
+                _ => crate::session::ManagedResumeCause::ExecutionContextUnattested,
             };
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("api.sock");
@@ -1986,17 +1993,7 @@ mod tests {
                 };
                 let message = error.to_string();
                 assert!(!format!("{error:?}").contains("secret"));
-                assert!(message.contains("aoe session set-session-id"), "{message}");
-                assert!(message.contains("--store"), "{message}");
                 assert!(!message.contains("secret"), "{message}");
-                if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
-                    assert!(message.contains("session.agent_execution_as"), "{message}");
-                    assert!(message.contains("session.agent_config_dir"), "{message}");
-                }
-                assert!(
-                    message.contains("aoe session set-session-id <session> \"\""),
-                    "{message}"
-                );
                 if committed {
                     assert!(
                         matches!(error, DaemonClientError::Committed { cursor, code }

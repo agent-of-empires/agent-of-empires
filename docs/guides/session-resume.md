@@ -122,6 +122,16 @@ aoe session set-session-id <session> <native-id> --store /absolute/native/store
 
 `--store` explicitly selects a Claude configuration directory. For Pi and OMP it must name the exact existing transcript file, whose header must name the requested ID. Other agents resolve their store from configuration and reject explicit store routing.
 
+OMP cannot authorize resume from a native ID alone when its conversation binding
+or exact transcript path is absent. This refusal does not delete the saved
+conversation or establish that its transcript is missing or its configuration
+changed. Rebind the intended conversation with its exact existing transcript
+file, not the directory, then start or restart the session:
+
+```sh
+aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl
+```
+
 To start fresh once:
 
 ```sh

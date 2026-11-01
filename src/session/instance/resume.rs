@@ -26,6 +26,8 @@ pub enum ManagedResumeCause {
     UnsupportedManagedArguments,
     #[error("OpenCode session schema cannot be attested")]
     OpenCodeSchemaUnattested,
+    #[error("OMP exact transcript binding is missing")]
+    OmpTranscriptBindingRequired,
     #[error("native execution context cannot be attested")]
     ExecutionContextUnattested,
 }
@@ -36,6 +38,7 @@ impl ManagedResumeCause {
             Self::WrapperContractRequired => "wrapper_contract_required",
             Self::UnsupportedManagedArguments => "unsupported_managed_arguments",
             Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
+            Self::OmpTranscriptBindingRequired => "omp_transcript_binding_required",
             Self::ExecutionContextUnattested => "execution_context_unattested",
         }
     }
@@ -56,6 +59,15 @@ impl ManagedResumeCause {
                 "Managed resume refused: OpenCode schema cannot be attested.\n\
                  Restore a verified release/build and its original database."
             ),
+            Self::OmpTranscriptBindingRequired => {
+                "Managed resume refused: OMP transcript file is not bound.\n\
+                 The native session ID alone is not enough to authorize resume.\n\
+                 This refusal does not delete the saved conversation.\n\
+                 Bind the original conversation using its exact existing transcript file:\n\
+                 aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n\
+                 For OMP, --store must name the file, not its directory.\n\
+                 Then start/restart the session."
+            }
             Self::ExecutionContextUnattested => recovery_message!(
                 "Managed resume refused: execution context cannot be attested.\n\
                  Restore the original agent configuration and store."
@@ -974,6 +986,58 @@ mod tests {
         inst.source_profile = "managed-resume-refusal".into();
         inst.agent_session_id = Some(sid.into());
         inst.omp_capture_generation = Some("original-generation".into());
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        inst.extra_args = format!("--session-dir {}", shell_escape(store.to_str().unwrap()));
+        let transcript = store.join("original.jsonl");
+        let header = |id: &str, cwd: &std::path::Path| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session", "id": id, "cwd": cwd})
+            )
+        };
+        std::fs::write(&transcript, header(sid, &project)).unwrap();
+        let binding = inst
+            .asserted_resume_binding(sid, Some(&transcript))
+            .unwrap();
+        inst.resolve_native_execution(Some((sid, Some(&binding), false)))
+            .unwrap();
+        let mut no_path = binding.clone();
+        no_path.transcript_path = None;
+        let mut missing_file = binding.clone();
+        missing_file.transcript_path = Some(store.join("missing.jsonl"));
+        let mut outside_store = binding.clone();
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, header(sid, &project)).unwrap();
+        outside_store.transcript_path = Some(outside);
+        let mut wrong_sid = binding.clone();
+        let other_sid = store.join("other-id.jsonl");
+        std::fs::write(
+            &other_sid,
+            header("66666666-7777-4888-8999-aaaaaaaaaaaa", &project),
+        )
+        .unwrap();
+        wrong_sid.transcript_path = Some(other_sid);
+        let mut wrong_cwd = binding.clone();
+        let other_cwd = store.join("other-cwd.jsonl");
+        std::fs::write(&other_cwd, header(sid, temp.path())).unwrap();
+        wrong_cwd.transcript_path = Some(other_cwd);
+        let mut wrong_filesystem = binding.clone();
+        wrong_filesystem.execution.as_mut().unwrap().filesystem = "other".into();
+        use ManagedResumeCause::{ExecutionContextUnattested, OmpTranscriptBindingRequired};
+        let cases = [
+            (None, OmpTranscriptBindingRequired),
+            (
+                Some(ConversationBinding::unknown(sid)),
+                OmpTranscriptBindingRequired,
+            ),
+            (Some(no_path), OmpTranscriptBindingRequired),
+            (Some(missing_file), ExecutionContextUnattested),
+            (Some(outside_store), ExecutionContextUnattested),
+            (Some(wrong_sid), ExecutionContextUnattested),
+            (Some(wrong_cwd), ExecutionContextUnattested),
+            (Some(wrong_filesystem), ExecutionContextUnattested),
+        ];
         let storage =
             crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage
@@ -993,34 +1057,56 @@ mod tests {
         let pane = only_pane_id(&name);
         wait_for_pane_command(&pane, "sleep");
         let process = pane_field(&pane, "#{pane_pid}");
-        for intent in [ResumeIntent::Default, ResumeIntent::Use(sid.into())] {
-            inst.resume_intent = intent.clone();
-            let before = inst.conversation_state();
-            let failed_probe = matches!(intent, ResumeIntent::Use(_));
-            storage
-                .update(|rows, _| {
-                    rows[0].resume_intent = intent.clone();
-                    rows[0].resume_probe_failed_sid = failed_probe.then(|| sid.into());
-                    Ok(())
-                })
-                .unwrap();
-            let result = inst.restart_with_resume_policy(None, true, ResumeAttemptPolicy::Allow);
-            assert!(result.is_err(), "an unbound managed resume must refuse");
-            assert_eq!(only_pane_id(&name), pane);
-            assert_eq!(pane_field(&pane, "#{pane_pid}"), process);
-            assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
-            assert_eq!(inst.conversation_state(), before);
-            let stored = storage.load().unwrap().remove(0);
-            assert_eq!(stored.conversation_state(), before);
-            assert_eq!(
-                stored.omp_capture_generation.as_deref(),
-                Some("original-generation")
-            );
-            assert_eq!(
-                stored.resume_probe_failed_sid.as_deref(),
-                failed_probe.then_some(sid)
-            );
-            assert!(stored.lifecycle_reservation.is_none());
+        for (binding, expected) in cases {
+            for intent in [ResumeIntent::Default, ResumeIntent::Use(sid.into())] {
+                inst.resume_intent = intent.clone();
+                inst.agent_session_binding = binding.clone();
+                inst.resume_binding = binding.clone();
+                let before = inst.conversation_state();
+                let failed_probe = matches!(intent, ResumeIntent::Use(_));
+                storage
+                    .update(|rows, _| {
+                        rows[0].resume_intent = intent.clone();
+                        rows[0].agent_session_binding = binding.clone();
+                        rows[0].resume_binding = binding.clone();
+                        rows[0].resume_probe_failed_sid = failed_probe.then(|| sid.into());
+                        Ok(())
+                    })
+                    .unwrap();
+                let error = inst
+                    .restart_with_resume_policy(None, true, ResumeAttemptPolicy::Allow)
+                    .unwrap_err();
+                assert_eq!(
+                    ManagedResumeCause::from_error(&error),
+                    expected,
+                    "{error:#}"
+                );
+                if intent == ResumeIntent::Default {
+                    assert_eq!(
+                        error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                        expected
+                    );
+                }
+                assert_eq!(only_pane_id(&name), pane);
+                assert_eq!(pane_field(&pane, "#{pane_pid}"), process);
+                assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+                assert_eq!(inst.conversation_state(), before);
+                let stored = storage.load().unwrap().remove(0);
+                assert_eq!(stored.conversation_state(), before);
+                assert_eq!(
+                    stored.omp_capture_generation.as_deref(),
+                    Some("original-generation")
+                );
+                assert_eq!(
+                    stored.resume_probe_failed_sid.as_deref(),
+                    failed_probe.then_some(sid)
+                );
+                assert!(stored.lifecycle_reservation.is_none());
+                assert_eq!(
+                    std::fs::read_to_string(&transcript).unwrap(),
+                    header(sid, &project)
+                );
+            }
         }
     }
 

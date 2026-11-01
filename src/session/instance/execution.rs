@@ -2252,10 +2252,16 @@ impl Instance {
             }
             context.layout.sessions = inputs.canonical_path(&context.layout.sessions)?;
             if let Some((sid, binding, _)) = target {
-                let binding = binding.context("OMP resume requires a bound transcript")?;
-                let file = binding.transcript_path.as_ref().context(
-                    "OMP resume requires its exact transcript; rebind using --store with that file",
-                )?;
+                let binding = binding
+                    .context("OMP resume requires a bound transcript")
+                    .context(ManagedResumeCause::OmpTranscriptBindingRequired)?;
+                let file = binding
+                    .transcript_path
+                    .as_ref()
+                    .context(
+                        "OMP resume requires its exact transcript; rebind using --store with that file",
+                    )
+                    .context(ManagedResumeCause::OmpTranscriptBindingRequired)?;
                 anyhow::ensure!(
                     binding
                         .execution

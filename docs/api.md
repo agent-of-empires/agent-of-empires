@@ -662,8 +662,10 @@ effect-free daemon refusals do not acknowledge a commit.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.
-Missing, unknown, or ambiguous cause metadata keeps the refusal generic; native
-clients do not read response bodies to derive that reason. See
+The `omp_transcript_binding_required` cause identifies an absent OMP conversation
+binding or exact transcript path, not a missing file on disk or another failed
+attestation. Missing, unknown, or ambiguous cause metadata keeps the refusal
+generic; native clients do not read response bodies to derive that reason. See
 [managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
