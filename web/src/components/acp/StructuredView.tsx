@@ -9,7 +9,7 @@ import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import { visibleSessionNotices } from "../../lib/acpTypes";
+import { canSubmitPromptIntent, nativeInputAvailable, visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting } from "./startupWait";
 import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
@@ -193,6 +193,7 @@ function AcpChrome({
     : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
+  const nativeReady = status === "open" && nativeInputAvailable(state);
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
@@ -220,8 +221,8 @@ function AcpChrome({
     localInflight: state.inflightPromptIds.length > 0,
   });
 
-  // An adapter that failed the compatibility check never runs, so no chat surface.
-  if (state.incompatibleAgent) {
+  // Structured compatibility diagnostics do not override a current healthy native receipt.
+  if (state.incompatibleAgent && !nativeReady) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
         <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={view.isSandboxed} />
@@ -335,16 +336,18 @@ function AcpChrome({
                 <ApprovalCard
                   key={approval.nonce}
                   approval={approval}
+                  canDecide={!readOnly && nativeReady}
                   onResolve={(decision, optionId) => ctx.resolveApproval(approval.nonce, decision, optionId)}
                 />
               ))}
 
               {state.pendingElicitations.map((elicitation) => (
-                <AskUserQuestionCard
-                  key={elicitation.nonce}
-                  elicitation={elicitation}
-                  onResolve={(resolution) => ctx.resolveElicitation(elicitation.nonce, resolution)}
-                />
+                <fieldset key={elicitation.nonce} disabled={readOnly || !nativeReady} className="contents">
+                  <AskUserQuestionCard
+                    elicitation={elicitation}
+                    onResolve={(resolution) => ctx.resolveElicitation(elicitation.nonce, resolution)}
+                  />
+                </fieldset>
               ))}
             </div>
           </ThreadPrimitive.Viewport>
@@ -465,7 +468,7 @@ function ComposerDock({
         rejected={state.rejectedPrompts}
         onRetry={ctx.sendPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
-        disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+        disabled={status !== "open" || !canSubmitPromptIntent(state)}
       />
 
       <SessionNoticesStrip notices={visibleSessionNotices(state)} onDismiss={ctx.dismissSessionNotice} />
@@ -522,7 +525,10 @@ function ComposerDock({
           sessionUsage={state.sessionUsage}
           authStatus={state.authStatus}
           availableCommands={state.availableCommands}
-          connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+          connected={status === "open" && nativeInputAvailable(state)}
+          canForceEndTurn={ctx.canForceEndTurn}
+          stopTurn={ctx.stopTurn}
+          canSubmit={status === "open" && canSubmitPromptIntent(state)}
           turnActive={state.turnActive}
           enqueuePrompt={ctx.sendPrompt}
           promptCapabilities={state.promptCapabilities}

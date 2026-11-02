@@ -188,11 +188,15 @@ pub async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
 ) -> (PathBuf, RunnerGuard) {
+    let node = shim_node().expect("shim prerequisite");
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    let mut roots = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"]);
+    roots.set("HOME", &home);
+    roots.set("XDG_CONFIG_HOME", &xdg);
 
     // The daemon verifies the id the runner announces, so `session_id` must
     // match what the caller later attaches with.
@@ -211,7 +215,7 @@ pub async fn spawn_runner_with_shim(
         "--cwd",
         home.to_str().unwrap(),
         "--",
-        shim_node().expect("shim prerequisite").to_str().unwrap(),
+        node.to_str().unwrap(),
         shim_path().to_str().unwrap(),
     ])
     .env("HOME", &home)
@@ -305,6 +309,7 @@ pub async fn spawn_runner_with_shim(
         socket_path,
         RunnerGuard {
             _child: child,
+            _env: roots,
             _temp: temp,
         },
     )
@@ -314,6 +319,7 @@ pub async fn spawn_runner_with_shim(
 /// Dropping this kills the runner, which takes the shim with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
+    _env: EnvGuard,
     _temp: tempfile::TempDir,
 }
 

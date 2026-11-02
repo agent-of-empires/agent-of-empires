@@ -280,10 +280,10 @@ impl HomeView {
         }
         let pending = self.pending_native_attachment.take()?;
         let error = match result {
-            Ok(Ok(tmux_name)) if pending.preparation.lease.is_valid() => {
+            Ok(Ok(terminal)) if pending.preparation.lease.is_valid() => {
                 return Some(ReadyNativeAttachment {
                     id: pending.id,
-                    tmux_name,
+                    terminal,
                     lease: pending.preparation.lease,
                     intent: pending.intent,
                 });
@@ -301,77 +301,6 @@ impl HomeView {
         };
         self.info_dialog = Some(InfoDialog::sized_to_fit(title, &error));
         None
-    }
-
-    /// Attach only after this restart's receipt and its compatible snapshot.
-    pub fn restart_then_attach(
-        &mut self,
-        id: &str,
-        size: Option<(u16, u16)>,
-        skip_on_launch: bool,
-    ) {
-        self.queue_launch_then_attach(id, size, Some(skip_on_launch));
-    }
-
-    pub fn start_then_attach(&mut self, id: &str, size: Option<(u16, u16)>) {
-        self.queue_launch_then_attach(id, size, None);
-    }
-
-    fn queue_launch_then_attach(
-        &mut self,
-        id: &str,
-        size: Option<(u16, u16)>,
-        restart_skip_on_launch: Option<bool>,
-    ) {
-        if self.restart_in_flight.contains(id) {
-            return;
-        }
-        let Some(instance) = self.get_instance(id) else {
-            return;
-        };
-        let source_profile = instance.source_profile.clone();
-        self.cancel_native_attachment();
-        let preparation = if let Some(skip_on_launch) = restart_skip_on_launch {
-            let body = crate::daemon::RestartSessionBody {
-                size: size.and_then(|(cols, rows)| {
-                    Some(crate::daemon::TerminalSize {
-                        cols: std::num::NonZeroU16::new(cols)?,
-                        rows: std::num::NonZeroU16::new(rows)?,
-                    })
-                }),
-                skip_on_launch,
-                wake_message: Some(String::new()),
-                ..Default::default()
-            };
-            self.session_feed.restart_agent(id.into(), body)
-        } else {
-            self.session_feed.start_agent(id.into(), size)
-        };
-        match preparation {
-            Ok(preparation) => {
-                self.pending_native_attachment = Some(PendingNativeAttachment {
-                    id: id.into(),
-                    profile_filter: self.active_profile.clone(),
-                    source_profile,
-                    view_mode: self.view_mode.clone(),
-                    terminal_mode: self.get_terminal_mode(id),
-                    pane: NativePane::Agent,
-                    intent: PaneIntent::Attach,
-                    preparation,
-                });
-                self.restart_in_flight.insert(id.into());
-            }
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    if restart_skip_on_launch.is_some() {
-                        "Restart failed"
-                    } else {
-                        "Start failed"
-                    },
-                    &format!("{error}\nReconnect the runtime and try again."),
-                ))
-            }
-        }
     }
 
     /// Submit a daemon stop for id through the feed. The daemon snapshot remains authoritative.

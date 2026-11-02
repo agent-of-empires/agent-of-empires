@@ -11,7 +11,7 @@ pub(crate) fn classify_rate_limit_error(
 ) -> Option<RateLimitInfo> {
     let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
     (kind == "rate_limit").then(|| RateLimitInfo {
-        status: err.message.clone(),
+        status: super::errors::public_error_message(err),
         resets_at: captured_resets_at,
         kind: kind.to_string(),
     })
@@ -33,29 +33,6 @@ pub(crate) fn classify_rate_limit_from_message(
         resets_at: captured_resets_at,
         kind: "rate_limit".to_string(),
     })
-}
-
-/// A stored session ID the agent no longer knows, as opposed to an
-/// unsupported session feature.
-pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
-    const PHRASES: &[&str] = &[
-        "unsupported acp session",
-        "unknown session",
-        "session not found",
-        "no such session",
-        "session does not exist",
-    ];
-    // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
-    if err.code == agent_client_protocol::ErrorCode::ResourceNotFound
-        && err
-            .data
-            .as_ref()
-            .is_some_and(|d| d.get("sessionId").is_some())
-    {
-        return true;
-    }
-    let msg = err.message.to_ascii_lowercase();
-    PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
 
 /// A rejected window from a `usage_update`'s `_meta["_claude/rateLimit"]`.
@@ -351,45 +328,5 @@ mod tests {
                 assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
-    }
-
-    #[test]
-    fn is_unsupported_session_error_matches_only_stale_session_rejections() {
-        let cases = [
-            ("Unsupported ACP session", true),
-            ("Unknown session 01a040bb-...", true),
-            ("session not found", true),
-            ("no such session: abc", true),
-            ("Session does not exist", true),
-            ("You've hit your limit", false),
-            ("transport closed", false),
-            ("unsupported model", false),
-            ("unknown tool", false),
-            ("Unsupported content block in session/prompt", false),
-            ("Method not found: session/prompt", false),
-            ("Unsupported session mode", false),
-            ("Unsupported session capability: fork", false),
-        ];
-        for (msg, expected) in cases {
-            assert_eq!(
-                is_unsupported_session_error(&err(msg, None)),
-                expected,
-                "{msg:?}"
-            );
-        }
-
-        // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
-        let not_found = |data| {
-            let mut e = err("Resource not found", data);
-            e.code = agent_client_protocol::ErrorCode::ResourceNotFound;
-            e
-        };
-        assert!(is_unsupported_session_error(&not_found(Some(
-            json!({ "sessionId": "abc" })
-        ))));
-        assert!(!is_unsupported_session_error(&not_found(None)));
-        assert!(!is_unsupported_session_error(&not_found(Some(
-            json!({ "uri": "file:///x" })
-        ))));
     }
 }

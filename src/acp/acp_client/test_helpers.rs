@@ -122,3 +122,83 @@ pub(super) fn reset_fake_spawn_config(
         base_host_environment: vec![],
     }
 }
+
+impl super::AcpClient {
+    /// Use the real control reader and SDK foreground, without spawning another
+    /// actor or consuming its original inbound receiver in the fixture.
+    pub(crate) async fn original_fork_for_test(
+        record: &crate::process::worker_registry::WorkerRecord,
+        row: &crate::session::Instance,
+        parent: &str,
+    ) -> Self {
+        let launch = super::Launch {
+            session_id: crate::acp::state::AcpSessionId(row.id.clone()),
+            mode: super::ConnectMode::Fresh {
+                stored_acp_session_id: None,
+                seed_history_replay: false,
+                fork_from: Some(parent.into()),
+                prior_conversation: false,
+            },
+            cwd: row.project_path.clone().into(),
+            additional_dirs: Vec::new(),
+            sandbox: None,
+            profile: crate::acp::agent_profiles::resolve("test-agent"),
+            install_binary: "test-agent-acp".into(),
+            source_profile: Some(row.source_profile.clone()),
+            default_effort: None,
+            default_mode: None,
+            default_model: None,
+            mcp_servers: Vec::new(),
+            claude_home: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        Self::connect_via_socket(
+            record.socket_path.clone(),
+            launch,
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10)),
+            crate::acp::runner_lifecycle::RunnerIdentity::from_record(record),
+        )
+        .await
+        .expect("original child completed initialize")
+    }
+
+    pub(crate) fn captured_fork_response_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<crate::acp::state::NativeForkRejection>> {
+        self.connection_state
+            .fork_response
+            .lock()
+            .unwrap()
+            .snapshot()
+    }
+
+    pub(crate) fn original_fork_emit_for_test(
+        &self,
+        before: bool,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let (notified, observed) = tokio::sync::oneshot::channel();
+        if before {
+            let (release, waiting) = tokio::sync::oneshot::channel();
+            assert!(self
+                .connection_state
+                .fork_emit_gate
+                .lock()
+                .unwrap()
+                .replace((notified, waiting))
+                .is_none());
+            (observed, Some(release))
+        } else {
+            assert!(self
+                .connection_state
+                .fork_emitted
+                .lock()
+                .unwrap()
+                .replace(notified)
+                .is_none());
+            (observed, None)
+        }
+    }
+}

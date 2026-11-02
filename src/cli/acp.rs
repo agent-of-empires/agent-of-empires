@@ -1011,7 +1011,7 @@ async fn restart(session: &str) -> Result<()> {
             &Some(intent),
         )?;
     }
-    worker_registry::mark_restart_pending(session, record.generation);
+    worker_registry::mark_restart_pending(session, record.generation)?;
 
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
@@ -1259,6 +1259,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::BackgroundTaskStarted { .. } => "background_task_started",
         Event::BackgroundTaskFinished { .. } => "background_task_finished",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
+        Event::AcpConnectionUnavailable { .. } => "acp_connection_unavailable",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
@@ -1398,6 +1399,7 @@ mod tests {
                     store: std::sync::Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let mut admitted = crate::acp::supervisor::with_durable_launch(
                     Some(admission),
@@ -1411,7 +1413,7 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(admitted.wait().unwrap().success());
-                worker_registry::clear_restart_marker(&row.id);
+                let _ = worker_registry::claim_restart_marker(&row.id);
             }
         }
     }

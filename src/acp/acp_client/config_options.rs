@@ -13,6 +13,11 @@ use agent_client_protocol::{Agent, ConnectionTo};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::connection::ConnectionState;
+use super::errors::public_error_message;
+use super::session_identity::{ordered_native_request, spawn_native_request, OrderedRequestResult};
+use std::sync::Arc;
+
 /// `None` when the response carried no options, so cached selectors persist.
 /// An empty list is a real replacement and must propagate (#1403).
 pub(super) fn config_options_event(raw: Option<Vec<SessionConfigOption>>) -> Option<Event> {
@@ -105,11 +110,11 @@ pub(super) fn config_option_failure_event(
     }
 }
 
-/// The adapter answers with the full option list but sends no follow-up
-/// notification, so the response itself is re-emitted. Runs detached so the
-/// command loop never blocks.
+/// The adapter's response itself supplies the option list. Its application
+/// scope belongs to the SDK connection and settles at ordered native loss.
 pub(super) fn dispatch_set_config_option(
     connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
     acp_session_id: &SessionId,
     config_id: String,
     value: String,
@@ -120,21 +125,32 @@ pub(super) fn dispatch_set_config_option(
         target: "acp.protocol",
         "sending session/set_config_option {config_id}={value}"
     );
-    let sent = connection.send_request(SetSessionConfigOptionRequest::new(
+    let request = SetSessionConfigOptionRequest::new(
         acp_session_id.clone(),
         SessionConfigId::new(config_id.clone()),
         SessionConfigValueId::new(value.clone()),
-    ));
-    tokio::spawn(async move {
-        let events = match sent.block_task().await {
-            Ok(resp) => config_option_success_events(resp.config_options, value, purpose),
-            Err(e) => {
-                let reason = e.to_string();
-                warn!(target: "acp.protocol", "session/set_config_option failed: {reason}");
+    );
+    let _ = spawn_native_request(connection, state, request, move |request| async move {
+        let events = match request.wait().await {
+            OrderedRequestResult::Correlated(Ok(response)) => {
+                config_option_success_events(response.config_options, value, purpose)
+            }
+            OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error) => {
+                warn!(target: "acp.protocol", ?error, "session/set_config_option failed");
                 vec![config_option_failure_event(
-                    config_id, value, reason, purpose,
+                    config_id,
+                    value,
+                    public_error_message(&error),
+                    purpose,
                 )]
             }
+            OrderedRequestResult::Unavailable(_) => return,
+            OrderedRequestResult::Abandoned => vec![config_option_failure_event(
+                config_id,
+                value,
+                "Config response was not observed".into(),
+                purpose,
+            )],
         };
         for event in events {
             let _ = event_tx.send(event).await;
@@ -147,6 +163,7 @@ pub(super) fn dispatch_set_config_option(
 /// Returns the agent's option list, or the rejection reason.
 pub(super) async fn apply_config_default(
     connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
     event_tx: &mpsc::Sender<Event>,
     session_id: SessionId,
     config_id: SessionConfigId,
@@ -165,21 +182,21 @@ pub(super) async fn apply_config_default(
         config_id,
         SessionConfigValueId::new(value.to_string()),
     );
-    match connection.send_request(request).block_task().await {
-        Ok(resp) => {
+    let request = ordered_native_request(connection, state, request)
+        .map_err(|_| "ACP connection unavailable".to_string())?;
+    match request.wait().await {
+        OrderedRequestResult::Correlated(Ok(resp)) => {
             if let Some(event) = config_options_event(Some(resp.config_options.clone())) {
                 let _ = event_tx.send(event).await;
             }
             Ok(resp.config_options)
         }
-        Err(e) => {
-            warn!(
-                target: "acp.protocol",
-                session = %session_label,
-                "structured view default failed: {e}"
-            );
-            Err(e.to_string())
+        OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error) => {
+            warn!(target: "acp.protocol", session = %session_label, ?error, "structured view default failed");
+            Err(public_error_message(&error))
         }
+        OrderedRequestResult::Unavailable(_) => Err("ACP connection unavailable".into()),
+        OrderedRequestResult::Abandoned => Err("Config response was not observed".into()),
     }
 }
 
@@ -331,6 +348,7 @@ fn resolve_mode_set_target<'a>(
 
 pub(super) fn dispatch_set_mode(
     connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
     acp_session_id: &SessionId,
     mode_id: String,
     channels: &SessionChannels,
@@ -349,6 +367,7 @@ pub(super) fn dispatch_set_mode(
     if let ModeSetTarget::ConfigOption(config_id) = target {
         dispatch_set_config_option(
             connection,
+            state,
             acp_session_id,
             config_id.to_string(),
             mode_id,
@@ -362,20 +381,24 @@ pub(super) fn dispatch_set_mode(
         while_prompting,
         "sending session/set_mode mode={mode_id}"
     );
-    let sent = connection.send_request(SetSessionModeRequest::new(
-        acp_session_id.clone(),
-        mode_id.clone(),
-    ));
-    tokio::spawn(async move {
-        let event = match sent.block_task().await {
-            Ok(_) => Event::CurrentModeChanged {
+    let request = SetSessionModeRequest::new(acp_session_id.clone(), mode_id.clone());
+    let _ = spawn_native_request(connection, state, request, move |request| async move {
+        let event = match request.wait().await {
+            OrderedRequestResult::Correlated(Ok(_)) => Event::CurrentModeChanged {
                 current_mode_id: mode_id,
             },
-            Err(e) => {
-                let reason = e.to_string();
-                warn!(target: "acp.protocol", while_prompting, "session/set_mode failed: {reason}");
-                Event::ModeSwitchFailed { mode_id, reason }
+            OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error) => {
+                warn!(target: "acp.protocol", while_prompting, ?error, "session/set_mode failed");
+                Event::ModeSwitchFailed {
+                    mode_id,
+                    reason: public_error_message(&error),
+                }
             }
+            OrderedRequestResult::Unavailable(_) => return,
+            OrderedRequestResult::Abandoned => Event::ModeSwitchFailed {
+                mode_id,
+                reason: "Mode response was not observed".into(),
+            },
         };
         let _ = event_tx.send(event).await;
     });

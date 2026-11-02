@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 use super::AppState;
+use crate::session::SessionStore;
 
 pub(super) fn legacy_tool_scope(
     rows: &[crate::session::Instance],
@@ -89,6 +90,7 @@ pub(super) fn observe_auxiliary(
                             metadata.server.as_ref(),
                         ) {
                             return PaneObservation {
+                                physical: None,
                                 state: crate::session::PanePresence::Unknown,
                                 tmux_session: Some(name.to_owned()),
                                 legacy_tool: Some(crate::session::LegacyToolObservation {
@@ -112,6 +114,7 @@ fn observe_metadata(
     use crate::session::{PaneObservation, PanePresence};
     match metadata {
         Ok(Some((name, metadata))) => PaneObservation {
+            physical: metadata.physical_observation(),
             state: if metadata.pane_dead {
                 PanePresence::Dead
             } else {
@@ -121,6 +124,7 @@ fn observe_metadata(
             legacy_tool: None,
         },
         Ok(None) => PaneObservation {
+            physical: None,
             state: PanePresence::Absent,
             tmux_session: None,
             legacy_tool: None,
@@ -302,12 +306,18 @@ pub(super) async fn seed_initial_observations(
 #[error("Auxiliary target is unavailable")]
 pub(super) struct AuxiliaryTargetUnavailable;
 
+struct SampledAuxiliary {
+    _ownership: (crate::session::StorageFlock, crate::session::StorageFlock),
+    tmux_session: String,
+    physical: Arc<crate::session::LegacyToolObservation>,
+}
+
 // Retain these locks through any launch-owned state handoff.
 fn sample_auxiliary_after_ensure(
     native: &super::session_store::NativeSessionStore,
     instance: &mut crate::session::Instance,
     target: crate::session::AuxiliaryTarget,
-) -> anyhow::Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
+) -> anyhow::Result<SampledAuxiliary> {
     let generation = instance.lifecycle_generation;
     let title = instance.title.clone();
     let ownership = instance.acquire_auxiliary_locks_in(native)?;
@@ -324,57 +334,92 @@ fn sample_auxiliary_after_ensure(
         &instance.source_profile,
         None,
     );
-    let state = pane.state;
+    let sampled = if pane.state == crate::session::PanePresence::Alive {
+        pane.tmux_session
+            .as_ref()
+            .zip(pane.physical.as_ref())
+            .map(|(name, physical)| (name.clone(), physical.clone()))
+    } else {
+        None
+    };
     native.adopt_auxiliary_observations(
         instance,
         std::iter::once(crate::session::AuxiliaryObservation { target, pane }),
     )?;
     panes?;
-    anyhow::ensure!(
-        state == crate::session::PanePresence::Alive,
-        AuxiliaryTargetUnavailable
-    );
-    Ok(ownership)
+    let (tmux_session, physical) = sampled.ok_or(AuxiliaryTargetUnavailable)?;
+    Ok(SampledAuxiliary {
+        _ownership: ownership,
+        tmux_session,
+        physical,
+    })
 }
 
 pub(super) async fn publish_auxiliary_after_ensure(
     state: &Arc<AppState>,
     mut instance: crate::session::Instance,
     target: crate::session::AuxiliaryTarget,
-) -> anyhow::Result<crate::daemon::RuntimeCursor> {
+    created: bool,
+    native: super::session_store::NativeSessionStore,
+) -> anyhow::Result<crate::daemon::MutationReceipt<crate::daemon::TerminalTarget>> {
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&instance.id).await;
     let guard = lock.lock().await;
     let id = instance.id.clone();
-    let worker_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let native = super::session_store::NativeSessionStore::open(
-            worker_state,
-            &instance.source_profile,
-            None,
-        )?;
-        let _ownership = sample_auxiliary_after_ensure(&native, &mut instance, target)?;
-        Ok(())
+    let expected = (
+        instance.lifecycle_generation,
+        instance.source_profile.clone(),
+    );
+    let created_at = instance.created_at;
+    let expected_target = target.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let sampled = sample_auxiliary_after_ensure(&native, &mut instance, target)?;
+        Ok(crate::daemon::TerminalTarget {
+            tmux_session: sampled.tmux_session,
+            physical: Some(sampled.physical),
+            lifecycle_generation: instance.lifecycle_generation,
+            profile: instance.source_profile,
+            status: if created {
+                crate::daemon::TerminalTargetStatus::Created
+            } else {
+                crate::daemon::TerminalTargetStatus::Exists
+            },
+        })
     })
     .await?;
     drop(guard);
     drop(namespace);
     let snapshot = state.runtime.publish(state).await?;
-    result?;
+    let target = result?;
     anyhow::ensure!(
         snapshot.value.contents.health == crate::daemon::RuntimeHealth::Healthy,
         crate::session::NativeStoreUnavailable
     );
-    anyhow::ensure!(
-        snapshot
-            .value
-            .contents
-            .sessions
-            .iter()
-            .any(|row| row.id == id),
-        crate::session::LifecycleReservationError::Superseded
-    );
-    Ok(snapshot.value.cursor.clone())
+    let row = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| {
+            row.id == id
+                && row.lifecycle_generation == expected.0
+                && row.profile == expected.1
+                && row.created_at.parse::<chrono::DateTime<chrono::Utc>>().ok() == Some(created_at)
+        })
+        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+    row.auxiliary
+        .iter()
+        .find(|observation| observation.target == expected_target)
+        .filter(|observation| {
+            observation.pane.state == crate::session::PanePresence::Alive
+                && observation.pane.physical == target.physical
+                && observation.pane.tmux_session.as_deref() == Some(target.tmux_session.as_str())
+        })
+        .ok_or(AuxiliaryTargetUnavailable)?;
+    Ok(crate::daemon::MutationReceipt {
+        cursor: snapshot.value.cursor.clone(),
+        outcome: target,
+    })
 }
 
 pub(super) enum AuxiliaryStopRequest {
@@ -685,13 +730,13 @@ pub(crate) async fn respawn_paired_if_dead(
             &instance.source_profile,
             None,
         )?;
-        let (terminal, _) = instance.start_terminal_with_size_indexed_in(index, None, &native)?;
-        let _ownership = sample_auxiliary_after_ensure(
+        instance.start_terminal_with_size_indexed_in(index, None, &native)?;
+        let sampled = sample_auxiliary_after_ensure(
             &native,
             &mut instance,
             crate::session::AuxiliaryTarget::Host { index },
         )?;
-        Ok(terminal.name().to_owned())
+        Ok(sampled.tmux_session)
     })
     .await??;
     drop(guard);
@@ -726,7 +771,13 @@ pub(crate) async fn respawn_container_if_dead(
         return Ok(tmux_name);
     }
 
-    let (target, _) = ensure_native_container_terminal(state, id, index, None).await?;
+    let binding = crate::session::Storage::open_reference(&inst.source_profile)?;
+    let expected = crate::daemon::NativePreparationIdentity::from_instance(
+        inst,
+        binding.bound_profile_identity()?,
+    );
+    let (target, _) =
+        ensure_native_container_terminal(state, id, index, None, Some(expected)).await?;
     Ok(target.tmux_session)
 }
 
@@ -735,6 +786,7 @@ pub(crate) async fn ensure_native_container_terminal(
     id: &str,
     index: u32,
     size: Option<(u16, u16)>,
+    expected: Option<crate::daemon::NativePreparationIdentity>,
 ) -> anyhow::Result<(crate::daemon::TerminalTarget, crate::daemon::RuntimeCursor)> {
     let worker_state = state.clone();
     let worker_id = id.to_owned();
@@ -753,14 +805,26 @@ pub(crate) async fn ensure_native_container_terminal(
             .find(|row| row.id == worker_id)
             .cloned()
             .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            expected
+                .as_ref()
+                .is_none_or(|expected| expected.matches(&instance)),
+            crate::session::LifecycleReservationError::Superseded
+        );
         let native = super::session_store::NativeSessionStore::open(
             worker_state.clone(),
             &instance.source_profile,
             None,
         )?;
+        anyhow::ensure!(
+            expected
+                .as_ref()
+                .is_none_or(|expected| expected.matches_source(native.storage())),
+            crate::session::LifecycleReservationError::Superseded
+        );
         let prior_identity_publisher = instance.identity_publisher_launched;
         let mut minted_env = false;
-        let (terminal, created) = instance.start_container_terminal_with_hook_in(
+        let (_, created) = instance.start_container_terminal_with_hook_in(
             index,
             size,
             &native,
@@ -772,7 +836,11 @@ pub(crate) async fn ensure_native_container_terminal(
                 result
             },
         )?;
-        let _ownership = sample_auxiliary_after_ensure(
+        let SampledAuxiliary {
+            _ownership,
+            tmux_session,
+            physical,
+        } = sample_auxiliary_after_ensure(
             &native,
             &mut instance,
             crate::session::AuxiliaryTarget::Container { index },
@@ -782,7 +850,8 @@ pub(crate) async fn ensure_native_container_terminal(
             instance.source_profile.clone(),
         );
         let target = crate::daemon::TerminalTarget {
-            tmux_session: terminal.name().to_owned(),
+            physical: Some(physical),
+            tmux_session,
             status: if created {
                 crate::daemon::TerminalTargetStatus::Created
             } else {
@@ -798,7 +867,8 @@ pub(crate) async fn ensure_native_container_terminal(
             .find(|row| row.id == worker_id)
             .ok_or(crate::session::LifecycleReservationError::Superseded)?;
         anyhow::ensure!(
-            row.lifecycle_generation == instance.lifecycle_generation
+            row.created_at == instance.created_at
+                && row.lifecycle_generation == instance.lifecycle_generation
                 && row.source_profile == instance.source_profile
                 && row.title == instance.title,
             crate::session::LifecycleReservationError::Superseded
@@ -941,6 +1011,145 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 mod tests {
     use super::*;
 
+    async fn assert_container_receipt_matches_sampled_physical(
+        recreate_dead: bool,
+    ) -> anyhow::Result<()> {
+        use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        let mut row = crate::session::Instance::new("container receipt", "/tmp");
+        row.source_profile = "default".into();
+        row.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "receipt-fixture".into(),
+            container_name: "receipt-fixture".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let terminal = row.container_terminal_tmux_session_indexed(0)?;
+        let _terminal = TmuxTestSession::from_name(terminal.name());
+        // Inject only the pane command through the existing constructor. Ensure,
+        // native-store reconciliation, observation and receipt production stay real.
+        terminal.create_with_size("/tmp", Some("sleep 600"), None, "default")?;
+        let target = AuxiliaryTarget::Container { index: 0 };
+        let corpse = if recreate_dead {
+            let pane_id = only_pane_id(terminal.name());
+            assert!(crate::tmux::tmux_command()
+                .args([
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane_id,
+                    "remain-on-exit",
+                    "on",
+                    ";",
+                    "respawn-pane",
+                    "-k",
+                    "-t",
+                    &pane_id,
+                    "exit 0",
+                ])
+                .status()?
+                .success());
+            wait_for_pane_dead(&pane_id);
+            let panes = crate::tmux::batch_pane_metadata()?;
+            let observation = observe_auxiliary(
+                &row.id,
+                &row.title,
+                &target,
+                Some(&panes),
+                &row.source_profile,
+                None,
+            );
+            assert_eq!(observation.state, PanePresence::Dead);
+            let physical = observation
+                .physical
+                .clone()
+                .expect("confirmed corpse identity");
+            row.auxiliary.push(AuxiliaryObservation {
+                target: target.clone(),
+                pane: observation,
+            });
+            terminal.kill()?;
+            // Recreate through the same owned-tmux constructor, without requiring
+            // a container engine. This isolates the receipt, not Docker launch.
+            terminal.create_with_size("/tmp", Some("sleep 600"), None, "default")?;
+            Some(physical)
+        } else {
+            assert!(row.auxiliary.is_empty());
+            None
+        };
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let metadata = panes.get(terminal.name()).expect("owned fixture pane");
+        assert_eq!(
+            metadata.session_kind.as_deref(),
+            Some(crate::tmux::SessionKind::ContainerTerminal.as_marker())
+        );
+        assert!(!metadata.pane_dead);
+        let expected = metadata
+            .physical_observation()
+            .expect("live physical identity");
+        if let Some(corpse) = &corpse {
+            assert_ne!(corpse, &expected, "fixture must replace the corpse");
+        }
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let result = ensure_native_container_terminal(&state, &row.id, 0, None, None).await;
+        let sampled = state.instances.read().await[0]
+            .auxiliary
+            .iter()
+            .find(|observation| observation.target == target)
+            .expect("Ensure must adopt its actual sample")
+            .pane
+            .clone();
+        assert_eq!(sampled.state, PanePresence::Alive);
+        assert_eq!(sampled.physical.as_ref(), Some(&expected));
+        let (receipt, _) =
+            result.expect("first Ensure must return its newly sampled physical target");
+        assert_eq!(receipt.tmux_session, terminal.name());
+        assert_eq!(receipt.lifecycle_generation, row.lifecycle_generation);
+        assert_eq!(receipt.profile, row.source_profile);
+        if let Some(corpse) = corpse {
+            assert_ne!(
+                receipt.physical.as_ref(),
+                Some(&corpse),
+                "recreation receipt must not authorize the confirmed-dead pane"
+            );
+        }
+        assert_eq!(
+            receipt.physical.as_ref(),
+            Some(&expected),
+            "receipt must identify the physical pane sampled by this Ensure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn container_first_ensure_without_prior_observation_returns_sampled_physical(
+    ) -> anyhow::Result<()> {
+        assert_container_receipt_matches_sampled_physical(false).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn container_ensure_after_dead_fixture_recreation_returns_new_physical(
+    ) -> anyhow::Result<()> {
+        assert_container_receipt_matches_sampled_physical(true).await
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn unavailable_tool_journal_preserves_unknown_targets_and_refuses_native_writes(
@@ -960,6 +1169,7 @@ mod tests {
                     tool_name: "removed-tool".into(),
                 },
                 pane: crate::session::PaneObservation {
+                    physical: None,
                     state: crate::session::PanePresence::Alive,
                     tmux_session: Some("original-tool".into()),
                     legacy_tool: None,
@@ -1059,6 +1269,11 @@ mod tests {
         tool.create_with_size("/tmp", "sleep 600", None, "default", &row.id, "probe")?;
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let prepared_state = state.clone();
+        let prepared_native = tokio::task::spawn_blocking(move || {
+            crate::server::session_store::NativeSessionStore::open(prepared_state, "default", None)
+        })
+        .await??;
         let storage = crate::session::Storage::open_unwatched("default")?;
         // A remembered target avoids the admission journal read. Holding the real
         // sidecar therefore pauses the actual handler after its generation commit,
@@ -1116,6 +1331,8 @@ mod tests {
             crate::session::AuxiliaryTarget::Tool {
                 tool_name: "probe".into(),
             },
+            true,
+            prepared_native,
         )
         .await
         .unwrap_err();

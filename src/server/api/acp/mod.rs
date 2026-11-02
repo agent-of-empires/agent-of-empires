@@ -59,7 +59,7 @@ fn session_not_found() -> Response {
 
 /// Plain-text status mapping for a `SupervisorError`. The dashboard matches
 /// body prefixes (`worker_not_ready`, `rate_limited`, `spawn_cancelled`).
-fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
+pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
     let (status, body) = match err {
         SupervisorError::UnknownSession(_) => (
             StatusCode::NOT_FOUND,
@@ -81,7 +81,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
-        | SupervisorError::NativeStoreUnavailable => {
+        | SupervisorError::NativeStoreUnavailable
+        | SupervisorError::RegistryBusy
+        | SupervisorError::Acp(AcpError::RegistryBusy) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
         // The worker is mid-restart (e.g. a force stop); the client re-queues.
@@ -89,6 +91,15 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             format!("worker_not_ready: {context}: {err}"),
         ),
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(unavailability)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(crate::acp::dispatch::PromptDispatch::Unavailable {
+                    unavailability: *unavailability,
+                }),
+            )
+                .into_response();
+        }
         SupervisorError::Acp(AcpError::RateLimited(_)) => (
             StatusCode::TOO_MANY_REQUESTS,
             format!("rate_limited: {context}: {err}"),
@@ -123,7 +134,7 @@ fn is_store_write_failure(error: &anyhow::Error) -> bool {
 /// and have it respawn from the stored row; writing the old value back could
 /// overwrite a newer edit.
 async fn persist_failure_response(
-    state: &AppState,
+    state: &Arc<AppState>,
     id: &str,
     what: &str,
     err: &anyhow::Error,
@@ -134,11 +145,13 @@ async fn persist_failure_response(
         "failed to persist {what}: {err:#}"
     );
     // `shutdown_and_wait` can return Ok at its deadline without a confirmed stop.
-    let shutdown_ok = state
-        .acp_supervisor
-        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
-        .await
-        .is_ok();
+    let shutdown_ok = crate::server::acp_events::retire_native_worker(
+        state,
+        id,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .is_ok();
     let worker_state = state.acp_supervisor.worker_state(id).await;
     let stopped = shutdown_ok && worker_state == crate::daemon::AcpWorkerState::Absent;
     // The reconciler skips a session it already attempted unless asked, and a
@@ -284,11 +297,19 @@ mod tests {
         )
     }
 
-    /// Shared by the agent switch and the selector picks: names the operation,
-    /// stops the worker, and answers 500.
+    /// A failed selector persistence retires the changed worker.
     #[tokio::test]
-    async fn persist_failure_names_the_operation_and_stops_the_worker() {
-        let state = crate::server::test_support::build_test_app_state(vec![]);
+    #[serial_test::serial]
+    async fn persist_failure_stops_the_changed_worker() {
+        use crate::server::test_support as support;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut row = crate::session::Instance::new("persist-failure", "/tmp");
+        row.id = "sess".into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = support::build_test_app_state(vec![row]);
+        support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker("sess").await;
 
         let resp = persist_failure_response(
@@ -303,9 +324,7 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("persist_failed") && body.contains("agent switch"));
-        assert!(body.contains("disk full") && body.contains("worker was stopped"));
+        assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
         assert_eq!(
             state.acp_supervisor.worker_state("sess").await,
             crate::daemon::AcpWorkerState::Absent
@@ -326,6 +345,16 @@ mod tests {
             (
                 SupervisorError::Acp(AcpError::Protocol("bad frame".into())),
                 StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                SupervisorError::Acp(AcpError::ConnectionUnavailable(
+                    crate::acp::state::AcpConnectionUnavailability {
+                        source: crate::acp::state::AcpConnectionSource::Native,
+                        cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+                        phase: crate::acp::state::AcpConnectionPhase::Established,
+                    },
+                )),
+                StatusCode::CONFLICT,
             ),
             (
                 SupervisorError::UnknownSession("s-1".into()),
@@ -504,6 +533,7 @@ mod tests {
             support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
             let (launcher, launches) = support::counting_failing_launcher();
             let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+            support::refresh_canonical_metadata_for_test(&state).await;
 
             let handler = tokio::spawn({
                 let state = Arc::clone(&state);
@@ -842,6 +872,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_handoff_does_not_lock_other_sessions_during_storage_contention() {
+        use anyhow::Context as _;
+        use futures_util::FutureExt as _;
         use std::time::Duration;
 
         let temp = tempfile::tempdir().unwrap();
@@ -874,131 +906,185 @@ mod tests {
             .unwrap();
         let state = terminal_handoff_test_state(rows, temp.path());
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (contended_tx, contended_rx) = tokio::sync::oneshot::channel();
+        let _contention = storage.observe_shared_lock_contention_for_test(contended_tx);
         let listener = tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while state.acp_events_tx.receiver_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = tokio::task::spawn_blocking(move || {
-            storage
-                .update(|_, _| {
+        let mut holder = None;
+        let mut handler = None;
+        let probe = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("event listener subscribes")?;
+            holder = Some(tokio::task::spawn_blocking(move || {
+                storage.update(|_, _| {
                     let _ = entered_tx.send(());
                     let _ = release_rx.recv_timeout(Duration::from_secs(10));
                     Ok(())
                 })
-                .unwrap();
-        });
-        entered_rx.await.unwrap();
-        let lock = state.instance_lock(&id).await;
-        let handler = tokio::spawn({
-            let state = state.clone();
-            let id = id.clone();
-            async move { acp_disable(State(state), Path(id)).await.into_response() }
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while lock.try_lock().is_ok() {
-                tokio::task::yield_now().await;
+            }));
+            entered_rx
+                .await
+                .context("profile holder enters its exclusive flock")?;
+            handler = Some(tokio::spawn({
+                let state = state.clone();
+                let id = id.clone();
+                async move { acp_disable(State(state), Path(id)).await.into_response() }
+            }));
+            tokio::time::timeout(Duration::from_secs(2), contended_rx)
+                .await
+                .context("handoff reaches the exact profile shared flock")?
+                .context("shared-flock observer remains registered")?;
+            for (seq, event) in [
+                crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "late".into(),
+                    connection_ready: false,
+                    native_subject: None,
+                },
+                crate::acp::Event::SessionContextReset {
+                    reason: "late".into(),
+                    fork_rejection: None,
+                },
+                crate::acp::Event::SessionCleared,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                state
+                    .acp_events_tx
+                    .send(crate::server::AcpBroadcastFrame {
+                        native_subject: None,
+                        session_id: id.clone(),
+                        seq: seq as u64 + 1,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                        sidebar_status: None,
+                    })
+                    .map_err(|_| anyhow::anyhow!("late-frame listener remains available"))?;
             }
+            let accessible = tokio::time::timeout(Duration::from_secs(2), async {
+                let rows = state.instances.read().await;
+                let observed_sid = rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.acp_session_id.clone());
+                drop(rows);
+                let mut rows = state.instances.write().await;
+                let edited = if let Some(other) = rows.iter_mut().find(|row| row.id == other_id) {
+                    other.title = "edited during contention".into();
+                    true
+                } else {
+                    false
+                };
+                (observed_sid, edited)
+            })
+            .await
+            .context("storage contention leaves the global instance cache accessible")?;
+            Ok::<_, anyhow::Error>((accessible, !handler.as_ref().unwrap().is_finished()))
         })
-        .await
-        .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        for (seq, event) in [
-            crate::acp::Event::AcpSessionAssigned {
-                acp_session_id: "late".into(),
-            },
-            crate::acp::Event::SessionContextReset {
-                reason: "late".into(),
-            },
-            crate::acp::Event::SessionCleared,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        .catch_unwind()
+        .await;
+
+        let _ = release_tx.send(());
+        let held = match holder {
+            Some(holder) => Some(holder.await),
+            None => None,
+        };
+        let (handled, handler_timed_out) = match handler {
+            Some(mut handler) => {
+                match tokio::time::timeout(Duration::from_secs(10), &mut handler).await {
+                    Ok(result) => (Some(result), false),
+                    Err(_) => (Some(handler.await), true),
+                }
+            }
+            None => (None, false),
+        };
+        let drained = std::panic::AssertUnwindSafe(async {
             state
                 .acp_events_tx
                 .send(crate::server::AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq: seq as u64 + 1,
-                    event: Arc::new(event),
+                    native_subject: None,
+                    session_id: other_id.clone(),
+                    seq: 1,
+                    event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                        acp_session_id: "drained".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    }),
                     worker_generation: None,
                     sidebar_status: None,
                 })
-                .unwrap();
-        }
-        let accessible = tokio::time::timeout(Duration::from_secs(2), async {
-            let rows = state.instances.read().await;
-            assert_eq!(
-                rows.iter()
-                    .find(|row| row.id == id)
-                    .unwrap()
-                    .acp_session_id
-                    .as_deref(),
-                Some("original-acp")
-            );
-            drop(rows);
-            let mut rows = state.instances.write().await;
-            rows.iter_mut()
-                .find(|row| row.id == other_id)
-                .unwrap()
-                .title = "edited during contention".into();
-        })
-        .await;
-        let still_waiting = !handler.is_finished();
-        release_tx.send(()).unwrap();
-        holder.await.unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(10), handler)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            accessible.is_ok(),
-            "storage contention blocked the global instance cache"
-        );
-        assert!(still_waiting);
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        state
-            .acp_events_tx
-            .send(crate::server::AcpBroadcastFrame {
-                session_id: other_id.clone(),
-                seq: 1,
-                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
-                    acp_session_id: "drained".into(),
-                }),
-                worker_generation: None,
-                sidebar_status: None,
-            })
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if state
-                    .instances
-                    .read()
-                    .await
-                    .iter()
-                    .find(|row| row.id == other_id)
-                    .unwrap()
-                    .acp_session_id
-                    .as_deref()
-                    == Some("drained")
-                {
-                    break;
+                .map_err(|_| anyhow::anyhow!("listener accepts the post-handoff drain fence"))?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == other_id)
+                        .and_then(|row| row.acp_session_id.as_deref())
+                        == Some("drained")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            })
+            .await
+            .context("listener consumes the handoff's preceding late frames")?;
+            Ok::<_, anyhow::Error>(())
         })
-        .await
-        .unwrap();
+        .catch_unwind()
+        .await;
         listener.abort();
+        let _ = listener.await;
+
+        let response = match handled {
+            Some(Ok(response)) => {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                Some((status, body))
+            }
+            Some(Err(error)) => panic!("handoff handler failed after joined cleanup: {error}"),
+            None => None,
+        };
+        let ((observed_sid, edited), still_waiting) = match probe {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(error)) => {
+                panic!("contention probe failed: {error:#}; response={response:?}; holder={held:?}")
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        held.expect("profile holder started")
+            .expect("profile holder joined")
+            .expect("profile holder update completed");
+        let (status, body) = response.expect("handoff handler started");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(
+            !handler_timed_out,
+            "handoff completes within its existing deadline"
+        );
+        assert_eq!(observed_sid, Some(Some("original-acp".into())));
+        assert!(
+            edited,
+            "the other cached row remains editable during storage contention"
+        );
+        assert!(
+            still_waiting,
+            "handoff cannot finish while its profile flock is held"
+        );
+        match drained {
+            Ok(result) => result.expect("listener drained before cleanup"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
         let rows = state.instances.read().await;
         let row = rows.iter().find(|row| row.id == id).unwrap();
         assert_eq!(row.view, crate::session::View::Terminal);

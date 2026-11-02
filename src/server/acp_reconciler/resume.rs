@@ -2,14 +2,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use super::{is_resumable, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
-    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservationOutcome, SpawnRequest,
-    Supervisor, SupervisorError,
+    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservation, ResumeReservationOutcome,
+    SpawnRequest, Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
 use crate::server::session_service::SessionService;
@@ -22,6 +21,8 @@ use crate::session::Instance;
 pub(super) struct ResumeTarget {
     pub(super) id: String,
     pub(super) lifecycle_generation: u64,
+    pub(super) created_at: chrono::DateTime<chrono::Utc>,
+    pub(super) native_scope: Option<crate::acp::state::NativeObservationScope>,
     tool: String,
     agent_override: Option<String>,
     pub(super) project_path: String,
@@ -38,6 +39,8 @@ impl ResumeTarget {
         Self {
             id: inst.id.clone(),
             lifecycle_generation: inst.lifecycle_generation,
+            created_at: inst.created_at,
+            native_scope: None,
             tool: inst.tool.clone(),
             agent_override: inst.agent_name.clone(),
             project_path: inst.project_path.clone(),
@@ -51,6 +54,61 @@ impl ResumeTarget {
 
     fn spawn_kind(&self) -> ResumeKind {
         spawn_kind(self.stored_acp_session_id.is_some())
+    }
+
+    fn unavailable(
+        &self,
+        refusal: worker_registry::ControlAdmissionRefusal,
+        origin: Option<&crate::acp::runner_lifecycle::Lease>,
+    ) -> ResumeOutcome {
+        ResumeOutcome::Unavailable {
+            scope: match origin {
+                Some(lease) => lease.native_scope().ok().flatten(),
+                None => self.native_scope.clone(),
+            },
+            refusal,
+            originating_epoch: origin.map(|lease| lease.epoch()),
+        }
+    }
+
+    pub(super) async fn freeze_native_scope(
+        &mut self,
+        previous: Option<crate::acp::state::NativeObservationScope>,
+    ) -> anyhow::Result<()> {
+        let (profile, id, created_at, generation) = (
+            self.source_profile.clone(),
+            self.id.clone(),
+            self.created_at,
+            self.lifecycle_generation,
+        );
+        let scope = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = crate::session::Storage::open_reference(&profile)?;
+            let context = crate::acp::state::NativeEventContext::capture_identity(
+                &id, created_at, generation, &storage,
+            )?;
+            let scope = if let Some(scope) = previous.filter(|scope| scope.context == context) {
+                scope
+            } else {
+                crate::acp::state::NativeObservationScope {
+                    context,
+                    choice: None,
+                    fence: crate::session::NativeInputFence::capture_route(
+                        storage.profile(),
+                        &id,
+                        created_at,
+                        generation,
+                        false,
+                        Some(storage.bound_profile_identity()?),
+                    )?,
+                }
+            };
+            let _guard = scope.fence.lock_observation()?;
+            drop(_guard);
+            Ok(scope)
+        })
+        .await??;
+        self.native_scope = Some(scope);
+        Ok(())
     }
 }
 
@@ -134,30 +192,69 @@ async fn admit(
     state: &AppState,
     id: &str,
     kind: ResumeKind,
+    predecessor: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
 ) -> Result<Option<crate::acp::supervisor::ResumeReservation>, SupervisorError> {
-    match state
-        .acp_supervisor
-        .begin_resume(
-            id,
-            kind,
-            crate::process::worker_registry::ResumeAuthority::Automatic,
-        )
-        .await?
-    {
+    let outcome = match predecessor {
+        Some(predecessor) => {
+            state
+                .acp_supervisor
+                .begin_governed_replacement(id, kind, predecessor)
+                .await?
+        }
+        None => {
+            state
+                .acp_supervisor
+                .begin_resume(
+                    id,
+                    kind,
+                    crate::process::worker_registry::ResumeAuthority::Automatic,
+                )
+                .await?
+        }
+    };
+    match outcome {
         ResumeReservationOutcome::Reserved(reservation) => Ok(Some(reservation)),
         ResumeReservationOutcome::AlreadyPresent => Ok(None),
     }
 }
 
-pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
+pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -> ResumeOutcome {
     let id = target.id.clone();
     let in_flight_turn = target.in_flight_turn;
+    if target.native_scope.is_none() && target.freeze_native_scope(None).await.is_err() {
+        return ResumeOutcome::Retry;
+    }
 
     // Take the lease before any preparation so a stop landing from here on is honored.
-    let record = worker_registry::load(&id).unwrap_or_else(|error| {
-        tracing::warn!(target: "acp.supervisor", session = %id, %error, "resume: worker record unreadable, treating as absent");
-        None
-    });
+    let probe_id = id.clone();
+    let record = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let registry =
+            worker_registry::try_registry_lock(&probe_id)?.ok_or(worker_registry::RegistryBusy)?;
+        Ok(registry.control_admission())
+    })
+    .await
+    {
+        Ok(Ok(Ok(record))) => record,
+        Ok(Ok(Err(refusal))) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, %refusal,
+                "resume: retained runtime admission refused");
+            return target.unavailable(refusal, None);
+        }
+        Ok(Err(error)) if error.is::<worker_registry::RegistryBusy>() => {
+            return ResumeOutcome::RegistryBusy
+        }
+        Ok(Err(_)) => {
+            return target.unavailable(
+                worker_registry::ControlAdmissionRefusal::unconfirmed(None),
+                None,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                "resume: retained runtime admission probe failed");
+            return ResumeOutcome::Retry;
+        }
+    };
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             worker_registry::is_record_live(r),
@@ -170,9 +267,22 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => ResumeKind::Attach,
         _ => target.spawn_kind(),
     };
-    let mut reservation = match admit(&state, &id, kind).await {
+    let predecessor = record
+        .as_ref()
+        .filter(|_| {
+            matches!(
+                decision,
+                AdoptDecision::ReplaceIncompatibleRunner | AdoptDecision::RespawnStaleIdle,
+            )
+        })
+        .map(crate::acp::runner_lifecycle::RunnerIdentity::from_record);
+    let mut reservation = match admit(&state, &id, kind, predecessor).await {
         Ok(Some(reservation)) => reservation,
         Ok(None) => return ResumeOutcome::SpawnFinished,
+        Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
+        Err(SupervisorError::Acp(
+            crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
+        )) => return target.unavailable(*refusal, None),
         Err(error @ SupervisorError::CapacityFull { .. }) => {
             return ResumeOutcome::CapacityDeferred {
                 message: error.to_string(),
@@ -190,11 +300,13 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         }
     };
     reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
+    let mut originating_lease = reservation.lease().clone();
     // The snapshot may predate an archive, snooze, trash or stop.
     if resume_target_for_session(&state.session_service, &id)
         .await
         .filter(|fresh| {
             fresh.lifecycle_generation == target.lifecycle_generation
+                && fresh.created_at == target.created_at
                 && fresh.source_profile == target.source_profile
         })
         .is_none()
@@ -215,22 +327,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                         "adopting build-stale structured view worker to drain in-flight turn before respawn"
                     );
                 }
-                let sandbox = {
-                    let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
-                };
-                let attach = state.acp_supervisor.attach_inner(
-                    id.clone(),
-                    PathBuf::from(&target.project_path),
-                    vec![],
-                    in_flight_turn,
-                    sandbox,
-                    reservation,
-                );
-                match timeout(Duration::from_secs(3), attach).await {
+                let attach_deadline = reservation.admission_deadline();
+                let attach = attach_retained_target(&state.session_service, &target, reservation);
+                match timeout_at(attach_deadline, attach).await {
                     Ok(Ok(())) => {
                         // Flagged only once attached: a failed attach respawns on the current binary.
                         if decision == AdoptDecision::AdoptStaleForDrain {
@@ -248,32 +347,59 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                         }
                         return ResumeOutcome::Attached;
                     }
+                    Ok(Err(error)) if error.is_registry_busy() => {
+                        return ResumeOutcome::RegistryBusy
+                    }
                     Ok(Err(SupervisorError::SpawnCancelled(_))) => {
                         return ResumeOutcome::SpawnFinished
                     }
                     Ok(Err(SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
+                    ))) => return target.unavailable(*refusal, Some(&originating_lease)),
+                    Ok(Err(SupervisorError::Acp(
                         crate::acp::acp_client::AcpError::AttachTimedOut,
                     ))) => {
+                        // An incomplete observation is not evidence against
+                        // this already attested retained owner. Release only
+                        // the borrowed attachment and let the existing tick retry.
                         return ResumeOutcome::Retry;
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
-                        if worker_registry::terminate_record_and_wait(record, ())
-                            .await
-                            .is_err()
+                        if worker_registry::retained_process_may_be_alive(&record) {
+                            return target.unavailable(
+                                worker_registry::ControlAdmissionRefusal::from_record(
+                                    &record,
+                                    worker_registry::ControlRefusalReason::OwnershipUnconfirmed,
+                                ),
+                                Some(&originating_lease),
+                            );
+                        }
+                        tracing::warn!(target: "acp.supervisor", session = %id,
+                            "dead runner attachment failed; following existing retirement policy: {e}");
+                        if let Err(error) =
+                            worker_registry::terminate_record_and_wait(record, ()).await
                         {
-                            return ResumeOutcome::Retry;
+                            return if error.is::<worker_registry::RegistryBusy>() {
+                                ResumeOutcome::RegistryBusy
+                            } else {
+                                ResumeOutcome::Retry
+                            };
                         }
                     }
                     Err(_) => {
-                        tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; preserving the runner for another attachment attempt");
+                        tracing::warn!(target: "acp.supervisor", session = %id,
+                            "attach timed out; preserving the original runner owner");
                         return ResumeOutcome::Retry;
                     }
                 }
                 // The failed attach released its lease; the spawn needs one that counts toward capacity.
-                reservation = match admit(&state, &id, target.spawn_kind()).await {
+                reservation = match admit(&state, &id, target.spawn_kind(), None).await {
                     Ok(Some(reservation)) => reservation,
                     Ok(None) => return ResumeOutcome::SpawnFinished,
+                    Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
+                    Err(SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
+                    )) => return target.unavailable(*refusal, None),
                     Err(error @ SupervisorError::CapacityFull { .. }) => {
                         return ResumeOutcome::CapacityDeferred {
                             message: error.to_string(),
@@ -287,6 +413,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                 };
                 reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
+                originating_lease = reservation.lease().clone();
             }
             AdoptDecision::ReplaceIncompatibleRunner => {
                 tracing::info!(
@@ -296,11 +423,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -311,20 +439,22 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
             // A dead record can still hold a live pid whose socket vanished.
             AdoptDecision::FreshSpawn => {
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
         }
@@ -339,6 +469,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     };
     let agent = req.agent.clone();
     match state.acp_supervisor.spawn_inner(req, reservation).await {
+        Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
+        Err(SupervisorError::Acp(
+            crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
+        )) => return target.unavailable(*refusal, Some(&originating_lease)),
         Err(e @ SupervisorError::CapacityFull { .. }) => {
             return ResumeOutcome::CapacityDeferred {
                 message: e.to_string(),
@@ -374,7 +508,10 @@ async fn report_spawn_failure(
 ) {
     if matches!(
         error,
-        SupervisorError::AlreadyRunning(_) | SupervisorError::SpawnCancelled(_)
+        SupervisorError::AlreadyRunning(_)
+            | SupervisorError::SpawnCancelled(_)
+            | SupervisorError::RegistryBusy
+            | SupervisorError::Acp(crate::acp::acp_client::AcpError::RegistryBusy)
     ) {
         return;
     }
@@ -503,6 +640,7 @@ async fn build_spawn_request(
             store: native,
             generation: target.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         expected_lifecycle_generation: target.lifecycle_generation,
         session_id: target.id.clone(),
@@ -542,6 +680,104 @@ pub(crate) fn command_override_for_spawn(
     })
 }
 
+async fn attach_retained_target(
+    service: &Arc<SessionService>,
+    target: &ResumeTarget,
+    reservation: ResumeReservation,
+) -> Result<(), SupervisorError> {
+    let sandbox = {
+        let instances = service.instances.read().await;
+        let row = instances
+            .iter()
+            .find(|row| {
+                row.id == target.id
+                    && is_resumable(row)
+                    && row.source_profile == target.source_profile
+                    && row.created_at == target.created_at
+                    && row.lifecycle_generation == target.lifecycle_generation
+            })
+            .ok_or_else(|| SupervisorError::SpawnCancelled(target.id.clone()))?;
+        row.sandbox_info.clone()
+    };
+    // Attached workers resume their background tailers independently in
+    // install_worker. Only an actual main turn owns a cached prompt completion.
+    let in_flight_turn = query_store(
+        &service.acp_event_store,
+        &target.id,
+        "retained main-turn adoption",
+        |store, id| store.has_in_flight_main_turn(id),
+    )
+    .await
+    .ok_or(SupervisorError::NativeStoreUnavailable)?;
+    service
+        .acp_supervisor
+        .attach_inner(
+            target.id.clone(),
+            PathBuf::from(&target.project_path),
+            vec![],
+            in_flight_turn,
+            sandbox,
+            reservation,
+        )
+        .await
+}
+
+pub(super) async fn ensure_rate_limit_worker(
+    state: &Arc<AppState>,
+    id: &str,
+    authority: worker_registry::ResumeAuthority,
+) -> Result<(), SupervisorError> {
+    if !state.acp_supervisor.is_running(id).await {
+        let target = resume_target_for_session(&state.session_service, id)
+            .await
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+        let probe_id = id.to_owned();
+        let record =
+            tokio::task::spawn_blocking(move || worker_registry::control_admission(&probe_id))
+                .await
+                .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+                .map_err(|refusal| {
+                    SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(Box::new(
+                            refusal,
+                        )),
+                    )
+                })?;
+        if record
+            .as_ref()
+            .is_some_and(worker_registry::retained_process_may_be_alive)
+        {
+            match state
+                .acp_supervisor
+                .begin_resume(id, ResumeKind::Attach, authority)
+                .await?
+            {
+                ResumeReservationOutcome::AlreadyPresent => {}
+                ResumeReservationOutcome::Reserved(mut reservation) => {
+                    reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
+                    let deadline = reservation.admission_deadline();
+                    timeout_at(
+                        deadline,
+                        attach_retained_target(&state.session_service, &target, reservation),
+                    )
+                    .await
+                    .map_err(|_| {
+                        SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)
+                    })??;
+                }
+            }
+        } else {
+            match trigger_resume_background(&state.session_service, id, authority, None).await? {
+                ResumeTrigger::NotFound => {
+                    return Err(SupervisorError::UnknownSession(id.to_owned()))
+                }
+                ResumeTrigger::Started | ResumeTrigger::AlreadyResuming => {}
+            }
+        }
+    }
+    state.acp_supervisor.wait_until_ready(id).await
+}
+
 async fn resume_target_for_session(service: &SessionService, id: &str) -> Option<ResumeTarget> {
     let instances = service.instances.read().await;
     instances
@@ -566,6 +802,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
+    reservation: Option<crate::acp::supervisor::ResumeReservation>,
 ) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
@@ -582,13 +819,21 @@ pub(crate) async fn trigger_resume_background(
         .await
         .iter()
         .any(|i| i.id == id && i.acp_session_id.is_some());
-    let reservation = match service
-        .acp_supervisor
-        .begin_resume(id, spawn_kind(has_stored_id), authority)
-        .await?
-    {
-        ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+    let reservation = match reservation {
+        Some(reservation) => {
+            service
+                .acp_supervisor
+                .validate_reserved_resume(&reservation)?;
+            reservation
+        }
+        None => match service
+            .acp_supervisor
+            .begin_resume(id, spawn_kind(has_stored_id), authority)
+            .await?
+        {
+            ResumeReservationOutcome::Reserved(reservation) => reservation,
+            ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+        },
     };
     let Some(target) = resume_target_for_session(service, id).await else {
         return Ok(ResumeTrigger::NotFound);
@@ -667,7 +912,11 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             });
         // With nothing naming the runner, a marker written by the stop that removed the record stands.
         if let Some(generation) = generation {
-            worker_registry::mark_restart_pending(&id, generation);
+            if let Err(error) = worker_registry::mark_restart_pending(&id, generation) {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "restart publication refused; retaining the current owner");
+                continue;
+            }
         }
         if let Err(error) = worker_registry::terminate_and_wait(&id).await {
             tracing::warn!(target: "acp.supervisor", session = %id, %error, "runtime termination unproven; retaining restart marker");
@@ -681,6 +930,7 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
 mod tests {
     use super::super::test_fixtures::{structured_instance, test_state};
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial_test::serial]
@@ -876,7 +1126,7 @@ mod tests {
             .await;
         for id in ["s-drain", "s-drain-gone"] {
             state.acp_supervisor.mark_build_respawn_pending(id);
-            worker_registry::mark_restart_pending(id, 4);
+            worker_registry::mark_restart_pending(id, 4).unwrap();
         }
 
         respawn_drained_stale_workers(&state).await;
@@ -906,6 +1156,7 @@ mod tests {
             &state.session_service,
             id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            None,
         )
         .await
         .expect("resume is admitted");
@@ -926,11 +1177,8 @@ mod tests {
     #[serial_test::serial]
     async fn resume_one_rechecks_eligibility_under_the_lease() {
         let id = "s-archived-late";
-        let (_home, state, project) = test_state(id);
-        let target = ResumeTarget::from_instance(&structured_instance(
-            id,
-            &project.path().to_string_lossy(),
-        ));
+        let (_home, state, _project) = test_state(id);
+        let target = ResumeTarget::from_instance(&state.instances.read().await[0]);
         state.instances.write().await[0].archive();
 
         let outcome = resume_one(Arc::clone(&state), target).await;
@@ -991,7 +1239,7 @@ mod tests {
             |_| {},
             |supervisor| supervisor.with_process_control(control.clone()),
         );
-        let mut runner = HeldAttachRunner::new(id, project.path(), 17, Some("default"));
+        let mut runner = HeldAttachRunner::new(id, project.path(), 17, Some("default")).await;
         state
             .acp_event_store
             .record(
@@ -1043,7 +1291,9 @@ mod tests {
             .iter()
             .any(|(_, event)| matches!(
                 event,
-                Event::Stopped { .. } | Event::AgentStartupError { .. }
+                Event::Stopped { .. }
+                    | Event::AgentStartupError { .. }
+                    | Event::AcpConnectionUnavailable { .. }
             )));
 
         tick.run(&state).await;
