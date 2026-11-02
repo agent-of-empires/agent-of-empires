@@ -166,8 +166,8 @@ impl ActiveTasks {
     }
 
     /// Ends `task_id` because `TaskStop` killed it. A following tailer
-    /// publishes the end itself; with none, the stop is kept for
-    /// [`Self::take_early_stop`].
+    /// publishes the end itself; with none, the stop is kept for the resumed
+    /// tailer that registers next.
     pub(crate) fn stop(&self, task_id: &str) {
         match self.lock().get(task_id) {
             Some(owner) => owner.stop.cancel(),
@@ -180,32 +180,11 @@ impl ActiveTasks {
         }
     }
 
-    /// Whether `TaskStop` already ended `task_id` with no tailer following it.
-    pub(crate) fn take_early_stop(&self, task_id: &str) -> bool {
+    fn take_early_stop(&self, task_id: &str) -> bool {
         self.stopped_early
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(task_id)
-    }
-
-    /// Splits resumed launches into those still to tail and the ids
-    /// `TaskStop` already ended.
-    pub(crate) fn split_stopped(
-        &self,
-        tasks: Vec<BackgroundTaskLaunch>,
-    ) -> (Vec<BackgroundTaskLaunch>, Vec<String>) {
-        let mut stopped = Vec::new();
-        let to_tail = tasks
-            .into_iter()
-            .filter(|task| {
-                let early = self.take_early_stop(&task.task_id);
-                if early {
-                    stopped.push(task.task_id.clone());
-                }
-                !early
-            })
-            .collect();
-        (to_tail, stopped)
     }
 
     fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
@@ -254,7 +233,6 @@ impl TaskTailer {
         start_event: Option<Event>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let publication = self.active.publication.lock().await;
-        self.active.take_early_stop(&self.task_id);
         let owner = {
             let mut owners = self.active.lock();
             if let Some(current) = owners.get(&self.task_id) {
@@ -269,6 +247,12 @@ impl TaskTailer {
                 stop: CancellationToken::new(),
             });
             owners.insert(self.task_id.clone(), owner.clone());
+            // Under the owners lock, so a concurrent `stop` either finds this
+            // owner or leaves its marker here. A live launch supersedes a
+            // stale marker.
+            if self.active.take_early_stop(&self.task_id) && self.start == TailerStart::Resumed {
+                owner.stop.cancel();
+            }
             owner
         };
         let guard = ActiveGuard {
@@ -885,62 +869,41 @@ mod tests {
     }
 
     /// A task still open in the persisted log whose `TaskStop` result arrives
-    /// before tailing resumes ends Idle, and is not tailed again.
-    #[test]
-    fn a_stop_before_resume_ends_the_persisted_task() {
+    /// before tailing resumes ends Idle.
+    #[tokio::test]
+    async fn a_stop_before_resume_ends_the_persisted_task() {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         use crate::session::Status;
 
-        let launch = |task_id: &str| BackgroundTaskLaunch {
-            task_id: task_id.into(),
-            tool_call_id: Some("toolu_1".into()),
-            workflow: None,
-            workflow_agents: Default::default(),
-        };
         let mut state = AcpState::new(
             AcpSessionId("s-1".into()),
             AgentName("aoe-agent".into()),
             None,
         );
-        for (seq, id) in [(1, "t-1"), (2, "t-2")] {
-            let started = Event::BackgroundTaskStarted {
-                task_id: id.into(),
-                tool_call_id: Some("toolu_1".into()),
-                description: String::new(),
-                workflow: None,
-            };
-            state.apply_event(seq, started).unwrap();
-        }
-
-        let active = ActiveTasks::default();
-        active.stop("t-1");
-        let (to_tail, stopped) = active.split_stopped(vec![launch("t-1"), launch("t-2")]);
-        assert_eq!(stopped, ["t-1"]);
-        assert_eq!(
-            to_tail
-                .iter()
-                .map(|t| t.task_id.as_str())
-                .collect::<Vec<_>>(),
-            ["t-2"]
-        );
-
-        let finished = Event::BackgroundTaskFinished {
+        let started = Event::BackgroundTaskStarted {
             task_id: "t-1".into(),
-            ended_at: None,
+            tool_call_id: Some("toolu_1".into()),
+            description: String::new(),
+            workflow: None,
         };
-        state.apply_event(3, finished).unwrap();
-        assert_eq!(state.background_tasks, ["t-2"]);
-        assert_eq!(state.sidebar_status(), Status::Running);
-        state
-            .apply_event(
-                4,
-                Event::BackgroundTaskFinished {
-                    task_id: "t-2".into(),
-                    ended_at: None,
-                },
-            )
-            .unwrap();
+        state.apply_event(1, started).unwrap();
+
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        f.spawn(TailerStart::Resumed).await;
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-1");
+        state.apply_event(2, finished).unwrap();
         assert_eq!(state.sidebar_status(), Status::Idle);
+        f.released().await;
+    }
+
+    #[tokio::test]
+    async fn a_workflow_stopped_before_resume_settles_its_agents() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        spawn_workflow_tailer(&f).await;
+        assert_agent_settled_then_finished(&mut f).await;
     }
 
     #[tokio::test]
