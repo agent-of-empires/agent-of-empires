@@ -1900,6 +1900,7 @@ impl GatedCli {
         let stdout = tempfile::NamedTempFile::new().unwrap();
         let stderr = tempfile::NamedTempFile::new().unwrap();
         let child = command
+            .stdin(std::process::Stdio::null())
             .stdout(stdout.reopen().unwrap())
             .stderr(stderr.reopen().unwrap())
             .spawn()
