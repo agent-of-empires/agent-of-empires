@@ -3186,14 +3186,15 @@ mod durable_stop_tests {
             std::fs::create_dir_all(&source)?;
             let private = source.join("config.toml");
             std::fs::write(&private, b"private-content")?;
-            if !deferred {
-                std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))?;
-            }
-            let cause = (!deferred).then(|| {
-                let error = std::fs::read(&private).unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string()
-            });
+            let cause = if deferred {
+                None
+            } else {
+                let blocker = root.path().join(".codex/sandbox-v2");
+                std::fs::write(&blocker, b"not-a-directory")?;
+                let error = std::fs::create_dir(blocker.join("child")).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+                Some(nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string())
+            };
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
                 vec![row.clone()],
@@ -3254,7 +3255,7 @@ mod durable_stop_tests {
                     assert!(
                         captured.lines().any(|line| {
                             line.contains(&row.id)
-                                && line.contains("config.toml")
+                                && line.contains("sandbox-v2")
                                 && line.contains(cause)
                         }),
                         "missing correlated migration cause: {captured}"
