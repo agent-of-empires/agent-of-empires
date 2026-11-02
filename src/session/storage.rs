@@ -4100,6 +4100,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[serial]
     fn write_failure_is_scoped_to_path_across_handles_and_guards() -> Result<()> {
         let root = tempdir()?;
         let paths = [root.path().join("a"), root.path().join("b")];
