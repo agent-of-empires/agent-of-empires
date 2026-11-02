@@ -722,7 +722,7 @@ fn native_unread_respects_visits_and_canonical_feedback() {
         canonical.contents.sessions = [(&a, a_unread), (&b, b_unread)]
             .into_iter()
             .map(|(id, unread)| {
-                let mut row = crate::daemon::SessionResponse::from_instance(
+                let mut row = crate::server::api::sessions::session_response_from_instance(
                     env.view.get_instance(id).unwrap(),
                     false,
                 );
