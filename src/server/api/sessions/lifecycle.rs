@@ -2898,6 +2898,8 @@ async fn prepare_agent_session_inner(
         Ok(Err(error)) => Ok(Err(error)),
         Err(error) => Err(error),
     };
+    #[cfg(all(test, unix))]
+    durable_stop_tests::pause_before_adoption(&id).await;
     let outcome = match result {
         Ok(Ok(Some((generation, started, outcome, ownership, panes)))) => {
             let adopted = {
@@ -2944,7 +2946,12 @@ async fn prepare_agent_session_inner(
             if adopted {
                 outcome.map(Some)
             } else {
-                Err(crate::session::LifecycleReservationError::Superseded.into())
+                match outcome {
+                    Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => {
+                        Err(error)
+                    }
+                    _ => Err(crate::session::LifecycleReservationError::Superseded.into()),
+                }
             }
         }
         Ok(Ok(None)) => Ok(None),
@@ -3124,6 +3131,162 @@ pub(super) async fn sandbox_migration_response(
 mod durable_stop_tests {
     use super::*;
     use crate::process::worker_registry::{self, WorkerRecord};
+    type AdoptionGate = (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    static ADOPTION_GATE: std::sync::Mutex<Option<AdoptionGate>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_adoption(id: &str) {
+        let gate = {
+            let mut gate = ADOPTION_GATE.lock().unwrap();
+            if gate.as_ref().is_some_and(|(session, _, _)| session == id) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn superseded_sandbox_launch_preserves_migration_failure() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        for case in ["deferred", "failed", "other"] {
+            let root = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            crate::migrations::run_migrations()?;
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })?;
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+                config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+            })?;
+            let _env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
+                .and_set("DOCKER_HOST", "unix:///var/run/docker.sock")
+                .and_set(
+                    "AOE_DEFER_SANDBOX_MIGRATION",
+                    if case == "deferred" { "1" } else { "" },
+                )
+                .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin)?;
+            let message = if case == "other" {
+                "permission denied"
+            } else {
+                "Error: No such container (container not found)"
+            };
+            for runtime in ["docker", "podman", "container"] {
+                let path = bin.join(runtime);
+                std::fs::write(&path, format!(
+                    "#!/bin/sh\ncase \"$*\" in *inspect*) echo '{message}' >&2; exit 1;; esac\nexit 0\n"
+                ))?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let mut raw =
+                serde_json::to_value(Instance::new("original", project.to_str().unwrap()))?;
+            raw["tool"] = "codex".into();
+            raw["command"] = "codex".into();
+            raw["status"] = "stopped".into();
+            raw["sandbox_store_generation"] = 0.into();
+            raw["sandbox_info"] = serde_json::json!({
+                "enabled": true, "image": "test-image", "container_name": "migration",
+            });
+            let mut row: Instance = serde_json::from_value(raw)?;
+            row.source_profile = "default".into();
+            let source = root.path().join(".codex/sandbox").join(&row.id);
+            std::fs::create_dir_all(&source)?;
+            let private = source.join("config.toml");
+            std::fs::write(&private, b"private-content")?;
+            if case == "failed" {
+                std::fs::write(root.path().join(".codex/sandbox-v2"), b"not-a-directory")?;
+            }
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let before = state.runtime.publish(&state).await?;
+            let request_state = state.clone();
+            let id = row.id.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *ADOPTION_GATE.lock().unwrap() = Some((id.clone(), entered_tx, release_rx));
+            let request = tokio::spawn(async move {
+                start_session(State(request_state), Path(id), Ok(None))
+                    .await
+                    .into_response()
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(20), entered_rx).await??;
+            let newer = {
+                let mut instances = state.instances.write().await;
+                let current = instances
+                    .iter_mut()
+                    .find(|current| current.id == row.id)
+                    .unwrap();
+                current.title = "newer title".into();
+                current.clone()
+            };
+            release_tx.send(()).unwrap();
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(30), request).await??;
+            let expected = match case {
+                "deferred" => crate::daemon::ApiErrorCode::SandboxMigrationDeferred,
+                "failed" => crate::daemon::ApiErrorCode::SandboxMigrationFailed,
+                _ => crate::daemon::ApiErrorCode::LifecycleSuperseded,
+            };
+            assert_eq!(response.status(), expected.status(), "{case}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                expected.as_str(),
+                "{case}"
+            );
+            if case != "other" {
+                assert_eq!(
+                    response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                    before.value.cursor.epoch
+                );
+                let revision: u64 = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                    .to_str()?
+                    .parse()?;
+                assert!(revision > before.value.cursor.revision);
+            } else {
+                assert!(!response
+                    .headers()
+                    .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+            }
+            let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+            let public = String::from_utf8_lossy(&body);
+            if let Some(message) = expected.sandbox_migration_message() {
+                assert!(public.contains(message), "{case}: {public}");
+            }
+            assert!(!public.contains(root.path().to_str().unwrap()));
+            assert!(!public.contains("private-content"));
+            assert_eq!(std::fs::read(&private)?, b"private-content");
+            let instances = state.instances.read().await;
+            let current = instances
+                .iter()
+                .find(|current| current.id == row.id)
+                .unwrap();
+            assert_eq!(current.title, "newer title");
+            assert_eq!(current.status, newer.status);
+            assert_eq!(current.lifecycle_generation, newer.lifecycle_generation);
+            assert_eq!(current.last_error, newer.last_error);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[serial_test::serial]
