@@ -898,6 +898,34 @@
       "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
+      "id": "sessions.focus-mode",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/focus-mode.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/components/__tests__/FocusModeNote.test.tsx",
+        "src/components/__tests__/FocusSessionGone.test.tsx",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/hooks/useDashboardPresence.test.ts",
+        "src/hooks/useFocusMode.test.tsx",
+        "src/lib/__tests__/focusMode.test.ts",
+        "src/lib/__tests__/sessionRoute.test.ts",
+        "src/__tests__/sw.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/TopBar.tsx",
+        "web/src/components/FocusModeNote.tsx",
+        "web/src/components/FocusSessionGone.tsx",
+        "web/public/sw.js"
+      ],
+      "notes": "The Session menu's More lists Show only this Session, which reloads the current window as `/session/<id>?focus=1`, and, on desktop, Open in its own window; the palette offers both under the same names. A focus window hides the sidebar, the dashboard link and the switching shortcuts, titles the tab after its session, shows a dismissible first-use note, and reports its focus session with its presence; its All Sessions button, which replaces the sidebar toggle and the logo, reloads the window back to the regular view. Because both transitions load a new document, the service worker reads the current mode from the window's URL: it sends pushes about other sessions to the OS rather than a focus window's toasts, and never navigates a focus window to another session on a notification click. A focus window counts badges and sounds for its own session only; the spec checks that a plugin link to another session, a plugin page button, the settings shortcut and a palette settings entry each open a new window while the focus window keeps its URL, and that a trashed or deleted session shows a screen naming it whose Show all Sessions button reloads to the dashboard. A router navigation that changes the mode, such as an in-app link to a `?focus=1` URL, reloads the document so the service worker sees it (spec and `useFocusMode.test.tsx`). Background session creates started elsewhere add their session without a toast in a focus window. The palette offers neither enter command for a trashed session. Server-side push scoping and presence expiry are covered by `web_watch_follows_foreground_windows_and_their_focus`, `web_presence_writes_prune_abandoned_windows`, `due_events_hold_sessions_a_window_shows_until_it_stops_showing_them` and `presence_is_recorded_per_window_with_its_focus`."
+    },
+    {
       "id": "notifications.service-worker-clear",
       "kind": "vitest",
       "risk": "medium",
