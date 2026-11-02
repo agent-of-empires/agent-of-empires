@@ -61,7 +61,8 @@ async fn list_with_timeout(
         return Err(ListSessionsError::Failed("agent has no stdio".into()));
     };
     let newest_first = NEWEST_FIRST_AGENTS.contains(&config.agent_key.as_str());
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    let (read_half, write_half) = tokio::io::split(super::batch::wrap(stdout, stdin));
+    let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
     let result = Client
         .v1()
         .name("aoe-acp")
