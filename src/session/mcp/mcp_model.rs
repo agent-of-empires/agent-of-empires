@@ -481,9 +481,18 @@ struct ClaudeProject {
 }
 
 /// Another project's malformed list must not drop every server definition.
+/// Within a list, non-string entries are skipped so the valid names still apply.
 fn lenient_names<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-    let value = serde_json::Value::deserialize(d)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(name),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1026,7 +1035,7 @@ enabled = true
                         "/a": {{ "disabledMcpServers": null }},
                         "/b": {{ "disabledMcpServers": "pagerduty" }},
                         "/c": null,
-                        {cwd:?}: {{ "disabledMcpServers": ["pagerduty"] }}
+                        {cwd:?}: {{ "disabledMcpServers": ["pagerduty", null, 7] }}
                     }} }}"#
             ),
         );
