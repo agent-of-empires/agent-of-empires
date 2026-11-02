@@ -1193,11 +1193,13 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
 #[tokio::test]
 #[serial_test::serial]
 async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Result<()> {
-    for (startup, moved_before_crash, recreated) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false),
-        (true, true, true),
+    for (startup, moved_before_crash, recreated, shared_original) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, true, true, false),
+        (true, true, true, true),
+        (true, false, false, true),
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
@@ -1259,11 +1261,17 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             std::fs::create_dir(&worktree)?;
             std::fs::write(worktree.join("unrelated"), b"keep me")?;
         }
+        let peer = shared_original.then(|| {
+            let mut peer = Instance::new("original owner", worktree.to_str().unwrap());
+            peer.source_profile = "receipt".into();
+            peer
+        });
         storage.update(|rows, _| {
             rows[0] = row.clone();
+            rows.extend(peer.clone());
             Ok(())
         })?;
-        *state.instances.write().await = vec![row];
+        *state.instances.write().await = std::iter::once(row).chain(peer).collect();
         *state.canonical_metadata.write().await =
             crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
         if startup {
@@ -1361,7 +1369,12 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(
-            body["outcome"]["relocation"]["status"], "relocated",
+            body["outcome"]["relocation"]["status"],
+            if shared_original && !moved_before_crash {
+                "skipped"
+            } else {
+                "relocated"
+            },
             "{body}"
         );
         let stored = storage
@@ -1377,7 +1390,10 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             std::fs::read(std::path::Path::new(&stored.project_path).join("payload"))?,
             b"retained"
         );
-        assert_eq!(worktree.exists(), recreated);
+        assert_eq!(
+            worktree.exists(),
+            recreated || (shared_original && !moved_before_crash)
+        );
         if let Some(pane) = pane {
             assert!(!crate::tmux::session_exists(pane.name()));
         }
@@ -1397,6 +1413,14 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
                 std::fs::read(std::path::Path::new(&stored.project_path).join("payload"))?,
                 b"retained"
             );
+            if shared_original {
+                let rows = storage.load()?;
+                assert_eq!(
+                    rows.iter().find(|row| row.id != id).unwrap().project_path,
+                    worktree.to_string_lossy()
+                );
+                continue;
+            }
             std::fs::remove_file(worktree.join("unrelated"))?;
             std::fs::remove_dir(&worktree)?;
         }

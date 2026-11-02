@@ -300,6 +300,27 @@ fn holding_matches_registered_worktree(inst: &Instance, holding: &Path, original
         })
 }
 
+pub(crate) fn trashed_worktree_location_is_verified(inst: &Instance) -> bool {
+    if !is_managed_single_worktree(inst) {
+        return true;
+    }
+    let Some(info) = inst.worktree_info.as_ref() else {
+        return false;
+    };
+    let Ok(path) = Path::new(&inst.project_path).canonicalize() else {
+        return false;
+    };
+    let Ok(git) = GitWorktree::new(PathBuf::from(&info.main_repo_path)) else {
+        return false;
+    };
+    let Ok(entries) = git.list_worktrees() else {
+        return false;
+    };
+    entries
+        .iter()
+        .any(|entry| entry.path == path && entry.branch.as_deref() == Some(info.branch.as_str()))
+}
+
 /// Recover a proven holding move while the caller owns a retried Trash transition.
 pub(crate) fn recover_trashed_worktree_move(inst: &mut Instance) -> Option<RelocateOutcome> {
     let ReconcilePlan::PointAtHolding { holding, original } = plan_trashed_reconcile(inst) else {
