@@ -942,10 +942,23 @@ fn own_line(line: Line<'_>) -> Line<'static> {
 
 /// Word-wrap a styled line at the last space, hard-breaking long words.
 /// Unlike `markdown::wrap_line_into`, tabs are not expanded.
-pub(super) fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1) as usize;
+    if !line.spans.is_empty() {
+        let mut last = 0;
+        for next in 1..line.spans.len() {
+            if line.spans[last].style == line.spans[next].style {
+                let content = std::mem::take(&mut line.spans[next].content);
+                line.spans[last].content.to_mut().push_str(&content);
+            } else {
+                last += 1;
+                line.spans.swap(last, next);
+            }
+        }
+        line.spans.truncate(last + 1);
+    }
     let painted_width: usize = line
         .spans
         .iter()
@@ -2307,24 +2320,46 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_preserves_original_span_boundaries_and_line_style() {
-        let style = Style::default().fg(Color::Red);
-        let line = Line::from(vec![
-            Span::styled("a".repeat(31) + "♥", style),
-            Span::styled("\u{fe0f}x", style),
-        ])
-        .style(Style::default().bg(Color::Blue));
-        let mut rows = Vec::new();
-        wrap_line_into(line, 32, &mut rows);
-        assert_eq!(
-            rows[0].spans.len(),
-            2,
-            "separate styled grapheme streams must not be merged"
-        );
-        assert_eq!(rows[0].style.bg, Some(Color::Blue));
-        assert_eq!(rows[1].style.bg, Some(Color::Blue));
-        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Red));
-        assert_eq!(rows[1].to_string(), "x");
+    fn wrapping_preserves_equal_style_ansi_graphemes_and_line_style() {
+        use crate::tui::components::text::line_columns;
+        for (prefix, suffix, width) in [
+            ("Ae".to_string(), "\u{301}XYZ", 3),
+            ("a".repeat(31) + "♥", "\u{fe0f}x", 32),
+        ] {
+            let text = format!("{prefix}{suffix}");
+            let ansi = format!("\x1b[31m{prefix}\x1b[31m{suffix}");
+            let line = styled_output_lines(&ansi)
+                .remove(0)
+                .style(Style::default().bg(Color::Blue));
+            let mut rows = Vec::new();
+            wrap_line_into(line, width, &mut rows);
+            let copied = rows
+                .iter()
+                .map(|row| line_columns(row, width).slice(0, width))
+                .collect::<String>();
+            assert_eq!(copied, text);
+            assert!(rows.iter().all(|row| row.style.bg == Some(Color::Blue)));
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                width,
+                rows.len() as u16,
+            ))
+            .unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(Paragraph::new(Text::from(rows)), frame.area());
+                })
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .filter(|symbol| *symbol != " ")
+                .collect();
+            assert_eq!(painted, text);
+            assert_eq!(terminal.backend().buffer()[(0, 0)].fg, Color::Red);
+        }
     }
 
     #[test]
