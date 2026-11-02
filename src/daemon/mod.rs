@@ -1921,6 +1921,9 @@ mod tests {
     #[tokio::test]
     async fn managed_resume_refusal_recovers_without_reflecting_private_bodies() {
         use axum::response::IntoResponse;
+        use clap::CommandFactory;
+
+        let mut recovery_command = crate::cli::Cli::command();
         for (unix, authenticated, cause) in [
             (false, false, "wrapper_contract_required"),
             (false, true, "wrapper_contract_required"),
@@ -2003,6 +2006,51 @@ mod tests {
                 if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
                     assert!(message.contains("session.agent_execution_as"), "{message}");
                     assert!(message.contains("session.agent_config_dir"), "{message}");
+                }
+                if matches!(
+                    expected,
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                        | crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                ) {
+                    let agent = if expected
+                        == crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                    {
+                        "Pi"
+                    } else {
+                        "OMP"
+                    };
+                    assert!(
+                        message
+                            .split(|ch: char| !ch.is_ascii_alphanumeric())
+                            .any(|token| token == agent),
+                        "{message}"
+                    );
+                    let mut rebind = false;
+                    let mut fresh = false;
+                    for line in message
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| line.starts_with("aoe "))
+                    {
+                        let argv = shell_words::split(line).expect("recovery command quoting");
+                        let parsed = recovery_command
+                            .try_get_matches_from_mut(argv)
+                            .expect("recovery command must parse");
+                        let args = parsed
+                            .subcommand_matches("session")
+                            .and_then(|args| args.subcommand_matches("set-session-id"))
+                            .expect("recovery command must select a native conversation");
+                        let sid = args.get_one::<String>("session_id").unwrap();
+                        let store = args.get_one::<std::path::PathBuf>("store");
+                        if sid.is_empty() {
+                            assert!(store.is_none(), "{message}");
+                            fresh = true;
+                        } else {
+                            assert!(store.is_some_and(|path| path.is_absolute()), "{message}");
+                            rebind = true;
+                        }
+                    }
+                    assert!(rebind && fresh, "{message}");
                 }
                 if committed {
                     assert!(

@@ -80,8 +80,11 @@ Transcript-specific refusals distinguish the agents' requirements:
 - **Pi:** a matching binding must supply the required transcript path, or permitted discovery must find it. Nonexplicit preallocated bindings are exempt from this check.
 
 Neither refusal deletes the conversation or proves that its transcript is missing
-or its configuration changed. Use [exact-file recovery](#pinning-or-resetting-a-conversation),
-not a recent conversation.
+or its configuration changed. For host sessions, use
+[exact-file recovery](#pinning-or-resetting-a-conversation), not a recent conversation.
+Manual transcript rebinding is unsupported for sandboxed Pi/OMP terminal sessions.
+They can explicitly choose fresh as described in that section, replacing the AoE
+conversation association on a subsequent launch without deleting the original transcript.
 
 Local diagnostics include the native refusal chain and any scope-retirement error; public recovery messages exclude both. If scope retirement remains unproven, inspect its diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
 
