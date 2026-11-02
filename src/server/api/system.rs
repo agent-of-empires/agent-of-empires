@@ -236,9 +236,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     count_profile_hooks,
                 )
             };
-            let (installed, create_ready) = (check(false), check(true));
+            // An installed adapter is create-ready, so the hooked check runs only when it isn't.
+            let installed = check(false);
+            agent.acp_create_ready = installed || check(true);
             agent.acp_installed = installed;
-            agent.acp_create_ready = create_ready;
         }
         agents
     })
