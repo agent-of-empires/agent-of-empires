@@ -1925,6 +1925,9 @@ mod tests {
             (false, false, "wrapper_contract_required"),
             (false, true, "wrapper_contract_required"),
             (true, false, "wrapper_contract_required"),
+            (false, false, "pi_transcript_binding_required"),
+            (false, true, "pi_transcript_binding_required"),
+            (true, false, "pi_transcript_binding_required"),
             (false, false, "omp_transcript_binding_required"),
             (false, true, "omp_transcript_binding_required"),
             (true, false, "omp_transcript_binding_required"),
@@ -1933,6 +1936,9 @@ mod tests {
             let expected = match cause {
                 "wrapper_contract_required" => {
                     crate::session::ManagedResumeCause::WrapperContractRequired
+                }
+                "pi_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
                 }
                 "omp_transcript_binding_required" => {
                     crate::session::ManagedResumeCause::OmpTranscriptBindingRequired

@@ -2087,8 +2087,10 @@ impl Instance {
                             namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
                         }
                     } else if let Some(binding) = binding {
-                        anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
-                            "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
+                        (!explicit && binding.provenance == ConversationProvenance::Preallocated)
+                            .then_some(())
+                            .context("Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript")
+                            .context(ManagedResumeCause::PiTranscriptBindingRequired)?;
                     }
                 }
                 pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
@@ -4362,5 +4364,87 @@ mod tests {
             .resolve_native_execution(Some((unknown, None, false)))
             .unwrap();
         assert_eq!(fresh.pi_transcript_path, None, "no transcript, no selector");
+
+        let mut preallocated = ConversationBinding::unknown(unknown);
+        preallocated.provenance = ConversationProvenance::Preallocated;
+        assert!(inst
+            .resolve_native_execution(Some((unknown, Some(&preallocated), false)))
+            .unwrap()
+            .pi_transcript_path
+            .is_none());
+        let missing_binding = ConversationBinding::unknown(unknown);
+        let mut missing_file = ConversationBinding::unknown(unknown);
+        missing_file.execution = Some(fresh.binding.clone());
+        missing_file.provenance = ConversationProvenance::Asserted;
+        missing_file.transcript_path = Some(store.join(format!("missing_{unknown}.jsonl")));
+        let mut wrong_header = missing_file.clone();
+        wrong_header.transcript_path = Some(transcript.clone());
+        for (target, binding, explicit, expected) in [
+            (
+                unknown,
+                &missing_binding,
+                false,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                sid,
+                &migrated,
+                true,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                unknown,
+                &preallocated,
+                true,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                unknown,
+                &missing_file,
+                true,
+                ManagedResumeCause::ExecutionContextUnattested,
+            ),
+            (
+                unknown,
+                &wrong_header,
+                true,
+                ManagedResumeCause::ExecutionContextUnattested,
+            ),
+        ] {
+            let error = inst
+                .resolve_native_execution(Some((target, Some(binding), explicit)))
+                .err()
+                .expect("invalid Pi target must refuse");
+            assert_eq!(
+                ManagedResumeCause::from_error(&error),
+                expected,
+                "{error:#}"
+            );
+        }
+
+        inst.agent_session_id = Some(unknown.into());
+        inst.agent_session_binding = Some(missing_binding.clone());
+        let error = inst
+            .resolve_launch_execution()
+            .err()
+            .expect("managed Pi target must refuse");
+        assert_eq!(
+            error
+                .downcast_ref::<super::super::ManagedResumeRefused>()
+                .unwrap()
+                .0,
+            ManagedResumeCause::PiTranscriptBindingRequired
+        );
+        inst.resume_intent = ResumeIntent::Use(unknown.into());
+        inst.resume_binding = Some(missing_binding);
+        let error = inst
+            .resolve_launch_execution()
+            .err()
+            .expect("explicit Pi target must refuse");
+        assert_eq!(
+            ManagedResumeCause::from_error(&error),
+            ManagedResumeCause::PiTranscriptBindingRequired
+        );
+        assert!(!error.is::<super::super::ManagedResumeRefused>());
     }
 }

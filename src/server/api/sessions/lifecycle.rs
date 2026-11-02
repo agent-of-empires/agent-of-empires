@@ -3121,6 +3121,11 @@ mod durable_stop_tests {
             "omp",
             "#!/bin/sh\nexit 97\n",
         );
+        let _pi = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "pi",
+            "#!/bin/sh\nexit 97\n",
+        );
         let _prime = crate::session::test_support::install_login_shell_path_command(
             root.path(),
             "prime-agent",
@@ -3149,6 +3154,11 @@ mod durable_stop_tests {
         let sid = "11111111-2222-4333-8444-555555555555";
         for (tool, transcript_bound, expected_cause) in [
             (
+                "pi",
+                false,
+                crate::session::ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
                 "omp",
                 false,
                 crate::session::ManagedResumeCause::OmpTranscriptBindingRequired,
@@ -3174,9 +3184,7 @@ mod durable_stop_tests {
             binding.transcript_path = transcript_bound.then(|| transcript.clone());
             row.agent_session_binding = Some(binding);
             row.omp_capture_generation = Some("original-generation".into());
-            if tool == "omp" {
-                assert!(row.supports_native_resume());
-            } else {
+            if tool == "prime-agent" {
                 let agent = crate::agents::get_agent("prime-agent").unwrap();
                 assert!(row.launch_invokes_resolved_agent_directly(agent));
                 assert_eq!(row.command, "prime-agent");
@@ -3185,6 +3193,8 @@ mod durable_stop_tests {
                     std::fs::read_to_string(project.join(".prime/agent/settings.json")).unwrap(),
                     r#"{"sessionDir":7}"#
                 );
+            } else {
+                assert!(row.supports_native_resume());
             }
             assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
             let conversation = row.conversation_state();

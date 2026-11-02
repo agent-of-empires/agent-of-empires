@@ -17,6 +17,25 @@ macro_rules! recovery_message {
     };
 }
 
+macro_rules! transcript_recovery_message {
+    ($agent:literal) => {
+        concat!(
+            "Managed resume refused: ",
+            $agent,
+            " transcript file is not bound.\n",
+            "The native session ID alone is not enough to authorize resume.\n",
+            "This refusal does not delete the saved conversation.\n",
+            "Manual transcript rebinding is not supported for sandboxed sessions.\n",
+            "For host sessions, bind the exact existing transcript file:\n",
+            "aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n",
+            "For ",
+            $agent,
+            ", --store must name the file, not its directory.\n",
+            "Then start/restart the session."
+        )
+    };
+}
+
 /// Finite reasons safe to present without exposing native diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ManagedResumeCause {
@@ -26,6 +45,8 @@ pub enum ManagedResumeCause {
     UnsupportedManagedArguments,
     #[error("OpenCode session schema cannot be attested")]
     OpenCodeSchemaUnattested,
+    #[error("Pi exact transcript binding is missing")]
+    PiTranscriptBindingRequired,
     #[error("OMP exact transcript binding is missing")]
     OmpTranscriptBindingRequired,
     #[error("native execution context cannot be attested")]
@@ -38,6 +59,7 @@ impl ManagedResumeCause {
             Self::WrapperContractRequired => "wrapper_contract_required",
             Self::UnsupportedManagedArguments => "unsupported_managed_arguments",
             Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
+            Self::PiTranscriptBindingRequired => "pi_transcript_binding_required",
             Self::OmpTranscriptBindingRequired => "omp_transcript_binding_required",
             Self::ExecutionContextUnattested => "execution_context_unattested",
         }
@@ -59,16 +81,8 @@ impl ManagedResumeCause {
                 "Managed resume refused: OpenCode schema cannot be attested.\n\
                  Restore a verified release/build and its original database."
             ),
-            Self::OmpTranscriptBindingRequired => {
-                "Managed resume refused: OMP transcript file is not bound.\n\
-                 The native session ID alone is not enough to authorize resume.\n\
-                 This refusal does not delete the saved conversation.\n\
-                 Manual transcript rebinding is not supported for sandboxed sessions.\n\
-                 For host sessions, bind the exact existing transcript file:\n\
-                 aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n\
-                 For OMP, --store must name the file, not its directory.\n\
-                 Then start/restart the session."
-            }
+            Self::PiTranscriptBindingRequired => transcript_recovery_message!("Pi"),
+            Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
             Self::ExecutionContextUnattested => recovery_message!(
                 "Managed resume refused: execution context cannot be attested.\n\
                  Restore the original agent configuration and store."
