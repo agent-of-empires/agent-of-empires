@@ -70,9 +70,18 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 ## Common managed resume and fork refusals
 
-Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal. Pi and OMP also require their exact transcript; recover it with `--store` as described below rather than selecting a recent conversation.
+Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal.
 
 When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and a fixed recovery reason. Missing wrapper contracts identify the trusted settings to restore; their declarations must match the actual native agent and original store. The [API receipt contract](../api.md#native-mutation-completion) describes the finite cause metadata.
+
+Transcript-specific refusals distinguish the agents' requirements:
+
+- **OMP:** resume requires a binding to the exact transcript file; the native ID alone is insufficient.
+- **Pi:** a matching binding must supply the required transcript path, or permitted discovery must find it. Nonexplicit preallocated bindings are exempt from this check.
+
+Neither refusal deletes the conversation or proves that its transcript is missing
+or its configuration changed. Use [exact-file recovery](#pinning-or-resetting-a-conversation),
+not a recent conversation.
 
 Local diagnostics include the native refusal chain and any scope-retirement error; public recovery messages exclude both. If scope retirement remains unproven, inspect its diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
 
@@ -96,7 +105,7 @@ Pin a terminal session to a specific native conversation:
 aoe session set-session-id <session-name-or-id> <native-session-id>
 ```
 
-For sandboxed sessions, pin while the container is running. Resolving a new native execution context requires reading its environment and canonical paths.
+Pi/OMP transcript rebinding is host-only. For other agents that support sandboxed pinning, keep the container running so AoE can resolve its environment and canonical paths.
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
@@ -116,11 +125,21 @@ An explicit pin or fork that migration left unqualified resumes against the stor
 
 An agent that publishes its own conversation spends the pin at launch; its recorded binding remains unqualified until a capture qualifies it. A spent pin follows the `Default` failed-probe policy above. An agent without such a publisher keeps its persistent `Use` pin armed, including after a failed probe; that pin remains retryable without another assertion. Each retry still validates the resolved execution context and any qualified binding. A dispatched fork is always spent, whether or not it resumes. `set-session-id` is the only way to assert a store without launching:
 
+For Claude, `--store` selects its configuration directory:
+
 ```sh
 aoe session set-session-id <session> <native-id> --store /absolute/native/store
 ```
 
-`--store` explicitly selects a Claude configuration directory. For Pi and OMP it must name the exact existing transcript file, whose header must name the requested ID. Other agents resolve their store from configuration and reject explicit store routing.
+For Pi and OMP (host sessions only), use the exact existing transcript file, not
+its directory. The file's header must name the requested ID:
+
+```sh
+aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl
+```
+
+Then start or restart the session. Other agents resolve their store from
+configuration and reject explicit `--store` routing.
 
 To start fresh once:
 
