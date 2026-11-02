@@ -230,7 +230,11 @@ pub async fn reconcile_acp_workers(
     };
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
-    let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
+    let (targets, with_queued_prompts, idle_with_queue): (
+        Vec<ResumeTarget>,
+        HashSet<String>,
+        HashSet<String>,
+    ) = {
         let instances = state.instances.read().await;
         (
             instances
@@ -241,6 +245,13 @@ pub async fn reconcile_acp_workers(
             instances
                 .iter()
                 .filter(|i| !i.queued_prompts.is_empty())
+                .map(|i| i.id.clone())
+                .collect(),
+            instances
+                .iter()
+                .filter(|i| {
+                    !i.queued_prompts.is_empty() && i.status == crate::session::Status::Idle
+                })
                 .map(|i| i.id.clone())
                 .collect(),
         )
@@ -261,7 +272,12 @@ pub async fn reconcile_acp_workers(
     let mut tasks = Vec::new();
     for mut target in targets {
         let id = target.id.clone();
-        if attempted.contains(&id) {
+        // An idle session with a queue and no worker is retried under the
+        // normal budget: an earlier cancelled attempt must not strand the queue (#5200).
+        let retry_for_queue = attempted.contains(&id)
+            && idle_with_queue.contains(&id)
+            && supervisor.worker_state(&id).await == AcpWorkerState::Absent;
+        if attempted.contains(&id) && !retry_for_queue {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
             if supervisor.worker_state(&id).await == AcpWorkerState::Stopping
@@ -873,6 +889,41 @@ mod tests {
                 "session was not woken"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A resume attempt that launch admission cancelled (row still `Stopped`)
+    /// pins the id; once the row reads `Idle` with a queue, the pin must lift
+    /// so the queue is not stranded behind a worker nothing starts (#5200).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pinned_idle_session_with_a_queue_is_resumed() {
+        use crate::session::Status;
+
+        let cases = [
+            ("idle with a queue", Status::Idle, 1),
+            ("deliberately stopped with a queue", Status::Stopped, 0),
+        ];
+        for (name, status, expected_attempts) in cases {
+            let id = "sess-pinned";
+            let (_home, state, _project) = test_fixtures::test_state(id);
+            {
+                let mut instances = state.instances.write().await;
+                instances[0].status = status;
+                instances[0]
+                    .queued_prompts
+                    .push(test_fixtures::queued_prompt());
+            }
+
+            let mut tick = test_fixtures::Tick::default();
+            tick.attempted.insert(id.to_string());
+            tick.run(&state).await;
+
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                expected_attempts,
+                "{name}"
+            );
         }
     }
 
