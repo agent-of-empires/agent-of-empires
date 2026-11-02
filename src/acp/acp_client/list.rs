@@ -269,9 +269,14 @@ done
         stub(dir.path(), LISTING, 120, 2, "none");
         run(dir.path()).await.unwrap();
         let log = std::fs::read_to_string(dir.path().join("requests.log")).unwrap();
-        let lists: Vec<serde_json::Value> = log
+        let requests: Vec<serde_json::Value> = log
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect();
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[0]["params"]["protocolVersion"], 1);
+        let lists: Vec<_> = requests
+            .iter()
             .filter(|r| r["method"] == "session/list")
             .collect();
         assert!(lists.iter().all(|r| r["params"].get("cwd").is_none()));
