@@ -721,6 +721,10 @@ Repeating a completed request for an already-trashed session succeeds without
 repeating teardown or relocation. A fresh lifecycle reservation returns
 `409 lifecycle_locked` rather than acknowledging an unfinished transition.
 Generation preconditions are checked before the already-trashed state.
+An expired reservation for an unfinished Trash transition survives daemon startup.
+Retrying acquires a new generation and repeats teardown and relocation using the
+retry's `kill_pane` setting. Path reconciliation cannot acknowledge that pending
+teardown.
 
 ## Explicit structured worker stop
 

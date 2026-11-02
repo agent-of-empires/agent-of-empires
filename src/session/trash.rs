@@ -292,6 +292,15 @@ pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
             "stopping sandbox container before trash relocation failed: {error}"
         );
     }
+    if let ReconcilePlan::PointAtHolding { holding, original } = plan_trashed_reconcile(inst) {
+        inst.project_path = holding.to_string_lossy().into_owned();
+        inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+        return RelocateOutcome::Relocated {
+            from: original,
+            to: holding,
+            warning: None,
+        };
+    }
     relocate_worktree_to_trash(inst)
 }
 
@@ -766,14 +775,19 @@ fn reconcile_trashed_batch(
             else {
                 continue;
             };
-            // Compare and set: the plan was decided from a snapshot taken without any lock, so a
-            // peer can have restored, purged, or moved the row since.
+            // Only reconcile the same durable location that was scanned.
             if !plan_inputs_unchanged(snapshot, stored) {
                 tracing::debug!(
                     target: "session.trash",
                     session = %snapshot.id,
                     "trash reconciliation skipped: the row changed after it was scanned"
                 );
+                continue;
+            }
+            if stored.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Trash,
+                stored.lifecycle_generation,
+            ) {
                 continue;
             }
             match stored.try_acquire_lifecycle_reservation(
@@ -853,8 +867,7 @@ fn reconcile_trashed_batch(
 
 /// Reconcile one trashed worktree as a serialized lifecycle transition.
 ///
-/// The caller's snapshot is replaced with the durable row after commit. A
-/// fresh peer reservation refuses the pass; an expired reservation is superseded.
+/// Pending Trash teardown must be resumed through the lifecycle handler.
 pub(crate) fn reconcile_trashed_transition(
     store: &dyn crate::session::SessionStore,
     inst: &mut Instance,
@@ -875,6 +888,15 @@ pub(crate) fn reconcile_trashed_transition(
         let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) else {
             anyhow::bail!("session disappeared before trash reconciliation");
         };
+        if stored.lifecycle_reservation_is_owned(
+            crate::session::LifecycleOperation::Trash,
+            stored.lifecycle_generation,
+        ) {
+            return Err(crate::session::LifecycleReservationError::Busy(
+                crate::session::LifecycleOperation::Trash,
+            )
+            .into());
+        }
         let generation = stored.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,

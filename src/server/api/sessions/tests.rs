@@ -1109,12 +1109,14 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 #[tokio::test]
 #[serial_test::serial]
 async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
+    use crate::session::LifecycleOperation;
     for (already_trashed, precondition, omit_body, peer) in [
-        (false, true, false, false),
-        (true, true, false, false),
-        (true, false, false, false),
-        (true, false, true, false),
-        (true, false, false, true),
+        (false, true, false, None),
+        (true, true, false, None),
+        (true, false, false, None),
+        (true, false, true, None),
+        (true, false, false, Some(LifecycleOperation::Purge)),
+        (true, false, false, Some(LifecycleOperation::Trash)),
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
         let mut row = Instance::new("stale trash", "/tmp/stale-trash");
@@ -1124,9 +1126,9 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
         if already_trashed {
             row.trash();
         }
-        if peer {
+        if let Some(operation) = peer {
             row.try_acquire_lifecycle_reservation(
-                crate::session::LifecycleOperation::Purge,
+                operation,
                 Instance::LIFECYCLE_RESERVATION_TTL,
                 chrono::Utc::now(),
             )?;
@@ -1153,7 +1155,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
         .into_response();
         assert_eq!(
             response.status(),
-            if precondition || peer {
+            if precondition || peer.is_some() {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::OK
@@ -1165,14 +1167,14 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
                 crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
             );
         }
-        if peer {
+        if peer.is_some() {
             assert_eq!(
                 response.headers()[crate::daemon::ERROR_CODE_HEADER],
                 crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
             );
         }
         assert_eq!(std::fs::read(storage.sessions_path())?, before);
-        if precondition || peer {
+        if precondition || peer.is_some() {
             assert!(!response
                 .headers()
                 .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
@@ -1184,6 +1186,132 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             let body: serde_json::Value = serde_json::from_slice(&body)?;
             assert_eq!(body["outcome"]["relocation"]["status"], "skipped", "{body}");
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Result<()> {
+    for (startup, moved_before_crash) in [(false, false), (true, false), (true, true)] {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        let root = tempfile::tempdir()?;
+        let main_repo = root.path().join("main");
+        let worktree = root.path().join("worktree");
+        let repo = git2::Repository::init(&main_repo)?;
+        let signature = git2::Signature::now("Test", "test@example.com")?;
+        let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+        crate::git::GitWorktree::new(main_repo.clone())?.create_worktree(
+            "interrupted-trash",
+            &worktree,
+            true,
+            None,
+        )?;
+        std::fs::write(worktree.join("payload"), b"retained")?;
+        let mut row = Instance::new("interrupted trash", worktree.to_str().unwrap());
+        row.source_profile = "receipt".into();
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "interrupted-trash".into(),
+            main_repo_path: main_repo.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let storage = Storage::new("receipt", state.file_watch.clone())?;
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let pane = if crate::tmux::is_tmux_available() {
+            let name = crate::server::pane::respawn_paired_if_dead(&state, &id, &row, 0).await?;
+            Some(crate::tmux::test_helpers::TmuxTestSession::from_name(name))
+        } else {
+            None
+        };
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )?;
+        row.trash();
+        let generation = row.lifecycle_generation;
+        let stamp = row.trashed_at;
+        let trash_id = row.trash_lifecycle_id.clone();
+        if moved_before_crash {
+            let mut uncommitted = row.clone();
+            assert!(matches!(
+                crate::session::trash::relocate_worktree_to_trash(&mut uncommitted),
+                crate::session::trash::RelocateOutcome::Relocated { .. },
+            ));
+        }
+        storage.update(|rows, _| {
+            rows[0] = row.clone();
+            Ok(())
+        })?;
+        *state.instances.write().await = vec![row];
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        if startup {
+            let before = std::fs::read(storage.sessions_path())?;
+            crate::server::startup_recovery::repair_startup_profile_ownership(&state.file_watch)?;
+            assert_eq!(std::fs::read(storage.sessions_path())?, before);
+            let failed = super::delete::reconcile_trashed_worktrees(&state).await;
+            assert!(failed.contains(&id));
+            assert_eq!(std::fs::read(storage.sessions_path())?, before);
+            assert!(crate::session::trash::reconcile_trashed_profile("receipt")?.is_empty());
+            assert_eq!(std::fs::read(storage.sessions_path())?, before);
+        }
+        let response = trash_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            body["outcome"]["relocation"]["status"], "relocated",
+            "{body}"
+        );
+        let stored = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(stored.lifecycle_generation, generation + 1);
+        assert!(stored.lifecycle_reservation.is_none());
+        assert_eq!(stored.trashed_at, stamp);
+        assert_eq!(stored.trash_lifecycle_id, trash_id);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&stored.project_path).join("payload"))?,
+            b"retained"
+        );
+        assert!(!worktree.exists());
+        if let Some(pane) = pane {
+            assert!(!crate::tmux::session_exists(pane.name()));
+        }
+        let before = std::fs::read(storage.sessions_path())?;
+        let response = trash_session(State(state.clone()), Path(id.clone()), None)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(storage.sessions_path())?, before);
+        let response = restore_session(State(state), Path(id))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(worktree.join("payload"))?, b"retained");
     }
     Ok(())
 }

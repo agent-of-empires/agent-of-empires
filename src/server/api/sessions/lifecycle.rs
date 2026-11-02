@@ -607,7 +607,9 @@ pub async fn trash_session(
                 if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
-                return Ok(None);
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, row.lifecycle_generation) {
+                    return Ok(None);
+                }
             }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
