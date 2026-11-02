@@ -113,7 +113,12 @@ export function StructuredView(props: Props) {
             >
               {(ctx) => (
                 <BackgroundAgentsContext.Provider
-                  value={{ agents: ctx.state.backgroundAgents, openPane: props.onOpenAgentsPane }}
+                  value={{
+                    agents: ctx.state.backgroundAgents,
+                    workflowRuns: ctx.state.workflowRuns,
+                    backgroundTasks: ctx.state.backgroundTasks,
+                    openPane: props.onOpenAgentsPane,
+                  }}
                 >
                   <AcpChrome
                     view={props}

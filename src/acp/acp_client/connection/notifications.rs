@@ -294,6 +294,7 @@ impl Shared {
             if let Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
+                workflow,
                 ..
             } = &event
             {
@@ -304,10 +305,13 @@ impl Shared {
                     BackgroundTaskLaunch {
                         task_id: task_id.clone(),
                         tool_call_id: tool_call_id.clone(),
+                        workflow: workflow.clone(),
+                        workflow_agents: Default::default(),
                     },
                     session_id.clone(),
                     self.claude_home.clone(),
                     self.bg_tasks.clone(),
+                    self.between_prompt.bg_agents.clone(),
                     self.event_tx.downgrade(),
                     TailerStart::Live,
                     Some(event),
@@ -341,6 +345,7 @@ impl Shared {
                 session_id.to_string(),
                 self.claude_home.clone(),
                 self.bg_tasks.clone(),
+                self.between_prompt.bg_agents.clone(),
                 self.event_tx.downgrade(),
                 TailerStart::Resumed,
                 None,

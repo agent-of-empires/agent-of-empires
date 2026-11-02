@@ -23,7 +23,14 @@ vi.mock("../../hooks/useSkillIndex", () => ({
   useSkillIndex: () => skillIndexRef.current,
 }));
 
-import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
+import {
+  applyReducedState,
+  emptyAcpState,
+  type ActivityRow,
+  type BackgroundAgent,
+  type ToolCall,
+  type ToolOutputBlock,
+} from "../../lib/acpTypes";
 import { writeClipboard } from "../../lib/clipboard";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
@@ -819,6 +826,131 @@ describe("AsyncSubagentCard", () => {
     );
     fireEvent.click(getByRole("button"));
     expect(openPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowToolCard", () => {
+  const script = "export const meta = { name: 'drafts' }\nawait agent('x')";
+  const tool = makeToolCall({ id: "toolu_wf", name: "Workflow", kind: "other", args_preview: args({ script }) });
+  const launched = makeCompletion({ text: "Workflow launched in background. Task ID: wfx" });
+  const member = (agentId: string, phase: string, status: BackgroundAgent["status"]): BackgroundAgent => ({
+    agentId,
+    toolCallId: "toolu_wf",
+    workflow: { run_id: "wf_1", name: "drafts", phase },
+    description: agentId,
+    prompt: "",
+    model: "",
+    status,
+    startedAt: new Date().toISOString(),
+    endedAt: status === "running" ? null : new Date().toISOString(),
+    toolCount: 0,
+    tools: [],
+    lastTool: null,
+    lastText: null,
+    result: null,
+    warning: null,
+  });
+
+  it("follows the run's agents per phase, keeping the script folded", () => {
+    const openPane = vi.fn();
+    const value = {
+      agents: [member("d1", "Draft", "completed"), member("v1", "Verify", "running")],
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: "Draft five issues" } },
+      backgroundTasks: ["wfx"],
+      openPane,
+    };
+    const { container, getByText } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard tool={tool} result={launched} />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    const text = () => container.textContent ?? "";
+    expect(text()).toContain("issue-drafts");
+    expect(text()).toContain("1 of 2 agents done");
+    // The call returned at launch, but the run goes on.
+    expect(text()).toContain("running");
+    expect(text()).not.toContain("Draft five issues");
+    fireEvent.click(container.querySelector("button")!);
+    expect(text()).toContain("Draft five issues");
+    expect(text()).toContain("Draft1 done");
+    expect(text()).toContain("Verify1 running · 0 done");
+    expect(text()).toContain("await agent");
+    fireEvent.click(getByText("Open Sub agents"));
+    expect(openPane).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["before its first agent", [], ["wfx"], false, true],
+    ["between phases", [member("d1", "Draft", "completed")], ["wfx"], false, true],
+    ["once its task ends", [member("d1", "Draft", "completed")], [], false, false],
+    ["after it finished, while a later task reuses its id", [], ["wfx"], true, false],
+  ] as const)("follows the run's task %s", (_label, agents, backgroundTasks, finished, running) => {
+    const value = {
+      agents: [...agents],
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: null, finished } },
+      backgroundTasks: [...backgroundTasks],
+    };
+    const { container } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard tool={tool} result={launched} />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    expect(container.textContent).toContain("issue-drafts");
+    expect(container.textContent?.includes("running")).toBe(running);
+  });
+
+  it.each([
+    ["its last agent ended", [{ ...member("d1", "Draft", "completed"), endedAt: "2026-10-30T10:00:10Z" }]],
+    ["it had no agents", []],
+  ] as const)("times a run opened after it finished by its task even when %s", (_label, agents) => {
+    // The replay window holds neither its launch nor its finish; only the
+    // daemon's state and the history rows know the run.
+    const state = applyReducedState(emptyAcpState(), {
+      agent: "claude",
+      model: null,
+      mode: "Default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      workflow_runs: [
+        { task_id: "wfx", tool_call_id: "toolu_wf", name: "drafts", finished: true, ended_at: "2026-10-30T10:01:00Z" },
+      ],
+    });
+    const value = { agents: [...agents], workflowRuns: state.workflowRuns, backgroundTasks: state.backgroundTasks };
+    const { container } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard
+            tool={{ ...tool, started_at: "2026-10-30T10:00:00Z" }}
+            result={{ ...launched, at: "2026-10-30T10:00:01Z" }}
+          />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    expect(container.textContent).toContain("1m 0s");
+  });
+
+  it("names a run with no agents yet, and is the generic card for other agents", () => {
+    // The "workflow" label, then the fallback run name.
+    expect(renderCard(tool, launched, { toolKey: "claude" }).text()).toContain("workflowWorkflow");
+    cleanup();
+    expect(renderCard(tool, launched, { toolKey: "codex" }).text()).not.toContain("workflowWorkflow");
   });
 });
 

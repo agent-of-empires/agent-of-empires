@@ -1528,6 +1528,7 @@ mod tests {
                         model: "claude-opus-4-8".into(),
                         output_file: "/tmp/bg-1.output".into(),
                         started_at: chrono::Utc::now(),
+                        workflow: None,
                     },
                     stopped(),
                 ],
@@ -2157,6 +2158,7 @@ mod tests {
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
                 live_frame.clone(),
             ];
@@ -2589,6 +2591,7 @@ mod tests {
             (
                 Event::BackgroundTaskFinished {
                     task_id: "t".into(),
+                    ended_at: None,
                 },
                 Some(Background),
             ),
@@ -2817,6 +2820,7 @@ mod tests {
                     task_id: "task-1".into(),
                     tool_call_id: Some("toolu_1".into()),
                     description: "sleep".into(),
+                    workflow: None,
                 },
             ];
             if !main_running {
@@ -2841,6 +2845,7 @@ mod tests {
                     events.len() as u64 + 1,
                     &crate::acp::Event::BackgroundTaskFinished {
                         task_id: "task-1".into(),
+                        ended_at: None,
                     },
                 )
                 .unwrap();
@@ -3003,6 +3008,7 @@ mod tests {
                     destructive: false,
                     options: Vec::new(),
                     choice: false,
+                    plan: None,
                     requested_at: chrono::Utc::now(),
                     resolved: None,
                 },
