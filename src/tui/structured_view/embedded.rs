@@ -83,7 +83,10 @@ impl RetainedView {
                 acp_agent: inst.agent_name.clone().filter(|name| !name.is_empty()),
                 paths: crate::acp::session_paths::SessionPathRoots {
                     id: inst.id.clone(),
-                    project_path: inst.project_path.clone(),
+                    project_path: inst
+                        .pre_trash_project_path
+                        .clone()
+                        .unwrap_or_else(|| inst.project_path.clone()),
                     main_repo_path: inst
                         .worktree_info
                         .as_ref()
@@ -625,8 +628,28 @@ mod retained_tests {
             "AOE_DAEMON_TOKEN",
             "AOE_DAEMON_PASSPHRASE",
         ]);
-        let mut inst = crate::session::Instance::new("retained paths", "/repo");
-        inst.trash();
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let original = root.path().join("worktree");
+        let repo = git2::Repository::init(&main).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        crate::git::GitWorktree::new(main.clone())
+            .unwrap()
+            .create_worktree("retained-paths", &original, true, None)
+            .unwrap();
+        let mut inst = crate::session::Instance::new("retained paths", original.to_str().unwrap());
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "retained-paths".into(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
         let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
         state
@@ -644,7 +667,7 @@ mod retained_tests {
                         parent_tool_call_id: None,
                         memory_recall: None,
                         diffs: vec![DiffPreview {
-                            path: "/repo/src/test.rs".into(),
+                            path: original.join("src/test.rs").to_string_lossy().into_owned(),
                             old_text: Some("before".into()),
                             new_text: Some("after".into()),
                             created_at: at,
@@ -668,6 +691,14 @@ mod retained_tests {
                 },
             )
             .unwrap();
+        inst.trash();
+        assert!(matches!(
+            crate::session::trash::relocate_worktree_to_trash(&mut inst),
+            crate::session::trash::RelocateOutcome::Relocated { .. },
+        ));
+        assert!(!original.exists());
+        assert_eq!(inst.pre_trash_project_path.as_deref(), original.to_str());
+        *state.instances.write().await = vec![inst.clone()];
         let app = Router::new()
             .route(
                 "/api/sessions/{id}/acp/replay",
@@ -719,7 +750,7 @@ mod retained_tests {
             let copied = prepared_text(&mut view, 80).to_string();
             assert!(copied.contains("Before: src/test.rs"), "{copied}");
             assert!(copied.contains("After: src/test.rs"), "{copied}");
-            assert!(!copied.contains("/repo/"), "{copied}");
+            assert!(!copied.contains(original.to_str().unwrap()), "{copied}");
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
             terminal
@@ -735,7 +766,7 @@ mod retained_tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(painted.contains("Before: src/test.rs"), "{painted}");
-            assert!(!painted.contains("/repo/"), "{painted}");
+            assert!(!painted.contains(original.to_str().unwrap()), "{painted}");
         }
         server.abort();
         let _ = server.await;
