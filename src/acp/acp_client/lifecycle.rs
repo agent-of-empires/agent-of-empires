@@ -5,7 +5,6 @@ use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::{
     CompactionStatus, ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
 };
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::mpsc;
 use tracing::trace;
 
@@ -129,48 +128,120 @@ pub(crate) enum OffProtocolWorkKind {
 /// Ensures exactly one path publishes each turn's terminal event. Epochs allow
 /// a later turn to be claimed without letting an older path clear its state.
 pub(crate) struct TerminalClaim {
-    epoch: AtomicU64,
-    /// Epoch whose terminal was published; `0` means none.
-    claimed_for: AtomicU64,
+    state: std::sync::Mutex<TerminalState>,
+}
+
+struct TerminalState {
+    epoch: u64,
+    claimed: bool,
+    failed: bool,
 }
 
 impl TerminalClaim {
     pub(crate) fn new() -> Self {
         Self {
-            epoch: AtomicU64::new(1),
-            claimed_for: AtomicU64::new(0),
+            state: std::sync::Mutex::new(TerminalState {
+                epoch: 1,
+                claimed: false,
+                failed: false,
+            }),
         }
     }
 
     pub(super) fn begin_turn(&self) {
-        self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        state.epoch += 1;
+        state.claimed = false;
+        state.failed = false;
+    }
+
+    /// Ambiguous output cannot mint another main terminal for a failed operation.
+    pub(super) fn begin_unowned_turn(&self) -> bool {
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        if state.failed {
+            return false;
+        }
+        state.epoch += 1;
+        state.claimed = false;
+        true
+    }
+
+    pub(super) fn clear_failed_outcome(&self) {
+        self.state
+            .lock()
+            .expect("terminal claim mutex poisoned")
+            .failed = false;
+    }
+
+    pub(super) fn failed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("terminal claim mutex poisoned")
+            .failed
     }
 
     /// `false` when another path already published this turn's terminal.
     pub(super) fn claim(&self) -> bool {
-        let epoch = self.epoch.load(AtomicOrdering::Acquire);
-        loop {
-            let claimed = self.claimed_for.load(AtomicOrdering::Acquire);
-            if claimed == epoch {
-                return false;
-            }
-            if self
-                .claimed_for
-                .compare_exchange(
-                    claimed,
-                    epoch,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                )
-                .is_ok()
-            {
-                return true;
-            }
+        self.claim_outcome(false)
+    }
+
+    pub(super) fn claim_failed(&self) -> bool {
+        self.claim_outcome(true)
+    }
+
+    fn claim_outcome(&self, failed: bool) -> bool {
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        if state.claimed {
+            return false;
         }
+        state.claimed = true;
+        state.failed = failed;
+        true
     }
 
     pub(super) fn claimed(&self) -> bool {
-        self.claimed_for.load(AtomicOrdering::Acquire) == self.epoch.load(AtomicOrdering::Acquire)
+        self.state
+            .lock()
+            .expect("terminal claim mutex poisoned")
+            .claimed
+    }
+
+    pub(super) fn current_turn(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("terminal claim mutex poisoned")
+            .epoch
+    }
+
+    pub(super) fn claimed_turn(&self) -> Option<u64> {
+        let state = self.state.lock().expect("terminal claim mutex poisoned");
+        state.claimed.then_some(state.epoch)
+    }
+
+    /// Closures only enqueue reserved events; neither closure may await or reenter this claim.
+    pub(super) fn claim_and_publish(
+        &self,
+        epoch: u64,
+        eligible: impl FnOnce() -> bool,
+        publish: impl FnOnce(),
+    ) -> bool {
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        if state.epoch != epoch || state.claimed || !eligible() {
+            return false;
+        }
+        state.claimed = true;
+        publish();
+        true
+    }
+
+    pub(super) fn publish_claimed(&self, epoch: u64, failed: bool, publish: impl FnOnce()) -> bool {
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        if state.epoch != epoch || !state.claimed {
+            return false;
+        }
+        state.failed = failed;
+        publish();
+        true
     }
 }
 
@@ -540,5 +611,42 @@ mod tests {
         assert!(!claim.claim());
         claim.begin_turn();
         assert!(claim.claim());
+    }
+
+    #[test]
+    fn stale_idle_fallback_cannot_claim_or_publish_into_a_new_local_turn() {
+        let terminal = TerminalClaim::new();
+        let adopted = terminal.current_turn();
+        let (events, mut received) = mpsc::channel(2);
+        let old_permit = events.try_reserve().unwrap();
+        terminal.begin_turn();
+        assert!(!terminal.claim_and_publish(
+            adopted,
+            || true,
+            || {
+                old_permit.send(Event::Stopped {
+                    reason: "reattach_idle".into(),
+                });
+            }
+        ));
+        assert!(!terminal.claimed());
+        assert!(terminal.claim());
+        assert!(
+            !terminal.publish_claimed(adopted, true, || panic!("old completion must not publish"))
+        );
+        let current = terminal.claimed_turn().unwrap();
+        let permit = events.try_reserve().unwrap();
+        assert!(terminal.publish_claimed(current, true, || {
+            permit.send(Event::Stopped {
+                reason: "prompt_failed".into(),
+            });
+        }));
+        assert!(
+            matches!(received.try_recv(), Ok(Event::Stopped { reason }) if reason == "prompt_failed")
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

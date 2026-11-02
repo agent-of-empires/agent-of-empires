@@ -2,6 +2,15 @@
 // Reconnect replays only frames and rows newer than the acknowledged sequence.
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
+import {
+  applyEvent,
+  applyReducedState,
+  emptyAcpState,
+  revokeNativeAuthority,
+  type AcpConnectionUnavailability,
+  type AcpEvent,
+} from "../../src/lib/acpTypes";
+import { currentControlSnapshot } from "./acpControlSnapshot";
 
 /** `prompt_id` is the client-minted id echoed on `UserPromptSent`. */
 export interface AcpPromptBody {
@@ -33,8 +42,14 @@ export interface AcpSessionMockOptions {
   importPending?: boolean;
   /** The profile's rate-limit auto-resume setting; omitted means unknown. */
   rateLimitAutoResume?: boolean;
-  /** Daemon control state sent on connect, over idle defaults; the only way a rate limit reaches the client. */
+  /** Initial daemon control state; native receipts remain independently declared. */
   reducedState?: Record<string, unknown>;
+  /** This fixture's current native receipt, independent of historical events/SIDs. */
+  nativeAvailable?: boolean;
+  nativeUnavailability?: AcpConnectionUnavailability | null;
+  promptWakeEligible?: boolean;
+  /** Let a spec hold current authority while the socket/replay is already open. */
+  emitNativeSnapshot?: boolean;
   /** Extra `SessionResponse` fields, such as the agent's `clear_aliases` and `compact_aliases`. */
   sessionFields?: Record<string, unknown>;
 }
@@ -47,6 +62,9 @@ export interface AcpSessionMock {
   telemetryPings: Array<{ surface?: string }>;
   /** Deliver events as frames, buffered until the WS connects. */
   pushEvents: (events: unknown[]) => void;
+  setNativeState: (receipt: Parameters<typeof currentControlSnapshot>[1], atSeq?: number) => void;
+  /** A delayed transport frame: it cannot mutate the mock daemon's current fold. */
+  sendRawFrame: (atSeq: number, event: unknown) => void;
 }
 
 /**
@@ -128,15 +146,37 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   let seq = 0;
   let ws: WebSocketRoute | null = null;
   const frameLog: string[] = [];
+  const queuedPrompts: Array<{ id: string; seq: number; text: string; created_at: string }> = [];
   // Rows keep their seq so replay pages rows over the same window as frames.
   const rowLog: Array<{ seq: number; row: Record<string, unknown> }> = [];
   let groupCounter = 0;
   const nextGroup = () => `g${++groupCounter}`;
   const openMessageGroup: { id: string | null } = { id: null };
+  let controlState: ReturnType<typeof emptyAcpState> = { ...emptyAcpState(), agent: opts.startingAgent ?? "claude" };
+  let nativeReceipt: Parameters<typeof currentControlSnapshot>[1] = {
+    ready: opts.nativeAvailable ?? !(opts.workerStarting || opts.trashedAt || opts.archivedAt),
+    unavailable: opts.nativeUnavailability ?? null,
+    wakeEligible: opts.promptWakeEligible ?? false,
+  };
+  const sendNativeSnapshot = (atSeq = seq) => {
+    ws?.send(JSON.stringify(currentControlSnapshot(controlState, nativeReceipt, atSeq)));
+  };
+  const retireHistoricalControls = (observation: AcpConnectionUnavailability, atSeq: number) => {
+    const snapshot = currentControlSnapshot(controlState, { ready: false, unavailable: observation }, atSeq);
+    controlState = revokeNativeAuthority(applyReducedState(controlState, snapshot.state, [], atSeq));
+  };
   const pushEvents = (events: unknown[]) => {
     for (const event of events) {
       const at = ++seq;
       const frame = JSON.stringify({ session_id: sessionId, seq: at, event });
+      if (typeof event === "string" || (typeof event === "object" && event !== null)) {
+        // Specs supply in-process event shapes; delayed raw transport uses sendRawFrame.
+        const controlEvent = event as AcpEvent;
+        controlState = applyEvent(controlState, { session_id: sessionId, seq: at, event: controlEvent });
+        if (typeof controlEvent === "object" && "AcpConnectionUnavailable" in controlEvent) {
+          retireHistoricalControls(controlEvent.AcpConnectionUnavailable, at);
+        }
+      }
       frameLog.push(frame);
       ws?.send(frame);
       const row = foldEventToRow(event, at, nextGroup, openMessageGroup);
@@ -145,6 +185,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
         ws?.send(JSON.stringify({ kind: "transcript_delta", delta: { Append: row } }));
       }
     }
+    if (opts.emitNativeSnapshot !== false) sendNativeSnapshot();
   };
 
   const handle: AcpSessionMock = {
@@ -154,6 +195,13 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     configOptionBodies: [],
     telemetryPings: [],
     pushEvents,
+    setNativeState: (receipt, atSeq) => {
+      if (atSeq !== undefined) seq = Math.max(seq, atSeq);
+      nativeReceipt = receipt;
+      if (receipt.unavailable) retireHistoricalControls(receipt.unavailable, seq);
+      sendNativeSnapshot(atSeq);
+    },
+    sendRawFrame: (atSeq, event) => ws?.send(JSON.stringify({ session_id: sessionId, seq: atSeq, event })),
   };
 
   await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
@@ -246,6 +294,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   // Registered first: later, more specific routes win.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
+  await page.route("**/api/sessions/*/queue", (r) => r.fulfill({ json: queuedPrompts }));
   // Replay pages recent-first like the daemon so cold open and scroll-up paging run for real (#2236).
   // `?view=rows` returns rows with empty frames, as the daemon does.
   const isBoundary = (event: unknown): boolean =>
@@ -306,6 +355,20 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   await page.route("**/api/sessions/*/acp/prompt", async (r) => {
     const body = JSON.parse(r.request().postData() ?? "{}") as AcpPromptBody;
     handle.promptBodies.push(body);
+    if (nativeReceipt.unavailable) {
+      await r.fulfill({ status: 409, json: { disposition: "unavailable", unavailability: nativeReceipt.unavailable } });
+      return;
+    }
+    if (!nativeReceipt.ready) {
+      if (!nativeReceipt.wakeEligible) {
+        await r.fulfill({ status: 409, json: { error: "native readiness is unconfirmed" } });
+        return;
+      }
+      const id = body.prompt_id ?? `governed-${queuedPrompts.length + 1}`;
+      queuedPrompts.push({ id, seq: queuedPrompts.length + 1, text: body.text, created_at: new Date().toISOString() });
+      await r.fulfill({ status: 202, json: { disposition: "queued", queued_id: id } });
+      return;
+    }
     await r.fulfill({ json: {} });
     // The daemon echoes `UserPromptSent` before the agent replies; without it the composer stays working (#3417).
     pushEvents([{ UserPromptSent: { text: body.text, prompt_id: body.prompt_id ?? null } }]);
@@ -317,6 +380,10 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       value: string;
     };
     handle.configOptionBodies.push(body);
+    if (!nativeReceipt.ready || nativeReceipt.unavailable) {
+      await r.fulfill({ status: 409, json: { error: "native input is unavailable" } });
+      return;
+    }
     await r.fulfill({ json: {} });
     pushEvents(opts.onConfigOption?.(body) ?? []);
   });
@@ -338,30 +405,27 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
         rows: rowLog.filter((entry) => entry.seq > since).map((entry) => entry.row),
       }),
     );
-    if (opts.reducedState) {
-      const state = {
-        agent: "claude",
-        model: null,
-        mode: "Default",
-        current_plan: null,
-        in_flight_tool: null,
-        pending_approvals: [],
-        pending_elicitations: [],
-        thinking: null,
-        rate_limit: null,
-        available_commands: [],
-        available_modes: [],
-        current_mode_id: null,
-        turn_active: false,
-        cancelling: false,
-        compacting: false,
-        ...opts.reducedState,
-      };
-      route.send(JSON.stringify({ kind: "reduced_state", state }));
-    }
+    if (opts.emitNativeSnapshot !== false) sendNativeSnapshot();
   });
 
   pushEvents(opts.initialEvents ?? []);
+  if (opts.reducedState) {
+    const initial = currentControlSnapshot(controlState, nativeReceipt, seq);
+    controlState = revokeNativeAuthority(
+      applyReducedState(
+        controlState,
+        {
+          ...initial.state,
+          ...opts.reducedState,
+          connection_ready: initial.state.connection_ready,
+          connection_unavailable: initial.state.connection_unavailable,
+          prompt_wake_eligible: initial.state.prompt_wake_eligible,
+        },
+        [],
+        seq,
+      ),
+    );
+  }
   return handle;
 }
 
@@ -371,7 +435,7 @@ export async function openStructuredSession(page: Page, mock: AcpSessionMock) {
   await expect(page.locator("header")).toBeVisible();
 }
 
-/** The Send button reads "Send message" only once the WS is open; earlier sends queue instead. */
+/** The Send label requires a current native receipt; socket-open alone grants nothing. */
 export async function waitForComposerConnected(page: Page) {
   await expect(page.getByRole("button", { name: "Send message" })).toBeVisible({ timeout: 10_000 });
 }

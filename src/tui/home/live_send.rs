@@ -11,12 +11,9 @@
 //! `Paste` sets `force_tmux` for the entire batch, including other keys, to preserve ordering
 //! through tmux instead of mixing socket writes with `send-keys` on one pty input stream.
 //!
-//! Otherwise each action forks `tmux send-keys`: plain characters literally, every other
-//! key by tmux key name with `C-` / `M-` prefixes. That covers tmux older than 3.8 (where
-//! writing to a dead pane's input takes the server down), a pane whose forwarder never
-//! connected, and `vt_live` turned off. A long-lived `tmux -C` connection was tried
-//! (#1485) and EOF'd within milliseconds on macOS tmux 3.x, so one fork per coalesced
-//! batch is the portable model; held keys and pastes coalesce into one fork.
+//! Otherwise each action uses the captured physical pane through tmux: literal and raw
+//! bytes use `send-keys -H`, named keys retain tmux's key translation, and paste uses
+//! `paste-buffer -p`. No queued input resolves the session name or channel again.
 //!
 //! The user exits with one of the configured exit chords, a comma-separated list of chord
 //! specs whose default is `C-q` alone: mobile-friendly, passes through restrictive SSH
@@ -403,8 +400,7 @@ pub(super) enum WorkerMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Coalesced one-shot tmux dispatcher. The grant lease is checked before
-/// acquiring size ownership and before each fork, including queued work.
+/// Coalesced dispatcher bound to one native generation and physical input channel.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
     /// Set (sticky) by the worker when the size-owner lock is seen held by another
@@ -414,13 +410,26 @@ pub(in crate::tui) struct LiveSendWorker {
     /// Set by the worker when resize-window fails or times out. Paint consumes
     /// the flag and schedules a bounded retry for the same geometry.
     resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    input_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LiveSendWorker {
+    /// State-only UI fixture: no native input authority and no accepting writer.
+    /// Input-admission tests must use a real bound NativeLease instead.
+    #[cfg(test)]
+    pub(in crate::tui) fn notification_fixture_for_test() -> Self {
+        let (tx, _receiver) = channel();
+        Self {
+            tx,
+            lock_lost: Default::default(),
+            resize_failed: Default::default(),
+            input_error: Default::default(),
+        }
+    }
+
     /// `capture_wake` requests an early preview capture after each dispatched batch.
     /// The target process may not have echoed the input yet.
     pub(super) fn spawn(
-        tmux_name: String,
         capture_wake: Option<LiveCaptureWake>,
         lease: crate::tui::session_feed::NativeLease,
     ) -> Self {
@@ -429,6 +438,21 @@ impl LiveSendWorker {
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
         let resize_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_resize_failed = std::sync::Arc::clone(&resize_failed);
+        let input_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let session = match lease.input_session() {
+            Ok(session) => session,
+            Err(error) => {
+                lease.cancel_continuation();
+                *input_error.lock().unwrap() = Some(error.to_string());
+                return Self {
+                    tx,
+                    lock_lost,
+                    resize_failed,
+                    input_error,
+                };
+            }
+        };
+        let thread_input_error = std::sync::Arc::clone(&input_error);
 
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
@@ -447,9 +471,10 @@ impl LiveSendWorker {
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             if !lease.is_valid() {
+                *thread_input_error.lock().unwrap() =
+                    Some("Live input scope is no longer current".into());
                 return;
             }
-            let session = crate::tmux::Session::from_name(&tmux_name);
             // Entry is explicit user intent, so it forces the lock even over a live
             // holder. False means the session is missing or broken at entry, or another
             // surface won the confirm-read race; the retry on the next resize batch tells
@@ -478,14 +503,20 @@ impl LiveSendWorker {
             // ownership is re-asserted at most once per heartbeat. Resize batches keep the
             // steal-before-dispatch ordering, since geometry must not race another grid.
             let mut last_owner_maintenance = std::time::Instant::now();
-            // The sender may be revoked while a batch is queued.
-            // The dispatch path checks again before every fork.
+            // Recheck cancellation after queue waits and before every input effect.
             loop {
                 if !lease.is_valid() {
+                    *thread_input_error.lock().unwrap() =
+                        Some("Live input scope is no longer current".into());
                     break;
                 }
                 match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
                     Ok(first) => {
+                        if !lease.is_valid() {
+                            *thread_input_error.lock().unwrap() =
+                                Some("Live input scope is no longer current".into());
+                            break;
+                        }
                         let mut batch = vec![first];
                         while let Ok(msg) = rx.try_recv() {
                             batch.push(msg);
@@ -529,15 +560,20 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            match dispatch_batch(&tmux_name, &owner_id, batch, &lease) {
-                                ResizeDispatchResult::Failed => {
+                            match dispatch_batch(&session, &owner_id, batch, &lease) {
+                                Ok(ResizeDispatchResult::Failed) => {
                                     owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
                                 }
-                                ResizeDispatchResult::Succeeded => {
+                                Ok(ResizeDispatchResult::Succeeded) => {
                                     thread_resize_failed.store(false, Ordering::Relaxed);
                                 }
-                                ResizeDispatchResult::None => {}
+                                Ok(ResizeDispatchResult::None) => {}
+                                Err(error) => {
+                                    lease.cancel_continuation();
+                                    *thread_input_error.lock().unwrap() = Some(error.to_string());
+                                    break;
+                                }
                             }
                             if let Some(wake) = &capture_wake {
                                 wake.wake();
@@ -567,6 +603,7 @@ impl LiveSendWorker {
             tx,
             lock_lost,
             resize_failed,
+            input_error,
         }
     }
 
@@ -583,6 +620,11 @@ impl LiveSendWorker {
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Consume the worker's terminal input failure so the UI can end live mode.
+    pub(super) fn take_input_error(&self) -> Option<String> {
+        self.input_error.lock().ok()?.take()
+    }
+
     #[cfg(test)]
     pub(super) fn force_lock_lost_for_test(&self) {
         self.lock_lost
@@ -592,8 +634,7 @@ impl LiveSendWorker {
     /// Enqueue a translated key. Returns immediately: the fork happens on the worker
     /// thread, so the UI never blocks on tmux latency.
     pub(super) fn send(&self, key: TmuxKey) {
-        // A send only fails if the worker thread panicked. Drop silently: the user's next
-        // exit clears the dead worker and the next entry spawns a fresh one.
+        // Capture and dispatch failures are reported through `take_input_error`.
         let _ = self.tx.send(WorkerMsg::Send(key));
     }
 
@@ -2014,14 +2055,13 @@ enum ResizeDispatchResult {
     Failed,
 }
 
-/// Walk one drained batch and execute it as one-shot tmux subprocesses: coalescing merges
-/// literal runs into one send-keys call, while named keys and resizes dispatch singly.
+/// Dispatch a coalesced batch without refreshing its native or physical input scope.
 fn dispatch_batch(
-    tmux_name: &str,
+    session: &crate::tmux::Session,
     resize_owner: &str,
     batch: Vec<WorkerMsg>,
     lease: &crate::tui::session_feed::NativeLease,
-) -> ResizeDispatchResult {
+) -> anyhow::Result<ResizeDispatchResult> {
     let actions = coalesce(batch);
     // A Paste can only go through tmux (`paste-buffer -p` decides whether the pane gets
     // bracketed-paste markers), so pin the whole mixed batch to tmux and keep one ordered
@@ -2029,11 +2069,9 @@ fn dispatch_batch(
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
-        if !lease.is_valid() {
-            break;
-        }
+        anyhow::ensure!(lease.is_valid(), "Live input scope is no longer current");
         let is_resize = matches!(action, TmuxAction::Resize { .. });
-        match dispatch_via_fork(tmux_name, &action, force_tmux, Some(resize_owner)) {
+        match dispatch_action(session, &action, force_tmux, Some(resize_owner)) {
             Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
             Ok(()) => {}
             Err(err) => {
@@ -2044,122 +2082,70 @@ fn dispatch_batch(
                     target: "tui.live_send",
                     error = %err,
                     action = ?action,
-                    "live-send fork dispatch failed; action dropped",
+                    "live-send dispatch failed; action dropped",
                 );
+                if !is_resize {
+                    lease.cancel_continuation();
+                    return Err(err);
+                }
             }
         }
     }
-    resize_result
+    Ok(resize_result)
 }
 
-/// Execute one TmuxAction as a one-shot tmux subprocess. A module-level fn rather than a
-/// method, so the spawned thread can call it without holding a worker reference.
-fn dispatch_via_fork(
-    tmux_name: &str,
+/// Execute one action using only the input route captured before queue admission.
+fn dispatch_action(
+    session: &crate::tmux::Session,
     action: &TmuxAction,
     force_tmux: bool,
     resize_owner: Option<&str>,
 ) -> anyhow::Result<()> {
-    use std::process::Stdio;
-
-    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane,
-    // ordinary batches send pane input through the socket, not `send-keys`. A batch
-    // containing `Paste` sets `force_tmux` and sends the whole batch through tmux instead.
-    // Mixing writers on one pty input stream can corrupt multi-byte sequences, since
-    // `pipe-pane -I` arbitrates nothing. `input_mode` returns `Some` only while the
-    // forwarder is connected, so a dead or not-yet-connected channel falls through to the
-    // fork below instead of vanishing. Keys are encoded here against the pane's DECCKM from
-    // the grid, since tmux's own translation is bypassed. `Resize` is not pane input.
-    //
-    // The invariant forbids concurrent writers, not a sequential fallback:
-    // `try_send_input`'s `write_all` on a blocking `UnixStream` fails only on a broken pipe,
-    // never a transient WouldBlock, so `false` means the forwarder died between the
-    // `input_mode` check and this write, leaving no live writer and making the fork safe. An
-    // empty-bytes encoding still drops without forking: nothing proves the writer is dead,
-    // so falling back could race a live socket writer.
     #[cfg(unix)]
-    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name).filter(|_| !force_tmux) {
-        if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
+    if !force_tmux
+        && matches!(
+            action,
+            TmuxAction::Named(_) | TmuxAction::NamedRepeat { .. }
+        )
+    {
+        if let Some(app_cursor) = session.live_input_mode() {
             let bytes = encode_action_bytes(action, app_cursor);
             if bytes.is_empty() {
                 return Ok(());
             }
-            if crate::tmux::vt::try_send_input(tmux_name, &bytes) {
-                return Ok(());
-            }
-            tracing::warn!(
-                target: "tui.live_send",
-                action = ?action,
-                "vt socket write failed; falling back to send-keys fork",
-            );
-            // Fall through to the send-keys fork below.
+            // A failed socket write may have delivered a prefix. Never replay it.
+            return session.send_live_raw_bytes(&bytes);
         }
     }
 
-    let target = crate::tmux::Session::from_name(tmux_name)
-        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-    let mut cmd = crate::tmux::tmux_command();
-    cmd.stderr(Stdio::null());
     match action {
-        TmuxAction::Literal(s) => {
-            // tmux's command parser reads a trailing `;` in a `send-keys -l` payload as a
-            // command separator and drops it, even after `--`, so it never reaches the pane
-            // (#1942). Peel the trailing semicolons and send them as raw hex (`-H 3b`),
-            // which tmux passes through verbatim; embedded and leading ones survive `-l`.
-            let (head, semis) = crate::tmux::peel_trailing_semicolons(s);
-            if semis > 0 {
-                if !head.is_empty() {
-                    send_literal(&target, head)?;
-                }
-                return crate::tmux::Session::from_name(tmux_name)
-                    .send_raw_bytes(&vec![0x3b; semis]);
+        TmuxAction::Literal(text) => {
+            if force_tmux {
+                session.send_raw_bytes(text.as_bytes())
+            } else {
+                session.send_live_raw_bytes(text.as_bytes())
             }
-            // `-l --` mirrors `send_literal_no_enter`: a literal send plus the
-            // end-of-options marker, so a payload starting with `-` isn't read as a flag.
-            cmd.args(["send-keys", "-t", &target, "-l", "--", s.as_str()]);
         }
-        TmuxAction::Named(name) => {
-            cmd.args(["send-keys", "-t", &target, name.as_str()]);
-        }
-        TmuxAction::NamedRepeat { name, count } => {
-            // `-N <count>` repeats the key in one fork. tmux renders each press in the
-            // pane's current cursor-key mode, so wheel-forward arrows honor DECCKM.
-            let count = count.to_string();
-            cmd.args(["send-keys", "-t", &target, "-N", &count, name.as_str()]);
-        }
+        TmuxAction::Named(name) => session.send_named_key(name),
+        TmuxAction::NamedRepeat { name, count } => session.send_named_key_repeat(name, *count),
         TmuxAction::HexBytes(bytes) => {
-            // `-H` sends each arg as the hex value of an ASCII character, used for control
-            // bytes (CR, TAB, ESC) and the bracketed-paste markers, none of which ride a
-            // `-l` payload safely. ARG_MAX chunking and the hex encoding live in the shared
-            // tmux layer, which the web live view's input path also uses.
-            return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
+            if force_tmux {
+                session.send_raw_bytes(bytes)
+            } else {
+                session.send_live_raw_bytes(bytes)
+            }
         }
-        TmuxAction::Paste(text) => {
-            // tmux emits the bracketed-paste markers only when the program set DECSET
-            // 2004, so a raw shell gets clean text instead of literal `00~` / `01~`.
-            return crate::tmux::Session::from_name(tmux_name).paste_text(text);
-        }
+        TmuxAction::Paste(text) => session.paste_text(text),
         TmuxAction::Resize { cols, rows } => {
-            // tmux checks ownership in the same command queue as the resize; the worker's
-            // earlier heartbeat check only filters stale batches and cannot authorize a
-            // later subprocess.
+            // Ownership is checked in tmux's resize command queue, not by a stale heartbeat.
             let owner = resize_owner
                 .ok_or_else(|| anyhow::anyhow!("live-send resize has no owner token"))?;
-            if !crate::tmux::Session::from_name(tmux_name)
-                .resize_window_if_owner(owner, *cols, *rows)
-            {
+            if !session.resize_window_if_owner(owner, *cols, *rows) {
                 anyhow::bail!("live-send resize lost ownership, failed, or timed out");
             }
-            return Ok(());
+            Ok(())
         }
     }
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
-    if !status.success() {
-        anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
-    }
-    Ok(())
 }
 
 /// Encode a `TmuxAction` to raw terminal bytes for the persistent-input fast path. It
@@ -2423,21 +2409,25 @@ impl Drop for OneshotSlot {
     }
 }
 
-/// Forward a single translated key to a tmux pane with a one-shot `tmux send-keys` fork on
-/// a detached thread, for the passive-preview wheel forward where there is no
-/// `LiveSendWorker` to enqueue onto and `dispatch_via_fork` would block the UI thread.
-/// Fire-and-forget: a dropped notch is harmless and a failed fork is logged. Scroll notches
-/// carry no ordering relationship, so racing forks are fine within
-/// `MAX_INFLIGHT_ONESHOT`.
-pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
+/// Capture a passive-preview wheel target before starting its bounded one-shot worker.
+/// Failed capture or dispatch drops the notch without resolving a replacement name.
+pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key: TmuxKey) {
     use std::sync::atomic::Ordering;
-    // Reserve a slot first; if we are already at the cap, drop this notch
-    // rather than pile another thread on.
+    // Reserve a slot before capture so a dropped notch does no native store work.
     if INFLIGHT_ONESHOT.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ONESHOT {
         INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
         return;
     }
-    let tmux_name = tmux_name.to_string();
+    let session = match lease.input_session() {
+        Ok(session) => session,
+        Err(error) => {
+            INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
+            lease.cancel_continuation();
+            tracing::warn!(target: "tui.live_send", error = %error,
+                "passive-preview input capture failed; notch dropped");
+            return;
+        }
+    };
     let action = match key {
         TmuxKey::Literal(s) => TmuxAction::Literal(s),
         TmuxKey::Named(name) => TmuxAction::Named(name),
@@ -2453,8 +2443,11 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
             let _slot = OneshotSlot;
-            // A wheel notch is never a paste, so the vt fast path stays open.
-            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false, None) {
+            if !lease.is_valid() {
+                return;
+            }
+            if let Err(err) = dispatch_action(&session, &action, false, None) {
+                lease.cancel_continuation();
                 tracing::warn!(
                     target: "tui.live_send",
                     error = %err,
@@ -2470,25 +2463,6 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
             "could not spawn wheel-forward thread; notch dropped",
         );
     }
-}
-
-/// Send a literal string through one `tmux send-keys -l --` fork, for the head of a payload
-/// whose trailing semicolons were peeled off (see [`dispatch_via_fork`]).
-fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
-    use std::process::Stdio;
-    let mut cmd = crate::tmux::tmux_command();
-    cmd.stderr(Stdio::null());
-    cmd.args(["send-keys", "-t", target, "-l", "--", s]);
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
-    if !status.success() {
-        anyhow::bail!(
-            "live-send tmux subprocess exited non-zero for literal {:?}",
-            s
-        );
-    }
-    Ok(())
 }
 
 /// What the translator says to do with one incoming key event. The exit-chord check lives
@@ -2611,18 +2585,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancelled_native_continuation_discards_queued_worker_actions() {
+    fn worker_reports_unknown_input_scope_before_accepting_actions() {
         let lease = crate::tui::session_feed::NativeLease::valid_for_test();
-        lease.cancel_continuation();
-        assert_eq!(
-            dispatch_batch(
-                "missing-native-session",
-                "owner",
-                vec![WorkerMsg::Resize { cols: 80, rows: 24 }],
-                &lease,
-            ),
-            ResizeDispatchResult::None,
-        );
+        let worker = LiveSendWorker::spawn(None, lease.clone());
+        assert!(worker.take_input_error().is_some());
+        assert!(!lease.is_valid());
+        assert!(worker.tx.send(snd_lit("must-not-send")).is_err());
     }
 
     fn k(code: KeyCode) -> KeyEvent {
@@ -3591,37 +3559,6 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    #[test]
-    fn live_send_worker_reports_failed_resize() {
-        let name = "aoe_test_missing_live_resize";
-        let action = TmuxAction::Resize { cols: 80, rows: 24 };
-        assert!(
-            dispatch_via_fork(name, &action, false, Some("test-owner")).is_err(),
-            "the bounded resize path must expose failure"
-        );
-
-        let worker = LiveSendWorker::spawn(
-            name.to_string(),
-            None,
-            crate::tui::session_feed::NativeLease::valid_for_test(),
-        );
-        worker.resize(80, 24);
-        wait_until(
-            "live resize failure flag",
-            std::time::Duration::from_secs(5),
-            || {
-                worker
-                    .resize_failed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            },
-        );
-        assert!(
-            worker.take_resize_failed(),
-            "paint consumes the sticky failure"
-        );
-        assert!(!worker.take_resize_failed(), "consuming the flag clears it");
-    }
-
     fn pane_width(name: &str) -> u16 {
         let out = crate::tmux::tmux_command()
             .args([
@@ -3640,7 +3577,9 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn create_live_send_fixture(name: &str) -> crate::tmux::Session {
+    fn create_live_send_fixture(
+        name: &str,
+    ) -> std::sync::Arc<crate::session::LegacyToolObservation> {
         let mut args: Vec<String> = [
             "new-session",
             "-d",
@@ -3650,7 +3589,7 @@ mod tests {
             "80",
             "-y",
             "24",
-            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
+            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; while IFS= read -r line; do printf "INPUT-ACK:%s\n" "$line"; done'"#,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -3678,8 +3617,90 @@ mod tests {
                     && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
             },
         );
-        crate::tmux::refresh_session_cache();
-        crate::tmux::Session::from_name(name)
+        let (physical, state, _) =
+            crate::tmux::utils::observe_pane(name, &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .expect("live physical pane");
+        assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
+        std::sync::Arc::new(physical)
+    }
+
+    struct NativeFixture {
+        guard: crate::tmux::test_helpers::TmuxTestSession,
+        storage: crate::session::Storage,
+        row: crate::session::Instance,
+        physical: std::sync::Arc<crate::session::LegacyToolObservation>,
+        auxiliary: crate::session::AuxiliaryTarget,
+    }
+
+    impl NativeFixture {
+        fn new(prefix: &str, auxiliary: crate::session::AuxiliaryTarget) -> Self {
+            let guard = crate::tmux::test_helpers::TmuxTestSession::new(prefix);
+            let physical = create_live_send_fixture(guard.name());
+            let storage = crate::session::Storage::new_unwatched("live-input").unwrap();
+            let mut row = crate::session::Instance::new(guard.name(), "/tmp");
+            row.source_profile = storage.profile().into();
+            row.status = crate::session::Status::Error;
+            row.lifecycle_generation = 7;
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            Self {
+                guard,
+                storage,
+                row,
+                physical,
+                auxiliary,
+            }
+        }
+
+        fn lease(&self) -> crate::tui::session_feed::NativeLease {
+            let target = std::sync::Arc::new(crate::daemon::TerminalTarget {
+                tmux_session: self.guard.name().into(),
+                status: crate::daemon::TerminalTargetStatus::Alive,
+                lifecycle_generation: self.row.lifecycle_generation,
+                profile: self.row.source_profile.clone(),
+                physical: Some(self.physical.clone()),
+            });
+            crate::tui::session_feed::NativeLease::bound_for_test(
+                &self.row,
+                Some(self.auxiliary.clone()),
+                target,
+            )
+        }
+
+        fn advance_generation(&mut self) {
+            let _title = crate::session::acquire_session_title_lock(&self.row.id).unwrap();
+            let _lifecycle = self
+                .storage
+                .acquire_instance_lifecycle_lock(&self.row.id)
+                .unwrap();
+            self.row
+                .advance_auxiliary_generation_in(&self.storage)
+                .unwrap();
+        }
+
+        fn capture(&self) -> String {
+            let output = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &self.physical.identity.pane_id])
+                .output()
+                .expect("capture input consumer");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        }
+
+        fn wait_for_ack(&self, text: &str) -> String {
+            let expected = format!("INPUT-ACK:{text}");
+            wait_until(
+                "input consumer acknowledgment",
+                std::time::Duration::from_secs(5),
+                || self.capture().lines().any(|line| line == expected),
+            );
+            self.capture()
+        }
     }
 
     // Losing size ownership drops queued resizes, not keys.
@@ -3691,14 +3712,13 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
-        let session = create_live_send_fixture(guard.name());
-
-        let worker = LiveSendWorker::spawn(
-            guard.name().to_string(),
-            None,
-            crate::tui::session_feed::NativeLease::valid_for_test(),
+        let _app = crate::session::test_support::isolate_app_dir();
+        let fixture = NativeFixture::new(
+            "aoe_test_livelock_steal",
+            crate::session::AuxiliaryTarget::Host { index: 0 },
         );
+        let session = fixture.lease().input_session().unwrap();
+        let worker = LiveSendWorker::spawn(None, fixture.lease());
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3720,24 +3740,11 @@ mod tests {
             Some("live-test-thief".to_string()),
             "worker must not steal the lock back"
         );
-        let target = format!("{}:^.0", guard.name());
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
         worker.send(TmuxKey::Named("Enter".into()));
-        wait_until(
-            "post-resize input reached the pane",
-            std::time::Duration::from_secs(5),
-            || {
-                let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", &target])
-                    .output()
-                    .expect("capture ordered input");
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
-            },
-        );
+        fixture.wait_for_ack("RESIZE-BATCH-COMPLETE");
         assert_eq!(
-            pane_width(guard.name()),
+            pane_width(fixture.guard.name()),
             80,
             "dropped resize must not dispatch"
         );
@@ -3750,14 +3757,13 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_own");
-        let session = create_live_send_fixture(guard.name());
-
-        let worker = LiveSendWorker::spawn(
-            guard.name().to_string(),
-            None,
-            crate::tui::session_feed::NativeLease::valid_for_test(),
+        let _app = crate::session::test_support::isolate_app_dir();
+        let fixture = NativeFixture::new(
+            "aoe_test_livelock_own",
+            crate::session::AuxiliaryTarget::Host { index: 0 },
         );
+        let session = fixture.lease().input_session().unwrap();
+        let worker = LiveSendWorker::spawn(None, fixture.lease());
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3767,124 +3773,350 @@ mod tests {
         wait_until(
             "owned resize dispatch",
             std::time::Duration::from_secs(5),
-            || pane_width(guard.name()) == 60,
+            || pane_width(fixture.guard.name()) == 60,
         );
         assert!(!worker.lock_lost());
     }
 
-    // Start before session creation to exercise the failed entry-steal retry.
-
     #[test]
     #[serial_test::serial]
-    fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
-        // A failed resize acknowledges that the worker observed the absent session.
-        let worker = LiveSendWorker::spawn(
-            guard.name().to_string(),
-            None,
-            crate::tui::session_feed::NativeLease::valid_for_test(),
-        );
-        worker.resize(60, 20);
-        wait_until(
-            "resize against absent session",
-            std::time::Duration::from_secs(5),
-            || worker.take_resize_failed(),
-        );
-
-        let session = create_live_send_fixture(guard.name());
-
-        // The new session has a live owner before the next resize.
-        assert!(session.steal_size_owner("live-test-thief"));
-        assert!(!worker.lock_lost());
-
-        // The retry must claim, not steal: a live holder is a takeover, so the
-        // loss is flagged and the resize dropped.
-        worker.resize(60, 20);
-        wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
-            worker.lock_lost()
-        });
-        assert_eq!(
-            session.size_owner().map(|(id, _)| id),
-            Some("live-test-thief".to_string()),
-            "unowned retry must not steal from a live owner"
-        );
-        let target = format!("{}:^.0", guard.name());
-        worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
-        worker.send(TmuxKey::Named("Enter".into()));
-        wait_until(
-            "post-resize input reached the pane",
-            std::time::Duration::from_secs(5),
-            || {
-                let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", &target])
-                    .output()
-                    .expect("capture ordered input");
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
+    fn queued_coalesced_input_rejects_same_pty_native_generation_change() {
+        crate::tmux::test_helpers::require_tmux!();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let mut fixture = NativeFixture::new(
+            "aoe_test_live_generation",
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: "shell".into(),
             },
         );
-        assert_eq!(
-            pane_width(guard.name()),
-            80,
-            "dropped resize must not dispatch"
+        let lease = fixture.lease();
+        let worker = LiveSendWorker::spawn(None, lease.clone());
+        let session = fixture.lease().input_session().unwrap();
+        wait_until(
+            "captured worker entry",
+            std::time::Duration::from_secs(5),
+            || matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
         );
+        let original_physical = fixture.physical.clone();
+        let title = crate::session::acquire_session_title_lock(&fixture.row.id).unwrap();
+        let lifecycle = fixture
+            .storage
+            .acquire_instance_lifecycle_lock(&fixture.row.id)
+            .unwrap();
+        worker.send(TmuxKey::Literal("STALE-".into()));
+        worker.send(TmuxKey::Literal("COALESCED".into()));
+        worker.send(TmuxKey::HexBytes(b"-RAW".to_vec()));
+        worker.send(TmuxKey::NamedRepeat {
+            name: "Tab".into(),
+            count: 2,
+        });
+        worker.send(TmuxKey::Named("Enter".into()));
+        fixture
+            .row
+            .advance_auxiliary_generation_in(&fixture.storage)
+            .unwrap();
+        drop((lifecycle, title));
+        wait_until(
+            "stale worker input error",
+            std::time::Duration::from_secs(5),
+            || worker.take_input_error().is_some(),
+        );
+        assert!(!lease.is_valid());
+        let current = crate::tmux::utils::observe_pane(
+            fixture.guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(
+            *original_physical, current,
+            "the PTY must survive the generation change"
+        );
+        drop(worker);
+
+        let fresh = fixture.lease().input_session().unwrap();
+        dispatch_action(
+            &fresh,
+            &TmuxAction::HexBytes(b"FRESH-TOOL\r".to_vec()),
+            false,
+            None,
+        )
+        .unwrap();
+        let capture = fixture.wait_for_ack("FRESH-TOOL");
+        assert!(!capture.contains("STALE-"));
     }
 
     #[test]
     #[serial_test::serial]
-    fn worker_claims_vacant_lock_when_session_appears_late() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
+    fn queued_paste_and_enter_revalidate_after_waits() {
+        crate::tmux::test_helpers::require_tmux!();
+        let _app = crate::session::test_support::isolate_app_dir();
+        for paste_first in [false, true] {
+            let mut fixture = NativeFixture::new(
+                "aoe_test_live_paste_generation",
+                crate::session::AuxiliaryTarget::Host { index: 0 },
+            );
+            let lease = fixture.lease();
+            let session = lease.input_session().unwrap();
+            let (queued, waiting) = channel();
+            let (release, gate) = channel();
+            let sender = std::thread::spawn(move || {
+                if paste_first {
+                    dispatch_batch(
+                        &session,
+                        "fixture-owner",
+                        vec![WorkerMsg::Send(TmuxKey::Paste("PASTED-BODY".into()))],
+                        &lease,
+                    )
+                    .unwrap();
+                }
+                let mut batch = Vec::new();
+                if !paste_first {
+                    batch.push(WorkerMsg::Send(TmuxKey::Paste("STALE-PASTE".into())));
+                }
+                batch.push(snd_named("Enter"));
+                queued.send(()).unwrap();
+                gate.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                dispatch_batch(&session, "fixture-owner", batch, &lease)
+            });
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            fixture.advance_generation();
+            release.send(()).unwrap();
+            assert!(sender.join().unwrap().is_err());
+
+            let fresh = fixture.lease().input_session().unwrap();
+            dispatch_batch(
+                &fresh,
+                "fixture-owner",
+                vec![snd_lit("-FRESH-HOST"), snd_named("Enter")],
+                &fixture.lease(),
+            )
+            .unwrap();
+            let expected = if paste_first {
+                "PASTED-BODY-FRESH-HOST"
+            } else {
+                "-FRESH-HOST"
+            };
+            let capture = fixture.wait_for_ack(expected);
+            assert!(!capture.contains("STALE-PASTE"));
         }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
-        let worker = LiveSendWorker::spawn(
-            guard.name().to_string(),
-            None,
-            crate::tui::session_feed::NativeLease::valid_for_test(),
-        );
-        worker.resize(60, 20);
-        wait_until(
-            "resize against absent session",
-            std::time::Duration::from_secs(5),
-            || worker.take_resize_failed(),
-        );
-
-        let session = create_live_send_fixture(guard.name());
-
-        worker.resize(60, 20);
-        wait_until(
-            "late resize dispatch",
-            std::time::Duration::from_secs(5),
-            || pane_width(guard.name()) == 60,
-        );
-        assert!(!worker.lock_lost());
-        assert!(
-            matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
-            "vacant lock must still be claimed on the retry path"
-        );
     }
 
     #[test]
-    fn queued_resize_batch_does_not_dispatch_after_its_native_lease_is_revoked() {
-        let lease = crate::tui::session_feed::NativeLease::valid_for_test();
-        let queued = vec![WorkerMsg::Resize { cols: 80, rows: 24 }];
-        let missing_target = format!("aoe_absent_lease_probe_{}", uuid::Uuid::new_v4());
+    #[serial_test::serial]
+    fn queued_input_never_falls_back_to_a_fresh_same_name_pane() {
+        crate::tmux::test_helpers::require_tmux!();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let mut fixture = NativeFixture::new(
+            "aoe_test_live_name_replacement",
+            crate::session::AuxiliaryTarget::Host { index: 0 },
+        );
+        let lease = fixture.lease();
+        let session = lease.input_session().unwrap();
+        let (queued, waiting) = channel();
+        let (release, gate) = channel();
+        let sender = std::thread::spawn(move || {
+            let batch = vec![
+                WorkerMsg::Send(TmuxKey::Paste("STALE-REPLACEMENT".into())),
+                snd_named("Enter"),
+            ];
+            queued.send(()).unwrap();
+            gate.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            dispatch_batch(&session, "fixture-owner", batch, &lease)
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let killed = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", fixture.guard.name()])
+            .output()
+            .unwrap();
+        assert!(killed.status.success());
+        let replacement = create_live_send_fixture(fixture.guard.name());
+        assert_ne!(fixture.physical, replacement);
+        release.send(()).unwrap();
+        assert!(sender.join().unwrap().is_err());
+
+        fixture.physical = replacement;
+        let fresh = fixture.lease().input_session().unwrap();
+        fresh.send_live_raw_bytes(b"REPLACEMENT-CONTROL\r").unwrap();
+        let capture = fixture.wait_for_ack("REPLACEMENT-CONTROL");
+        assert!(!capture.contains("STALE-REPLACEMENT"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revoked_lease_rejects_queued_resize_without_touching_ownership() {
+        crate::tmux::test_helpers::require_tmux!();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let fixture = NativeFixture::new(
+            "aoe_test_live_cancel_resize",
+            crate::session::AuxiliaryTarget::Host { index: 0 },
+        );
+        let lease = fixture.lease();
+        let session = lease.input_session().unwrap();
+        assert!(session.steal_size_owner("fixture-owner"));
         assert_eq!(
-            dispatch_batch(&missing_target, "fixture-owner", queued.clone(), &lease),
+            dispatch_batch(
+                &session,
+                "wrong-owner",
+                vec![WorkerMsg::Resize { cols: 60, rows: 20 }],
+                &lease,
+            )
+            .unwrap(),
             ResizeDispatchResult::Failed,
-            "positive control reaches real resize dispatch for a valid lease and absent target"
+        );
+        assert!(
+            lease.is_valid(),
+            "resize ownership failure does not revoke raw input"
         );
         lease.cancel_continuation();
-        assert_eq!(
-            dispatch_batch(&missing_target, "fixture-owner", queued, &lease),
-            ResizeDispatchResult::None,
-            "already queued native work must not reach resize dispatch after revocation"
-        );
+        assert!(dispatch_batch(
+            &session,
+            "fixture-owner",
+            vec![WorkerMsg::Resize { cols: 60, rows: 20 }],
+            &lease,
+        )
+        .is_err());
+        assert_eq!(pane_width(fixture.guard.name()), 80);
+        assert_eq!(session.size_owner().unwrap().0, "fixture-owner");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn captured_channel_replacement_and_partial_write_never_replay_input() {
+        use std::io::Read;
+        crate::tmux::test_helpers::require_tmux!();
+        let _app = crate::session::test_support::isolate_app_dir();
+        for auxiliary in [
+            crate::session::AuxiliaryTarget::Host { index: 0 },
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: "shell".into(),
+            },
+        ] {
+            let fixture = NativeFixture::new("aoe_test_live_channel_scope", auxiliary);
+            let directory = tempfile::tempdir().unwrap();
+            let (original, mut original_peer) =
+                crate::tmux::vt::register_live_with_physical_for_test(
+                    fixture.guard.name(),
+                    directory.path(),
+                    fixture.physical.clone(),
+                    true,
+                );
+            original_peer
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let lease = fixture.lease();
+            let session = lease.input_session().unwrap();
+            let (queued, waiting) = channel();
+            let (release, gate) = channel();
+            let sender = std::thread::spawn(move || {
+                let batch = vec![
+                    snd_lit("captured;"),
+                    snd_lit(";"),
+                    snd_hex(b"\x1b[1;5A"),
+                    snd_named("Up"),
+                    snd_named_repeat("Down", 2),
+                ];
+                queued.send(()).unwrap();
+                gate.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let result = dispatch_batch(&session, "fixture-owner", batch, &lease);
+                (result, session)
+            });
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (replacement, mut replacement_peer) =
+                crate::tmux::vt::register_live_with_physical_for_test(
+                    fixture.guard.name(),
+                    directory.path(),
+                    fixture.physical.clone(),
+                    false,
+                );
+            replacement_peer
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            release.send(()).unwrap();
+            let (result, captured) = sender.join().unwrap();
+            result.unwrap();
+            let expected = b"captured;;\x1b[1;5A\x1bOA\x1bOB\x1bOB";
+            let mut observed = vec![0; expected.len()];
+            original_peer.read_exact(&mut observed).unwrap();
+            assert_eq!(observed, expected);
+            replacement_peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                replacement_peer.read(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "queued input must not resolve the replacement channel"
+            );
+            replacement_peer.set_nonblocking(false).unwrap();
+
+            dispatch_batch(
+                &captured,
+                "fixture-owner",
+                vec![
+                    WorkerMsg::Send(TmuxKey::Paste("CAPTURED-PASTE".into())),
+                    snd_named("Enter"),
+                ],
+                &fixture.lease(),
+            )
+            .unwrap();
+            fixture.wait_for_ack("CAPTURED-PASTE");
+            replacement_peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                replacement_peer.read(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "paste and Enter retain the original physical route"
+            );
+            replacement_peer.set_nonblocking(false).unwrap();
+
+            let fresh = fixture.lease().input_session().unwrap();
+            dispatch_action(&fresh, &TmuxAction::Named("Up".into()), false, None).unwrap();
+            let mut fresh_bytes = [0; 3];
+            replacement_peer.read_exact(&mut fresh_bytes).unwrap();
+            assert_eq!(&fresh_bytes, b"\x1b[A");
+
+            let reader = std::thread::spawn(move || {
+                let mut prefix = [0; 64];
+                original_peer.read_exact(&mut prefix).unwrap();
+                original_peer.shutdown(std::net::Shutdown::Both).unwrap();
+                prefix
+            });
+            let payload = vec![b'X'; 4 * 1024 * 1024];
+            let failed_lease = fixture.lease();
+            assert!(dispatch_batch(
+                &captured,
+                "fixture-owner",
+                vec![
+                    WorkerMsg::Send(TmuxKey::HexBytes(payload)),
+                    snd_named("Enter")
+                ],
+                &failed_lease,
+            )
+            .is_err());
+            assert_eq!(reader.join().unwrap(), [b'X'; 64]);
+            assert!(!failed_lease.is_valid());
+            dispatch_batch(
+                &fresh,
+                "fixture-owner",
+                vec![
+                    WorkerMsg::Send(TmuxKey::Paste("NO-REPLAY-CONTROL".into())),
+                    snd_named("Enter"),
+                ],
+                &fixture.lease(),
+            )
+            .unwrap();
+            let capture = fixture.wait_for_ack("NO-REPLAY-CONTROL");
+            assert!(!capture.contains("INPUT-ACK:X"));
+            crate::tmux::vt::unregister_for_test(fixture.guard.name());
+            drop((original, replacement));
+        }
     }
 }

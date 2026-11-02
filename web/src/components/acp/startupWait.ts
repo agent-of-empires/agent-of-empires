@@ -1,4 +1,4 @@
-import type { AcpState } from "../../lib/acpTypes";
+import { nativeInputAvailable, type AcpState } from "../../lib/acpTypes";
 import type { SessionResponse } from "../../lib/types";
 import type { AcpContext } from "./AcpRuntime";
 
@@ -28,6 +28,7 @@ export function isNewSessionStarting(
 ): boolean {
   if (
     startedBefore ||
+    nativeInputAvailable(state) ||
     state.startupError ||
     state.workerStopped ||
     state.workerRestarting ||

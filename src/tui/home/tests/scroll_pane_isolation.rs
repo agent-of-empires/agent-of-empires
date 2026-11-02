@@ -2,7 +2,9 @@
 //! never moves the list cursor, at a scroll boundary or with nothing selected (#1361).
 
 use super::*;
+use crate::tmux::test_helpers::require_tmux;
 use ratatui::layout::Rect;
+use std::sync::Arc;
 
 fn setup_panes(env: &mut TestEnv) {
     env.view.list_area = Rect::new(0, 0, 30, 40);
@@ -27,11 +29,7 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
         ),
         leader: None,
     });
-    env.view.live_send_worker = Some(LiveSendWorker::spawn(
-        "fake".to_string(),
-        None,
-        crate::tui::session_feed::NativeLease::valid_for_test(),
-    ));
+    env.view.live_send_worker = Some(LiveSendWorker::notification_fixture_for_test());
     env.view
         .sync_preview_capture_worker(Some("fake".to_string()));
     env.view.preview_cache.dimensions = (80, 24);
@@ -48,29 +46,73 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
     env
 }
 
-/// Like `live_env_with_cursor` but without entering live-send: the session is merely
-/// previewed, with the capture worker and target set so `forward_wheel_to_preview` takes
-/// the passive one-shot path.
-fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+struct PassiveNativeAuthority {
+    _pane: crate::tmux::test_helpers::TmuxTestSession,
+    _command_lane: Box<dyn std::any::Any>,
+}
+
+/// Passive input has the same native custody prerequisites as real preview input.
+fn passive_env_with_cursor(
+    cursor: crate::tmux::PaneCursor,
+) -> (TestEnv, Option<PassiveNativeAuthority>) {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;
     env.view.update_selected();
+    let id = env.view.instance_at(1).id.clone();
+    let instance = env.view.get_instance(&id).unwrap();
+    let name = crate::tmux::Session::generate_name(&id, &instance.title);
+    let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+    crate::tmux::Session::from_name(&name)
+        .create("/tmp", Some("exec cat >/dev/null"), "test")
+        .unwrap();
+    let pane_id = crate::tmux::test_helpers::only_pane_id(&name);
+    crate::tmux::test_helpers::wait_for_pane_command(&pane_id, "cat");
+    let (physical, state, _) =
+        crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap();
+    assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
+    let command_lane = env.view.session_feed.terminal_driver_for_test();
+    let crate::tui::session_feed::SessionFeedResult::Snapshot(mut snapshot) =
+        super::session_feed_tests::daemon_snapshot(&env.view, &id, "Running")
+    else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut snapshot).contents.sessions[0].agent_pane =
+        crate::session::PaneObservation {
+            state: crate::session::PanePresence::Alive,
+            tmux_session: Some(name.clone()),
+            physical: Some(Arc::new(physical)),
+            legacy_tool: None,
+        };
     env.view
-        .sync_preview_capture_worker(Some("fake".to_string()));
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            snapshot,
+        ));
+    env.view.apply_session_feed();
+    env.view.select_session_by_id(&id);
+    env.view.sync_preview_capture_worker(Some(name.clone()));
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.captured_lines = 200;
     env.view.preview_scroll_offset = 10;
-    env.view.preview_capture_target = Some("fake".to_string());
+    env.view.preview_capture_target = Some(name.clone());
     env.view.preview_cache.cursor = Some(cursor);
-    env.view.preview_cache.capture_target = Some("fake".to_string());
+    env.view.preview_cache.capture_target = Some(name);
     env.view.preview_cache.capture_generation = env
         .view
         .preview_capture_worker
         .as_ref()
         .expect("capture worker")
         .current_generation_for_test();
-    env
+    (
+        env,
+        Some(PassiveNativeAuthority {
+            _pane: pane,
+            _command_lane: Box::new(command_lane),
+        }),
+    )
 }
 
 fn alt_screen_cursor(
@@ -142,6 +184,7 @@ fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
 #[test]
 #[serial]
 fn wheel_over_preview_forwards_only_for_alternate_screen() {
+    require_tmux!();
     // (label, passive preview, cursor, forwards)
     let cases = [
         (
@@ -164,10 +207,10 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
         ),
     ];
     for (label, passive, cursor, forwards) in cases {
-        let mut env = if passive {
+        let (mut env, _native) = if passive {
             passive_env_with_cursor(cursor)
         } else {
-            live_env_with_cursor(cursor)
+            (live_env_with_cursor(cursor), None)
         };
         assert_eq!(env.view.live_send.is_none(), passive, "{label}");
         assert!(env.view.handle_scroll_up(50, 10), "{label}");
@@ -189,14 +232,15 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
 #[test]
 #[serial]
 fn forward_mouse_to_preview_tracks_press_through_release() {
+    require_tmux!();
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     // (label, passive preview, drag/release point)
     for (label, passive, (x, y)) in [("live", false, (1, 1)), ("passive", true, (55, 12))] {
         let cursor = alt_screen_cursor(true, true, true);
-        let mut env = if passive {
+        let (mut env, _native) = if passive {
             passive_env_with_cursor(cursor)
         } else {
-            live_env_with_cursor(cursor)
+            (live_env_with_cursor(cursor), None)
         };
         let steps = [
             (MouseEventKind::Down(MouseButton::Left), (50, 10), Some(0)),

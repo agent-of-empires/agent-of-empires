@@ -5,6 +5,7 @@ import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
 import {
   emptyAcpState,
   normaliseTurnState,
+  revokeNativeAuthority,
   type AcpState,
   type BackgroundAgent,
   type WorkflowRun,
@@ -76,9 +77,10 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 // Optimistic rows and in-flight ids are ephemeral, and attachment bytes would blow the quota
 // (text alone would drain a degraded prompt on reload), so none of them are persisted.
 function toPersistedState(state: AcpState): AcpState {
+  state = revokeNativeAuthority(state);
   const base: AcpState =
-    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0
-      ? { ...state, optimisticRows: [], inflightPromptIds: [] }
+    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0 || state.interactionError
+      ? { ...state, optimisticRows: [], inflightPromptIds: [], interactionError: null }
       : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
@@ -96,6 +98,7 @@ export function persistState(sessionId: string, state: AcpState): void {
 // Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
 // reloads the transcript from the tail; folded control state keeps its own cursor and is untouched.
 function reopenState(state: AcpState): AcpState {
+  state = revokeNativeAuthority(state);
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) return { ...state, activity: [], oldestSeq: 0 };
   return state;
 }

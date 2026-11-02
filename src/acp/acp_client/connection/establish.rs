@@ -27,11 +27,13 @@ use crate::acp::acp_client::config_options::{
     apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
     modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
-use crate::acp::acp_client::control::{establish_session_v3, DaemonControlClient};
-use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
+use crate::acp::acp_client::control::{establish_session_v5, DaemonControlClient};
+use crate::acp::acp_client::errors::{
+    acp_internal_error, public_error_message, AcpError, IncompatibleAgentError,
+};
 use crate::acp::acp_client::handshake::{build_initialize_request, should_fork};
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
-use crate::acp::acp_client::session_identity::ordered_session_request;
+use crate::acp::acp_client::session_identity::{ordered_native_request, ordered_session_request};
 
 /// Fully silent grace after reattaching to an in-flight turn.
 const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
@@ -57,11 +59,12 @@ fn initial_reset_reason(
 
 /// A prior conversation drops the prefix the transcript suppresses, since the
 /// view switch cleared the history that suppression looks for.
-fn load_failed_reason(prior_conversation: bool, error: &impl std::fmt::Display) -> String {
+fn load_failed_reason(prior_conversation: bool, error: &agent_client_protocol::Error) -> String {
+    let message = public_error_message(error);
     if prior_conversation {
-        format!("Conversation context reset; {LOAD_FAILED_PREFIX}: {error}")
+        format!("Conversation context reset; {LOAD_FAILED_PREFIX}: {message}")
     } else {
-        format!("{LOAD_FAILED_PREFIX}: {error}")
+        format!("{LOAD_FAILED_PREFIX}: {message}")
     }
 }
 
@@ -127,13 +130,17 @@ pub(super) async fn establish(
             serde_json::from_value(control.initialize(params).await?)
                 .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
         }
-        None => {
-            connection
-                .send_request(build_initialize_request())
-                .block_task()
-                .await?
-        }
+        None => ordered_native_request(
+            &connection,
+            &shared.connection_state,
+            build_initialize_request(),
+        )
+        .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
+        .wait()
+        .await
+        .into_result()?,
     };
+    shared.connection_state.initialized();
 
     // The supervisor mirrors the typed error into events; a clean return
     // keeps the outer cleanup from adding a generic startup error.
@@ -153,6 +160,26 @@ pub(super) async fn establish(
             ))));
         }
         return Ok(None);
+    }
+
+    // Return initialized ownership before any bootstrap replay can fill the
+    // public queue. Session establishment still owns its own readiness gate.
+    if let Some(tx) = ctx.ready_tx.lock().await.take() {
+        let _admission = shared
+            .connection_state
+            .admission
+            .lock()
+            .expect("connection admission lock");
+        let readiness = match shared.connection_state.loss() {
+            Some(observation) => Err(AcpError::ConnectionUnavailable(observation)),
+            None => Ok(()),
+        };
+        let _ = tx.send(readiness);
+    }
+    if matches!(&ctx.mode, ConnectMode::Fresh { .. }) {
+        let _guard = shared.ingress.fence.write().await;
+        let replay = shared.ingress.finish(None)?;
+        shared.apply_replay(replay).await;
     }
 
     let load_session_capable = init.agent_capabilities.load_session;
@@ -183,9 +210,10 @@ pub(super) async fn establish(
             ..
         }
     );
-    shared
-        .adopted_turn_active
-        .store(arm_resume_watchdog, Ordering::Relaxed);
+    shared.adopted_turn_active.store(
+        arm_resume_watchdog && shared.connection_state.loss().is_none(),
+        Ordering::Relaxed,
+    );
     info!(
         target: "acp.protocol",
         session = %label,
@@ -193,11 +221,6 @@ pub(super) async fn establish(
         mode = ?ctx.mode,
         "initialize handshake complete"
     );
-    // Ready now: session/load can replay a whole transcript and must stay
-    // outside the handshake timeout (#2276).
-    if let Some(tx) = ctx.ready_tx.lock().await.take() {
-        let _ = tx.send(Ok(()));
-    }
 
     let mcp_servers = mcp_config::filter_for_capabilities(
         ctx.mcp_servers,
@@ -209,7 +232,6 @@ pub(super) async fn establish(
         shared: shared.clone(),
         control: ctx.control,
         acp_session_id: SessionId::new(""),
-        session_from_storage: matches!(ctx.mode, ConnectMode::Resume { .. }),
         channels: SessionChannels::default(),
         steering_capable,
         close_capable: init.agent_capabilities.session_capabilities.close.is_some(),
@@ -247,8 +269,8 @@ pub(super) async fn establish(
     };
     session.apply_default_model().await;
     session.apply_default_effort().await;
-    if arm_resume_watchdog {
-        spawn_resume_idle_watchdog(shared);
+    if arm_resume_watchdog && shared.connection_state.loss().is_none() {
+        spawn_resume_idle_watchdog(shared, &session.connection);
     }
     Ok(Some(session))
 }
@@ -256,44 +278,45 @@ pub(super) async fn establish(
 /// Fallback when an adopted turn neither completes nor shows activity, so the
 /// UI cannot stay "thinking" forever. Once the turn is observable, completion
 /// belongs to the between-prompt watchdog.
-fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
+fn spawn_resume_idle_watchdog(shared: Arc<Shared>, connection: &ConnectionTo<Agent>) {
     let grace_ms = resume_idle_grace().as_millis() as i64;
     let interval = resume_idle_check_interval();
-    tokio::spawn(async move {
+    let adopted_turn = shared.terminal_claim.current_turn();
+    let state = shared.connection_state.clone();
+    let _ = state.admit(|| connection.spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shared.connection_state.wait_unavailable() => return Ok(()),
+            }
             if shared.terminal_claim.claimed()
                 || shared.prompt_sent_since_attach.load(Ordering::Relaxed)
+                || shared.first_event_after_attach.load(Ordering::Relaxed)
             {
-                return;
-            }
-            if shared.first_event_after_attach.load(Ordering::Relaxed) {
-                info!(
-                    target: "acp.protocol",
-                    session = %shared.session_label,
-                    "resume-idle watchdog: disarming, in-flight turn is observable"
-                );
-                return;
+                return Ok(());
             }
             let idle_ms = now_ms() - shared.last_event_at.load(Ordering::Relaxed);
             if idle_ms >= grace_ms {
-                if shared.terminal_claim.claim() {
-                    info!(
-                        target: "acp.protocol",
-                        session = %shared.session_label,
-                        idle_ms,
-                        "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
-                    );
-                    shared
-                        .emit(Event::Stopped {
-                            reason: "reattach_idle".into(),
-                        })
-                        .await;
-                }
-                return;
+                let Ok(permit) = shared.event_tx.reserve().await else {
+                    return Ok(());
+                };
+                let _ = shared.connection_state.admit(|| shared.terminal_claim.claim_and_publish(
+                    adopted_turn,
+                    || {
+                        !shared.prompt_sent_since_attach.load(Ordering::Relaxed)
+                            && shared.adopted_turn_active.load(Ordering::Relaxed)
+                            && !shared.first_event_after_attach.load(Ordering::Relaxed)
+                    },
+                    || {
+                        info!(target: "acp.protocol", session = %shared.session_label, idle_ms,
+                            "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn");
+                        permit.send(Event::Stopped { reason: "reattach_idle".into() });
+                    },
+                ));
+                return Ok(());
             }
         }
-    });
+    }));
 }
 
 impl Session {
@@ -306,21 +329,28 @@ impl Session {
         method: &str,
         req: Req,
         native_id: fn(&Req::Response) -> SessionId,
-    ) -> Result<Req::Response, agent_client_protocol::Error>
+    ) -> Result<Req::Response, super::super::control::EstablishmentFailure>
     where
         Req: JsonRpcRequest + serde::Serialize,
         Req::Response: serde::de::DeserializeOwned + Send + 'static,
     {
         let ingress = &self.shared.ingress;
         let generation = {
-            let _guard = ingress.fence.lock().await;
+            let _guard = ingress.fence.write().await;
             ingress.begin()
         };
         match self.control.as_ref() {
-            Some(control) => establish_session_v3(control, method, &req).await,
-            None => {
-                ordered_session_request(&self.connection, ingress, generation, req, native_id).await
-            }
+            Some(control) => establish_session_v5(control, method, &req).await,
+            None => ordered_session_request(
+                &self.connection,
+                ingress,
+                &self.shared.connection_state,
+                generation,
+                req,
+                native_id,
+            )
+            .await
+            .map_err(Into::into),
         }
     }
 
@@ -339,19 +369,23 @@ impl Session {
             runner_id = %runner,
             "resume mode: reusing runner session without agent load/new"
         );
-        if runner != stored {
+        if !stored.is_empty() && runner != stored {
             // Ahead of the assignment, so the reset's id clear is overwritten by the new id.
             self.shared
                 .emit(Event::SessionContextReset {
                     reason:
                         "Conversation context reset; the agent resumed a different conversation."
                             .to_string(),
+                    fork_rejection: None,
                 })
                 .await;
         }
-        // Clears a sticky startup error in the UI; same-id is a no-op server-side.
         let id = SessionId::from(runner);
-        self.shared.commit_session(id.clone()).await?;
+        let ready = self
+            .control
+            .as_ref()
+            .is_some_and(|control| control.native_session_ready());
+        self.shared.commit_session(id.clone(), ready).await?;
         Ok(id)
     }
 
@@ -363,13 +397,17 @@ impl Session {
         req: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
         let Some(control) = self.control.as_ref() else {
-            return self.connection.send_request(req).block_task().await;
+            return ordered_native_request(&self.connection, &self.shared.connection_state, req)
+                .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
+                .wait()
+                .await
+                .into_result();
         };
-        let result = establish_session_v3(control, "session/load", &req).await;
+        let result = establish_session_v5(control, "session/load", &req).await;
         if result.is_ok() {
             control.session_replayed().await;
         }
-        result
+        result.map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -408,7 +446,7 @@ impl Session {
             {
                 Ok(resp) => {
                     let new_id = resp.session_id.clone();
-                    self.shared.commit_session(new_id.clone()).await?;
+                    self.shared.commit_session(new_id.clone(), true).await?;
                     info!(
                         target: "acp.protocol",
                         session = %label,
@@ -427,20 +465,35 @@ impl Session {
                     Ok(new_id)
                 }
                 Err(e) => {
+                    let rejection = (e.origin
+                        == crate::acp::control_protocol::HandshakeFailureOrigin::NativeResponse)
+                        .then(|| {
+                            self.control.as_ref().map(|control| {
+                                std::sync::Arc::new(crate::acp::state::NativeForkRejection {
+                                    owner: control.peer_identity(),
+                                    parent: parent.clone(),
+                                })
+                            })
+                        })
+                        .flatten();
                     warn!(
                         target: "acp.protocol",
                         session = %label,
                         parent_acp_id = %parent,
                         "session/fork failed; failing spawn (no session/new fallback): {e}"
                     );
-                    // Clears the one-shot fork marker so reattach does not
-                    // retry the failing fork forever.
-                    self.shared
-                        .emit(Event::SessionContextReset {
-                            reason: format!("fork_failed: {e}"),
-                        })
-                        .await;
-                    Err(e)
+                    if let Some(rejection) = rejection {
+                        self.shared
+                            .emit(Event::SessionContextReset {
+                                reason: format!(
+                                    "fork_failed: {}",
+                                    super::super::errors::public_error_message(&e.error)
+                                ),
+                                fork_rejection: Some(rejection),
+                            })
+                            .await;
+                    }
+                    Err(e.into())
                 }
             };
         }
@@ -453,6 +506,7 @@ impl Session {
             self.shared
                 .emit(Event::SessionContextReset {
                     reason: "fork_unsupported_by_agent".to_string(),
+                    fork_rejection: None,
                 })
                 .await;
         }
@@ -470,14 +524,13 @@ impl Session {
             // before the request rather than on its reply.
             {
                 let ingress = &self.shared.ingress;
-                let _guard = ingress.fence.lock().await;
+                let _guard = ingress.fence.write().await;
                 ingress.finish(Some(SessionId::from(stored.clone())))?;
             }
             let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
                 .mcp_servers(mcp_servers.clone());
             match self.load_request(req).await {
                 Ok(resp) => {
-                    self.session_from_storage = true;
                     info!(
                         target: "acp.protocol",
                         session = %label,
@@ -489,6 +542,8 @@ impl Session {
                     self.shared
                         .emit(Event::AcpSessionAssigned {
                             acp_session_id: stored.clone(),
+                            connection_ready: true,
+                            native_subject: None,
                         })
                         .await;
                     if let Some(event) = config_options_event(resp.config_options) {
@@ -496,6 +551,7 @@ impl Session {
                     }
                     return Ok(SessionId::from(stored));
                 }
+                Err(error) if self.shared.connection_state.loss().is_some() => return Err(error),
                 // A partial replay may already be in the empty store, so a
                 // failed import must not continue on a fresh session.
                 Err(e) if seed_history_replay => {
@@ -516,7 +572,7 @@ impl Session {
                     );
                     {
                         let ingress = &self.shared.ingress;
-                        let _guard = ingress.fence.lock().await;
+                        let _guard = ingress.fence.write().await;
                         ingress.finish(None)?;
                     }
                     self.shared
@@ -547,10 +603,13 @@ impl Session {
         let id = new_session.session_id.clone();
         if let Some(reason) = context_reset_reason {
             self.shared
-                .emit(Event::SessionContextReset { reason })
+                .emit(Event::SessionContextReset {
+                    reason,
+                    fork_rejection: None,
+                })
                 .await;
         }
-        self.shared.commit_session(id.clone()).await?;
+        self.shared.commit_session(id.clone(), true).await?;
         info!(
             target: "acp.protocol",
             session = %label,
@@ -576,6 +635,7 @@ impl Session {
                 Some(config_id) => {
                     let _ = apply_config_default(
                         &self.connection,
+                        &self.shared.connection_state,
                         &self.shared.event_tx,
                         id.clone(),
                         config_id,
@@ -622,6 +682,7 @@ impl Session {
         }
         let result = apply_config_default(
             &self.connection,
+            &self.shared.connection_state,
             &self.shared.event_tx,
             self.acp_session_id.clone(),
             SessionConfigId::new(option.id.clone()),
@@ -634,7 +695,7 @@ impl Session {
                 self.channels.thought_level_config_option_id =
                     thought_level_config_id(&options).map(|id| id.0.to_string());
             }
-            Err(reason) => {
+            Err(reason) if self.shared.connection_state.loss().is_none() => {
                 let event = config_option_failure_event(
                     option.id.clone(),
                     model.to_string(),
@@ -643,6 +704,7 @@ impl Session {
                 );
                 self.shared.emit(event).await;
             }
+            Err(_) => {}
         }
     }
 
@@ -656,6 +718,7 @@ impl Session {
             Some(config_id) => {
                 let _ = apply_config_default(
                     &self.connection,
+                    &self.shared.connection_state,
                     &self.shared.event_tx,
                     self.acp_session_id.clone(),
                     SessionConfigId::new(config_id.to_string()),
@@ -693,7 +756,5 @@ mod tests {
                 "stored={stored} load={load} fork={fork} prior={prior}"
             );
         }
-        assert!(load_failed_reason(false, &"boom").starts_with(LOAD_FAILED_PREFIX));
-        assert!(!load_failed_reason(true, &"boom").starts_with(LOAD_FAILED_PREFIX));
     }
 }

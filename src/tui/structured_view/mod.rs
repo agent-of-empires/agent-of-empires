@@ -390,6 +390,10 @@ pub async fn run_for_endpoint(
                         redraw(terminal, theme, &mut state)?;
                     }
                     None => {
+                        if state.ws.is_some() {
+                            state.disconnect_management();
+                            redraw(terminal, theme, &mut state)?;
+                        }
                         // No ws handle, or the channel closed. Sleep briefly
                         // rather than spin the select loop.
                         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -524,11 +528,9 @@ async fn apply_ws_message(
                 format!("ws disconnected: {e}; reconnecting…"),
                 ToastKind::Error,
             );
-            state.ws = None;
-            // Turn boundaries are unobservable while the socket is down: drop
-            // the lock so a stuck send doesn't wedge the composer, and queue new
-            // prompts (is_busy() is true while ws is None).
-            state.in_flight = false;
+            // No live authority survives a management connection boundary.
+            // Reconnecting transport alone cannot restore it.
+            state.disconnect_management();
             let since = state.transcript.last_seq;
             match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
                 Ok(handle) => {
@@ -634,7 +636,8 @@ async fn handle_terminal_event(
                 // sub-agent signal (see `AcpTranscript.background_agent_active`),
                 // or Esc stops being inert while the main turn is genuinely
                 // idle (#4001).
-                agent_busy: state.transcript.turn_active || state.in_flight,
+                agent_busy: state.native_input_available()
+                    && (state.transcript.turn_active || state.in_flight),
             };
             let intent = input::dispatch(state.focus, &key, ctx);
             // Plugin keybinds are a fallback: consulted only for a key the view
@@ -676,6 +679,42 @@ async fn handle_terminal_event(
         // Resize needs no bookkeeping: the next frame recomputes the layout.
         _ => return Ok(false),
     };
+    apply_intent(state, toast_deadline, intent).await
+}
+
+/// One admission boundary for keyboard, mouse and already-open native pickers.
+async fn apply_intent(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+    intent: Intent,
+) -> Result<bool> {
+    let has_pending = !state.transcript.pending_approvals.is_empty();
+    // Check before taking composer/recall text or a native picker's selection.
+    // Editing an existing queued row is management, not delivery of new intent.
+    let admitted = match &intent {
+        Intent::SubmitPrompt => {
+            state
+                .composer
+                .lines()
+                .iter()
+                .all(|line| line.trim().is_empty())
+                || state
+                    .recall
+                    .as_ref()
+                    .is_some_and(|recall| state.queue.id_at(recall.index).is_some())
+                || state.can_submit_prompt_intent()
+        }
+        Intent::ResolveApproval(_)
+        | Intent::SkipElicitation
+        | Intent::CancelElicitation
+        | Intent::CancelInFlight => state.native_input_available(),
+        Intent::ChoicePick(_) | Intent::ChoiceAccept => state.can_accept_choice(),
+        _ => true,
+    };
+    if !admitted {
+        native_input_refused(state, toast_deadline);
+        return Ok(false);
+    }
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
@@ -1664,11 +1703,15 @@ fn set_toast(
     *deadline = Some(Instant::now() + TOAST_TTL);
 }
 
-/// POST one prompt to the daemon, taking the optimistic in-flight lock
-/// for the round-trip. The lock stays set on success (the WS turn-start
-/// echo clears it) so a rapid second Enter queues instead of double-
-/// firing; it is released on failure since no turn began. Returns whether
-/// the POST succeeded.
+fn native_input_refused(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    let message = if state.transcript.connection_unavailable.is_some() {
+        "native input unavailable; pending input retained"
+    } else {
+        "native input readiness is unconfirmed; pending input retained"
+    };
+    set_toast(state, toast_deadline, message.into(), ToastKind::Info);
+}
+
 /// POST a prompt and reflect whatever the daemon says it did with it.
 ///
 /// The daemon owns the send / steer / queue decision (Tier 3), so this no
@@ -1682,6 +1725,11 @@ async fn send_prompt_now(
     text: &str,
 ) {
     use crate::acp::client::http::PromptDispositionWire;
+    if !state.can_submit_prompt_intent() {
+        state.set_composer_text(text);
+        native_input_refused(state, toast_deadline);
+        return;
+    }
     state.in_flight = true;
     match state.http.prompt(&state.session_id, text, false).await {
         Ok(dispatch) => match dispatch.disposition {
@@ -1883,6 +1931,454 @@ async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
+
+    struct NativeInputFixture {
+        view: StructuredViewState,
+        wire: tokio::sync::broadcast::Sender<String>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for NativeInputFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl NativeInputFixture {
+        async fn new() -> Self {
+            use axum::extract::ws::{Message, WebSocketUpgrade};
+            use axum::response::IntoResponse;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = DaemonEndpoint::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                None,
+                Source::Env,
+            );
+            let (wire, _) = tokio::sync::broadcast::channel::<String>(16);
+            let messages = wire.clone();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let app = axum::Router::new()
+                .route("/sessions/{id}/acp/ws", axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let mut messages = messages.subscribe();
+                    async move {
+                        upgrade.on_upgrade(move |mut socket| async move {
+                            loop {
+                                tokio::select! {
+                                    message = messages.recv() => {
+                                        let Ok(message) = message else { break };
+                                        if socket.send(Message::Text(message.into())).await.is_err() { break; }
+                                    }
+                                    message = socket.recv() => {
+                                        if matches!(message, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) { break; }
+                                    }
+                                }
+                            }
+                        })
+                    }
+                }))
+                .fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                    let received = received.clone();
+                    async move {
+                        if method != axum::http::Method::GET {
+                            received.lock().unwrap().push((
+                                format!("{method} {}", uri.path()),
+                                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+                            ));
+                        }
+                        if uri.path().ends_with("/queue") && method == axum::http::Method::GET {
+                            axum::Json(serde_json::json!([])).into_response()
+                        } else if uri.path().ends_with("/acp/prompt") {
+                            axum::Json(serde_json::json!({"disposition":"queued","queued_id":"accepted"})).into_response()
+                        } else {
+                            axum::http::StatusCode::NO_CONTENT.into_response()
+                        }
+                    }
+                });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let ws = ws_connect_projections_only(&endpoint, "s-1", 0)
+                .await
+                .unwrap();
+            let http = HttpClient::new(endpoint.clone()).unwrap();
+            Self {
+                view: StructuredViewState::new("s-1".into(), endpoint, http, Some(ws)),
+                wire,
+                requests,
+                server,
+            }
+        }
+
+        async fn ingest(&mut self, message: serde_json::Value) {
+            self.wire.send(message.to_string()).unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), recv_ws(&mut self.view))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            apply_ws_message(&mut self.view, &mut None, Ok(message)).await;
+        }
+
+        async fn snapshot(
+            &mut self,
+            seq: u64,
+            state: crate::acp::state::AcpState,
+            wake: Option<serde_json::Value>,
+        ) {
+            let mut state = serde_json::to_value(state).unwrap();
+            if let Some(wake) = wake {
+                state["prompt_wake_eligible"] = wake;
+            }
+            self.ingest(serde_json::json!({
+                "kind":"reduced_state", "session_id":"s-1", "seq":seq, "state":state,
+            }))
+            .await;
+        }
+
+        async fn act(&mut self, intent: Intent) {
+            assert!(!apply_intent(&mut self.view, &mut None, intent)
+                .await
+                .unwrap());
+        }
+
+        fn native_requests(&self) -> Vec<(String, serde_json::Value)> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.contains("/acp/"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn native_snapshot(
+        ready: bool,
+        unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
+    ) -> crate::acp::state::AcpState {
+        let mut state = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId("s-1".into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        state.connection_ready = ready;
+        state.connection_unavailable = unavailable;
+        state.available_modes = vec![
+            crate::acp::state::ModeInfo {
+                id: "default".into(),
+                name: "Default".into(),
+                description: None,
+            },
+            crate::acp::state::ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            },
+        ];
+        state
+    }
+
+    fn native_mode_choice() -> ChoicePicker {
+        ChoicePicker {
+            title: "Mode".into(),
+            options: vec![
+                ("default".into(), "Default".into()),
+                ("plan".into(), "Plan".into()),
+            ],
+            selected: 1,
+            purpose: ChoicePurpose::Mode,
+        }
+    }
+
+    fn native_footer(view: &StructuredViewState) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                render::render(frame, frame.area(), &Theme::default(), view, true);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn live_native_receipts_gate_intent_without_consuming_drafts_or_replaying_history() {
+        use crate::acp::state::Event;
+        let mut fixture = NativeInputFixture::new().await;
+        fixture.view.set_composer_text("retained draft");
+        fixture.ingest(serde_json::json!({
+            "session_id":"s-1", "seq":100,
+            "event":{"AcpSessionAssigned":{"acp_session_id":"historical","connection_ready":true}},
+        })).await;
+        fixture.act(Intent::SubmitPrompt).await;
+        assert!(fixture.native_requests().is_empty());
+        assert_eq!(fixture.view.composer.lines().join("\n"), "retained draft");
+        assert!(!native_footer(&fixture.view).contains("● Ready"));
+        assert!(!native_footer(&fixture.view).contains("Enter to send"));
+
+        // Serialization cannot preserve a wake grant into saved/history data.
+        let mut cached = native_snapshot(false, None);
+        cached.prompt_wake_eligible = Some(true);
+        fixture.snapshot(0, cached, None).await;
+        fixture.act(Intent::SubmitPrompt).await;
+        fixture
+            .snapshot(
+                0,
+                native_snapshot(false, None),
+                Some(serde_json::Value::Null),
+            )
+            .await;
+        fixture.act(Intent::SubmitPrompt).await;
+        assert!(fixture.native_requests().is_empty());
+        assert_eq!(fixture.view.composer.lines().join("\n"), "retained draft");
+
+        fixture
+            .snapshot(
+                0,
+                native_snapshot(false, None),
+                Some(serde_json::json!(true)),
+            )
+            .await;
+        assert!(!native_footer(&fixture.view).contains("● Ready"));
+        fixture.view.set_composer_text("one governed wake intent");
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(fixture.native_requests().len(), 1);
+        assert!(fixture.view.composer.lines().join("\n").is_empty());
+
+        fixture
+            .snapshot(1, native_snapshot(false, None), None)
+            .await;
+        fixture.snapshot(0, native_snapshot(true, None), None).await;
+        fixture.view.set_composer_text("still retained");
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(
+            fixture.native_requests().len(),
+            1,
+            "stale readiness cannot grant delivery"
+        );
+        assert_eq!(fixture.view.composer.lines().join("\n"), "still retained");
+
+        let mut healthy_failure = native_snapshot(true, None);
+        healthy_failure
+            .apply_event(
+                2,
+                Event::PromptRuntimeError {
+                    message: "ordinary request failed".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+            )
+            .unwrap();
+        fixture.snapshot(2, healthy_failure, None).await;
+        fixture.view.set_composer_text("healthy retry");
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(fixture.native_requests().len(), 2);
+
+        fixture.view.disconnect_management();
+        fixture.view.ws = Some(
+            ws_connect_projections_only(
+                &fixture.view.endpoint,
+                "s-1",
+                fixture.view.transcript.last_seq,
+            )
+            .await
+            .unwrap(),
+        );
+        fixture.view.set_composer_text("after reconnect");
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(
+            fixture.native_requests().len(),
+            2,
+            "open transport cannot restore an old receipt"
+        );
+        assert_eq!(fixture.view.composer.lines().join("\n"), "after reconnect");
+        fixture.snapshot(2, native_snapshot(true, None), None).await;
+        fixture.act(Intent::SubmitPrompt).await;
+        let texts: Vec<_> = fixture
+            .native_requests()
+            .into_iter()
+            .map(|(_, body)| body["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "one governed wake intent",
+                "healthy retry",
+                "after reconnect"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_controls_require_current_ready_even_when_work_or_wake_intent_is_retained() {
+        use crate::acp::state::{
+            AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource,
+            AcpConnectionUnavailability, Event, ToolCall,
+        };
+        for case in [
+            "unknown",
+            "wake",
+            "native loss",
+            "management refusal",
+            "healthy request failure",
+        ] {
+            let mut fixture = NativeInputFixture::new().await;
+            let unavailable = match case {
+                "native loss" => Some(AcpConnectionUnavailability {
+                    source: AcpConnectionSource::Native,
+                    cause: AcpConnectionCause::StdoutEof,
+                    phase: AcpConnectionPhase::Established,
+                }),
+                "management refusal" => Some(AcpConnectionUnavailability {
+                    source: AcpConnectionSource::RunnerRecord,
+                    cause: AcpConnectionCause::ControlProtocolUnknown,
+                    phase: AcpConnectionPhase::Establishing,
+                }),
+                _ => None,
+            };
+            let healthy = case == "healthy request failure";
+            let mut snapshot = native_snapshot(healthy || case == "native loss", unavailable);
+            snapshot
+                .pending_approvals
+                .push(crate::acp::permissions::build_approval(
+                    ToolCall {
+                        id: "pending".into(),
+                        name: "read".into(),
+                        kind: "read".into(),
+                        args_preview: "{}".into(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    Vec::new(),
+                ));
+            snapshot
+                .pending_elicitations
+                .push(crate::acp::elicitations::Elicitation {
+                    nonce: crate::acp::approvals::Nonce("question".into()),
+                    message: "Choose".into(),
+                    title: None,
+                    description: None,
+                    tool_call_id: None,
+                    questions: Vec::new(),
+                    requested_at: chrono::Utc::now(),
+                    resolved: None,
+                });
+            if healthy {
+                snapshot
+                    .apply_event(
+                        1,
+                        Event::PromptRuntimeError {
+                            message: "request failed, channel healthy".into(),
+                            evidence: None,
+                            native_subject: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            snapshot.turn_active = case == "management refusal";
+            fixture
+                .snapshot(0, snapshot, Some(serde_json::json!(case != "unknown")))
+                .await;
+            fixture.view.choice = Some(native_mode_choice());
+            fixture.view.set_composer_text("do not consume this");
+            if !healthy {
+                fixture.act(Intent::ChoicePick(0)).await;
+                fixture.act(Intent::ChoiceAccept).await;
+                fixture.act(Intent::CancelElicitation).await;
+                let picker = fixture.view.choice.as_ref().unwrap();
+                assert_eq!(
+                    picker.selected, 1,
+                    "{case}: a refused action must retain its selection"
+                );
+                assert!(matches!(&picker.purpose, ChoicePurpose::Mode));
+                // Inspecting already-announced choices is local; accepting one
+                // still requires a genuine current native receipt.
+                fixture.view.choice = None;
+                fixture.act(Intent::OpenModePicker).await;
+                let selected = fixture.view.choice.as_ref().unwrap().selected;
+                fixture.act(Intent::ChoiceAccept).await;
+                assert_eq!(fixture.view.choice.as_ref().unwrap().selected, selected);
+                assert!(fixture.native_requests().is_empty());
+            } else {
+                fixture.act(Intent::ChoiceAccept).await;
+                assert!(fixture.view.choice.is_none());
+            }
+            fixture.act(Intent::CancelInFlight).await;
+            fixture
+                .act(Intent::ResolveApproval(
+                    crate::acp::protocol::ApprovalDecisionWire::Allow,
+                ))
+                .await;
+            fixture.act(Intent::SkipElicitation).await;
+            assert_eq!(
+                fixture.view.composer.lines().join("\n"),
+                "do not consume this"
+            );
+            let requests = fixture.native_requests();
+            if healthy {
+                assert_eq!(
+                    requests.len(),
+                    4,
+                    "healthy request failure must leave real controls usable"
+                );
+                assert!(fixture.view.transcript.pending_approvals.is_empty());
+                assert!(fixture.view.transcript.pending_elicitations.is_empty());
+                assert!(native_footer(&fixture.view).contains("● Ready"));
+                assert!(native_footer(&fixture.view).contains("Enter to send"));
+            } else {
+                assert!(requests.is_empty(), "{case}: no native request may be sent");
+                assert_eq!(fixture.view.transcript.pending_approvals.len(), 1);
+                assert_eq!(fixture.view.transcript.pending_elicitations.len(), 1);
+                assert!(!native_footer(&fixture.view).contains("● Ready"));
+                assert!(!native_footer(&fixture.view).contains("Enter to send"));
+                if case == "management refusal" {
+                    assert!(
+                        fixture.view.transcript.turn_active,
+                        "unavailable controls do not finish retained native work"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_queue_edit_is_management_but_stale_recall_cannot_create_new_intent() {
+        let mut fixture = NativeInputFixture::new().await;
+        fixture.view.queue.push("existing intent".into());
+        fixture.view.set_composer_text("stashed draft");
+        fixture.view.recall_step(-1);
+        fixture.view.set_composer_text("edited existing intent");
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(
+            fixture.view.queue.text_at(0),
+            Some("edited existing intent")
+        );
+        assert!(fixture.native_requests().is_empty());
+        fixture.act(Intent::ClearQueue).await;
+        assert!(fixture.view.queue.is_empty());
+        fixture.view.queue.push("draining intent".into());
+        fixture.view.set_composer_text("original draft");
+        fixture.view.recall_step(-1);
+        fixture.view.set_composer_text("edited after drain");
+        fixture.view.queue.clear();
+        let before = fixture.requests.lock().unwrap().len();
+        fixture.act(Intent::SubmitPrompt).await;
+        assert_eq!(fixture.requests.lock().unwrap().len(), before);
+        assert!(fixture.view.browsing_queue());
+        assert_eq!(
+            fixture.view.composer.lines().join("\n"),
+            "edited after drain"
+        );
+    }
 
     fn test_state() -> StructuredViewState {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
@@ -2340,16 +2836,30 @@ mod tests {
 
     /// Approval buttons paint under the pointer without moving focus or the
     /// selection, and go inert while a choice picker owns the keyboard.
-    #[test]
-    fn approval_buttons_hover_is_visual_only() {
-        let mut state = test_state();
-        state
-            .transcript
+    #[tokio::test]
+    async fn approval_buttons_hover_is_visual_only() {
+        let mut fixture = NativeInputFixture::new().await;
+        let mut snapshot = native_snapshot(true, None);
+        snapshot
             .pending_approvals
-            .push(pending_approval(false, Vec::new()));
-        state.reconcile_selection();
+            .push(crate::acp::permissions::build_approval(
+                crate::acp::state::ToolCall {
+                    id: "hover-pending".into(),
+                    name: "read".into(),
+                    kind: "read".into(),
+                    args_preview: "{}".into(),
+                    started_at: chrono::Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        fixture.snapshot(0, snapshot, None).await;
+        let state = &mut fixture.view;
         state.focus = Focus::Composer;
-        draw(&mut state);
+        let selected = state.selected_approval.clone();
+        draw(state);
         let buttons = state.mouse_targets.borrow().buttons.clone();
         let intents: Vec<_> = buttons.iter().map(|(_, i)| i.clone()).collect();
         assert_eq!(
@@ -2362,18 +2872,24 @@ mod tests {
             ]
         );
         let deny = buttons[2].0;
-        assert!(handle_hover(&mut state, deny.x, deny.y));
+        assert!(handle_hover(state, deny.x, deny.y));
         assert_eq!(state.hover.current(), Some(deny));
-        assert!(!handle_hover(&mut state, deny.right() - 1, deny.y));
+        assert!(!handle_hover(state, deny.right() - 1, deny.y));
         assert_eq!(state.focus, Focus::Composer);
-        assert!(handle_hover(&mut state, 0, 0));
+        assert_eq!(state.selected_approval, selected);
+        assert!(handle_hover(state, 0, 0));
         assert_eq!(state.hover.current(), None);
+        assert_eq!(state.transcript.pending_approvals.len(), 1);
 
         state.choice = Some(approval_option_picker(&pending_approval(
             true,
             answer_options(ApprovalOptionKind::AllowOnce),
         )));
-        draw(&mut state);
+        draw(state);
         assert!(state.mouse_targets.borrow().buttons.is_empty());
+        assert!(
+            fixture.native_requests().is_empty(),
+            "hovering live enabled controls must not resolve or send anything"
+        );
     }
 }

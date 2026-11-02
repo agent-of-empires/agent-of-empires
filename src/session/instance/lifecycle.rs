@@ -201,6 +201,7 @@ impl Instance {
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
         self.last_error = None;
+        self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
     }
@@ -259,6 +260,33 @@ impl Instance {
         anyhow::ensure!(committed, LifecycleReservationError::Superseded);
         self.lifecycle_reservation = None;
         self.first_launch_names_agent = false;
+        Ok(())
+    }
+
+    pub(super) fn release_indeterminate_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) -> Result<()> {
+        let status = storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            if row.active_execution == self.active_execution {
+                row.capture_started_at = self.capture_started_at;
+                row.started_at = self.started_at;
+                row.launch_executable = self.launch_executable.clone();
+            }
+            row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(row.status)
+        })?;
+        self.lifecycle_reservation = None;
+        self.status = status;
         Ok(())
     }
 
@@ -656,7 +684,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn fail_reserved_launch(
+    pub(crate) fn fail_reserved_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
         generation: u64,
@@ -677,6 +705,7 @@ impl Instance {
         } else {
             None
         };
+        self.last_error_evidence = None;
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(

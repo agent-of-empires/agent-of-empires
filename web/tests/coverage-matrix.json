@@ -3,6 +3,63 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "acp.operation-error-evidence",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/ApprovalCard.test.tsx",
+        "src/components/acp/AskUserQuestionCard.test.tsx",
+        "src/components/acp/SessionConfigControls.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/ApprovalCard.tsx",
+        "web/src/components/acp/AskUserQuestionCard.tsx",
+        "web/src/lib/types.ts",
+        "web/src/components/acp/SystemNotices.tsx"
+      ],
+      "notes": "Request-local prompt failure preserves the canonical diagnostic without a startup failure or stopped-worker claim. Typed and legacy missing/null failures survive retained-card resolution and A-to-transient-B-to-resolution compound failures. Hook/card consumers cover HTTP and network rejection, enabled retry of the same nonce, and success or named-404 resolution revealing the canonical banner; destructive approval retries require a fresh full hold. HTTP errors are not relabelled as network failures. Matching request errors clear independently and reveal the canonical banner; transient errors are not persisted. Reattach and optimistic retry retain diagnostics; accepted prompts and intentional clear/switch retire them. Session responses forward optional terminal evidence without a new retry policy. Current wrapper receipts, including same-seq refresh and seq zero, are distinct from raw history/socket/cache authority. Cache reopen and disconnect revoke native authority without erasing diagnostics; generic Unknown/refused/lost owners cannot queue or wake, while explicit current governed wake eligibility remains separate from native config/actionability. Header-before-catch-up regressions retain configuration results, usage baselines, capability/park state, diagnostics and client-only history without replacing current controls. Safe queue listing preserves unconfirmed cached intent; migration waits for current native or explicit governed eligibility, including an eligibility change after refusal. A runner-record management refusal preserves retained turn/tool/callback history and raw replay turn context while native controls remain unavailable; actual native loss still retires impossible controls."
+    },
+    {
+      "id": "acp.current-native-authority",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-structured-view.spec.ts", "tests/acp-startup-wait.spec.ts", "tests/acp-plan-modal.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts"
+      ],
+      "notes": "Browser regressions specify socket/history refusal, a current healthy receipt without historical readiness, stale covered raw loss, same-seq healthy/lost/Unknown refreshes, preserved request diagnostics and explicit next-request delivery. A separate current-governor case permits an existing managed queue intent without enabling native model/config controls. Fixtures emit explicit daemon snapshots instead of granting readiness from socket-open; historical context remains visible across authority withdrawal."
+    },
+    {
+      "id": "acp.native-input-commit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useAcpSession.test.ts", "src/components/acp/__tests__/CommittedStop.test.tsx"],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/useCancelEscalation.ts"
+      ],
+      "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow the committed authority. A separate real Runtime/Composer/StopButton/installed-SDK consumer clicks once from an outer Profiler after layouts but before SDK passive publication, then verifies that the previous turn callback issues neither cancel nor force against the new turn. Only transport and browser APIs are faked; SDK, admission, reducer and cancellation identities remain real."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -197,7 +254,7 @@
         "web/src/components/TerminalComposeSheet.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ],
-      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Backend ownership heartbeat fences require the live read-only recheck; these unit cases do not claim physical tmux-lock coverage."
+      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Hook regressions retire queued binary and paste input across close, error, manual/online reconnect, session/route/deselection changes and ownership denial; stale socket callbacks cannot affect a new connection, and fresh owner-confirmed input retains order. Backend ownership heartbeat and native generation/physical fences require backend tests and live rechecks; these unit cases do not claim physical tmux-lock coverage."
     },
     {
       "id": "terminal.live-grid-transport",
@@ -2956,7 +3013,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
+      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card. A composed current-snapshot/replay/pane regression keeps a current run live when covered historical Started/Finished events reuse its task id, while retaining the completed historical run for inspection.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3109,8 +3166,20 @@
       "id": "acp.stop-button-escalation",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/useCancelEscalation.test.tsx"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx", "web/src/components/acp/useCancelEscalation.ts"]
+      "specs": [
+        "src/components/acp/__tests__/useCancelEscalation.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/useCancelEscalation.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ],
+      "notes": "Graceful Stop requires current native readiness even when managed prompt intent may queue. Server-confirmed cancellation or an accepted current-identity cancel enables explicit local force after readiness withdraws, including server confirmation before the first HTTP response settles. Only unconfirmed pending gestures coalesce. Refusal never arms escalation; distinct committed identities prevent late A-to-B-to-A results or stale callbacks from granting or erasing newer eligibility. Composer tests exercise disabled Unknown, restored Ready, accepted cancellation followed by Unknown, and server-confirmed cancellation while Unknown. The existing live Stop story retains one deliberate click and the native cancelled outcome."
     },
     {
       "id": "acp.spinner-tool-precedence",
@@ -3485,14 +3554,16 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
+      "notes": "Native decision permission is explicit and independent of offline/submitting state. Withdrawing permission retires an active destructive hold; regranting permission cannot revive it and requires a new full hold."
     },
     {
       "id": "acp.plan-modal",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
-      "components": ["web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/PlanModal.tsx"],
+      "notes": "View plan, local expansion, Raw/Rendered, copy, and dismissal remain available without current native authority. A browser case opens under Unknown, changes current sequenced readiness while the modal stays open, then reads/copies/closes the plan with native decisions disabled and zero approval POSTs."
     },
     {
       "id": "acp.markdown",
@@ -3618,7 +3689,7 @@
       "risk": "low",
       "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
       "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
-      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+      "reason": "The queued-messages header's Tooltip opens on keyboard focus and dismisses on Tab; a strip with an unconfirmed row says it isn't sent yet."
     },
     {
       "id": "acp.queue-send-now",
@@ -3797,7 +3868,7 @@
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/StructuredView.tsx"
       ],
-      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all."
+      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all. Explicit Start posts /start under core admission without granting native send authority; socket-open with Unknown cannot send or wake queued intent until a current governor receipt permits it."
     },
     {
       "id": "acp.startup-error-screen",
@@ -4433,7 +4504,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"],
+      "notes": "The four-phase cancellation story checks enabled and activates Stop in one browser task, once only; it observes while disabled and never retries an admitted or refused click. Cancellation count, idle, hidden Stop and absent tail output remain required. This story does not certify physical pointer down/up; the other Stop stories retain real pointer clicks."
     },
     {
       "id": "acp.story.composer-queue-follow-up",

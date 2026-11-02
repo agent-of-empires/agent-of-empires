@@ -14,6 +14,10 @@ pub enum PromptDispatch {
     Steered,
     /// Park it on the server-owned queue; the turn-end drain delivers it.
     Queued { reason: QueueReason },
+    /// A current, scoped observation forbids native delivery and queue drain.
+    Unavailable {
+        unavailability: super::state::AcpConnectionUnavailability,
+    },
 }
 
 /// Why a prompt was parked.
@@ -48,6 +52,9 @@ pub struct WorkerLiveness {
 
 /// Decide what to do with a prompt arriving for `state`.
 pub fn decide(state: &AcpState, worker: WorkerLiveness) -> PromptDispatch {
+    if let Some(unavailability) = state.connection_unavailable {
+        return PromptDispatch::Unavailable { unavailability };
+    }
     if !worker.running && !worker.idle_dormant && !worker.rate_limit_parked {
         return PromptDispatch::Queued {
             reason: QueueReason::WorkerDown,

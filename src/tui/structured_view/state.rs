@@ -397,6 +397,32 @@ impl StructuredViewState {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
     }
 
+    pub fn native_input_available(&self) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_ready
+            && self.transcript.connection_unavailable.is_none()
+    }
+
+    pub fn can_submit_prompt_intent(&self) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+            && (self.transcript.connection_ready || self.transcript.prompt_wake_eligible)
+    }
+
+    pub fn can_accept_choice(&self) -> bool {
+        self.choice.as_ref().is_none_or(|choice| {
+            matches!(&choice.purpose, ChoicePurpose::OpenLink) || self.native_input_available()
+        })
+    }
+
+    pub fn disconnect_management(&mut self) {
+        self.ws = None;
+        self.in_flight = false;
+        self.transcript.revoke_native_authority();
+    }
+
     /// Drain the composer's current text and clear it so the user can
     /// start the next prompt.
     pub fn take_composer_text(&mut self) -> String {

@@ -75,8 +75,8 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
-use self::connection::{run_connection_task, ConnectionParams, RunnerLink};
-use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
+use self::connection::{run_connection_task, ConnectionParams, ConnectionState, RunnerLink};
+use self::control::{connect_runner_control_v5, wait_runner_registration, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
 use self::handshake::wait_for_handshake;
 use self::lifecycle::TerminalClaim;
@@ -116,10 +116,12 @@ pub struct AcpClient {
     inbound: Option<mpsc::Receiver<Event>>,
     cmd_tx: Option<mpsc::Sender<ClientCmd>>,
     pending_responders: PendingResponders,
+    connection_state: Arc<ConnectionState>,
     /// Kills an in-proc agent when the client drops.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
     /// The detached runner this client launched, which its lease owns.
     runner_pid: Option<u32>,
+    connected_runner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -219,9 +221,15 @@ impl Launch {
         let (ready_tx, ready_rx) = oneshot::channel();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+        let connection_state = runner
+            .as_ref()
+            .map(|runner| runner.control.connection_state.clone())
+            .unwrap_or_else(|| Arc::new(ConnectionState::default()));
         let label = self.session_id.0.clone();
+        let connected_runner = runner.as_ref().map(|runner| runner.control.peer_identity());
         let params = ConnectionParams {
             event_tx,
+            connection_state: connection_state.clone(),
             cmd_rx,
             child: child.clone(),
             pending_responders: pending_responders.clone(),
@@ -252,8 +260,10 @@ impl Launch {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            connection_state,
             _child: child,
             runner_pid: None,
+            connected_runner,
             native_store: None,
             connection_shutdown: shutdown,
             connection_task: std::sync::Mutex::new(Some(task)),
@@ -274,8 +284,10 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            connection_state: Arc::new(ConnectionState::default()),
             _child: None,
             runner_pid: None,
+            connected_runner: None,
             native_store: None,
             connection_shutdown: tokio_util::sync::CancellationToken::new(),
             connection_task: std::sync::Mutex::new(None),
@@ -360,6 +372,20 @@ impl AcpClient {
     /// A client that spawns nothing, for structured view state tests.
     pub fn fake_for_test(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
         Self::fake(session_id, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_observe_native_ready(&self) {
+        self.connection_state.established();
+        self.connection_state.record_usable();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_observe_native_loss(&self) {
+        self.connection_state.observe(
+            crate::acp::state::AcpConnectionSource::Native,
+            crate::acp::state::AcpConnectionCause::StdoutEof,
+        );
     }
 
     /// Every command fails with `AgentExited`, as between a connection task
@@ -522,6 +548,16 @@ impl AcpClient {
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
+            if let Some(record) = crate::process::worker_registry::control_admission(&session_id.0)
+                .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?
+                .filter(crate::process::worker_registry::retained_process_may_be_alive)
+            {
+                return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                    crate::process::worker_registry::ControlAdmissionRefusal::unconfirmed(Some(
+                        crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
+                    )),
+                )));
+            }
             // A fresh spawn overwrites the registry entry, so reap any prior
             // runner's process group first or its children leak (#1689).
             crate::process::worker_registry::terminate_and_wait(&session_id.0)
@@ -531,12 +567,17 @@ impl AcpClient {
                 return Err(AcpError::Spawn("launch cancelled before spawning".into()));
             }
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
-            let (runner_pid, native_store) =
+            let (runner_identity, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client =
-                Self::connect_via_socket(socket_path, launch(sandbox, &native_store), None).await?;
-            client.runner_pid = Some(runner_pid);
+            let mut client = Self::connect_via_socket(
+                socket_path,
+                launch(sandbox, &native_store),
+                None,
+                runner_identity,
+            )
+            .await?;
+            client.runner_pid = Some(runner_identity.pid);
             client.native_store = native_store;
             return Ok(client);
         }
@@ -563,8 +604,13 @@ impl AcpClient {
         if let Err(error) =
             wait_for_handshake(&label, ready_rx, Some(&child), &install_binary, None).await
         {
-            let _ = client.shutdown().await;
-            return Err(error);
+            if !matches!(&error, AcpError::ConnectionUnavailable(_))
+                && (client.connection_unavailable().is_none()
+                    || client.connection_state.driver_finished())
+            {
+                let _ = client.shutdown().await;
+                return Err(error);
+            }
         }
         client.native_store = native_store;
         Ok(client)
@@ -577,8 +623,10 @@ impl AcpClient {
         socket_path: PathBuf,
         launch: Launch,
         deadline: Option<tokio::time::Instant>,
+        expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
     ) -> Result<Self, AcpError> {
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
+        let newborn = matches!(launch.mode, ConnectMode::Fresh { .. });
         // Debug-only #1890 hook: fail a fresh handshake after the runner is up.
         #[cfg(debug_assertions)]
         if matches!(launch.mode, ConnectMode::Fresh { .. })
@@ -590,6 +638,16 @@ impl AcpClient {
         }
         let label = launch.session_id.0.clone();
         let terminal_claim = Arc::new(TerminalClaim::new());
+        if matches!(
+            &launch.mode,
+            ConnectMode::Resume {
+                unsuccessful_main: true,
+                in_flight_turn: false,
+                ..
+            }
+        ) {
+            terminal_claim.claim_failed();
+        }
         // The reader may see a cached completion right after Attach, before
         // the handshake marks the adopted turn.
         let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
@@ -605,17 +663,20 @@ impl AcpClient {
             _ = launch.cancellation.cancelled() => {
                 return Err(AcpError::Spawn("runner construction cancelled".into()));
             }
-            connected = connect_runner_control_v3(
-                &control_path, events.0.clone(), label.clone(),
-                terminal_claim.clone(), prompt_in_flight.clone(),
-            ) => connected,
+            connected = async {
+                wait_runner_registration(&label, expected_owner, newborn, deadline).await?;
+                let connect = connect_runner_control_v5(
+                    &control_path, label.clone(),
+                    terminal_claim.clone(), prompt_in_flight.clone(), expected_owner,
+                );
+                match deadline {
+                    Some(end) => tokio::time::timeout_at(end, connect)
+                        .await.map_err(|_| AcpError::AttachTimedOut)?,
+                    None => connect.await,
+                }
+            } => connected,
         };
-        let (control, crate_transport) = connected.map_err(|error| {
-            AcpError::Spawn(format!(
-                "runner control attach failed at {}: {error:#}",
-                control_path.display()
-            ))
-        })?;
+        let (control, crate_transport) = connected?;
         let (read_half, write_half) = tokio::io::split(crate_transport);
         let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
         // Shuts the runner channel down if the handshake fails or is dropped.
@@ -630,8 +691,13 @@ impl AcpClient {
         if let Err(error) =
             wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await
         {
-            let _ = client.shutdown().await;
-            return Err(error);
+            if !matches!(&error, AcpError::ConnectionUnavailable(_))
+                && (client.connection_unavailable().is_none()
+                    || client.connection_state.driver_finished())
+            {
+                let _ = client.shutdown().await;
+                return Err(error);
+            }
         }
         handshake_control.0.take();
         Ok(client)
@@ -649,6 +715,7 @@ impl AcpClient {
         additional_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
+        unsuccessful_main: bool,
         session_id: AcpSessionId,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
@@ -657,6 +724,23 @@ impl AcpClient {
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
     ) -> Result<Self, AcpError> {
+        let expected_owner = match launch_lease
+            .as_ref()
+            .and_then(|lease| lease.spawned_runner())
+        {
+            Some(identity) => identity,
+            None => {
+                let record =
+                    crate::process::worker_registry::control_admission(&session_id.0)
+                        .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?
+                        .ok_or_else(|| {
+                            AcpError::RetainedRuntimeUnavailable(Box::new(
+                        crate::process::worker_registry::ControlAdmissionRefusal::unconfirmed(None),
+                    ))
+                        })?;
+                crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record)
+            }
+        };
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
         let install_binary = crate::acp::AgentRegistry::with_defaults()
@@ -668,6 +752,7 @@ impl AcpClient {
             mode: ConnectMode::Resume {
                 acp_session_id: stored_acp_session_id,
                 in_flight_turn,
+                unsuccessful_main,
             },
             cwd,
             additional_dirs,
@@ -688,12 +773,41 @@ impl AcpClient {
                     lease.cancellation().child_token()
                 }),
         };
-        Self::connect_via_socket(socket_path, launch, deadline).await
+        Self::connect_via_socket(socket_path, launch, deadline, expected_owner).await
+    }
+
+    pub fn connection_unavailable(&self) -> Option<crate::acp::state::AcpConnectionUnavailability> {
+        self.connection_state.loss()
+    }
+
+    pub(crate) fn connection_ready(&self) -> bool {
+        self.connection_state.ready()
+    }
+
+    pub(crate) fn connected_runner(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
+        self.connected_runner
+    }
+
+    pub(crate) fn ensure_available(&self) -> Result<(), AcpError> {
+        self.connection_state.admit(|| ())
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {
+        self.ensure_available()?;
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
-        cmd_tx.send(cmd).await.map_err(|_| AcpError::AgentExited)
+        let permit = tokio::select! {
+            biased;
+            observation = self.connection_state.wait_unavailable() =>
+                return Err(AcpError::ConnectionUnavailable(observation)),
+            permit = cmd_tx.reserve() => permit.map_err(|_| {
+                self.connection_unavailable().map(AcpError::ConnectionUnavailable)
+                    .unwrap_or(AcpError::NotRunning)
+            })?,
+        };
+        self.connection_state.admit(|| {
+            permit.send(cmd);
+        })?;
+        Ok(())
     }
 
     /// Attachments follow the text block. Callers gate kinds on the agent's
@@ -703,6 +817,7 @@ impl AcpClient {
         text: &str,
         attachments: &[AttachmentBlob],
     ) -> Result<(), AcpError> {
+        self.ensure_available()?;
         use base64::Engine as _;
         if self.cmd_tx.is_none() {
             return Err(AcpError::NotRunning);
@@ -759,6 +874,7 @@ impl AcpClient {
         nonce: &Nonce,
     ) -> Result<oneshot::Sender<ApprovalResolutionMessage>, AcpError> {
         let mut map = self.pending_responders.lock().await;
+        self.ensure_available()?;
         let PendingResolver::Approval(_) = &map.get(nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
             return Err(AcpError::UnknownNonce);
@@ -833,6 +949,7 @@ impl AcpClient {
         resolution: ElicitationResolution,
     ) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
+        self.ensure_available()?;
         let PendingResolver::Elicitation { elicitation, .. } =
             &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
@@ -862,9 +979,9 @@ impl AcpClient {
     /// Best-effort experimental `session/delete` before shutdown, so adapters
     /// can clean up persisted session state (#1404). Never fatal.
     pub async fn delete_session(&self, acp_session_id: String) -> DeleteSessionOutcome {
-        let Some(cmd_tx) = self.cmd_tx.as_ref() else {
-            return DeleteSessionOutcome::Failed("client not running".into());
-        };
+        if let Err(error) = self.ensure_available() {
+            return DeleteSessionOutcome::Failed(error.to_string());
+        }
         let (tx, rx) = oneshot::channel();
         // The guard covers the send too, so a wedged task cannot stall delete,
         // and outlasts the in-task timeout so the task's classification wins.
@@ -873,8 +990,8 @@ impl AcpClient {
                 acp_session_id,
                 respond_to: tx,
             };
-            if cmd_tx.send(cmd).await.is_err() {
-                return DeleteSessionOutcome::Failed("connect task gone".into());
+            if let Err(error) = self.send_cmd(cmd).await {
+                return DeleteSessionOutcome::Failed(error.to_string());
             }
             rx.await
                 .unwrap_or_else(|_| DeleteSessionOutcome::Failed("respond channel closed".into()))
@@ -889,7 +1006,7 @@ impl AcpClient {
     /// adapter cannot return a durable post-reset id (#2979). `text` is the
     /// user's clear invocation, echoed in a mid-turn refusal.
     pub async fn reset_session(&self, text: &str) -> Result<ResetSessionOutcome, AcpError> {
-        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        self.ensure_available()?;
         let (tx, rx) = oneshot::channel();
         // Created before queueing so queue time counts against the reset.
         let deadline = tokio::time::Instant::now() + SESSION_RESET_IN_TASK_TIMEOUT;
@@ -902,34 +1019,30 @@ impl AcpClient {
                 deadline,
                 respond_to: tx,
             };
-            if cmd_tx.send(cmd).await.is_err() {
-                return failed("connect task gone");
-            }
-            rx.await
-                .unwrap_or_else(|_| failed("respond channel closed"))
+            self.send_cmd(cmd).await?;
+            Ok(rx
+                .await
+                .unwrap_or_else(|_| failed("respond channel closed")))
         };
-        Ok(tokio::time::timeout(SESSION_RESET_TIMEOUT, request)
-            .await
-            .unwrap_or_else(|_| ResetSessionOutcome::Failed {
+        match tokio::time::timeout(SESSION_RESET_TIMEOUT, request).await {
+            Ok(result) => result,
+            Err(_) => Ok(ResetSessionOutcome::Failed {
                 message: format!(
                     "agent did not answer session/new within {}s",
                     SESSION_RESET_TIMEOUT.as_secs()
                 ),
-            }))
+            }),
+        }
     }
 
     pub async fn close_session(&self) -> CloseSessionOutcome {
-        let Some(commands) = &self.cmd_tx else {
-            return CloseSessionOutcome::Failed("client not running".into());
-        };
+        if let Err(error) = self.ensure_available() {
+            return CloseSessionOutcome::Failed(error.to_string());
+        }
         let (respond_to, response) = oneshot::channel();
         let request = async {
-            if commands
-                .send(ClientCmd::CloseSession(respond_to))
-                .await
-                .is_err()
-            {
-                return CloseSessionOutcome::Failed("connect task gone".into());
+            if let Err(error) = self.send_cmd(ClientCmd::CloseSession(respond_to)).await {
+                return CloseSessionOutcome::Failed(error.to_string());
             }
             response
                 .await
@@ -951,6 +1064,7 @@ impl AcpClient {
         if native.is_some() {
             let _ = self.close_session().await;
         }
+        self.connection_state.mark_stopping();
         self.connection_shutdown.cancel();
         let task = self
             .connection_task
