@@ -82,6 +82,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     webInstall &&
     (info?.install_blocked === "container_not_running" ||
       (containerDownFor === detail && install.errorCode === "container_not_running"));
+  // A manual step can't run in a stopped container; Check again respawns the worker, which starts it.
+  const manualWaitsOnContainer = !webInstall && info?.install_blocked === "container_not_running";
   const busy = respawnState === "retrying" || install.state === "installing";
 
   const updateLabel = sandboxed ? "Update in Sandbox & restart" : "Update & restart";
@@ -108,6 +110,20 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     disabled: busy,
   };
   const primary = containerDown ? startContainer : webInstall ? update : checkAgain;
+
+  const manualTitle = containerHint ? "Run this inside this Session's container" : "Run this where the Daemon runs";
+  const manualStep =
+    manualCommand || containerHint ? (
+      <CommandBlock
+        {...splitInstallHint((manualCommand ?? containerHint)!)}
+        testId="startup-error-install-command"
+        scroll
+      />
+    ) : (
+      <>
+        Run <Code>aoe acp doctor --fix</Code>.
+      </>
+    );
   const secondary = containerDown ? [] : webInstall ? [checkAgain] : [];
 
   return (
@@ -171,23 +187,18 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 )}
               </Step>
             </>
+          ) : manualWaitsOnContainer ? (
+            <>
+              <Step n={1} title="Click Check again to start the container" />
+              <Step n={2} title={manualTitle}>
+                Once it's running, run this, then Check again:
+                <div className="mt-2">{manualStep}</div>
+              </Step>
+            </>
           ) : (
             <>
-              <Step
-                n={1}
-                title={containerHint ? "Run this inside this Session's container" : "Run this where the Daemon runs"}
-              >
-                {manualCommand || containerHint ? (
-                  <CommandBlock
-                    {...splitInstallHint((manualCommand ?? containerHint)!)}
-                    testId="startup-error-install-command"
-                    scroll
-                  />
-                ) : (
-                  <>
-                    Run <Code>aoe acp doctor --fix</Code>.
-                  </>
-                )}
+              <Step n={1} title={manualTitle}>
+                {manualStep}
               </Step>
               <Step n={2} title={observer ? "Restart the agent from the TUI" : "Click Check again"}>
                 {observer &&
