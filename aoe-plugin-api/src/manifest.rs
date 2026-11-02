@@ -986,6 +986,22 @@ impl PluginManifest {
                     .is_none_or(|command| !command.trim().is_empty()),
                 format!("agent_integrations[{i}].command must not be blank"),
             );
+            if let Some(command) = integration
+                .command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
+            {
+                check(
+                    crate::agent_integration::launch_prefix(command).is_some(),
+                    format!(
+                        "agent_integrations[{i}].command {command:?} must start with literal \
+                         NAME=value assignments and a literal executable that does not begin \
+                         with `-`; quotes, backslashes, `$`, backticks, `~`, `#`, empty words \
+                         and invalid assignment names are not supported there (arguments \
+                         after the executable are free-form)"
+                    ),
+                );
+            }
             check(
                 integration_tools.insert(integration.tool.as_str()),
                 format!(

@@ -2834,140 +2834,13 @@ fn agent_probe_output(
     }
 }
 
-fn home_dir() -> Option<String> {
-    std::env::var_os("HOME").and_then(|home| home.into_string().ok())
-}
-
-/// Split a discovery command into shell words while expanding the supported
-/// `$HOME`/`${HOME}` and leading `~`, so the probe agrees with the launch
-/// shell. Splitting happens on the command's own unquoted whitespace, so an
-/// expansion that itself contains whitespace (a `$HOME` path with a space)
-/// stays inside one word, exactly as the shell assignment treats it. Quote
-/// context is preserved: single-quoted `$HOME` stays literal (the launch does
-/// not expand it), tilde never expands inside quotes, and a backslash escapes
-/// the next character outside single quotes (`foo\ bar` is one word, `\$HOME`
-/// is a literal dollar). Unsupported constructs are left verbatim and rejected
-/// later only when they sit in the probed assignments or executable (never in
-/// trailing agent arguments).
-fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
-    let home = home_dir();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            // Outside single quotes a backslash escapes the next character; in
-            // double quotes POSIX only lets it escape `$`, backtick, `"`, `\`
-            // and newline, so a `\ ` there retains the backslash (`foo\ bar` is
-            // one word and `\$HOME` is a literal dollar when unquoted, but
-            // `"a\ b"` keeps the backslash). Inside single quotes backslash is
-            // literal, exactly as the launch shell treats it.
-            '\\' if !in_single => match (in_double, chars.peek().copied()) {
-                (false, Some(next)) => {
-                    chars.next();
-                    current.push(next);
-                }
-                (true, Some(next @ ('$' | '`' | '"' | '\\' | '\n'))) => {
-                    chars.next();
-                    current.push(next);
-                }
-                (true, _) => current.push('\\'),
-                (false, None) => current.push('\\'),
-            },
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
-            '$' if !in_single => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let mut name = String::new();
-                    for ch in chars.by_ref() {
-                        if ch == '}' {
-                            break;
-                        }
-                        name.push(ch);
-                    }
-                    if name == "HOME" {
-                        match &home {
-                            // HOME is unavailable: keep the form literal so it is
-                            // rejected by the probed-word scan, never blanked.
-                            Some(home) => current.push_str(home),
-                            None => current.push_str("${HOME}"),
-                        }
-                    } else {
-                        current.push_str("${");
-                        current.push_str(&name);
-                        current.push('}');
-                    }
-                } else {
-                    let mut token = String::new();
-                    while let Some(&next) = chars.peek() {
-                        if next.is_ascii_alphanumeric() || next == '_' {
-                            token.push(next);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if token == "HOME" {
-                        match &home {
-                            Some(home) => current.push_str(home),
-                            None => current.push_str("$HOME"),
-                        }
-                    } else {
-                        current.push('$');
-                        current.push_str(&token);
-                    }
-                }
-            }
-            // Tilde expands only at the start of a word (the executable or a
-            // standalone argument), exactly as the launching shell treats it.
-            // `~` after `=` in a `NAME=value` argument to `env` is left literal
-            // by sh/zsh/dash, so expanding it here would report an agent
-            // installed that the launch cannot run.
-            '~' if !in_single && !in_double && current.is_empty() => match (&home, chars.peek()) {
-                (Some(home), Some('/') | None) => current.push_str(home),
-                _ => current.push('~'),
-            },
-            _ => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    let assignments = words
-        .iter()
-        .take_while(|word| {
-            word.split_once('=')
-                .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
-        })
-        .count();
-    (words.get(assignments).is_some()).then_some((words, assignments))
-}
-
+/// The probed prefix of a plugin launch command: leading `NAME=value`
+/// assignments and the executable. The manifest grammar keeps those words free
+/// of shell syntax, so discovery checks exactly the words the launch passes to
+/// `exec env` rather than re-implementing shell expansion.
 fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
-    let (words, assignments) = probe_command_words(command)?;
-    if words.len() <= assignments {
-        return None;
-    }
-    // Only the assignments and the executable are probed, so only there do we
-    // refuse constructs discovery cannot safely verify (command substitution,
-    // backticks, a `$` the launch would expand but we kept literal, or a `~`
-    // that `which` would expand but the launch's `env` passes literally).
-    // Trailing agent arguments are never inspected or run.
-    if words[..=assignments]
-        .iter()
-        .any(|word| word.contains('$') || word.contains('`') || word.contains('~'))
-    {
-        return None;
-    }
-    Some((words, assignments))
+    let (words, assignments) = aoe_plugin_api::agent_integration::launch_prefix(command)?;
+    Some((words.into_iter().map(str::to_owned).collect(), assignments))
 }
 
 fn plugin_command_on_path(command: &str) -> bool {
@@ -3859,13 +3732,10 @@ mod tests {
         let _env = probe_environment(home.path());
         let login_bin = home.path().join("login-bin");
         std::fs::create_dir(&login_bin).unwrap();
-        let spaced_bin = home.path().join("my tools");
-        std::fs::create_dir(&spaced_bin).unwrap();
         let executed = home.path().join("executed");
         for path in [
             home.path().join("bin/direct-agent"),
             login_bin.join("login-agent"),
-            spaced_bin.join("spaced-agent"),
         ] {
             std::fs::write(
                 &path,
@@ -3892,16 +3762,12 @@ mod tests {
             ("login-agent", true),
             ("TOKEN=local login-agent", true),
             (injected.as_str(), true),
-            // `$HOME` expands so discovery agrees with the launch shell, but a
-            // literal `~` after `=` is a `env` argument, left unexpanded by
-            // sh/zsh/dash, so such an agent is unavailable, as at launch.
-            ("PATH=$HOME/login-bin login-agent", true),
+            // Shell syntax in the probed prefix is refused by the manifest
+            // grammar, so discovery never silently disagrees with the launch.
+            ("PATH=$HOME/login-bin login-agent", false),
+            ("PATH=\"$HOME/my tools\" login-agent", false),
             ("PATH=~/login-bin login-agent", false),
-            // A quoted `$HOME` path containing a space resolves a real executable.
-            ("PATH=\"$HOME/my tools\" spaced-agent", true),
-            // Single-quoted `$HOME` stays literal, as the launch shell would.
             ("PATH='$HOME/login-bin' login-agent", false),
-            // Command substitution in a probed part is rejected, never run.
             ("PATH=$(printf /missing) login-agent", false),
             ("PATH=/missing direct-agent", false),
             ("TOKEN=local", false),
@@ -4043,125 +3909,76 @@ mod tests {
     }
 
     #[test]
+    fn plugin_command_parts_reads_only_the_probed_prefix() {
+        assert_eq!(
+            plugin_command_parts("PATH=/opt/agents/bin acmebot --flag"),
+            Some((
+                vec!["PATH=/opt/agents/bin".to_string(), "acmebot".to_string()],
+                1
+            ))
+        );
+        assert_eq!(
+            plugin_command_parts("plain-agent"),
+            Some((vec!["plain-agent".to_string()], 0))
+        );
+        // Arguments after the executable are never parsed, so agent arguments
+        // may use any shell syntax without affecting discovery.
+        assert_eq!(
+            plugin_command_parts("plain-agent \"$(printf x)\" --filter='a b'"),
+            Some((vec!["plain-agent".to_string()], 0))
+        );
+        assert!(plugin_command_parts("").is_none());
+        assert!(plugin_command_parts("TOKEN=local").is_none());
+        // A `NAME=value` word `env` cannot set, and an `env` option word, are
+        // refused rather than probed as executables.
+        assert!(plugin_command_parts("9INVALID=local plain-agent").is_none());
+        assert!(plugin_command_parts("-i plain-agent").is_none());
+    }
+
+    #[test]
+    fn plugin_command_parts_refuses_shell_syntax_in_the_probed_prefix() {
+        // Discovery cannot reproduce every shell's expansion and field
+        // splitting, so the manifest grammar rejects these instead of probing
+        // them differently from the launch.
+        for command in [
+            // Unquoted `$HOME` field-splits in bash/sh when HOME has a space.
+            "PATH=$HOME/bin acmebot",
+            // Quoted `$HOME` is one word everywhere, but still needs expansion.
+            "PATH=\"$HOME/bin\" acmebot",
+            "PATH=${HOME}/bin acmebot",
+            "PATH=${HOME/bin acmebot",
+            // `~` after `=` expands in bash but not in sh, zsh or dash.
+            "PATH=~/bin acmebot",
+            "~/bin/acmebot",
+            // A backslash-newline continuation is removed by the shell.
+            "PATH=/opt/agents\\\n/bin acmebot",
+            // Unterminated quotes and empty words fail the launch.
+            "\"acmebot",
+            "'acmebot",
+            "\"\" acmebot",
+            // Command substitution and other variables are never run.
+            "PATH=$(printf /tmp) acmebot",
+            "PATH=`echo /tmp` acmebot",
+            "PATH=/tmp # comment",
+        ] {
+            assert!(plugin_command_parts(command).is_none(), "{command:?}");
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
-    fn probe_command_words_expands_home_and_keeps_quote_context() {
+    fn spaced_home_command_is_refused_before_probing() {
         let home = tempfile::tempdir().unwrap();
-        // A HOME whose path contains a space must stay one word after expansion.
-        let spaced = home.path().join("my home");
+        let spaced = home.path().join("Alice Smith");
         std::fs::create_dir(&spaced).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[("HOME", &spaced)]);
-        let h = spaced.to_string_lossy().into_owned();
-        assert_eq!(
-            probe_command_words("PATH=$HOME/.local/bin acmebot"),
-            Some((
-                vec![format!("PATH={h}/.local/bin"), "acmebot".to_string()],
-                1
-            ))
-        );
-        assert_eq!(
-            probe_command_words("PATH=\"$HOME/my tools\" spaced-agent"),
-            Some((
-                vec![format!("PATH={h}/my tools"), "spaced-agent".to_string()],
-                1
-            ))
-        );
-        assert_eq!(
-            probe_command_words("PATH=${HOME}/bin acmebot"),
-            Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
-        );
-        // `~` after `=` is an `env` argument, left literal by sh/zsh/dash.
-        assert_eq!(
-            probe_command_words("PATH=~/bin acmebot"),
-            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
-        );
-        // A leading `~` (the executable or a standalone word) does expand.
-        assert_eq!(
-            probe_command_words("~/bin/acmebot --flag"),
-            Some((vec![format!("{h}/bin/acmebot"), "--flag".to_string()], 0))
-        );
-        // Single quotes preserve a literal `$HOME`, exactly as the launch shell.
-        assert_eq!(
-            probe_command_words("PATH='$HOME/.local/bin' acmebot"),
-            Some((
-                vec!["PATH=$HOME/.local/bin".to_string(), "acmebot".to_string()],
-                1
-            ))
-        );
-        // Tilde does not expand inside double quotes, exactly as the shell.
-        assert_eq!(
-            probe_command_words("PATH=\"~/bin\" acmebot"),
-            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
-        );
-        // `~user` is another user's home and stays literal.
-        assert_eq!(
-            probe_command_words("PATH=~alice/bin acmebot"),
-            Some((
-                vec!["PATH=~alice/bin".to_string(), "acmebot".to_string()],
-                1
-            ))
-        );
-        // A backslash escapes the next character: `foo\ bar` is one word and
-        // `\$HOME` is a literal dollar, exactly as the launch shell treats them.
-        assert_eq!(
-            probe_command_words("foo\\ bar acmebot"),
-            Some((vec!["foo bar".to_string(), "acmebot".to_string()], 0))
-        );
-        assert_eq!(
-            probe_command_words("PATH=\\$HOME/bin acmebot"),
-            Some((vec!["PATH=$HOME/bin".to_string(), "acmebot".to_string()], 1))
-        );
-        // Inside double quotes a backslash only escapes `$`, backtick, `"` and
-        // `\`, so `\ ` retains the backslash (the launch path is `<h>/my\ tools`).
-        assert_eq!(
-            probe_command_words("PATH=\"$HOME/my\\ tools\" spaced-agent"),
-            Some((
-                vec![format!("PATH={h}/my\\ tools"), "spaced-agent".to_string()],
-                1
-            ))
-        );
-        // The escaped literal `$HOME` cannot be verified and is refused.
-        assert!(plugin_command_parts("PATH=\\$HOME/bin acmebot").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn plugin_command_parts_rejects_unverifiable_probed_constructs() {
-        let home = tempfile::tempdir().unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
-        let h = home.path().to_string_lossy().into_owned();
-        // Expanded and accepted.
-        let (words, assignments) = plugin_command_parts("PATH=$HOME/bin acmebot").unwrap();
-        assert_eq!(words, vec![format!("PATH={h}/bin"), "acmebot".to_string()]);
-        assert_eq!(assignments, 1);
-        // Command substitution, backticks, and other variables in a probed part
-        // are refused: discovery never runs arbitrary shell.
-        assert!(plugin_command_parts("PATH=$(printf /tmp) acmebot").is_none());
-        assert!(plugin_command_parts("PATH=`echo /tmp` acmebot").is_none());
-        assert!(plugin_command_parts("PATH=${OTHER} acmebot").is_none());
-        assert!(plugin_command_parts("PATH=$HOME_x acmebot").is_none());
-        // A single-quoted literal `$HOME` is refused too (it cannot be verified).
-        assert!(plugin_command_parts("PATH='$HOME/bin' acmebot").is_none());
-        // A literal `~` after `=` is an `env` argument: the launch passes it
-        // literally, so `which` must not be allowed to expand it either.
-        assert!(plugin_command_parts("PATH=~/bin acmebot").is_none());
-        // Unsupported constructs in trailing arguments are not probed.
-        assert!(plugin_command_parts("acmebot \"$(printf x)\"").is_some());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn probe_with_home_unset_keeps_ordinary_commands_and_refuses_home_forms() {
-        let _env = crate::session::test_support::EnvGuard::unset(&["HOME"]);
-        // Ordinary commands need no expansion and stay discoverable.
-        let (words, assignments) = plugin_command_parts("plain-agent --flag").unwrap();
-        assert_eq!(words, vec!["plain-agent".to_string(), "--flag".to_string()]);
-        assert_eq!(assignments, 0);
-        assert_eq!(
-            plugin_command_parts("TOKEN=local plain-agent").unwrap().0[0],
-            "TOKEN=local"
-        );
-        // A `$HOME`-dependent probe cannot be verified without HOME and is refused.
-        assert!(plugin_command_parts("PATH=$HOME/bin plain-agent").is_none());
+        // The grammar refuses `~` and `$HOME` in the probed prefix whatever
+        // HOME contains, so a spaced HOME can no longer make discovery probe a
+        // different path than the launch runs.
+        assert!(plugin_command_parts("~/bin/acmebot --flag").is_none());
+        assert!(plugin_command_parts("PATH=~/bin acmebot --flag").is_none());
+        assert!(plugin_command_parts("PATH=\"$HOME/bin\" acmebot").is_none());
+        assert!(!plugin_command_available("~/bin/acmebot", true, None));
     }
 
     #[test]

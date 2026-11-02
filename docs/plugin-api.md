@@ -38,15 +38,13 @@ capabilities = ["runtime.worker"]
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 | `agent_integrations` | array of tables | no | Optional agent launch metadata. Requires `api_version >= 19`. |
 
-
 ## Agent integrations
-
 
 An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when its name is unique across plugin declarations and does not match a configured custom agent. Built-in names and aliases retain precedence under AoE's case-insensitive substring resolver, so a plugin tool containing any such token is omitted from the catalog and a warning names the plugin ID and tool.
 
 Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
-Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
+`command` is a launch line, not a shell script. Up to and including the executable it may contain only whitespace-separated literal words: optional `NAME=value` assignments with valid environment names, followed by the executable. Quotes, backslashes, `$`, backticks, `~`, `#`, empty words and invalid assignment names are rejected when the manifest is validated, because discovery cannot reproduce a shell's expansion and field splitting closely enough to agree with the launch. The same rule refuses an executable beginning with `-`, which `env` would read as its own option. Arguments after the executable are passed through untouched and may use any syntax; the agent receives them from the shell exactly as written.
 
 ```toml
 [[agent_integrations]]
@@ -54,11 +52,12 @@ tool = "session-helper"
 command = "session-helper"
 ```
 
-
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
-| `command` | string | no | Default launch command for this agent. |
+| `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
+
+Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 
 ## Plugin id

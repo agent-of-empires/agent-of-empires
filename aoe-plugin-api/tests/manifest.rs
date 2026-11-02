@@ -84,6 +84,47 @@ command = "session-agent --"
 }
 
 #[test]
+fn agent_launch_commands_use_a_literal_prefix_grammar() {
+    let manifest = |command: &str| {
+        format!(
+            "id = \"acme.agent\"\nname = \"Agent\"\nversion = \"0.1.0\"\napi_version = 19\n\
+             [[agent_integrations]]\ntool = \"session-agent\"\ncommand = {command:?}\n"
+        )
+    };
+    // Only the prefix is constrained; agent arguments stay free-form.
+    for command in [
+        "session-agent",
+        "PATH=/opt/agents/bin session-agent --flag",
+        "TOKEN=local OTHER=2 session-agent --filter='a b' \"$(not run)\"",
+    ] {
+        PluginManifest::from_toml_str(&manifest(command))
+            .unwrap_or_else(|error| panic!("{command:?} should be accepted: {error}"));
+    }
+    // Shell syntax in the prefix disagrees with discovery, so it fails install.
+    for command in [
+        "PATH=$HOME/bin session-agent",
+        "PATH=\"$HOME/bin\" session-agent",
+        "PATH=${HOME}/bin session-agent",
+        "PATH=${HOME/bin session-agent",
+        "PATH=~/bin session-agent",
+        "~/bin/session-agent",
+        "PATH=/opt/agents\\\n/bin session-agent",
+        "\"session-agent",
+        "\"\" session-agent",
+        "PATH=$(printf /tmp) session-agent",
+        "PATH=`echo /tmp` session-agent",
+        "9INVALID=1 session-agent",
+        "-i session-agent",
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(command)).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains("literal executable"))),
+            "{command:?} should be rejected, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn contribution_sections_parse() {
     let m = parse(
         4,
