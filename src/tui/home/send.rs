@@ -58,7 +58,7 @@ impl HomeView {
     pub(in crate::tui) fn finish_send(
         &mut self,
         session_id: &str,
-        tmux_name: &str,
+        terminal: &std::sync::Arc<crate::daemon::TerminalTarget>,
         target: live_send::LiveSendTarget,
         message: &str,
         lease: &crate::tui::session_feed::NativeLease,
@@ -90,9 +90,7 @@ impl HomeView {
             ));
             return;
         };
-        // The receipt named the pane the daemon confirmed, so nothing is
-        // resolved locally and a stale name cannot be sent to.
-        let tmux_session = crate::tmux::Session::from_name(tmux_name);
+        let agent = matches!(target, live_send::LiveSendTarget::Agent);
         // Agent gets a tool-specific Enter delay so paste-burst-aware
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.
@@ -102,25 +100,49 @@ impl HomeView {
             | live_send::LiveSendTarget::ContainerTerminal
             | live_send::LiveSendTarget::Tool(_) => 0,
         };
-        // Rechecks the stored row and keeps a CLI or TUI archive out until the keys land.
-        let _input_lock = match &target {
-            live_send::LiveSendTarget::Agent => match inst.lock_for_input() {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new("Send Failed", &e.to_string()));
-                    return;
-                }
-            },
-            _ => None,
-        };
-        if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
-            self.info_dialog = Some(InfoDialog::new(
-                "Send Failed",
-                &format!("Failed to send message: {}", e),
-            ));
+        let delivered = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                lease
+                    .target()
+                    .is_some_and(|owned| std::sync::Arc::ptr_eq(owned, terminal))
+                    && inst.lifecycle_generation == terminal.lifecycle_generation
+                    && inst.effective_profile() == terminal.profile,
+                crate::session::NativeInputError::Ownership
+            );
+            let physical = terminal
+                .physical
+                .clone()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let fence = lease.input_fence(agent)?;
+            let session = if agent {
+                inst.agent_input_session(&terminal.tmux_session, physical, true, Some(fence))?
+            } else {
+                crate::tmux::Session::from_observation(&terminal.tmux_session, physical)
+                    .with_native_input_fence(fence)
+            };
+            anyhow::ensure!(
+                lease.is_valid(),
+                crate::session::NativeInputError::Ownership
+            );
+            session.send_keys_with_delay(message, delay)
+        })();
+        if let Err(error) = delivered {
+            self.info_dialog = Some(InfoDialog::new("Send Failed", &error.to_string()));
             return;
         }
-        self.stamp_last_accessed(session_id);
+        #[cfg(test)]
+        post_send_test_hook::run(session_id);
+        if let Err(error) = self.session_feed.submit(
+            session_id.to_owned(),
+            crate::daemon::SessionMutation::InputRecency(crate::daemon::InputRecencyBody {
+                created_at: inst.created_at,
+                lifecycle_generation: terminal.lifecycle_generation,
+                profile: terminal.profile.clone(),
+                profile_identity: lease.preparation_profile_identity(),
+            }),
+        ) {
+            tracing::warn!(target: "tui.home", session_id, %error, "input recency request refused");
+        }
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(None);
             self.selected_session = None;
@@ -158,21 +180,63 @@ impl HomeView {
         let Some(tokens) = permission_response_tokens(&response, choice) else {
             return;
         };
-        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
-            Ok(s) => s,
-            Err(e) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Respond Failed",
-                    &format!("Failed to resolve session: {}", e),
-                ));
-                return;
-            }
-        };
-        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+        let delivered = (|| -> anyhow::Result<()> {
+            let pane = &inst.agent_pane;
+            anyhow::ensure!(
+                pane.state == crate::session::PanePresence::Alive,
+                crate::session::NativeInputError::Ownership
+            );
+            let name = pane
+                .tmux_session
+                .as_deref()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let physical = pane
+                .physical
+                .clone()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let session = inst.agent_input_session(name, physical, false, None)?;
+            session.send_key_tokens(tokens)
+        })();
+        if let Err(e) = delivered {
             self.info_dialog = Some(InfoDialog::new(
                 "Respond Failed",
                 &format!("Failed to send response: {}", e),
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod post_send_test_hook {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static HOOKS: RefCell<HashMap<String, Box<dyn FnOnce()>>> = RefCell::new(HashMap::new());
+    }
+
+    pub(in crate::tui::home) struct Guard(String);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.with(|hooks| hooks.borrow_mut().remove(&self.0));
+        }
+    }
+
+    pub(in crate::tui::home) fn install(id: &str, hook: impl FnOnce() + 'static) -> Guard {
+        HOOKS.with(|hooks| {
+            assert!(hooks
+                .borrow_mut()
+                .insert(id.into(), Box::new(hook))
+                .is_none());
+        });
+        Guard(id.into())
+    }
+
+    pub(super) fn run(id: &str) {
+        let hook = HOOKS.with(|hooks| hooks.borrow_mut().remove(id));
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }

@@ -36,14 +36,17 @@ beforeEach(() => localStorage.clear());
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPersistedState", () => {
-  it.each(["pendingElicitations", "oldestSeq"])("backfills %s missing from an older entry", (field) => {
-    const legacy: Record<string, unknown> = { ...emptyAcpState() };
-    delete legacy[field];
-    writeEntry("legacy", legacy);
-    expect(loadPersistedState("legacy")).toMatchObject({
-      [field]: (emptyAcpState() as unknown as Record<string, unknown>)[field],
-    });
-  });
+  it.each(["pendingElicitations", "oldestSeq", "interactionError"])(
+    "backfills %s missing from an older entry",
+    (field) => {
+      const legacy: Record<string, unknown> = { ...emptyAcpState() };
+      delete legacy[field];
+      writeEntry("legacy", legacy);
+      expect(loadPersistedState("legacy")).toMatchObject({
+        [field]: (emptyAcpState() as unknown as Record<string, unknown>)[field],
+      });
+    },
+  );
 
   it("preserves stored values", () => {
     const elicitation = { nonce: "e-1", message: "Pick", questions: [], resolved: null };
@@ -52,6 +55,22 @@ describe("loadPersistedState", () => {
     const loaded = loadPersistedState("seq");
     expect(loaded?.oldestSeq).toBe(42);
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
+
+  it("persists canonical failures without persisting transient interaction errors", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical failure" } },
+    });
+    persistState("failed", {
+      ...state,
+      interactionError: { message: "temporary request failure", target: { kind: "elicitation", nonce: "e-1" } },
+    });
+    const loaded = loadPersistedState("failed");
+    expect(loaded?.lastError).toBe("canonical failure");
+    expect(loaded?.lastErrorEvidence).toBeNull();
+    expect(loaded?.interactionError).toBeNull();
   });
 });
 

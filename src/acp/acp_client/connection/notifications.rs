@@ -57,6 +57,9 @@ pub(super) struct Shared {
     pub(super) adopted_turn_active: AtomicBool,
     /// While set, the per-prompt watchdog owns idle detection.
     pub(super) prompt_in_flight: Arc<AtomicBool>,
+    pub(super) local_prompt_settled: tokio::sync::Notify,
+    initial_session_committed: AtomicBool,
+    initial_session_commit: tokio::sync::Notify,
     /// Bumped before each prompt so stale lifecycle envelopes are discarded.
     pub(super) prompt_epoch: AtomicU64,
     lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
@@ -109,6 +112,9 @@ impl Shared {
             terminal_claim,
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
+            local_prompt_settled: tokio::sync::Notify::new(),
+            initial_session_committed: AtomicBool::new(false),
+            initial_session_commit: tokio::sync::Notify::new(),
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
@@ -133,14 +139,29 @@ impl Shared {
         &self,
         id: SessionId,
     ) -> Result<(), agent_client_protocol::Error> {
-        let _guard = self.ingress.fence.lock().await;
+        let _guard = self.ingress.fence.write().await;
         let replay = self.ingress.finish(Some(id.clone()))?;
         self.emit(Event::AcpSessionAssigned {
             acp_session_id: id.0.to_string(),
         })
         .await;
         self.apply_replay(replay).await;
+        self.initial_session_committed
+            .store(true, Ordering::Release);
+        self.initial_session_commit.notify_waiters();
         Ok(())
+    }
+
+    pub(super) async fn wait_initial_session_commit(&self) {
+        loop {
+            let committed = self.initial_session_commit.notified();
+            tokio::pin!(committed);
+            committed.as_mut().enable();
+            if self.initial_session_committed.load(Ordering::Acquire) {
+                return;
+            }
+            committed.await;
+        }
     }
 
     /// Replayed updates carry no local prompt, so they only rebuild state.
@@ -230,7 +251,8 @@ impl Shared {
         if lifecycle.is_some() || wakeup.is_some() {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
-        let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
+        let prompt_active = self.prompt_in_flight.load(Ordering::Acquire);
+        let failed_main_turn = !prompt_active && self.terminal_claim.failed();
         if !prompt_active
             && self.between_prompt.observe(
                 lifecycle.as_ref(),
@@ -263,6 +285,9 @@ impl Shared {
         )
         .await;
         for event in events {
+            if failed_main_turn && matches!(event, Event::ThinkingStarted) {
+                continue;
+            }
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,

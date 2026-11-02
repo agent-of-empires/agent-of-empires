@@ -1346,7 +1346,7 @@ impl App {
                         self.update_status = None;
                         match self.home.enter_live_send_with(
                             &ready.id,
-                            &ready.tmux_name,
+                            &ready.terminal.tmux_session,
                             target,
                             ready.lease,
                         ) {
@@ -1358,7 +1358,7 @@ impl App {
                         self.update_status = None;
                         self.home.finish_send(
                             &ready.id,
-                            &ready.tmux_name,
+                            &ready.terminal,
                             target,
                             &message,
                             &ready.lease,
@@ -2866,7 +2866,7 @@ impl App {
     fn attach_session(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
+        _terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -2878,38 +2878,13 @@ impl App {
             return Ok(());
         }
 
-        let tmux_session = instance.tmux_session()?;
-
-        // Hook status and wrapper commands are stronger than shell detection
-        // when deciding whether a running row needs an explicit restart.
-        let exists = tmux_session.exists();
-        let pane_dead = exists && tmux_session.is_pane_dead();
-        let needs_restart = if !exists || pane_dead {
-            true
-        } else if crate::hooks::read_hook_status(&instance.id).is_some()
-            || instance.has_command_override()
-        {
-            false
-        } else {
-            !instance.expects_shell() && tmux_session.is_pane_running_shell()
-        };
-        tracing::debug!(target: "tui.input",
-            session_id,
-            exists,
-            pane_dead,
-            needs_restart,
-            "attach_session: restart decision"
-        );
-        // A row about to be started must not be one the user shelved: the
-        // trashed/archived agent stays stopped, so refuse visibly and point at
-        // the restore key instead of letting the runtime reject the start
-        // (#4118). The predicate is this branch's own, so the Stopped case the
-        // thin-client rework added to it is refused the same way.
-        let starts_agent = needs_restart || instance.status == crate::session::Status::Stopped;
-        if starts_agent && self.home.refuse_start_if_shelved(session_id) {
+        // Advisory only for the launch warning. The daemon must independently
+        // prove Missing/Dead before any implicit start; Enter is never Restart.
+        let may_start_agent = instance.agent_pane.state != crate::session::PanePresence::Alive;
+        if may_start_agent && self.home.refuse_start_if_shelved(session_id) {
             return Ok(());
         }
-        if starts_agent {
+        if may_start_agent {
             // Warn once when the agent can't take the sandbox's custom instruction.
             if instance.is_sandboxed() {
                 let has_instruction = instance
@@ -2957,52 +2932,9 @@ impl App {
             {
                 return Ok(());
             }
-
-            let size = crate::terminal::get_size();
-            if instance.status == crate::session::Status::Stopped {
-                self.home.start_then_attach(session_id, size);
-            } else {
-                self.home.restart_then_attach(session_id, size, false);
-            }
-            return Ok(());
         }
 
-        self.attach_live_session(session_id, terminal)
-    }
-
-    /// Attach to `session_id`'s running tmux pane and settle the row on return.
-    fn attach_live_session(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
-    ) -> Result<()> {
-        if !self.home.session_feed.native_interaction_available() {
-            return Ok(());
-        }
-        let tmux_session = match self.home.get_instance(session_id) {
-            Some(inst) => inst.tmux_session()?,
-            None => return Ok(()),
-        };
-        // Undo manual preview sizing so the attaching client gets the full
-        // terminal, and re-assert preview geometry afterwards.
-        tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync(session_id);
-        let attach_result = self.with_raw_mode_disabled(terminal, || tmux_session.attach())?;
-
-        self.needs_redraw = true;
-        crate::tmux::refresh_session_cache();
-        self.home.apply_session_feed();
-        let result = self.home.reload();
-        self.home.reload_failure_state.record_storage(&result);
-        self.home.try_present_reload_failure_dialog();
-        self.home.clear_unread_on_view(session_id);
-        self.home.stamp_last_accessed(session_id);
-        self.select_after_attach(session_id);
-
-        if let Err(e) = attach_result {
-            tracing::warn!(target: "tui.input", "tmux attach returned error: {}", e);
-        }
-
+        self.prepare_native_attachment(session_id, crate::tui::home::panes::NativePane::Agent);
         Ok(())
     }
 
@@ -3028,23 +2960,26 @@ impl App {
         } else {
             crate::session::AuxiliaryTarget::Host { index: 0 }
         };
-        self.prepare_native_attachment(session_id, target);
+        self.prepare_native_attachment(
+            session_id,
+            crate::tui::home::panes::NativePane::Auxiliary(target),
+        );
     }
 
     fn attach_tool_session(&mut self, session_id: &str, tool_name: &str) {
         self.prepare_native_attachment(
             session_id,
-            crate::session::AuxiliaryTarget::Tool {
+            crate::tui::home::panes::NativePane::Auxiliary(crate::session::AuxiliaryTarget::Tool {
                 tool_name: tool_name.into(),
-            },
+            }),
         );
     }
 
-    fn prepare_native_attachment(&mut self, id: &str, target: crate::session::AuxiliaryTarget) {
-        use crate::tui::home::panes::{NativePane, PaneIntent};
+    fn prepare_native_attachment(&mut self, id: &str, pane: crate::tui::home::panes::NativePane) {
+        use crate::tui::home::panes::PaneIntent;
         if let Err(error) = self.home.prepare_native_attachment(
             id,
-            NativePane::Auxiliary(target),
+            pane,
             crate::terminal::get_size(),
             PaneIntent::Attach,
         ) {
@@ -3063,7 +2998,12 @@ impl App {
         if !ready.lease.is_valid() {
             return Ok(());
         }
-        let target = crate::tmux::Session::from_name(&ready.tmux_name);
+        let Some(physical) = ready.terminal.physical.clone() else {
+            return Err(anyhow::anyhow!(
+                "Native target has no physical ownership receipt"
+            ));
+        };
+        let target = crate::tmux::Session::from_observation(&ready.terminal.tmux_session, physical);
         let lease = ready.lease;
         self.home.clear_preview_pane_sync(&ready.id);
         let attach_result = self.with_raw_mode_disabled(

@@ -404,7 +404,7 @@ impl TranscriptModel {
                     text,
                 )]
             }
-            Event::PromptRuntimeError { message } => {
+            Event::PromptRuntimeError { message, .. } => {
                 self.turn_has_output = true;
                 vec![self.notice(seq, format!("prompt failed: {message}"))]
             }
@@ -904,6 +904,7 @@ mod tests {
             (
                 Event::PromptRuntimeError {
                     message: "stream died".into(),
+                    evidence: None,
                 },
                 "notice-1",
                 TranscriptRowKind::Notice,
@@ -1643,6 +1644,7 @@ mod tests {
         };
         let runtime_error = Event::PromptRuntimeError {
             message: "boom".into(),
+            evidence: None,
         };
         // (events between the prompt and its stop, notice expected)
         let cases = [
