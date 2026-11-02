@@ -65,6 +65,8 @@ async fn split_incoming<R: AsyncRead + Unpin>(
             }
         }
     }
+    // The agent's stdout ended: the SDK must see EOF, not a quiet pipe.
+    let _ = to_sdk.shutdown().await;
 }
 
 fn track_requests(state: &Shared, items: &[Value]) {
@@ -206,6 +208,22 @@ mod tests {
             .map(|r| r["id"].clone())
             .collect();
         assert_eq!(ids, [serde_json::json!("x"), serde_json::json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn agent_exit_reaches_the_sdk_as_eof() {
+        let (agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, _agent_side_in) = tokio::io::duplex(4096);
+        let mut sdk = wrap(agent_out, agent_in);
+        drop(agent_side_out);
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut sdk, &mut buf),
+        )
+        .await
+        .expect("the SDK end sees EOF");
+        assert_eq!(read.unwrap(), 0);
     }
 
     #[tokio::test]
