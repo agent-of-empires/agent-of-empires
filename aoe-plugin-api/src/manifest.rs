@@ -996,9 +996,10 @@ impl PluginManifest {
                     format!(
                         "agent_integrations[{i}].command {command:?} must start with literal \
                          NAME=value assignments and a literal executable that does not begin \
-                         with `-`; quotes, backslashes, `$`, backticks, `~`, `#`, empty words \
-                         and invalid assignment names are not supported there (arguments \
-                         after the executable are free-form)"
+                         with `-`; quotes, backslashes, `$`, backticks, `~`, `#`, empty words, \
+                         invalid assignment names, command separators, redirections, globs, \
+                         braces and whitespace other than single spaces or tabs are not \
+                         supported there (arguments after the executable are free-form)"
                     ),
                 );
             }

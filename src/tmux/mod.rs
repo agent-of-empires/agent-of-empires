@@ -3960,6 +3960,12 @@ mod tests {
             "PATH=$(printf /tmp) acmebot",
             "PATH=`echo /tmp` acmebot",
             "PATH=/tmp # comment",
+            // A newline ends the shell command, so `env` runs without a
+            // program instead of the executable discovery probed.
+            "TOKEN=local\nacmebot",
+            "TOKEN=local; acmebot",
+            "TOKEN=local&acmebot",
+            "PATH=/opt/*/bin acmebot",
         ] {
             assert!(plugin_command_parts(command).is_none(), "{command:?}");
         }

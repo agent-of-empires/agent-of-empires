@@ -12,20 +12,23 @@ pub struct AgentIntegrationContribution {
 }
 
 /// The leading `NAME=value` assignments and the executable word of a launch
-/// command, split on whitespace, plus how many of the words are assignments.
+/// command, plus how many of the words are assignments.
 ///
 /// Discovery checks that executable without running anything, and the launch
-/// passes these words to `exec env` unchanged. Quoting, expansion and field
-/// splitting differ between shells, so a prefix that depends on them cannot be
-/// verified the way it runs and is refused instead. Only the prefix is
-/// inspected: arguments after the executable are never parsed.
+/// passes these words to `exec env` unchanged. Only spaces and tabs separate
+/// them, and no word may contain anything the launch shell would act on, so a
+/// probed word is the word `env` receives. Quoting, expansion, field splitting
+/// and command separators therefore cannot make discovery disagree with the
+/// launch. Only the prefix is inspected: arguments after the executable are
+/// never parsed.
 pub fn launch_prefix(command: &str) -> Option<(Vec<&str>, usize)> {
     let mut words: Vec<&str> = Vec::new();
-    for word in command.split_whitespace() {
-        if !word
-            .chars()
-            .all(|c| !matches!(c, '\'' | '"' | '\\' | '$' | '`' | '~' | '#'))
-        {
+    for word in command.split([' ', '\t']) {
+        // Repeated separators produce no word in the shell either.
+        if word.is_empty() {
+            continue;
+        }
+        if !literal_word(word) {
             return None;
         }
         if let Some((key, _)) = word.split_once('=') {
@@ -46,6 +49,40 @@ pub fn launch_prefix(command: &str) -> Option<(Vec<&str>, usize)> {
         return Some((words, assignments));
     }
     None
+}
+
+/// Whether the launch shell leaves a word intact: no separators, redirections,
+/// globs, braces, expansions, quoting or whitespace other than what
+/// `launch_prefix` already split on. A newline is a command separator to the
+/// shell and a non-breaking space is one to `split_whitespace`, so both would
+/// make the probed words differ from the launched ones.
+fn literal_word(word: &str) -> bool {
+    word.chars().all(|c| {
+        !c.is_whitespace()
+            && !c.is_control()
+            && !matches!(
+                c,
+                '\'' | '"'
+                    | '\\'
+                    | '$'
+                    | '`'
+                    | '~'
+                    | '#'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+            )
+    })
 }
 
 fn valid_env_key(key: &str) -> bool {
@@ -92,8 +129,36 @@ mod tests {
             "PATH=$(printf /tmp) acmebot",
             "PATH=`echo /tmp` acmebot",
             "PATH=/tmp # comment",
+            // A newline ends the shell command, so `env` would run without an
+            // executable instead of running the probed one.
+            "TOKEN=local\nacmebot",
+            "TOKEN=local\r\nacmebot",
+            // Command separators and redirections split or redirect the launch.
+            "TOKEN=local; acmebot",
+            "TOKEN=local; acmebot",
+            "TOKEN=local&acmebot",
+            "TOKEN=local|acmebot",
+            "TOKEN=local&&acmebot",
+            "PATH=/opt/a>b acmebot",
+            "PATH=/opt/a<b acmebot",
+            "PATH=(x) acmebot",
+            // Globs and braces expand to words discovery never sees.
+            "PATH=/opt/*/bin acmebot",
+            "PATH=/opt/[ab]/bin acmebot",
+            "PATH=/opt/?/bin acmebot",
+            "PATH={/opt/a,/opt/b} acmebot",
+            // Non-ASCII whitespace is not a shell word separator.
+            "TOKEN=local\u{a0}acmebot",
         ] {
             assert_eq!(launch_prefix(command), None, "{command:?}");
         }
+    }
+
+    #[test]
+    fn launch_prefix_accepts_tabs_and_repeated_spaces_between_words() {
+        assert_eq!(
+            launch_prefix("PATH=/opt/agents/bin\tacmebot  --flag"),
+            Some((vec!["PATH=/opt/agents/bin", "acmebot"], 1))
+        );
     }
 }

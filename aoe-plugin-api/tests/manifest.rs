@@ -115,6 +115,12 @@ fn agent_launch_commands_use_a_literal_prefix_grammar() {
         "PATH=`echo /tmp` session-agent",
         "9INVALID=1 session-agent",
         "-i session-agent",
+        // A newline ends the shell command before `env` gets an executable.
+        "TOKEN=local\nsession-agent",
+        // Separators and globs rewrite the words `env` receives.
+        "TOKEN=local; session-agent",
+        "TOKEN=local|session-agent",
+        "PATH=/opt/*/bin session-agent",
     ] {
         let error = PluginManifest::from_toml_str(&manifest(command)).unwrap_err();
         assert!(

@@ -45,7 +45,7 @@ Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces, s
 
 A worker requests only the grants it uses. `runtime.worker` is required to run any code at all; add `net`, `session.read`, `notifications`, and so on as needed. Static contributions (commands, keybinds, themes, ui, status) need no capability. The user grants the exact declared set at install, pinned to the manifest hash, so an update that widens capabilities must be re-approved. Keep the list honest and minimal.
 
-Agent launch metadata is an optional contribution type, not a worker RPC. It requires `api_version >= 19`; see [Agent integrations](../plugin-api.md#agent-integrations) for the manifest contract. A launch command starts with optional literal `NAME=value` assignments and the executable, with agent arguments after that; shell syntax in that prefix is rejected at install because discovery could not check it the way the launch runs it.
+Agent launch metadata is an optional contribution type, not a worker RPC. It requires `api_version >= 19`; see [Agent integrations](../plugin-api.md#agent-integrations) for the manifest contract. A launch command starts with optional literal `NAME=value` assignments and the executable, with agent arguments after that; shell syntax in that prefix, including separators, redirections, globs and newlines, is rejected at install because discovery could not check it the way the launch runs it.
 The install approval lists each declared tool and exact launch command. Updates that add an agent integration or change its launch command require approval again; removals alone do not. The command runs as the host user only when a user launches that agent.
 
 ## The worker
