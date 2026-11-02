@@ -82,6 +82,28 @@ fn edit_identity_matches(row: &Instance, expected: &Instance) -> bool {
         && row.worktree_info == expected.worktree_info
 }
 
+/// Committed rows before and after an edit; caller holds the session lock.
+fn log_committed_edit(id: &str, before: &Instance, after: &Instance) {
+    if before.title != after.title {
+        tracing::info!(target: "session.rename", session = %id, from = %before.title, to = %after.title, "session renamed");
+    }
+    if before.project_path != after.project_path {
+        let leaf = |path: &str| {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        tracing::info!(target: "session.rename", session = %id, from = %leaf(&before.project_path), to = %leaf(&after.project_path), "worktree renamed");
+    }
+    if before.group_path != after.group_path {
+        tracing::info!(target: "session.sync", session = %id, field = "group", value = %after.group_path, "session updated");
+    }
+    if before.source_profile != after.source_profile {
+        tracing::info!(target: "session.sync", session = %id, field = "profile", value = %after.source_profile, "session updated");
+    }
+}
+
 async fn edit_session(
     state: &Arc<AppState>,
     id: &str,
@@ -326,6 +348,7 @@ async fn edit_session(
     let move_warning_slot = move_warning.clone();
     let old_title = before.title.clone();
     let new_title = after.title.clone();
+    let (log_before, log_after) = (before.clone(), after.clone());
     let structured = before.is_structured();
     let profiles = vec![before.source_profile.clone(), after.source_profile.clone()];
     let committed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -478,6 +501,7 @@ async fn edit_session(
             ));
         }
     };
+    log_committed_edit(id, &log_before, &log_after);
     let mut warnings = Vec::new();
     warnings.extend(move_warning.lock().expect("move warning slot").take());
     if old_title != new_title && !structured {
@@ -669,6 +693,7 @@ pub async fn attach_session_project(
     match result {
         Ok((outcome, worker)) => {
             use crate::server::attach_project::WorkerOutcome;
+            tracing::info!(target: "session.attach", session = %id, repo = %repo.display(), "project attached");
             let worker = match worker {
                 WorkerOutcome::Restarted => AttachedWorkerOutcome::Restarted,
                 WorkerOutcome::NotRunning => AttachedWorkerOutcome::NotRunning,
@@ -756,4 +781,32 @@ async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::Pa
     })
     .await
     .map_err(|e| format!("project lookup panicked: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::test_support;
+
+    /// The handler receives raw input; the edit trims and sanitizes the leaf,
+    /// so the event must come from the committed rows.
+    #[test]
+    fn committed_edit_logs_the_normalized_worktree_leaf() {
+        let before = Instance::new("t", "/repos/a/old-name");
+        let mut after = before.clone();
+        after.project_path = crate::session::worktree_edit::target_worktree_path(
+            std::path::Path::new(&before.project_path),
+            "  New Name ",
+        )
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        assert_ne!(after.project_path, "/repos/a/  New Name ");
+        let out = test_support::capture_log(|| log_committed_edit("s1", &before, &after));
+        assert!(out.contains("worktree renamed"), "{out}");
+        assert!(out.contains("from=old-name"), "{out}");
+        assert!(out.contains("to=New-Name"), "{out}");
+        assert!(!out.contains("New Name"), "{out}");
+        assert!(!out.contains("session renamed"), "{out}");
+    }
 }

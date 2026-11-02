@@ -127,6 +127,7 @@ pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &s
         .session_service
         .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
         .await;
+    tracing::debug!(target: "acp.supervisor", session = %session_id, "queued monitor re-arm reminder");
 }
 
 async fn admit(
@@ -153,7 +154,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     let in_flight_turn = target.in_flight_turn;
 
     // Take the lease before any preparation so a stop landing from here on is honored.
-    let record = worker_registry::load(&id).ok().flatten();
+    let record = worker_registry::load(&id).unwrap_or_else(|error| {
+        tracing::warn!(target: "acp.supervisor", session = %id, %error, "resume: worker record unreadable, treating as absent");
+        None
+    });
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             worker_registry::is_record_live(r),

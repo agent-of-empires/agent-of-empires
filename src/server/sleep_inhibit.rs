@@ -60,7 +60,10 @@ pub(super) fn reconcile_sleep_inhibit(
             // inside `is_held_alive` above, so overwriting the slot below leaks no zombie.
             let mut inhibitor = make();
             match inhibitor.acquire() {
-                Ok(()) => *slot = Some(inhibitor),
+                Ok(()) => {
+                    tracing::info!(target: "server.sleep_inhibit", "sleep inhibit acquired");
+                    *slot = Some(inhibitor);
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "server.sleep_inhibit",
@@ -74,6 +77,7 @@ pub(super) fn reconcile_sleep_inhibit(
         (false, Some(_)) => {
             if let Some(mut inhibitor) = slot.take() {
                 inhibitor.release();
+                tracing::info!(target: "server.sleep_inhibit", "sleep inhibit released");
             }
         }
         (false, None) => {}

@@ -248,9 +248,20 @@ fn check_auth_gate(
 async fn sync_passphrase_file(path: &std::path::Path, passphrase: Option<&str>) {
     match passphrase {
         Some(pp) => write_secret_file(path, pp).await,
-        None => {
-            let _ = tokio::fs::remove_file(path).await;
-        }
+        None => remove_passphrase_file(path).await,
+    }
+}
+
+/// Absent is the normal case for a daemon that ran without a passphrase.
+async fn remove_passphrase_file(path: &std::path::Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            target: "auth.passphrase",
+            %error,
+            "could not remove serve.passphrase"
+        ),
     }
 }
 
@@ -730,26 +741,29 @@ pub(crate) async fn start_server(
             vec![(IpKind::Loopback, make_url(host))]
         };
 
-        // A build without the dashboard bundle still serves the API, so the
-        // banner must not promise a page that is not there.
-        if cfg!(feature = "web") {
-            println!("aoe web dashboard running at:");
-        } else {
-            println!("aoe daemon running at (API only, no dashboard bundle):");
-        }
-        for (_, u) in &labeled_urls {
-            println!("  {}", u);
-        }
-        if auth_token.is_some() && cfg!(feature = "web") {
-            println!();
-            if allow_plaintext_remote {
-                println!(
-                    "Open any URL above in a browser. Share it to access from other devices on your network."
-                );
+        // The daemon child's stdout is the log file, which must never hold the token.
+        if !is_daemon {
+            // A build without the dashboard bundle still serves the API, so the
+            // banner must not promise a page that is not there.
+            if cfg!(feature = "web") {
+                println!("aoe web dashboard running at:");
             } else {
-                println!(
-                    "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
-                );
+                println!("aoe daemon running at (API only, no dashboard bundle):");
+            }
+            for (_, u) in &labeled_urls {
+                println!("  {}", u);
+            }
+            if auth_token.is_some() && cfg!(feature = "web") {
+                println!();
+                if allow_plaintext_remote {
+                    println!(
+                        "Open any URL above in a browser. Share it to access from other devices on your network."
+                    );
+                } else {
+                    println!(
+                        "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                    );
+                }
             }
         }
 
@@ -1245,6 +1259,16 @@ pub(crate) async fn start_server(
         .await;
     };
 
+    tracing::info!(
+        target: "serve.lifecycle",
+        host,
+        port = local_port,
+        socket = %socket_path.display(),
+        auth_mode = ?auth_mode,
+        remote,
+        core_only,
+        "daemon ready"
+    );
     notify_ready("daemon ready").await;
     // Publish counts after readiness so its initial status cannot overwrite them.
     super::systemd_reconcile::push_status(&state).await;
@@ -1277,6 +1301,7 @@ pub(crate) async fn start_server(
             }
         }
     );
+    let shutdown_started = std::time::Instant::now();
     state.shutdown.cancel();
     if let Err(error) = signal_task.await {
         tracing::error!(target: "serve.shutdown", %error, "shutdown task failed");
@@ -1292,8 +1317,13 @@ pub(crate) async fn start_server(
     }
 
     if let Ok(app_dir) = crate::session::get_app_dir() {
-        let _ = tokio::fs::remove_file(app_dir.join("serve.passphrase")).await;
+        remove_passphrase_file(&app_dir.join("serve.passphrase")).await;
     }
+    tracing::info!(
+        target: "serve.shutdown",
+        elapsed_ms = shutdown_started.elapsed().as_millis() as u64,
+        "daemon shutdown complete"
+    );
 
     serve_result.map(|_| ()).map_err(Into::into)
 }

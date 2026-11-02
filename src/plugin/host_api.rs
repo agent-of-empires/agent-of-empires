@@ -103,7 +103,9 @@ impl HostApiState {
         title: String,
         body: Option<String>,
     ) {
-        let _ = self.ui.notify(plugin_id, tone, title, body, None, None);
+        if let Err(error) = self.ui.notify(plugin_id, tone, title, body, None, None) {
+            tracing::debug!(target: "plugin.host", plugin = %plugin_id, ?error, "host notify rejected");
+        }
     }
 }
 

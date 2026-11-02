@@ -7,7 +7,7 @@ use agent_of_empires::tui;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
@@ -23,6 +23,19 @@ fn seed_cityhall_env(cli: &Cli) {
             }
         }
     }
+}
+
+/// Hot-path, app-data-free and log-reading commands never open the log file
+/// on their own; `AOE_LOG_LEVEL` still can.
+fn skips_cli_sink(cli: &Cli) -> bool {
+    matches!(
+        cli.command,
+        Some(Commands::Completion { .. })
+            | Some(Commands::Init(_))
+            | Some(Commands::ExtractSessionId(_))
+            | Some(Commands::Tmux { .. })
+            | Some(Commands::Logs(_))
+    )
 }
 
 /// The child's stdio is redirected to the log file, so tracing writes there too.
@@ -101,9 +114,7 @@ fn main() -> Result<()> {
     }
     if let Some(url) = &cli.daemon_url {
         // SAFETY: no runtime or background work has started.
-        unsafe {
-            std::env::set_var("AOE_DAEMON_URL", url);
-        }
+        unsafe { agent_of_empires::acp::client::discovery::export_daemon_url(url) };
     }
     agent_of_empires::acp::client::daemon_manager::set_autostart_disabled(cli.no_autostart);
     seed_cityhall_env(&cli);
@@ -145,13 +156,19 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
         ProcessContext::OneShotCli
     };
 
-    // One-shot CLI runs get no subscriber unless `AOE_LOG_LEVEL` is set.
+    // `should_init` also decides which config warnings stay on stderr (see `run`).
     let should_init = matches!(
         ctx,
         ProcessContext::Tui | ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
     ) || env_filter.is_some();
+    // One-shot commands log to the file too, but never create the app dir
+    // (`aoe completion`, `aoe init` on read-only installs).
+    let init_sink = should_init
+        || (ctx == ProcessContext::OneShotCli
+            && !skips_cli_sink(&cli)
+            && agent_of_empires::session::app_dir_exists());
 
-    let (init, log_path_for_msg) = if should_init {
+    let (init, log_path_for_msg) = if init_sink {
         let filter = env_filter
             .clone()
             .or_else(logging::load_persisted_filter)
@@ -188,6 +205,7 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
                     filter,
                     log_cfg.show_spans,
                     session_tee,
+                    ctx != ProcessContext::OneShotCli,
                 );
                 if let Some(w) = resolution.warning {
                     tracing::warn!(target: "log.runtime", "{}", w);
@@ -312,7 +330,7 @@ async fn run(
         cli.command,
         Some(Commands::Settings { .. }) | Some(Commands::Mcp { .. })
     ) {
-        run_startup_migrations(command_name, is_daemon_child, None)?;
+        run_startup_migrations(command_name, is_daemon_child, None).await?;
     }
 
     // Skipped for the detached daemon child so `aoe serve --daemon` counts once.
@@ -384,7 +402,7 @@ async fn run(
     };
 
     if cli.command.is_some() {
-        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref())?;
+        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref()).await?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
@@ -461,7 +479,7 @@ async fn run(
 /// the parent on `.schema_version` and, for the one that writes the launch
 /// record, wait on the very lock the parent holds. Verify the schema instead
 /// of migrating, and fail closed.
-fn run_startup_migrations(
+async fn run_startup_migrations(
     command_name: Option<&str>,
     is_daemon_child: bool,
     startup: Option<&cli::serve::ServeStartup>,
@@ -472,7 +490,10 @@ fn run_startup_migrations(
     let reporter = command_name.is_some().then(cli::migrate::stderr_reporter);
     match startup {
         Some(startup) => startup.run_migrations(reporter),
-        None => migrations::run_migrations_with(reporter),
+        None => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+            cli::migrate::run_offering_restart(reporter, interactive).await
+        }
     }
 }
 /// Every command above exits from inside its own handler, so completing one

@@ -602,23 +602,31 @@ pub async fn perform_update(
     on_progress: Option<&mut dyn FnMut(u64, Option<u64>)>,
 ) -> Result<()> {
     match method {
-        InstallMethod::Homebrew => update_via_brew(version),
+        InstallMethod::Homebrew => update_via_brew(version)?,
         InstallMethod::Tarball { binary_path } => {
-            update_via_tarball(binary_path, version, on_progress).await
+            update_via_tarball(binary_path, version, on_progress).await?
         }
         InstallMethod::Nix => {
             print_nix_refusal();
-            Ok(())
+            return Ok(());
         }
         InstallMethod::Cargo => {
             print_cargo_refusal();
-            Ok(())
+            return Ok(());
         }
         InstallMethod::Unknown { binary_path } => {
             print_unknown_refusal(binary_path);
-            Ok(())
+            return Ok(());
         }
     }
+    tracing::info!(
+        target: "update",
+        from = env!("CARGO_PKG_VERSION"),
+        to = version,
+        method = ?method,
+        "update installed"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

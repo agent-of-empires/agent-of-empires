@@ -36,6 +36,7 @@ pub mod task_transcript;
 pub mod terminal_handler;
 pub mod transcript;
 pub mod version_probe;
+pub mod workflow_journal;
 
 pub use agent_registry::{
     display_name_for, inherited_acp_base, pick_acp_agent_name, pinned_model_for_tool,

@@ -201,12 +201,12 @@ fn observe_worktree_move(repo_path: &Path, from: &Path, to: &Path) -> TimedMutat
 }
 
 impl GitWorktree {
-    fn relock(&self, to: &Path) {
-        if let Err(e) = self.lock_worktree(to) {
+    fn relock(&self, path: &Path) {
+        if let Err(e) = self.lock_worktree(path) {
             tracing::warn!(target: "git.worktree",
-                to = %to.display(),
+                path = %path.display(),
                 error = %e,
-                "move_worktree: could not re-lock worktree at new path"
+                "move_worktree: could not re-lock worktree"
             );
         }
     }
@@ -254,7 +254,11 @@ impl GitWorktree {
         });
         let restore_pointer = || {
             if let Some(original) = &original_pointer {
-                let _ = std::fs::write(from.join(".git"), original);
+                if let Err(error) = std::fs::write(from.join(".git"), original) {
+                    tracing::warn!(target: "git.worktree", path = %from.display(), %error,
+                        "could not restore original .git pointer"
+                    );
+                }
             }
         };
         let moved = run_git_with_timeout(
@@ -275,14 +279,14 @@ impl GitWorktree {
                         && matches!(to.try_exists(), Ok(false)) =>
                 {
                     restore_pointer();
-                    let _ = self.lock_worktree(from);
+                    self.relock(from);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s without moving"
                     )));
                 }
                 TimedMutationOutcome::Unchanged | TimedMutationOutcome::Indeterminate => {
-                    let _ = self.lock_worktree(from);
-                    let _ = self.lock_worktree(to);
+                    self.relock(from);
+                    self.relock(to);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s and its final location is indeterminate"
                     )));
@@ -298,7 +302,7 @@ impl GitWorktree {
                 }
             }
             restore_pointer();
-            let _ = self.lock_worktree(from);
+            self.relock(from);
             return Err(error);
         }
         self.relock(to);
@@ -322,14 +326,14 @@ impl GitWorktree {
             Ok(checkouts) => checkouts,
             Err(e) => {
                 // `move_worktree`'s backstop has already unlocked the source.
-                let _ = self.lock_worktree(from);
+                self.relock(from);
                 return Err(e);
             }
         };
         self.unlock_worktree(from);
 
         if let Err(e) = std::fs::rename(from, to) {
-            let _ = self.lock_worktree(from);
+            self.relock(from);
             return Err(e.into());
         }
         let mut problems = Vec::new();
@@ -346,8 +350,12 @@ impl GitWorktree {
                     repair_command(to)
                 ));
             } else {
-                let _ = self.repair_worktree(from);
-                let _ = self.lock_worktree(from);
+                if let Err(error) = self.repair_worktree(from) {
+                    tracing::warn!(target: "git.worktree", from = %from.display(), %error,
+                        "move_worktree: could not repair worktree after rollback"
+                    );
+                }
+                self.relock(from);
                 return Err(e);
             }
         }

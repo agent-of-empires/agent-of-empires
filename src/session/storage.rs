@@ -1287,13 +1287,17 @@ pub(crate) trait SessionStore: Send + Sync {
     ) where
         Self: Sized + 'static,
     {
-        let _ = std::thread::Builder::new()
+        let session = id.clone();
+        if let Err(error) = std::thread::Builder::new()
             .name("aoe-lifecycle-reservation-release".into())
             .spawn(move || {
                 if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
                     tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
                 }
-            });
+            })
+        {
+            tracing::error!(target: "session.lifecycle", session = %session, %error, "could not spawn reservation-release thread");
+        }
     }
     fn managed_capture_store_is_exclusive(
         &self,

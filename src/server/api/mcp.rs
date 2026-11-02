@@ -134,6 +134,7 @@ pub async fn resolve_mcp_conflict(
 
     let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
+    let (agent, winner_label, server) = (body.agent.clone(), body.winner.clone(), name.clone());
     let result = tokio::task::spawn_blocking(move || {
         // Re-resolve the current conflicts and find the one for `name`; the
         // fingerprint guard in resolve_conflict rejects a stale resolution.
@@ -159,6 +160,7 @@ pub async fn resolve_mcp_conflict(
 
     match result {
         Ok(Ok(mcp_state::ResolveStatus::Applied)) => {
+            tracing::info!(target: "http.api", name = %server, %agent, winner = %winner_label, "mcp server resolved");
             Json(serde_json::json!({"status": "applied"})).into_response()
         }
         Ok(Ok(mcp_state::ResolveStatus::Stale)) => (
@@ -192,10 +194,14 @@ pub async fn keep_mcp_server(
     let Ok(Json(body)) = body else {
         return bad_body();
     };
+    let (agent, server) = (body.agent.clone(), name.clone());
     let result =
         tokio::task::spawn_blocking(move || mcp_state::keep_removed(&body.agent, &name)).await;
     match result {
-        Ok(Ok(true)) => Json(serde_json::json!({"status": "kept"})).into_response(),
+        Ok(Ok(true)) => {
+            tracing::info!(target: "http.api", name = %server, %agent, "mcp server kept");
+            Json(serde_json::json!({"status": "kept"})).into_response()
+        }
         Ok(Ok(false)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"status": "not_found"})),
@@ -222,10 +228,14 @@ pub async fn drop_mcp_server(
     let Ok(Json(body)) = body else {
         return bad_body();
     };
+    let (agent, server) = (body.agent.clone(), name.clone());
     let result =
         tokio::task::spawn_blocking(move || mcp_state::forget_native(&body.agent, &name)).await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({"status": "dropped"})).into_response(),
+        Ok(Ok(())) => {
+            tracing::info!(target: "http.api", name = %server, %agent, "mcp server dropped");
+            Json(serde_json::json!({"status": "dropped"})).into_response()
+        }
         _ => internal_error(),
     }
 }
@@ -305,12 +315,16 @@ pub async fn create_mcp_server(
     let Ok(Json(body)) = body else {
         return bad_json();
     };
+    let name = body.name.clone();
     match run_write(&state, move || {
         mcp_overrides::create_global_server(&body.name, &body.input)
     })
     .await
     {
-        Ok(server) => (StatusCode::CREATED, Json(redacted_global(server))).into_response(),
+        Ok(server) => {
+            tracing::info!(target: "http.api", %name, scope = "global", "mcp server created");
+            (StatusCode::CREATED, Json(redacted_global(server))).into_response()
+        }
         Err(e) => write_error(e),
     }
 }
@@ -326,12 +340,16 @@ pub async fn edit_mcp_server(
     let Ok(Json(input)) = body else {
         return bad_json();
     };
+    let server = name.clone();
     match run_write(&state, move || {
         mcp_overrides::update_global_server(&name, &input)
     })
     .await
     {
-        Ok(server) => Json(redacted_global(server)).into_response(),
+        Ok(server_def) => {
+            tracing::info!(target: "http.api", name = %server, scope = "global", "mcp server edited");
+            Json(redacted_global(server_def)).into_response()
+        }
         Err(e) => write_error(e),
     }
 }
@@ -342,8 +360,12 @@ pub async fn delete_mcp_server(
     _guard: ElevatedMutationGuard,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let server = name.clone();
     match run_write(&state, move || mcp_overrides::delete_global_server(&name)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            tracing::info!(target: "http.api", name = %server, scope = "global", "mcp server removed");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => write_error(e),
     }
 }
