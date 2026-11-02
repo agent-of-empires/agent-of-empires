@@ -19,7 +19,8 @@ use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
     background_agent_launched_from_value, background_command_launched_from_value,
-    background_task_started_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_task_started_from_value, background_task_stopped_from_value, monitor_event_from_raw,
+    wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -481,6 +482,7 @@ pub(super) fn map_update_to_events(
                         if profile.supports_wakeup_tools {
                             events.extend(background_command_launched_from_value(&payload));
                             events.extend(background_task_started_from_value(&payload));
+                            events.extend(background_task_stopped_from_value(&payload));
                         }
                         events.push(Event::RawAgentUpdate { payload });
                     }
