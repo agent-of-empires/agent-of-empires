@@ -8,7 +8,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
 use super::project_mcp::{
@@ -338,6 +338,7 @@ fn read_native(
                 let disabled = cwd
                     .and_then(Path::to_str)
                     .and_then(|cwd| f.projects.get(cwd))
+                    .and_then(Option::as_ref)
                     .map(|project| project.disabled_mcp_servers.iter().cloned().collect())
                     .unwrap_or_default();
                 (f.mcp_servers, disabled)
@@ -469,14 +470,20 @@ struct ClaudeConfigFile {
     #[serde(default)]
     mcp_servers: BTreeMap<String, StandardRawServer>,
     #[serde(default)]
-    projects: BTreeMap<String, ClaudeProject>,
+    projects: BTreeMap<String, Option<ClaudeProject>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeProject {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_names")]
     disabled_mcp_servers: Vec<String>,
+}
+
+/// Another project's malformed list must not drop every server definition.
+fn lenient_names<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1002,6 +1009,30 @@ enabled = true
             assert!(view.conflicts.is_empty(), "re-enabling must not conflict");
             assert!(!view.drift_paused);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_malformed_project_state_keeps_servers_forwarding() {
+        let (home, _env) = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write(
+            home.path(),
+            ".claude.json",
+            &format!(
+                r#"{{ "mcpServers": {{ "fs": {{ "command": "mcp-fs" }}, "pagerduty": {{ "command": "pd" }} }},
+                    "projects": {{
+                        "/a": {{ "disabledMcpServers": null }},
+                        "/b": {{ "disabledMcpServers": "pagerduty" }},
+                        "/c": null,
+                        {cwd:?}: {{ "disabledMcpServers": ["pagerduty"] }}
+                    }} }}"#
+            ),
+        );
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(resolved_names(&view.effective), ["fs"]);
+        assert!(!view.drift_paused);
     }
 
     #[test]
