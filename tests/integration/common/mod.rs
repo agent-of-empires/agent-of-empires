@@ -306,7 +306,7 @@ async fn bootstrap_runner(
     };
 
     let stream = &mut stream;
-    expect_frame(stream, deadline, &mut exited, "Hello", |frame| {
+    expect_frame(stream, deadline, &mut exited, "Hello", false, |frame| {
         matches!(frame, ControlBody::Hello { .. })
     })
     .await?;
@@ -328,9 +328,14 @@ async fn bootstrap_runner(
         },
     )
     .await?;
-    expect_frame(stream, deadline, &mut exited, "Initialized", |frame| {
-        matches!(frame, ControlBody::Initialized { .. })
-    })
+    expect_frame(
+        stream,
+        deadline,
+        &mut exited,
+        "Initialized",
+        true,
+        |frame| matches!(frame, ControlBody::Initialized { .. }),
+    )
     .await?;
     send_frame(
         stream,
@@ -342,9 +347,14 @@ async fn bootstrap_runner(
         },
     )
     .await?;
-    expect_frame(stream, deadline, &mut exited, "SessionReady", |frame| {
-        matches!(frame, ControlBody::SessionReady { .. })
-    })
+    expect_frame(
+        stream,
+        deadline,
+        &mut exited,
+        "SessionReady",
+        true,
+        |frame| matches!(frame, ControlBody::SessionReady { .. }),
+    )
     .await
 }
 
@@ -363,13 +373,14 @@ async fn send_frame(
     }
 }
 
-/// Reads frames until `wanted` matches, skipping notifications.
+/// Reads frames until `wanted` matches, skipping notifications if `skip_notify`.
 #[cfg(debug_assertions)]
 async fn expect_frame(
     stream: &mut tokio::net::UnixStream,
     deadline: tokio::time::Instant,
     exited: &mut impl FnMut() -> Option<String>,
     stage: &str,
+    skip_notify: bool,
     wanted: impl Fn(&agent_of_empires::acp::control_protocol::ControlBody) -> bool,
 ) -> Result<(), String> {
     use agent_of_empires::acp::control_protocol::{self, ControlBody};
@@ -379,7 +390,7 @@ async fn expect_frame(
             Err(_) => return Err(format!("timed out waiting for {stage}")),
             Ok(Err(error)) => format!("{error:#}"),
             Ok(Ok(Some(frame))) if wanted(&frame) => return Ok(()),
-            Ok(Ok(Some(ControlBody::Notify { .. }))) => continue,
+            Ok(Ok(Some(ControlBody::Notify { .. }))) if skip_notify => continue,
             Ok(Ok(frame)) => format!("{frame:?}"),
         };
         let runner = exited().unwrap_or_else(|| "still running".into());
@@ -445,6 +456,7 @@ mod tests {
         let mut script = match peer {
             Peer::Stalls => return std::future::pending().await,
             Peer::OpensWith(frame) => vec![(0, frame)],
+            // (frames to read first, frame to send)
             Peer::Completes => vec![
                 (0, hello),
                 (2, notify.clone()),
@@ -464,7 +476,6 @@ mod tests {
                 ),
             ],
         };
-        // (frames to read first, frame to send)
         for (reads, frame) in script.drain(..) {
             for _ in 0..reads {
                 control_protocol::read_frame(&mut stream)
@@ -546,6 +557,15 @@ mod tests {
                 })),
                 Duration::from_secs(10),
                 "expected Hello, got Some(Initialized",
+            ),
+            // A runner says Hello before anything else, notifications included.
+            (
+                Some(Peer::OpensWith(ControlBody::Notify {
+                    method: "session/update".into(),
+                    params: serde_json::json!({}),
+                })),
+                Duration::from_secs(10),
+                "expected Hello, got Some(Notify",
             ),
         ];
         for (peer, within, want) in cases {
