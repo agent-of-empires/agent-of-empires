@@ -294,18 +294,17 @@ impl HttpClient {
     pub(crate) async fn replay_retained_paged(
         &self,
         session_id: &str,
-        since: u64,
         page_size: u64,
     ) -> Result<RetainedReplay, HttpError> {
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        let mut last_seen = since;
-        let mut snapshot_highest = since;
+        let mut last_seen = 0;
+        let mut snapshot_highest = 0;
         let mut incomplete = false;
         let mut coverage: Vec<(u64, u64)> = Vec::new();
         let (_, _, reported_lost) = self
             .replay_pages(
                 session_id,
-                since,
+                0,
                 page_size,
                 ReplayKind::Retained,
                 |page, cap| {
@@ -1434,7 +1433,7 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 8] {
-            let snapshot = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let snapshot = client.replay_retained_paged(&id, size).await.unwrap();
             let rows = snapshot.transcript.rows;
             assert!(!snapshot.incomplete);
             let messages: Vec<_> = rows
@@ -1540,7 +1539,7 @@ mod tests {
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let first = client.replay_retained_paged(&id, 0, 2).await.unwrap();
+        let first = client.replay_retained_paged(&id, 2).await.unwrap();
         assert!(appended.load(Ordering::SeqCst));
         assert_eq!(first.highest_seq, 3);
         assert!(!first.incomplete);
@@ -1555,7 +1554,7 @@ mod tests {
             .iter()
             .any(|row| row.text.contains("retained-4")));
         assert_eq!(client.replay(&id, u64::MAX).await.unwrap().highest_seq, 4);
-        let next = client.replay_retained_paged(&id, 0, 2).await.unwrap();
+        let next = client.replay_retained_paged(&id, 2).await.unwrap();
         assert_eq!(next.highest_seq, 4);
         assert!(next
             .transcript
@@ -1627,7 +1626,7 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 10] {
-            let replay = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let replay = client.replay_retained_paged(&id, size).await.unwrap();
             let rows = replay.transcript.rows;
             assert!(replay.incomplete, "page size {size}");
             assert_eq!(

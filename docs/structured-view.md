@@ -174,28 +174,15 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
-Painting and copying use the same wrapped document. Scrolling reuses it instead
-of rebuilding the full history. Resizing or changing the theme clears the
-previous text selection.
+The reader refreshes available content automatically and preserves focus and
+scroll position. Read failures keep the last loaded content visible with an
+error. Content, size, or theme changes clear the previous text selection.
+Reopen the reader after in-place edits to already retained events.
 
-While selected, the reader checks the highest persisted ACP sequence every two
-seconds and reloads when it changes. It also rereads incomplete histories to
-acquire events committed out of order. An identical incomplete replay backs off
-further full reads for 30 seconds. An identical reread leaves text selections
-intact. Changed snapshots preserve reader focus and scroll offset, and
-clear old selections. Read failures keep the last loaded content visible with
-an error. For in-place event edits, reopen the reader.
+Dialogs close when their target session changes or disappears. Restore and
+permanent deletion always apply to the session confirmed, not a later selection.
 
-Rename and workdir dialogs, quick permission replies, and pending Trash
-confirmations close if their session changes lifecycle or disappears. A pending
-dialog cannot retarget another session when the list updates.
-
-A Trash permanent-delete confirmation keeps its original session and Trash
-identity. Selection or lifecycle changes cancel it. A purge already queued
-still carries that original consent, so a concurrent restore cannot silently
-turn it into an ordinary session purge.
-
-The reader folds persisted ACP events across all retained pages, including events
+The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges
 trigger a global incomplete-history warning, even when no readable transcript
 rows remain. The reader does not import native agent history files: their formats

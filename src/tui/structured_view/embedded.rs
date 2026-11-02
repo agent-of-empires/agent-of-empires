@@ -52,6 +52,8 @@ pub struct RetainedView {
     session_id: String,
     source_profile: String,
     generation: u64,
+    session_info: crate::acp::session_paths::SessionViewInfo,
+    rediscover: bool,
     state: Option<StructuredViewState>,
     unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
     text_cache: Option<RetainedTextCache>,
@@ -75,6 +77,29 @@ impl RetainedView {
             session_id: inst.id.clone(),
             source_profile: inst.source_profile.clone(),
             generation: inst.lifecycle_generation,
+            session_info: crate::acp::session_paths::SessionViewInfo {
+                title: inst.title.clone(),
+                tool: inst.tool.clone(),
+                acp_agent: inst.agent_name.clone().filter(|name| !name.is_empty()),
+                paths: crate::acp::session_paths::SessionPathRoots {
+                    id: inst.id.clone(),
+                    project_path: inst.project_path.clone(),
+                    main_repo_path: inst
+                        .worktree_info
+                        .as_ref()
+                        .map(|info| info.main_repo_path.clone()),
+                    workspace_repos: inst
+                        .workspace_info
+                        .iter()
+                        .flat_map(|info| &info.repos)
+                        .map(|repo| crate::acp::session_paths::WorkspaceRepoRoot {
+                            name: repo.name.clone(),
+                            source_path: repo.source_path.clone(),
+                        })
+                        .collect(),
+                },
+            },
+            rediscover: true,
             state: None,
             unfinished_outputs: Vec::new(),
             text_cache: None,
@@ -90,24 +115,45 @@ impl RetainedView {
         let Some(endpoint) = endpoint else {
             return view;
         };
-        let http = match crate::acp::client::HttpClient::new(endpoint.clone()) {
-            Ok(http) => http,
-            Err(error) => {
-                view.message = format!("Transcript read failed: {error}");
-                return view;
-            }
-        };
-        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-        state.transcript.session_title = Some(inst.title.clone());
-        view.state = Some(state);
+        if let Err(error) = view.connect(endpoint) {
+            view.message = format!("Transcript read failed: {error}");
+            return view;
+        }
         view.message = "Loading retained ACP transcript…".into();
         view.start_read();
         view
     }
 
-    fn start_read(&mut self) {
+    fn connect(&mut self, endpoint: DaemonEndpoint) -> Result<()> {
+        let http = crate::acp::client::HttpClient::new(endpoint.clone())?;
+        if let Some(state) = self.state.as_mut() {
+            state.endpoint = endpoint;
+            state.http = http;
+        } else {
+            let mut state = StructuredViewState::new(self.session_id.clone(), endpoint, http, None);
+            super::apply_session_info(&mut state, self.session_info.clone());
+            self.state = Some(state);
+        }
+        self.known_highest = None;
+        self.rediscover = false;
+        Ok(())
+    }
+
+    fn start_read(&mut self) -> bool {
+        self.next_read = Instant::now() + RETAINED_REFRESH_INTERVAL;
+        if self.rediscover {
+            let connected = crate::acp::client::discover()
+                .map_err(anyhow::Error::from)
+                .and_then(|endpoint| self.connect(endpoint));
+            if let Err(error) = connected {
+                let message = format!("Transcript read failed: {error}");
+                let changed = self.message != message;
+                self.message = message;
+                return changed;
+            }
+        }
         let Some(state) = self.state.as_ref() else {
-            return;
+            return false;
         };
         let http = state.http.clone();
         let id = self.session_id.clone();
@@ -125,12 +171,13 @@ impl RetainedView {
                         return Ok(None);
                     }
                 }
-                http.replay_retained_paged(&id, 0, 1000).await.map(Some)
+                http.replay_retained_paged(&id, 1000).await.map(Some)
             }
             .await
             .map_err(|error: crate::acp::client::HttpError| error.to_string());
             let _ = tx.send(read);
         }));
+        false
     }
 
     pub fn matches(&self, inst: &crate::session::Instance) -> bool {
@@ -142,8 +189,8 @@ impl RetainedView {
 
     pub fn tick(&mut self) -> bool {
         if self.load.is_none() {
-            if self.state.is_some() && Instant::now() >= self.next_read {
-                self.start_read();
+            if Instant::now() >= self.next_read {
+                return self.start_read();
             }
             return false;
         }
@@ -195,6 +242,7 @@ impl RetainedView {
             Ok(None) => return false,
             Err(error) => {
                 self.known_highest = None;
+                self.rediscover = true;
                 let message = format!("Transcript read failed: {error}");
                 let changed = self.message != message;
                 self.message = message;
@@ -565,6 +613,132 @@ mod retained_tests {
     fn prepared_text(view: &mut RetainedView, width: u16) -> &ratatui::text::Text<'static> {
         view.prepare_text(width, &Theme::default());
         view.rendered_text(width).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_reader_recovers_initialization_and_uses_feed_path_roots() {
+        use crate::acp::state::{DiffPreview, Event, ToolCall};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _discovery = crate::session::test_support::EnvGuard::unset(&[
+            "AOE_DAEMON_URL",
+            "AOE_DAEMON_TOKEN",
+            "AOE_DAEMON_PASSPHRASE",
+        ]);
+        let mut inst = crate::session::Instance::new("retained paths", "/repo");
+        inst.trash();
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        state
+            .acp_event_store
+            .record(
+                &inst.id,
+                1,
+                &Event::ToolCallStarted {
+                    tool_call: ToolCall {
+                        id: "edit".into(),
+                        name: "Edit".into(),
+                        kind: "edit".into(),
+                        args_preview: "{}".into(),
+                        started_at: at,
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: vec![DiffPreview {
+                            path: "/repo/src/test.rs".into(),
+                            old_text: Some("before".into()),
+                            new_text: Some("after".into()),
+                            created_at: at,
+                        }],
+                    },
+                },
+            )
+            .unwrap();
+        state
+            .acp_event_store
+            .record(
+                &inst.id,
+                2,
+                &Event::ToolCallCompleted {
+                    tool_call_id: "edit".into(),
+                    is_error: false,
+                    content: "READ-ONLY-CONTENT".into(),
+                    output: Vec::new(),
+                    completed_at: at,
+                    async_subagent: false,
+                },
+            )
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for endpoint in [
+            Some(DaemonEndpoint::new(
+                url.clone(),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            )),
+            None,
+            Some(DaemonEndpoint::new(
+                "not a URL".into(),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            )),
+        ] {
+            let mut view = RetainedView::new(endpoint, &inst);
+            if view.load.is_none() {
+                view.tick();
+                assert!(view.load.is_none());
+                assert!(view.next_read > Instant::now());
+                assert!(
+                    !view.tick(),
+                    "discovery failure must respect the retry deadline"
+                );
+            }
+            let _endpoint =
+                crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &url)]);
+            if view.load.is_none() {
+                view.next_read = Instant::now();
+                view.tick();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                view.load
+                    .as_mut()
+                    .expect("reader must retry without remount"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(view.tick());
+            let copied = prepared_text(&mut view, 80).to_string();
+            assert!(copied.contains("Before: src/test.rs"), "{copied}");
+            assert!(copied.contains("After: src/test.rs"), "{copied}");
+            assert!(!copied.contains("/repo/"), "{copied}");
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    view.render(frame, frame.area(), &Theme::default(), usize::MAX, true);
+                })
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(painted.contains("Before: src/test.rs"), "{painted}");
+            assert!(!painted.contains("/repo/"), "{painted}");
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -1310,10 +1484,17 @@ mod retained_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn retained_refresh_preserves_content_on_failure_and_replaces_reset_history() {
         use crate::acp::state::Event;
         use axum::{middleware, response::IntoResponse};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _discovery = crate::session::test_support::EnvGuard::unset(&[
+            "AOE_DAEMON_URL",
+            "AOE_DAEMON_TOKEN",
+            "AOE_DAEMON_PASSPHRASE",
+        ]);
         let inst = crate::session::Instance::new("refresh transitions", "/tmp");
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
@@ -1355,6 +1536,9 @@ mod retained_tests {
             None,
             crate::acp::client::discovery::Source::Env,
         );
+        let _endpoint =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &endpoint.base_url)]);
+        let replacement_app = app.clone();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut view = RetainedView::new(Some(endpoint), &inst);
         async fn finish(view: &mut RetainedView) -> bool {
@@ -1394,12 +1578,38 @@ mod retained_tests {
             "identical failure must not redraw"
         );
         failing.store(false, Ordering::SeqCst);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replacement_url = format!("http://{}", listener.local_addr().unwrap());
+        let _replacement =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &replacement_url)]);
+        let replacement = tokio::spawn(async move {
+            axum::serve(listener, replacement_app).await.unwrap();
+        });
+        server.abort();
+        let _ = server.await;
+        state.acp_event_store.delete_session(&id);
+        for seq in 1..=2 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: "REPLACEMENT-CONTENT\n\n".into(),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
         assert!(
             refresh(&mut view).await,
             "recovery at unchanged watermark must reload"
         );
         assert!(!view.message.contains("failed"));
         assert!(prepared_text(&mut view, 80)
+            .to_string()
+            .contains("REPLACEMENT-CONTENT"));
+        assert!(!prepared_text(&mut view, 80)
             .to_string()
             .contains("KEEP-ON-ERROR"));
         state.acp_event_store.delete_session(&id);
@@ -1461,8 +1671,8 @@ mod retained_tests {
             .to_string()
             .contains("BACKFILLED"));
         assert!(!view.message.contains("incomplete"));
-        server.abort();
-        let _ = server.await;
+        replacement.abort();
+        let _ = replacement.await;
     }
 
     #[tokio::test]
