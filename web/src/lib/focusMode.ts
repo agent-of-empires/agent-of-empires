@@ -25,16 +25,32 @@ export function focusNavigation(focusSessionId: string | null, sessionId?: strin
   return sessionId === focusSessionId ? "none" : "new-window";
 }
 
-/** The focus session a URL names (`/session/<id>?focus=1`, optional trailing slash), or null. `public/sw.js`
- *  `focusSessionOf` reads client URLs the same way. */
+/** The focus session a URL names (`/session/<id>?focus=1`), or null. The path is read exactly as the router's
+ *  `useMatch("/session/:sessionId")` reads it (case-insensitive, trailing slashes, percent-decoded segments), so the
+ *  document and the route always agree on the mode. `public/sw.js` `focusSessionOf` reads client URLs the same way. */
 export function focusSessionOfUrl(url: string): string | null {
+  let parsed: URL;
   try {
-    const parsed = new URL(url, "http://aoe.invalid");
-    const match = /^\/session\/([^/]+)\/?$/.exec(parsed.pathname);
-    return match && parsed.searchParams.get("focus") === "1" ? decodeURIComponent(match[1]!) : null;
+    parsed = new URL(url, "http://aoe.invalid");
   } catch {
     return null;
   }
+  return parsed.searchParams.get("focus") === "1" ? routedSessionOfPath(parsed.pathname) : null;
+}
+
+/** The `sessionId` param react-router 7 matches in `pathname` for `/session/:sessionId`, or null. */
+function routedSessionOfPath(pathname: string): string | null {
+  let decoded: string;
+  try {
+    decoded = pathname
+      .split("/")
+      .map((segment) => decodeURIComponent(segment).replace(/\//g, "%2F"))
+      .join("/");
+  } catch {
+    decoded = pathname;
+  }
+  const match = /^\/session\/([^/]+)\/*$/i.exec(decoded);
+  return match ? match[1]!.replace(/%2F/g, "/") : null;
 }
 
 /** The name a focus window shows for its session, in its tab title, note and gone screen. */

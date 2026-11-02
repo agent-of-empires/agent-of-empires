@@ -170,6 +170,7 @@ describe("service worker notification click with focus-mode windows", () => {
   it.each<[string, string[], number | "open"]>([
     ["focuses the focus window already showing the session", ["/session/s2?focus=1", "/session/s1?focus=1"], 1],
     ["focuses it through a trailing slash too", ["/session/s2/?focus=1", "/session/s1/?focus=1"], 1],
+    ["focuses it through a mixed-case path, as the app routes it", ["/session/s2?focus=1", "/Session/s1?focus=1"], 1],
     ["navigates a regular window, never another session's focus window", ["/session/s2?focus=1", "/"], 1],
     ["opens a window when only other focus windows exist", ["/session/s2?focus=1"], "open"],
   ])("%s", async (_label, paths, expected) => {

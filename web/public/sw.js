@@ -55,15 +55,30 @@ function recordSeq(tag, seq) {
 }
 
 // The session a focus-mode window is limited to (`/session/<id>?focus=1`), or null for a regular window. `client.url`
-// is the URL the document loaded with, so entering and leaving focus mode must load a new document.
+// is the URL the document loaded with, so entering and leaving focus mode must load a new document. Mirrors
+// `focusSessionOfUrl` in `src/lib/focusMode.ts`, which reads the path as the app's router does.
 function focusSessionOf(client) {
+  let url;
   try {
-    const url = new URL(client.url);
-    const match = /^\/session\/([^/]+)\/?$/.exec(url.pathname);
-    return match && url.searchParams.get("focus") === "1" ? decodeURIComponent(match[1]) : null;
+    url = new URL(client.url);
   } catch {
     return null;
   }
+  return url.searchParams.get("focus") === "1" ? routedSessionOfPath(url.pathname) : null;
+}
+
+function routedSessionOfPath(pathname) {
+  let decoded;
+  try {
+    decoded = pathname
+      .split("/")
+      .map((segment) => decodeURIComponent(segment).replace(/\//g, "%2F"))
+      .join("/");
+  } catch {
+    decoded = pathname;
+  }
+  const match = /^\/session\/([^/]+)\/*$/i.exec(decoded);
+  return match ? match[1].replace(/%2F/g, "/") : null;
 }
 
 function sessionOfUrl(target) {

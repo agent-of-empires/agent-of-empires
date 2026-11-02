@@ -145,25 +145,46 @@ test("a focus window opens other sessions, plugin pages and settings beside it a
   await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
 });
 
-test("a link into focus mode from a regular window reloads it, so the service worker sees the change", async ({
-  page,
-}) => {
+/** Counts the documents this page loads, so a test can tell one reload from a reload loop. */
+function countLoads(page: Page): () => number {
+  let loads = 0;
+  page.on("load", () => loads++);
+  return () => loads;
+}
+
+for (const href of ["/session/s-1?focus=1", "/Session/s-1?focus=1"]) {
+  test(`a link to ${href} from a regular window reloads it once, so the service worker sees the change`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await installSidebarMocks(page, { sessions: SESSIONS });
+    const link = { plugin_id: "acme.kit", slot: "header-start", id: "focus", payload: { text: "acme: focus", href } };
+    await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: [link], notifications: [] } }));
+    const loads = countLoads(page);
+    await page.goto("/session/s-1");
+    await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
+
+    await page.getByRole("link", { name: "acme: focus", exact: true }).click();
+    await expect(page).toHaveURL(href);
+    await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
+    await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
+    // The router reads the path case-insensitively; the document must agree, or it reloads forever.
+    await page.waitForTimeout(500);
+    expect(loads()).toBe(2);
+  });
+}
+
+test("a focus window loaded at a mixed-case path stays put", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await installSidebarMocks(page, { sessions: SESSIONS });
-  const link = {
-    plugin_id: "acme.kit",
-    slot: "header-start",
-    id: "focus",
-    payload: { text: "acme: focus", href: "/session/s-1?focus=1" },
-  };
-  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: [link], notifications: [] } }));
-  await page.goto("/session/s-1");
-  await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
-
-  await page.getByRole("link", { name: "acme: focus", exact: true }).click();
-  await expect(page).toHaveURL("/session/s-1?focus=1");
+  const loads = countLoads(page);
+  await page.goto("/Session/s-1/?focus=1");
   await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
+  await expect(page.locator(SIDEBAR)).toHaveCount(0);
   await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
+  await page.waitForTimeout(500);
+  expect(loads()).toBe(1);
+  await expect(page).toHaveURL("/Session/s-1/?focus=1");
 });
 
 for (const [how, expected] of [

@@ -85,6 +85,14 @@ describe("useFocusMode", () => {
     expect(replace).not.toHaveBeenCalled();
   });
 
+  it.each([["/Session/s1?focus=1"], ["/session/s1//?focus=1"], ["/session/a%2Fb?focus=1"], ["/session/%ZZ?focus=1"]])(
+    "keeps a document loaded at %s, which the router also routes, without reloading it",
+    (url) => {
+      expect(setup(url).result.current.focus.focusSessionId).not.toBeNull();
+      expect(replace).not.toHaveBeenCalled();
+    },
+  );
+
   it("reloads a document whose load URL and route disagree from the start", () => {
     setup("/session/s1?focus=1", "/session/s1");
     expect(replace).toHaveBeenCalledWith("/session/s1?focus=1");

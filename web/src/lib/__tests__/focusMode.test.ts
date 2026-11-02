@@ -25,6 +25,11 @@ describe("focusSessionOfUrl", () => {
     ["https://aoe.test/session/s1?focus=0", null],
     ["https://aoe.test/session/s1/diff?focus=1", null],
     ["https://aoe.test/settings?focus=1", null],
+    // Paths the router's `useMatch("/session/:sessionId")` also accepts.
+    ["https://aoe.test/Session/S1?focus=1", "S1"],
+    ["https://aoe.test/SESSION/s1//?focus=1", "s1"],
+    ["https://aoe.test/session/a%2Fb?focus=1", "a/b"],
+    ["https://aoe.test/session/%ZZ?focus=1", "%ZZ"],
   ])("reads %s as %s", (url, expected) => {
     expect(focusSessionOfUrl(url)).toBe(expected);
   });
