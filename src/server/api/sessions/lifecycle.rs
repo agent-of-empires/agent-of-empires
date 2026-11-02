@@ -603,7 +603,8 @@ pub async fn trash_session(
             if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
                 return Err(crate::session::LifecycleReservationError::Superseded.into());
             }
-            if row.is_trashed() {
+            let retrying = row.is_trashed();
+            if retrying {
                 if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
@@ -615,9 +616,9 @@ pub async fn trash_session(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
             row.trash();
-            Ok(Some(row.clone()))
+            Ok(Some((row.clone(), retrying)))
         })?;
-        let Some(mut instance) = instance else {
+        let Some((mut instance, retrying)) = instance else {
             return Ok((crate::session::trash::RelocateOutcome::Skipped, None));
         };
         instance.source_profile = profile;
@@ -652,7 +653,14 @@ pub async fn trash_session(
         instance.source_profile = store.storage().profile().to_owned();
         instance.file_watch = Some(worker_state.file_watch.clone());
         let outcome = match &stopped {
-            Ok(()) => crate::session::trash::prepare_trashed_worktree(&mut instance),
+            Ok(()) => {
+                let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+                if retrying && matches!(outcome, crate::session::trash::RelocateOutcome::Failed { .. }) {
+                    crate::session::trash::recover_trashed_worktree_move(&mut instance).unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
             Err(error) => crate::session::trash::RelocateOutcome::Failed { reason: format!("Tmux teardown failed; worktree retained: {error}") },
         };
         store.update(|rows, _| {
@@ -669,8 +677,13 @@ pub async fn trash_session(
             } else {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
-                if !row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation) {
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation) {
                     return Err(LifecycleTargetError::Busy.into());
+                }
+                if stopped.is_ok()
+                    && (!retrying || !matches!(outcome, crate::session::trash::RelocateOutcome::Failed { .. }))
+                {
+                    row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
                 }
                 if let Err(error) = &stopped {
                     row.status = Status::Error;
@@ -1193,6 +1206,11 @@ pub(crate) fn lifecycle_rejection(
     let (code, operation, message) = match error
         .downcast_ref::<crate::session::LifecycleReservationError>()
     {
+        Some(crate::session::LifecycleReservationError::Busy(LifecycleOperation::Trash)) => (
+            "trash_incomplete",
+            Some(LifecycleOperation::Trash),
+            "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".to_owned(),
+        ),
         Some(crate::session::LifecycleReservationError::Busy(operation)) => (
             "lifecycle_busy",
             Some(*operation),
@@ -1221,10 +1239,10 @@ pub(crate) fn lifecycle_rejection(
         }
         _ => return None,
     };
-    let header = if code == "lifecycle_superseded" {
-        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
-    } else {
-        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    let header = match code {
+        "lifecycle_superseded" => crate::daemon::ApiErrorCode::LifecycleSuperseded.header(),
+        "trash_incomplete" => crate::daemon::ApiErrorCode::TrashIncomplete.header(),
+        _ => crate::daemon::ApiErrorCode::LifecycleLocked.header(),
     };
     Some(
         (

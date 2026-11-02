@@ -278,6 +278,42 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     }
 }
 
+fn holding_matches_registered_worktree(inst: &Instance, holding: &Path, original: &Path) -> bool {
+    let Some(info) = inst.worktree_info.as_ref() else {
+        return false;
+    };
+    let Ok(holding) = holding.canonicalize() else {
+        return false;
+    };
+    let Ok(git) = GitWorktree::new(PathBuf::from(&info.main_repo_path)) else {
+        return false;
+    };
+    let Ok(entries) = git.list_worktrees() else {
+        return false;
+    };
+    let current = original.canonicalize().ok();
+    !entries
+        .iter()
+        .any(|entry| current.as_ref() == Some(&entry.path))
+        && entries.iter().any(|entry| {
+            entry.path == holding && entry.branch.as_deref() == Some(info.branch.as_str())
+        })
+}
+
+/// Recover a proven holding move while the caller owns a retried Trash transition.
+pub(crate) fn recover_trashed_worktree_move(inst: &mut Instance) -> Option<RelocateOutcome> {
+    let ReconcilePlan::PointAtHolding { holding, original } = plan_trashed_reconcile(inst) else {
+        return None;
+    };
+    inst.project_path = holding.to_string_lossy().into_owned();
+    inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+    Some(RelocateOutcome::Relocated {
+        from: original,
+        to: holding,
+        warning: None,
+    })
+}
+
 /// Stop the sandbox before moving its managed worktree into the holding area.
 /// Caller holds identity then lifecycle, owns the durable Trash reservation,
 /// and supplies the source profile. Ownership is rechecked after container stop.
@@ -291,15 +327,6 @@ pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
             session = %inst.id,
             "stopping sandbox container before trash relocation failed: {error}"
         );
-    }
-    if let ReconcilePlan::PointAtHolding { holding, original } = plan_trashed_reconcile(inst) {
-        inst.project_path = holding.to_string_lossy().into_owned();
-        inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
-        return RelocateOutcome::Relocated {
-            from: original,
-            to: holding,
-            warning: None,
-        };
     }
     relocate_worktree_to_trash(inst)
 }
@@ -592,9 +619,8 @@ fn plan_trashed_reconcile_cached(
         {
             return ReconcilePlan::Nothing;
         }
-        // Crash case: the worktree was already moved to `holding` but the marker/pointer persist
-        // was lost and something was recreated at the original path.
-        if holding.exists() {
+        // A recreated original must not hide a proven move.
+        if holding_matches_registered_worktree(inst, &holding, &original) {
             return ReconcilePlan::PointAtHolding { holding, original };
         }
         // Terminal state for a relocation that can never succeed.
@@ -618,7 +644,7 @@ fn plan_trashed_reconcile_cached(
 
     // The recorded path is gone. Heal the pointer toward wherever the worktree
     // actually landed.
-    if holding.exists() {
+    if holding_matches_registered_worktree(inst, &holding, &original) {
         return ReconcilePlan::PointAtHolding { holding, original };
     }
     if original.exists() && original != current {
@@ -1737,6 +1763,45 @@ mod tests {
             if !healed {
                 assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
             }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_and_retry_reject_unrelated_holding_checkouts() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        for collision in ["directory", "foreign_repo", "wrong_branch"] {
+            let (tmp, mut inst) = real_worktree_instance();
+            let original = PathBuf::from(&inst.project_path);
+            let holding = trash_holding_path(&original, &inst.id).unwrap();
+            let info = inst.worktree_info.as_ref().unwrap();
+            let git = GitWorktree::new(PathBuf::from(&info.main_repo_path)).unwrap();
+            git.move_worktree(&original, &tmp.path().join("actual-checkout"))
+                .unwrap();
+            std::fs::create_dir_all(holding.parent().unwrap()).unwrap();
+            match collision {
+                "wrong_branch" => {
+                    git.create_worktree("unrelated", &holding, true, None)
+                        .unwrap();
+                }
+                "foreign_repo" => {
+                    git2::Repository::init(&holding).unwrap();
+                }
+                _ => std::fs::create_dir(&holding).unwrap(),
+            }
+            std::fs::write(holding.join("sentinel"), b"unrelated files").unwrap();
+            inst.trash();
+            let before = serde_json::to_value(&inst).unwrap();
+            assert!(!reconcile_trashed_location(&mut inst), "{collision}");
+            assert!(
+                recover_trashed_worktree_move(&mut inst).is_none(),
+                "{collision}"
+            );
+            assert_eq!(serde_json::to_value(&inst).unwrap(), before, "{collision}");
+            assert_eq!(
+                std::fs::read(holding.join("sentinel")).unwrap(),
+                b"unrelated files"
+            );
         }
     }
 

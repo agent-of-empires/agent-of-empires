@@ -13,6 +13,7 @@ pub enum ApiErrorCode {
     AccessPolicyDenied,
     CityhallMode,
     LifecycleLocked,
+    TrashIncomplete,
     LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
@@ -43,6 +44,7 @@ impl ApiErrorCode {
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
+            Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
@@ -73,6 +75,7 @@ impl ApiErrorCode {
             | Self::AccessPolicyDenied
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
+            | Self::TrashIncomplete
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
@@ -117,6 +120,7 @@ impl ApiErrorCode {
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
+            b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,

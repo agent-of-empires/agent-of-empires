@@ -724,7 +724,13 @@ Generation preconditions are checked before the already-trashed state.
 An expired reservation for an unfinished Trash transition survives daemon startup.
 Retrying acquires a new generation and repeats teardown and relocation using the
 retry's `kill_pane` setting. Path reconciliation cannot acknowledge that pending
-teardown.
+teardown. Other lifecycle actions, including Restore and Purge, cannot replace
+the pending Trash owner after expiry. Restore and Purge return `409 trash_incomplete`, which
+directs native clients to retry `aoe rm <id>` before another lifecycle action.
+Orphan cleanup retains both the pending row and its moved checkout.
+A failed retry keeps that protection. Recovery adopts a holding checkout only
+when Git registers it in the expected repository and branch; unrelated holding
+collisions remain failures and their files stay untouched.
 
 ## Explicit structured worker stop
 
