@@ -290,6 +290,7 @@ pub(crate) fn response_deadline(response: &reqwest::Response) -> tokio::time::In
 }
 
 pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
+    tracing::debug!(target: "daemon.client", %error, "daemon request failed");
     if error.is_timeout() {
         DaemonClientError::Timeout
     } else {

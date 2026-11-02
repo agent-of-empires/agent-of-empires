@@ -128,7 +128,7 @@ pub use types::{
     TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub(crate) use types::{
-    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
     SessionSidecarSource,
 };
 
@@ -660,6 +660,9 @@ pub struct Instance {
     // Docker sandbox integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_info: Option<SandboxInfo>,
+    /// Target of the last container this row built or adopted; absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox_pin: Option<SandboxPin>,
     /// Filesystem generation used by this container's private agent stores.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub(crate) sandbox_store_generation: u8,

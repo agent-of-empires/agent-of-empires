@@ -130,6 +130,40 @@ pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
     guard.and_set("PATH", path)
 }
 
+/// A pin whose runtime is a script that logs its argv to `calls`, prints `stderr` and exits `code`.
+pub(crate) fn fake_sandbox_pin(
+    dir: &Path,
+    container_id: &str,
+    code: i32,
+    stderr: &str,
+) -> (crate::session::SandboxPin, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let calls = dir.join("runtime-calls");
+    let program = dir.join("fake-runtime");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho '{stderr}' >&2\nexit {code}\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pin = crate::session::SandboxPin {
+        runtime: crate::containers::RuntimeExecutionSnapshot {
+            kind: crate::session::ContainerRuntimeName::Docker,
+            program,
+            cwd: dir.to_path_buf(),
+            endpoint: "fake://runtime".into(),
+            local_mounts: true,
+            routing: Vec::new(),
+            global_arguments: Vec::new(),
+        },
+        container_id: container_id.into(),
+    };
+    (pin, calls)
+}
+
 /// Writes an executable stub named `name` into `dir`, for a structured create to find
 /// on hosts without the real ACP adapter (CI runners). It speaks no ACP.
 pub(crate) fn write_stub_adapter(dir: &Path, name: &str) {

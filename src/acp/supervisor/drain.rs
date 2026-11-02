@@ -11,14 +11,15 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    admit_stored_row, apply_claude_store_pin, apply_declared_config_dir, before_session_env,
-    overlay_env, publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
+    admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
+    await_resume_to_completion, before_session_env, overlay_env, publish_rejection,
+    refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
+    Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
+    RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -72,6 +73,18 @@ struct Drain<S> {
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+}
+
+impl<S> Drain<S> {
+    fn reservation_for_lease(&self, lease: Lease) -> super::ResumeReservation {
+        super::ResumeReservation {
+            lease,
+            expected_lifecycle_generation: None,
+            attach_record: None,
+            lifecycle: Arc::clone(&self.lifecycle),
+            notify: Arc::clone(&self.notify),
+        }
+    }
 }
 
 /// What a worker's event stream said before it closed.
@@ -489,17 +502,20 @@ impl<S: BroadcastSink> Drain<S> {
             );
             return None;
         };
-        let reservation = ResumeReservation {
-            lease: respawn_lease.clone(),
-            expected_lifecycle_generation: None,
-            attach_record: None,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.notify),
-        };
+        let reservation = self.reservation_for_lease(respawn_lease.clone());
         config.generation = respawn_lease.epoch();
         config.launch_lease = Some(respawn_lease.clone());
 
-        tokio::time::sleep(RESPAWN_BACKOFF).await;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+            _ = reservation.cancellation().cancelled() => {
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.finish_cancelled(&respawn_lease, previous).await;
+                }
+                return None;
+            }
+        }
         if worker_registry::stop_requested(session_id) {
             lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
         }
@@ -547,10 +563,15 @@ impl<S: BroadcastSink> Drain<S> {
             previous = None;
         }
         respawn_lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
-        Self::refresh_launch_env(&self.session_id, &mut config).await;
+        let refreshed = await_resume_to_completion(
+            reservation.cancellation(),
+            Self::refresh_launch_env(&self.session_id, &mut config),
+        )
+        .await
+        .is_ok();
         self.refuse_if_dismissed(&config).await;
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
-        if cancelled.is_some() {
+        if !refreshed || cancelled.is_some() {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                 self.finish_cancelled(&respawn_lease, previous).await;
             }
@@ -559,6 +580,8 @@ impl<S: BroadcastSink> Drain<S> {
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
+        // Like spawn_inner, keep the cooperative handshake result so a
+        // concurrent permanent stop can retire its adapter-side session.
         let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
         let mut client = match launched {
             Ok(client) => client,
@@ -1305,6 +1328,7 @@ mod tests {
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent-4029.jsonl".into(),
                 started_at: chrono::Utc::now(),
+                workflow: None,
             },
         );
         let sup = Supervisor::new(sink);
@@ -1526,6 +1550,108 @@ mod tests {
         assert!(
             sup.take_respawned_in_place().is_empty(),
             "a retired replacement never reached the agent"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn permanent_delete_during_respawn_uses_the_replacement_client() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let gate = Gate::default();
+        let (launcher, deleted) = recording_gated_launcher(
+            &gate,
+            4343,
+            "s-resp-delete",
+            "native-replacement",
+            Some(attested_test_birth(4343, 1)),
+        );
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(launcher),
+        );
+        save_attested_test_record("s-resp-delete", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-resp-delete").unwrap();
+        let lease = sup
+            .test_install_runner(
+                "s-resp-delete",
+                runner_config(socket),
+                Some(attested_test_identity(4242, 0)),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-resp-delete".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("replacement publishes its adapter session before the gate");
+        assert_eq!(
+            sup.worker_state("s-resp-delete").await,
+            AcpWorkerState::Resuming
+        );
+        let record = worker_registry::load_strict("s-resp-delete")
+            .unwrap()
+            .expect("replacement registry record is published");
+        assert_eq!(
+            record.stored_acp_session_id.as_deref(),
+            Some("native-replacement")
+        );
+        let respawning_lease = sup
+            .capture_retirement("s-resp-delete")
+            .unwrap()
+            .lease
+            .expect("respawn owns a cancellation lease");
+        let cancellation = respawning_lease.cancellation().clone();
+        let cancelled = tokio::spawn(async move { cancellation.cancelled().await });
+        let deletion = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.shutdown_and_delete_and_wait("s-resp-delete", Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), cancelled)
+            .await
+            .expect("permanent delete cancels the respawn")
+            .expect("cancellation observer does not panic");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !lock_recover(&sup.lifecycle).adapter_delete_pending(&respawning_lease) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permanent delete did not register adapter deletion debt"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "replacement has not returned its client before the gate opens"
+        );
+        gate.open.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), deletion)
+            .await
+            .expect("permanent delete waits for respawn retirement")
+            .expect("delete task does not panic")
+            .expect("delete settles");
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task settles after deletion")
+            .unwrap();
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "session/delete was sent through the replacement client"
+        );
+        assert!(worker_registry::load_strict("s-resp-delete")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sup.worker_state("s-resp-delete").await,
+            AcpWorkerState::Absent
         );
     }
 

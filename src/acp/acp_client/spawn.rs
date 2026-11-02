@@ -9,7 +9,7 @@ use std::process::Stdio;
 use tracing::{debug, info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::resolve_agent_command;
+use super::resolve_command::{resolve_agent_command, Unresolved};
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -464,7 +464,16 @@ pub(super) fn spawn_subprocess(
             r.path.to_string_lossy().into_owned(),
             r.prepend_paths.clone(),
         ),
-        Err(_) => (config.spec.command.clone(), Vec::new()),
+        Err(Unresolved::NotBare) => (config.spec.command.clone(), Vec::new()),
+        Err(error) => {
+            debug!(
+                target: "acp.protocol.spawn",
+                command = %config.spec.command,
+                ?error,
+                "could not resolve command via node-manager dirs; using bare command"
+            );
+            (config.spec.command.clone(), Vec::new())
+        }
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);

@@ -144,7 +144,9 @@ fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<(
 /// never override a user's config, and `aoe tmux-status` serves them to users
 /// painting their own bar.
 pub(crate) fn refresh_session_title(session_name: &str, title: &str) {
-    let _ = set_session_option(session_name, "@aoe_title", title);
+    if let Err(error) = set_session_option(session_name, "@aoe_title", title) {
+        tracing::debug!(target: "tmux.status", option = "@aoe_title", %error, "failed to set tmux option");
+    }
 }
 
 /// Apply mouse support option to a tmux session.
@@ -190,7 +192,9 @@ pub fn apply_all_tmux_options(
             "status-right-length",
             "status-style",
         ] {
-            let _ = set_session_option_unset(session_name, option);
+            if let Err(error) = set_session_option_unset(session_name, option) {
+                tracing::debug!(target: "tmux.status", option, %error, "failed to unset tmux option");
+            }
         }
     }
 
@@ -204,7 +208,9 @@ pub fn apply_all_tmux_options(
         // A session option outranks the global one, so leaving it to the user
         // means clearing any value aoe set earlier.
         TmuxSettingAction::LeaveToUser => {
-            let _ = set_session_option_unset(session_name, "mouse");
+            if let Err(error) = set_session_option_unset(session_name, "mouse") {
+                tracing::debug!(target: "tmux.status", option = "mouse", %error, "failed to unset tmux option");
+            }
         }
     }
 }

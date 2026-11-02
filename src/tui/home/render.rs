@@ -889,6 +889,65 @@ fn title_width_for_column(
     (title_width.min(budget), false)
 }
 
+const MAX_PLUGIN_STATUS_WIDTH: usize = 32;
+
+const MAX_PLUGIN_STATUS_COUNT: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PluginStatusSpan<'a> {
+    text: &'a str,
+    tone: Option<crate::plugin::ui_state::Tone>,
+    width: usize,
+}
+
+struct PluginStatusPlan<'a> {
+    spans: [Option<PluginStatusSpan<'a>>; MAX_PLUGIN_STATUS_COUNT],
+    len: usize,
+    width: usize,
+}
+
+impl<'a> PluginStatusPlan<'a> {
+    fn iter(&self) -> impl Iterator<Item = PluginStatusSpan<'a>> + '_ {
+        self.spans[..self.len].iter().flatten().copied()
+    }
+}
+
+fn plan_plugin_statuses<'a>(
+    statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
+    budget: usize,
+) -> PluginStatusPlan<'a> {
+    let mut plan = PluginStatusPlan {
+        spans: [None; MAX_PLUGIN_STATUS_COUNT],
+        len: 0,
+        width: 0,
+    };
+    let budget = budget.min(MAX_PLUGIN_STATUS_WIDTH);
+
+    for (text, tone) in statuses {
+        if plan.len == MAX_PLUGIN_STATUS_COUNT {
+            break;
+        }
+        let available = budget.saturating_sub(plan.width).saturating_sub(2);
+        if available == 0 {
+            break;
+        }
+        let text_width = rendered_width(text);
+        let visible_width = text_width.min(available);
+        plan.spans[plan.len] = Some(PluginStatusSpan {
+            text,
+            tone,
+            width: visible_width,
+        });
+        plan.len += 1;
+        plan.width += 2 + visible_width;
+        if visible_width < text_width {
+            break;
+        }
+    }
+
+    plan
+}
+
 /// The activity column's text: remaining snooze under Attention sort, else the age of a
 /// resting (Idle or Unknown) row, else blank. `last_accessed_at` is only a fallback for a
 /// missing `idle_entered_at`; on an active row it reads as idle time.
@@ -1975,6 +2034,7 @@ impl HomeView {
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
         let prefix_width: usize = line_spans.iter().map(|s| s.width()).sum();
         let room = (list_width as usize).saturating_sub(prefix_width);
+        let text_width = rendered_width(&text);
 
         let inst = match item {
             Item::Session { id, .. } => self.get_instance(id).map(|inst| (id, inst)),
@@ -2039,18 +2099,46 @@ impl HomeView {
             LAST_ACTIVITY_SLOT
         };
 
-        let (title_width, keep_tag) = title_width_for_column(
-            rendered_width(&text),
-            room,
-            tag_span.as_ref().map_or(0, |s| s.width()),
-            slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN,
+        let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
+        let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+
+        let status_budget = room
+            .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
+            .min(MAX_PLUGIN_STATUS_WIDTH);
+
+        let plugin_status_plan = plan_plugin_statuses(
+            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
+            status_budget,
         );
+        let plugin_status_width = plugin_status_plan.width;
+
+        let (title_width, keep_tag) = if plugin_status_width > 0 {
+            (
+                text_width
+                    .min(room.saturating_sub(tag_width + fixed_trailing + plugin_status_width)),
+                true,
+            )
+        } else {
+            title_width_for_column(text_width, room, tag_width, fixed_trailing)
+        };
         line_spans.push(Span::styled(
             truncate_to_width(&text, title_width),
             text_style,
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
+        for status in plugin_status_plan.iter() {
+            line_spans.push(Span::raw("  "));
+            let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
+            line_spans.push(Span::styled(
+                truncate_to_width(status.text, status.width),
+                if is_selected {
+                    selected_row_style(status_style, theme)
+                } else {
+                    status_style
+                },
+            ));
+        }
         let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
         let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
         let column_fits = column_pad.is_some();
@@ -5425,5 +5513,72 @@ mod tests {
             max_width: 2,
         };
         assert_eq!(sb.rendered(), "[sb]");
+    }
+}
+
+#[cfg(test)]
+mod plugin_status_plan_tests {
+    use super::plan_plugin_statuses;
+    use crate::plugin::ui_state::Tone;
+
+    /// (name, budget, count, expected span list, expected width).
+    type StatusPlanCase = (
+        &'static str,
+        usize,
+        usize,
+        Vec<(&'static str, Option<Tone>, usize)>,
+        usize,
+    );
+
+    #[test]
+    fn status_plan_respects_width_budgets() {
+        let statuses = [
+            ("Open", Some(Tone::Success)),
+            ("CI", Some(Tone::Info)),
+            ("WIP", Some(Tone::Warn)),
+        ];
+        let cases: &[StatusPlanCase] = &[
+            ("empty", 32, 0, vec![], 0),
+            ("separator only", 2, 3, vec![], 0),
+            ("narrow", 3, 1, vec![("Open", Some(Tone::Success), 1)], 3),
+            ("exact", 6, 1, vec![("Open", Some(Tone::Success), 4)], 6),
+            (
+                "multiple",
+                10,
+                2,
+                vec![
+                    ("Open", Some(Tone::Success), 4),
+                    ("CI", Some(Tone::Info), 2),
+                ],
+                10,
+            ),
+            (
+                "truncated first",
+                5,
+                1,
+                vec![("Open", Some(Tone::Success), 3)],
+                5,
+            ),
+            (
+                "truncated later",
+                9,
+                2,
+                vec![
+                    ("Open", Some(Tone::Success), 4),
+                    ("CI", Some(Tone::Info), 1),
+                ],
+                9,
+            ),
+        ];
+
+        for (name, budget, count, expected, expected_width) in cases {
+            let plan = plan_plugin_statuses(statuses[..*count].iter().copied(), *budget);
+            let actual: Vec<_> = plan
+                .iter()
+                .map(|span| (span.text, span.tone, span.width))
+                .collect();
+            assert_eq!(&actual, expected, "{name}");
+            assert_eq!(plan.width, *expected_width, "{name}");
+        }
     }
 }
