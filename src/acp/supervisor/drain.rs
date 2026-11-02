@@ -2210,7 +2210,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn respawn_drops_a_withdrawn_hook_route_and_realigns_native_mcp() {
-        use agent_client_protocol::schema::v1::McpServer;
+        use agent_client_protocol::v1::schema::McpServer;
 
         let (_home, temp) = isolate_home();
         let hook_store = temp.path().join("hook-store");
@@ -2310,7 +2310,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
-        use agent_client_protocol::schema::v1::McpServer;
+        use agent_client_protocol::v1::schema::McpServer;
 
         let (_home, temp) = isolate_home();
         let declared = temp.path().join("declared");

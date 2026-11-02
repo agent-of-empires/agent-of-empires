@@ -5,12 +5,13 @@ use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use crate::acp::transcript::LOAD_FAILED_PREFIX;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ForkSessionRequest, ForkSessionResponse, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, SessionConfigId,
     SessionId,
 };
-use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, JsonRpcRequest};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

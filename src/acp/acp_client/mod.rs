@@ -61,7 +61,7 @@ use crate::acp::fs_handler::{FsPolicy, SandboxPathMap};
 use crate::acp::state::{AcpSessionId, Event};
 use crate::acp::terminal_handler::TerminalManager;
 use crate::daemon::PromptAttachmentKind;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, McpServer, TextContent,
 };

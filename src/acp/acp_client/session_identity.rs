@@ -1,8 +1,9 @@
 //! Native session admission, selected only by the connection lifecycle.
 
-use agent_client_protocol::schema::v1::{RequestId, SessionId, SessionNotification};
+use agent_client_protocol::v1::schema::{RequestId, SessionId, SessionNotification};
+use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{
-    Agent, ConnectionTo, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
+    Agent, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -85,7 +86,7 @@ impl JsonRpcMessage for SessionIngressNotification {
 
     fn parse_message(
         method: &str,
-        params: &impl serde::Serialize,
+        params: &serde_json::Value,
     ) -> agent_client_protocol::Result<Self> {
         if SessionReplayed::matches_method(method) {
             return Ok(Self::Replayed(SessionReplayed::parse_message(
@@ -98,13 +99,13 @@ impl JsonRpcMessage for SessionIngressNotification {
             )?));
         }
         if method == AUTH_STATUS_UPDATE_METHOD {
-            let parsed: AuthStatusParams = serde_json::from_value(serde_json::to_value(params)?)?;
+            let parsed: AuthStatusParams = serde_json::from_value(params.clone())?;
             return Ok(Self::AuthStatus(parsed.auth_status));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
         }
-        Ok(Self::Update(serde_json::to_value(params)?))
+        Ok(Self::Update(params.clone()))
     }
 }
 

@@ -1,7 +1,7 @@
 //! Per-adapter compatibility policy for ACP agents.
 
-use agent_client_protocol::schema::v1::InitializeResponse;
 use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::InitializeResponse;
 
 use super::state::StartupErrorDetail;
 
@@ -359,7 +359,7 @@ pub fn version_gates() -> impl Iterator<Item = VersionGate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::Implementation;
+    use agent_client_protocol::v1::schema::Implementation;
 
     fn init(info: Option<(&str, &str)>) -> InitializeResponse {
         let init = InitializeResponse::new(ProtocolVersion::V1);

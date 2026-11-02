@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{InitializeResponse, ListSessionsRequest};
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use agent_client_protocol::v1::schema::{InitializeResponse, ListSessionsRequest};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, ByteStreams, Client};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use super::handshake::build_initialize_request;
@@ -62,7 +63,7 @@ async fn list_with_timeout(
     let newest_first = NEWEST_FIRST_AGENTS.contains(&config.agent_key.as_str());
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let result = Client
-        .builder()
+        .v1()
         .name("aoe-acp")
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             Ok(list_pages(&connection, owned, newest_first, step_timeout).await)
