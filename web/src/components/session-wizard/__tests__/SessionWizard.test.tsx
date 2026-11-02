@@ -1307,6 +1307,17 @@ describe("SessionWizard create failures", () => {
     }
   });
 
+  it("turning the Sandbox off by hand takes down the box and the row's cue", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    await screen.findByTestId("create-failure");
+    fireEvent.click(screen.getByRole("switch", { name: "Run in a safe container" }));
+    expect(screen.queryByTestId("create-failure")).toBeNull();
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).not.toContain("couldn't start");
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
   it("Launch without Sandbox sends the Session on the host under a fresh key", async () => {
     createSession.mockResolvedValueOnce(
       failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),

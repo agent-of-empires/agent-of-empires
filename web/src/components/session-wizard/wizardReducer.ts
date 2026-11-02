@@ -1,5 +1,6 @@
 import type { AgentInfo, CreateFailure, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
 import { normalizeProjectPathKey } from "../../lib/registeredProjects";
+import { failureFields } from "./createFailureView";
 import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -226,6 +227,14 @@ function seededStructuredView(data: WizardData, action: { useStructuredView?: bo
 }
 
 export function reducer(state: WizardState, action: Action): WizardState {
+  const next = reduce(state, action);
+  const { failure } = next;
+  if (failure && failure === state.failure && failureFields(failure).some((f) => next.data[f] !== state.data[f]))
+    return { ...next, failure: null };
+  return next;
+}
+
+function reduce(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };

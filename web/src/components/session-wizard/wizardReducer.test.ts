@@ -397,4 +397,32 @@ describe("submit failures", () => {
     const failed = reducer(makeState(), { type: "SUBMIT_FAILED", failure });
     expect(reducer(action.type === "SUBMIT_FAILED" ? makeState() : failed, action)).toMatchObject(expected);
   });
+
+  const field = (name: string, value: unknown): Action => ({ type: "SET_FIELD", field: name, value });
+  it.each<[string, string, Action, boolean]>([
+    ["a new Project clears a missing Working directory", "working_dir_missing", field("path", "/elsewhere"), true],
+    ["a new image clears a failed pull", "sandbox_image_pull_failed", field("sandboxImage", "img:2"), true],
+    [
+      "the Sandbox turned off clears an unavailable runtime",
+      "sandbox_unavailable",
+      field("sandboxEnabled", false),
+      true,
+    ],
+    [
+      "a Profile that turns the Sandbox off clears an unavailable runtime",
+      "sandbox_unavailable",
+      defaults({ sandboxEnabled: false, skipIfDirty: false }),
+      true,
+    ],
+    ["a new image leaves an unavailable runtime", "sandbox_unavailable", field("sandboxImage", "img:2"), false],
+    ["the Sandbox leaves a missing Working directory", "working_dir_missing", field("sandboxEnabled", false), false],
+    ["a new Project leaves a failed hook", "hook_failed", field("path", "/elsewhere"), false],
+  ])("%s", (_label, code, action, cleared) => {
+    const failure = { code, message: "m", stage: null, reference: "r" };
+    const failed = reducer(makeState({ path: "/repo", sandboxEnabled: true, sandboxImage: "img:1" }), {
+      type: "SUBMIT_FAILED",
+      failure,
+    });
+    expect(reducer(failed, action).failure).toBe(cleared ? null : failure);
+  });
 });

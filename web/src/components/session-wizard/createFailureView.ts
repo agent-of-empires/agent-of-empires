@@ -39,6 +39,22 @@ const STEP: Record<CreateStage, string> = {
 
 const GENERIC_MESSAGE = "Failed to create session";
 
+/** The form fields a failure blames: once one changes, the box describes a form that's gone. */
+export function failureFields(failure: CreateFailure): readonly ("path" | "sandboxEnabled" | "sandboxImage")[] {
+  switch (failure.code) {
+    case "working_dir_missing":
+      return ["path"];
+    case "sandbox_unavailable":
+      return ["sandboxEnabled"];
+    case "sandbox_image_pull_failed":
+      return ["sandboxEnabled", "sandboxImage"];
+    default:
+      return failure.code === "create_failed" && failure.stage === "starting_container"
+        ? ["sandboxEnabled", "sandboxImage"]
+        : [];
+  }
+}
+
 /** What the wizard shows for a failed create. `runtimeDown`: a Retry re-check found the
  *  Container runtime still down. */
 export function failureView(
