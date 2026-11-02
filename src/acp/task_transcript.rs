@@ -147,7 +147,10 @@ pub(crate) struct ActiveTasks {
 
 struct TaskOwner {
     tool_call_id: Option<String>,
+    /// Another launch took over the task: stop without reporting an end.
     cancellation: CancellationToken,
+    /// `TaskStop` killed the task: settle its agents, then report the end.
+    stop: CancellationToken,
 }
 
 impl ActiveTasks {
@@ -159,10 +162,11 @@ impl ActiveTasks {
         self.lock().is_empty()
     }
 
-    /// Stops following `task_id`, returning whether a tailer was following it.
-    pub(crate) fn cancel(&self, task_id: &str) -> bool {
+    /// Ends `task_id` because `TaskStop` killed it, returning whether a tailer
+    /// was following it. The tailer publishes the end itself.
+    pub(crate) fn stop(&self, task_id: &str) -> bool {
         self.lock().get(task_id).is_some_and(|owner| {
-            owner.cancellation.cancel();
+            owner.stop.cancel();
             true
         })
     }
@@ -224,6 +228,7 @@ impl TaskTailer {
             let owner = Arc::new(TaskOwner {
                 tool_call_id: self.tool_call_id.clone(),
                 cancellation: CancellationToken::new(),
+                stop: CancellationToken::new(),
             });
             owners.insert(self.task_id.clone(), owner.clone());
             owner
@@ -249,6 +254,7 @@ impl TaskTailer {
             });
             let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
+                () = owner.stop.cancelled() => Some(Utc::now()),
                 ended_at = self.follow() => ended_at,
             };
             ended.cancel();
@@ -807,16 +813,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_tailer_releases_its_slot_without_finishing() {
+    async fn a_stopped_task_reports_one_end_and_releases_its_slot() {
         let mut f = fixture("{\"type\":\"user\"}\n");
         f.spawn(TailerStart::Live).await;
         f.parked().await;
-        assert!(f.active.cancel("t-1"));
+        assert!(f.active.stop("t-1"));
+        match f.next().await {
+            Event::BackgroundTaskFinished { task_id, ended_at } => {
+                assert_eq!(task_id, "t-1");
+                assert!(ended_at.is_some());
+            }
+            other => panic!("expected BackgroundTaskFinished, got {other:?}"),
+        }
         f.released().await;
-        assert!(!f.active.cancel("t-1"), "nothing follows a released task");
+        assert!(!f.active.stop("t-1"), "nothing follows a released task");
         f.append(&notification_line("t-1", Some("completed")));
         f.drop_sender();
-        assert!(f.rx.recv().await.is_none(), "no end event after cancel");
+        assert!(f.rx.recv().await.is_none(), "no second end event");
     }
 
     #[tokio::test]
@@ -826,11 +839,8 @@ mod tests {
         assert_eq!(finished_id(f.next().await), "t-1");
     }
 
-    /// A resumed workflow run whose journal is gone settles the agents the log
-    /// recorded before the task reports its end.
-    #[tokio::test]
-    async fn a_workflow_run_settles_its_agents_before_it_finishes() {
-        let mut f = fixture(&notification_line("t-1", Some("completed")));
+    /// A resumed run of workflow `t-1` with agent `a1` open and no journal.
+    async fn spawn_workflow_tailer(f: &Fixture) {
         let tx = f.tx.as_ref().expect("sender kept").downgrade();
         let _ = TaskTailer {
             tool_call_id: Some("toolu_1".into()),
@@ -862,12 +872,32 @@ mod tests {
         }
         .spawn(None)
         .await;
+    }
+
+    async fn assert_agent_settled_then_finished(f: &mut Fixture) {
         assert!(matches!(
             f.next().await,
             Event::BackgroundAgentCompleted { agent_id, status: crate::acp::state::BackgroundAgentStatus::Detached, .. }
                 if agent_id == "a1"
         ));
         assert_eq!(finished_id(f.next().await), "t-1");
+    }
+
+    /// A resumed workflow run whose journal is gone settles the agents the log
+    /// recorded before the task reports its end.
+    #[tokio::test]
+    async fn a_workflow_run_settles_its_agents_before_it_finishes() {
+        let mut f = fixture(&notification_line("t-1", Some("completed")));
+        spawn_workflow_tailer(&f).await;
+        assert_agent_settled_then_finished(&mut f).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_workflow_settles_its_agents_before_it_finishes() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        spawn_workflow_tailer(&f).await;
+        assert!(f.active.stop("t-1"));
+        assert_agent_settled_then_finished(&mut f).await;
     }
 
     #[tokio::test]

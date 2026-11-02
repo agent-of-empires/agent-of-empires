@@ -322,12 +322,11 @@ impl Shared {
                 }
                 continue;
             }
-            // Only `TaskStop` ends a task here (the tailer sends its own end).
+            // Only `TaskStop` ends a task here. A tailer publishes the end itself.
             // A task no tailer follows already ended, so its end is not repeated.
             if let Event::BackgroundTaskFinished { task_id, .. } = &event {
-                if !self.bg_tasks.cancel(task_id) {
-                    continue;
-                }
+                self.bg_tasks.stop(task_id);
+                continue;
             }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
