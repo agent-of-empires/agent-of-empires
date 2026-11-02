@@ -1048,8 +1048,8 @@ enabled = true
         }"#;
         // (disabled list for `cwd`, disabled list for another project, expected forwarded)
         let cases: [(&str, &str, &[&str]); 4] = [
-            (r#"["pagerduty"]"#, "[]", &["fs"]),
             ("[]", "[]", &["fs", "pagerduty"]),
+            (r#"["pagerduty"]"#, "[]", &["fs"]),
             ("[]", r#"["pagerduty", "fs"]"#, &["fs", "pagerduty"]),
             (r#"["gone"]"#, "[]", &["fs", "pagerduty"]),
         ];
