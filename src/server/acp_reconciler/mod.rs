@@ -278,15 +278,17 @@ pub async fn reconcile_acp_workers(
         let retry_for_queue = attempted.contains(&id)
             && queued_not_stopped.contains(&id)
             && supervisor.worker_state(&id).await == AcpWorkerState::Absent;
-        if attempted.contains(&id) && !retry_for_queue {
+        if attempted.contains(&id) {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
-            if supervisor.worker_state(&id).await == AcpWorkerState::Stopping
-                || !supervisor.take_late_restart_marker(&id)
-            {
+            let restart_marker = supervisor.worker_state(&id).await != AcpWorkerState::Stopping
+                && supervisor.take_late_restart_marker(&id);
+            if !retry_for_queue && !restart_marker {
                 continue;
             }
-            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+            if restart_marker {
+                forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+            }
         }
         match supervisor.worker_state(&id).await {
             AcpWorkerState::Running | AcpWorkerState::Resuming => {
