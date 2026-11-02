@@ -3390,6 +3390,59 @@ mod session_mutation_tests {
 
     #[tokio::test]
     #[serial]
+    async fn set_session_id_clears_sandboxed_transcript_targets_without_rebinding() {
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let transcript = temp.path().join("original.jsonl");
+        std::fs::write(&transcript, "saved conversation\n").unwrap();
+
+        for tool in ["pi", "omp"] {
+            let mut inst = Instance::new("sandboxed target", temp.path().to_str().unwrap());
+            inst.tool = tool.into();
+            inst.sandbox_info = Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "image": "fixture",
+                    "container_name": format!("clear-{tool}")
+                }))
+                .unwrap(),
+            );
+            let mut observed = crate::session::ConversationBinding::unknown(SID_A);
+            observed.transcript_path = Some(transcript.clone());
+            inst.agent_session_id = Some(SID_A.into());
+            inst.agent_session_binding = Some(observed.clone());
+            inst.resume_intent = ResumeIntent::Use(SID_B.into());
+            inst.resume_binding = Some(crate::session::ConversationBinding::unknown(SID_B));
+            inst.resume_probe_failed_sid = Some(SID_A.into());
+            let profile = format!("clear-sandbox-{tool}");
+            let (storage, id) = seed(&profile, inst);
+
+            set_session_id(
+                &profile,
+                SetSessionIdArgs {
+                    identifier: id.clone(),
+                    session_id: String::new(),
+                    store: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let row = stored(&storage, &id);
+            assert_eq!(row.resume_intent, ResumeIntent::Cleared);
+            assert!(row.resume_binding.is_none());
+            assert!(row.resume_probe_failed_sid.is_none());
+            assert_eq!(row.agent_session_id.as_deref(), Some(SID_A));
+            assert_eq!(row.agent_session_binding, Some(observed));
+            assert_eq!(
+                std::fs::read_to_string(&transcript).unwrap(),
+                "saved conversation\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());

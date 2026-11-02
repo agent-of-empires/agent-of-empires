@@ -3,6 +3,16 @@
 
 use super::*;
 
+macro_rules! fresh_recovery_footer {
+    () => {
+        concat!(
+            "Or choose fresh (abandons this AoE association):\n",
+            "aoe session set-session-id <session> \"\"\n",
+            "Then start/restart; old history is not deleted or recovered."
+        )
+    };
+}
+
 macro_rules! recovery_message {
     ($reason:literal) => {
         concat!(
@@ -10,9 +20,7 @@ macro_rules! recovery_message {
             "\nConversation preserved. Restore original context, then retry:\n",
             "aoe session set-session-id <session> <native-id>\n",
             "Use --store with the exact store/transcript where required.\n",
-            "Or choose fresh (abandons this AoE association):\n",
-            "aoe session set-session-id <session> \"\"\n",
-            "Then start/restart; old history is not deleted or recovered."
+            fresh_recovery_footer!()
         )
     };
 }
@@ -26,12 +34,13 @@ macro_rules! transcript_recovery_message {
             "The native session ID alone is not enough to authorize resume.\n",
             "This refusal does not delete the saved conversation.\n",
             "Manual transcript rebinding is not supported for sandboxed sessions.\n",
+            "If store routing changed, restore the original store configuration.\n",
             "For host sessions, bind the exact existing transcript file:\n",
             "aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n",
             "For ",
             $agent,
             ", --store must name the file, not its directory.\n",
-            "Then start/restart the session."
+            fresh_recovery_footer!()
         )
     };
 }

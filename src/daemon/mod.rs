@@ -2000,6 +2000,10 @@ mod tests {
                 let message = error.to_string();
                 assert!(!format!("{error:?}").contains("secret"));
                 assert!(!message.contains("secret"), "{message}");
+                if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
+                    assert!(message.contains("session.agent_execution_as"), "{message}");
+                    assert!(message.contains("session.agent_config_dir"), "{message}");
+                }
                 if committed {
                     assert!(
                         matches!(error, DaemonClientError::Committed { cursor, code }

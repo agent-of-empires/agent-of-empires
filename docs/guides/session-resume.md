@@ -138,10 +138,13 @@ its directory. The file's header must name the requested ID:
 aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl
 ```
 
+The file must belong to the configured store. If store routing changed, restore
+the original store configuration before rebinding.
+
 Then start or restart the session. Other agents resolve their store from
 configuration and reject explicit `--store` routing.
 
-To start fresh once:
+To start fresh once, including for sandboxed terminal sessions:
 
 ```sh
 aoe session set-session-id <session-name-or-id> ""
