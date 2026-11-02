@@ -594,24 +594,30 @@ pub async fn trash_session(
         let store: &dyn crate::session::SessionStore = &native;
         let title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
-        let mut instance = store.update(|rows, _| {
+        let instance = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
-            if row.is_trashed() {
-                return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
-            }
             if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
                 return Err(crate::session::LifecycleReservationError::Superseded.into());
+            }
+            if row.is_trashed() {
+                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                return Ok(None);
             }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
             row.trash();
-            Ok(row.clone())
+            Ok(Some(row.clone()))
         })?;
+        let Some(mut instance) = instance else {
+            return Ok((crate::session::trash::RelocateOutcome::Skipped, None));
+        };
         instance.source_profile = profile;
         instance.file_watch = Some(worker_state.file_watch.clone());
         let generation = instance.lifecycle_generation;

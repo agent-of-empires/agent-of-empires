@@ -708,6 +708,20 @@ selection. `drop_failed` removes the row only after a forced failure for the sam
 selection; it retains worktree files. Restore or a new lifecycle generation
 invalidates the failure marker.
 
+## POST /api/sessions/{id}/trash
+
+Move a session to Trash. Optional JSON fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `kill_pane` | `true` | Stop the session's terminal panes during the transition. |
+| `expected_generation` | omitted | Require the selected session's `lifecycle_generation`; a mismatch returns `409 lifecycle_superseded` without mutation. |
+
+Repeating a completed request for an already-trashed session succeeds without
+repeating teardown or relocation. A fresh lifecycle reservation returns
+`409 lifecycle_locked` rather than acknowledging an unfinished transition.
+Generation preconditions are checked before the already-trashed state.
+
 ## Explicit structured worker stop
 
 `DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.

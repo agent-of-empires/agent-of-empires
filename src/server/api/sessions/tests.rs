@@ -1108,8 +1108,14 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 
 #[tokio::test]
 #[serial_test::serial]
-async fn trash_rejects_stale_or_already_trashed_targets_without_mutation() -> anyhow::Result<()> {
-    for already_trashed in [false, true] {
+async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
+    for (already_trashed, precondition, omit_body, peer) in [
+        (false, true, false, false),
+        (true, true, false, false),
+        (true, false, false, false),
+        (true, false, true, false),
+        (true, false, false, true),
+    ] {
         let _guard = crate::session::test_support::isolate_app_dir();
         let mut row = Instance::new("stale trash", "/tmp/stale-trash");
         row.source_profile = "receipt".into();
@@ -1117,6 +1123,13 @@ async fn trash_rejects_stale_or_already_trashed_targets_without_mutation() -> an
         row.lifecycle_generation += 1;
         if already_trashed {
             row.trash();
+        }
+        if peer {
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?;
         }
         let id = row.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
@@ -1131,24 +1144,46 @@ async fn trash_rejects_stale_or_already_trashed_targets_without_mutation() -> an
         let response = trash_session(
             State(state.clone()),
             Path(id),
-            Some(Json(TrashSessionBody {
+            (!omit_body).then_some(Json(TrashSessionBody {
                 kill_pane: true,
-                expected_generation: (!already_trashed).then_some(expected_generation),
+                expected_generation: precondition.then_some(expected_generation),
             })),
         )
         .await
         .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        if !already_trashed {
+        assert_eq!(
+            response.status(),
+            if precondition || peer {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            }
+        );
+        if precondition {
             assert_eq!(
                 response.headers()[crate::daemon::ERROR_CODE_HEADER],
                 crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
             );
         }
+        if peer {
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
+            );
+        }
         assert_eq!(std::fs::read(storage.sessions_path())?, before);
-        assert!(!response
-            .headers()
-            .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+        if precondition || peer {
+            assert!(!response
+                .headers()
+                .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+        } else {
+            assert!(response
+                .headers()
+                .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            let body: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(body["outcome"]["relocation"]["status"], "skipped", "{body}");
+        }
     }
     Ok(())
 }
