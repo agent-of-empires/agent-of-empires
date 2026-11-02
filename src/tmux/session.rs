@@ -834,7 +834,12 @@ impl Session {
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+    /// Returns false when the budget ran out first.
+    pub fn wait_until_ready(
+        &self,
+        max_wait: std::time::Duration,
+        ready_marker: Option<&str>,
+    ) -> bool {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
         let ready_marker = ready_marker.map(str::to_lowercase);
@@ -848,17 +853,18 @@ impl Session {
             tests::observe_ready_capture(&now);
             if let Some(marker) = ready_marker.as_deref() {
                 if now.to_lowercase().contains(marker) {
-                    return;
+                    return true;
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return;
+                    return true;
                 }
                 last = Some(now);
             }
         }
+        false
     }
 
     /// Capture the whole first window, panes composited, for the passive

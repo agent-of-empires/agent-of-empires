@@ -529,6 +529,7 @@ async fn admit_and_create(
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),

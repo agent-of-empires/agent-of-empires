@@ -8,6 +8,12 @@ import { createSession } from "./api";
 import { safeGetItem, safeSetItem } from "./safeStorage";
 import type { CreateSessionRequest, SessionResponse } from "./types";
 
+export function newIdempotencyKey(): string {
+  // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export interface PendingCreate {
   body: CreateSessionRequest & { idempotency_key: string };
   tool: string;

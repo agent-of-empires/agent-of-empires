@@ -1455,3 +1455,79 @@ fn ctrl_l_toggles_footer_when_not_in_live_send() {
         "Ctrl+L turns the footer back off"
     );
 }
+
+#[test]
+#[serial]
+fn s_opens_the_suggestions_view_which_owns_keys_until_esc() {
+    let mut env = create_test_env_empty();
+    env.view.handle_key(key(KeyCode::Char('S')), None);
+    assert!(env.view.suggestions_view.is_some());
+    assert!(env.view.has_non_live_send_overlay());
+
+    env.view.handle_key(key(KeyCode::Char('n')), None);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "keys go to the view, not the list behind it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.suggestions_view.is_none());
+}
+
+fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
+    crate::tui::suggestions::Start {
+        provider: "GitHub".to_string(),
+        source_ref: "#7".to_string(),
+        reason: "review requested".to_string(),
+        source_text: None,
+        path: path.to_string(),
+        title: "Review PR 7".to_string(),
+        initial_prompt: "Inspect the diff".to_string(),
+        tool: "claude".to_string(),
+        suggestion: None,
+    }
+}
+
+#[test]
+#[serial]
+fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
+    let mut env = create_test_env_empty();
+    // A structured default would make Enter check for the ACP adapter on the host.
+    crate::session::config::update_config(|config| {
+        config.acp.structured_view = crate::session::config::StructuredView::Terminal;
+    })
+    .unwrap();
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.start_suggestion(start_for_test("/tmp"));
+    assert!(env.view.suggestions_view.is_none());
+    let data = match env
+        .view
+        .new_dialog
+        .as_mut()
+        .unwrap()
+        .handle_key(key(KeyCode::Enter))
+    {
+        crate::tui::dialogs::DialogResult::Submit(data) => data,
+        _ => panic!("expected Submit"),
+    };
+    assert_eq!(data.path, "/tmp");
+    assert_eq!(data.tool, "claude");
+    assert_eq!(data.title, "Review PR 7");
+    assert_eq!(data.initial_prompt.as_deref(), Some("Inspect the diff"));
+}
+
+#[test]
+#[serial]
+fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
+    let mut env = create_test_env_empty();
+    env.view.creating_stub_id = Some("pending".to_string());
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.start_suggestion(start_for_test("/tmp"));
+    assert!(env.view.new_dialog.is_none());
+    let view = env.view.suggestions_view.as_ref().expect("view stays open");
+    assert!(view
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("already being created"));
+}

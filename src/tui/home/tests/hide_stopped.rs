@@ -42,7 +42,7 @@ fn session_titles(view: &HomeView) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => view.get_instance(id).map(|i| i.title.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect()
 }
@@ -556,7 +556,7 @@ fn live_send_ends_when_a_grouping_change_hides_its_session() {
 fn cursor_row_session(view: &HomeView) -> Option<String> {
     match view.flat_items.get(view.cursor)? {
         Item::Session { id, .. } => Some(id.clone()),
-        Item::Group { .. } => None,
+        _ => None,
     }
 }
 

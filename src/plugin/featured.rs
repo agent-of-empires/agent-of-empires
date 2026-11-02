@@ -8,9 +8,14 @@ use serde::Deserialize;
 const EMBEDDED: &str = include_str!("../../plugins/featured.toml");
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeaturedEntry {
     pub source: String,
     pub versions: BTreeMap<String, String>,
+    /// The plugin's manifest declares `[suggestions]`; the Marketplace marks it
+    /// without fetching the manifest.
+    #[serde(default)]
+    pub suggestions: bool,
 }
 
 impl FeaturedEntry {
@@ -49,6 +54,12 @@ impl FeaturedIndex {
             .values()
             .any(|e| e.source.eq_ignore_ascii_case(slug))
     }
+
+    pub fn declares_suggestions(&self, slug: &str) -> bool {
+        self.plugins
+            .values()
+            .any(|e| e.suggestions && e.source.eq_ignore_ascii_case(slug))
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +92,22 @@ versions = { "1.0" = "sha256:aaa", "1.1" = "sha256:bbb" }
             "the source match is case-insensitive"
         );
         assert!(!index.is_featured_source("gh:someone/else"));
+
+        assert!(!entry.suggestions, "suggestions defaults to off");
+        assert!(
+            FeaturedIndex::from_toml_str(
+                "[plugins.\"a.b\"]\nsource = \"gh:acme/x\"\nversions = {}\nsuggestion = true\n"
+            )
+            .is_err(),
+            "a typoed key must fail the parse, not default off"
+        );
+        assert!(!index.declares_suggestions("gh:agent-of-empires/example"));
+        let flagged = FeaturedIndex::from_toml_str(
+            "[plugins.\"a.b\"]\nsource = \"gh:Acme/Tracker\"\nsuggestions = true\nversions = {}\n",
+        )
+        .unwrap();
+        assert!(flagged.declares_suggestions("gh:acme/tracker"));
+        assert!(!flagged.declares_suggestions("gh:acme/other"));
 
         assert!(entry.verifies("sha256:aaa"));
         assert!(entry.verifies("sha256:bbb"));

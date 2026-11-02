@@ -688,6 +688,41 @@ pub async fn create_session(
         }
     }
 
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt must not be blank",
+        );
+    }
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::plugin::suggestions::MAX_PROMPT_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt exceeds 64 KiB",
+        );
+    }
+
+    if body.suggestion.as_ref().is_some_and(|s| {
+        [&s.provider_id, &s.id]
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > aoe_plugin_api::suggestions::MAX_KEY_BYTES)
+    }) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "suggestion ids must be non-empty and within the key size limit",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -1132,6 +1167,7 @@ pub async fn create_session(
         );
     }
 
+    let initial_prompt = body.initial_prompt.take();
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1180,6 +1216,7 @@ pub async fn create_session(
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key.clone(),
         profile,
+        suggestion: body.suggestion,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session (#2897).
         created_by_plugin: None,
@@ -1208,7 +1245,7 @@ pub async fn create_session(
         let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
-            .create_structured_session(spec, None, None, None)
+            .create_structured_session(spec, None, None, initial_prompt.as_deref())
             .await;
         if let (Err(e), Some(key)) = (&result, &key) {
             if let Some(failure) = create_failure(e) {

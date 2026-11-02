@@ -60,6 +60,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
 
+    /// Read-only work suggestions and the criteria they come in; grants no
+    /// session execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<crate::suggestions::SuggestionsSpec>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
 }
@@ -1101,6 +1106,61 @@ impl PluginManifest {
             check(
                 self.settings.iter().all(|s| !s.per_project),
                 "per_project settings require api_version >= 18".into(),
+            );
+        }
+        if let Some(suggestions) = &self.suggestions {
+            check(
+                self.api_version >= 20,
+                "suggestions require api_version >= 20".into(),
+            );
+            check(
+                !suggestions.sources.is_empty(),
+                "suggestions must declare at least one source".into(),
+            );
+            let mut criteria = std::collections::HashSet::new();
+            for source in &suggestions.sources {
+                let criterion = source.criterion.as_str();
+                check(
+                    !criterion.trim().is_empty()
+                        && criterion.len() <= crate::suggestions::MAX_KEY_BYTES,
+                    "suggestion source criterion must be non-empty and at most 256 bytes".into(),
+                );
+                check(
+                    criteria.insert(criterion),
+                    format!("duplicate suggestion source criterion {criterion:?}"),
+                );
+                check(
+                    !source.label.trim().is_empty(),
+                    format!("suggestion source {criterion:?} needs a label"),
+                );
+                check(
+                    source
+                        .variables
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == source.variables.len(),
+                    format!("suggestion source {criterion:?} has duplicate variables"),
+                );
+                check(
+                    source.variables.iter().all(|name| {
+                        !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    }),
+                    format!("suggestion source {criterion:?} variables must match [a-z0-9_]+"),
+                );
+            }
+            check(
+                self.runtime.is_some(),
+                "suggestions require a runtime worker".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|cap| cap.as_str() == "runtime.worker"),
+                "suggestions require the runtime.worker capability".into(),
             );
         }
         for key in self.setting_defaults.keys() {

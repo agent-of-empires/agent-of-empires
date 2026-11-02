@@ -26,7 +26,7 @@ The host keeps the five newest logs per plugin and removes older ones when a wor
 
 ## Featured plugins
 
-Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`.
+Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`. A featured entry whose manifest declares `[suggestions]` sets `suggestions = true`, which marks it in the dashboard Marketplace (and enables its "Works with Suggestions" filter) and in the TUI Plugin Manager's discover list.
 
 - **Board** (`agent-of-empires.kanban`): a kanban board of your sessions in the web dashboard. Install with `aoe plugin install gh:agent-of-empires/plugin-kanban`; it needs Node 22 or newer on the daemon's `PATH`.
 

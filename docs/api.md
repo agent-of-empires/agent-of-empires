@@ -468,6 +468,16 @@ reservation returns `409`, and a missing conversation or incompatible provider
 returns `400`. CityHall mode refuses canonical forks with `403`. An idempotent
 replay still succeeds when the parent row has since been removed.
 
+**Initial prompt**
+
+`initial_prompt` is sent to the agent as its first turn, never before the
+agent is ready. Structured sessions deliver it once the worker is live and
+retry until it lands. Terminal sessions wait up to 60 seconds for the agent
+prompt, then type it; on timeout or a send error nothing is typed and the
+session row carries `initial_prompt_error`. A failed terminal prompt is not
+retried. A crash between delivery and bookkeeping can deliver it twice. A
+blank value returns `400`.
+
 **Worktree fields**
 
 | Field | Notes |

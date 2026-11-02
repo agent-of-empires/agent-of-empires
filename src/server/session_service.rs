@@ -1021,6 +1021,173 @@ impl SessionService {
         }
     }
 
+    fn claim_pending_drain(self: &Arc<Self>, id: &str) -> Option<PendingDrainGuard> {
+        let mut drains = self
+            .pending_drains
+            .lock()
+            .expect("pending_drains mutex poisoned");
+        drains.insert(id.to_string()).then(|| PendingDrainGuard {
+            service: Arc::clone(self),
+            id: id.to_string(),
+        })
+    }
+
+    /// Type a terminal session's `pending_initial_turn` once its agent is
+    /// running and ready, then clear it.
+    ///
+    /// Only the `pending_drains` claim is held while waiting, so lifecycle and
+    /// send operations on the session are not blocked. The submission and
+    /// instance guards cover re-validation, typing and clearing, which makes
+    /// the create-path and reconciler drains mutually exclusive. A failure
+    /// types nothing and marks the in-memory turn `error`, persisted when the
+    /// disk write succeeds; if it does not, only memory is errored and a
+    /// daemon restart retries the turn from disk. An errored turn is never
+    /// retried; the user's next terminal send discards it.
+    pub(crate) async fn drain_terminal_initial_turn(self: &Arc<Self>, id: &str) {
+        self.drain_terminal_initial_turn_within(id, TERMINAL_INITIAL_TURN_READY_BUDGET)
+            .await;
+    }
+
+    async fn drain_terminal_initial_turn_within(
+        self: &Arc<Self>,
+        id: &str,
+        ready_budget: std::time::Duration,
+    ) {
+        let Some(_claim) = self.claim_pending_drain(id) else {
+            return;
+        };
+        let Some((instance, text)) = self.undelivered_terminal_turn(id).await else {
+            return;
+        };
+        let probe = instance.clone();
+        let ready =
+            tokio::task::spawn_blocking(move || wait_for_terminal_agent(&probe, ready_budget))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+        if let Err(error) = ready {
+            self.report_undelivered_turn(id, &text, &error).await;
+            return;
+        }
+
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
+        let lock = self.instance_lock(id).await;
+        let _guard = lock.lock().await;
+        // The wait released every guard; type only into the same turn of the
+        // same launch.
+        let Some((current, current_text)) = self.undelivered_terminal_turn(id).await else {
+            return;
+        };
+        if current.lifecycle_generation != instance.lifecycle_generation
+            || current.title != instance.title
+            || current.tool != instance.tool
+            || current.lifecycle_reservation.is_some()
+            || current_text != text
+        {
+            return;
+        }
+        let typed = text.clone();
+        let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                crate::server::api::sessions::ready_agent_session(&current)?.is_some(),
+                "the agent is no longer running"
+            );
+            current
+                .tmux_session()?
+                .send_keys_with_delay(&typed, crate::agents::send_keys_enter_delay(&current.tool))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        match delivered {
+            Ok(()) => self.clear_pending_initial_turn(id).await,
+            Err(error) => self.report_undelivered_turn(id, &text, &error).await,
+        }
+    }
+
+    /// The row and text of a terminal session's pending turn that has not
+    /// failed, once its launch is finalized.
+    async fn undelivered_terminal_turn(&self, id: &str) -> Option<(Instance, String)> {
+        let instances = self.instances.read().await;
+        instances
+            .iter()
+            .find(|i| {
+                i.id == id
+                    && !i.is_structured()
+                    && i.launch_is_finalized()
+                    && i.terminal_handoff.is_none()
+            })
+            .and_then(|i| {
+                let turn = i.pending_initial_turn.as_ref()?;
+                turn.error.is_none().then(|| (i.clone(), turn.text.clone()))
+            })
+    }
+
+    async fn report_undelivered_turn(
+        self: &Arc<Self>,
+        id: &str,
+        text: &str,
+        error: &anyhow::Error,
+    ) {
+        tracing::warn!(
+            target: "tmux.command",
+            session = %id,
+            error = %error,
+            "initial prompt not delivered"
+        );
+        self.fail_pending_initial_turn(id, text, error.to_string())
+            .await;
+    }
+
+    /// Keep the pending turn but mark it undelivered, in memory and on disk.
+    async fn fail_pending_initial_turn(self: &Arc<Self>, id: &str, text: &str, reason: String) {
+        let profile = {
+            let mut instances = self.instances.write().await;
+            match instances.iter_mut().find(|i| i.id == id) {
+                Some(inst) => match inst.pending_initial_turn.as_mut() {
+                    Some(turn) if turn.text == text => {
+                        turn.error = Some(reason.clone());
+                        self.invalidate_disk_snapshots();
+                        inst.source_profile.clone()
+                    }
+                    _ => return,
+                },
+                None => return,
+            }
+        };
+        let persisted = match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let text = text.to_string();
+                tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(turn) = instances
+                            .iter_mut()
+                            .find(|i| i.id == id_persist)
+                            .and_then(|i| i.pending_initial_turn.as_mut())
+                            .filter(|turn| turn.text == text)
+                        {
+                            turn.error = Some(reason);
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+                .is_ok_and(|result| result.is_ok())
+            }
+            Err(_) => false,
+        };
+        if !persisted {
+            tracing::warn!(
+                target: "tmux.command",
+                session = %id,
+                "failed to persist initial prompt error; a daemon restart retries the prompt"
+            );
+        }
+    }
+
     /// Deliver a session's persisted `pending_initial_turn`, then clear it.
     ///
     /// Single drain owner: callers (the create fast path and the reconciler
@@ -1034,18 +1201,8 @@ impl SessionService {
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        {
-            let mut drains = self
-                .pending_drains
-                .lock()
-                .expect("pending_drains mutex poisoned");
-            if !drains.insert(id.to_string()) {
-                return;
-            }
-        }
-        let _claim = PendingDrainGuard {
-            service: Arc::clone(self),
-            id: id.to_string(),
+        let Some(_claim) = self.claim_pending_drain(id) else {
+            return;
         };
         // Non-vivifying.
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
@@ -1183,6 +1340,7 @@ impl SessionService {
             text,
             attachments,
             synthesized: true,
+            error: None,
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -1229,7 +1387,7 @@ impl SessionService {
     /// session, in memory and on disk. A newer user prompt supersedes a queued
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
-    pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
+    pub(crate) async fn clear_pending_initial_turn(&self, id: &str) {
         let profile = {
             let mut instances = self.instances.write().await;
             match instances.iter_mut().find(|i| i.id == id) {
@@ -2168,6 +2326,34 @@ impl SessionService {
     }
 }
 
+const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Blocks until the terminal session's agent process is up (alive pane, not a
+/// bare shell) and its prompt is showing. Stable output alone is never enough:
+/// a shell prompt or a failed launch is stable too.
+fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    while crate::server::api::sessions::ready_agent_session(instance)?.is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the agent was not running within {}s",
+            budget.as_secs()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let remaining = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_secs(2));
+    anyhow::ensure!(
+        instance
+            .tmux_session()?
+            .wait_until_ready(remaining, crate::agents::ready_marker(&instance.tool)),
+        "the agent was not ready within {}s",
+        budget.as_secs()
+    );
+    Ok(())
+}
+
 /// Releases a session's `pending_drains` claim on every exit path of
 /// [`SessionService::drain_pending_initial_turn`], including panics.
 struct PendingDrainGuard {
@@ -2562,6 +2748,7 @@ mod tests {
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             pending_initial_turn: None,
             acp_mode_id: None,
             view: crate::session::View::Structured,
@@ -3358,6 +3545,180 @@ mod tests {
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
+    fn terminal_turn_instance(id: &str, title: &str, text: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/aoe-term-drain");
+        inst.id = id.to_string();
+        inst.view = crate::session::View::Terminal;
+        inst.status = crate::session::Status::Idle;
+        inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: None,
+        });
+        inst
+    }
+
+    /// Starts the pane `inst` resolves to, running `script`; the guard kills it.
+    fn start_terminal_pane(
+        inst: &Instance,
+        script: &str,
+        remain_on_exit: bool,
+    ) -> crate::tmux::test_helpers::TmuxTestSession {
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let mut args = vec![
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+            "-c",
+            script,
+            ";",
+            "set-option",
+            "-t",
+            &name,
+            "pane-base-index",
+            "0",
+        ];
+        if remain_on_exit {
+            args.extend([";", "set-option", "-t", &name, "remain-on-exit", "on"]);
+        }
+        let status = crate::tmux::tmux_command()
+            .args(args)
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        crate::tmux::refresh_session_cache();
+        crate::tmux::test_helpers::TmuxTestSession::from_name(name)
+    }
+
+    const READY_AGENT_SCRIPT: &str = "echo 'agent ready banner, type a prompt below'; exec cat";
+
+    async fn pending_turn(
+        service: &SessionService,
+        id: &str,
+    ) -> Option<crate::session::PendingInitialTurn> {
+        service
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn.clone())
+    }
+
+    fn pane_text(pane: &crate::tmux::test_helpers::TmuxTestSession) -> String {
+        crate::tmux::Session::from_name(pane.name())
+            .capture_pane(20)
+            .expect("capture pane")
+    }
+
+    /// A ready agent is typed once even when the create-path and reconciler
+    /// drains race, and the turn is cleared in memory and on disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_typed_once_when_the_agent_is_ready() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-ready", "term-ready", "run-the-nightly-task");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let profile = inst.source_profile.clone();
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        let budget = std::time::Duration::from_secs(10);
+        tokio::join!(
+            service.drain_terminal_initial_turn_within("sess-term-ready", budget),
+            service.drain_terminal_initial_turn_within("sess-term-ready", budget),
+        );
+
+        // `cat` echoes each typed line once as input and once as output.
+        let typed = pane_text(&pane).matches("run-the-nightly-task").count();
+        assert_eq!(
+            typed,
+            2,
+            "typed more or less than once:\n{}",
+            pane_text(&pane)
+        );
+        assert!(pending_turn(&service, "sess-term-ready").await.is_none());
+        let on_disk = crate::session::Storage::new_unwatched(&profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(on_disk[0].pending_initial_turn.is_none());
+    }
+
+    /// Stable output is not readiness: a bare shell or a dead pane is never
+    /// typed into, the reason is recorded, and later drains do not retry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_not_typed_into_a_shell_or_dead_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        for (case, script, remain_on_exit) in [
+            (
+                "shell",
+                "echo 'login banner, nothing is running here'; exec sh",
+                false,
+            ),
+            ("dead", "echo 'the agent exited with an error banner'", true),
+            ("missing", "", false),
+        ] {
+            let id = format!("sess-term-{case}");
+            let inst = terminal_turn_instance(&id, &format!("term-{case}"), "must-not-be-typed");
+            let pane =
+                (!script.is_empty()).then(|| start_terminal_pane(&inst, script, remain_on_exit));
+            let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+                .session_service
+                .clone();
+
+            let budget = std::time::Duration::from_millis(600);
+            service
+                .drain_terminal_initial_turn_within(&id, budget)
+                .await;
+
+            let turn = pending_turn(&service, &id)
+                .await
+                .expect("the undelivered turn is kept");
+            assert_eq!(turn.text, "must-not-be-typed", "{case}");
+            assert!(
+                turn.error.is_some_and(|e| e.contains("not running")),
+                "{case}"
+            );
+            if let Some(pane) = &pane {
+                assert!(!pane_text(pane).contains("must-not-be-typed"), "{case}");
+            }
+
+            // The agent comes up afterwards; an errored turn is still not retried.
+            drop(pane);
+            let ready = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+            service
+                .drain_terminal_initial_turn_within(&id, budget)
+                .await;
+            assert!(!pane_text(&ready).contains("must-not-be-typed"), "{case}");
+            assert!(
+                pending_turn(&service, &id)
+                    .await
+                    .is_some_and(|t| t.error.is_some()),
+                "{case}"
+            );
+        }
+    }
+
     /// #3687: a background drain spawned from a pre-deletion snapshot must not
     /// re-create the deleted session's `prompt_locks` entry.
     ///
@@ -3380,6 +3741,7 @@ mod tests {
                 text: "hello".to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
             });
             inst
         }
@@ -3845,6 +4207,7 @@ mod tests {
             text: "resume".into(),
             attachments: vec![],
             synthesized: true,
+            error: None,
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;

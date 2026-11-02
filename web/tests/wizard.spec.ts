@@ -180,9 +180,9 @@ test.describe("mobile", () => {
     await expect(launchBtn).toBeInViewport();
     await expect(launchBtn).not.toContainText("Enter");
     // No dead band between the last row and Launch.
-    const group = (await w.getByLabel("Group", { exact: true }).boundingBox())!;
+    const lastRow = (await w.getByLabel("Prompt", { exact: true }).boundingBox())!;
     const launch = (await launchBtn.boundingBox())!;
-    expect(launch.y - (group.y + group.height)).toBeLessThan(80);
+    expect(launch.y - (lastRow.y + lastRow.height)).toBeLessThan(80);
   });
 
   test("a long panel grows the sheet and scrolls instead of overflowing", async ({ page }) => {

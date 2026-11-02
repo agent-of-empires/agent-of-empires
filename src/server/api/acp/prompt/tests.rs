@@ -361,6 +361,7 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
             });
         }
         seed_native_row(&state).await;
@@ -505,6 +506,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
             });
         seed_native_row(&state).await;
 
@@ -564,6 +566,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
         });
     seed_native_row(&state).await;
 

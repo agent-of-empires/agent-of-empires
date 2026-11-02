@@ -44,6 +44,7 @@ impl Instance {
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             plugin_revival_pending: false,
             pending_initial_turn: None,
             queued_prompts: Vec::new(),

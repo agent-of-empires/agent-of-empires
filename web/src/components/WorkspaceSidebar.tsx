@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
-import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "../lib/types";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
 import type { SidebarAxis } from "../lib/sidebarAxis";
@@ -35,6 +36,7 @@ import {
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
+import { SidebarSuggestions } from "./sidebar/SidebarSuggestions";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
@@ -96,6 +98,13 @@ interface Props {
   onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
+  /** Enables the "Suggested" Group, which shows only while the `sidebar` suggestions pref is on. */
+  suggestions?: {
+    onPrepare: (prefill: WizardPrefill) => void;
+    onStarted: (session: SessionResponse) => void;
+    onViewAll: () => void;
+    onOpenSession: (sessionId: string) => void;
+  };
 }
 
 export function WorkspaceSidebar(props: Props) {
@@ -384,6 +393,8 @@ export function WorkspaceSidebar(props: Props) {
               </button>
             </div>
           )}
+
+          {props.suggestions && <SidebarSuggestions readOnly={readOnly} {...props.suggestions} />}
         </div>
 
         <SidebarSystemHealth />

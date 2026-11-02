@@ -128,6 +128,7 @@ impl HomeView {
             || self.serve_view.is_some()
             || self.settings_view.is_some()
             || self.diff_view.is_some()
+            || self.suggestions_view.is_some()
     }
 
     /// True when live-send owns the keyboard: live mode is active and no

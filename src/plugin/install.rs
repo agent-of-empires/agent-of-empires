@@ -15,7 +15,7 @@ use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
-use super::registry::ValidationState;
+use super::registry::{LoadedPlugin, ValidationState};
 use super::source::PluginSource;
 
 pub enum OperationLog {
@@ -611,6 +611,8 @@ fn apply_prepared(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
+    let suggestions_changed =
+        suggestions_spec_changed(super::registry().get(id), &prepared.fetched.manifest);
     replace_and_build(id, &prepared.fetched, &final_dir, log)?;
 
     let granted = grant.is_some();
@@ -621,6 +623,9 @@ fn apply_prepared(
         &prepared.manifest_hash,
         prepared.featured_verified,
     )?;
+    if suggestions_changed {
+        forget_suggestion_publication(id);
+    }
     super::reload_registry();
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
 
@@ -974,8 +979,43 @@ fn remove_external(id: &str) -> Result<()> {
     if lock.remove(id) {
         lock.save()?;
     }
+    forget_suggestion_publication(id);
     super::reload_registry();
     Ok(())
+}
+
+/// Whether an update replaces the installed `[suggestions]` block; an
+/// unknown installed plugin counts as changed.
+fn suggestions_spec_changed(current: Option<&LoadedPlugin>, next: &PluginManifest) -> bool {
+    current.is_none_or(|p| p.manifest.suggestions != next.suggestions)
+}
+
+/// Best effort, for when no daemon is involved: it waits on the daemon's write
+/// lock, and a failure only leaves stale rows until the next publish. A running
+/// daemon clears them again itself once it stops the worker of a plugin
+/// that is gone from the registry.
+fn forget_suggestion_publication(plugin_id: &str) {
+    let result = (|| -> Result<()> {
+        let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        super::suggestions::forget_publication(&conn, plugin_id)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "plugin.install",
+            plugin = %plugin_id,
+            "could not clear published suggestions: {e:#}"
+        );
+    }
 }
 
 pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
@@ -1446,6 +1486,94 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("gh:"), "{err}");
+    }
+
+    #[test]
+    fn suggestions_spec_changed_compares_the_installed_block() {
+        let manifest = |sources: &str| {
+            PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 20\ncapabilities = [\"runtime.worker\"]\n\
+                 [runtime]\nkind = \"command\"\nsystem = true\ncommand = [\"true\"]\n{sources}"
+            ))
+            .unwrap()
+        };
+        let block = |criterion: &str| {
+            format!(
+                "[suggestions]\n[[suggestions.sources]]\ncriterion = \"{criterion}\"\nlabel = \"L\"\n"
+            )
+        };
+        let installed = LoadedPlugin {
+            manifest: manifest(&block("assigned")),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        assert!(suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("quiet"))
+        ));
+        assert!(!suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("assigned"))
+        ));
+        assert!(suggestions_spec_changed(
+            None,
+            &manifest(&block("assigned"))
+        ));
+    }
+
+    /// A separate process clears a provider's published rows through the
+    /// database file, and does not create the file when no daemon ever has.
+    #[test]
+    #[serial]
+    fn forgetting_suggestions_reaches_the_daemons_database_file() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        forget_suggestion_publication("acme.thing");
+        assert!(!db.exists());
+
+        let host = super::super::host_api::HostApiState::open(&db, "default", 100).unwrap();
+        let count = |table: &str| -> i64 {
+            host.with_suggestions_db(|conn, _| {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap()
+            })
+        };
+        host.with_suggestions_db(|conn, _| {
+            for (table, columns) in [
+                ("suggestion_providers", "updated_at"),
+                ("suggestion_items", "item_id, item_json"),
+                ("suggestion_sources", "criterion, enabled"),
+                ("suggestion_dismissals", "item_id"),
+            ] {
+                let values = match table {
+                    "suggestion_providers" => "0",
+                    "suggestion_items" => "'a', '{}'",
+                    "suggestion_sources" => "'c', 1",
+                    _ => "'a'",
+                };
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (profile, provider_id, {columns}) VALUES ('p', 'acme.thing', {values})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        });
+
+        forget_suggestion_publication("acme.thing");
+
+        assert_eq!(count("suggestion_providers"), 0);
+        assert_eq!(count("suggestion_items"), 0);
+        assert_eq!(count("suggestion_sources"), 1);
+        assert_eq!(count("suggestion_dismissals"), 1);
     }
 
     /// Uninstall removes only a configured external plugin's directory: a

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import {
   applyPluginUpdate,
@@ -151,8 +151,9 @@ export function usePluginUpdates(setError: (e: string | null) => void, startJob:
 export const sourceFromCommand = (command: string) => command.replace(/^.*\binstall\s+/, "").trim();
 
 /** GitHub discovery and the preview, consent and install flow. */
-export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
+export function usePluginMarketplace(startJob: (job: PluginJobRef) => void, initialSuggestionsOnly = false) {
   const [query, setQuery] = useState("");
+  const [suggestionsOnly, setSuggestionsOnly] = useState(initialSuggestionsOnly);
   const [results, setResults] = useState<PluginDiscoveryResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
@@ -161,10 +162,13 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
 
+  const latestDiscover = useRef(0);
   const discover = async () => {
+    const id = ++latestDiscover.current;
     setDiscovering(true);
     setError(null);
     const res = await discoverPlugins(query);
+    if (id !== latestDiscover.current) return;
     if (res.kind === "ok") {
       setResults(res.results);
     } else {
@@ -174,7 +178,8 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
     setDiscovering(false);
   };
 
-  const install = async (source: string) => {
+  /** Resolves `true` when the preview opened a consent. */
+  const install = async (source: string): Promise<boolean> => {
     setPreviewingSource(source);
     setError(null);
     setInstallError(null);
@@ -182,6 +187,7 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
       const res = await previewPluginInstall(source);
       if (res.kind === "ok") setConsent(res.consent);
       else setError(res.message);
+      return res.kind === "ok";
     } finally {
       setPreviewingSource(null);
     }
@@ -207,6 +213,8 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
   return {
     query,
     setQuery,
+    suggestionsOnly,
+    setSuggestionsOnly,
     results,
     error,
     discovering,

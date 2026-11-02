@@ -1,17 +1,22 @@
 //! The capability-gated host API a plugin worker calls over the worker
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use aoe_plugin_api::UiSlot;
+use aoe_plugin_api::{SuggestionsSpec, UiSlot};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
+use crate::plugin::suggestions;
 use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
+
+/// File name of the plugin database under the app directory.
+pub(crate) const EVENTS_DB: &str = "plugin_events.db";
 
 const CAP_WORKER: &str = "runtime.worker";
 pub(crate) const CAP_SESSION_READ: &str = "session.read";
@@ -31,7 +36,13 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    /// Providers asked to refresh, by request time (monotonic, and unix seconds to compare
+    /// with a provider's `updated_at`).
+    refreshing: Mutex<HashMap<String, (Instant, i64)>>,
 }
+
+/// A worker that never answers stops counting as refreshing after this long.
+const REFRESH_TTL: Duration = Duration::from_secs(120);
 
 impl HostApiState {
     pub fn open(
@@ -51,6 +62,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        suggestions::init(&conn).context("create suggestion tables")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -58,7 +70,36 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            refreshing: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                provider_id.to_string(),
+                (Instant::now(), chrono::Utc::now().timestamp()),
+            );
+    }
+
+    pub(crate) fn clear_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+    }
+
+    /// Unix seconds each provider was last asked to refresh, within [`REFRESH_TTL`]. A provider
+    /// is still refreshing only if its `updated_at` is older than that.
+    pub(crate) fn refreshing_providers(&self) -> HashMap<String, i64> {
+        let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|_, (at, _)| at.elapsed() < REFRESH_TTL);
+        pending
+            .iter()
+            .map(|(id, (_, unix))| (id.clone(), *unix))
+            .collect()
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
@@ -67,6 +108,20 @@ impl HostApiState {
 
     pub(crate) fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// The profile key suggestions are stored and read under.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
+    }
+
+    /// Run `f` on the plugin database with the profile key suggestions are
+    /// stored and read under. The key is resolved before the shared lock is
+    /// taken, and `f` must stay a short query: every worker RPC waits behind it.
+    pub(crate) fn with_suggestions_db<T>(&self, f: impl FnOnce(&Connection, &str) -> T) -> T {
+        let profile = self.suggestions_profile();
+        let conn = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        f(&conn, &profile)
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -182,6 +237,41 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
+            })
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::error(conn, profile, &ctx.plugin_id, params)
+            })
+        }
+        "suggestions.checks.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            let stored = state.with_suggestions_db(|conn, profile| {
+                suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
+            });
+            // A worker may answer a refresh with checks alone, which leaves `updated_at` as it was.
+            state.clear_refreshing(&ctx.plugin_id);
+            stored
+        }
+        "suggestions.sources" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::sources(conn, profile, &ctx.plugin_id, &spec)
+            })
+        }
+        "projects.list" => {
+            ctx.require(CAP_SESSION_READ)?;
+            projects_list(state)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -244,6 +334,28 @@ pub fn dispatch(
         }
         other => Err(DispatchError::method_not_found(other)),
     }
+}
+
+fn suggestions_spec(ctx: &PluginRpcContext) -> Result<SuggestionsSpec, DispatchError> {
+    crate::plugin::registry()
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active())
+        .and_then(|p| p.manifest.suggestions.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })
+}
+
+fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
+    let profile = crate::session::config::effective_profile(&state.profile);
+    let projects: Vec<Value> = crate::session::projects::load_merged(&profile)
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|project| json!({ "name": project.name, "path": project.path }))
+        .collect();
+    Ok(json!({ "projects": projects }))
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError> {
@@ -892,6 +1004,30 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_counts_until_reported_or_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.mark_refreshing("a");
+        state.mark_refreshing("b");
+        state.clear_refreshing("a");
+        let pending = state.refreshing_providers();
+        assert_eq!(pending.keys().collect::<Vec<_>>(), ["b"]);
+        assert!(pending["b"] >= chrono::Utc::now().timestamp() - 5);
+        let stale = Instant::now().checked_sub(REFRESH_TTL + Duration::from_secs(1));
+        if let Some(stale) = stale {
+            state
+                .refreshing
+                .lock()
+                .unwrap()
+                .insert("b".into(), (stale, 0));
+            assert!(
+                state.refreshing_providers().is_empty(),
+                "a silent worker expires"
+            );
+        }
+    }
+
+    #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
@@ -912,6 +1048,59 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    fn suggestions_and_projects_rpcs_are_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        for (method, caps) in [
+            ("suggestions.set", &[][..]),
+            ("suggestions.error", &[][..]),
+            ("suggestions.checks.set", &[][..]),
+            ("suggestions.sources", &[CAP_SESSION_READ][..]),
+            ("projects.list", &[CAP_WORKER][..]),
+        ] {
+            let err = dispatch(&state, &ctx(caps), method, &json!({"items": []})).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{method}");
+        }
+        // A worker whose manifest declares no [suggestions] is refused too.
+        for method in ["suggestions.sources", "suggestions.checks.set"] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert!(
+                err.message.contains("did not declare suggestions"),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_returns_registered_name_and_path() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::projects::add(
+            "default",
+            crate::session::projects::ProjectScope::Global,
+            crate::session::projects::Project::new(
+                "target",
+                "/tmp/project-target",
+                crate::session::projects::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [{ "name": "target", "path": "/tmp/project-target" }] })
+        );
     }
 
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {

@@ -29,6 +29,7 @@ mod selection;
 mod send;
 mod status;
 mod store_move;
+mod suggested;
 #[cfg(test)]
 mod tests;
 mod user_action;
@@ -40,7 +41,8 @@ use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
-    append_archived_section, append_archived_section_by_project, append_trash_section,
+    append_archived_section, append_archived_section_by_project, append_suggested_section,
+    append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
@@ -454,6 +456,7 @@ pub struct HomeView {
     pub(super) settings_close_confirm: bool,
 
     pub(super) diff_view: Option<DiffView>,
+    pub(super) suggestions_view: Option<super::suggestions::SuggestionsView>,
 
     pub(super) list_width: u16,
     pub(super) list_height: Option<u16>,
@@ -496,6 +499,8 @@ pub struct HomeView {
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     pub(super) trashed_section_collapsed: bool,
+    pub(super) suggested_section_collapsed: bool,
+    pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,
 
     /// Non-web links handed to the system opener until their exit status arrives.
     pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,

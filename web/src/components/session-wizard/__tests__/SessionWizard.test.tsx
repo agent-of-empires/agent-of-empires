@@ -1046,3 +1046,79 @@ describe("SessionWizard Group field", () => {
     expect(payload()).toMatchObject({ group: "client/new" });
   });
 });
+
+describe("SessionWizard initial prompt", () => {
+  it("seeds the field from the prefill and sends edits as initial_prompt", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft" });
+    const field = screen.getByLabelText("Prompt") as HTMLTextAreaElement;
+    expect(field.value).toBe("draft");
+    fireEvent.change(field, { target: { value: "edited" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ initial_prompt: "edited" });
+  });
+
+  it("omits initial_prompt when the field is blank", async () => {
+    renderWizard();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "  " } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().initial_prompt).toBeUndefined();
+  });
+});
+
+describe("SessionWizard suggestion link", () => {
+  it("sends the suggestion reference, and nothing when the prefill has none", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ suggestion: { provider_id: "github", id: "issue-1" } });
+  });
+});
+
+describe("SessionWizard suggestion source", () => {
+  const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
+
+  it("shows the From strip and seeds the title", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", title: "Review RFC 4562", source });
+    const strip = screen.getByTestId("wizard-source");
+    expect(strip.textContent).toContain("GitHub");
+    expect(strip.textContent).toContain("Fix lifecycle");
+    expect(strip.textContent).toContain("issue text not included");
+    expect(strip.querySelector("a")?.getAttribute("href")).toBe(source.url);
+    expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Review RFC 4562");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ title: "Review RFC 4562" });
+  });
+
+  it("offers Edit template only for a templated prompt", () => {
+    const onEditTemplate = vi.fn();
+    const template = { providerId: "gh", criterion: "review-requested" };
+    const mount = (prefill: WizardPrefill) =>
+      render(
+        <SessionWizard
+          servedProfile="default"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+          prefill={prefill}
+          onEditTemplate={onEditTemplate}
+        />,
+      );
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "/aoe-review", source, template });
+    expect(screen.getByTestId("wizard-template").textContent).toContain("review-requested");
+    fireEvent.click(screen.getByRole("button", { name: "Edit template" }));
+    expect(onEditTemplate).toHaveBeenCalledWith(template);
+    cleanup();
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft", source });
+    expect(screen.queryByTestId("wizard-template")).toBeNull();
+  });
+
+  it("does not link a non-http source url, and shows no strip without a source", () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", source: { ...source, url: "javascript:alert(1)" } });
+    expect(screen.getByTestId("wizard-source").querySelector("a")).toBeNull();
+    cleanup();
+    renderWizard();
+    expect(screen.queryByTestId("wizard-source")).toBeNull();
+  });
+});

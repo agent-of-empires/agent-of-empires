@@ -21,6 +21,7 @@ pub mod host_api;
 pub mod protocol;
 pub mod sandbox;
 pub mod session_api;
+pub mod suggestions;
 pub mod ui_state;
 
 pub mod launch;

@@ -352,6 +352,52 @@ impl HttpClient {
             .commands)
     }
 
+    /// `GET /api/suggestions`. The raw snapshot (`providers`, `items`); the
+    /// caller decodes only the fields it renders. Global, like `plugin_ui_state`.
+    pub async fn suggestions(&self) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}/api/suggestions", self.endpoint.base_url);
+        let res = self.execute(self.http.get(&url)).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json(res).await?)
+    }
+
+    /// `POST /api/suggestions/refresh`. Asks every provider to discover again;
+    /// the new items arrive in a later [`suggestions`](Self::suggestions) read.
+    pub async fn refresh_suggestions(&self) -> Result<(), HttpError> {
+        let url = format!("{}/api/suggestions/refresh", self.endpoint.base_url);
+        let res = self.execute(self.http.post(&url)).await?;
+        check_global_status(res)?;
+        Ok(())
+    }
+
+    /// `POST /api/suggestions/{dismiss,undismiss}`.
+    pub async fn set_suggestion_dismissed(
+        &self,
+        provider_id: &str,
+        id: &str,
+        dismissed: bool,
+    ) -> Result<(), HttpError> {
+        let verb = if dismissed { "dismiss" } else { "undismiss" };
+        let url = format!("{}/api/suggestions/{verb}", self.endpoint.base_url);
+        let body = serde_json::json!({ "provider_id": provider_id, "id": id });
+        let res = self.execute(self.http.post(&url).json(&body)).await?;
+        check_global_status(res)?;
+        Ok(())
+    }
+
+    /// `POST /api/suggestions/prepare`. The wizard prefill for one item.
+    pub async fn prepare_suggestion(
+        &self,
+        provider_id: &str,
+        id: &str,
+    ) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}/api/suggestions/prepare", self.endpoint.base_url);
+        let body = serde_json::json!({ "provider_id": provider_id, "id": id });
+        let res = self.execute(self.http.post(&url).json(&body)).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json(res).await?)
+    }
+
     /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
     /// plugin command to its worker as a fire-and-forget notification (the TUI
     /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the

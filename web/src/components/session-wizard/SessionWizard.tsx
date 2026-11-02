@@ -36,6 +36,7 @@ import {
   claimPendingCreate,
   isPendingCreateExpired,
   PENDING_CREATE_EXPIRED_MESSAGE,
+  newIdempotencyKey,
   peekPendingCreate,
   registerPendingCreate,
   releasePendingCreate,
@@ -55,6 +56,7 @@ import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
+import { slugifyBranch } from "./sessionNames";
 import { buildCreateRequest } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
@@ -82,6 +84,14 @@ export interface WizardPrefill {
   scratch?: boolean;
   /** The registered project's worktree override for `path`; `undefined` means none. */
   worktreeEnabled?: boolean;
+  initialPrompt?: string;
+  title?: string;
+  /** Where a suggested session came from, shown as the "From" strip. */
+  source?: { label: string; title: string; url: string };
+  /** Set when a stored template produced `initialPrompt`. */
+  template?: { providerId: string; criterion: string };
+  /** Suggestion to link the created Session to. */
+  suggestion?: { provider_id: string; id: string };
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -102,6 +112,9 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
     group: prefill.group || "",
+    initialPrompt: prefill.initialPrompt ?? "",
+    title: prefill.title ?? "",
+    worktreeBranch: prefill.title ? slugifyBranch(prefill.title) : base.worktreeBranch,
     scratch: prefill.scratch ?? false,
     useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
@@ -131,12 +144,6 @@ const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
-
-function newIdempotencyKey(): string {
-  // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-}
 
 function waitUntilOnline(): Promise<void> {
   if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
@@ -175,9 +182,29 @@ interface Props {
   onRetryServedProfile?: () => Promise<void>;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
+  /** Opens the template that produced the prefilled prompt for editing. */
+  onEditTemplate?: (template: NonNullable<WizardPrefill["template"]>) => void;
 }
 
 const NO_GROUPS: GroupInfo[] = [];
+
+function SourceStrip({ source }: { source: NonNullable<WizardPrefill["source"]> }) {
+  return (
+    <div
+      data-testid="wizard-source"
+      className="flex flex-wrap items-center gap-2 rounded-md border border-surface-700/60 bg-surface-900 px-2.5 py-2 text-xs text-text-secondary"
+    >
+      <span className="font-mono font-medium">{source.label}</span>
+      <span className="min-w-[200px] flex-1 text-text-primary">{source.title}</span>
+      <span className="text-[11px] text-text-dim">issue text not included</span>
+      {/^https?:\/\//i.test(source.url) && (
+        <a href={source.url} target="_blank" rel="noreferrer" className="text-brand-500 hover:underline">
+          Open &#8599;
+        </a>
+      )}
+    </div>
+  );
+}
 
 export function SessionWizard({
   onClose,
@@ -187,6 +214,7 @@ export function SessionWizard({
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
+  onEditTemplate,
 }: Props) {
   const [state, dispatch] = useReducer(reducer, {
     data: initialWizardData(prefill, nameOnly),
@@ -614,6 +642,7 @@ export function SessionWizard({
           state.agents.find((a) => a.name === d.tool),
         ),
       ),
+      suggestion: prefill?.suggestion,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.
@@ -778,6 +807,7 @@ export function SessionWizard({
     <RowGroup>{titleRow}</RowGroup>
   ) : (
     <div className="space-y-4">
+      {prefill?.source && <SourceStrip source={prefill.source} />}
       <RowGroup>
         {state.profiles.length > 1 && (
           <NavRow
@@ -877,6 +907,29 @@ export function SessionWizard({
             onChange={(v) => handleChange("group", v)}
             groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
           />
+        </FieldRow>
+        <FieldRow label="Prompt" htmlFor="wizard-initial-prompt">
+          <textarea
+            id="wizard-initial-prompt"
+            value={d.initialPrompt}
+            onChange={(e) => handleChange("initialPrompt", e.target.value)}
+            placeholder="Sent to the agent once it is ready"
+            rows={2}
+            className={`${ROW_INPUT} resize-y`}
+          />
+          {prefill?.template && onEditTemplate && (
+            <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
+              From template: <span className="font-mono">{prefill.template.criterion}</span>
+              {" \u00b7 "}
+              <button
+                type="button"
+                onClick={() => onEditTemplate(prefill.template!)}
+                className="cursor-pointer text-brand-500 hover:underline"
+              >
+                Edit template
+              </button>
+            </p>
+          )}
         </FieldRow>
       </RowGroup>
     </div>
