@@ -1855,7 +1855,7 @@ impl SessionCacheGuard {
         }
     }
 
-    /// Force a fresh "server reachable" snapshot containing exactly `names`.
+    /// Pin names with a fresh timestamp; the cache TTL still applies.
     pub(crate) fn force_present(&self, names: &[&str]) {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = Some(
