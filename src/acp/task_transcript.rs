@@ -159,6 +159,14 @@ impl ActiveTasks {
         self.lock().is_empty()
     }
 
+    /// Stops following `task_id`, returning whether a tailer was following it.
+    pub(crate) fn cancel(&self, task_id: &str) -> bool {
+        self.lock().get(task_id).is_some_and(|owner| {
+            owner.cancellation.cancel();
+            true
+        })
+    }
+
     fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
         self.lock()
             .get(task_id)
@@ -796,6 +804,19 @@ mod tests {
         f.parked().await;
         f.append(&notification_line("t-1", Some("failed")));
         assert_eq!(finished_id(f.next().await), "t-1");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tailer_releases_its_slot_without_finishing() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.spawn(TailerStart::Live).await;
+        f.parked().await;
+        assert!(f.active.cancel("t-1"));
+        f.released().await;
+        assert!(!f.active.cancel("t-1"), "nothing follows a released task");
+        f.append(&notification_line("t-1", Some("completed")));
+        f.drop_sender();
+        assert!(f.rx.recv().await.is_none(), "no end event after cancel");
     }
 
     #[tokio::test]
