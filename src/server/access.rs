@@ -457,6 +457,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sandbox/image-pull"),
     ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
+    ("POST", "/api/sessions/empty-trash"),
     ("POST", "/api/sessions/{id}/restart"),
     ("POST", "/api/sessions/{id}/recreate-container"),
     ("POST", "/api/sessions/{id}/tools/ensure"),
@@ -514,6 +515,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/install-agent"),
     ("POST", "/api/sessions/{id}/acp/mode"),
     ("POST", "/api/sessions/{id}/acp/spawn"),
+    ("POST", "/api/sessions/{id}/acp/restart"),
     ("POST", "/api/sessions/{id}/acp/switch-agent"),
     ("POST", "/api/sessions/{id}/acp/switch-provider"),
     // Global settings / ops / shared workspace ordering.

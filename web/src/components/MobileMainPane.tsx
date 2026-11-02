@@ -4,6 +4,7 @@ import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./acp/startupWait";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
@@ -16,10 +17,14 @@ import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
+import type { ServerAbout } from "../lib/api";
+import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
+  /** Start a Session, for a queued row's "Start and send". */
+  onStartSession?: (sessionId: string) => void;
   readOnly: boolean;
   view: RightPanelView;
   pluginPanes: PluginPane[];
@@ -56,6 +61,8 @@ interface Props {
   onOpenSendDialog: () => void;
   onCloseSendDialog: () => void;
   onClearSelectedFile: () => void;
+  /** Decides whether the usage-limit banner links to Settings. */
+  serverAbout: ServerAbout | null;
 }
 
 function layerClass(active: boolean): string {
@@ -66,6 +73,7 @@ function layerClass(active: boolean): string {
 /** Keep terminal geometry and scrollback across switches; only the visible
  *  surface owns keyboard input. */
 export function MobileMainPane({
+  onStartSession,
   readOnly,
   view,
   pluginPanes,
@@ -98,6 +106,7 @@ export function MobileMainPane({
   onOpenSendDialog,
   onCloseSendDialog,
   onClearSelectedFile,
+  serverAbout,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
@@ -142,10 +151,14 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
+                    settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
+                    startedBefore={hasStartedBefore(session)}
                     acpProvider={session.acp_provider ?? null}
                     clearAliases={session.clear_aliases}
+                    compactAliases={session.compact_aliases}
+                    onStartSession={onStartSession && (() => onStartSession(session.id))}
                     archivedAt={session.archived_at ?? null}
                     snoozedUntil={session.snoozed_until ?? null}
                     trashedAt={session.trashed_at ?? null}

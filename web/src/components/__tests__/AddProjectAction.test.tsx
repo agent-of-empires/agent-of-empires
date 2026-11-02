@@ -126,7 +126,7 @@ describe("AddProjectModal", () => {
     openRowMenu(ws());
     fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
     fireEvent.change(screen.getByTestId("add-project-modal-input"), { target: { value: "/typed/repo" } });
-    await screen.findByRole("alert");
+    expect((await screen.findByRole("alert")).textContent).toMatch(/^Projects could not be loaded\./);
     fail = false;
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await screen.findByTitle("/src/frontend");

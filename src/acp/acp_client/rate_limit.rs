@@ -45,6 +45,15 @@ pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -
         "no such session",
         "session does not exist",
     ];
+    // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
+    if err.code == agent_client_protocol::ErrorCode::ResourceNotFound
+        && err
+            .data
+            .as_ref()
+            .is_some_and(|d| d.get("sessionId").is_some())
+    {
+        return true;
+    }
     let msg = err.message.to_ascii_lowercase();
     PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
@@ -368,5 +377,19 @@ mod tests {
                 "{msg:?}"
             );
         }
+
+        // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
+        let not_found = |data| {
+            let mut e = err("Resource not found", data);
+            e.code = agent_client_protocol::ErrorCode::ResourceNotFound;
+            e
+        };
+        assert!(is_unsupported_session_error(&not_found(Some(
+            json!({ "sessionId": "abc" })
+        ))));
+        assert!(!is_unsupported_session_error(&not_found(None)));
+        assert!(!is_unsupported_session_error(&not_found(Some(
+            json!({ "uri": "file:///x" })
+        ))));
     }
 }

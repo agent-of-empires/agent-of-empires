@@ -128,7 +128,7 @@ pub async fn create_skill(
         skills_model::create_skill(&app_dir, &directory, body.description.as_deref())
     })
     .await;
-    mutation_response(result, Some(response_directory))
+    mutation_response(result, "skill created", &response_directory, true)
 }
 
 #[derive(Deserialize)]
@@ -142,6 +142,7 @@ pub async fn edit_skill(
     Path(directory): Path<String>,
     Json(body): Json<EditSkillBody>,
 ) -> Response {
+    let edited = directory.clone();
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
@@ -150,7 +151,7 @@ pub async fn edit_skill(
         skills_model::edit_skill(&home, &app_dir, &directory, &body.content)
     })
     .await;
-    mutation_response(result, None)
+    mutation_response(result, "skill updated", &edited, false)
 }
 
 /// `DELETE /api/skills/{directory}`: delete an AoE-managed skill.
@@ -158,6 +159,7 @@ pub async fn delete_skill(
     _guard: ElevatedMutationGuard,
     Path(directory): Path<String>,
 ) -> Response {
+    let removed = directory.clone();
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
@@ -166,7 +168,7 @@ pub async fn delete_skill(
         skills_model::delete_skill(&home, &app_dir, &directory)
     })
     .await;
-    mutation_response(result, None)
+    mutation_response(result, "skill removed", &removed, false)
 }
 
 #[derive(Default, Deserialize)]
@@ -185,6 +187,7 @@ pub async fn adopt_skill(
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
     };
+    let (adopted, requested) = (provenance.clone(), directory.clone());
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
@@ -200,12 +203,18 @@ pub async fn adopt_skill(
     })
     .await;
     match result {
-        Ok(Ok(directory)) => (
-            StatusCode::CREATED,
-            Json(json!({ "ok": true, "directory": directory })),
-        )
-            .into_response(),
-        Ok(Err(error)) => skill_error(error),
+        Ok(Ok(directory)) => {
+            tracing::info!(target: "session.skills", %directory, source = ?adopted, "skill adopted");
+            (
+                StatusCode::CREATED,
+                Json(json!({ "ok": true, "directory": directory })),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "session.skills", %source, directory = %requested, ?error, "skill adopt failed");
+            skill_error(error)
+        }
         Err(error) => task_error(error),
     }
 }
@@ -247,6 +256,7 @@ pub async fn sync_skills(
             );
         }
     }
+    let (roots, directories) = (body.roots.clone(), body.directories.clone());
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
@@ -268,19 +278,35 @@ pub async fn sync_skills(
     })
     .await;
     match result {
-        Ok(Ok(outcomes)) => Json(json!({ "ok": true, "outcomes": outcomes })).into_response(),
-        Ok(Err(error)) => skill_error(error),
+        Ok(Ok(outcomes)) => {
+            tracing::info!(target: "session.skills", ?roots, ?directories, outcomes = outcomes.len(), "skills synced");
+            Json(json!({ "ok": true, "outcomes": outcomes })).into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "session.skills", ?roots, ?directories, ?error, "skill sync failed");
+            skill_error(error)
+        }
         Err(error) => task_error(error),
     }
 }
 
+/// `echo_directory` keeps the create response's `directory` field; other mutations answer `null`.
 fn mutation_response(
     result: Result<Result<(), SkillError>, tokio::task::JoinError>,
-    directory: Option<String>,
+    message: &'static str,
+    directory: &str,
+    echo_directory: bool,
 ) -> Response {
     match result {
-        Ok(Ok(())) => Json(json!({ "ok": true, "directory": directory })).into_response(),
-        Ok(Err(error)) => skill_error(error),
+        Ok(Ok(())) => {
+            tracing::info!(target: "session.skills", %directory, source = "aoe-managed", "{message}");
+            let directory = echo_directory.then_some(directory);
+            Json(json!({ "ok": true, "directory": directory })).into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "session.skills", %directory, ?error, "{message} failed");
+            skill_error(error)
+        }
         Err(error) => task_error(error),
     }
 }

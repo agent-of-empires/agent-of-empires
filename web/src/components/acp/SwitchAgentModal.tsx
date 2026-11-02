@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent, type AcpAgentInfo } from "../../lib/api";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { effectiveLifecycle } from "../../lib/agentProfiles";
 
 /** Hands the session to another ACP agent, then prefills (never sends) a handoff
  *  message with a recap from before the switch and any prompt the old agent never
- *  processed. The rate-limit trigger prefers codex and frames the recap as a handoff. */
+ *  processed. The rate-limit trigger frames the recap as a handoff. */
 type SwitchTrigger = "rate_limit" | "manual";
 
 interface Props {
@@ -14,13 +15,22 @@ interface Props {
   onClose: () => void;
   onPrefill: (text: string) => void;
   trigger?: SwitchTrigger;
+  /** When set, only these Agents are offered besides the current one. */
+  eligible?: readonly string[];
 }
 
-const PREFERRED_FALLBACK = "codex";
-
-export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPrefill, trigger = "manual" }: Props) {
+export function SwitchAgentModal({
+  open,
+  sessionId,
+  currentAgent,
+  onClose,
+  onPrefill,
+  trigger = "manual",
+  eligible,
+}: Props) {
   const [agents, setAgents] = useState<AcpAgentInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const agentName = useAgentDisplayNames();
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,10 +58,9 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
       .then((list) => {
         if (cancelled) return;
         // The current agent stays listed but disabled; picks come from the others.
-        setAgents(list);
-        const targets = list.filter((a) => a.name !== currentAgent);
-        const preferred = rateLimited ? targets.find((a) => a.name === PREFERRED_FALLBACK) : undefined;
-        setSelected(preferred?.name ?? targets[0]?.name ?? null);
+        const offered = eligible ? list.filter((a) => a.name === currentAgent || eligible.includes(a.name)) : list;
+        setAgents(offered);
+        setSelected(offered.find((a) => a.name !== currentAgent)?.name ?? null);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -64,7 +73,7 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
     return () => {
       cancelled = true;
     };
-  }, [open, currentAgent, rateLimited, depKey]);
+  }, [open, currentAgent, rateLimited, depKey, eligible]);
 
   // No dismissal mid-switch, so a half-done handoff can finish.
   useEffect(() => {
@@ -120,7 +129,8 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
     }
   };
 
-  const title = rateLimited ? "Continue in another agent?" : "Switch agent?";
+  const currentName = agentName(currentAgent);
+  const title = rateLimited ? "Continue in another Agent" : "Switch agent?";
   const hasAlternatives = agents.some((a) => a.name !== currentAgent);
 
   return (
@@ -140,9 +150,9 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
         <p className="mt-1 text-xs text-text-muted">
           {rateLimited ? (
             <>
-              The current agent ({currentAgent ?? "unknown"}) is rate-limited. Hand the session off to a different
-              installed ACP backend; we will pre-fill the composer with a recap of the recent turns for you to review
-              before sending.
+              {currentName} reached its usage limit. The Agent you pick continues this Session: the composer is
+              pre-filled with a recap of the recent turns for you to review before sending. The full history isn&apos;t
+              carried over.
             </>
           ) : (
             <>
@@ -188,19 +198,25 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
                         disabled={submitting || isCurrent}
                       />
                       <span className="flex-1">
-                        <span className="block text-sm font-mono">
-                          {a.name}
-                          {isCurrent && <span className="ml-2 font-sans text-xs text-text-muted">(current)</span>}
+                        <span className="block text-sm">
+                          {agentName(a.name)}
+                          {isCurrent && (
+                            <span className="ml-2 text-xs text-text-muted">
+                              {rateLimited ? "current · limit reached" : "(current)"}
+                            </span>
+                          )}
                           {effectiveLifecycle(a, a.name).state === "deprecated" && (
                             <span
-                              className="ml-2 font-sans text-xs text-status-warning"
+                              className="ml-2 text-xs text-status-warning"
                               data-testid={`switch-agent-deprecated-${a.name}`}
                             >
                               (deprecated)
                             </span>
                           )}
                         </span>
-                        <span className="block text-xs text-text-muted">{a.description}</span>
+                        {a.description !== agentName(a.name) && (
+                          <span className="block text-xs text-text-muted">{a.description}</span>
+                        )}
                       </span>
                     </label>
                   </li>
@@ -240,7 +256,9 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
             disabled={!selected || submitting || !hasAlternatives}
             className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {submitting ? "Switching..." : `${rateLimited ? "Continue in" : "Switch to"} ${selected ?? ""}`}
+            {submitting
+              ? "Switching..."
+              : `${rateLimited ? "Continue in" : "Switch to"} ${selected ? agentName(selected) : ""}`}
           </button>
         </div>
       </div>

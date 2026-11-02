@@ -45,7 +45,7 @@ export interface SidebarGroup {
   repoPath?: string;
   /** Set when `kind === "sessionGroup"`. Empty string for Ungrouped. */
   groupPath?: string;
-  /** Saved projects for this repo path, pinned or not. Repo axis only. */
+  /** Registered Projects for this repo path, pinned or not. Repo axis only. */
   registeredProjects: ProjectInfo[];
   pinned: boolean;
   /** Pinned with no live workspace. */
@@ -59,7 +59,7 @@ function isSyntheticRepoGroup(id: string): boolean {
 // Synthetic Multi-repo and Scratch buckets keep the wizard create action.
 export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
   const synthetic = isSyntheticRepoGroup(group.id);
-  // A saved but unpinned project gets no marker and no sessionless header.
+  // An unpinned Project gets the plain Project marker and no sessionless header.
   const pinned = !synthetic && group.registeredProjects.some((p) => p.pinned);
   return {
     id: group.id,

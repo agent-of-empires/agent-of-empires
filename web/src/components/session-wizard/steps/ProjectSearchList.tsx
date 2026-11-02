@@ -51,7 +51,7 @@ export function ProjectSearchList({
 
       {filteredSaved.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Saved projects</p>
+          <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Projects</p>
           {filteredSaved.map((s) => (
             <button
               key={`saved:${s.scope}:${s.path}`}

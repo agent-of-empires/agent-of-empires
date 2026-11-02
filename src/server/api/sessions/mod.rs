@@ -54,6 +54,7 @@ pub use ensure::*;
 pub(crate) use lifecycle::recovery_restart;
 pub use lifecycle::*;
 pub use list::*;
+pub(crate) use model::session_response_from_instance;
 use model::*;
 pub use rename::*;
 pub use search::*;

@@ -86,6 +86,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             put(api::edit_skill).delete(api::delete_skill),
         )
         .route(
+            "/api/sessions/empty-trash",
+            post(api::empty_trash).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}",
             patch(api::rename_session)
                 .delete(api::delete_session)
@@ -426,6 +430,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
+        .route("/api/sessions/{id}/acp/restart", post(api::restart_acp))
         .route(
             "/api/sessions/{id}/acp/install-agent",
             post(api::install_agent),

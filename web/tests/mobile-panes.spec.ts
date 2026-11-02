@@ -126,6 +126,34 @@ test.describe("Mobile right panel picker (#1452)", () => {
     });
   }
 
+  test("adjusting selected chat text does not open either drawer", async ({ page }) => {
+    await openLiveTerminal(page, { mobile: true, settings: null });
+    const content = liveContent(page).first();
+    await expect(content).toContainText("$ ready");
+    const selected = await content.evaluate((el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = document.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return selection.toString();
+    });
+    expect(selected).toContain("$ ready");
+    const { width, height } = page.viewportSize()!;
+    for (const [from, to] of [
+      [width / 2 + 80, width / 2 - 80],
+      [width / 2 - 80, width / 2 + 80],
+    ]) {
+      await swipe(page, from, to, height / 2);
+      await expect(picker(page)).toBeHidden();
+      await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
+      expect(await page.evaluate(() => document.getSelection()?.toString())).toBe(selected);
+    }
+    await page.evaluate(() => document.getSelection()?.removeAllRanges());
+    await swipe(page, width / 2 + 80, width / 2 - 80, height / 2);
+    await expect(picker(page)).toBeVisible();
+  });
+
   test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
     await openPicker(page);

@@ -112,24 +112,32 @@ pub(super) async fn reap_idle_sessions(
                     let id = cand.session_id.clone();
                     let profile = cand.profile.clone();
                     let file_watch_for_storage = file_watch.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(storage) =
-                            crate::session::Storage::new(&profile, file_watch_for_storage)
-                        {
-                            let _ = storage.update(|instances, _groups| {
-                                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                                    inst.status = crate::session::Status::Error;
-                                }
-                                Ok(())
-                            });
-                        }
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        let storage =
+                            crate::session::Storage::new(&profile, file_watch_for_storage)?;
+                        storage.update(|instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                                inst.status = crate::session::Status::Error;
+                            }
+                            Ok(())
+                        })
                     })
-                    .await;
-                    tracing::warn!(
-                        target: "server.idle_reap",
-                        session = %cand.session_id,
-                        "idle auto-stop kill failed; marked Error",
-                    );
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+                    match persisted {
+                        Ok(()) => tracing::warn!(
+                            target: "server.idle_reap",
+                            session = %cand.session_id,
+                            "idle auto-stop kill failed; marked Error",
+                        ),
+                        Err(error) => tracing::error!(
+                            target: "server.idle_reap",
+                            session = %cand.session_id,
+                            %error,
+                            "failed to persist Error after idle-stop kill failure",
+                        ),
+                    }
                 }
             }
         });

@@ -133,6 +133,9 @@ test.describe("Sidebar project pin/unpin", () => {
     await page.getByTestId("sidebar-group-context-menu-unpin").click();
     await expect(header).toBeHidden();
     const toggle = page.getByTestId("sidebar-projects-toggle");
+    // The section names what it holds, with its own count.
+    await expect(toggle).toContainText("Projects, no sessions");
+    await expect(toggle).toContainText("(1)");
     if ((await toggle.getAttribute("aria-expanded")) === "false") await toggle.click();
     await expect(page.getByTestId("sidebar-project-row").filter({ hasText: "repo-b" })).toBeVisible();
   });

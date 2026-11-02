@@ -49,8 +49,9 @@ export function CityHallSettings() {
         <div className="text-[13px] text-text-secondary">CityHall config bundle</div>
         <p className="mt-1 text-[11px] text-text-muted">
           One file describing how CityHall should set up every workspace: the settings on this install that differ from
-          the defaults, plus your saved projects, addressed by git remote so a workspace can clone them. Host-specific
-          paths are left out, and no credentials are included. Paste it into CityHall's workspace configuration.
+          the defaults, plus your registered Projects, addressed by git remote so a workspace can clone them.
+          Host-specific paths are left out, and no credentials are included. Paste it into CityHall's workspace
+          configuration.
         </p>
       </div>
 

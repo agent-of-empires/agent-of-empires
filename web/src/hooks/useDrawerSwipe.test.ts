@@ -140,6 +140,41 @@ describe("useDrawerSwipe", () => {
     else expect(onAction).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("preserves text selection active mid-gesture: %s", (midGesture) => {
+    const { onAction } = mount();
+    const text = document.createTextNode("Selected chat text");
+    document.body.appendChild(text);
+    const selection = document.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    try {
+      for (const [start, end] of [
+        [150, 300],
+        [300, 150],
+      ]) {
+        selection.removeAllRanges();
+        if (midGesture) {
+          dispatchTouch("touchstart", [[start, 100]]);
+          swipeMoves([(start + end) / 2, 100]);
+        }
+        selection.addRange(range);
+        if (!midGesture) dispatchTouch("touchstart", [[start, 100]]);
+        swipeMoves([end, 100]);
+        expect(selection.toString()).toBe("Selected chat text");
+        expect(onAction).not.toHaveBeenCalled();
+        selection.removeAllRanges();
+        swipeMoves([end, 100]);
+        expect(onAction).not.toHaveBeenCalled();
+        dispatchTouch("touchend", []);
+      }
+      swipe([150, 100], [300, 100]);
+      expect(onAction).toHaveBeenCalledExactlyOnceWith("open-sidebar");
+    } finally {
+      selection.removeAllRanges();
+      text.remove();
+    }
+  });
+
   it("acts on the latest state without remounting", () => {
     const onAction = vi.fn();
     const { rerender } = renderHook(({ state }) => useDrawerSwipe(state, onAction), {

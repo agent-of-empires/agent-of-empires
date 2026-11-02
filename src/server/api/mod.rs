@@ -27,8 +27,8 @@ pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
     acp_set_mode, acp_worker_log, agent_install_info, get_option_catalog, install_agent,
-    list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, shutdown_acp,
-    spawn_acp, switch_acp_agent, switch_acp_provider,
+    list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, restart_acp,
+    shutdown_acp, spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
@@ -57,11 +57,11 @@ pub use projects::{create_project, delete_project, list_projects, update_project
 pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
-    create_session_progress, delete_session, delete_workspace, ensure_container_terminal,
-    ensure_session, ensure_terminal, ensure_tool, force_smart_rename, get_recent_projects,
-    kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs, read_output,
-    recreate_container, rename_session, restart_for_update, restart_session, restore_session,
-    review_creation_trust, search_sessions, send_message, serve_session_artifact,
+    create_session_progress, delete_session, delete_workspace, empty_trash,
+    ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
+    get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
+    read_output, recreate_container, rename_session, restart_for_update, restart_session,
+    restore_session, review_creation_trust, search_sessions, send_message, serve_session_artifact,
     session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
     set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
     touch_session_access, trash_session, update_session_archive, update_session_color,
@@ -407,7 +407,12 @@ mod tests {
         (
             "sessions/delete.rs",
             include_str!("sessions/delete.rs"),
-            &["abandon_purge", "delete_session", "delete_workspace"],
+            &[
+                "abandon_purge",
+                "delete_session",
+                "delete_workspace",
+                "empty_trash",
+            ],
         ),
         (
             "sessions/rename.rs",
@@ -522,6 +527,7 @@ mod tests {
             "acp/worker.rs",
             include_str!("acp/worker.rs"),
             &[
+                "restart_acp",
                 "shutdown_acp",
                 "spawn_acp",
                 "switch_acp_agent",
@@ -1725,6 +1731,7 @@ mod tests {
             (Method::DELETE, "/api/sessions/missing"),
             (Method::POST, "/api/sessions/missing/trash"),
             (Method::POST, "/api/plugins/commands/missing/invoke"),
+            (Method::POST, "/api/sessions/empty-trash"),
             (Method::POST, "/api/groups"),
             (Method::PATCH, "/api/groups"),
             (Method::DELETE, "/api/groups"),

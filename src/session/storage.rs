@@ -1287,13 +1287,17 @@ pub(crate) trait SessionStore: Send + Sync {
     ) where
         Self: Sized + 'static,
     {
-        let _ = std::thread::Builder::new()
+        let session = id.clone();
+        if let Err(error) = std::thread::Builder::new()
             .name("aoe-lifecycle-reservation-release".into())
             .spawn(move || {
                 if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
                     tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
                 }
-            });
+            })
+        {
+            tracing::error!(target: "session.lifecycle", session = %session, %error, "could not spawn reservation-release thread");
+        }
     }
     fn managed_capture_store_is_exclusive(
         &self,
@@ -1870,6 +1874,32 @@ impl Storage {
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
         )
+    }
+
+    /// [`Self::acquire_instance_lifecycle_lock`] without the wait; `None` while another holder has it.
+    pub(crate) fn try_acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        try_acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_locks_are_free_for_test(&self) -> bool {
+        let profile_dir = self.sessions_path.parent().expect("profile directory");
+        self.save_lock.try_lock().is_ok()
+            && try_acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)
+                .expect("probe storage lock")
+                .is_some()
     }
 
     /// Whether some holder currently has `instance_id`'s lifecycle lock.

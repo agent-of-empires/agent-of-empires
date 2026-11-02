@@ -52,6 +52,7 @@ pub async fn update_session_group(
     };
 
     let persist_id = id.clone();
+    let value = group.clone();
     let committed = commit_profile_update(
         &state,
         profile,
@@ -67,6 +68,7 @@ pub async fn update_session_group(
     if let Err(response) = committed {
         return response;
     }
+    tracing::info!(target: "session.sync", session = %id, field = "group", %value, "session updated");
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await

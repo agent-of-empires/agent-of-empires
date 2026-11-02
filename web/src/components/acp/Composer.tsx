@@ -82,6 +82,8 @@ interface Props {
   connected: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
   /** Mid-turn the textarea stays editable and sends go through the queue. */
   turnActive: boolean;
   /** Queue path used by the custom send buttons and mid-turn Enter, which the primitive blocks. */
@@ -367,6 +369,7 @@ export function Composer(props: Props) {
                     <QueueSendButton
                       connected={connected}
                       waitingFor={props.waitingFor}
+                      connecting={props.connecting}
                       steering={!!promptCapabilities?.steering}
                       disabled={!canSend}
                       onSend={submitComposer}
@@ -376,6 +379,7 @@ export function Composer(props: Props) {
                   <SendButton
                     connected={connected}
                     waitingFor={props.waitingFor}
+                    connecting={props.connecting}
                     disabled={!canSend}
                     onSend={submitComposer}
                   />

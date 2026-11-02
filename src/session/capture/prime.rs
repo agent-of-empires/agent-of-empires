@@ -123,22 +123,16 @@ fn open_root_transcript(
         .then_some((reader, header))
 }
 
-/// Copy the root transcript of `parent_id` from the parent's sessions directory
-/// into `session_dir` of the child's private store, so `prime-agent --fork
-/// <parent_id>` finds it there. Exactly one
-/// transcript must carry that id and `cwd`; a copy already in place for the same
-/// conversation is kept, any other entry at its name is refused, and the
-/// parent's store is only read, never shared.
-pub(crate) fn hand_off_root_transcript(
+fn open_unique_root_transcript(
     parent_sessions: &Path,
-    child_store: &Path,
-    session_dir: &Path,
     parent_id: &str,
     cwd: &str,
-) -> Result<()> {
+) -> Result<(
+    std::ffi::OsString,
+    std::io::BufReader<std::fs::File>,
+    Vec<u8>,
+)> {
     use anyhow::Context as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
     let parent = crate::session::AnchoredDir::open(parent_sessions)
         .context("opening the parent's Prime sessions")?;
     let names = parent
@@ -162,8 +156,36 @@ pub(crate) fn hand_off_root_transcript(
         matches.next().is_none(),
         "more than one Prime transcript names the parent conversation"
     );
-    let (mut reader, header) = open_root_transcript(&parent, Path::new(&name), parent_id, cwd)
+    let (reader, header) = open_root_transcript(&parent, Path::new(&name), parent_id, cwd)
         .context("the parent's Prime transcript changed during the handoff")?;
+    Ok((name, reader, header))
+}
+
+pub(crate) fn validate_root_transcript(
+    parent_sessions: &Path,
+    parent_id: &str,
+    cwd: &str,
+) -> Result<()> {
+    open_unique_root_transcript(parent_sessions, parent_id, cwd).map(|_| ())
+}
+
+/// Copy the root transcript of `parent_id` from the parent's sessions directory
+/// into `session_dir` of the child's private store, so `prime-agent --fork
+/// <parent_id>` finds it there. Exactly one
+/// transcript must carry that id and `cwd`; a copy already in place for the same
+/// conversation is kept, any other entry at its name is refused, and the
+/// parent's store is only read, never shared.
+pub(crate) fn hand_off_root_transcript(
+    parent_sessions: &Path,
+    child_store: &Path,
+    session_dir: &Path,
+    parent_id: &str,
+    cwd: &str,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (name, mut reader, header) = open_unique_root_transcript(parent_sessions, parent_id, cwd)?;
     let child = crate::session::AnchoredDir::open(child_store)
         .context("opening the child's Prime store")?
         .create_child(session_dir)?;

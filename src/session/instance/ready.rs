@@ -135,8 +135,8 @@ impl Instance {
         if !session.exists() {
             // Route fresh starts through the resume probe so a sid loaded
             // from disk that crashes the agent on launch is detected and
-            // preserved with a loop-breaker instead of being retried
-            // automatically. Always `Allow`: Send Message and Live Send must
+            // preserved on the first failure. The next attempt starts fresh
+            // rather than repeating that resume. Always `Allow`: sends must
             // keep trying to preserve agent context regardless of
             // `auto_resume_on_restart`, which only scopes explicit
             // restart/reattach. See #2609.

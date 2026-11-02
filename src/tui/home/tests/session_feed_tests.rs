@@ -100,7 +100,7 @@ fn daemon_status_ignores_an_unknown_session_id() {
 }
 
 fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionResponse {
-    let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(instance, false);
     row.status = status.into();
     row.last_error = None;
     row.pane_dead_observed = false;
@@ -127,7 +127,9 @@ pub(super) fn daemon_snapshot(view: &HomeView, id: &str, status: &str) -> Sessio
     sessions.extend(
         view.instances()
             .filter(|instance| instance.id != id)
-            .map(|instance| crate::daemon::SessionResponse::from_instance(instance, false)),
+            .map(|instance| {
+                crate::server::api::sessions::session_response_from_instance(instance, false)
+            }),
     );
     SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(
         sessions,
@@ -1428,9 +1430,9 @@ fn canonical_row(
     instance: &Instance,
     overrides: serde_json::Value,
 ) -> crate::daemon::SessionResponse {
-    let mut value = serde_json::to_value(crate::daemon::SessionResponse::from_instance(
-        instance, false,
-    ))
+    let mut value = serde_json::to_value(
+        crate::server::api::sessions::session_response_from_instance(instance, false),
+    )
     .unwrap();
     let object = value.as_object_mut().expect("an object row");
     for (key, item) in overrides.as_object().expect("object overrides") {
@@ -2407,6 +2409,96 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
         !env.view.try_present_reload_failure_dialog(),
         "same failure burst stays acknowledged"
     );
+}
+
+#[test]
+#[serial]
+fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    for action in ["mutation", "ensure", "start"] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut respond = env.view.session_feed.request_driver_for_test();
+        env.view
+            .session_feed
+            .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+        env.view.apply_session_feed();
+        match action {
+            "ensure" => env
+                .view
+                .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
+                .unwrap(),
+            "start" => env.view.start_then_attach(&id, None),
+            _ => env
+                .view
+                .session_feed
+                .submit(
+                    id.clone(),
+                    crate::daemon::SessionMutation::Start(
+                        crate::daemon::StartSessionBody::default(),
+                    ),
+                )
+                .unwrap(),
+        }
+        let refusal = crate::daemon::DaemonClientError::Committed {
+            cursor: crate::daemon::RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            },
+            code: crate::daemon::ApiErrorCode::ManagedResumeRefused(
+                crate::session::ManagedResumeCause::WrapperContractRequired,
+            ),
+        };
+        let message = if action == "start" {
+            format!("Session started; pane preparation failed: {refusal}")
+        } else {
+            refusal.to_string()
+        };
+        assert_eq!(respond(Err(message)).unwrap().0, id);
+        env.view.apply_session_feed();
+        env.view.apply_restart_results();
+        if action != "mutation" {
+            assert!(env.view.info_dialog.is_none());
+            assert!(env.view.pending_native_attachment.is_some());
+            assert!(env.view.take_native_attachment().is_none());
+            assert!(env.view.pending_native_attachment.is_none());
+            assert!(env.view.live_send.is_none());
+        }
+        assert!(env.view.session_feed.can_submit(&id));
+        assert!(env.view.pending_indeterminate_resolution.is_none());
+        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+            let screen = render_home_to_string(&mut env.view, width, height);
+            for instruction in [
+                if action == "mutation" {
+                    "Runtime change"
+                } else {
+                    "Attachment failed"
+                },
+                "set-session-id",
+                "<session>",
+                "<native-id>",
+                "--store",
+                "session.agent_execution_as",
+                "session.agent_config_dir",
+                "\"\"",
+                "AoE association",
+                "[OK]",
+            ] {
+                assert!(
+                    screen.contains(instruction),
+                    "{action}: {instruction} is clipped:\n{screen}"
+                );
+            }
+            assert!(!screen.contains("Resolve Unknown Outcome"), "{screen}");
+        }
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.info_dialog.is_none());
+        env.view.strict_hotkeys = false;
+        env.view.handle_key(key(KeyCode::Char('e')), None);
+        assert!(env.view.restart_dialog.is_some());
+        assert!(respond(Err("must not submit before confirmation".into())).is_none());
+    }
 }
 
 #[test]

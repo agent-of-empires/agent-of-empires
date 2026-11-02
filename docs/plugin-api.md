@@ -33,7 +33,7 @@ capabilities = ["runtime.worker"]
 | `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
-| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
+| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 
@@ -47,7 +47,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 
 | Capability | Grants |
 |---|---|
-| `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
+| `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
@@ -429,7 +429,9 @@ request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => p
 
 `status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
 
-Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
+`row-badge` items on terminal session rows render every item with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links.
+
+In the web dashboard, give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 
 ```json
 { "items": [
@@ -440,6 +442,8 @@ Give items a shared `group` to collapse them into one chip that shows one item a
 ```
 
 Items without a `group` stay separate chips, and each distinct `group` cycles independently. The position is kept per browser tab and is never sent to the worker. A cycling chip ignores `href`; a group with a single item renders as a normal chip. The TUI cannot click and shows the first item with text.
+
+Grouped `row-badge` items remain separate in the TUI and do not cycle.
 
 ### Pane payload
 
@@ -604,11 +608,15 @@ caption = "Live status in the pane."
 
 The worker the host spawns and supervises, in one of two kinds. Omit it for a static, metadata-only plugin.
 
+Both runtime kinds require `runtime.worker` in the manifest's top-level `capabilities`. Missing declarations are rejected before installation or build execution, even with `--yes`. Installed manifests missing the declaration are skipped with a load diagnostic after the daemon is upgraded and restarted. Correct the declaration and approve the changed manifest; an old grant does not authorize new manifest bytes.
+
 ### Command
 
 The host runs the build steps at install or update, then launches `command`.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "command"
 command = [".aoe-build/venv/bin/my-plugin-worker"]
@@ -638,6 +646,8 @@ Build into `.aoe-build/` (the host's build-output directory); the host excludes 
 The host downloads a release asset instead of building from source.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "release-binary"
 asset = "my-plugin-${target}.tar.gz"

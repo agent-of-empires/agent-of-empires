@@ -49,7 +49,8 @@ function setup(over: { selectedPaths?: string[]; repoBases?: Record<string, stri
 
 const row = (container: HTMLElement, name: string) =>
   Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes(name));
-const loaded = (container: HTMLElement) => waitFor(() => expect(container.textContent).toContain("Saved projects"));
+const loaded = (container: HTMLElement) =>
+  waitFor(() => expect(Array.from(container.querySelectorAll("p"), (p) => p.textContent)).toContain("Projects"));
 const addFreeText = (value: string) => {
   const input = screen.getByPlaceholderText("/path/to/another/repo") as HTMLInputElement;
   fireEvent.change(input, { target: { value } });

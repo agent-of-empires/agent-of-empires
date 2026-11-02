@@ -105,7 +105,10 @@ tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
 unicode-segmentation = "1"
-unicode-width = "0.2"
+# 0.2.3 widens U+FF9E/U+FF9F to one cell, which ratatui-core 0.1.2's `CellWidth`
+# already adds, so every halfwidth dakuten counts twice. Lift once ratatui-core
+# stops compensating.
+unicode-width = "=0.2.2"
 
 # Terminal spinners
 rattles = "0.3"

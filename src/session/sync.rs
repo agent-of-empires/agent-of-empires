@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 use crate::session::capture::validated_session_id;
-use crate::session::instance::{ConversationKey, ConversationState};
+use crate::session::instance::{CaptureCommit, ConversationKey, ConversationState};
 use crate::session::poller::{SessionIdGuard, SessionIdObservation};
 use crate::session::storage::{CaptureStorage, SessionStore};
 use crate::session::{Instance, ResumeIntent, SidWrite, Status};
@@ -30,8 +30,8 @@ use crate::session::{Instance, ResumeIntent, SidWrite, Status};
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SessionIdSyncOutcome {
     /// Instances whose poller observation durably changed the conversation,
-    /// confirmed an OMP pin, or stored a Pi transcript path. Sid updates also
-    /// reset `resume_probe_failed_sid`.
+    /// confirmed an OMP pin, or stored a Pi transcript path. Only a different
+    /// durable sid resets `resume_probe_failed_sid`.
     pub(crate) applied: Vec<String>,
     /// Instances whose in-memory state was reloaded from disk after a
     /// CAS-Skipped persist (peer wrote a different sid first).
@@ -399,7 +399,7 @@ fn drain_and_persist_session_ids_inner(
         });
     }
 
-    let mut to_apply: Vec<&Update> = Vec::with_capacity(updates.len());
+    let mut to_apply: Vec<(&Update, Option<String>)> = Vec::with_capacity(updates.len());
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
@@ -466,13 +466,13 @@ fn drain_and_persist_session_ids_inner(
                     return Err(error);
                 }
                 tracing::warn!(target: "session.sync", instance = %update.id, %error, "capture persistence failed");
-                SidWrite::Failed
+                CaptureCommit::unapplied(SidWrite::Failed)
             }
         };
-        match outcome {
+        match outcome.outcome {
             // Acknowledged once its transcript path is stored, in the loop below.
             SidWrite::Applied => {
-                to_apply.push(update);
+                to_apply.push((update, outcome.failed_sid));
             }
             SidWrite::OwnershipConflict => {
                 // The owner holds this sid until it releases it, and the loser
@@ -525,10 +525,10 @@ fn drain_and_persist_session_ids_inner(
         }
     }
 
-    for update in &to_apply {
+    for (update, failed_sid) in &mut to_apply {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == update.id) {
             inst.apply_conversation_observation(&update.observation);
-            inst.resume_probe_failed_sid = None;
+            inst.resume_probe_failed_sid = failed_sid.take();
             if update.confirms_omp_pin {
                 inst.resume_intent = ResumeIntent::Default;
                 inst.resume_binding = None;
@@ -575,7 +575,7 @@ fn drain_and_persist_session_ids_inner(
     Ok(SessionIdSyncOutcome {
         applied: path_only_applied
             .into_iter()
-            .chain(to_apply.into_iter().map(|update| update.id.clone()))
+            .chain(to_apply.into_iter().map(|(update, _)| update.id.clone()))
             .collect(),
         rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
@@ -824,15 +824,15 @@ fn persist_conversation_observation_to_store(
     instance_id: &str,
     observation: &SessionIdObservation,
     expected: &ConversationState,
-) -> anyhow::Result<SidWrite> {
+) -> anyhow::Result<CaptureCommit> {
     use crate::session::poller::SessionIdGuard;
 
     let session_id = observation.sid.as_str();
     if validated_session_id(session_id.to_string()).is_none() {
-        return Ok(SidWrite::Failed);
+        return Ok(CaptureCommit::unapplied(SidWrite::Failed));
     }
     if observation.execution != expected.active {
-        return Ok(SidWrite::Skipped);
+        return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
     }
     let binding = observation.conversation_binding();
     storage.update(|instances, _| {
@@ -840,28 +840,28 @@ fn persist_conversation_observation_to_store(
             .iter()
             .position(|instance| instance.id == instance_id)
         else {
-            return Ok(SidWrite::Failed);
+            return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         };
         let instance = &instances[index];
         if !expected.matches(instance)
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
-            return Ok(SidWrite::Skipped);
+            return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
         }
         match &observation.guard {
             SessionIdGuard::OmpGeneration(generation)
                 if instance.omp_capture_generation.as_ref() != Some(generation) =>
             {
-                return Ok(SidWrite::Skipped)
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
             }
             SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(SidWrite::Skipped)
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
             }
             _ => {}
         }
         if let ResumeIntent::Use(pinned) = &instance.resume_intent {
             if pinned != session_id {
-                return Ok(SidWrite::PinnedForeign);
+                return Ok(CaptureCommit::unapplied(SidWrite::PinnedForeign));
             }
             if instance.resume_binding.as_ref().is_some_and(|target| {
                 target.execution.as_ref()
@@ -869,11 +869,11 @@ fn persist_conversation_observation_to_store(
                         .as_ref()
                         .and_then(|binding| binding.execution.as_ref())
             }) {
-                return Ok(SidWrite::Skipped);
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
         }
         if instance.is_capture_excluded(session_id, observation.source()) {
-            return Ok(SidWrite::Skipped);
+            return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
         }
         let owns = |sid: Option<&str>, owner: Option<&crate::session::ConversationBinding>| {
             sid == Some(session_id)
@@ -898,24 +898,26 @@ fn persist_conversation_observation_to_store(
             // A peer durably owns this sid, so the publication is a conflict to
             // retry rather than a divergence to abandon. A pin confirmation is
             // exempt: the row armed the pin and must be able to re-prove it.
-            return Ok(if confirms_pin {
+            return Ok(CaptureCommit::unapplied(if confirms_pin {
                 SidWrite::Skipped
             } else {
                 SidWrite::OwnershipConflict
-            });
+            }));
         }
-        let establishes = binding.is_some();
         let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
         let instance = &mut instances[index];
         instance.apply_conversation_observation(observation);
-        if establishes || new_conversation {
+        if new_conversation {
             instance.resume_probe_failed_sid = None;
         }
         if confirms_pin {
             instance.resume_intent = ResumeIntent::Default;
             instance.resume_binding = None;
         }
-        Ok(SidWrite::Applied)
+        Ok(CaptureCommit {
+            outcome: SidWrite::Applied,
+            failed_sid: instance.resume_probe_failed_sid.clone(),
+        })
     })
 }
 
@@ -935,7 +937,7 @@ fn reload_skipped_from_disk(storage: &dyn SessionStore, id: &str) -> anyhow::Res
 
 fn publish_tmux_env(
     instances: &[Instance],
-    to_apply: &[&Update],
+    to_apply: &[(&Update, Option<String>)],
     to_rollback: &[Rollback],
     filtered_ids: &HashSet<String>,
 ) {
@@ -945,7 +947,7 @@ fn publish_tmux_env(
 
     let touched_ids = to_apply
         .iter()
-        .map(|update| update.id.as_str())
+        .map(|(update, _)| update.id.as_str())
         .chain(to_rollback.iter().map(|r| r.id.as_str()))
         .chain(filtered_ids.iter().map(|s| s.as_str()));
 
@@ -1425,6 +1427,104 @@ mod tests {
         assert_eq!(instances[0].agent_session_id.as_deref(), Some(sid));
         let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(disk[0].agent_session_id.as_deref(), Some(sid));
+    }
+
+    #[test]
+    #[serial]
+    fn drain_preserves_failed_marker_when_same_sid_is_qualified() {
+        let sid = "019342ab-1234-7def-8901-abcdef012345";
+        let other_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        for (case, qualified, prior_binding, captured_sid) in [
+            ("qualified-replay", true, "observed", sid),
+            ("binding-enrichment", true, "missing", sid),
+            ("asserted-qualification", true, "asserted", sid),
+            ("source-less-replay", false, "observed", sid),
+            ("different-sid", true, "observed", other_sid),
+        ] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-failed-marker";
+            let generation = "failed-generation";
+            let mut inst = pinned_omp_instance(profile, sid, generation);
+            inst.resume_intent = ResumeIntent::Default;
+            inst.resume_binding = None;
+            match prior_binding {
+                "missing" => inst.agent_session_binding = None,
+                "asserted" => {
+                    inst.agent_session_binding.as_mut().unwrap().provenance =
+                        crate::session::ConversationProvenance::Asserted;
+                }
+                _ => {}
+            }
+            inst.resume_probe_failed_sid = Some(sid.into());
+            seed_instance_on_disk(profile, &inst);
+            if qualified {
+                attach_poller_with_omp_update(&mut inst, captured_sid, generation);
+            } else {
+                attach_poller_with_update(&mut inst, captured_sid);
+            }
+            let mut instances = vec![inst];
+
+            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+
+            assert!(outcome.filtered.is_empty(), "{case}");
+            assert!(outcome.rolled_back.is_empty(), "{case}");
+            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            for row in [&instances[0], &disk[0]] {
+                assert_eq!(
+                    row.agent_session_id.as_deref(),
+                    Some(captured_sid),
+                    "{case}"
+                );
+                if qualified {
+                    let binding = row.agent_session_binding.as_ref().unwrap();
+                    assert_eq!(binding.session_id, captured_sid, "{case}");
+                    assert_eq!(
+                        binding.provenance,
+                        crate::session::ConversationProvenance::Observed,
+                        "{case}"
+                    );
+                }
+                assert_eq!(
+                    row.resume_probe_failed_sid.as_deref(),
+                    (captured_sid == sid).then_some(sid),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_pin_confirmation_restores_durable_failed_marker_with_empty_memory_sid() {
+        let sid = "019342ab-1234-7def-8901-abcdef012345";
+        for memory_marker in [None, Some("stale-memory-marker")] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-omp-pin-failed-marker";
+            let generation = "failed-generation";
+            let mut inst = pinned_omp_instance(profile, sid, generation);
+            inst.resume_probe_failed_sid = Some(sid.into());
+            seed_instance_on_disk(profile, &inst);
+            inst.agent_session_id = None;
+            inst.agent_session_binding = None;
+            inst.resume_probe_failed_sid = memory_marker.map(str::to_owned);
+            attach_poller_with_omp_update(&mut inst, sid, generation);
+            let mut instances = vec![inst];
+
+            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+
+            assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            for row in [&instances[0], &disk[0]] {
+                assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                assert_eq!(row.resume_intent, ResumeIntent::Default);
+                assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(sid));
+            }
+            assert!(
+                !drain_and_persist_session_ids(&mut instances, &FileWatchService::noop()).touched()
+            );
+        }
     }
 
     #[test]

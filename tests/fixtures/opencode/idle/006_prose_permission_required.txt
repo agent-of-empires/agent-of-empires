@@ -1,0 +1,20 @@
+# FIXTURE: OpenCode - Idle State
+# Captured from: hand-built from the 1.17.12+6697cf3 mini split-footer layout (no pane capture supplied in #5031)
+# Capture date: 2026-10-29
+# Verified against: 1.17.x (last check: 2026-10-29)
+#
+# Expected status: Idle
+# Key indicators: prose "No permission required", finished response, "Ask anything..." prompt, no permission dialog, no spinner
+
+
+█▀▀█  OpenCode
+█  █  /private/tmp/opencode-fixture-home
+▀▀▀▀
+
+› can you run the tests?
+
+  No permission required to run the tests.
+
+Ask anything... "Fix a TODO in the codebase"
+
+ BUILD                                                                                                                                                                                       ctrl+p cmd

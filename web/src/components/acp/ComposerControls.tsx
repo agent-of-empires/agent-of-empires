@@ -364,20 +364,27 @@ export function SendButton({
   connected = true,
   disabled = false,
   waitingFor = null,
+  connecting = false,
   onSend,
 }: {
   connected?: boolean;
   disabled?: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
   onSend: () => void;
 }) {
-  const disconnectedLabel = waitingFor ? `Pending until ${waitingFor} is ready` : "Queue message until session resumes";
+  const disconnectedLabel = waitingFor
+    ? `Pending until ${waitingFor} is ready`
+    : connecting
+      ? "Send while disconnected"
+      : "Queue message until session resumes";
   const title = disabled
     ? "Type a message to send"
     : connected
       ? "Send, Enter"
-      : waitingFor
+      : waitingFor || connecting
         ? disconnectedLabel
         : "Session not active, will send on resume";
   return (
@@ -422,16 +429,24 @@ export function QueueSendButton({
   connected,
   steering,
   waitingFor = null,
+  connecting = false,
   disabled = false,
   onSend,
 }: {
   connected: boolean;
   steering: boolean;
   waitingFor?: string | null;
+  connecting?: boolean;
   disabled?: boolean;
   onSend: () => void;
 }) {
-  const pendingLabel = !connected && waitingFor ? `Pending until ${waitingFor} is ready` : null;
+  const pendingLabel = connected
+    ? null
+    : waitingFor
+      ? `Pending until ${waitingFor} is ready`
+      : connecting
+        ? "Queue follow-up while disconnected, Enter"
+        : null;
   const title = disabled
     ? "Type a message to queue"
     : !connected
