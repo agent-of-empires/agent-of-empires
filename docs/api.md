@@ -664,7 +664,7 @@ effect-free daemon refusals do not acknowledge a commit.
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.
 The `omp_transcript_binding_required` cause identifies an absent OMP conversation
 binding or exact transcript path. `pi_transcript_binding_required` identifies
-Pi's existing refusal when a matching binding lacks the required transcript path
+the refusal when a matching Pi binding lacks the required transcript path
 after permitted discovery. Neither cause identifies a missing file on disk or
 another failed attestation. Missing, unknown, or ambiguous cause metadata keeps
 the refusal generic; native clients do not read response bodies to derive that
