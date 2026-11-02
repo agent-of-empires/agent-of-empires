@@ -344,17 +344,17 @@ impl Shared {
         if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
             return;
         }
+        let (tasks, stopped) = self.bg_tasks.split_stopped(tasks);
+        for task_id in stopped {
+            let _ = self
+                .event_tx
+                .send(Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                })
+                .await;
+        }
         for task in tasks {
-            if self.bg_tasks.take_early_stop(&task.task_id) {
-                let _ = self
-                    .event_tx
-                    .send(Event::BackgroundTaskFinished {
-                        task_id: task.task_id,
-                        ended_at: Some(chrono::Utc::now()),
-                    })
-                    .await;
-                continue;
-            }
             spawn_task_tailer(
                 task,
                 session_id.to_string(),

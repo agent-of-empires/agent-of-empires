@@ -188,6 +188,26 @@ impl ActiveTasks {
             .remove(task_id)
     }
 
+    /// Splits resumed launches into those still to tail and the ids
+    /// `TaskStop` already ended.
+    pub(crate) fn split_stopped(
+        &self,
+        tasks: Vec<BackgroundTaskLaunch>,
+    ) -> (Vec<BackgroundTaskLaunch>, Vec<String>) {
+        let mut stopped = Vec::new();
+        let to_tail = tasks
+            .into_iter()
+            .filter(|task| {
+                let early = self.take_early_stop(&task.task_id);
+                if early {
+                    stopped.push(task.task_id.clone());
+                }
+                !early
+            })
+            .collect();
+        (to_tail, stopped)
+    }
+
     fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
         self.lock()
             .get(task_id)
@@ -862,6 +882,65 @@ mod tests {
         assert!(!f.active.take_early_stop("t-1"));
         f.drop_sender();
         f.released().await;
+    }
+
+    /// A task still open in the persisted log whose `TaskStop` result arrives
+    /// before tailing resumes ends Idle, and is not tailed again.
+    #[test]
+    fn a_stop_before_resume_ends_the_persisted_task() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::session::Status;
+
+        let launch = |task_id: &str| BackgroundTaskLaunch {
+            task_id: task_id.into(),
+            tool_call_id: Some("toolu_1".into()),
+            workflow: None,
+            workflow_agents: Default::default(),
+        };
+        let mut state = AcpState::new(
+            AcpSessionId("s-1".into()),
+            AgentName("aoe-agent".into()),
+            None,
+        );
+        for (seq, id) in [(1, "t-1"), (2, "t-2")] {
+            let started = Event::BackgroundTaskStarted {
+                task_id: id.into(),
+                tool_call_id: Some("toolu_1".into()),
+                description: String::new(),
+                workflow: None,
+            };
+            state.apply_event(seq, started).unwrap();
+        }
+
+        let active = ActiveTasks::default();
+        active.stop("t-1");
+        let (to_tail, stopped) = active.split_stopped(vec![launch("t-1"), launch("t-2")]);
+        assert_eq!(stopped, ["t-1"]);
+        assert_eq!(
+            to_tail
+                .iter()
+                .map(|t| t.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-2"]
+        );
+
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t-1".into(),
+            ended_at: None,
+        };
+        state.apply_event(3, finished).unwrap();
+        assert_eq!(state.background_tasks, ["t-2"]);
+        assert_eq!(state.sidebar_status(), Status::Running);
+        state
+            .apply_event(
+                4,
+                Event::BackgroundTaskFinished {
+                    task_id: "t-2".into(),
+                    ended_at: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.sidebar_status(), Status::Idle);
     }
 
     #[tokio::test]
