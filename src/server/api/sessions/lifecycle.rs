@@ -3107,6 +3107,8 @@ mod durable_stop_tests {
             "TMUX_PANE",
             "OMP_SESSION_ID",
             "PI_SESSION_ID",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
             "AOE_SESSION_ID",
             "AOE_PROFILE",
             "AOE_DAEMON_URL",
