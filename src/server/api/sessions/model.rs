@@ -5,7 +5,8 @@ use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
 use chrono::{DateTime, Utc};
 
-/// Convert backend session facts using the request's Claude fullscreen preference.
+/// Convert session facts with the user fullscreen setting read once per request.
+/// [`SessionResponse::claude_fullscreen`] exposes that setting only for Claude.
 pub(crate) fn session_response_from_instance(
     inst: &Instance,
     claude_fullscreen: bool,
