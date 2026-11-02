@@ -168,7 +168,9 @@ for (const href of ["/session/s-1?focus=1", "/Session/s-1?focus=1"]) {
     await expect(page).toHaveURL(href);
     await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
     await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
-    // The router reads the path case-insensitively; the document must agree, or it reloads forever.
+    // The router reads the path case-insensitively; the document must agree, or it reloads forever. The new
+    // document's `load` can fire after the checks above, so wait for it before watching for more.
+    await expect.poll(loads).toBe(2);
     await page.waitForTimeout(500);
     expect(loads()).toBe(2);
   });
@@ -182,6 +184,7 @@ test("a focus window loaded at a mixed-case path stays put", async ({ page }) =>
   await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
   await expect(page.locator(SIDEBAR)).toHaveCount(0);
   await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
+  await expect.poll(loads).toBe(1);
   await page.waitForTimeout(500);
   expect(loads()).toBe(1);
   await expect(page).toHaveURL("/Session/s-1/?focus=1");
