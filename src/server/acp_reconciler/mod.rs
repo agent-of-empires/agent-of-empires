@@ -230,7 +230,7 @@ pub async fn reconcile_acp_workers(
     };
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
-    let (targets, with_queued_prompts, idle_with_queue): (
+    let (targets, with_queued_prompts, queued_not_stopped): (
         Vec<ResumeTarget>,
         HashSet<String>,
         HashSet<String>,
@@ -250,7 +250,7 @@ pub async fn reconcile_acp_workers(
             instances
                 .iter()
                 .filter(|i| {
-                    !i.queued_prompts.is_empty() && i.status == crate::session::Status::Idle
+                    !i.queued_prompts.is_empty() && i.status != crate::session::Status::Stopped
                 })
                 .map(|i| i.id.clone())
                 .collect(),
@@ -272,10 +272,11 @@ pub async fn reconcile_acp_workers(
     let mut tasks = Vec::new();
     for mut target in targets {
         let id = target.id.clone();
-        // An idle session with a queue and no worker is retried under the
-        // normal budget: an earlier cancelled attempt must not strand the queue (#5200).
+        // A session with a queue and no worker is retried under the normal
+        // budget, whatever its status short of Stopped (a failed spawn leaves
+        // Error): an earlier attempt must not strand the queue (#5200).
         let retry_for_queue = attempted.contains(&id)
-            && idle_with_queue.contains(&id)
+            && queued_not_stopped.contains(&id)
             && supervisor.worker_state(&id).await == AcpWorkerState::Absent;
         if attempted.contains(&id) && !retry_for_queue {
             // A restart marker can land after the reaper ran: add-project (#3103)
@@ -902,6 +903,7 @@ mod tests {
 
         let cases = [
             ("idle with a queue", Status::Idle, 1),
+            ("error with a queue", Status::Error, 1),
             ("deliberately stopped with a queue", Status::Stopped, 0),
         ];
         for (name, status, expected_attempts) in cases {
