@@ -429,6 +429,7 @@ impl Session {
         extra_env: &[PaneEnvMutation],
     ) -> Result<()> {
         self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[], None)
+            .map(|_| ())
     }
 
     /// Create a pane whose container runtime reads target environment values
@@ -444,7 +445,7 @@ impl Session {
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
         scope: Option<&crate::process::systemd::ScopePrefix>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::session::LegacyToolObservation>> {
         self.create_with_size_env_inner(
             working_dir,
             command,
@@ -467,9 +468,9 @@ impl Session {
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
         scope: Option<&crate::process::systemd::ScopePrefix>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::session::LegacyToolObservation>> {
         if self.exists_live() {
-            return Ok(());
+            return Ok(None);
         }
 
         // tmux silently falls back to $HOME for a missing `-c` directory.
@@ -539,6 +540,14 @@ impl Session {
             Some(&wrapped_command),
             size,
         );
+        args.splice(
+            1..1,
+            [
+                "-P".to_owned(),
+                "-F".to_owned(),
+                "#{session_id}|#{pane_id}|#{pane_pid}|#{socket_path}|#{pid}".to_owned(),
+            ],
+        );
         let target = format!("={}:", self.name);
         append_session_setup_args(&mut args, &target, &config, None);
         crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Agent);
@@ -567,7 +576,15 @@ impl Session {
         env_file.disarm();
         super::refresh_session_cache();
 
-        Ok(())
+        Ok(
+            match super::utils::created_pane_observation(&output.stdout) {
+                Ok(pane) => Some(pane),
+                Err(error) => {
+                    tracing::warn!(target: "tmux.command", session = %self.name, error = %format_args!("{error:#}"), "created pane identity is unproven");
+                    None
+                }
+            },
+        )
     }
 
     pub fn is_pane_dead(&self) -> bool {

@@ -602,6 +602,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    pub(crate) fn current_lease(&self, session_id: &str) -> Option<Lease> {
+        lock_recover(&self.lifecycle).current_lease(session_id)
+    }
+
     /// The running epoch, for a caller that must stop only that epoch.
     pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
         lock_recover(&self.lifecycle)

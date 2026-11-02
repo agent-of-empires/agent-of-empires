@@ -103,6 +103,7 @@ fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionRespon
     let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
     row.status = status.into();
     row.last_error = None;
+    row.last_error_evidence = None;
     row.pane_dead_observed = false;
     row
 }
@@ -1171,6 +1172,11 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
+    let mut evidence = crate::session::OperationErrorEvidence::new(
+        crate::session::ErrorEvidenceSource::TmuxObservation,
+        crate::session::ErrorOperation::TerminalObservation,
+    );
+    evidence.runtime = crate::session::RuntimeEvidence::PaneExited { exit_code: None };
     // Seed the row stale the way a live Running terminal looks before the
     // daemon reports the stop.
     env.view.mutate_instance(&id, |instance| {
@@ -1202,6 +1208,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
         row.view = crate::session::View::Terminal;
         row.pane_dead_observed = true;
         row.last_error = Some("agent process exited".into());
+        row.last_error_evidence = Some(evidence);
         row.agent_pane = PaneObservation {
             state: PanePresence::Dead,
             ..PaneObservation::default()
@@ -1225,6 +1232,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     let instance = env.view.get_instance(&id).unwrap();
     assert_eq!(instance.status, Status::Stopped);
     assert_eq!(instance.last_error.as_deref(), Some("agent process exited"));
+    assert_eq!(instance.last_error_evidence, Some(evidence));
     assert!(instance.pane_dead_observed);
     assert_eq!(instance.agent_pane.state, PanePresence::Dead);
     assert_eq!(
@@ -2497,6 +2505,40 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
         assert!(env.view.restart_dialog.is_some());
         assert!(respond(Err("must not submit before confirmation".into())).is_none());
     }
+}
+
+#[test]
+#[serial]
+fn indeterminate_launch_refuses_attachment_without_resubmitting() {
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    let mut respond = env.view.session_feed.request_driver_for_test();
+    env.view
+        .session_feed
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+    env.view.apply_session_feed();
+    env.view
+        .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
+        .unwrap();
+    let error = crate::daemon::DaemonClientError::Committed {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        },
+        code: crate::daemon::ApiErrorCode::LaunchIndeterminate,
+    };
+    assert_eq!(respond(Err(error.to_string())).unwrap().0, id);
+    env.view.apply_session_feed();
+    env.view.apply_restart_results();
+    assert!(env.view.take_native_attachment().is_none());
+    assert!(env.view.pending_native_attachment.is_none());
+    assert!(env.view.live_send.is_none());
+    assert!(env.view.session_feed.can_submit(&id));
+    assert!(env.view.pending_indeterminate_resolution.is_none());
+    assert!(env.view.info_dialog.is_some());
+    assert!(respond(Err("no automatic retry".into())).is_none());
 }
 
 #[test]

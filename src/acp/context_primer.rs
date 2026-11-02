@@ -198,8 +198,9 @@ fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
             }
             Event::Stopped { reason } => {
                 turns.extend(current.take());
-                ended_non_success =
-                    reason == "rate_limited" || reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
+                ended_non_success = reason == "rate_limited"
+                    || reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                    || reason == "prompt_failed";
             }
             Event::AgentStartupError { .. } => {
                 turns.extend(current.take());
@@ -629,6 +630,11 @@ mod tests {
             (
                 vec![user("Refactor it."), startup_error],
                 Some("Refactor it."),
+                0,
+            ),
+            (
+                vec![user("explicit request failed"), stopped("prompt_failed")],
+                Some("explicit request failed"),
                 0,
             ),
             (

@@ -273,7 +273,7 @@ pub(crate) fn native_socket_locator() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn tmux_query_command_for_socket(socket: &str) -> Command {
+pub(crate) fn tmux_query_command_for_socket(socket: &str) -> Command {
     let mut cmd = Command::new("tmux");
     cmd.args(["-S", socket, "-u"]);
     cmd.env_remove("TMUX");
@@ -447,7 +447,7 @@ impl TmuxCommandDeadline {
     }
 
     #[cfg(test)]
-    fn expiring_after_commands(commands: i64) -> Self {
+    pub(crate) fn expiring_after_commands(commands: i64) -> Self {
         Self {
             deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
             budget: Some(CommandBudget(std::sync::atomic::AtomicI64::new(commands))),

@@ -823,10 +823,21 @@ done
             .await
             .unwrap();
         client.cancel_prompt().await.unwrap();
-        let events = identity_events_until_stop(&mut client).await;
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::Stopped { reason } if reason == "cancelled")));
+        // ForceStop reserves terminal ownership for the supervisor's user_forced
+        // publication. A later Cancel must still reach native transport, but
+        // cannot invent a second private terminal. Flush commands, not events.
+        let (done, flushed) = tokio::sync::oneshot::channel();
+        client
+            .cmd_tx
+            .as_ref()
+            .unwrap()
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed)
+            .await
+            .unwrap()
+            .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let wire = std::fs::read_to_string(&capture).unwrap();
@@ -857,7 +868,12 @@ done
         }
         client.shutdown().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while client.next_event().await.is_some() {}
+            while let Some(event) = client.next_event().await {
+                assert!(
+                    !matches!(event, Event::Stopped { .. }),
+                    "ForceStop's supervisor-owned terminal cannot be duplicated by Cancel"
+                );
+            }
         })
         .await
         .unwrap();

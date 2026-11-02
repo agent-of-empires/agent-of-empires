@@ -67,6 +67,9 @@ pub enum StartOutcome {
     /// observed an explicit invalid-resume signal. The sid was preserved and
     /// marked so startup recovery does not retry it automatically.
     ResumeFailed { sid: String },
+    /// Observation could not establish readiness. The launched runtime and
+    /// conversation remain intact; callers must not send input or wake keys.
+    Indeterminate { cause: LaunchIndeterminateCause },
     /// No resume cascade ran. Either no prior sid, the agent doesn't support
     /// resume, the sid was invalid, the session is structured view-mode (no tmux
     /// pane), or the tmux session was already alive when entered (so
@@ -263,7 +266,7 @@ impl Instance {
                     publication,
                 )?;
             }
-            let outcome = self.spawn_prepared_launch(size, storage, prepared)?;
+            let (outcome, _) = self.spawn_prepared_launch(size, storage, prepared)?;
             self.commit_lifecycle_launch(storage, generation, false)?;
             Ok(outcome)
         })();
@@ -697,7 +700,7 @@ impl Instance {
         size: Option<(u16, u16)>,
         storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
-    ) -> Result<LaunchSidOutcome> {
+    ) -> Result<(LaunchSidOutcome, resume::LaunchProbe)> {
         let profile = storage.storage().profile();
         let handoff_key = self
             .terminal_handoff
@@ -870,7 +873,7 @@ impl Instance {
             }
             Ok(scopes.clone())
         })?);
-        session.create_with_size_env_and_container_env(
+        let pane = session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),
             size,
@@ -902,6 +905,11 @@ impl Instance {
         if handoff_key.is_none() {
             self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
         }
+        let probe = resume::LaunchProbe {
+            tmux_session: session.name().to_owned(),
+            pane,
+            expected: self.published_launch_conversation(),
+        };
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
 
@@ -915,10 +923,25 @@ impl Instance {
 
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::After);
-        Ok(match launch_sid {
+        let outcome = match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
             None => LaunchSidOutcome::Fresh { pinned_prior_sid },
-        })
+        };
+        Ok((outcome, probe))
+    }
+
+    fn published_launch_conversation(&self) -> ConversationState {
+        let mut desired = self.conversation_state();
+        if matches!(
+            desired.intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        ) || (matches!(desired.intent, ResumeIntent::Use(_))
+            && self.launch_has_session_publisher())
+        {
+            desired.intent = ResumeIntent::Default;
+            desired.resume_binding = None;
+        }
+        desired
     }
 
     fn apply_prepared_launch_state(
@@ -1061,22 +1084,7 @@ impl Instance {
             let _ = published;
         }
 
-        let desired = confirm_desired_conversation.then(|| {
-            let mut desired = self.conversation_state();
-            // Mirror persist_session_id's promotion of one-shot launch
-            // directives, or the comparison below would reject the state it
-            // itself produces for Cleared, Fork and publisher-pinned Use.
-            if matches!(
-                desired.intent,
-                ResumeIntent::Cleared | ResumeIntent::Fork { .. }
-            ) || (matches!(desired.intent, ResumeIntent::Use(_))
-                && self.launch_has_session_publisher())
-            {
-                desired.intent = ResumeIntent::Default;
-                desired.resume_binding = None;
-            }
-            desired
-        });
+        let desired = confirm_desired_conversation.then(|| self.published_launch_conversation());
         let outcome = self.persist_session_id_with_storage(storage, expected);
         if desired.is_some_and(|desired| {
             !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
@@ -1261,17 +1269,7 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    fn frozen_test_helper(
-        root: &std::path::Path,
-        entry: &str,
-    ) -> crate::process::test_support::NativeLaunchExecutable {
-        use std::os::unix::fs::PermissionsExt;
-        let helper = root.join("native-helper");
-        let module = module_path!().split_once("::").unwrap().1;
-        std::fs::write(&helper, format!("#!/bin/sh\nAOE_FROZEN_NATIVE_TEST_CHILD=1 exec {} --exact {} --nocapture --test-threads=1\n", crate::session::environment::shell_escape(std::env::current_exe().unwrap().to_str().unwrap()), crate::session::environment::shell_escape(&format!("{module}::{entry}")))).unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        crate::process::test_support::NativeLaunchExecutable::install(helper)
-    }
+    use crate::session::instance::test_helpers::frozen_test_helper;
 
     #[cfg(unix)]
     #[test]
@@ -1375,7 +1373,10 @@ mod tests {
         let pid = pane_field(&pane, "#{pane_pid}");
         let _helper = frozen_test_helper(
             root.path(),
-            "direct_start_attests_failed_resume_before_retrying_a_dead_pane",
+            concat!(
+                module_path!(),
+                "::direct_start_attests_failed_resume_before_retrying_a_dead_pane"
+            ),
         );
         let error = instance
             .start_with_size_opts(None, true)
@@ -1543,7 +1544,7 @@ else:
             seed_disk_for_sidecar_test(profile, &instance);
             let _helper = frozen_test_helper(
                 directory.path(),
-                "store_fork_requires_durable_publication_and_preserves_recovery_and_peer_pins",
+                concat!(module_path!(), "::store_fork_requires_durable_publication_and_preserves_recovery_and_peer_pins"),
             );
             let reached = std::rc::Rc::new(std::cell::Cell::new(false));
             let observed = reached.clone();
