@@ -975,7 +975,8 @@ pub async fn create_session(
         );
     }
 
-    // CLI arguments are parsed and shell-quoted on the Daemon; other callers retain their gate.
+    // `cli` selects behavior, not an authenticated origin. Its paths are canonicalized
+    // on the Daemon; only extra_args is parsed and shell-quoted here.
     let mut shell_checks: Vec<(&str, &str)> = Vec::new();
     if body.cli.is_some() {
         body.extra_args = match shell_words::split(&body.extra_args) {
@@ -1388,6 +1389,12 @@ pub async fn create_session(
             if let Err(error) = state.runtime.publish(&state).await {
                 tracing::debug!(target: "server.runtime", %error, "publish after failed create failed");
             }
+            if e.is::<crate::server::session_spawn::CliCreationOutcomeUnknown>() {
+                tracing::warn!(target: "http.api.sessions", error = ?e, "CLI creation outcome unknown");
+                return create_failure_response(
+                    create_failure(&e).expect("unknown creation outcome"),
+                );
+            }
             if e.is::<crate::server::session_service::CreationCancelled>() {
                 return crate::server::api::api_error_with_code_header(
                     crate::daemon::ApiErrorCode::CreationCancelled,
@@ -1439,8 +1446,13 @@ pub async fn create_session(
 fn create_failure_response(
     failure: crate::server::create_progress::CreateFailure,
 ) -> axum::response::Response {
-    let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
-    if failure.code == code.as_str() {
+    let code = [
+        crate::daemon::ApiErrorCode::AgentHooksNotApproved,
+        crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
+    ]
+    .into_iter()
+    .find(|code| failure.code == code.as_str());
+    if let Some(code) = code {
         crate::server::api::api_error_with_code_header(code, failure.message)
     } else {
         api_error(failure.status, failure.code, failure.message)
@@ -1451,6 +1463,14 @@ fn create_failure_response(
 /// caller resubmits with the same key.
 fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
     use crate::server::create_progress::CreateFailure;
+    if e.is::<crate::server::session_spawn::CliCreationOutcomeUnknown>() {
+        let code = crate::daemon::ApiErrorCode::CreateOutcomeUnknown;
+        return Some(CreateFailure {
+            status: code.status(),
+            code: code.as_str(),
+            message: "Creation finalization was not confirmed. Check the Daemon session state before creating again.".to_owned(),
+        });
+    }
     if let Some(refusal) = e.downcast_ref::<crate::session::HostHookApprovalRequired>() {
         let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
         return Some(CreateFailure {

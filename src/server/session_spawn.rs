@@ -79,6 +79,10 @@ pub(crate) struct SpawnOutcome {
 #[error("{0}")]
 pub(crate) struct CliDuplicateSession(anyhow::Error);
 
+#[derive(Debug, thiserror::Error)]
+#[error("CLI creation committed, but finalization was not confirmed")]
+pub(crate) struct CliCreationOutcomeUnknown;
+
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
 /// while a plain build failure stays `400`. Mirrors the existing
@@ -645,8 +649,8 @@ pub(crate) async fn spawn_structured_session(
                 row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
                 instance = row.clone();
                 Ok(())
-            })?;
-            native.adopt_runtime_fields(&instance)?;
+            }).context(CliCreationOutcomeUnknown)?;
+            native.adopt_runtime_fields(&instance).context(CliCreationOutcomeUnknown)?;
             crate::tips::record_session_creations(1);
             return Ok((instance, build_warnings, agent_effort, native, creation_profile, None));
         }

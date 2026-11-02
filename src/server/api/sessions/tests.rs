@@ -10689,6 +10689,68 @@ async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
         .any(|row| row.id == id));
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_post_commit_failure_preserves_creation_and_reports_unknown_on_replay() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let project = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": "post-commit-failure", "view": "terminal",
+        "cli": {}, "idempotency_key": "post-commit-failure",
+    });
+    let mut commits = state.session_service.arm_creation_commit();
+    let request = tokio::spawn({
+        let state = state.clone();
+        let body = body.clone();
+        async move { post_create_raw(&state, body).await }
+    });
+    let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let storage = Storage::open_unwatched("test").unwrap();
+    let failure = storage.fail_writes_for_test();
+    release.send(()).unwrap();
+    let (status, code, response) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+    drop(failure);
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        code.as_deref(),
+        Some("create_outcome_unknown"),
+        "{response}"
+    );
+    let rows = storage.load().unwrap();
+    let row = rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(row.idempotency_key.as_deref(), Some("post-commit-failure"));
+    assert_eq!(row.status, Status::Creating);
+    assert!(row.lifecycle_reservation.is_some());
+    let (status, code, response) = post_create_raw(&state, body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        code.as_deref(),
+        Some("create_outcome_unknown"),
+        "{response}"
+    );
+    assert_eq!(
+        storage
+            .load()
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == id)
+            .count(),
+        1
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]

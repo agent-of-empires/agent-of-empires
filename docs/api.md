@@ -409,6 +409,10 @@ clients must require it before sending CLI intent to avoid an older Daemon ignor
 Concurrent CLI requests with the same title and working directory cannot create duplicates.
 Interrupting the CLI while launch is pending leaves the created session intact;
 inspect Daemon state before retrying launch.
+If terminal finalization fails after creation commits, the Daemon returns `409`
+with `aoe-error-code: create_outcome_unknown` and retains the session and resources.
+The CLI checks canonical state without resubmitting creation. A healthy, finalized
+session confirms success; otherwise the CLI reports an unknown outcome.
 
 CLI forks use the latest durable parent binding, including a completed
 `aoe session set-session-id`, without waiting for the filesystem watcher.
@@ -428,6 +432,8 @@ retains its existing readiness checks.
 With CLI intent, `extra_args` uses shell-style word grouping, then each argument
 is quoted for literal delivery. Quotes group text; shell operators and substitutions
 are arguments, not scripts. Other API callers retain their existing input validation.
+With `cli`, project paths are canonicalized on the Daemon host, not shell-quoted.
+The field expresses selection intent; any authenticated caller can supply it.
 
 Host launches and structured creations that need agent-hook approval return `409`
 with `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon

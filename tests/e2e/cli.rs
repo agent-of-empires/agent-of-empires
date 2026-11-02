@@ -489,11 +489,23 @@ fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
 
 #[test]
 #[parallel]
-fn cli_add_lists_the_new_session() {
+fn cli_add_lists_the_new_session_and_provides_a_start_command() {
     let h = TuiTestHarness::new("cli_add_list");
     let project = h.project_path();
 
-    h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "NextSteps"]);
+    let output = h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "NextSteps"]);
+    let sessions = h.read_sessions();
+    let row = crate::harness::session_by_title(&sessions, "NextSteps");
+    let hint = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Start with: "))
+        .expect("creation must provide a start command");
+    let command = shell_words::split(hint).unwrap();
+    assert_eq!(command[0], "aoe");
+    assert_eq!(
+        &command[command.len() - 3..],
+        ["session", "start", row["id"].as_str().unwrap()]
+    );
 
     assert!(h.run_cli_ok(&["list"]).contains("NextSteps"));
 }
@@ -717,6 +729,12 @@ fn cli_add_rejects_invalid_requests() {
             forbid: Some("secret-command-for-leak-check"),
         },
         Case {
+            name: "unknown command names safe alternatives only",
+            config: "[session]\ncustom_agents = { custom = \"secret-command-for-leak-check\" }",
+            args: &["add", "$PROJECT", "--cmd", "missing"],
+            forbid: Some("secret-command-for-leak-check"),
+        },
+        Case {
             name: "custom tool rejects --cmd-override",
             config: "[session]\ncustom_agents = { custom = \"bash -lc true\" }",
             args: &[
@@ -789,6 +807,15 @@ fn cli_add_rejects_invalid_requests() {
 
         let out = h.run_cli(&args);
         assert!(!out.status.success(), "{}: must exit non-zero", case.name);
+        if case.forbid.is_some() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            for alternative in ["custom", "claude"] {
+                assert!(
+                    stderr.contains(alternative),
+                    "missing safe alternative {alternative}: {stderr}"
+                );
+            }
+        }
         if let Some(secret) = case.forbid {
             assert!(
                 !String::from_utf8_lossy(&out.stdout).contains(secret)
@@ -1278,7 +1305,16 @@ fn cli_add_workspace_runs_effective_on_create_hooks() {
         init_git_repo(&project_b);
 
         let marker = h.home_path().join("hook-ran.marker");
-        let hooks = format!("[hooks]\non_create = [\"touch {}\"]", marker.display());
+        let release = h.home_path().join("hook-release");
+        let command = format!(
+            "touch {}; while [ ! -e {} ]; do sleep .02; done",
+            shell_words::quote(marker.to_str().unwrap()),
+            shell_words::quote(release.to_str().unwrap()),
+        );
+        let hooks = format!(
+            "[hooks]\non_create = [{}]",
+            serde_json::to_string(&command).unwrap()
+        );
         if repo_hooks {
             let repo_config = project_a.join(".agent-of-empires");
             std::fs::create_dir_all(&repo_config).expect("create .agent-of-empires dir");
@@ -1301,7 +1337,33 @@ fn cli_add_workspace_runs_effective_on_create_hooks() {
         if repo_hooks {
             args.push("--trust-hooks");
         }
-        h.run_cli_ok(&args);
+        let mut pending = GatedCli {
+            child: Some(h.spawn_cli(&args)),
+            release,
+        };
+        let stderr = pending.child.as_mut().unwrap().stderr.take().unwrap();
+        let (observed, progress) = std::sync::mpsc::channel();
+        let output = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut lines = Vec::new();
+            for line in std::io::BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                if line.contains(&command) {
+                    let _ = observed.send(());
+                }
+                lines.push(line);
+            }
+            lines
+        });
+        let seen = progress.recv_timeout(Duration::from_secs(20));
+        std::fs::write(&pending.release, "release").unwrap();
+        let result = pending.child.take().unwrap().wait_with_output().unwrap();
+        let lines = output.join().unwrap();
+        assert!(result.status.success(), "{lines:?}");
+        assert!(
+            seen.is_ok(),
+            "pending hook command was not shown: {lines:?}"
+        );
         assert!(
             marker.exists(),
             "repo_hooks={repo_hooks}: hooks did not run"
@@ -1328,10 +1390,16 @@ fn cli_add_attaches_to_existing_worktree() {
         "-t",
         "FirstSession",
     ]);
-    h.run_cli_ok(&["add", project, "-w", "feat/existing", "-t", "SecondSession"]);
+    let output = h.run_cli_ok(&["add", project, "-w", "feat/existing", "-t", "SecondSession"]);
 
     let sessions = h.read_sessions();
     let second = crate::harness::session_by_title(&sessions, "SecondSession");
+    let first = crate::harness::session_by_title(&sessions, "FirstSession");
+    assert_eq!(second["project_path"], first["project_path"]);
+    assert!(
+        output.contains(second["project_path"].as_str().unwrap()),
+        "{output}"
+    );
     assert_eq!(second["worktree_info"]["managed_by_aoe"], false);
     assert_eq!(
         second["worktree_info"]["branch"].as_str(),

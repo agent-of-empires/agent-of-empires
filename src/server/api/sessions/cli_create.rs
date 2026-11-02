@@ -178,10 +178,20 @@ fn resolve_host_creation(
         !options.generated_name || body.extra_repo_paths.is_empty(),
         "--generated-name does not apply to multi-repo workspaces"
     );
+    let unknown_tool = |description: &str| {
+        let mut names = crate::agents::agent_names();
+        names.extend(config.session.custom_agents.keys().map(String::as_str));
+        names.sort_unstable();
+        names.dedup();
+        format!(
+            "{description}\nSupported built-in and configured custom agents: {}",
+            names.join(", ")
+        )
+    };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
-            .with_context(|| format!("Unknown tool in command: {command}"))?
+            .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?
             .to_owned();
         if command.trim().contains(' ')
             && body.command_override.is_empty()
@@ -214,7 +224,7 @@ fn resolve_host_creation(
             body.tool = name.to_owned();
         } else {
             body.tool = crate::agents::resolve_tool_name(name)
-                .with_context(|| format!("Unknown tool: {name}"))?
+                .with_context(|| unknown_tool(&format!("Unknown tool: {name}")))?
                 .to_owned();
         }
     } else {

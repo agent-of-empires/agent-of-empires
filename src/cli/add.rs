@@ -698,6 +698,85 @@ fn definitive(error: &DaemonClientError) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_commit_write_failure_reconciles_without_recreating() {
+        use crate::server::test_support as support;
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::TempDir::new_in("/tmp").unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router =
+            support::build_router_for_test(state.clone()).layer(axum::middleware::from_fn({
+                let creates = creates.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let creates = creates.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/api/sessions"
+                        {
+                            creates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                }
+            }));
+        let socket = home.path().join("daemon.sock");
+        let server = support::serve_owner_router_for_test(&socket, router).await;
+        let client = DaemonClient::new_unix(&socket).unwrap();
+        let epoch = client.runtime_info().await.unwrap().epoch;
+        let key = "cli-post-commit-write-failure";
+        let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "path": home.path(), "tool": "", "profile": "test",
+            "title": "post-commit", "view": "terminal",
+            "cli": {}, "idempotency_key": key,
+        }))
+        .unwrap();
+        let mut commits = state.session_service.arm_creation_commit();
+        let request = tokio::spawn(async move {
+            let signal = std::future::pending::<std::io::Result<()>>();
+            tokio::pin!(signal);
+            create_and_observe(&client, &body, &epoch, key, signal.as_mut()).await
+        });
+        let (id, release) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let storage = crate::session::Storage::open_unwatched("test").unwrap();
+        let failure = storage.fail_writes_for_test();
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), request).await;
+        drop(failure);
+        state.shutdown.cancel();
+        server.abort();
+        let _ = server.await;
+        let error = result.unwrap().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("Creation outcome unknown"),
+            "post-commit failure must reconcile instead of reporting rejection: {error:#}"
+        );
+        let rows = storage.load().unwrap();
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| row.idempotency_key.as_deref() == Some(key))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(matching[0].id, id);
+        assert_eq!(matching[0].status, crate::session::Status::Creating);
+    }
+
     #[tokio::test]
     async fn queued_interruption_does_not_submit_launch() {
         let submitted = std::cell::Cell::new(false);
