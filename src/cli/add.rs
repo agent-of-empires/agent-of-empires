@@ -711,7 +711,7 @@ mod tests {
     async fn post_commit_write_failure_reconciles_without_recreating() {
         use crate::server::test_support as support;
         use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::TempDir::new_in("/tmp").unwrap();
+        let home = tempfile::TempDir::new_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         support::seed_instances_on_disk_for_test("test", Vec::new());
