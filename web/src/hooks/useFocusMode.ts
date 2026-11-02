@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { focusSessionTitle } from "../lib/focusMode";
-import { enterFocusWindow, loadedFocusSessionId, replaceDocument } from "../lib/sessionRoute";
+import { enterFocusWindow, loadedFocusSessionId, reloadDocument, replaceDocument } from "../lib/sessionRoute";
 
 export interface FocusMode {
   /** The only session this window shows, or null outside focus mode. */
@@ -19,15 +19,13 @@ export interface FocusMode {
  *  into one) reloads the document at the new URL. */
 export function useFocusMode(routedSessionId: string | null): FocusMode {
   const [searchParams] = useSearchParams();
-  const location = useLocation();
   const focusSessionId = routedSessionId && searchParams.get("focus") === "1" ? routedSessionId : null;
   // Synchronizes the document with the route whatever navigated it (links, toasts, Back), not one event's handler.
+  // The router has already put the new URL in the address bar, so a reload loads it.
   useEffect(() => {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (focusSessionId !== loadedFocusSessionId()) {
-      replaceDocument(`${location.pathname}${location.search}${location.hash}`);
-    }
-  }, [focusSessionId, location]);
+    if (focusSessionId !== loadedFocusSessionId()) reloadDocument();
+  }, [focusSessionId]);
   const exitFocusMode = useCallback(() => {
     if (focusSessionId) replaceDocument(`/session/${encodeURIComponent(focusSessionId)}`);
   }, [focusSessionId]);

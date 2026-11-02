@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { createToasts, focusNavigation, focusSessionOfUrl, focusSessionTitle, noticedSessions } from "../focusMode";
+import {
+  createToasts,
+  focusNavigation,
+  focusSessionOfUrl,
+  focusSessionTitle,
+  noticedSessions,
+  withFocusMode,
+} from "../focusMode";
 import { toastBus, type ToastApi } from "../toastBus";
 
 describe("createToasts", () => {
@@ -62,10 +69,21 @@ describe("focusNavigation", () => {
   it.each([
     [null, "b", "here"],
     [null, undefined, "here"],
-    ["a", "a", "none"],
+    ["a", "a", "focused"],
     ["a", "b", "new-window"],
     ["a", undefined, "new-window"],
   ] as const)("in focus %s, a target session %s goes %s", (focus, target, expected) => {
     expect(focusNavigation(focus, target)).toBe(expected);
+  });
+});
+
+describe("withFocusMode", () => {
+  it.each([
+    ["/session/s1", "/session/s1?focus=1"],
+    ["/session/s1#turn-3", "/session/s1?focus=1#turn-3"],
+    ["/session/s1?x=1&focus=0#turn-3", "/session/s1?x=1&focus=1#turn-3"],
+    ["/session/a%20b?focus=1", "/session/a%20b?focus=1"],
+  ])("keeps %s in focus mode as %s", (path, expected) => {
+    expect(withFocusMode(path)).toBe(expected);
   });
 });

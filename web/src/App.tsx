@@ -19,7 +19,7 @@ import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useFocusMode, useFocusSession } from "./hooks/useFocusMode";
-import { createToasts, focusNavigation, noticedSessions } from "./lib/focusMode";
+import { createToasts, focusNavigation, noticedSessions, withFocusMode } from "./lib/focusMode";
 import { FocusModeNote } from "./components/FocusModeNote";
 import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
@@ -1038,15 +1038,20 @@ function AppContent({
 
   const handleSelectSession = useCallback(
     (sessionId: string, path?: string) => {
-      // A focus window never switches; another session opens in a regular window instead.
+      // A focus window never switches; another session opens in a regular window instead. A path into the focused
+      // session (e.g. a deep link) keeps the window in focus mode, and without one there is nowhere to go.
       const target = focusNavigation(focusSessionId, sessionId);
-      if (target === "new-window") window.open(path ?? `/session/${encodeURIComponent(sessionId)}`, "_blank");
-      if (target !== "here") return;
+      if (target === "new-window") {
+        window.open(path ?? `/session/${encodeURIComponent(sessionId)}`, "_blank");
+        return;
+      }
+      const route =
+        target === "focused" ? path && withFocusMode(path) : (path ?? `/session/${encodeURIComponent(sessionId)}`);
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
         transitionKeyboardProxy(sessionId, sessionId === activeSessionId && singlePane ? rightPanelView : "agent");
-        navigate(path ?? `/session/${encodeURIComponent(sessionId)}`);
+        if (route) navigate(route);
         // iOS does not permit a session's asynchronously mounted terminal
         // input to inherit this sidebar tap's keyboard authorization. The
         // persistent keyboard input keeps the gesture-authorized focus while
@@ -1068,11 +1073,11 @@ function AppContent({
           focusAgentInput(picked);
         }
         if (window.innerWidth < 768) setSidebarOpen(false);
-      } else if (path) {
+      } else if (path && route) {
         // Not yet in the locally known workspace list (e.g. a session a
         // plugin just created); the route itself resolves the session
         // independently of this list, so a bare navigation still works.
-        navigate(path);
+        navigate(route);
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },

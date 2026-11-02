@@ -16,10 +16,15 @@ vi.mock("../lib/sessionRoute", async (importOriginal) => ({
 
 const originalLocation = Object.getOwnPropertyDescriptor(window, "location")!;
 let replace: ReturnType<typeof vi.fn>;
+let reload: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   replace = vi.fn();
-  Object.defineProperty(window, "location", { configurable: true, value: { ...window.location, replace } });
+  reload = vi.fn();
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    value: { ...window.location, replace, reload },
+  });
 });
 afterEach(() => {
   Object.defineProperty(window, "location", originalLocation);
@@ -51,6 +56,7 @@ describe("useFocusMode", () => {
   ])("reads %s as focus session %s", (url, expected) => {
     expect(setup(url).result.current.focus.focusSessionId).toBe(expected);
     expect(replace).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
   });
 
   // A router navigation would leave the service worker's `Client.url` on the old mode.
@@ -68,20 +74,24 @@ describe("useFocusMode", () => {
     expect(replace).not.toHaveBeenCalled();
   });
 
+  // A reload, not `location.replace` to the URL the router already set: with a hash, that would only scroll.
   it("reloads when a router navigation changes the mode, so the service worker sees it", () => {
     const { result } = setup("/session/s1");
     act(() => result.current.navigate("/session/s1?focus=1#turn-3"));
-    expect(replace).toHaveBeenLastCalledWith("/session/s1?focus=1#turn-3");
+    expect(reload).toHaveBeenCalledTimes(1);
 
     // Back into a regular entry from a document loaded as a focus window.
     const back = setup("/session/s1?focus=1");
     act(() => back.result.current.navigate("/session/s1"));
-    expect(replace).toHaveBeenLastCalledWith("/session/s1");
+    expect(reload).toHaveBeenCalledTimes(2);
 
     // A session change within the same mode stays a router navigation.
-    replace.mockClear();
     const regular = setup("/session/s1");
     act(() => regular.result.current.navigate("/session/s2"));
+    // So does a same-mode change of query or hash.
+    const focused = setup("/session/s1?focus=1");
+    act(() => focused.result.current.navigate("/session/s1?focus=1#turn-3"));
+    expect(reload).toHaveBeenCalledTimes(2);
     expect(replace).not.toHaveBeenCalled();
   });
 
@@ -89,13 +99,13 @@ describe("useFocusMode", () => {
     "keeps a document loaded at %s, which the router also routes, without reloading it",
     (url) => {
       expect(setup(url).result.current.focus.focusSessionId).not.toBeNull();
-      expect(replace).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
     },
   );
 
   it("reloads a document whose load URL and route disagree from the start", () => {
     setup("/session/s1?focus=1", "/session/s1");
-    expect(replace).toHaveBeenCalledWith("/session/s1?focus=1");
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 });
 

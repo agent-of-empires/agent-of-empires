@@ -36,6 +36,13 @@ export function replaceDocument(path: string): void {
   window.location.replace(path);
 }
 
+/** Loads the current URL as a new document, for a router navigation the service worker must see (`Client.url`).
+ *  `replaceDocument` to that same URL would only scroll to its fragment when it has one. */
+export function reloadDocument(): void {
+  if (typeof window === "undefined") return;
+  window.location.reload();
+}
+
 /** The focus session of the URL this document loaded with, which is the one the service worker sees for the window
  *  (`Client.url`), whatever history changes followed. */
 export function loadedFocusSessionId(): string | null {

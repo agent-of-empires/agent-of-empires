@@ -16,13 +16,20 @@ export function noticedSessions<T extends { id: string }>(
   return focusSessionId ? sessions.filter((s) => s.id === focusSessionId) : sessions;
 }
 
-/** Where a navigation this window asked for goes: in place, into a new window, or nowhere because the focused
- *  session is already shown. `sessionId` is set when the target is a session route. */
-export type FocusNavigation = "here" | "new-window" | "none";
+/** Where a navigation this window asked for goes: in place, into a new window, or in place within focus mode because
+ *  it targets the focused session (see `withFocusMode`). `sessionId` is set when the target is a session route. */
+export type FocusNavigation = "here" | "new-window" | "focused";
 
 export function focusNavigation(focusSessionId: string | null, sessionId?: string): FocusNavigation {
   if (!focusSessionId) return "here";
-  return sessionId === focusSessionId ? "none" : "new-window";
+  return sessionId === focusSessionId ? "focused" : "new-window";
+}
+
+/** `path` (relative, same origin) with `focus=1` set, so that following it keeps the window in focus mode. */
+export function withFocusMode(path: string): string {
+  const url = new URL(path, "http://aoe.invalid");
+  url.searchParams.set("focus", "1");
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 /** The focus session a URL names (`/session/<id>?focus=1`), or null. The path is read exactly as the router's
