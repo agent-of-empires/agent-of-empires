@@ -510,6 +510,46 @@ fn cli_add_lists_the_new_session_and_provides_a_start_command() {
     assert!(h.run_cli_ok(&["list"]).contains("NextSteps"));
 }
 
+#[test]
+#[parallel]
+fn cli_add_remote_start_hint_targets_the_daemon_host() {
+    let server = TuiTestHarness::new("cli_remote_start_server");
+    let port = server.start_daemon();
+    let project = server.project_path();
+    let url = format!("http://127.0.0.1:{port}");
+    for explicit in [true, false] {
+        let mut client = TuiTestHarness::new("cli_remote_start_client");
+        let title = if explicit { "flag" } else { "environment" };
+        let mut args = vec!["add", project.to_str().unwrap(), "-t", title];
+        if explicit {
+            args.extend(["--daemon-url", &url]);
+        } else {
+            client.set_env("AOE_DAEMON_URL", &url);
+        }
+        let output = client.run_cli_ok(&args);
+        let sessions = server.read_sessions();
+        let row = crate::harness::session_by_title(&sessions, title);
+        let hint = output
+            .lines()
+            .find_map(|line| line.strip_prefix("On the Daemon host, start with: "))
+            .expect("remote creation must identify where the start command runs");
+        let command = shell_words::split(hint).unwrap();
+        assert_eq!(
+            command,
+            [
+                "aoe",
+                "-p",
+                "default",
+                "session",
+                "start",
+                row["id"].as_str().unwrap()
+            ]
+        );
+        assert!(!output.lines().any(|line| line.starts_with("Start with: ")));
+        assert!(!client.sessions_path().exists());
+    }
+}
+
 /// #3224: a repeated `aoe add` for the same title and path is a conflict, and
 /// must not silently retain the first session's command override.
 #[test]
@@ -1337,33 +1377,17 @@ fn cli_add_workspace_runs_effective_on_create_hooks() {
         if repo_hooks {
             args.push("--trust-hooks");
         }
-        let mut pending = GatedCli {
-            child: Some(h.spawn_cli(&args)),
-            release,
-        };
-        let stderr = pending.child.as_mut().unwrap().stderr.take().unwrap();
-        let (observed, progress) = std::sync::mpsc::channel();
-        let output = std::thread::spawn(move || {
-            use std::io::BufRead;
-            let mut lines = Vec::new();
-            for line in std::io::BufReader::new(stderr).lines() {
-                let line = line.unwrap();
-                if line.contains(&command) {
-                    let _ = observed.send(());
-                }
-                lines.push(line);
-            }
-            lines
+        let mut pending = GatedCli::spawn(h.cli_command(&args), release);
+        wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+            let stderr = std::fs::read_to_string(pending.stderr.path()).unwrap();
+            stderr
+                .contains(&command)
+                .then_some(())
+                .ok_or_else(|| format!("pending hook command was not shown: {stderr}"))
         });
-        let seen = progress.recv_timeout(Duration::from_secs(20));
         std::fs::write(&pending.release, "release").unwrap();
-        let result = pending.child.take().unwrap().wait_with_output().unwrap();
-        let lines = output.join().unwrap();
-        assert!(result.status.success(), "{lines:?}");
-        assert!(
-            seen.is_ok(),
-            "pending hook command was not shown: {lines:?}"
-        );
+        let result = pending.wait_with_output(Duration::from_secs(20));
+        assert!(result.status.success(), "{result:?}");
         assert!(
             marker.exists(),
             "repo_hooks={repo_hooks}: hooks did not run"
@@ -1864,18 +1888,93 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
 }
 
 struct GatedCli {
-    child: Option<std::process::Child>,
+    child: std::process::Child,
     release: std::path::PathBuf,
+    stdout: tempfile::NamedTempFile,
+    stderr: tempfile::NamedTempFile,
+}
+
+impl GatedCli {
+    fn spawn(mut command: Command, release: std::path::PathBuf) -> Self {
+        // Files avoid pipe backpressure and EOF waits on inherited descriptors.
+        let stdout = tempfile::NamedTempFile::new().unwrap();
+        let stderr = tempfile::NamedTempFile::new().unwrap();
+        let child = command
+            .stdout(stdout.reopen().unwrap())
+            .stderr(stderr.reopen().unwrap())
+            .spawn()
+            .expect("spawn gated CLI");
+        Self {
+            child,
+            release,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn wait_with_output(&mut self, timeout: Duration) -> std::process::Output {
+        let status = wait_until(timeout, Duration::from_millis(20), || {
+            self.child.try_wait().unwrap().ok_or_else(|| {
+                format!(
+                    "CLI did not exit; stderr: {}",
+                    std::fs::read_to_string(self.stderr.path()).unwrap()
+                )
+            })
+        });
+        std::process::Output {
+            status,
+            stdout: std::fs::read(self.stdout.path()).unwrap(),
+            stderr: std::fs::read(self.stderr.path()).unwrap(),
+        }
+    }
 }
 
 impl Drop for GatedCli {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.release, "release");
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn gated_cli_collects_large_output_and_reaps_after_timeout() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "i=0; while [ \"$i\" -lt 8192 ]; do printf '0123456789abcdef'; printf 'fedcba9876543210' >&2; i=$((i+1)); done; exit 7",
+    ]);
+    let mut pending = GatedCli::spawn(command, root.path().join("normal-release"));
+    let output = pending.wait_with_output(Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"0123456789abcdef".repeat(8192));
+    assert_eq!(output.stderr, b"fedcba9876543210".repeat(8192));
+    drop(pending);
+
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf waiting >&2; exec sleep 600"]);
+    let release = root.path().join("timeout-release");
+    let mut pending = GatedCli::spawn(command, release.clone());
+    wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        (std::fs::read(pending.stderr.path()).unwrap() == b"waiting")
+            .then_some(())
+            .ok_or_else(|| "child did not enter its blocking phase".to_owned())
+    });
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(pending.child.id()).unwrap());
+    let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pending.wait_with_output(Duration::from_millis(50))
+    }));
+    assert!(timed_out.is_err());
+    drop(pending);
+    assert!(release.exists());
+    assert_eq!(
+        nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+        Err(nix::errno::Errno::ECHILD),
+        "timed-out child must be reaped"
+    );
 }
 
 #[test]
@@ -1899,17 +1998,17 @@ fn cli_agent_probe_does_not_block_daemon_requests() {
     h.append_config("[session]\nagent_command_override = { claude = \"aoe-review-missing\" }");
     let port = h.start_daemon();
     let project = h.project_path();
-    let mut pending = GatedCli {
-        child: Some(h.spawn_cli(&[
+    let mut pending = GatedCli::spawn(
+        h.cli_command(&[
             "add",
             project.to_str().unwrap(),
             "-t",
             "probe",
             "--cmd",
             "claude",
-        ])),
+        ]),
         release,
-    };
+    );
     wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
         entered
             .exists()
@@ -1924,7 +2023,7 @@ fn cli_agent_probe_does_not_block_daemon_requests() {
             .await
     });
     std::fs::write(&pending.release, "release").unwrap();
-    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    let output = pending.wait_with_output(Duration::from_secs(20));
     assert_eq!(response.unwrap().status(), reqwest::StatusCode::OK);
     assert!(
         !output.status.success(),
@@ -1970,17 +2069,17 @@ fn cli_launch_waits_for_a_hook_beyond_the_read_timeout() {
         ),
     )
     .unwrap();
-    let mut pending = GatedCli {
-        child: Some(h.spawn_cli(&[
+    let mut pending = GatedCli::spawn(
+        h.cli_command(&[
             "add",
             project.to_str().unwrap(),
             "-t",
             "long-hook",
             "--trust-hooks",
             "--launch",
-        ])),
+        ]),
         release,
-    };
+    );
     wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
         entered
             .exists()
@@ -1990,21 +2089,14 @@ fn cli_launch_waits_for_a_hook_beyond_the_read_timeout() {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut exited_early = false;
     while std::time::Instant::now() < deadline {
-        if pending
-            .child
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .unwrap()
-            .is_some()
-        {
+        if pending.child.try_wait().unwrap().is_some() {
             exited_early = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     std::fs::write(&pending.release, "release").unwrap();
-    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    let output = pending.wait_with_output(Duration::from_secs(20));
     assert!(!exited_early, "{output:?}");
     assert!(output.status.success(), "{output:?}");
     wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
@@ -2137,24 +2229,24 @@ fn cli_review_boundary_sigint_during_launch_preserves_the_created_session() {
         ),
     )
     .unwrap();
-    let mut pending = GatedCli {
-        child: Some(h.spawn_cli(&[
+    let mut pending = GatedCli::spawn(
+        h.cli_command(&[
             "add",
             project.to_str().unwrap(),
             "-t",
             "interrupted-launch",
             "--trust-hooks",
             "--launch",
-        ])),
+        ]),
         release,
-    };
+    );
     wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
         entered
             .exists()
             .then_some(())
             .ok_or_else(|| "launch hook not entered".to_owned())
     });
-    let pid = pending.child.as_ref().unwrap().id();
+    let pid = pending.child.id();
     wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let caught = status
@@ -2170,13 +2262,11 @@ fn cli_review_boundary_sigint_during_launch_preserves_the_created_session() {
     wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
         pending
             .child
-            .as_mut()
-            .unwrap()
             .try_wait()
             .unwrap()
             .ok_or_else(|| "CLI ignored SIGINT while launch remained blocked".to_owned())
     });
-    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    let output = pending.wait_with_output(Duration::from_secs(3));
     assert!(!output.status.success(), "{output:?}");
     let rows = h.read_sessions();
     let row = crate::harness::session_by_title(&rows, "interrupted-launch");

@@ -470,12 +470,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     } else if row.view == crate::session::View::Structured {
         println!("Structured session lifecycle is managed by the Daemon.");
-    } else {
+    } else if local {
         println!(
             "Start with: aoe -p {} session start {}",
             shell_words::quote(&profile),
             shell_words::quote(&row.id)
         );
+    } else {
+        println!(
+            "On the Daemon host, start with: aoe -p {} session start {}",
+            shell_words::quote(&profile),
+            shell_words::quote(&row.id)
+        );
+        println!("Or use the Daemon dashboard to start the session.");
     }
     Ok(())
 }

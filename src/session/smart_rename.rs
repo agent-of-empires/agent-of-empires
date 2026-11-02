@@ -3145,8 +3145,6 @@ claude = "repo-wrapper"
             None
         };
 
-        // Scoped: the injection is process-wide, so the guard must drop before
-        // the assertions that read storage back.
         {
             let _failing_writes = storage.fail_writes_for_test();
             let error = apply_terminal_title(

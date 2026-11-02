@@ -39,6 +39,8 @@ running. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the sele
 Daemon, never locally if that connection fails. Pass an absolute path on that host,
 or `--scratch`; registered `--project` names and agent settings also come from that host.
 `--hook-env KEY` explicitly reads that client variable; no other client environment is sent.
+For a remote terminal session without `--launch`, run the printed start command on the
+Daemon host, not on the client machine. You can also start it from the Daemon dashboard.
 
 During creation, hook progress appears on stderr. `Ctrl+C` requests cancellation and waits
 for the Daemon's result. If the connection is lost, the CLI checks canonical state without
