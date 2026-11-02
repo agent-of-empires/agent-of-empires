@@ -727,6 +727,8 @@ retry's `kill_pane` setting. Path reconciliation cannot acknowledge that pending
 teardown. Other lifecycle actions, including Restore and Purge, cannot replace
 the pending Trash owner after expiry. Restore and Purge return `409 trash_incomplete`, which
 directs native clients to retry `aoe rm <id>` before another lifecycle action.
+For an unfinished Trash transition, `aoe rm <id>` retries Trash even when
+`session.delete_to_trash` is disabled. `--purge` never performs this recovery.
 Orphan cleanup retains both the pending row and its moved checkout.
 A failed retry keeps that protection. Recovery adopts a holding checkout only
 when Git registers it in the expected repository and branch; unrelated holding

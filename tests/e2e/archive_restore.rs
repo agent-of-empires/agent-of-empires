@@ -1239,3 +1239,66 @@ fn trash_reader_ctrl_c_exits() {
         .success());
     h.wait_for_exit(Duration::from_secs(5));
 }
+
+#[test]
+#[parallel]
+fn trash_retry_ignores_permanent_delete_policy() {
+    use agent_of_empires::session::{Instance, LifecycleOperation, Status};
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_retry_policy");
+    h.stop_daemon_on_drop();
+    h.append_config("[session]\ndelete_to_trash = false");
+    let mut row = Instance::new("PendingTrashPolicy", h.project_path().to_str().unwrap());
+    row.status = Status::Stopped;
+    let generation = row
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+    row.trash();
+    let id = row.id.clone();
+    let identity = row.trash_lifecycle_id.clone().unwrap();
+    std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+    h.start_daemon();
+    let refused = h.run_cli(&["rm", "--purge", &id]);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("aoe rm"), "{message}");
+    h.run_cli_ok(&["rm", &id]);
+    let rows = h.read_sessions();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap();
+    assert!(row["trashed_at"].is_string());
+    assert_eq!(row["trash_lifecycle_id"], identity);
+    assert_eq!(row["lifecycle_generation"], generation + 1);
+    assert!(row["lifecycle_reservation"].is_null());
+    h.run_cli_ok(&["session", "restore", &id]);
+    // Restore writes locally; wait for the daemon's selection snapshot.
+    crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        let rows: serde_json::Value =
+            serde_json::from_str(&h.run_cli_ok(&["list", "--json"])).unwrap();
+        if rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == id && row["trashed_at"].is_null())
+        {
+            Ok(())
+        } else {
+            Err("daemon has not adopted the restored row".into())
+        }
+    });
+    h.run_cli_ok(&["rm", &id]);
+    assert!(!h
+        .read_sessions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == id));
+}

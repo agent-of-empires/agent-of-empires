@@ -72,9 +72,24 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
 
     let title = &session.title;
     let id = &session.id;
-    if session.cleanup_defaults.delete_to_trash && !args.purge {
+    let retrying_trash = session.trashed_at.is_some()
+        && session
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| {
+                reservation.op == crate::session::LifecycleOperation::Trash
+                    && reservation.generation == session.lifecycle_generation
+            });
+    if !args.purge && (session.cleanup_defaults.delete_to_trash || retrying_trash) {
         let receipt = daemon
-            .trash_session(id, &TrashSessionBody::default(), &info.epoch)
+            .trash_session(
+                id,
+                &TrashSessionBody {
+                    expected_generation: retrying_trash.then_some(session.lifecycle_generation),
+                    ..Default::default()
+                },
+                &info.epoch,
+            )
             .await?;
         trash_result(receipt.outcome.relocation, title)?;
         println!("  Moved session to trash: {title} (from profile '{profile}')");
