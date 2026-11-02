@@ -155,6 +155,23 @@ impl Instance {
             )
     }
 
+    /// A returned attempt no longer owns a live lease, but unconfirmed paths remain fenced.
+    pub(crate) fn retire_trash_reservation_if_owned(
+        &mut self,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if !self.has_pending_trash()
+            || !self.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+        {
+            return false;
+        }
+        if let Some(reservation) = &mut self.lifecycle_reservation {
+            reservation.at = reservation.at.min(now - Self::LIFECYCLE_RESERVATION_TTL);
+        }
+        true
+    }
+
     pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,

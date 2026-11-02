@@ -721,18 +721,14 @@ Repeating a completed request for an already-trashed session succeeds without
 repeating teardown or relocation. A fresh lifecycle reservation returns
 `409 lifecycle_locked` rather than acknowledging an unfinished transition.
 Generation preconditions are checked before the already-trashed state.
-An expired reservation for an unfinished Trash transition survives daemon startup.
-Retrying acquires a new generation and repeats teardown and relocation using the
-retry's `kill_pane` setting. Path reconciliation cannot acknowledge that pending
-teardown. Other lifecycle actions, including Restore and Purge, cannot replace
-the pending Trash owner after expiry. Restore and Purge return `409 trash_incomplete`, which
-directs native clients to retry `aoe rm <id>` before another lifecycle action.
+Restore and Purge return `409 trash_incomplete` while a Trash outcome remains
+unconfirmed. Retry `POST /api/sessions/{id}/trash`, or use `aoe rm <id>`, before
+another lifecycle action.
 For an unfinished Trash transition, `aoe rm <id>` retries Trash even when
 `session.delete_to_trash` is disabled. `--purge` never performs this recovery.
-Orphan cleanup retains both the pending row and its moved checkout.
-A failed retry keeps that protection. Recovery adopts a holding checkout only
-when Git registers it in the expected repository and branch; unrelated holding
-collisions remain failures and their files stay untouched.
+A terminal teardown or relocation failure leaves the session in Trash without
+preventing explicit Restore or Purge. Unconfirmed retained locations remain
+protected until a subsequent Trash request confirms them.
 
 ## Explicit structured worker stop
 

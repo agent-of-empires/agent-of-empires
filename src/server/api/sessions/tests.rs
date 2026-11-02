@@ -1192,6 +1192,73 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
 
 #[tokio::test]
 #[serial_test::serial]
+async fn trash_teardown_failure_allows_explicit_restore_and_purge() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    let project = tempfile::tempdir()?;
+    let mut row = Instance::new("failed trash teardown", project.path().to_str().unwrap());
+    row.source_profile = "receipt".into();
+    row.view = crate::session::View::Terminal;
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row.clone());
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let name = crate::server::pane::respawn_paired_if_dead(&state, &id, &row, 0).await?;
+    let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+    assert!(crate::tmux::session_exists(pane.name()));
+    let tmux = which::which("tmux")?;
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = kill-session ]; then echo teardown-fault >&2; exit 1; fi\ndone\nexec {} \"$@\"\n",
+        shell_words::quote(tmux.to_str().unwrap()),
+    );
+    let fault = crate::session::test_support::install_login_shell_path_command(
+        project.path(),
+        "tmux",
+        &script,
+    );
+    let response = trash_session(State(state.clone()), Path(id.clone()), None)
+        .await
+        .into_response();
+    drop(fault);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["outcome"]["relocation"]["status"], "teardown_failed",
+        "{body}"
+    );
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(stored.is_trashed());
+    assert_eq!(stored.status, Status::Error);
+    assert!(stored.lifecycle_reservation.is_none());
+    let response = restore_session(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = delete_session(State(state), Path(id.clone()), None)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!storage.load()?.iter().any(|row| row.id == id));
+    assert!(!crate::tmux::session_exists(pane.name()));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Result<()> {
     for (startup, moved_before_crash, recreated, shared_original) in [
         (false, false, false, false),
@@ -1203,6 +1270,7 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let root = tempfile::tempdir()?;
         let main_repo = root.path().join("main");
         let worktree = root.path().join("worktree");
@@ -1339,21 +1407,52 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             let response = restore_session(State(state.clone()), Path(id.clone()))
                 .await
                 .into_response();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let expired = storage.update(|rows, _| {
-                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
-                assert!(row.has_pending_trash());
-                row.lifecycle_reservation.as_mut().unwrap().at = chrono::Utc::now()
-                    - Instance::LIFECYCLE_RESERVATION_TTL
-                    - chrono::Duration::seconds(1);
-                Ok(row.clone())
-            })?;
-            generation = expired.lifecycle_generation;
-            *state.instances.write().await = vec![expired];
-            *state.canonical_metadata.write().await =
-                crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
-            std::fs::remove_file(holding.join("unrelated"))?;
-            std::fs::remove_dir(&holding)?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = delete_session(State(state.clone()), Path(id.clone()), None)
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!storage.load()?.iter().any(|row| row.id == id));
+            assert_eq!(std::fs::read(holding.join("unrelated"))?, b"keep holding");
+            assert_eq!(std::fs::read(worktree.join("payload"))?, b"retained");
+            continue;
+        }
+        if moved_before_crash && !recreated && !shared_original {
+            let holding = crate::session::trash::trash_holding_path(&worktree, &id).unwrap();
+            let holding_repo = git2::Repository::open(&holding)?;
+            holding_repo
+                .find_branch("interrupted-trash", git2::BranchType::Local)?
+                .rename("unconfirmed-trash-location", false)?;
+            for _ in 0..2 {
+                let response = trash_session(State(state.clone()), Path(id.clone()), None)
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+                let body: serde_json::Value = serde_json::from_slice(&body)?;
+                assert_eq!(body["outcome"]["relocation"]["status"], "failed");
+                let pending = storage
+                    .load()?
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert!(pending.has_pending_trash());
+                assert!(!pending.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                assert_eq!(pending.lifecycle_generation, generation + 1);
+                generation = pending.lifecycle_generation;
+                let response = restore_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let response = delete_session(State(state.clone()), Path(id.clone()), None)
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(std::fs::read(holding.join("payload"))?, b"retained");
+            }
+            holding_repo
+                .find_branch("unconfirmed-trash-location", git2::BranchType::Local)?
+                .rename("interrupted-trash", false)?;
         }
         let response = trash_session(
             State(state.clone()),
