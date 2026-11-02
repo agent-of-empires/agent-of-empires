@@ -2341,7 +2341,6 @@ impl HomeView {
                     self.context_menu = None;
                 }
                 DialogResult::Submit(action) => {
-                    self.context_menu = None;
                     self.dispatch_context_menu_action(action);
                 }
             }
@@ -5370,8 +5369,14 @@ impl HomeView {
                 }
             }
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
-                if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
-                    self.context_menu = Some(ContextMenuDialog::for_trashed_session(anchor));
+                if let Some(inst) = self.get_instance(id).filter(|inst| inst.is_trashed()) {
+                    self.context_menu = Some(
+                        ContextMenuDialog::for_trashed_session(anchor).with_session_target(
+                            &inst.id,
+                            &inst.source_profile,
+                            inst.lifecycle_generation,
+                        ),
+                    );
                     return true;
                 }
             }
@@ -5478,7 +5483,6 @@ impl HomeView {
                 self.context_menu = None;
             }
             Some(DialogResult::Submit(action)) => {
-                self.context_menu = None;
                 self.dispatch_context_menu_action(action);
             }
         }
@@ -5491,6 +5495,26 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        let menu = self.context_menu.take();
+        if let Some((id, profile, generation)) =
+            menu.as_ref().and_then(ContextMenuDialog::session_target)
+        {
+            let valid = self.selected_session.as_ref() == Some(id)
+                && self.get_instance(id).is_some_and(|inst| {
+                    inst.source_profile == *profile
+                        && inst.lifecycle_generation == *generation
+                        && inst.is_trashed()
+                })
+                && self.session_feed.applied_session(id).is_some_and(|row| {
+                    row.profile == *profile
+                        && row.lifecycle_generation == *generation
+                        && row.trashed_at.is_some()
+                });
+            if !valid {
+                self.flash_status("Session changed; reopen the context menu");
+                return;
+            }
+        }
         if self.selected_is_trashed()
             && !matches!(
                 action,

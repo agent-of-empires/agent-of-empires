@@ -61,6 +61,7 @@ pub struct ContextMenuDialog {
     anchor: (u16, u16),
     /// Last rendered rect, so click-outside needs no layout math.
     last_area: Rect,
+    session_target: Option<(String, String, u64)>,
 }
 
 /// The menu item at `(col, row)`, or `None` on any border, past the last item,
@@ -152,6 +153,15 @@ impl ContextMenuDialog {
         )
     }
 
+    pub fn with_session_target(mut self, id: &str, profile: &str, generation: u64) -> Self {
+        self.session_target = Some((id.to_owned(), profile.to_owned(), generation));
+        self
+    }
+
+    pub fn session_target(&self) -> Option<&(String, String, u64)> {
+        self.session_target.as_ref()
+    }
+
     pub fn is_read_only_session_menu(&self) -> bool {
         self.items.iter().all(|(action, _)| {
             matches!(
@@ -239,6 +249,7 @@ impl ContextMenuDialog {
             highlight: Some(0),
             anchor,
             last_area: Rect::default(),
+            session_target: None,
         }
     }
 

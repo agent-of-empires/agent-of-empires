@@ -179,8 +179,9 @@ scroll position. Read failures keep the last loaded content visible with an
 error. Content, size, or theme changes clear the previous text selection.
 Reopen the reader after in-place edits to already retained events.
 
-Dialogs close when their target session changes or disappears. Restore and
-permanent deletion always apply to the session confirmed, not a later selection.
+Dialogs close when their target session changes or disappears. Trash context
+menus reject actions if the original session, profile, or lifecycle generation
+changes. Restore and permanent deletion never target a replacement selection.
 
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges
