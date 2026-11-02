@@ -673,11 +673,25 @@ pub async fn create_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    let wait_ready = query.wait.as_deref() == Some("ready");
+    create_session_with(state, local_owner, wait_ready, body, None).await
+}
 
+/// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface
+/// that builds the body itself. `local_owner` sees hook failure detail, `wait_ready` is
+/// `?wait=ready`, and `initial_turn` is a structured session's first prompt, delivered
+/// once its worker runs.
+pub(crate) async fn create_session_with(
+    state: Arc<AppState>,
+    local_owner: bool,
+    wait_ready: bool,
+    mut body: CreateSessionBody,
+    initial_turn: Option<String>,
+) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
             return api_error(
@@ -979,6 +993,34 @@ pub async fn create_session(
         );
     }
 
+    // A sub-session lives in its parent's group, as `aoe add --parent` places it.
+    if let Some(parent_id) = body.parent_session_id.as_deref() {
+        // CityHall answers a terminal parent like a missing one, so the mode does not
+        // reveal which ids exist.
+        let parent = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == parent_id && (!state.cityhall_mode || i.is_structured()))
+            .cloned();
+        let Some(parent) = parent else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "parent_not_found",
+                format!("No session {parent_id} to be the parent"),
+            );
+        };
+        if let Err(e) = parent.ensure_can_parent() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "parent_is_sub_session",
+                e.to_string(),
+            );
+        }
+        body.group = parent.group_path;
+    }
+
     let worktree_enabled = create_body_uses_worktree(&body);
     let mut import_binding = None;
 
@@ -1185,6 +1227,7 @@ pub async fn create_session(
         created_by_plugin: None,
         plugin_create_idempotency: None,
         pending_initial_turn: None,
+        parent_session_id: body.parent_session_id,
         acp_mode_id: None,
         view: body.view,
         agent_name: body.agent_name,
@@ -1208,7 +1251,7 @@ pub async fn create_session(
         let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
-            .create_structured_session(spec, None, None, None)
+            .create_structured_session(spec, None, None, initial_turn.as_deref())
             .await;
         if let (Err(e), Some(key)) = (&result, &key) {
             if let Some(failure) = create_failure(e) {
@@ -1227,7 +1270,7 @@ pub async fn create_session(
     match created {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
-            if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
+            if wait_ready && instance.status == Status::Starting {
                 let _ = wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await;
             }
             created_session_response(&state, &instance.id, outcome.warnings, StatusCode::CREATED)

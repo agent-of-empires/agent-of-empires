@@ -2563,6 +2563,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            parent_session_id: None,
             acp_mode_id: None,
             view: crate::session::View::Structured,
             agent_name: Some("claude".to_string()),

@@ -53,6 +53,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
+    /// The session this one is a sub-session of, already checked by the caller.
+    pub parent_session_id: Option<String>,
     /// Explicit ACP approval-mode id to persist on the instance; the
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
@@ -143,6 +145,7 @@ pub(crate) async fn spawn_structured_session(
             created_by_plugin,
             plugin_create_idempotency,
             pending_initial_turn,
+            parent_session_id,
             acp_mode_id,
             view,
             agent_name,
@@ -260,6 +263,7 @@ pub(crate) async fn spawn_structured_session(
                 attachments: Vec::new(),
                 synthesized: false,
             });
+        instance.parent_session_id = parent_session_id;
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
@@ -1056,6 +1060,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            parent_session_id: None,
             acp_mode_id: None,
             view: crate::session::View::Terminal,
             agent_name: Some("claude".into()),

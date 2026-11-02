@@ -515,9 +515,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
         let parent = super::resolve_session(parent_ref, &instances)?;
-        if parent.is_sub_session() {
-            bail!("Cannot create sub-session of a sub-session (single level only)");
-        }
+        parent.ensure_can_parent()?;
         group_path = Some(parent.group_path.clone());
         Some(parent.id.clone())
     } else {
