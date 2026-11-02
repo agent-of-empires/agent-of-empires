@@ -142,6 +142,9 @@ fn shared_watch() -> Arc<FileWatchService> {
 #[derive(Default)]
 pub(crate) struct ActiveTasks {
     owners: Mutex<HashMap<String, Arc<TaskOwner>>>,
+    /// Tasks `TaskStop` ended before any tailer followed them, as when the
+    /// result is replayed ahead of the resumed tailing.
+    stopped_early: Mutex<HashSet<String>>,
     publication: tokio::sync::Mutex<()>,
 }
 
@@ -162,13 +165,27 @@ impl ActiveTasks {
         self.lock().is_empty()
     }
 
-    /// Ends `task_id` because `TaskStop` killed it, returning whether a tailer
-    /// was following it. The tailer publishes the end itself.
-    pub(crate) fn stop(&self, task_id: &str) -> bool {
-        self.lock().get(task_id).is_some_and(|owner| {
-            owner.stop.cancel();
-            true
-        })
+    /// Ends `task_id` because `TaskStop` killed it. A following tailer
+    /// publishes the end itself; with none, the stop is kept for
+    /// [`Self::take_early_stop`].
+    pub(crate) fn stop(&self, task_id: &str) {
+        match self.lock().get(task_id) {
+            Some(owner) => owner.stop.cancel(),
+            None => {
+                self.stopped_early
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(task_id.to_string());
+            }
+        }
+    }
+
+    /// Whether `TaskStop` already ended `task_id` with no tailer following it.
+    pub(crate) fn take_early_stop(&self, task_id: &str) -> bool {
+        self.stopped_early
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(task_id)
     }
 
     fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
@@ -217,6 +234,7 @@ impl TaskTailer {
         start_event: Option<Event>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let publication = self.active.publication.lock().await;
+        self.active.take_early_stop(&self.task_id);
         let owner = {
             let mut owners = self.active.lock();
             if let Some(current) = owners.get(&self.task_id) {
@@ -817,7 +835,7 @@ mod tests {
         let mut f = fixture("{\"type\":\"user\"}\n");
         f.spawn(TailerStart::Live).await;
         f.parked().await;
-        assert!(f.active.stop("t-1"));
+        f.active.stop("t-1");
         match f.next().await {
             Event::BackgroundTaskFinished { task_id, ended_at } => {
                 assert_eq!(task_id, "t-1");
@@ -826,10 +844,24 @@ mod tests {
             other => panic!("expected BackgroundTaskFinished, got {other:?}"),
         }
         f.released().await;
-        assert!(!f.active.stop("t-1"), "nothing follows a released task");
+        f.active.stop("t-1");
+        assert!(
+            f.active.take_early_stop("t-1"),
+            "a stop with no tailer is kept"
+        );
         f.append(&notification_line("t-1", Some("completed")));
         f.drop_sender();
         assert!(f.rx.recv().await.is_none(), "no second end event");
+    }
+
+    #[tokio::test]
+    async fn a_new_launch_forgets_an_earlier_stop_of_its_id() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        f.spawn(TailerStart::Live).await;
+        assert!(!f.active.take_early_stop("t-1"));
+        f.drop_sender();
+        f.released().await;
     }
 
     #[tokio::test]
@@ -896,7 +928,7 @@ mod tests {
     async fn a_stopped_workflow_settles_its_agents_before_it_finishes() {
         let mut f = fixture("{\"type\":\"user\"}\n");
         spawn_workflow_tailer(&f).await;
-        assert!(f.active.stop("t-1"));
+        f.active.stop("t-1");
         assert_agent_settled_then_finished(&mut f).await;
     }
 

@@ -322,8 +322,7 @@ impl Shared {
                 }
                 continue;
             }
-            // Only `TaskStop` ends a task here. A tailer publishes the end itself.
-            // A task no tailer follows already ended, so its end is not repeated.
+            // Only `TaskStop` ends a task here; the tailer publishes the end.
             if let Event::BackgroundTaskFinished { task_id, .. } = &event {
                 self.bg_tasks.stop(task_id);
                 continue;
@@ -346,6 +345,16 @@ impl Shared {
             return;
         }
         for task in tasks {
+            if self.bg_tasks.take_early_stop(&task.task_id) {
+                let _ = self
+                    .event_tx
+                    .send(Event::BackgroundTaskFinished {
+                        task_id: task.task_id,
+                        ended_at: Some(chrono::Utc::now()),
+                    })
+                    .await;
+                continue;
+            }
             spawn_task_tailer(
                 task,
                 session_id.to_string(),
