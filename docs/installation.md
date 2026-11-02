@@ -52,12 +52,17 @@ Local Unix transport requires a current-user-owned `daemon/` directory with mode
 group-write bits, including under umask `002`; it does not change existing
 `~/.config` permissions. On each daemon start, AoE removes group and other write
 permissions from an existing application directory owned by the current user.
-Follow the recovery advice for the refused directory:
-set `daemon/` to mode `0700`, or remove both group and other write permissions from
-another refused ancestor, then retry. A directory owned by another user also
-requires ownership recovery; changing its mode alone is not sufficient.
+If the parent chain is unsafe, repair its unsafe ancestors from the highest down,
+or select a location with trusted ancestors, then retry before changing the
+refused directory. Once the parent chain is trusted, follow the recovery advice:
+set `daemon/` to mode `0700`, or remove both group and other write permissions
+from another refused ancestor. A directory owned by another user also requires
+ownership recovery; changing its mode alone is not sufficient.
 
-Daemon directory refusals report escaped paths and recovery guidance. Paths containing non-UTF-8 bytes, control characters, bidirectional formatting characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
+Daemon directory refusals report escaped paths and recovery guidance. Paths with
+an unsafe parent chain, non-UTF-8 bytes, control characters, bidirectional
+formatting characters, or backticks receive manual instructions instead of a
+shell command.
 
 ## Downgrading
 
@@ -92,6 +97,8 @@ On Linux with a local systemd user manager, scope recovery authenticates that ma
 Managerless Linux operation resolves legacy rows to no scopes when `/run/user` or `/run/user/<euid>` is positively absent beneath validated canonical ancestors. If the canonical runtime exists but its `systemd/` directory is absent, recovery additionally requires a complete physical cgroup2 hierarchy with no populated scope matching that session. This supports elogind-style hosts without trusting missing user-owned sockets alone.
 
 The kernel-only proof checks the cgroup2 filesystem, complete mount boundary, physical-root interfaces and namespace stability, then scans the full hierarchy without exempting captured units. A populated matching scope, unreadable or partial inventory, symlink, or changing boundary retains unresolved authority and resources. Existing `systemd/` with an unavailable private socket still refuses recovery. Kernel discovery never grants retirement authority or changes original captured receipts. Caller-selected `XDG_RUNTIME_DIR`, disabling scope creation and a failed capability probe are not absence proof.
+
+Disappearance reported by a child-directory open does not block the scan. Missing or unreadable population evidence for an opened scope still blocks recovery.
 
 Unsupported or incomplete evidence remains protected: cgroup v1, hybrid layouts without the required root-mounted cgroup2 view, and views exposing only a delegated subtree do not establish absence. If the caller's namespace restricts that view, retry from the original host and context exposing the complete original hierarchy. Do not reboot, switch cgroup modes or manufacture receipts to make unknown authority disappear. Without supported original evidence, retain the resources; automatic v1 recovery and operator-attestation overrides are not provided.
 

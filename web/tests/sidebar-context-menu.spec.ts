@@ -410,6 +410,19 @@ test.describe("Long-press menu (mobile)", () => {
     expect(Math.round(box.y + box.height)).toBe(viewport.height);
     await expect(page.getByTestId("sidebar-context-menu-delete")).toBeInViewport({ ratio: 1 });
     expect(await sheet.evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
+    // The sheet keeps the popover's tiers: Rename, Run, More, Settings, then Move to Trash… last.
+    const ids = await sheet.evaluate((el) =>
+      [...el.querySelectorAll<HTMLElement>("[data-testid^='sidebar-context-menu-']")].map((e) => e.dataset.testid),
+    );
+    const at = (id: string) => ids.indexOf(`sidebar-context-menu-${id}`);
+    const tiers = ["rename", "stop", "more", "notify-default", "delete"].map(at);
+    expect(tiers.every((i) => i >= 0)).toBe(true);
+    expect(tiers).toEqual([...tiers].sort((a, b) => a - b));
+    expect(ids.at(-1)).toBe("sidebar-context-menu-delete");
+    // A Session's status and view, or a count for a row that holds several.
+    await expect(page.getByTestId("sidebar-context-menu-summary")).toHaveText(
+      /^(\w+ · (Terminal|Structured) view|\d+ Sessions)$/,
+    );
   });
 
   test("dragging the sheet header down past the threshold closes it; a short drag snaps back", async ({ page }) => {

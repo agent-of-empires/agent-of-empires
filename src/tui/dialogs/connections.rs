@@ -71,6 +71,8 @@ pub enum WebState {
     On(Option<&'static str>),
     Disabled,
     NeedsDaemon,
+    /// A launch failed while no view was open; Enter on the row shows why, once.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,21 +93,36 @@ pub struct ConnectionsView {
 
 impl ConnectionsView {
     pub fn new(daemon: Option<DaemonAttention>, web: WebState) -> Self {
-        Self {
+        let mut view = Self {
             host: host_name(),
             daemon,
             reason: None,
             web,
             selected: 0,
             row_rects: Vec::new(),
+        };
+        // A failed launch opens on its row, so Enter shows why at once.
+        if view.web == WebState::Failed {
+            view.selected = view
+                .rows()
+                .iter()
+                .position(|row| *row == Row::Web)
+                .unwrap_or(0);
         }
+        view
     }
 
-    /// The home screen's takeover while the Daemon can't be reached.
-    pub fn offline(reason: Option<&str>) -> Self {
+    /// The home screen's takeover while the Daemon can't be reached. `launch_failed`: a Web
+    /// dashboard start hidden with Esc failed, and Enter shows why.
+    pub fn offline(reason: Option<&str>, launch_failed: bool) -> Self {
+        let web = if launch_failed {
+            WebState::Failed
+        } else {
+            WebState::NeedsDaemon
+        };
         Self {
             reason: reason.map(str::to_owned),
-            ..Self::new(Some(DaemonAttention::Offline), WebState::NeedsDaemon)
+            ..Self::new(Some(DaemonAttention::Offline), web)
         }
     }
 
@@ -249,6 +266,12 @@ impl ConnectionsView {
                             "Needs the Daemon".to_string(),
                             dim,
                         ),
+                        WebState::Failed => (
+                            "\u{25CF}",
+                            theme.error,
+                            "Didn't start \u{00B7} Enter shows why".to_string(),
+                            Style::default().fg(theme.text),
+                        ),
                     };
                     (dot, color, name, status, style, Vec::new())
                 }
@@ -287,7 +310,13 @@ impl ConnectionsView {
             }
         }
         lines.push(Line::raw(""));
-        let hints: Vec<(&str, &str)> = if self.offline_takeover() {
+        let hints: Vec<(&str, &str)> = if self.offline_takeover() && self.web == WebState::Failed {
+            vec![
+                ("r", " reconnect  "),
+                ("Enter", " why it didn't start  "),
+                ("q", " quit"),
+            ]
+        } else if self.offline_takeover() {
             vec![("r", " reconnect  "), ("q", " quit")]
         } else if self.rows().len() > 1 {
             vec![
@@ -356,9 +385,9 @@ mod tests {
         } else {
             "API server"
         };
-        let offline = || ConnectionsView::offline(Some("connection refused"));
+        let offline = || ConnectionsView::offline(Some("connection refused"), false);
         // (view, text shown, text absent)
-        let cases: [(ConnectionsView, &[&str], &[&str]); 6] = [
+        let cases: [(ConnectionsView, &[&str], &[&str]); 8] = [
             // Healthy: no Daemon row and one row, so no move hint.
             (
                 ConnectionsView::new(None, WebState::Off),
@@ -384,6 +413,21 @@ mod tests {
                 ConnectionsView::new(None, WebState::Disabled),
                 &["aoe.web plugin is disabled"],
                 &[],
+            ),
+            // The takeover after a hidden start failed: its row and how to see why.
+            (
+                ConnectionsView::offline(Some("connection refused"), true),
+                &[
+                    "Didn't start \u{00B7} Enter shows why",
+                    "why it didn't start",
+                    "reconnect",
+                ],
+                &["Needs the Daemon"],
+            ),
+            (
+                ConnectionsView::new(None, WebState::Failed),
+                &["Didn't start \u{00B7} Enter shows why"],
+                &["Off"],
             ),
             // The offline takeover: what still works, the reason, and today's r and q.
             (
@@ -412,7 +456,10 @@ mod tests {
 
         // A detail one cell wider than the space under the indent wraps its last cell, not cuts it.
         let fill = "x".repeat(51);
-        let text = screen(&mut ConnectionsView::offline(Some(&format!("{fill}Q"))));
+        let text = screen(&mut ConnectionsView::offline(
+            Some(&format!("{fill}Q")),
+            false,
+        ));
         let lines: Vec<&str> = text.lines().collect();
         let at = lines
             .iter()
@@ -465,6 +512,13 @@ mod tests {
         assert!(matches!(
             press(&mut view, KeyCode::Enter),
             DialogResult::Continue
+        ));
+
+        // A failed launch opens on its own row, so the first Enter shows why.
+        let mut failed = ConnectionsView::new(Some(DaemonAttention::ReadOnly), WebState::Failed);
+        assert!(matches!(
+            press(&mut failed, KeyCode::Enter),
+            DialogResult::Submit(())
         ));
 
         // A refresh follows the Daemon and keeps the selected row when the rows change.

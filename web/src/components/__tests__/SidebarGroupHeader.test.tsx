@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { SidebarGroupHeader } from "../sidebar/SidebarGroupHeader";
 import type { SidebarGroup } from "../../lib/sidebarGroups";
+import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import { PluginUiProvider } from "../../lib/pluginUiContext";
 import type { PluginUiEntry } from "../../lib/api";
 import type { SessionStatus, Workspace } from "../../lib/types";
@@ -207,23 +208,30 @@ describe("SidebarGroupHeader", () => {
 
   it("marks a header that is a registered Project, and a pinned one more strongly", () => {
     const project = { name: "my-project", path: "/p", scope: "global" as const };
-    // (group, marker shown, its accessible name)
-    const cases: [Partial<SidebarGroup>, string | null, string | null][] = [
-      [{}, null, null],
-      [{ registeredProjects: [project] }, "sidebar-group-project-marker", "Project"],
+    // (group, marker shown, its accessible name, its tooltip)
+    const cases: [Partial<SidebarGroup>, string | null, string | null, string | null][] = [
+      [{}, null, null, null],
+      [{ registeredProjects: [project] }, "sidebar-group-project-marker", "Project", meaningText(MARK_MEANING.project)],
       [
         { registeredProjects: [{ ...project, pinned: true }], pinned: true },
         "sidebar-group-pinned-marker",
         "Pinned project",
+        meaningText(MARK_MEANING.pinnedProject),
       ],
     ];
-    for (const [over, testId, name] of cases) {
+    for (const [over, testId, name, tip] of cases) {
       renderHeader({ group: group(over) });
       const markers = ["sidebar-group-project-marker", "sidebar-group-pinned-marker"].filter((id) =>
         screen.queryByTestId(id),
       );
       expect(markers, JSON.stringify(over)).toEqual(testId ? [testId] : []);
-      if (name) expect(screen.getByRole("img", { name }).getAttribute("title")).toMatch(new RegExp(`^${name}`));
+      if (name) {
+        // A Tooltip, shared with the legend, explains the mark; no `title` duplicates it.
+        const mark = screen.getByRole("img", { name });
+        expect(mark.hasAttribute("title")).toBe(false);
+        fireEvent.mouseEnter(mark.parentElement!);
+        expect(screen.getByRole("tooltip").textContent).toBe(tip);
+      }
       cleanup();
     }
   });

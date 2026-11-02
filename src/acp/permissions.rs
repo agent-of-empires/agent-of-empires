@@ -16,6 +16,7 @@ pub fn build_approval(tool_call: ToolCall, options: Vec<ApprovalOption>) -> Appr
         destructive,
         choice: is_choice_list(&options),
         options,
+        plan: None,
         requested_at: Utc::now(),
         resolved: None,
     }

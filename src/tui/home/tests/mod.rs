@@ -904,6 +904,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         sandbox_image: String::new(),
         yolo_mode: false,
         extra_env: Vec::new(),
+        hook_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
@@ -1146,7 +1147,8 @@ fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision
         .view
         .instances()
         .map(|instance| {
-            let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
+            let mut row =
+                crate::server::api::sessions::session_response_from_instance(instance, false);
             if let Some((_, archived)) = stamps.iter().find(|(id, _)| id == &instance.id) {
                 row.archived_at = archived.then(|| now.clone());
             }

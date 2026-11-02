@@ -160,7 +160,9 @@ impl Session {
                     // The supervisor publishes the terminal here (#1100).
                     info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
                     self.stand_down_idle_completion();
-                    let _ = self.send_cancel().await;
+                    if let Err(error) = self.send_cancel().await {
+                        debug!(target: "acp.protocol", %error, "cancel notification failed");
+                    }
                 }
                 Some(ClientCmd::SetMode(mode_id)) => self.dispatch_mode(mode_id, false),
                 Some(ClientCmd::DeleteSession {

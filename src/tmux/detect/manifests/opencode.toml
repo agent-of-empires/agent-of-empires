@@ -11,11 +11,24 @@ extends = "spinner"
 id = "spinner"
 priority = 960
 
+# Standalone: the shared `approve`/`allow` substrings match prose like "the
+# approved plan", so only the dialog's own phrasing counts.
 [[rules]]
-extends = "approval_prompt"
 id = "approval_prompt"
+state = "waiting"
 priority = 950
-contains_any = ["continue?", "proceed?", "enter to select", "esc to cancel"]
+region = "whole_recent"
+visible = true
+contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "enter to select", "esc to cancel"]
+
+# The permission dialog's option row, which prose does not reproduce.
+[[rules]]
+id = "permission_dialog"
+state = "waiting"
+priority = 955
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)allow once\s+allow always']
 
 # A numbered menu row carrying the selection cursor.
 [[rules]]

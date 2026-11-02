@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useId, useRef, useState } from "react";
 import { Folder } from "lucide-react";
 import { archivableWorkspaces, type SidebarGroup } from "../../lib/sidebarGroups";
 import { SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
@@ -16,6 +16,7 @@ import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { ContextMenu, MenuChoiceRow, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
 import { OwnerAvatar } from "../OwnerAvatar";
 import { Tooltip } from "../Tooltip";
+import { GROUP_DOT_STATE, MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import { useContextMenu } from "../useContextMenu";
 import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
@@ -64,7 +65,23 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const rowClass = `${group.color ? "" : "hover:bg-surface-800/50"} ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
   const headerStyle = repoColorStyle(group.color);
-  const dot = <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />;
+  // Like a Session row's glyph: the header button takes focus and is described by the dot.
+  const [dotTip, setDotTip] = useState<"hover" | "focus" | null>(null);
+  const dotTipId = useId();
+  const dot = (
+    <Tooltip
+      text={group.status === "active" ? GROUP_DOT_STATE.active : GROUP_DOT_STATE.inactive}
+      id={dotTipId}
+      open={dotTip !== null}
+    >
+      <span
+        data-testid="sidebar-group-dot"
+        className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`}
+        onPointerEnter={(e) => e.pointerType === "mouse" && setDotTip((tip) => tip ?? "hover")}
+        onPointerLeave={() => setDotTip((tip) => (tip === "hover" ? null : tip))}
+      />
+    </Tooltip>
+  );
 
   const commitRename = () => {
     setRenaming(false);
@@ -162,6 +179,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
           aria-expanded={!group.collapsed}
           aria-controls={rowsId}
           aria-keyshortcuts={hasMenu ? "Shift+F10" : undefined}
+          aria-describedby={dotTip ? dotTipId : undefined}
+          onFocus={(e) => e.currentTarget.matches(":focus-visible") && setDotTip("focus")}
+          onBlur={() => setDotTip(null)}
           className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500"
         >
           <span className="relative h-4 w-4 shrink-0">
@@ -186,26 +206,28 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             </span>
           </span>
           {group.pinned ? (
-            <span
-              role="img"
-              className="shrink-0 text-[10px] leading-none text-text-dim"
-              data-testid="sidebar-group-pinned-marker"
-              title="Pinned project (persists without sessions)"
-              aria-label="Pinned project"
-            >
-              ◆
-            </span>
-          ) : (
-            group.registeredProjects.length > 0 && (
+            <Tooltip text={meaningText(MARK_MEANING.pinnedProject)}>
               <span
                 role="img"
                 className="shrink-0 text-[10px] leading-none text-text-dim"
-                data-testid="sidebar-group-project-marker"
-                title="Project"
-                aria-label="Project"
+                data-testid="sidebar-group-pinned-marker"
+                aria-label="Pinned project"
               >
-                ◇
+                ◆
               </span>
+            </Tooltip>
+          ) : (
+            group.registeredProjects.length > 0 && (
+              <Tooltip text={meaningText(MARK_MEANING.project)}>
+                <span
+                  role="img"
+                  className="shrink-0 text-[10px] leading-none text-text-dim"
+                  data-testid="sidebar-group-project-marker"
+                  aria-label="Project"
+                >
+                  ◇
+                </span>
+              </Tooltip>
             )
           )}
           <span

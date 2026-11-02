@@ -76,7 +76,8 @@ impl Instance {
             &self.id,
             &observation,
             &self.conversation_state(),
-        );
+        )
+        .outcome;
         if outcome != SidWrite::Skipped {
             return Some(outcome);
         }
@@ -87,12 +88,15 @@ impl Instance {
         let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
             return Some(SidWrite::Failed);
         };
-        Some(super::sid_persist::persist_session_with_storage(
-            storage,
-            &self.id,
-            &observation,
-            &retry.conversation_state(),
-        ))
+        Some(
+            super::sid_persist::persist_session_with_storage(
+                storage,
+                &self.id,
+                &observation,
+                &retry.conversation_state(),
+            )
+            .outcome,
+        )
     }
 
     /// The conversation this pane published last, for the final flush.
@@ -197,12 +201,16 @@ impl Instance {
                 Ok(generation)
             }
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }
@@ -242,12 +250,16 @@ impl Instance {
                 Status::Stopped,
             ),
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }
@@ -517,12 +529,16 @@ impl Instance {
                 Ok(())
             }
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }

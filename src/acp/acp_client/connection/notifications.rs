@@ -283,7 +283,7 @@ impl Shared {
             // During replay only transcript events are dropped; ambient state
             // and lifecycle events still pass so pickers stay current.
             if suppressing && is_transcript_event(&event) {
-                debug!(
+                tracing::trace!(
                     target: "acp.protocol",
                     session = %self.session_label,
                     kind = transcript_event_kind(&event),
@@ -294,6 +294,7 @@ impl Shared {
             if let Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
+                workflow,
                 ..
             } = &event
             {
@@ -304,10 +305,13 @@ impl Shared {
                     BackgroundTaskLaunch {
                         task_id: task_id.clone(),
                         tool_call_id: tool_call_id.clone(),
+                        workflow: workflow.clone(),
+                        workflow_agents: Default::default(),
                     },
                     session_id.clone(),
                     self.claude_home.clone(),
                     self.bg_tasks.clone(),
+                    self.between_prompt.bg_agents.clone(),
                     self.event_tx.downgrade(),
                     TailerStart::Live,
                     Some(event),
@@ -316,6 +320,11 @@ impl Shared {
                 if self.event_tx.is_closed() {
                     break;
                 }
+                continue;
+            }
+            // Only `TaskStop` ends a task here; the tailer publishes the end.
+            if let Event::BackgroundTaskFinished { task_id, .. } = &event {
+                self.bg_tasks.stop(task_id);
                 continue;
             }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
@@ -341,6 +350,7 @@ impl Shared {
                 session_id.to_string(),
                 self.claude_home.clone(),
                 self.bg_tasks.clone(),
+                self.between_prompt.bg_agents.clone(),
                 self.event_tx.downgrade(),
                 TailerStart::Resumed,
                 None,

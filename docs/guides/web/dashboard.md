@@ -15,6 +15,8 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
+The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
+
 ## Creating a session
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:
@@ -69,12 +71,12 @@ Drag-to-reorder is disabled in the computed modes. The picker's state is per-bro
 A grouping toggle (layers icon) next to the sort toggle cycles the axis. Each click advances **By repo** to **By group** to **By repo and group** and back:
 
 - **By repo** (default): groups by git repository.
-- **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Edit group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
+- **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 
 The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but group rename, color, and drag-reorder live on the repo axis only.
 
-**Edit group.** Right-click (long-press on touch) a session row and choose **Edit group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
+**Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
 
 **Add project.** Attachment results stay open through Multi-repo regrouping.
 Warnings and a failed worker restart remain visible until dismissed.

@@ -67,6 +67,26 @@ describe("isNewSessionStarting", () => {
       false,
     ],
     ["a stopped Worker", [state({ workerStopped: true }), connection(), "resuming", false], false],
+    [
+      "a running Worker while the first connection opens",
+      [state(), connection({ status: "connecting", hasEverOpened: false }), "running", false],
+      false,
+    ],
+    [
+      "a running Worker while the first connection fails and retries",
+      [state(), connection({ status: "error", hasEverOpened: false }), "running", false],
+      false,
+    ],
+    [
+      "a running Worker during first-dial backoff",
+      [
+        state(),
+        connection({ status: "closed", hasEverOpened: false, reconnecting: true, retryCount: 1 }),
+        "running",
+        false,
+      ],
+      false,
+    ],
   ])("%s", (_label, args, expected) => {
     expect(isNewSessionStarting(...args)).toBe(expected);
   });

@@ -1,9 +1,11 @@
 import { memo, useRef } from "react";
 import type { ProjectInfo, RepoGroup } from "../lib/types";
 import { repoColorStyle } from "../lib/repoAppearance";
+import { MARK_MEANING, meaningText } from "../lib/sidebarMarks";
 import { useSidebarCompact } from "../lib/sidebarCompact";
 import { ContextMenu, MenuItem, MenuSeparator } from "./ContextMenu";
 import { FoldChevron, PlusIcon } from "./icons";
+import { Tooltip } from "./Tooltip";
 import { useContextMenu } from "./useContextMenu";
 import { useLongPress } from "./sidebar/useLongPress";
 import { usePersistedFlag } from "./usePersistedFlag";
@@ -150,9 +152,11 @@ const ProjectRow = memo(function ProjectRow({
         className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
         style={repoColorStyle(project.color)}
       >
-        <span className="shrink-0 text-[10px] leading-none text-text-dim" title="Project" aria-hidden>
-          ◇
-        </span>
+        <Tooltip text={meaningText(MARK_MEANING.project)}>
+          <span className="shrink-0 text-[10px] leading-none text-text-dim" aria-hidden>
+            ◇
+          </span>
+        </Tooltip>
         <button
           onClick={() => canModify && onCreateSession(project.repoPath)}
           disabled={!canModify}

@@ -535,6 +535,10 @@ pub(crate) fn slice_for(profile: &str) -> Option<String> {
 /// Whether session scopes are available. Blocking on the first call, like
 /// `scope_prefix_for`.
 pub(crate) fn scopes_available() -> bool {
+    #[cfg(test)]
+    if container_scope_fixture::systemd_run().is_some() {
+        return true;
+    }
     capability().is_some()
 }
 
@@ -573,10 +577,24 @@ fn container_scope_words(
 /// or `None` when scopes are unavailable. Blocking on the first call, like
 /// `scope_prefix_for`.
 pub(crate) fn container_scope_prefix(slice: &str, container: &str) -> Option<Vec<String>> {
-    let cap = capability()?;
+    #[cfg(test)]
+    let fake = container_scope_fixture::systemd_run();
+    #[cfg(not(test))]
+    let fake: Option<PathBuf> = None;
+    let (systemd_run, env_bin) = match (&fake, capability()) {
+        (Some(run), _) => (
+            run.to_string_lossy().into_owned(),
+            "/usr/bin/env".to_string(),
+        ),
+        (None, Some(cap)) => (
+            cap.systemd_run.to_string_lossy().into_owned(),
+            cap.env_bin.to_string_lossy().into_owned(),
+        ),
+        (None, None) => return None,
+    };
     Some(container_scope_words(
-        &cap.systemd_run.to_string_lossy(),
-        &cap.env_bin.to_string_lossy(),
+        &systemd_run,
+        &env_bin,
         slice,
         container,
         now_ms(),
@@ -788,6 +806,34 @@ pub(crate) mod legacy_runtime_fixture {
 
     pub(crate) fn root() -> Option<PathBuf> {
         ROOT.with(|root| root.borrow().clone())
+    }
+}
+
+/// Stands in for `systemd-run` on this thread, since `capability()` is always
+/// `None` under `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod container_scope_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYSTEMD_RUN: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            SYSTEMD_RUN.with(|run| *run.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(systemd_run: &Path) -> Installed {
+        Installed(SYSTEMD_RUN.with(|slot| slot.replace(Some(systemd_run.to_owned()))))
+    }
+
+    pub(super) fn systemd_run() -> Option<PathBuf> {
+        SYSTEMD_RUN.with(|run| run.borrow().clone())
     }
 }
 

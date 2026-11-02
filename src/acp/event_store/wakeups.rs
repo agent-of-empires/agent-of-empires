@@ -2,9 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
-use super::EventStore;
+use super::{decode_logged, EventStore};
 use crate::acp::state::Event;
 use crate::events;
 
@@ -190,18 +190,6 @@ impl EventStore {
         );
         Some((at, reason))
     }
-}
-
-fn decode_logged(json: &str, session_id: &str, what: &str) -> Option<Event> {
-    serde_json::from_str(json)
-        .map_err(|e| {
-            warn!(
-                target: "acp.event_store",
-                session = %session_id,
-                "{what}: deserialise failed: {e}"
-            )
-        })
-        .ok()
 }
 
 #[cfg(test)]

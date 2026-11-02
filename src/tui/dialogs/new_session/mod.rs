@@ -39,6 +39,7 @@ const WT_BASE_BRANCH_FIELD: usize = 2;
 const WT_EXTRA_REPOS_FIELD: usize = 3;
 const SANDBOX_IMAGE_FIELD: usize = 0;
 const SANDBOX_ENV_FIELD: usize = 1;
+const SANDBOX_HOOK_ENV_FIELD: usize = 2;
 
 pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
@@ -89,6 +90,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         description: "Env vars: bare KEY passes host value, KEY=VALUE sets explicitly",
     },
     FieldHelp {
+        name: "Host hook env",
+        description: "Env for the host before_start hook only; never enters the container",
+    },
+    FieldHelp {
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
@@ -113,6 +118,8 @@ pub struct NewSessionData {
     pub yolo_mode: bool,
     /// Container env: `KEY` passes through from the host, `KEY=VALUE` sets.
     pub extra_env: Vec<String>,
+    /// Env for the host `before_start` hook only; never enters the container.
+    pub hook_env: Vec<String>,
     pub extra_args: String,
     pub command_override: String,
     /// Provision a fresh `<app_dir>/scratch/<id>/` directory. Mutually
@@ -147,7 +154,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             sandbox_image: data.sandbox_image,
             yolo_mode: data.yolo_mode,
             extra_env: data.extra_env,
-            before_start_hook_env: Vec::new(),
+            before_start_hook_env: data.hook_env,
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
@@ -224,6 +231,7 @@ pub struct NewSessionDialog {
     pub(super) env_selected_index: usize,
     pub(super) env_editing_input: Option<Input>,
     pub(super) env_adding_new: bool,
+    pub(super) hook_env: HookEnvList,
     pub(super) inherited_settings: Vec<(String, String)>,
     pub(super) sandbox_config_mode: bool,
     pub(super) sandbox_focused_field: usize,
@@ -275,6 +283,16 @@ pub struct NewSessionDialog {
     /// Rows the pointer can highlight on the visible panel, rebuilt per frame.
     pub(super) hover_rects: Vec<ratatui::layout::Rect>,
     pub(super) hover: HoverState,
+}
+
+/// Editor state for the host-hook-only env list.
+#[derive(Default)]
+pub(super) struct HookEnvList {
+    pub(super) entries: Vec<String>,
+    pub(super) expanded: bool,
+    pub(super) selected_index: usize,
+    pub(super) editing_input: Option<Input>,
+    pub(super) adding_new: bool,
 }
 
 /// Key handling shared by the editable lists.
@@ -584,6 +602,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings,
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -705,6 +724,7 @@ impl NewSessionDialog {
             self.extra_env_overridden = false;
             self.env_list_expanded = false;
             self.env_editing_input = None;
+            self.hook_env = HookEnvList::default();
             self.inherited_settings.clear();
             self.sandbox_config_mode = false;
         }
@@ -1032,6 +1052,7 @@ impl NewSessionDialog {
 
         self.env_list_expanded = false;
         self.env_editing_input = None;
+        self.hook_env = HookEnvList::default();
         self.sandbox_config_mode = false;
         self.sandbox_focused_field = 0;
         self.worktree_config_mode = false;
@@ -1096,6 +1117,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings: Vec::new(),
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -1176,6 +1198,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings: Vec::new(),
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -1282,18 +1305,29 @@ impl NewSessionDialog {
     /// While an entry is being typed the list owns every key, so clicks wait
     /// for Enter or Esc rather than strand the edit.
     fn click_sandbox_config(&mut self, col: u16, row: u16) {
-        if self.env_editing_input.is_some() {
+        if self.env_editing_input.is_some() || self.hook_env.editing_input.is_some() {
             return;
         }
         if let Some(entry) = super::hit(&self.list_entry_rects, col, row) {
-            self.sandbox_focused_field = SANDBOX_ENV_FIELD;
-            self.env_selected_index = entry;
+            if self.hook_env.expanded {
+                self.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+                self.hook_env.selected_index = entry;
+            } else {
+                self.sandbox_focused_field = SANDBOX_ENV_FIELD;
+                self.env_selected_index = entry;
+            }
         } else if let Some(field) = super::hit(&self.sandbox_config_rects, col, row) {
             if field != SANDBOX_ENV_FIELD {
                 self.env_list_expanded = false;
             } else if !self.env_list_expanded {
                 self.env_list_expanded = true;
                 self.env_selected_index = 0;
+            }
+            if field != SANDBOX_HOOK_ENV_FIELD {
+                self.hook_env.expanded = false;
+            } else if !self.hook_env.expanded {
+                self.hook_env.expanded = true;
+                self.hook_env.selected_index = 0;
             }
             self.sandbox_focused_field = field;
         }
@@ -1656,10 +1690,13 @@ impl NewSessionDialog {
 
     fn handle_sandbox_config_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
         // Inherited settings are not focusable.
-        const SANDBOX_MAX: usize = 2;
+        const SANDBOX_MAX: usize = 3;
 
         if self.env_list_expanded && self.sandbox_focused_field == SANDBOX_ENV_FIELD {
             return self.handle_env_list_key(key);
+        }
+        if self.hook_env.expanded && self.sandbox_focused_field == SANDBOX_HOOK_ENV_FIELD {
+            return self.handle_hook_env_list_key(key);
         }
 
         match key.code {
@@ -1674,6 +1711,11 @@ impl NewSessionDialog {
             KeyCode::Enter if self.sandbox_focused_field == SANDBOX_ENV_FIELD => {
                 self.env_list_expanded = true;
                 self.env_selected_index = 0;
+                DialogResult::Continue
+            }
+            KeyCode::Enter if self.sandbox_focused_field == SANDBOX_HOOK_ENV_FIELD => {
+                self.hook_env.expanded = true;
+                self.hook_env.selected_index = 0;
                 DialogResult::Continue
             }
             KeyCode::Enter => {
@@ -1950,6 +1992,30 @@ impl NewSessionDialog {
         result
     }
 
+    fn handle_hook_env_list_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
+        let validate =
+            |value: &str, list: &[String]| !value.is_empty() && !list.contains(&value.to_string());
+        let list = &mut self.hook_env;
+        let snapshot = list.entries.clone();
+        let result = handle_editable_list_key(
+            key,
+            &mut list.entries,
+            &mut list.expanded,
+            &mut list.selected_index,
+            &mut list.editing_input,
+            &mut list.adding_new,
+            validate,
+        );
+        if list.entries != snapshot {
+            self.error_message = list
+                .entries
+                .get(list.selected_index)
+                .and_then(|entry| crate::session::validate_env_entry(entry))
+                .map(|w| w.replace("empty in the container", "skipped by the host hook"));
+        }
+        result
+    }
+
     fn handle_workspace_repos_list_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
         if self.workspace_repo_editing_input.is_some() {
             if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2099,6 +2165,8 @@ impl NewSessionDialog {
     pub fn handle_paste(&mut self, text: &str) {
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
+        } else if let Some(ref mut input) = self.hook_env.editing_input {
+            input
         } else if let Some(ref mut input) = self.workspace_repo_editing_input {
             input
         } else if self.tool_config_mode {
@@ -2197,6 +2265,11 @@ impl NewSessionDialog {
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
             extra_env: if self.sandbox_enabled && self.extra_env_overridden {
                 self.extra_env.clone()
+            } else {
+                Vec::new()
+            },
+            hook_env: if self.sandbox_enabled {
+                self.hook_env.entries.clone()
             } else {
                 Vec::new()
             },

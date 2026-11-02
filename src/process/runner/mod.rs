@@ -365,7 +365,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
         .await??;
     if !preserve_registry {
-        worker_registry::delete_if_owned(&session_id, our_pid).ok();
+        if let Err(error) = worker_registry::delete_if_owned(&session_id, our_pid) {
+            warn!(target: "acp.runner", session = %session_id, %error, "failed to delete worker record");
+        }
     }
     Ok(())
 }
@@ -513,7 +515,9 @@ fn register_and_spawn_agent(
     match spawn_agent(args) {
         Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
         Err(error) => {
-            worker_registry::delete(&args.session_id).ok();
+            if let Err(delete_error) = worker_registry::delete(&args.session_id) {
+                warn!(target: "acp.runner", session = %args.session_id, error = %delete_error, "failed to delete worker record");
+            }
             Err(error).with_context(|| format!("spawning agent {:?}", args.agent_argv))
         }
     }
@@ -639,6 +643,7 @@ fn init_runner_logging(session_id: &str) -> Result<()> {
         filter,
         log_cfg.show_spans,
         None,
+        true,
     );
     if let Some(c) = init.controller {
         crate::logging::install_controller(c);
