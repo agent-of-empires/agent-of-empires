@@ -180,8 +180,8 @@ pub async fn agent_install_info(
     let package = binary
         .as_deref()
         .and_then(crate::acp::install_hints::npm_package_for);
-    // A stopped container outranks the install setting: Check again starts it
-    // even when installs are off. Only dashboards that can't respawn come first.
+    // A stopped container outranks the install setting: the screen offers to
+    // start it even when installs are off. Only dashboards that can't respawn come first.
     let install_blocked = match install_block(&state) {
         block @ Some(InstallBlock::ReadOnly | InstallBlock::Cityhall) => block,
         _ if instance.is_sandboxed() && !container_running(&id).await => {
@@ -466,11 +466,15 @@ mod tests {
         assert_eq!(get("missing").await.0, StatusCode::NOT_FOUND);
 
         // `install_allowed` is false exactly where `install-agent` refuses.
-        let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![session(
-            "claude", "claude", None, false,
-        )]);
+        let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![
+            session("claude", "claude", None, false),
+            session("sandboxed", "claude", None, true),
+        ]);
         let read_only = crate::server::test_support::build_test_app_state_configured(
-            vec![session("claude", "claude", None, false)],
+            vec![
+                session("claude", "claude", None, false),
+                session("sandboxed", "claude", None, true),
+            ],
             |state| state.read_only = true,
         );
         // install-info names a stopped container first; install-agent still refuses for the setting.
@@ -490,8 +494,34 @@ mod tests {
                 Some("container_not_running"),
             ),
             ("setting on", true, state.clone(), "claude", None),
-            ("CityHall", true, cityhall, "claude", Some("cityhall")),
-            ("read-only", true, read_only, "claude", Some("read_only")),
+            (
+                "CityHall",
+                true,
+                cityhall.clone(),
+                "claude",
+                Some("cityhall"),
+            ),
+            (
+                "CityHall, stopped container",
+                true,
+                cityhall,
+                "sandboxed",
+                Some("cityhall"),
+            ),
+            (
+                "read-only",
+                true,
+                read_only.clone(),
+                "claude",
+                Some("read_only"),
+            ),
+            (
+                "read-only, stopped container",
+                true,
+                read_only,
+                "sandboxed",
+                Some("read_only"),
+            ),
         ] {
             crate::session::config::update_config(|c| c.acp.allow_agent_install = setting).unwrap();
             let body = fetch(state.clone(), id).await.1;
