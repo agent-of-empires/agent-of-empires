@@ -2255,6 +2255,9 @@ export async function reviewCreationTrust(
   }
 }
 
+// The Daemon's create stages; anything else from the wire is no stage.
+const CREATE_STAGES: readonly CreateStage[] = ["preparing", "starting_container", "running_hooks", "starting"];
+
 export async function createSession(body: CreateSessionRequest): Promise<{
   ok: boolean;
   error?: string;
@@ -2298,7 +2301,7 @@ export async function createSession(body: CreateSessionRequest): Promise<{
     if (data.error !== "hooks_need_trust") {
       const message = data.message || `Server error (${res.status})`;
       if (typeof data.error !== "string") return { ok: false, error: message };
-      const stage = typeof data.stage === "string" ? (data.stage as CreateStage) : null;
+      const stage = CREATE_STAGES.find((known) => known === data.stage) ?? null;
       const reference = typeof data.reference === "string" ? data.reference : res.headers.get("x-request-id");
       return { ok: false, error: message, failure: { code: data.error, message, stage, reference } };
     }

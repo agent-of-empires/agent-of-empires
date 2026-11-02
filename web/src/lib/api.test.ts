@@ -1139,8 +1139,9 @@ describe("createSession errors", () => {
 
   it("maps plain JSON, text, and network errors", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),
+      new Response(JSON.stringify({ error: "create_failed", message: "nope", stage: "__proto__" }), { status: 400 }),
     );
+    // An unknown stage reads as none, so the box never looks it up.
     expect(await api.createSession(body)).toEqual({
       ok: false,
       error: "nope",
