@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::{api_error, AppState};
+use super::{api_error_with_code_header, AppState};
 use crate::daemon::{
     CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
 };
@@ -536,9 +536,8 @@ const PLUGIN_SETTINGS_ELEVATION: &str = "per-project plugin settings need a rece
 /// drop, reveal or shadow stored values: removing an entry, or one overriding another at its path.
 fn elevation_required() -> axum::response::Response {
     tracing::warn!(target: "http.api.projects", reason = "elevation_required", "rejected plugin settings write");
-    api_error(
-        StatusCode::FORBIDDEN,
-        "elevation_required",
+    api_error_with_code_header(
+        crate::daemon::ApiErrorCode::ElevationRequired,
         PLUGIN_SETTINGS_ELEVATION,
     )
 }

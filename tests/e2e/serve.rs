@@ -3770,6 +3770,40 @@ fn cli_profile_and_project_writes_authenticate_with_a_passphrase_daemon() {
     h.run_cli_ok(&["project", "remove", repo]);
 }
 
+/// Skill writes and `cityhall apply` hit `ElevatedMutationGuard`; behind a proxy the
+/// CLI is not a local owner, so each must step up on the `elevation_required` header
+/// instead of failing on a bare 403.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_skill_write_and_cityhall_apply_step_up_a_passphrase_daemon() {
+    let mut h = TuiTestHarness::new("skill_apply_passphrase_behind_proxy");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&[
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
+
+    h.run_cli_ok(&["skill", "add", "stepped-up"]);
+    let applied = h.run_cli_with_stdin(&["cityhall", "apply", "-"], "schema_version = 1\n");
+    assert!(
+        applied.status.success(),
+        "cityhall apply must step up, not surface a 403.\nstderr: {}",
+        String::from_utf8_lossy(&applied.stderr),
+    );
+}
+
 /// The WS half of the passphrase-login fallback: `aoe acp tail` (and the
 /// TUI's live structured-view stream, same `src/acp/client/ws.rs`) must
 /// offer the literal `aoe-auth` subprotocol alongside
