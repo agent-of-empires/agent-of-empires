@@ -435,23 +435,32 @@ describe("StartupErrorScreen", () => {
     expect(queryByTestId("adapter-install-error")).toBeNull();
   });
 
-  it("a stopped container reported by install-info gets its steps before any click", async () => {
-    const stopped = info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" });
-    const view = await renderScreen(incompatible(), stopped);
-    const { getByTestId, queryByTestId } = view;
-    const screen = getByTestId("startup-error-screen");
-    expect(getByTestId("startup-error-container-down").textContent).toContain("This Session's container isn't running");
-    expect(buttons(screen)).toEqual(["Start the container"]);
-    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+  // install-info names the stopped container before the install setting, so installs off still start it first.
+  it.each([
+    ["installs allowed", info({ ...sandbox, ...allowed }), "true"],
+    ["installs off", info({ ...sandbox }), null],
+  ])(
+    "a stopped container reported by install-info gets its steps before any click, %s",
+    async (_label, started, done) => {
+      const stopped = info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" });
+      const view = await renderScreen(incompatible(), stopped);
+      const { getByTestId, queryByTestId } = view;
+      const screen = getByTestId("startup-error-screen");
+      expect(getByTestId("startup-error-container-down").textContent).toContain(
+        "This Session's container isn't running",
+      );
+      expect(buttons(screen)).toEqual(["Start the container"]);
+      expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
 
-    fireEvent.click(getByTestId("startup-error-start-container"));
-    spawnCall();
-    fetchAgentInstallInfo.mockResolvedValue(info({ ...sandbox, ...allowed }));
-    view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
-    await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
-    expect(queryByTestId("startup-error-container-down")).toBeNull();
-    expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe("true");
-  });
+      fireEvent.click(getByTestId("startup-error-start-container"));
+      spawnCall();
+      fetchAgentInstallInfo.mockResolvedValue(started);
+      view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+      await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+      expect(queryByTestId("startup-error-container-down")).toBeNull();
+      expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe(done);
+    },
+  );
 
   it("a stopped container: Check again starts it before a manual step, and protocol steps stay", async () => {
     const stopped = { ...sandbox, install_allowed: false, install_blocked: "container_not_running" } as const;
