@@ -735,11 +735,20 @@ mod tests {
 
     impl Fixture {
         async fn spawn_with(&self, watch: Arc<FileWatchService>, start: TailerStart) {
+            self.spawn_task("t-1", watch, start).await;
+        }
+
+        async fn spawn_task(
+            &self,
+            task_id: &str,
+            watch: Arc<FileWatchService>,
+            start: TailerStart,
+        ) {
             let _ = TaskTailer {
                 tool_call_id: Some("toolu_1".into()),
                 claude_home: Some(self.home.clone()),
                 watch,
-                task_id: "t-1".into(),
+                task_id: task_id.into(),
                 session_id: "sess".into(),
                 active: self.active.clone(),
                 event_tx: self.tx.as_ref().expect("sender kept").downgrade(),
@@ -787,6 +796,16 @@ mod tests {
         /// Drops the connection's strong sender, as a lost worker does.
         fn drop_sender(&mut self) {
             self.tx = None;
+        }
+
+        async fn released_task(&self, task_id: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.active.lock().contains_key(task_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the tailer released its slot");
         }
 
         async fn released(&self) {
@@ -894,6 +913,50 @@ mod tests {
         let finished = f.next().await;
         assert_eq!(finished_id(finished.clone()), "t-1");
         state.apply_event(2, finished).unwrap();
+        assert_eq!(state.sidebar_status(), Status::Idle);
+        f.released().await;
+    }
+
+    /// Stopping one of two tracked tasks leaves the other followed and the
+    /// session Running until it ends too.
+    #[tokio::test]
+    async fn a_stop_leaves_the_other_tracked_task_running() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::session::Status;
+
+        let mut state = AcpState::new(
+            AcpSessionId("s-1".into()),
+            AgentName("aoe-agent".into()),
+            None,
+        );
+        for (seq, id) in [(1, "t-1"), (2, "t-2")] {
+            let started = Event::BackgroundTaskStarted {
+                task_id: id.into(),
+                tool_call_id: Some("toolu_1".into()),
+                description: String::new(),
+                workflow: None,
+            };
+            state.apply_event(seq, started).unwrap();
+        }
+
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        for id in ["t-1", "t-2"] {
+            f.spawn_task(id, FileWatchService::new().unwrap(), TailerStart::Live)
+                .await;
+            f.parked().await;
+        }
+        f.active.stop("t-1");
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-1");
+        state.apply_event(3, finished).unwrap();
+        f.released_task("t-1").await;
+        assert!(f.active.lock().contains_key("t-2"), "t-2 is still followed");
+        assert_eq!(state.sidebar_status(), Status::Running);
+
+        f.append(&notification_line("t-2", Some("completed")));
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-2");
+        state.apply_event(4, finished).unwrap();
         assert_eq!(state.sidebar_status(), Status::Idle);
         f.released().await;
     }
