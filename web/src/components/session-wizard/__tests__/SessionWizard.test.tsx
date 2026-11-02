@@ -1453,4 +1453,21 @@ describe("SessionWizard create failures", () => {
       expect(box().querySelector("button")?.textContent).toBe(primary);
     },
   );
+
+  it("a Retry that finds the runtime back up offers Retry again even when the form changed", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: false, runtime: "docker", runtime_name: "Docker" });
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(box().querySelector("button")?.textContent).toBe("Launch without Sandbox"));
+    let answer!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    fireEvent.click(screen.getByTestId("create-failure-retry_runtime"));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+    await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+    await act(async () => {});
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(box().querySelector("button")?.textContent).toBe("Retry");
+  });
 });
