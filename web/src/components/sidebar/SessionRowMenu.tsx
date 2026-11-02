@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { Fragment, useId, useState } from "react";
 import {
   Archive,
   ArrowLeftRight,
@@ -109,9 +109,10 @@ export interface SingleRowActions {
   remove: () => void;
 }
 
-const NOTIFY_OPTIONS: { preset: NotifyPreset; label: string; hint: string }[] = [
+// Default follows the settings, so only the overrides explain themselves.
+const NOTIFY_OPTIONS: { preset: NotifyPreset; label: string; hint?: string }[] = [
   { preset: "off", label: "Off", hint: "No notifications from this session" },
-  { preset: "default", label: "Default", hint: "Follows your notification settings" },
+  { preset: "default", label: "Default" },
   { preset: "all", label: "All", hint: "Notifies when waiting, idle, or on error" },
 ];
 
@@ -146,186 +147,246 @@ function QuickAction({
   );
 }
 
+/** Tiers of menu items, with a separator only between two that show something. */
+function Tiers({ tiers }: { tiers: React.ReactNode[][] }) {
+  // Keyed by position in `tiers`, so a tier emptying while the menu is open doesn't remount the rest.
+  const shown = tiers
+    .map((tier, key) => ({ key, items: tier.filter(Boolean) }))
+    .filter(({ items }) => items.length > 0);
+  return (
+    <>
+      {shown.map(({ key, items }, n) => (
+        <Fragment key={key}>
+          {n > 0 && <MenuSeparator />}
+          {items}
+        </Fragment>
+      ))}
+    </>
+  );
+}
+
 export function SingleRowMenuItems({
   model,
   readOnly,
   colorsEnabled,
   unreadEnabled,
   actions: a,
+  extraItems,
 }: {
   model: RowModel;
   readOnly?: boolean;
   colorsEnabled: boolean;
   unreadEnabled: boolean;
   actions: SingleRowActions;
+  /** Plugin-contributed items, placed above Move to Trash…. */
+  extraItems?: React.ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const moreId = useId();
   const [pickerOpen, setPickerOpen] = useState<SessionAction | null>(null);
   const { actionTargets: t } = model;
   const write = !readOnly;
-  const item = (action: SessionAction, props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">) => (
-    <TargetedItem
-      {...props}
-      targets={t[action]}
-      open={pickerOpen === action}
-      onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
-      onRun={a[action]}
-    />
-  );
-  const more = write && {
-    editWorkdir: model.canEditWorkdir,
-    addProject: !!model.sessionId && model.canAddProject,
-  };
+  // A targeted item shows only when some sibling is a target, as before.
+  const item = (action: SessionAction, props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">) =>
+    write &&
+    t[action].length > 0 && (
+      <TargetedItem
+        key={action}
+        {...props}
+        targets={t[action]}
+        open={pickerOpen === action}
+        onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
+        onRun={a[action]}
+      />
+    );
+  const notifyHint = NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint;
   return (
-    <>
-      {write && <TriageRow model={model} unreadEnabled={unreadEnabled} actions={a} />}
-      <MenuSeparator />
-      {write && (
-        <MenuItem onClick={a.rename} testId="sidebar-context-menu-rename" icon={icon(Pencil)}>
-          Rename
-        </MenuItem>
-      )}
-      {write && item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) })}
-      {write && item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) })}
-      {write &&
-        item("restartUpdate", {
-          label: "Restart to apply update (keeps conversation)",
-          testId: "sidebar-context-menu-restart-update",
-          glyph: icon(RefreshCw),
-        })}
-      {write &&
-        item("switchView", {
-          label: "Switch view",
-          singleLabel: (s) => (s.view === "structured" ? "Switch to terminal" : "Switch to structured view"),
-          detail: (s) => `${s.status}, to ${s.view === "structured" ? "terminal" : "structured"}`,
-          testId: "sidebar-context-menu-switch-view",
-          glyph: icon(SquareTerminal),
-        })}
-      {write && item("fork", { label: "Fork session", testId: "sidebar-context-menu-fork", glyph: icon(GitFork) })}
-      {write && a.newSession && (
-        <MenuItem onClick={a.newSession} testId="sidebar-context-menu-new-session" icon={icon(Plus)}>
-          New session in this project
-        </MenuItem>
-      )}
-      {more && (
-        <>
-          <MenuItem
-            onClick={() => setMoreOpen((o) => !o)}
-            testId="sidebar-context-menu-more"
-            ariaExpanded={moreOpen}
-            ariaControls={moreId}
-            icon={icon(ChevronRight, `transition-transform ${moreOpen ? "rotate-90" : ""}`)}
-          >
-            More
-          </MenuItem>
-          <div id={moreId} hidden={!moreOpen}>
-            {write &&
-              item("switchAgent", {
-                label: "Switch agent",
-                testId: "sidebar-context-menu-switch-agent",
-                glyph: icon(ArrowLeftRight),
-                indent: true,
-              })}
-            {write &&
-              item("recreateContainer", {
-                label: "Recreate container",
-                testId: "sidebar-context-menu-recreate-container",
-                glyph: icon(Container),
-                indent: true,
-              })}
-            {write &&
-              item("autoName", {
-                label: "Auto-name now",
-                testId: "sidebar-context-menu-auto-name",
-                glyph: icon(Sparkles),
-                indent: true,
-              })}
-            {write &&
-              item("summarize", {
-                label: "Summarize conversation",
-                testId: "sidebar-context-menu-summarize",
-                glyph: icon(ScrollText),
-                indent: true,
-              })}
-            {more.editWorkdir && (
-              <MenuItem
-                onClick={a.editWorkdir}
-                testId="sidebar-context-menu-edit-workdir"
-                icon={icon(FolderPen)}
-                indent
-              >
-                Edit workdir name
-              </MenuItem>
-            )}
-            {more.addProject && (
-              <MenuItem onClick={a.addProject} testId="sidebar-context-menu-add-project" icon={icon(FolderPlus)} indent>
-                Add project
-              </MenuItem>
-            )}
-            <MenuItem onClick={a.editGroup} testId="sidebar-context-menu-edit-group" icon={icon(Folders)} indent>
-              Edit group
+    <Tiers
+      tiers={[
+        [write && <TriageRow key="triage" model={model} unreadEnabled={unreadEnabled} actions={a} />],
+        [
+          write && (
+            <MenuItem key="rename" onClick={a.rename} testId="sidebar-context-menu-rename" icon={icon(Pencil)}>
+              Rename
             </MenuItem>
-          </div>
-        </>
-      )}
-      <MenuSeparator />
-      <MenuChoiceRow label="Notify" hint={NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint}>
-        <div
-          role="group"
-          aria-label="Notify"
-          className="flex flex-1 rounded-md border border-surface-700 bg-surface-900 p-0.5"
-        >
-          {NOTIFY_OPTIONS.map(({ preset, label }) => (
-            <button
-              key={preset}
-              type="button"
-              onClick={() => a.notify(preset)}
-              data-testid={`sidebar-context-menu-notify-${preset}`}
-              aria-pressed={model.notifyPreset === preset}
-              className={`flex-1 rounded px-2 py-1 max-md:py-2 text-xs cursor-pointer transition-colors ${
-                model.notifyPreset === preset
-                  ? "bg-brand-600/20 text-text-primary"
-                  : "text-text-secondary hover:text-text-primary"
-              }`}
+          ),
+        ],
+        [
+          item("restartUpdate", {
+            label: "Restart to update",
+            detail: "Keeps the conversation",
+            testId: "sidebar-context-menu-restart-update",
+            glyph: icon(RefreshCw, "text-brand-400"),
+          }),
+          item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) }),
+          item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) }),
+          item("switchView", {
+            label: "Switch view",
+            singleLabel: (s) => (s.view === "structured" ? "Switch to terminal" : "Switch to structured view"),
+            targetDetail: (s) => `${s.status}, to ${s.view === "structured" ? "terminal" : "structured"}`,
+            testId: "sidebar-context-menu-switch-view",
+            glyph: icon(SquareTerminal),
+          }),
+        ],
+        [
+          item("fork", { label: "Fork session", testId: "sidebar-context-menu-fork", glyph: icon(GitFork) }),
+          write && a.newSession && (
+            <MenuItem
+              key="new-session"
+              onClick={a.newSession}
+              testId="sidebar-context-menu-new-session"
+              icon={icon(Plus)}
             >
-              {label}
-            </button>
-          ))}
-        </div>
-      </MenuChoiceRow>
-      {write && colorsEnabled && (
-        <MenuChoiceRow label="Color">
-          <MenuSwatches
-            options={SESSION_COLOR_OPTIONS.map((o) => ({ key: o.key, label: o.label, className: o.dotClass }))}
-            value={model.sessionColor}
-            onPick={a.color}
-            testIdPrefix="sidebar-context-menu-color"
-          />
-        </MenuChoiceRow>
-      )}
-      {write && (
-        <>
-          <MenuSeparator />
-          <MenuItem
-            onClick={a.remove}
-            testId="sidebar-context-menu-delete"
-            icon={icon(Trash2)}
-            className="text-status-error hover:bg-status-error/10"
-          >
-            Delete
-          </MenuItem>
-        </>
-      )}
-    </>
+              New session in this project
+            </MenuItem>
+          ),
+        ],
+        [
+          write && (
+            <Fragment key="more">
+              <MenuItem
+                onClick={() => setMoreOpen((o) => !o)}
+                testId="sidebar-context-menu-more"
+                ariaExpanded={moreOpen}
+                ariaControls={moreId}
+                icon={icon(ChevronRight, `transition-transform ${moreOpen ? "rotate-90" : ""}`)}
+              >
+                More
+              </MenuItem>
+              <div id={moreId} hidden={!moreOpen}>
+                <Tiers
+                  tiers={[
+                    [
+                      item("summarize", {
+                        label: "Summarize conversation",
+                        testId: "sidebar-context-menu-summarize",
+                        glyph: icon(ScrollText),
+                        indent: true,
+                      }),
+                      item("autoName", {
+                        label: "Auto-name now",
+                        testId: "sidebar-context-menu-auto-name",
+                        glyph: icon(Sparkles),
+                        indent: true,
+                      }),
+                      item("switchAgent", {
+                        label: "Switch agent",
+                        testId: "sidebar-context-menu-switch-agent",
+                        glyph: icon(ArrowLeftRight),
+                        indent: true,
+                      }),
+                    ],
+                    [
+                      <MenuItem
+                        key="edit-group"
+                        onClick={a.editGroup}
+                        testId="sidebar-context-menu-edit-group"
+                        icon={icon(Folders)}
+                        indent
+                      >
+                        Move to another group
+                      </MenuItem>,
+                      !!model.sessionId && model.canAddProject && (
+                        <MenuItem
+                          key="add-project"
+                          onClick={a.addProject}
+                          testId="sidebar-context-menu-add-project"
+                          icon={icon(FolderPlus)}
+                          indent
+                        >
+                          Add project
+                        </MenuItem>
+                      ),
+                      model.canEditWorkdir && (
+                        <MenuItem
+                          key="edit-workdir"
+                          onClick={a.editWorkdir}
+                          testId="sidebar-context-menu-edit-workdir"
+                          icon={icon(FolderPen)}
+                          indent
+                        >
+                          Rename workdir
+                        </MenuItem>
+                      ),
+                    ],
+                    [
+                      item("recreateContainer", {
+                        label: "Recreate container",
+                        detail: "Resets anything installed inside it",
+                        testId: "sidebar-context-menu-recreate-container",
+                        glyph: icon(Container),
+                        indent: true,
+                      }),
+                    ],
+                  ]}
+                />
+              </div>
+            </Fragment>
+          ),
+        ],
+        [
+          <MenuChoiceRow key="notify" label="Notify" hint={notifyHint}>
+            <div
+              role="group"
+              aria-label="Notify"
+              className="flex flex-1 rounded-md border border-surface-700 bg-surface-900 p-0.5"
+            >
+              {NOTIFY_OPTIONS.map(({ preset, label }) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => a.notify(preset)}
+                  data-testid={`sidebar-context-menu-notify-${preset}`}
+                  aria-pressed={model.notifyPreset === preset}
+                  className={`flex-1 rounded px-2 py-1 max-md:py-2 text-xs cursor-pointer transition-colors ${
+                    model.notifyPreset === preset
+                      ? "bg-brand-600/20 text-text-primary"
+                      : "text-text-secondary hover:text-text-primary"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </MenuChoiceRow>,
+          write && colorsEnabled && (
+            <MenuChoiceRow key="color" label="Color">
+              <MenuSwatches
+                options={SESSION_COLOR_OPTIONS.map((o) => ({ key: o.key, label: o.label, className: o.dotClass }))}
+                value={model.sessionColor}
+                onPick={a.color}
+                testIdPrefix="sidebar-context-menu-color"
+              />
+            </MenuChoiceRow>
+          ),
+        ],
+        [extraItems && <Fragment key="plugin">{extraItems}</Fragment>],
+        [
+          write && (
+            <MenuItem
+              key="trash"
+              onClick={a.remove}
+              testId="sidebar-context-menu-delete"
+              icon={icon(Trash2)}
+              className="text-status-error hover:bg-status-error/10"
+            >
+              Move to Trash…
+            </MenuItem>
+          ),
+        ],
+      ]}
+    />
   );
 }
 
 interface TargetedItemProps {
   label: string;
+  /** A second line under the label. */
+  detail?: string;
   /** Label when exactly one sibling is a target and no choice is needed. */
   singleLabel?: (s: SessionResponse) => string;
-  detail?: (s: SessionResponse) => string;
+  /** Each sibling's line in the picker. */
+  targetDetail?: (s: SessionResponse) => string;
   testId: string;
   glyph: React.ReactNode;
   indent?: boolean;
@@ -338,8 +399,9 @@ interface TargetedItemProps {
 /** A session-scoped action: runs on its only target, or discloses a list of siblings to choose from. */
 function TargetedItem({
   label,
+  detail,
   singleLabel,
-  detail = (s) => s.status,
+  targetDetail = (s) => s.status,
   testId,
   glyph,
   indent,
@@ -352,12 +414,12 @@ function TargetedItem({
   const titleOf = (s: SessionResponse) => s.title.trim() || "Untitled session";
   // Siblings can share a title (a worktree's default is its branch) and a status; an id tells them apart.
   const clashes = (s: SessionResponse) =>
-    targets.some((t) => t !== s && titleOf(t) === titleOf(s) && detail(t) === detail(s));
+    targets.some((t) => t !== s && titleOf(t) === titleOf(s) && targetDetail(t) === targetDetail(s));
   if (targets.length === 0) return null;
   if (targets.length === 1) {
     const only = targets[0]!;
     return (
-      <MenuItem onClick={() => onRun(only.id)} testId={testId} icon={glyph} indent={indent}>
+      <MenuItem onClick={() => onRun(only.id)} testId={testId} icon={glyph} indent={indent} detail={detail}>
         {singleLabel?.(only) ?? label}
       </MenuItem>
     );
@@ -371,6 +433,7 @@ function TargetedItem({
         ariaControls={pickerId}
         icon={glyph}
         indent={indent}
+        detail={detail}
       >
         {label}…
       </MenuItem>
@@ -385,7 +448,7 @@ function TargetedItem({
           >
             <span className="truncate">{titleOf(s)}</span>
             <span className="ml-2 shrink-0 text-xs">
-              {detail(s)}
+              {targetDetail(s)}
               {clashes(s) && ` #${s.id.slice(0, 8)}`}
             </span>
           </MenuItem>

@@ -692,12 +692,16 @@ pub async fn dismiss_plugin_update(
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
+    let plugin = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         plugin::install::dismiss_update(&id, &body.fingerprint)
     })
     .await;
     match result {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Ok(Ok(())) => {
+            tracing::debug!(target: "plugin.host", %plugin, "plugin update dismissed");
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
         Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
@@ -719,6 +723,8 @@ pub async fn set_plugin_enabled(
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
+    let plugin = id.clone();
+    let enabled = body.enabled;
     let result =
         tokio::task::spawn_blocking(move || plugin::install::set_enabled(&id, body.enabled)).await;
     match result {
@@ -732,8 +738,14 @@ pub async fn set_plugin_enabled(
             }
             list_plugins(State(state)).await
         }
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "plugin.host", %plugin, enabled, error = %format!("{e:#}"), "plugin toggle failed");
+            api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}"))
+        }
+        Err(e) => {
+            tracing::warn!(target: "plugin.host", %plugin, enabled, error = %e, "plugin toggle task failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
     }
 }
 
@@ -753,6 +765,7 @@ pub async fn restart_plugin_worker(
         Ok(registry) => registry,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     };
+    tracing::info!(target: "plugin.host", plugin = %id, "worker restart requested");
     if let Some(host) = state.plugin_host.clone() {
         host.restart_worker(&id, &registry).await;
     }
@@ -766,7 +779,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A host-side plugin lifecycle operation the dashboard started and tails. The
 /// daemon owns the work; the browser polls `GET /api/plugins/jobs/{id}` for
 /// status plus the live log tail.
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginJobKind {
     Install,
@@ -794,6 +807,8 @@ pub struct PluginJob {
     /// On-disk log file; never serialized (read via the tail endpoint instead).
     #[serde(skip)]
     log_path: PathBuf,
+    #[serde(skip)]
+    started: std::time::Instant,
 }
 
 /// Drop finished jobs and their log files older than this when a new job
@@ -860,6 +875,7 @@ impl PluginJobRegistry {
             started_at: chrono::Utc::now().timestamp(),
             finished_at: None,
             log_path: log_path.clone(),
+            started: std::time::Instant::now(),
         };
         self.jobs.lock().unwrap().insert(id.clone(), job);
         Some((id, log_path))
@@ -869,11 +885,17 @@ impl PluginJobRegistry {
     fn finish(&self, id: &str, result: anyhow::Result<()>) {
         if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
             job.finished_at = Some(chrono::Utc::now().timestamp());
+            let duration_ms = job.started.elapsed().as_millis();
             job.status = match result {
-                Ok(()) => PluginJobStatus::Succeeded,
-                Err(e) => PluginJobStatus::Failed {
-                    error: format!("{e:#}"),
-                },
+                Ok(()) => {
+                    tracing::info!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, "plugin job finished");
+                    PluginJobStatus::Succeeded
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    tracing::warn!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, %error, "plugin job finished");
+                    PluginJobStatus::Failed { error }
+                }
             };
         }
         self.active.store(false, Ordering::SeqCst);

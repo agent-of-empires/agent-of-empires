@@ -174,19 +174,25 @@ pub fn mark_recovery_attempted(ids: &[String]) {
     let Some(path) = recovery_ledger_path() else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        gc_stale_boot_ledgers(dir, path.file_name());
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    let written = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+            gc_stale_boot_ledgers(dir, path.file_name());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         use std::io::Write;
         for id in ids {
-            let _ = writeln!(file, "{id}");
+            writeln!(file, "{id}")?;
         }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        tracing::warn!(target: "session.startup_recovery", path = %path.display(), %error,
+            "failed to record recovery attempt ledger"
+        );
     }
 }
 
@@ -205,7 +211,9 @@ fn gc_stale_boot_ledgers(dir: &Path, keep: Option<&std::ffi::OsStr>) {
 /// Warm up the tmux server so that the first concurrent `new-session` from recovery workers does
 /// not race the server's cold start.
 pub fn warm_tmux_server() {
-    let _ = crate::tmux::tmux_command().arg("start-server").status();
+    if let Err(error) = crate::tmux::tmux_command().arg("start-server").status() {
+        tracing::debug!(target: "session.startup_recovery", %error, "tmux start-server failed");
+    }
 }
 
 /// Maximum number of recovery workers running concurrently.

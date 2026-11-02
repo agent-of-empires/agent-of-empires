@@ -179,6 +179,26 @@ impl DockerContainer {
         &self.runtime
     }
 
+    /// Best effort: an unpinned container is left running by a structured stop, never failed.
+    pub(crate) fn pin(
+        &self,
+        id: &str,
+        current: Option<&crate::session::SandboxPin>,
+        create_config: Option<&ContainerConfig>,
+    ) -> Option<crate::session::SandboxPin> {
+        // A created ID came from a command run with the config's inherited overrides (see
+        // `RuntimeBase::run_create`); a reused one was inspected on the ambient transport.
+        let inherited = create_config
+            .map(|config| container_interface::docker_env_args(&config.environment).1)
+            .unwrap_or_default();
+        let fresh = RuntimeExecutionSnapshot::capture_with(&self.runtime, &inherited);
+        if let Err(error) = &fresh {
+            tracing::warn!(target: "containers.runtime", name = %self.name, %error,
+                "could not pin the sandbox runtime");
+        }
+        reconcile_pin(current, fresh.ok(), id)
+    }
+
     pub fn exists(&self) -> Result<bool> {
         self.runtime.does_container_exist(&self.name)
     }
@@ -424,9 +444,132 @@ impl DockerContainer {
     }
 }
 
+/// A pin for `id` keeps its original endpoint: a fresh snapshot replaces its runtime only
+/// when it names the same kind and endpoint, and is otherwise ignored.
+fn reconcile_pin(
+    current: Option<&crate::session::SandboxPin>,
+    fresh: Option<RuntimeExecutionSnapshot>,
+    id: &str,
+) -> Option<crate::session::SandboxPin> {
+    let build = |runtime| crate::session::SandboxPin {
+        runtime,
+        container_id: id.to_owned(),
+    };
+    match (current.filter(|pin| pin.container_id == id), fresh) {
+        (Some(pin), Some(fresh))
+            if fresh.kind == pin.runtime.kind && fresh.endpoint == pin.runtime.endpoint =>
+        {
+            Some(build(fresh))
+        }
+        (Some(pin), _) => Some(pin.clone()),
+        (None, fresh) => fresh.map(build),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create ran with an inherited `DOCKER_HOST`, so the pin must name that endpoint and the
+    /// later stop must reach it, not the daemon's ambient one.
+    #[test]
+    #[serial_test::serial]
+    fn pin_uses_the_routing_create_ran_with() {
+        use crate::session::test_support::EnvGuard;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("calls");
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$DOCKER_HOST\" \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("DOCKER_HOST", "tcp://ambient:2375"),
+        ]);
+        let _clear = EnvGuard::unset(&["DOCKER_CONTEXT"]);
+        let config = ContainerConfig {
+            environment: vec![crate::containers::container_interface::EnvEntry::Inherit {
+                key: "DOCKER_HOST".into(),
+                value: "tcp://created:2375".into(),
+            }],
+            ..Default::default()
+        };
+        let container = DockerContainer::new("pin-routing", "img", ContainerRuntime::docker());
+        let reused = container.pin("c1", None, None).unwrap();
+        assert_eq!(reused.runtime.endpoint, "tcp://ambient:2375");
+        let pin = container.pin("c1", None, Some(&config)).unwrap();
+        assert_eq!(pin.runtime.endpoint, "tcp://created:2375");
+        pin.runtime.stop_container(&pin.container_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().trim(),
+            "tcp://created:2375 stop c1"
+        );
+    }
+
+    #[test]
+    fn reconcile_pin_refreshes_only_the_same_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pin, _) = crate::session::test_support::fake_sandbox_pin(dir.path(), "c1", 0, "");
+        let moved = |endpoint: &str| {
+            let mut runtime = pin.runtime.clone();
+            runtime.program = "/moved/docker".into();
+            runtime.endpoint = endpoint.into();
+            runtime
+        };
+        // (current, fresh, id, expected program, expected endpoint)
+        let kept = pin.runtime.clone();
+        let cases = [
+            (
+                Some(&pin),
+                Some(moved(&pin.runtime.endpoint)),
+                "c1",
+                "/moved/docker",
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                Some(moved("tcp://other")),
+                "c1",
+                kept.program.to_str().unwrap(),
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                None,
+                "c1",
+                kept.program.to_str().unwrap(),
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                Some(moved("tcp://other")),
+                "c2",
+                "/moved/docker",
+                &"tcp://other".to_owned(),
+            ),
+        ];
+        for (current, fresh, id, program, endpoint) in cases {
+            let result = reconcile_pin(current, fresh, id).unwrap();
+            assert_eq!(result.container_id, id);
+            assert_eq!(result.runtime.program.to_str().unwrap(), program);
+            assert_eq!(&result.runtime.endpoint, endpoint);
+        }
+        assert!(reconcile_pin(None, None, "c1").is_none());
+    }
 
     #[test]
     fn classify_removal_separates_gone_from_failed() {

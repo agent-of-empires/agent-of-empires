@@ -44,23 +44,23 @@ codecov:
 
 # One flag per test type. Each CI job uploads its own LCOV with its own
 # flag, and Codecov merges them server-side into the combined coverage
-# report (see https://docs.codecov.com/docs/flags). `carryforward: true`
-# means a flag whose job did not run on a given PR (e.g. docs-only PR
-# skipping playwright-live) does not zero out that slice; the last
-# known value carries forward instead.
+# report (see https://docs.codecov.com/docs/flags). All three jobs run on
+# every PR, so no carryforward: carried-forward sessions count toward
+# `after_n_builds` above, so with carryforward on a single upload satisfied
+# the gate and codecov/patch was posted from partial coverage.
 flags:
   vitest:
     paths:
       - web/src/
-    carryforward: true
+    carryforward: false
   playwright-mocked:
     paths:
       - web/src/
-    carryforward: true
+    carryforward: false
   playwright-live:
     paths:
       - web/src/
-    carryforward: true
+    carryforward: false
 
 component_management:
   default_rules:

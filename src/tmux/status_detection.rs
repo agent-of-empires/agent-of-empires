@@ -2655,6 +2655,161 @@ Final prose line.\n";
         assert!(!detection.visible);
     }
 
+    const OMP_HISTORY_SEARCH: &str = "\
+╭─ History ───────────────────────────╮
+│                                    │
+│ >                                  │
+│                                    │
+│ ❯ history probe beta           now │
+│   history probe alpha          now │
+│                                    │
+│ ↑/↓ navigate · ⏎ select · ⎋ cancel │
+│                                    │
+╰────────────────────────────────────╯";
+
+    #[test]
+    fn omp_prompt_history_preserves_state_without_creating_a_request() {
+        let empty = OMP_HISTORY_SEARCH.replace(
+            "│ ❯ history probe beta           now │\n│   history probe alpha          now │",
+            "│   ⓘ No history yet                 │",
+        );
+        let filtered = OMP_HISTORY_SEARCH
+            .replace("│ > ", "│ > beta ")
+            .replace("│   history probe alpha          now │\n", "");
+        let no_matches = empty
+            .replace("│ > ", "│ > missing ")
+            .replace("No history yet", "No matching history");
+        let wrapped = OMP_HISTORY_SEARCH.replace("⎋ cancel │", "⎋ │\n│ cancel │");
+        let remapped = OMP_HISTORY_SEARCH.replace(
+            "↑/↓ navigate · ⏎ select · ⎋ cancel",
+            "Ctrl+K/Ctrl+J navigate · Enter select · Ctrl+C cancel",
+        );
+        for history in [
+            OMP_HISTORY_SEARCH,
+            &empty,
+            &filtered,
+            &no_matches,
+            &wrapped,
+            &remapped,
+        ] {
+            for preset in ["unicode", "ascii", "nerd"] {
+                let pane = match preset {
+                    "ascii" => history
+                        .replace(['╭', '╮', '╰', '╯'], "+")
+                        .replace('─', "-")
+                        .replace('│', "|")
+                        .replace('❯', ">")
+                        .replace('ⓘ', "[i]")
+                        .replace('·', "-")
+                        .replace("↑/↓", "Up/Down")
+                        .replace('⏎', "Enter")
+                        .replace('⎋', "Esc"),
+                    "nerd" => history
+                        .replace('❯', "\u{f054}")
+                        .replace('ⓘ', "\u{f129}")
+                        .replace('⏎', "\u{f0311}")
+                        .replace('⎋', "\u{f12b7}"),
+                    _ => history.to_owned(),
+                };
+                for owned in [true, false] {
+                    let detection = crate::tmux::detect::detect(
+                        "omp",
+                        &pane,
+                        &Observation::new("", None, owned),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        detection.status,
+                        if owned { None } else { Some(Status::Idle) },
+                        "{preset}, owned={owned}: {pane}"
+                    );
+                }
+            }
+        }
+        for keys in [
+            "\u{f0636} ↑/↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "\u{f0636} ↑/\u{f0636} ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "\u{f0636} │\n│ ↑/\u{f0636} │\n│ ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "Ctrl+\u{f0636} ↑/Ctrl+\u{f0636} ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "Ctrl+\u{f0636} │\n│ ↑/Ctrl+\u{f0636} │\n│ ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+        ] {
+            let pane = OMP_HISTORY_SEARCH
+                .replace("↑/↓ navigate · ⏎ select · ⎋ cancel", keys)
+                .replace('❯', "\u{f054}");
+            for owned in [true, false] {
+                assert_eq!(
+                    crate::tmux::detect::detect("omp", &pane, &Observation::new("", None, owned))
+                        .unwrap()
+                        .status,
+                    if owned { None } else { Some(Status::Idle) },
+                    "{keys}, owned={owned}"
+                );
+            }
+        }
+
+        let old_ask = "╭─ Ask ─────────╮\n│ ❯ Yes │\n│   No │\n│ Enter select · n note · Esc cancel │\n╰───────────────╯";
+        let clipped_ask =
+            "│   Yes │\n│ ❯ No │\n│ Enter select · n note · Esc cancel │\n╰───────────────╯";
+        for (prefix, title, expected) in [
+            ("", "", None),
+            (old_ask, "", None),
+            (clipped_ask, "", None),
+            ("\n  Esc Waiting\n", "", None),
+            ("", "π ⠋ Task", Some(Status::Running)),
+            (
+                "Ask hidden: Continue? · Enter show · Esc cancel",
+                "",
+                Some(Status::Waiting),
+            ),
+            ("Retrying 1/3 now:", "", Some(Status::Running)),
+            ("\n  Esc Busy\n", "", Some(Status::Running)),
+        ] {
+            let pane = format!("{prefix}\n{empty}");
+            let detection =
+                crate::tmux::detect::detect("omp", &pane, &Observation::new(title, None, true))
+                    .unwrap();
+            assert_eq!(detection.status, expected, "{prefix}: {title}");
+        }
+        for prior in [old_ask, clipped_ask] {
+            let covered = format!("{prior}\n{empty}");
+            assert_eq!(
+                crate::tmux::detect::detect("omp", &covered, &Observation::new("", None, false))
+                    .unwrap()
+                    .status,
+                Some(Status::Idle),
+                "{prior}"
+            );
+        }
+
+        for pane in [
+            OMP_HISTORY_SEARCH.replace("History", "Saved prompts"),
+            format!("{OMP_HISTORY_SEARCH}\n{}", "PLUGIN\n".repeat(12)),
+        ] {
+            assert_eq!(
+                crate::tmux::detect::detect("omp", &pane, &Observation::new("", None, true),)
+                    .unwrap()
+                    .status,
+                None,
+                "{pane}"
+            );
+        }
+        for (pane, expected) in [
+            (OMP_HISTORY_SEARCH.replace("navigate", "submit"), Status::Waiting),
+            (OMP_HISTORY_SEARCH.replace(
+                "│ >                                  │\n│                                    │\n",
+                "",
+            ), Status::Waiting),
+            (format!("{OMP_HISTORY_SEARCH}\n{MINIMAL_COMPOSER_BOX}"), Status::Idle),
+        ] {
+            assert_eq!(
+                crate::tmux::detect::detect("omp", &pane, &Observation::new("", None, true))
+                    .unwrap().status,
+                Some(expected),
+                "{pane}"
+            );
+        }
+    }
+
     #[test]
     fn test_detect_omp_status_error_retry_table() {
         let prompt_box = MINIMAL_COMPOSER_BOX;

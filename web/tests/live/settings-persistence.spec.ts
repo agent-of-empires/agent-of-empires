@@ -434,31 +434,31 @@ test("shortcut bar toggle persists globally from Terminal UI settings", async ({
 
 test("runtime logging overrides persist and clearing one preserves the other", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
-  const uds = labelledSelect(page, /^runtime\.uds$/);
+  const runtime = labelledSelect(page, /^runtime\.ws$/);
   const ws = labelledSelect(page, /^server\.lifecycle$/);
   const migration = labelledSelect(page, /^migrations\.v043$/);
-  await expect(uds).toBeVisible();
-  await uds.selectOption("warn");
+  await expect(runtime).toBeVisible();
+  await runtime.selectOption("warn");
   const globalUrl = `${serve.baseUrl}/api/settings`;
-  await expect.poll(async () => (await getJson(globalUrl)).logging.targets["runtime.uds"]).toBe("warn");
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets["runtime.ws"]).toBe("warn");
   await ws.selectOption("debug");
   await expect
     .poll(async () => (await getJson(globalUrl)).logging.targets)
-    .toEqual({ "runtime.uds": "warn", "server.lifecycle": "debug" });
+    .toEqual({ "runtime.ws": "warn", "server.lifecycle": "debug" });
   await migration.selectOption("info");
   await expect.poll(async () => (await getJson(globalUrl)).logging.targets["migrations.v043"]).toBe("info");
   await page.reload();
-  await expect(uds).toHaveValue("warn");
+  await expect(runtime).toHaveValue("warn");
   await expect(ws).toHaveValue("debug");
   await expect(migration).toHaveValue("info");
 
   await migration.selectOption("");
   await expect
     .poll(async () => (await getJson(globalUrl)).logging.targets)
-    .toEqual({ "runtime.uds": "warn", "server.lifecycle": "debug" });
+    .toEqual({ "runtime.ws": "warn", "server.lifecycle": "debug" });
   await serve.restart();
   await page.reload();
-  await expect(uds).toHaveValue("warn");
+  await expect(runtime).toHaveValue("warn");
   await expect(ws).toHaveValue("debug");
   await expect(migration).toHaveValue("");
 });

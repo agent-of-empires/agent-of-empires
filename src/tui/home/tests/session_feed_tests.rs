@@ -2411,6 +2411,96 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
 
 #[test]
 #[serial]
+fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    for action in ["mutation", "ensure", "start"] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut respond = env.view.session_feed.request_driver_for_test();
+        env.view
+            .session_feed
+            .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+        env.view.apply_session_feed();
+        match action {
+            "ensure" => env
+                .view
+                .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
+                .unwrap(),
+            "start" => env.view.start_then_attach(&id, None),
+            _ => env
+                .view
+                .session_feed
+                .submit(
+                    id.clone(),
+                    crate::daemon::SessionMutation::Start(
+                        crate::daemon::StartSessionBody::default(),
+                    ),
+                )
+                .unwrap(),
+        }
+        let refusal = crate::daemon::DaemonClientError::Committed {
+            cursor: crate::daemon::RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            },
+            code: crate::daemon::ApiErrorCode::ManagedResumeRefused(
+                crate::session::ManagedResumeCause::WrapperContractRequired,
+            ),
+        };
+        let message = if action == "start" {
+            format!("Session started; pane preparation failed: {refusal}")
+        } else {
+            refusal.to_string()
+        };
+        assert_eq!(respond(Err(message)).unwrap().0, id);
+        env.view.apply_session_feed();
+        env.view.apply_restart_results();
+        if action != "mutation" {
+            assert!(env.view.info_dialog.is_none());
+            assert!(env.view.pending_native_attachment.is_some());
+            assert!(env.view.take_native_attachment().is_none());
+            assert!(env.view.pending_native_attachment.is_none());
+            assert!(env.view.live_send.is_none());
+        }
+        assert!(env.view.session_feed.can_submit(&id));
+        assert!(env.view.pending_indeterminate_resolution.is_none());
+        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+            let screen = render_home_to_string(&mut env.view, width, height);
+            for instruction in [
+                if action == "mutation" {
+                    "Runtime change"
+                } else {
+                    "Attachment failed"
+                },
+                "set-session-id",
+                "<session>",
+                "<native-id>",
+                "--store",
+                "session.agent_execution_as",
+                "session.agent_config_dir",
+                "\"\"",
+                "AoE association",
+                "[OK]",
+            ] {
+                assert!(
+                    screen.contains(instruction),
+                    "{action}: {instruction} is clipped:\n{screen}"
+                );
+            }
+            assert!(!screen.contains("Resolve Unknown Outcome"), "{screen}");
+        }
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.info_dialog.is_none());
+        env.view.strict_hotkeys = false;
+        env.view.handle_key(key(KeyCode::Char('e')), None);
+        assert!(env.view.restart_dialog.is_some());
+        assert!(respond(Err("must not submit before confirmation".into())).is_none());
+    }
+}
+
+#[test]
+#[serial]
 fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
     use crate::tui::dialogs::test_render::{draw, find};
     for mouse in [false, true] {

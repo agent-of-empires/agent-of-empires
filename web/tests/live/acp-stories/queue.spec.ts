@@ -126,5 +126,5 @@ test("sidebar row shows the queued-prompt count badge", async ({ page, spawnServ
   await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible();
 
   await page.goto(serve.baseUrl);
-  await expect(page.getByTitle("2 queued prompts")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTitle("2 queued messages")).toBeVisible({ timeout: 15_000 });
 });

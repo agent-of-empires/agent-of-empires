@@ -23,7 +23,9 @@ const claude = (over: Partial<AgentInstallInfo> = {}): AgentInstallInfo => ({
   install_command: CLAUDE_NPM,
   npm_installable: true,
   install_allowed: false,
+  install_blocked: "setting_off",
   sandboxed: false,
+  container_install_command: null,
   ...over,
 });
 const opencode = claude({

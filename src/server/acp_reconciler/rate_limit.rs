@@ -219,7 +219,7 @@ pub(super) async fn reap_rate_limit_resumes(
     let mut workerless = Vec::new();
     for candidate in candidates {
         if parked.contains(&candidate.0) {
-            tracing::debug!(target: "acp.supervisor", session = %candidate.0, "rate-limit auto-resume: skipped, session is crash-loop parked");
+            tracing::trace!(target: "acp.supervisor", session = %candidate.0, "rate-limit auto-resume: skipped, session is crash-loop parked");
         } else if !state.acp_supervisor.is_running(&candidate.0).await {
             workerless.push(candidate);
         }
@@ -235,7 +235,7 @@ pub(super) async fn reap_rate_limit_resumes(
     let now = Utc::now();
     for (id, profile, has_queued_prompts) in workerless {
         let skip = |reason: &str| {
-            tracing::debug!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
+            tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
         if !enabled_by_profile.get(&profile).copied().unwrap_or(false) {
             skip("not enabled for this profile");

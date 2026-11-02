@@ -10,20 +10,27 @@ const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 // Stable empty default so consumers never see a fresh array.
 const NO_CLEAR_ALIASES: readonly string[] = [];
 const ClearAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
+const CompactAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
 
 export function AgentProfileProvider({
   toolKey,
   clearAliases,
+  compactAliases,
   children,
 }: {
   toolKey: string | null | undefined;
   clearAliases?: readonly string[];
+  compactAliases?: readonly string[];
   children: ReactNode;
 }) {
   const profile = resolveAgentProfile(toolKey);
   return (
     <AgentProfileContext.Provider value={profile}>
-      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>{children}</ClearAliasesContext.Provider>
+      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>
+        <CompactAliasesContext.Provider value={compactAliases ?? NO_CLEAR_ALIASES}>
+          {children}
+        </CompactAliasesContext.Provider>
+      </ClearAliasesContext.Provider>
     </AgentProfileContext.Provider>
   );
 }
@@ -35,4 +42,9 @@ export function useAgentProfile(): AgentProfile {
 /** Empty without a clear alias or outside a provider. */
 export function useClearAliases(): readonly string[] {
   return useContext(ClearAliasesContext);
+}
+
+/** Empty without a compact alias or outside a provider. */
+export function useCompactAliases(): readonly string[] {
+  return useContext(CompactAliasesContext);
 }

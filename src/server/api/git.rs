@@ -191,6 +191,7 @@ pub async fn clone_repo(
 
     match result {
         Ok(Ok(path)) => {
+            tracing::info!(target: "http.api.git", destination = %path, bare, shallow, "repo cloned");
             (StatusCode::CREATED, Json(serde_json::json!({"path": path}))).into_response()
         }
         Ok(Err(e)) => {

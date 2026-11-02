@@ -49,7 +49,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | Variable | Description |
 |----------|-------------|
 | `AGENT_OF_EMPIRES_PROFILE` | Default profile |
-| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn`. One-shot CLI commands always log to the same file at the configured level once the app directory exists; `[logging].output = "stdout"` applies to a foreground `aoe serve` only |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
 
@@ -207,7 +207,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation. Use [status rules](#status-rules-for-custom-agents) when output differs from the built-in.
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
-  Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
+  Bare, non-path wrappers can start fresh and capture their pane-scoped published ID without this contract. Resuming the recorded conversation requires the contract. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers) for wrapper contracts and [Pinning or resetting a conversation](session-resume.md#pinning-or-resetting-a-conversation) for failed-resume recovery.
 - **`agent_config_dir`** (optional): The config directory the wrapper points its CLI at, when that is not the built-in default (see below).
 - **`default_tool`** can select a custom-agent name for new sessions.
 

@@ -268,11 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_wake_is_suppressed_for_resume_failed() {
-        let outcome = Ok(StartOutcome::ResumeFailed {
-            sid: "11111111-2222-3333-4444-555555555555".to_string(),
-        });
-
-        assert!(!launched_agent(&outcome));
+    fn restart_wake_requires_a_successful_launch() {
+        let sid = "11111111-2222-3333-4444-555555555555".to_string();
+        assert!(!launched_agent(&Ok(StartOutcome::ResumeFailed {
+            sid: sid.clone(),
+        })));
+        assert!(launched_agent(&Ok(StartOutcome::FreshAfterFailedResume {
+            sid,
+        })));
+        assert!(!launched_agent(&Err("launch refused".into())));
     }
 }

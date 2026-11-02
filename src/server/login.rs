@@ -1,11 +1,12 @@
 //! Passphrase-based login as a second authentication factor.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{FromRequest, State};
+use axum::extract::{ConnectInfo, FromRequest, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -1079,9 +1080,28 @@ pub async fn logout_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    // Extract session cookie
     if let Some(session_id) = extract_login_session(&request) {
         state.login_manager.invalidate_session(&session_id).await;
+        // Read off the request, not an extractor: a missing peer stamp must
+        // not fail the logout before the session is invalidated.
+        let addr = match request
+            .extensions()
+            .get::<ConnectInfo<super::peer::ConnectionPeer>>()
+        {
+            Some(ConnectInfo(super::peer::ConnectionPeer::Tcp(addr))) => Some(*addr),
+            Some(_) => None,
+            None => request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr),
+        };
+        match addr {
+            Some(addr) => {
+                let ip = state.ingress(addr, request.headers()).client_ip;
+                tracing::info!(target: "auth.passphrase", %ip, "device logged out");
+            }
+            None => tracing::info!(target: "auth.passphrase", "device logged out"),
+        }
     }
 
     let clear_cookie = clear_login_cookie(state.behind_tunnel);
@@ -1289,7 +1309,11 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
                 continue;
             }
         };
-        let _ = client
+        let host = reqwest::Url::parse(&sub.endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        match client
             .post(&sub.endpoint)
             .header("Authorization", &auth_header)
             .header("Content-Encoding", "aes128gcm")
@@ -1297,7 +1321,16 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
             .header("TTL", "60")
             .body(cipher)
             .send()
-            .await;
+            .await
+        {
+            Ok(response) if !response.status().is_success() => {
+                tracing::warn!(target: "auth.passphrase", %host, status = %response.status(), "login push failed");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(target: "auth.passphrase", %host, error = %error.without_url(), "login push failed");
+            }
+        }
     }
 }
 
