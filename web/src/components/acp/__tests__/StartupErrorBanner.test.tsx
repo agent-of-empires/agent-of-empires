@@ -144,7 +144,7 @@ describe("StartupErrorBanner layout", () => {
       command: CLAUDE_NPM,
       texts: [
         "Run this inside the container, then Retry",
-        'the dashboard\'s "Sandbox image update available" banner pulls it, or shows the command to run.',
+        'the dashboard\'s "Sandbox image update available" banner offers Update now to pull it, or shows the command to run.',
       ],
       absent: ["where the Daemon runs", "TUI"],
       actions: ["Retry", "Use Terminal view"],

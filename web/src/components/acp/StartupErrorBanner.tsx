@@ -271,7 +271,7 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
         <p className="mt-2 text-text-subtle">
           This updates the running container only. To keep new Sessions from hitting this, refresh the Sandbox image.
           When a newer image is published and update checks are on, the dashboard's "Sandbox image update available"
-          banner pulls it, or shows the command to run.
+          banner offers Update now to pull it, or shows the command to run.
         </p>
       </div>
     );
