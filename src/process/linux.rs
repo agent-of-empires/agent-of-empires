@@ -648,11 +648,11 @@ mod legacy_inventory_boundary_tests {
                 }
             }
             let _guard = super::super::systemd::legacy_runtime_fixture::install(fixture.path());
-            let names = legacy_scope_unit_names(prefix);
+            let names = inspect_legacy_scopes(prefix, &[], |_| true);
             let known = [crate::process::worker_registry::ScopeOwnership::Owned { unit }];
             let clear = legacy_scope_inventory_clear(prefix, &known);
             if matches!(case, "empty" | "empty-scope") {
-                assert!(names.unwrap().is_empty(), "{case}");
+                assert!(names.unwrap().adopted.is_empty(), "{case}");
                 assert!(clear.unwrap(), "{case}");
             } else {
                 assert!(names.is_err(), "{case}: cannot discard original debt");
@@ -730,15 +730,16 @@ mod legacy_inventory_boundary_tests {
             };
             if matches!(case, "missing-user" | "missing-runtime") {
                 assert!(result.unwrap(), "{case}");
-                assert!(legacy_scope_unit_names("aoe-session-fixture-")
+                assert!(inspect_legacy_scopes("aoe-session-fixture-", &[], |_| true)
                     .unwrap()
+                    .adopted
                     .is_empty());
                 assert!(legacy_scope_inventory_clear("aoe-session-fixture-", &[]).unwrap());
             } else {
                 assert!(result.is_err(), "{case} must retain unknown custody");
                 if case != "wrong-owner" {
                     assert!(
-                        legacy_scope_unit_names("aoe-session-fixture-").is_err(),
+                        inspect_legacy_scopes("aoe-session-fixture-", &[], |_| true).is_err(),
                         "{case}"
                     );
                     assert!(
@@ -828,34 +829,58 @@ mod legacy_inventory_boundary_tests {
     }
 }
 
-/// Loaded user-manager scope names starting with `prefix`.
-pub(super) fn legacy_scope_unit_names(prefix: &str) -> anyhow::Result<Vec<String>> {
-    let Some(manager) = LegacyUserManager::capture(prefix)? else {
-        return Ok(Vec::new());
-    };
-    let units = manager.list_scope_units(prefix)?;
-    manager.check_current()?;
-    Ok(units.into_iter().map(|(unit, _)| unit).collect())
-}
-
-pub(super) fn legacy_scope_inventory_clear(
+/// One captured boundary yields both the legacy units to adopt and the proof
+/// that no other unknown scope is live.
+pub(super) fn inspect_legacy_scopes(
     prefix: &str,
     known: &[crate::process::worker_registry::ScopeOwnership],
-) -> anyhow::Result<bool> {
+    is_legacy: impl Fn(&str) -> bool,
+) -> anyhow::Result<super::systemd::LegacyScopeInspection> {
     use crate::process::worker_registry::ScopeOwnership;
     use std::collections::HashSet;
-    use std::time::Duration;
     let Some(manager) = LegacyUserManager::capture(prefix)? else {
-        return Ok(true);
+        return Ok(super::systemd::LegacyScopeInspection {
+            adopted: Vec::new(),
+            absent: true,
+        });
     };
+    let units = manager.list_scope_units(prefix)?;
+    let adopted: Vec<String> = units
+        .iter()
+        .map(|(unit, _)| unit)
+        .filter(|unit| is_legacy(unit))
+        .cloned()
+        .collect();
     let retained: HashSet<&str> = known
         .iter()
         .filter_map(|scope| match scope {
             ScopeOwnership::Owned { unit } => Some(unit.as_str()),
             _ => None,
         })
+        .chain(adopted.iter().map(String::as_str))
         .collect();
-    for (unit, active) in manager.list_scope_units(prefix)? {
+    let absent = manager_scopes_clear(&manager, prefix, &units, &retained)?;
+    if absent {
+        manager.check_current()?;
+    }
+    Ok(super::systemd::LegacyScopeInspection { adopted, absent })
+}
+
+pub(super) fn legacy_scope_inventory_clear(
+    prefix: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    Ok(inspect_legacy_scopes(prefix, known, |_| false)?.absent)
+}
+
+fn manager_scopes_clear(
+    manager: &LegacyUserManager,
+    prefix: &str,
+    units: &[(String, String)],
+    retained: &std::collections::HashSet<&str>,
+) -> anyhow::Result<bool> {
+    use std::time::Duration;
+    for (unit, active) in units {
         let (unit, active) = (unit.as_str(), active.as_str());
         if !retained.contains(unit) {
             // Inventory can prove absence, not transfer kill authority.
@@ -897,15 +922,11 @@ pub(super) fn legacy_scope_inventory_clear(
             }
         }
     }
-    if !legacy_scope_cgroups_clear(
+    legacy_scope_cgroups_clear(
         open_cgroup_directory(&manager.inventory_root())?,
         prefix,
-        &retained,
-    )? {
-        return Ok(false);
-    }
-    manager.check_current()?;
-    Ok(true)
+        retained,
+    )
 }
 
 fn open_cgroup_directory(root: &Path) -> anyhow::Result<fs::File> {
