@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type { AgentInstallInfo } from "../../../lib/api";
+import type { AcpWorkerState } from "../../../lib/types";
 import { StartupErrorBanner } from "../StartupErrorBanner";
 
 const writeClipboard = vi.fn();
@@ -40,11 +41,12 @@ type Reply = { status: number; body: unknown };
 const json = (body: unknown, status = 200): Reply => ({ status, body });
 
 /** Answers each endpoint the banner calls; unlisted ones 404. */
-function stubApi(routes: { info?: Reply; spawn?: Reply; install?: Reply; log?: Reply }) {
-  const spy = vi.fn(async (url: string) => {
+function stubApi(routes: { info?: Reply; spawn?: Reply; restart?: Reply; install?: Reply; log?: Reply }) {
+  const spy = vi.fn(async (url: string, _init?: RequestInit) => {
     const reply =
       (url.includes("/acp/install-info") && routes.info) ||
       (url.includes("/acp/spawn") && routes.spawn) ||
+      (url.includes("/acp/restart") && routes.restart) ||
       (url.includes("/acp/install-agent") && routes.install) ||
       (url.includes("/acp/worker-log") && routes.log) ||
       json("not found", 404);
@@ -61,11 +63,18 @@ function renderBanner({
   message = SPAWN_MSG,
   onSwitchToTerminal = vi.fn(),
   switchable = true,
-}: { message?: string; onSwitchToTerminal?: () => void; switchable?: boolean } = {}) {
+  acpWorkerState = "absent",
+}: {
+  message?: string;
+  onSwitchToTerminal?: () => void;
+  switchable?: boolean;
+  acpWorkerState?: AcpWorkerState;
+} = {}) {
   return render(
     <StartupErrorBanner
       sessionId="s-1"
       message={message}
+      acpWorkerState={acpWorkerState}
       onSwitchToTerminal={switchable ? onSwitchToTerminal : undefined}
     />,
   );
@@ -409,11 +418,16 @@ describe("StartupErrorBanner install", () => {
 });
 
 describe("StartupErrorBanner Retry", () => {
-  it("says what happens next once the respawn is accepted", async () => {
-    stubApi({ info: json(claude()), spawn: json({}) });
-    const { getByTestId, findByText, queryByTestId } = renderBanner();
+  it.each([
+    ["spawns when no Worker is left", "absent", "/acp/spawn"],
+    ["restarts a Worker that hasn't settled, so it can't refuse the Retry", "running", "/acp/restart"],
+  ] as const)("%s, and says what happens next", async (_label, acpWorkerState, path) => {
+    const spy = stubApi({ info: json(claude()), spawn: json({}), restart: json({}) });
+    const { getByTestId, findByText, queryByTestId } = renderBanner({ acpWorkerState });
     fireEvent.click(getByTestId("startup-error-banner-retry"));
     await findByText("Retrying. Events will appear when Claude starts.");
+    expect(calls(spy, path)).toBe(1);
+    expect(calls(spy, path === "/acp/spawn" ? "/acp/restart" : "/acp/spawn")).toBe(0);
     expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
   });
 });
@@ -449,6 +463,13 @@ describe("StartupErrorBanner Details", () => {
       `spawn failed: ${longCause}`,
       "Retry failed: same error",
     ],
+    ["the same error from a restart", SPAWN_MSG, `restart spawn failed: ${cause}`, "Retry failed: same error"],
+    [
+      "the same error from a restart after a reason code",
+      SPAWN_MSG,
+      `worker_not_ready: restart spawn failed: ${cause}`,
+      "Retry failed: same error",
+    ],
     ["a new error", SPAWN_MSG, "spawn failed: capacity full", "Retry failed: capacity full"],
     [
       "a JSON refusal",
@@ -457,8 +478,11 @@ describe("StartupErrorBanner Details", () => {
       "Retry failed: session is archived; unarchive it first",
     ],
   ])("a retry failing with %s opens Details without the HTTP status", async (_label, message, body, line) => {
-    stubApi({ info: json(claude()), spawn: json(body, 500) });
-    const { getByTestId, findByTestId } = renderBanner({ message });
+    stubApi({ info: json(claude()), spawn: json(body, 500), restart: json(body, 500) });
+    const { getByTestId, findByTestId } = renderBanner({
+      message,
+      acpWorkerState: body.includes("restart") ? "running" : "absent",
+    });
     fireEvent.click(getByTestId("startup-error-banner-retry"));
     const details = await findByTestId("startup-error-banner-details-body");
     await waitFor(() => expect(details.textContent).toContain(line));

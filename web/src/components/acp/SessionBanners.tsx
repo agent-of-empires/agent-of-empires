@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
+import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
@@ -47,6 +48,7 @@ export function SessionBanners({
         <StartupErrorBanner
           sessionId={sessionId}
           message={state.startupError}
+          acpWorkerState={acpWorkerState}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
@@ -60,7 +62,7 @@ export function SessionBanners({
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {startingAgent ? (
-        <StartupWaitLine agent={startingAgent} />
+        <StartupWaitLine sessionId={sessionId} agent={startingAgent} />
       ) : (
         acpWorkerState === "resuming" &&
         healthy &&
@@ -87,20 +89,24 @@ export function SessionBanners({
 
 /** From this many seconds the line stops saying "You can type now" and only says it's still starting. */
 const STILL_STARTING_AFTER_S = 15;
+/** Restart is offered once the initialize handshake's 30s bound has passed with no error:
+ *  a start still going after that is waiting on `session/new` or `session/load`, which are unbounded. */
+const RESTART_OFFERED_AFTER_S = 30;
 
 const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 
 /** The one line shown while a new Session starts: the Agent, an elapsed count and
- *  Starting's breathe glyph. Mounting starts the count; unmounting resets it. */
-export function StartupWaitLine({ agent }: { agent: string }) {
+ *  Starting's breathe glyph. Mounting or a restart starts the count; unmounting resets it. */
+export function StartupWaitLine({ sessionId, agent }: { sessionId: string; agent: string }) {
+  const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
   const [frame, setFrame] = useState(0);
   const [still] = useState(reducedMotion);
+  const { state: restartState, error: restartError, respawn } = useRespawnSession(sessionId, null, { restart: true });
   useEffect(() => {
-    const started = Date.now();
-    const tick = setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    const tick = setInterval(() => setSeconds(Math.floor((Date.now() - startedAt) / 1000)), 1000);
     return () => clearInterval(tick);
-  }, []);
+  }, [startedAt]);
   useEffect(() => {
     if (still) return;
     const spin = setInterval(() => setFrame((f) => (f + 1) % RATTLES.breathe.frames.length), RATTLES.breathe.interval);
@@ -108,6 +114,12 @@ export function StartupWaitLine({ agent }: { agent: string }) {
   }, [still]);
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  const restart = async () => {
+    if (!(await respawn())) return;
+    setStartedAt(Date.now());
+    setSeconds(0);
+  };
+  const offerRestart = seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed";
   return (
     <div
       data-testid="startup-wait-line"
@@ -123,6 +135,22 @@ export function StartupWaitLine({ agent }: { agent: string }) {
       <span data-testid="startup-wait-elapsed" className="ml-auto shrink-0 font-mono tabular-nums">
         {elapsed}
       </span>
+      {offerRestart && (
+        <button
+          type="button"
+          data-testid="startup-wait-restart"
+          onClick={() => void restart()}
+          disabled={restartState === "retrying"}
+          className={`${SECONDARY_BUTTON} shrink-0`}
+        >
+          {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
+        </button>
+      )}
+      {restartState === "failed" && restartError && (
+        <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
+          Restart failed: {restartError}
+        </span>
+      )}
     </div>
   );
 }

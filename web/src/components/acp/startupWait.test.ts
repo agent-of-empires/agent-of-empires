@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { emptyAcpState } from "../../lib/acpTypes";
+import { applyEvent, emptyAcpState, type AcpEvent } from "../../lib/acpTypes";
 import { hasStartedBefore, isNewSessionStarting } from "./startupWait";
 
 type Connection = Parameters<typeof isNewSessionStarting>[1];
@@ -15,6 +15,14 @@ const connection = (over: Partial<Connection> = {}): Connection => ({
 
 describe("isNewSessionStarting", () => {
   const state = (over: Partial<ReturnType<typeof emptyAcpState>> = {}) => ({ ...emptyAcpState(), ...over });
+  const replay = (...events: AcpEvent[]) =>
+    events.reduce((s, event, i) => applyEvent(s, { session_id: "s", seq: i + 1, event }), emptyAcpState());
+  // What `initialize` persists before `session/new` answers.
+  const beforeSessionNew: AcpEvent[] = [
+    { PromptCapabilities: { image: false, audio: false, embedded_context: false } },
+    { AvailableCommandsUpdated: { commands: [] } },
+  ];
+  const assigned = replay(...beforeSessionNew, { AcpSessionAssigned: { acp_session_id: "acp-1" } });
   it.each<[string, Parameters<typeof isNewSessionStarting>, boolean]>([
     ["the Worker is starting a new Session", [state(), connection(), "resuming", false], true],
     [
@@ -57,9 +65,19 @@ describe("isNewSessionStarting", () => {
       ],
       true,
     ],
-    ["a resumed Session (it has events)", [state({ lastSeq: 7 }), connection(), "resuming", false], false],
-    ["a reconnect after the first open", [state(), connection({ status: "connecting" }), "running", false], false],
-    ["the Worker is running", [state(), connection(), "running", false], false],
+    ["a resumed Session (its session was assigned)", [assigned, connection(), "resuming", false], false],
+    ["a reconnect after the first open", [assigned, connection({ status: "connecting" }), "running", false], false],
+    ["the Worker is running with its session assigned", [assigned, connection(), "running", false], false],
+    [
+      "a running Worker whose session/new hasn't answered, past initialize's events",
+      [replay(...beforeSessionNew), connection(), "running", false],
+      true,
+    ],
+    [
+      "a reconnect while session/new hasn't answered",
+      [replay(...beforeSessionNew), connection({ status: "connecting" }), "running", false],
+      true,
+    ],
     ["a startup error shows its own banner", [state({ startupError: "boom" }), connection(), "resuming", false], false],
     [
       "an older Session whose events haven't loaded yet",

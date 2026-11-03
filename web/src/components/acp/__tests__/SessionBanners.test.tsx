@@ -118,7 +118,7 @@ describe("StartupWaitLine", () => {
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
     reducedMotion(false);
-    render(<StartupWaitLine agent="Claude Code" />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" />);
     expect(line().textContent).toContain("Starting Claude Code… You can type now.");
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
     act(() => vi.advanceTimersByTime(6_000));
@@ -143,7 +143,7 @@ describe("StartupWaitLine", () => {
   ])("%s", (_label, reduce) => {
     vi.useFakeTimers();
     reducedMotion(reduce);
-    const { unmount } = render(<StartupWaitLine agent="Codex" />);
+    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" />);
     const glyph = () => line().firstElementChild!.textContent;
     const first = glyph();
     act(() => vi.advanceTimersByTime(180 * 4));
@@ -158,5 +158,38 @@ describe("StartupWaitLine", () => {
     }
     unmount();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["a successful restart starts the count again", 200, "0:01", null],
+    [
+      "a failed restart keeps Restart and says why",
+      409,
+      "0:31",
+      "Restart failed: Server returned 409. worker_not_stopped",
+    ],
+  ])("offers Restart once the handshake bound has passed: %s", async (_label, status, elapsedAfter, failure) => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const spawn = vi.fn().mockResolvedValue({
+      ok: status === 200,
+      status,
+      text: () => Promise.resolve(status === 200 ? "" : "worker_not_stopped"),
+    });
+    vi.stubGlobal("fetch", spawn);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" />);
+    const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
+    act(() => vi.advanceTimersByTime(29_000));
+    expect(restart()).toBeNull();
+    act(() => vi.advanceTimersByTime(1_000));
+    await act(async () => {
+      fireEvent.click(restart()!);
+    });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
+    expect(restart() === null).toBe(failure === null);
+    expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
   });
 });
