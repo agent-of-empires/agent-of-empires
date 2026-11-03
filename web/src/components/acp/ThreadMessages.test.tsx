@@ -214,7 +214,8 @@ describe("AssistantMessage thinking", () => {
     expect(details!.open).toBe(false);
     expect(details!.querySelector("summary")?.textContent).toBe("Thinking");
     expect(details!.textContent).toContain("PINEAPPLE-7");
-    expect(screen.getByText("Done.")).toBeTruthy();
+    const reply = screen.getByText("Done.");
+    expect(details!.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 
