@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
@@ -62,7 +62,11 @@ export function SessionBanners({
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {startingAgent ? (
-        <StartupWaitLine sessionId={sessionId} agent={startingAgent} />
+        <StartupWaitLine
+          sessionId={sessionId}
+          agent={startingAgent}
+          promptPending={state.turnActive || state.queuedPrompts.length > 0}
+        />
       ) : (
         acpWorkerState === "resuming" &&
         healthy &&
@@ -97,7 +101,16 @@ const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce
 
 /** The one line shown while a new Session starts: the Agent, an elapsed count and
  *  Starting's breathe glyph. Mounting or a restart starts the count; unmounting resets it. */
-export function StartupWaitLine({ sessionId, agent }: { sessionId: string; agent: string }) {
+export function StartupWaitLine({
+  sessionId,
+  agent,
+  promptPending,
+}: {
+  sessionId: string;
+  agent: string;
+  /** A sent or queued prompt waits on this start; a restart stops it. */
+  promptPending: boolean;
+}) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
   const [frame, setFrame] = useState(0);
@@ -119,6 +132,7 @@ export function StartupWaitLine({ sessionId, agent }: { sessionId: string; agent
     setStartedAt(Date.now());
     setSeconds(0);
   };
+  const costId = useId();
   const offerRestart = seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed";
   return (
     <div
@@ -141,10 +155,16 @@ export function StartupWaitLine({ sessionId, agent }: { sessionId: string; agent
           data-testid="startup-wait-restart"
           onClick={() => void restart()}
           disabled={restartState === "retrying"}
+          aria-describedby={promptPending ? costId : undefined}
           className={`${SECONDARY_BUTTON} shrink-0`}
         >
           {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
         </button>
+      )}
+      {offerRestart && promptPending && (
+        <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
+          Restarting stops the message you sent. Send it again once {agent} is ready.
+        </span>
       )}
       {restartState === "failed" && restartError && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">

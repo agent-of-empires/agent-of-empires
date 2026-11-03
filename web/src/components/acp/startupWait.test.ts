@@ -108,6 +108,11 @@ describe("isNewSessionStarting", () => {
   ])("%s", (_label, args, expected) => {
     expect(isNewSessionStarting(...args)).toBe(expected);
   });
+  it("keeps a prompt accepted during a stalled session/new pending, so Restart warns about it", () => {
+    const stalled = replay(...beforeSessionNew, { UserPromptSent: { text: "hi", prompt_id: "p1" } });
+    expect(stalled.turnActive).toBe(true);
+    expect(isNewSessionStarting(stalled, connection(), "running", false)).toBe(true);
+  });
 });
 
 describe("hasStartedBefore", () => {
