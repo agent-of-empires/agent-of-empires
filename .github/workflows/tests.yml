@@ -100,6 +100,23 @@ jobs:
       # measured 336s -> 114s pinned to 4 cores, with identical results.
       # Raise this only with evidence; 4+ starts trading wall for flake risk on
       # the tests that wait on an ACP handshake.
+      # TEMP(runs-on): diagnose PATH loss in tmux panes on the RunsOn image.
+      - name: TEMP RunsOn PATH diagnostics
+        if: matrix.leg == 'web-e2e'
+        run: |
+          set -x
+          echo "SHELL=$SHELL"; getent passwd "$(id -un)"; id
+          readlink -f "$(command -v env)"; env --version | head -1; tmux -V
+          ls -la /etc/profile.d; cat /etc/environment || true
+          grep -n PATH /etc/profile /etc/bash.bashrc /etc/profile.d/* 2>/dev/null || true
+          d=$(mktemp -d); h=$(mktemp -d)
+          printf '#!/bin/sh\necho stub-ok\n' > "$d/zzstub"; chmod +x "$d/zzstub"
+          HOME="$h" PATH="$d:$PATH" bash -lc 'echo "login PATH=$PATH"; command -v zzstub; env zzstub'
+          HOME="$h" PATH="$d:$PATH" sh -lc 'echo "sh login PATH=$PATH"; env zzstub'
+          sock="$RUNNER_TEMP/diag.sock"
+          HOME="$h" PATH="$d:$PATH" tmux -S "$sock" -f /dev/null new-session -d -s diag "bash -l -c 'echo \"pane PATH=\$PATH\"; env zzstub; sleep 2'"
+          sleep 1; tmux -S "$sock" capture-pane -p -t diag; tmux -S "$sock" show-environment -g PATH; tmux -S "$sock" kill-server || true
+          findmnt /tmp; findmnt "$h" || true; df -h /tmp "$h"
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         env:
