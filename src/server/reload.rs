@@ -141,10 +141,18 @@ fn read_inventory_instances(
     name: &str,
     identity: ProfileIdentity,
     file_watch: Arc<FileWatchService>,
+    cache: Option<Arc<std::sync::Mutex<crate::session::SessionsFileCache>>>,
 ) -> anyhow::Result<Vec<Instance>> {
     let storage = Storage::open_inventory_reference(name, file_watch)?;
     identity.verify_storage(&storage)?;
-    let instances = storage.load_instances_readonly()?;
+    let instances = match cache {
+        Some(cache) => storage.load_instances_readonly_cached(
+            &mut cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )?,
+        None => storage.load_instances_readonly()?,
+    };
     storage.verify_bound_profile()?;
     Ok(instances)
 }
@@ -152,6 +160,14 @@ fn read_inventory_instances(
 fn load_read_instances(
     file_watch: &Arc<FileWatchService>,
     canonical: Option<LoadedInstances>,
+) -> LoadedInstances {
+    load_read_instances_cached(file_watch, canonical, None)
+}
+
+fn load_read_instances_cached(
+    file_watch: &Arc<FileWatchService>,
+    canonical: Option<LoadedInstances>,
+    mut cache: Option<&mut ProfileSessionsCache>,
 ) -> LoadedInstances {
     let reuse_canonical = canonical.is_some();
     let mut loaded = canonical.unwrap_or_default();
@@ -163,6 +179,18 @@ fn load_read_instances(
             return loaded;
         }
     };
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.supplementary.retain(|(name, identity), _| {
+            inventory
+                .iter()
+                .any(|profile| &profile.name == name && &profile.identity == identity)
+                && !loaded
+                    .cache
+                    .inventory
+                    .iter()
+                    .any(|accepted| &accepted.name == name || &accepted.identity == identity)
+        });
+    }
     for mut profile in inventory {
         if let Some(index) = loaded
             .cache
@@ -198,10 +226,22 @@ fn load_read_instances(
                 .iter()
                 .any(|accepted| &accepted.name == name)
         });
+        let session_cache = cache.as_deref_mut().map(|cache| {
+            cache
+                .supplementary
+                .entry((profile.name.clone(), profile.identity))
+                .or_default()
+                .clone()
+        });
         let (rows, stale) = if profile.listed {
             (
-                read_inventory_instances(&profile.name, profile.identity, file_watch.clone())
-                    .map_err(|error| error.to_string()),
+                read_inventory_instances(
+                    &profile.name,
+                    profile.identity,
+                    file_watch.clone(),
+                    session_cache,
+                )
+                .map_err(|error| error.to_string()),
                 false,
             )
         } else {
@@ -209,7 +249,7 @@ fn load_read_instances(
             let identity = profile.identity;
             let file_watch = file_watch.clone();
             let sampled = super::alias_io::sample(&profile.name, "sessions", move || {
-                read_inventory_instances(&name, identity, file_watch)
+                read_inventory_instances(&name, identity, file_watch, session_cache)
                     .map(|instances| (identity, instances))
                     .map_err(|error| error.to_string())
             });
@@ -265,9 +305,36 @@ pub(super) fn load_profiles_for_reload(
     load_read_projection(file_watch, load_all_profiles(file_watch))
 }
 
+#[derive(Default)]
+pub(super) struct ProfileSessionsCache {
+    sessions: std::collections::HashMap<String, crate::session::SessionsFileCache>,
+    supplementary: std::collections::HashMap<
+        (String, ProfileIdentity),
+        Arc<std::sync::Mutex<crate::session::SessionsFileCache>>,
+    >,
+}
+
+impl ProfileSessionsCache {
+    pub(super) fn load(
+        &mut self,
+        file_watch: &Arc<FileWatchService>,
+    ) -> (LoadedInstances, Result<CanonicalMetadata, ReloadFailure>) {
+        let canonical = load_profiles(file_watch, true, Some(self));
+        load_read_projection_cached(file_watch, canonical, Some(self))
+    }
+}
+
 pub(super) fn load_read_projection(
     file_watch: &Arc<FileWatchService>,
     canonical: Result<LoadedProfiles, ReloadFailure>,
+) -> (LoadedInstances, Result<CanonicalMetadata, ReloadFailure>) {
+    load_read_projection_cached(file_watch, canonical, None)
+}
+
+fn load_read_projection_cached(
+    file_watch: &Arc<FileWatchService>,
+    canonical: Result<LoadedProfiles, ReloadFailure>,
+    cache: Option<&mut ProfileSessionsCache>,
 ) -> (LoadedInstances, Result<CanonicalMetadata, ReloadFailure>) {
     match canonical {
         Ok(LoadedProfiles {
@@ -275,7 +342,7 @@ pub(super) fn load_read_projection(
             inventory,
             metadata,
         }) => (
-            load_read_instances(
+            load_read_instances_cached(
                 file_watch,
                 Some(LoadedInstances {
                     instances,
@@ -284,10 +351,14 @@ pub(super) fn load_read_projection(
                         ..Default::default()
                     },
                 }),
+                cache,
             ),
             Ok(metadata),
         ),
-        Err(error) => (load_all_instances(file_watch), Err(error)),
+        Err(error) => (
+            load_read_instances_cached(file_watch, None, cache),
+            Err(error),
+        ),
     }
 }
 
@@ -381,18 +452,19 @@ impl ReloadFailure {
 pub(crate) fn load_all_profiles(
     file_watch: &Arc<FileWatchService>,
 ) -> Result<LoadedProfiles, ReloadFailure> {
-    load_profiles(file_watch, true)
+    load_profiles(file_watch, true, None)
 }
 
 pub(crate) fn load_configuration_profiles(
     file_watch: &Arc<FileWatchService>,
 ) -> Result<LoadedProfiles, ReloadFailure> {
-    load_profiles(file_watch, false)
+    load_profiles(file_watch, false, None)
 }
 
 fn load_profiles(
     file_watch: &Arc<FileWatchService>,
     require_default: bool,
+    mut cache: Option<&mut ProfileSessionsCache>,
 ) -> Result<LoadedProfiles, ReloadFailure> {
     use crate::daemon::{ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth};
     let profiles = crate::session::list_profiles().map_err(|source| ReloadFailure {
@@ -432,6 +504,9 @@ fn load_profiles(
         },
         source,
     })?;
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.sessions.retain(|name, _| profiles.contains(name));
+    }
     let mut all = Vec::new();
     let mut profile_metadata = Vec::with_capacity(profiles.len());
     let mut inventory = Vec::with_capacity(profiles.len());
@@ -446,7 +521,12 @@ fn load_profiles(
                     Err(_) => error,
                 }
             })?;
-            let (instances, groups) = storage.load_complete_with_groups()?;
+            let (instances, groups) = match cache.as_deref_mut() {
+                Some(cache) => storage.load_complete_with_groups_cached(
+                    cache.sessions.entry(profile.clone()).or_default(),
+                )?,
+                None => storage.load_complete_with_groups()?,
+            };
             let (device, inode) = storage.bound_profile_identity()?;
             let details = load_profile_details(&profile)?;
             Ok::<_, anyhow::Error>((
@@ -1533,6 +1613,76 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn cached_reload_refreshes_profiles_and_prunes_removed_stores() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let watch = FileWatchService::noop();
+        let storage = Storage::new_unwatched("main").unwrap();
+        storage.update(|_, _| Ok(())).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = crate::session::get_profile_dir_path("external").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
+        let external = Storage::open_reference("external").unwrap();
+        external
+            .update(|rows, _| {
+                rows.push(Instance::new("before", "/repo"));
+                Ok(())
+            })
+            .unwrap();
+        let mut cache = ProfileSessionsCache::default();
+        let (loaded, metadata) = cache.load(&watch);
+        metadata.unwrap();
+        assert_eq!(loaded.cache.alias_only_instances[0].title, "before");
+        let groups = storage.sessions_path().with_file_name("groups.json");
+        std::fs::write(&groups, b"not json").unwrap();
+        let (_, metadata) = cache.load(&watch);
+        assert!(metadata.is_err());
+        assert_eq!(
+            cache.supplementary.len(),
+            2,
+            "fallback reads listed and alias profiles"
+        );
+        std::fs::write(&groups, b"[]").unwrap();
+        let (_, metadata) = cache.load(&watch);
+        metadata.unwrap();
+        assert_eq!(
+            cache.supplementary.len(),
+            1,
+            "recovery drops duplicate listed rows"
+        );
+
+        external
+            .update(|rows, _| {
+                rows[0].title = "after".into();
+                Ok(())
+            })
+            .unwrap();
+        let (loaded, metadata) = cache.load(&watch);
+        metadata.unwrap();
+        assert_eq!(loaded.cache.alias_only_instances[0].title, "after");
+        assert_eq!(cache.supplementary.len(), 1);
+
+        let added = Storage::new_unwatched("added").unwrap();
+        added
+            .update(|rows, _| {
+                rows.push(Instance::new("new", "/repo"));
+                Ok(())
+            })
+            .unwrap();
+        let (loaded, metadata) = cache.load(&watch);
+        metadata.unwrap();
+        assert!(loaded.instances.iter().any(|row| row.title == "new"));
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(crate::session::get_profile_dir_path("added").unwrap()).unwrap();
+        let (loaded, metadata) = cache.load(&watch);
+        metadata.unwrap();
+        assert!(loaded.instances.is_empty());
+        assert!(loaded.cache.alias_only_instances.is_empty());
+        assert!(cache.supplementary.is_empty());
+        assert_eq!(cache.sessions.len(), 1);
+    }
+
     use super::*;
     use chrono::Utc;
 

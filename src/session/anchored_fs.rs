@@ -42,6 +42,30 @@ pub(crate) struct ResolvedDataFile {
     _source: Option<AnchoredDir>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataFileStamp {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    size: libc::off_t,
+    mode: libc::mode_t,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl DataFileStamp {
+    pub(crate) fn settled_before(&self, read_started: std::time::SystemTime) -> bool {
+        let Ok(elapsed) = read_started.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
+            return false;
+        };
+        // Cover coarse two-second timestamps, including clocks ahead of this read.
+        let cutoff = elapsed.as_nanos() as i128 - 2_000_000_000;
+        let older = |(seconds, nanos): (i64, i64)| {
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanos) < cutoff
+        };
+        older(self.modified) && older(self.changed)
+    }
+}
+
 impl ResolvedDataFile {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let parent = path.parent().context("data file needs a parent")?;
@@ -149,6 +173,32 @@ impl ResolvedDataFile {
         self.parent.sync()?;
         Ok(self.parent.root.join(name))
     }
+    pub(crate) fn stamp(&self) -> Result<Option<DataFileStamp>> {
+        // Opening revalidates network filesystem attributes before considering a hit.
+        let fd = match openat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(error).context("opening resolved data file for stamp"),
+        };
+        let stat = fstat(&fd).context("inspecting opened data file")?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            bail!("resolved data file is not a regular file");
+        }
+        Ok(Some(DataFileStamp {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            size: stat.st_size,
+            mode: stat.st_mode,
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            changed: (stat.st_ctime, stat.st_ctime_nsec),
+        }))
+    }
+
     pub(crate) fn read(&self) -> Result<Option<String>> {
         let fd = match openat(
             &self.parent.fd,
@@ -970,6 +1020,27 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_file_stamp_requires_a_fresh_readable_open() {
+        if nix::unistd::geteuid().is_root() {
+            return; // Root bypasses the permissions exercised below.
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("sessions.json");
+        std::fs::write(&path, b"not parsed by a stamp").unwrap();
+        let resolved = ResolvedDataFile::open(&path).unwrap();
+        assert!(resolved.stamp().unwrap().is_some());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let result = resolved.stamp();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            result.is_err(),
+            "a stat-only lookup bypasses close-to-open revalidation"
+        );
+        assert!(resolved.stamp().unwrap().is_some());
+    }
 
     #[test]
     fn nested_directory_sync_failure_is_retryable() {
