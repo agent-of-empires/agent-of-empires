@@ -169,7 +169,12 @@ impl McpServer {
             return Err(refusal);
         }
         let structured = params.view == View::Structured;
-        let prompt = params.prompt.clone().filter(|p| !p.trim().is_empty());
+        // A terminal prompt is typed into a pane, so it gets what `send` does to keys.
+        let prompt = if structured {
+            params.prompt.clone().filter(|p| !p.trim().is_empty())
+        } else {
+            params.prompt.clone().and_then(terminal_text)
+        };
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
         let initial_turn = if structured { prompt.clone() } else { None };
         // A terminal prompt is typed into the pane, so wait for the agent to start first.
@@ -191,11 +196,15 @@ impl McpServer {
                     }
                     Err(e) => match e.error {
                         SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None),
-                        other => (
-                            false,
-                            PromptDelivery::Failed,
-                            Some(send_keys_message(&other)),
-                        ),
+                        other => {
+                            let refusal = terminal_refusal(&session.id, other).await;
+                            let message = refusal
+                                .structured_content
+                                .as_ref()
+                                .and_then(|c| c["message"].as_str())
+                                .map(str::to_string);
+                            (false, PromptDelivery::Failed, message)
+                        }
                     },
                 }
             }
@@ -237,25 +246,13 @@ impl McpServer {
                 .map_err(|e| prompt_refusal(&id, e))?;
             return Ok(Json(send_outcome(submitted)));
         }
-        let mut message = params.message;
-        crate::server::live_ws::strip_paste_escapes(&mut message);
-        let len = message.trim_end_matches(['\r', '\n']).len();
-        message.truncate(len);
-        if message.trim().is_empty() {
+        let Some(message) = terminal_text(params.message) else {
             return Err(tool_error("invalid_request", "The message is empty"));
+        };
+        if let Err(e) = send_terminal_message(&self.state.session_service, &id, message, true).await
+        {
+            return Err(terminal_refusal(&id, e.error).await);
         }
-        send_terminal_message(&self.state.session_service, &id, message, true)
-            .await
-            .map_err(|e| match e.error {
-                SendKeysError::NotFound | SendKeysError::Gone => not_found(&id),
-                SendKeysError::NotRunning => {
-                    tool_error("not_running", "The terminal session is not running")
-                }
-                SendKeysError::Transient(_) | SendKeysError::Preparation { .. } => {
-                    tool_error("busy", send_keys_message(&e.error))
-                }
-                other => tool_error("send_failed", send_keys_message(&other)),
-            })?;
         self.publish().await;
         Ok(Json(SendOutcome {
             disposition: Disposition::Sent,
@@ -493,16 +490,40 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
     }
 }
 
-fn send_keys_message(error: &SendKeysError) -> String {
+/// Keys typed into a pane, as `POST /send` takes them: paste delimiters stripped so text
+/// can't end the bracketed paste early, trailing line breaks dropped, nothing if empty.
+fn terminal_text(mut text: String) -> Option<String> {
+    crate::server::live_ws::strip_paste_escapes(&mut text);
+    let len = text.trim_end_matches(['\r', '\n']).len();
+    text.truncate(len);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// A refused terminal send as a tool error. A refusal from reviving the session carries the
+/// HTTP response `POST /send` would give, so it maps like any other refusal.
+async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
     match error {
-        SendKeysError::NotFound | SendKeysError::Gone => "The session is gone".into(),
-        SendKeysError::NotRunning => "The terminal session is not running".into(),
-        SendKeysError::Transient(status) => format!("The session is {status:?}; try again"),
-        SendKeysError::StructuredView => "The session no longer has a terminal agent".into(),
-        SendKeysError::Blocked(blocked) => blocked.to_string(),
-        SendKeysError::Preparation { .. } => "The session is busy; try again".into(),
-        SendKeysError::Tmux(e) => format!("tmux: {e:#}"),
-        SendKeysError::Internal => "Internal error".into(),
+        SendKeysError::NotFound | SendKeysError::Gone => not_found(id),
+        SendKeysError::NotRunning => {
+            tool_error("not_running", "The terminal session is not running")
+        }
+        SendKeysError::Transient(status) => {
+            tool_error("busy", format!("The session is {status:?}; try again"))
+        }
+        SendKeysError::Preparation { response, .. } => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(bytes) => refusal(status, &bytes),
+                Err(e) => tool_error("internal", e.to_string()),
+            }
+        }
+        SendKeysError::StructuredView => tool_error(
+            "invalid_request",
+            "The session no longer has a terminal agent",
+        ),
+        SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        SendKeysError::Tmux(e) => tool_error("send_failed", format!("tmux: {e:#}")),
+        SendKeysError::Internal => tool_error("send_failed", "Internal error"),
     }
 }
 
@@ -577,5 +598,76 @@ mod tests {
             .unwrap();
         assert_eq!(content["on_create"], json!(["make setup"]));
         assert!(content.get("trust_hooks").is_none());
+    }
+
+    /// Keys reach a pane as `POST /send` sends them, so a prompt can't close the bracketed
+    /// paste and run the rest as raw keys.
+    #[test]
+    fn terminal_text_strips_paste_delimiters_and_trailing_breaks() {
+        // (input, keys sent)
+        let cases = [
+            ("review the diff\n", Some("review the diff")),
+            ("one\r\ntwo\r\n", Some("one\r\ntwo")),
+            ("first\x1b[201~rm -rf ~\n", Some("firstrm -rf ~")),
+            ("\x1b[200~pasted\x1b[201~", Some("pasted")),
+            ("\n\r\n", None),
+            ("\x1b[200~\x1b[201~", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                terminal_text(input.to_string()).as_deref(),
+                want,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// A refused revive keeps the HTTP refusal's code, so a hook approval reads as one
+    /// instead of "try again"; a full queue is retryable.
+    #[tokio::test]
+    async fn refused_terminal_sends_and_full_queues_map_like_http() {
+        use axum::response::IntoResponse;
+        let preparation = |status: StatusCode, body: axum::response::Response| {
+            let mut response = body;
+            *response.status_mut() = status;
+            SendKeysError::Preparation {
+                response: Box::new(response),
+                detail: json!({}),
+            }
+        };
+        let hooks = axum::Json(json!({
+            "error": "hooks_need_trust", "message": "trust them",
+            "on_create": [], "on_launch": ["npm start"], "on_destroy": [],
+        }))
+        .into_response();
+        // (error, code)
+        let cases = [
+            (
+                preparation(StatusCode::FORBIDDEN, hooks),
+                "hooks_need_trust",
+            ),
+            (
+                preparation(StatusCode::CONFLICT, "resume_failed".into_response()),
+                "invalid_request",
+            ),
+            (
+                preparation(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "lifecycle busy".into_response(),
+                ),
+                "busy",
+            ),
+            (SendKeysError::NotRunning, "not_running"),
+            (SendKeysError::Gone, "not_found"),
+        ];
+        for (error, code) in cases {
+            let result = terminal_refusal("s", error).await;
+            assert_eq!(result.structured_content.unwrap()["code"], code);
+        }
+        let full = prompt_refusal(
+            "s",
+            PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
+        );
+        assert_eq!(full.structured_content.unwrap()["code"], "busy");
     }
 }

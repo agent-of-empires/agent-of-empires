@@ -620,10 +620,14 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
     parent.id = "parent".into();
     parent.source_profile = "test".into();
     parent.group_path = "team".into();
-    test_support::seed_instances_on_disk_for_test("test", vec![parent.clone()]);
+    let mut child = Instance::new("child", "/tmp/aoe-mcp-child");
+    child.id = "child".into();
+    child.source_profile = "test".into();
+    child.parent_session_id = Some("parent".into());
+    test_support::seed_instances_on_disk_for_test("test", vec![parent.clone(), child.clone()]);
     let (launcher, _launches) = test_support::counting_failing_launcher();
     let state = test_support::build_test_app_state_impl(
-        vec![parent],
+        vec![parent, child],
         vecs(&["localhost"]),
         Vec::new(),
         Some(TOKEN.to_string()),
@@ -634,18 +638,35 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
     test_support::refresh_canonical_metadata_for_test(&state).await;
     let app = test_support::build_router_for_test(state.clone());
     let project = tempfile::tempdir().unwrap();
-    let create = |parent_id: &str| {
+    // A repository whose hooks nobody has trusted yet.
+    let hooked = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(hooked.path().join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        hooked.path().join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"make setup\"]\n",
+    )
+    .unwrap();
+    let create = |path: &std::path::Path, parent_id: &str| {
         json!({
-            "path": project.path(), "tool": "claude", "view": "structured",
+            "path": path, "tool": "claude", "view": "structured",
             "title": "worker", "prompt": "review the diff", "parent_session_id": parent_id,
         })
     };
 
-    let refused = call_result(&app, "create_session", create("missing")).await;
-    assert_eq!(error_code(&refused), Some("parent_not_found"), "{refused}");
-    assert_eq!(state.instances.read().await.len(), 1);
+    // (path, parent, code); each refusal writes no row.
+    let refusals = [
+        (project.path(), "missing", "parent_not_found"),
+        (project.path(), "child", "parent_is_sub_session"),
+        // `trust_hooks` isn't in the input, so a model can never approve them itself.
+        (hooked.path(), "parent", "hooks_need_trust"),
+    ];
+    for (path, parent_id, code) in refusals {
+        let refused = call_result(&app, "create_session", create(path, parent_id)).await;
+        assert_eq!(error_code(&refused), Some(code), "{refused}");
+        assert_eq!(state.instances.read().await.len(), 2, "{code}");
+    }
 
-    let created = call(&app, "create_session", create("parent")).await;
+    let created = call(&app, "create_session", create(project.path(), "parent")).await;
     assert_eq!(created["prompt_sent"], true, "{created}");
     assert_eq!(created["prompt_delivery"], "pending_initial_turn");
     let id = created["session"]["id"].as_str().unwrap();
@@ -722,26 +743,36 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     let started = crate::tmux::tmux_command().args(&args).status().unwrap();
     assert!(started.success());
     let _cleanup = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.name());
-    let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let result = call_result(
-                &app,
-                "read_output",
-                json!({"session_id": live_id, "lines": 5}),
-            )
-            .await;
-            let text = result["structuredContent"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if text.contains("pane-says-hello") {
-                return result;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let pane_shows = |needle: &'static str| {
+        let (app, live_id) = (app.clone(), live_id.clone());
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let arguments = json!({"session_id": live_id, "lines": 5});
+                    let result = call_result(&app, "read_output", arguments).await;
+                    let text = result["structuredContent"]["text"].as_str().unwrap_or("");
+                    if text.contains(needle) {
+                        return result;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the pane never showed {needle:?}"))
         }
-    })
-    .await
-    .expect("the pane's output is captured");
+    };
+    let read = pane_shows("pane-says-hello").await;
     assert_eq!(read["structuredContent"]["view"], "terminal");
     assert!(read["structuredContent"].get("next_since").is_none());
+
+    // A shell pane reads as not running, so send once `cat` owns it; the pane echoes the keys.
+    crate::tmux::test_helpers::wait_for_pane_command(
+        &crate::tmux::test_helpers::only_pane_id(pane.name()),
+        "cat",
+    );
+    let arguments = json!({"session_id": live_id, "message": "typed-by-mcp\n"});
+    let sent = call(&app, "send", arguments).await;
+    assert_eq!(sent["disposition"], "sent", "{sent}");
+    assert!(sent.get("seq").is_none(), "{sent}");
+    pane_shows("typed-by-mcp").await;
 }
