@@ -101,7 +101,7 @@ fn is_empty_object(v: &Value) -> bool {
 }
 
 /// What [`apply`] did, so the CLI can print it and the serve path can log it.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyReport {
     /// Settings leaves merged into `config.toml`.
     pub settings_applied: usize,
