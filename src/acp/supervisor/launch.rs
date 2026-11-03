@@ -482,16 +482,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
         });
+        let (target, native) = wrapper_substitution.as_ref().map_or(
+            (req.agent.as_str(), req.agent.as_str()),
+            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+        );
         let claude_config_dir =
             apply_claude_store_pin(&mut host_environment, claude_store_pin.as_ref()).or_else(
                 || {
                     if req.sandbox_info.is_some() {
                         return None;
                     }
-                    let (target, native) = wrapper_substitution.as_ref().map_or(
-                        (req.agent.as_str(), req.agent.as_str()),
-                        |(wrapper, base)| (wrapper.as_str(), base.as_str()),
-                    );
                     apply_declared_config_dir(
                         &mut host_environment,
                         &resolved_cfg,
@@ -511,7 +511,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e:#}")))
         })?;
         let mcp_servers = resolve_mcp_servers(
-            &req.agent,
+            native,
             &req.session_id,
             req.source_profile.clone(),
             req.cwd.clone(),
@@ -1279,7 +1279,7 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
 /// Exports the selected target's declared `agent_config_dir` as its native agent's config-dir
 /// variable, as a terminal launch does. `target` is the selected backend's own key (a wrapper's
 /// name, not its base) and `native` the backend it resolves to. Returns the directory when the
-/// agent is Claude, for native MCP discovery.
+/// agent is Claude or Codex, for native MCP discovery.
 pub(super) fn apply_declared_config_dir(
     environment: &mut Vec<(String, String)>,
     cfg: &crate::session::Config,
@@ -1347,7 +1347,7 @@ pub(super) fn apply_declared_config_dir(
         environment,
         vec![(variable.into(), dir.to_string_lossy().into_owned())],
     );
-    (variable == "CLAUDE_CONFIG_DIR").then_some(dir)
+    matches!(variable, "CLAUDE_CONFIG_DIR" | "CODEX_HOME").then_some(dir)
 }
 
 pub(super) fn apply_claude_store_pin(
@@ -1676,7 +1676,7 @@ time.sleep(60)
                     pair("CLAUDE_CONFIG_DIR", "/hook"),
                     pair("CODEX_HOME", "/acct"),
                 ],
-                None,
+                Some(PathBuf::from("/acct")),
             ),
             (
                 cfg(&[("opencode", "/acct")]),
@@ -1721,7 +1721,7 @@ time.sleep(60)
                     pair("CLAUDE_CONFIG_DIR", "/hook"),
                     pair("CODEX_HOME", "/codex"),
                 ],
-                None,
+                Some(PathBuf::from("/codex")),
             ),
             (
                 cfg(&[("claude", "/acct")]),
@@ -1780,7 +1780,10 @@ time.sleep(60)
             .insert("work-codex".into(), "codex".into());
         assert_eq!(
             into(&explicit, "claude", "work-codex", "work-codex"),
-            (vec![pair("CODEX_HOME", "/work")], None)
+            (
+                vec![pair("CODEX_HOME", "/work")],
+                Some(PathBuf::from("/work"))
+            )
         );
         let mut inherited = cfg(&[
             ("claude", "/acct"),
@@ -1793,7 +1796,22 @@ time.sleep(60)
             .insert("work-codex".into(), "codex".into());
         assert_eq!(
             into(&inherited, "claude", "work-codex", "codex"),
-            (vec![pair("CODEX_HOME", "/work")], None)
+            (
+                vec![pair("CODEX_HOME", "/work")],
+                Some(PathBuf::from("/work"))
+            )
+        );
+        // `~` expands under the launch HOME, not the daemon's.
+        let mut env = vec![pair("HOME", "/accounts/work")];
+        assert_eq!(
+            apply_declared_config_dir(
+                &mut env,
+                &cfg(&[("codex", "~/.codex-work")]),
+                "codex",
+                "codex",
+                "codex"
+            ),
+            Some(PathBuf::from("/accounts/work/.codex-work"))
         );
         // An unrelated wrapper of the tool's own native agent keeps its own key too.
         let mut sibling = cfg(&[("claude", "/acct"), ("claude-d", "/d")]);

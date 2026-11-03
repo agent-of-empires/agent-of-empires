@@ -738,6 +738,10 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
+        let (target, native) = config.wrapper_substitution.as_ref().map_or(
+            (config.agent_key.as_str(), config.agent_key.as_str()),
+            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+        );
         let mut claude_config_dir = None;
         if config.sandbox_info.is_none() {
             let mut host_environment = config.base_host_environment.clone();
@@ -773,10 +777,6 @@ impl<S: BroadcastSink> Drain<S> {
                 apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref())
                     .or_else(|| {
                         let cfg = resolved.as_ref().ok()?;
-                        let (target, native) = config.wrapper_substitution.as_ref().map_or(
-                            (config.agent_key.as_str(), config.agent_key.as_str()),
-                            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
-                        );
                         apply_declared_config_dir(
                             &mut host_environment,
                             cfg,
@@ -789,7 +789,7 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         config.mcp_servers = resolve_mcp_servers(
-            &config.agent_key,
+            native,
             session_id,
             config.source_profile.clone(),
             config.cwd.clone(),
