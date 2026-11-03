@@ -2,8 +2,9 @@
 //! so incoming batches are split into single lines and the replies to their
 //! requests are regrouped into one array line.
 
+use agent_client_protocol::{RawJsonRpcMessage, TransportFrame};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
@@ -15,11 +16,13 @@ struct Batches {
     next: u64,
     /// Request id (as JSON text) to the batch awaiting its reply.
     owner: HashMap<String, u64>,
-    open: HashMap<u64, Open>,
+    /// Oldest first: replies with a null id go to the oldest batch awaiting one.
+    open: BTreeMap<u64, Open>,
 }
 
 struct Open {
-    missing: usize,
+    named: usize,
+    anonymous: usize,
     replies: Vec<Value>,
 }
 
@@ -69,14 +72,42 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     let _ = to_sdk.shutdown().await;
 }
 
+/// What the SDK answers for one batch entry. Entries it cannot attribute to an
+/// id (malformed, non-objects, null-id requests) get an `id: null` error.
+enum Expect {
+    Nothing,
+    Named(String),
+    Anonymous,
+}
+
+fn expected_reply(entry: &Value) -> Expect {
+    let response_only = entry.as_object().is_some_and(|object| {
+        !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error"))
+    });
+    match TransportFrame::parse_json(&entry.to_string()) {
+        TransportFrame::Single(RawJsonRpcMessage::Request(request)) => {
+            match serde_json::to_value(&request.id) {
+                Ok(id) if !id.is_null() => Expect::Named(id.to_string()),
+                _ => Expect::Anonymous,
+            }
+        }
+        TransportFrame::Malformed { .. } if !response_only => Expect::Anonymous,
+        _ => Expect::Nothing,
+    }
+}
+
 fn track_requests(state: &Shared, items: &[Value]) {
-    let ids: Vec<String> = items
-        .iter()
-        .filter(|item| item.get("method").is_some_and(Value::is_string))
-        .filter_map(|item| item.get("id").filter(|id| !id.is_null()))
-        .map(Value::to_string)
-        .collect();
-    if ids.is_empty() {
+    let mut named = Vec::new();
+    let mut anonymous = 0;
+    for item in items {
+        match expected_reply(item) {
+            Expect::Named(id) => named.push(id),
+            Expect::Anonymous => anonymous += 1,
+            Expect::Nothing => {}
+        }
+    }
+    if named.is_empty() && anonymous == 0 {
         return;
     }
     let mut batches = state.lock().expect("batch state poisoned");
@@ -85,11 +116,12 @@ fn track_requests(state: &Shared, items: &[Value]) {
     batches.open.insert(
         batch,
         Open {
-            missing: ids.len(),
+            named: named.len(),
+            anonymous,
             replies: Vec::new(),
         },
     );
-    for id in ids {
+    for id in named {
         batches.owner.insert(id, batch);
     }
 }
@@ -132,20 +164,36 @@ fn claim_reply(state: &Shared, reply: Value) -> Claimed {
     if reply.get("method").is_some() {
         return Claimed::Single;
     }
-    let Some(id) = reply.get("id").map(Value::to_string) else {
-        return Claimed::Single;
-    };
     let mut batches = state.lock().expect("batch state poisoned");
-    let Some(batch) = batches.owner.remove(&id) else {
-        return Claimed::Single;
+    let batch = match reply.get("id") {
+        None => return Claimed::Single,
+        // ponytail: a null-id reply to a non-batch line sent while a batch
+        // awaits one can be grouped into that batch.
+        Some(id) if id.is_null() => {
+            let Some((&batch, _)) = batches.open.iter().find(|(_, open)| open.anonymous > 0) else {
+                return Claimed::Single;
+            };
+            batches.open.get_mut(&batch).expect("found").anonymous -= 1;
+            batch
+        }
+        Some(id) => {
+            let Some(batch) = batches.owner.remove(&id.to_string()) else {
+                return Claimed::Single;
+            };
+            batches
+                .open
+                .get_mut(&batch)
+                .expect("owned batch is open")
+                .named -= 1;
+            batch
+        }
     };
-    let open = batches.open.get_mut(&batch).expect("owned batch is open");
+    let open = batches.open.get_mut(&batch).expect("claimed batch is open");
     open.replies.push(reply);
-    open.missing -= 1;
-    if open.missing > 0 {
+    if open.named + open.anonymous > 0 {
         return Claimed::Held;
     }
-    let done = batches.open.remove(&batch).expect("owned batch is open");
+    let done = batches.open.remove(&batch).expect("claimed batch is open");
     Claimed::Complete(done.replies)
 }
 
@@ -208,6 +256,47 @@ mod tests {
             .map(|r| r["id"].clone())
             .collect();
         assert_eq!(ids, [serde_json::json!("x"), serde_json::json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_null_id_entries_are_answered_inside_the_batch_reply() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, agent_side_in) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(wrap(agent_out, agent_in));
+        let batch = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "x/unknown"},
+            {"jsonrpc": "2.0", "id": 2, "method": "x/unknown", "result": 1},
+            {"jsonrpc": "2.0", "id": null, "method": "x/unknown"},
+            5,
+            {"jsonrpc": "2.0", "method": "x/notification"},
+            {"jsonrpc": "2.0", "id": 3, "result": 1},
+        ]);
+        let agent = async move {
+            agent_side_out
+                .write_all(format!("{batch}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut replies = BufReader::new(agent_side_in).lines();
+            let reply = read_value(&mut replies).await;
+            let entries = reply.as_array().expect("one array reply");
+            // Request 1, the malformed entry, the null-id request and `5`.
+            assert_eq!(entries.len(), 4, "{reply}");
+            assert_eq!(entries[0..1].iter().filter(|e| e["id"] == 1).count(), 1);
+            assert_eq!(entries.iter().filter(|e| e["id"].is_null()).count(), 3);
+        };
+        let client = Client.v1().connect_with(
+            ByteStreams::new(write.compat_write(), read.compat()),
+            async |_cx| {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok(())
+            },
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, agent)
+        })
+        .await
+        .expect("the batch is answered");
+        result.unwrap();
     }
 
     #[tokio::test]
