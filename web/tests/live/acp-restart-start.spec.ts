@@ -29,7 +29,7 @@ test("Restart on the startup line replaces a start stuck in session/new", async 
   const wizard = page.getByTestId("session-wizard");
   await wizard.getByRole("button", { name: "Scratch", exact: true }).click();
   await wizard.getByRole("button", { name: "Use a scratch folder" }).click();
-  await expect(wizard.getByRole("switch", { name: "Use structured view" })).toBeChecked({ timeout: 10_000 });
+  await expect(wizard.getByRole("radio", { name: "Structured view" })).toBeChecked({ timeout: 10_000 });
   await wizard.getByRole("button", { name: /Launch session/ }).click();
   const [session] = await waitForSessions(serve.baseUrl);
 
