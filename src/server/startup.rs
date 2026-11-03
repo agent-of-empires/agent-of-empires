@@ -327,11 +327,18 @@ fn watch_termination_signals() -> CancellationToken {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        let mut sighup = signal(SignalKind::hangup()).ok();
+        let register = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .inspect_err(|error| {
+                    tracing::warn!(target: "serve.shutdown", signal = name, %error, "could not register signal handler");
+                })
+                .ok()
+        };
+        let mut sigterm = register(SignalKind::terminate(), "SIGTERM");
+        let mut sighup = register(SignalKind::hangup(), "SIGHUP");
         tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = async { if tokio::signal::ctrl_c().await.is_err() { std::future::pending().await } } => {
                     tracing::info!(target: "serve.shutdown", signal = "SIGINT", "received signal, shutting down");
                 }
                 _ = async { match sigterm { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
@@ -346,7 +353,9 @@ fn watch_termination_signals() -> CancellationToken {
     }
     #[cfg(not(unix))]
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
         tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         cancel.cancel();
     });
