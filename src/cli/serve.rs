@@ -1890,8 +1890,7 @@ async fn start_daemon(
     )
     .await;
     if let Err(error) = ready {
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_unready_daemon(&mut child).await;
         return Err(error);
     }
 
@@ -1930,6 +1929,27 @@ async fn await_daemon_ready<'a>(
             started.elapsed().as_secs()
         ))
     })
+}
+
+/// Longer than the Tailscale Funnel reset's 3 s bound, so a start in flight can undo itself.
+const UNREADY_DAEMON_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// SIGTERM, then SIGKILL after the grace. `child` is unreaped, so its pid cannot be reused.
+async fn stop_unready_daemon(child: &mut std::process::Child) {
+    stop_child_within(child, UNREADY_DAEMON_GRACE).await;
+}
+
+async fn stop_child_within(child: &mut std::process::Child, grace: std::time::Duration) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let deadline = tokio::time::Instant::now() + grace;
+    while !matches!(child.try_wait(), Ok(Some(_))) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 async fn migrate_managed_launch(
@@ -2246,6 +2266,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn an_unready_daemon_is_stopped_within_the_grace() {
+        // The ready file is touched once the shell has installed its trap.
+        for (trap, kill_expected) in [("exit 0", false), ("", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "trap '{trap}' TERM; touch '{}'; while :; do sleep 0.05; done",
+                    ready.display()
+                ))
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(std::time::Instant::now() < deadline, "shell never started");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let grace = std::time::Duration::from_millis(500);
+            let started = std::time::Instant::now();
+            stop_child_within(&mut child, grace).await;
+            let elapsed = started.elapsed();
+            assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+            if kill_expected {
+                assert!(elapsed >= grace, "{elapsed:?}");
+            } else {
+                assert!(elapsed < grace, "{elapsed:?}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cityhall_refusal_cannot_reflect_the_bearer_into_errors() {
