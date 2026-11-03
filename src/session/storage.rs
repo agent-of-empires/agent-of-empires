@@ -1222,6 +1222,20 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
     }
 }
 
+/// Cached disk rows; callers apply live status only to the returned clones.
+#[derive(Default)]
+pub(crate) struct SessionsFileCache {
+    entry: Option<(
+        Option<super::anchored_fs::DataFileStamp>,
+        bool,
+        Vec<Instance>,
+    )>,
+    #[cfg(test)]
+    reads: usize,
+    #[cfg(test)]
+    read_time: Option<std::time::SystemTime>,
+}
+
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
@@ -2037,6 +2051,58 @@ impl Storage {
         self.load_instances(ReadPolicy::ReadOnly)
     }
 
+    pub(crate) fn load_instances_readonly_cached(
+        &self,
+        cache: &mut SessionsFileCache,
+    ) -> Result<Vec<Instance>> {
+        let files = self
+            .files
+            .as_deref()
+            .context("profile store is not bound")?;
+        self.load_cached_instances(files, ReadPolicy::ReadOnly, cache)
+    }
+
+    fn load_cached_instances(
+        &self,
+        files: &ProfileFiles,
+        policy: ReadPolicy<'_>,
+        cache: &mut SessionsFileCache,
+    ) -> Result<Vec<Instance>> {
+        let read_started = std::time::SystemTime::now();
+        #[cfg(test)]
+        let read_started = cache.read_time.unwrap_or(read_started);
+        let stamp = files
+            .sessions
+            .stamp()
+            .with_context(|| crate::session::LoadSource(self.sessions_path.clone()))?;
+        let complete = matches!(policy, ReadPolicy::Complete(_));
+        let instances = match &cache.entry {
+            Some((previous, strict, rows)) if *previous == stamp && *strict == complete => {
+                rows.clone()
+            }
+            _ => {
+                cache.entry = None;
+                #[cfg(test)]
+                {
+                    cache.reads += 1;
+                }
+                let rows = self.load_instances(policy)?;
+                if files
+                    .sessions
+                    .stamp()
+                    .with_context(|| crate::session::LoadSource(self.sessions_path.clone()))?
+                    == stamp
+                    // Do not cache racy timestamps: equal-size rewrites can share a tick.
+                    && stamp.as_ref().is_none_or(|stamp| stamp.settled_before(read_started))
+                {
+                    cache.entry = Some((stamp, complete, rows.clone()));
+                }
+                rows
+            }
+        };
+        Ok(instances)
+    }
+
     /// Read group metadata without reading sessions or writing quarantine files.
     pub fn load_groups_readonly(&self) -> Result<Vec<Group>> {
         self.load_rows(
@@ -2203,6 +2269,20 @@ impl Storage {
     }
 
     pub(crate) fn load_complete_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
+        self.load_complete_with_groups_inner(None)
+    }
+
+    pub(crate) fn load_complete_with_groups_cached(
+        &self,
+        cache: &mut SessionsFileCache,
+    ) -> Result<(Vec<Instance>, Vec<Group>)> {
+        self.load_complete_with_groups_inner(Some(cache))
+    }
+
+    fn load_complete_with_groups_inner(
+        &self,
+        cache: Option<&mut SessionsFileCache>,
+    ) -> Result<(Vec<Instance>, Vec<Group>)> {
         let opened;
         let files = match self.files.as_deref() {
             Some(files) => files,
@@ -2215,9 +2295,20 @@ impl Storage {
             .directory
             .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
         let _flock = acquire_open_storage_shared_flock(file, &path)?;
-        let bundle = self.load_bundle(ReadPolicy::Complete(files))?;
+        let instances = match cache {
+            Some(cache) => self.load_cached_instances(files, ReadPolicy::Complete(files), cache)?,
+            None => self.load_instances(ReadPolicy::Complete(files))?,
+        };
+        let groups = self.load_rows(
+            &self.sessions_path.with_file_name("groups.json"),
+            ReadPolicy::Complete(files),
+            "group",
+            Some(&files.groups),
+            |_| Ok(()),
+            |_| Ok(()),
+        )?;
         files.verify_current(&self.sessions_path)?;
-        Ok(bundle)
+        Ok((instances, groups))
     }
 
     /// Read every session row without taking the storage flock, failing on any
@@ -4077,6 +4168,155 @@ fn reconcile_groups_after_repair(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn sessions_file_cache_rereads_recent_timestamps_until_they_are_safe() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("racy")?;
+        storage.update(|rows, _| {
+            rows.push(Instance::new("first", "/repo"));
+            Ok(())
+        })?;
+        // A read in the same timestamp tick must never establish a cache hit.
+        let mut cache = SessionsFileCache {
+            read_time: Some(fs::metadata(storage.sessions_path())?.modified()?),
+            ..Default::default()
+        };
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(
+            cache.reads, 2,
+            "coarse timestamps can hide another same-size rewrite"
+        );
+        assert!(cache.entry.is_none());
+        let now = std::time::SystemTime::now();
+        let file = fs::File::options()
+            .write(true)
+            .open(storage.sessions_path())?;
+        // An old ctime alone is insufficient when mtime is in the future.
+        file.set_times(
+            fs::FileTimes::new().set_modified(now + std::time::Duration::from_secs(60)),
+        )?;
+        cache.read_time = Some(now + std::time::Duration::from_secs(3));
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(cache.reads, 4);
+        // An old mtime alone is insufficient when ctime is recent.
+        file.set_times(
+            fs::FileTimes::new().set_modified(now - std::time::Duration::from_secs(60)),
+        )?;
+        cache.read_time = Some(std::time::SystemTime::now());
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(cache.reads, 6);
+        // Advance the read clock, rather than sleeping on filesystem granularity.
+        cache.read_time = Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3));
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(cache.reads, 7, "settled files can skip reads and parsing");
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sessions_file_cache_reuses_rows_and_detects_edits_replacements_and_removal() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("cached")?;
+        let mut cache = SessionsFileCache {
+            read_time: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)?
+            .0
+            .is_empty());
+        assert_eq!(cache.reads, 1);
+        storage.update(|rows, _| {
+            rows.push(Instance::new("first", "/repo"));
+            Ok(())
+        })?;
+        let (rows, _) = storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(rows[0].title, "first");
+        assert_eq!(cache.reads, 2);
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(
+            cache.reads, 2,
+            "unchanged ticks must not read session contents"
+        );
+
+        let path = storage.sessions_path();
+        let mtime = fs::metadata(path)?.modified()?;
+        let mut edited = rows;
+        edited[0].title = "other".into();
+        let bytes = serde_json::to_vec_pretty(&edited)?;
+        fs::write(path, &bytes)?;
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_times(fs::FileTimes::new().set_modified(mtime))?;
+        assert_eq!(
+            storage.load_complete_with_groups_cached(&mut cache)?.0[0].title,
+            "other"
+        );
+        assert_eq!(cache.reads, 3, "ctime detects an edit with restored mtime");
+
+        edited[0].title = "third".into();
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, serde_json::to_vec_pretty(&edited)?)?;
+        fs::File::options()
+            .write(true)
+            .open(&replacement)?
+            .set_times(fs::FileTimes::new().set_modified(mtime))?;
+        fs::rename(replacement, path)?;
+        assert_eq!(
+            storage.load_complete_with_groups_cached(&mut cache)?.0[0].title,
+            "third"
+        );
+        assert_eq!(
+            cache.reads, 4,
+            "atomic replacements invalidate equal-size, equal-mtime rows"
+        );
+
+        fs::write(
+            path.with_file_name("groups.json"),
+            serde_json::to_vec(&vec![Group::new("fresh", "fresh")])?,
+        )?;
+        let (_, groups) = storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(groups[0].name, "fresh");
+        assert_eq!(
+            cache.reads, 4,
+            "groups refresh independently of session rows"
+        );
+        fs::remove_file(path)?;
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)?
+            .0
+            .is_empty());
+        assert_eq!(cache.reads, 5);
+        fs::write(path, b"not json")?;
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)
+            .is_err());
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)
+            .is_err());
+        assert_eq!(cache.reads, 7, "failed reads are retried");
+        fs::write(path, b"[]")?;
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)?
+            .0
+            .is_empty());
+        assert_eq!(cache.reads, 8);
+        fs::write(path, br#"[{"invalid":"row"}]"#)?;
+        let bound = Storage::open_unwatched("cached")?;
+        assert!(bound.load_instances_readonly_cached(&mut cache)?.is_empty());
+        assert!(
+            bound.load_complete_with_groups_cached(&mut cache).is_err(),
+            "a best-effort read must not bypass strict validation"
+        );
+        Ok(())
+    }
+
     use super::*;
     use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
     use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};

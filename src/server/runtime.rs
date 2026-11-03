@@ -691,6 +691,76 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cached_status_poll_publishes_disk_change_on_the_next_tick() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let mut row = crate::session::Instance::new("before", "/repo");
+        row.source_profile = "test".into();
+        row.status = crate::session::Status::Stopped;
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(Arc::default());
+        let mut snapshots = state.runtime.snapshots.subscribe();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut polling = Box::pin(super::super::status_poll::status_poll_loop_observed(
+            state.clone(),
+            health_rx,
+            Some(completed_tx),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut polling => panic!("poll loop stopped"),
+                result = completed_rx.recv() => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshots
+                .borrow_and_update()
+                .as_ref()
+                .unwrap()
+                .value
+                .contents
+                .sessions[0]
+                .title,
+            "before"
+        );
+        storage
+            .update(|rows, _| {
+                rows[0].title = "after".into();
+                rows[0].status = crate::session::Status::Creating;
+                Ok(())
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut polling => panic!("poll loop stopped"),
+                result = completed_rx.recv() => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "exactly one tick ran after the write"
+        );
+        let snapshot = snapshots.borrow_and_update().clone().unwrap();
+        let published = &snapshot.value.contents.sessions[0];
+        assert_eq!(published.title, "after");
+        assert_eq!(published.status, "Creating");
+        state.shutdown.cancel();
+        polling.await;
+    }
+
     use super::*;
 
     #[cfg(unix)]
