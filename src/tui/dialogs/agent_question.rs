@@ -280,11 +280,26 @@ impl AgentQuestionDialog {
         }
         let custom_focused = self.editing_custom || q.options.is_empty();
         let custom_line = lines.len();
-        lines.push(Line::from(format!(
-            "{} Custom answer (press c): {}",
-            if custom_focused { ">" } else { " " },
-            self.custom[self.question].value()
-        )));
+        let custom = &self.custom[self.question];
+        if self.editing_custom {
+            let byte = custom
+                .value()
+                .char_indices()
+                .nth(custom.cursor())
+                .map_or(custom.value().len(), |(index, _)| index);
+            let (before, after) = custom.value().split_at(byte);
+            lines.push(Line::from(vec![
+                Span::raw(format!("> Custom answer (press c): {before}")),
+                Span::styled("|", Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(after.to_owned()),
+            ]));
+        } else {
+            lines.push(Line::from(format!(
+                "{} Custom answer (press c): {}",
+                if custom_focused { ">" } else { " " },
+                custom.value()
+            )));
+        }
         let focus_line = if custom_focused {
             custom_line
         } else {
@@ -315,23 +330,41 @@ impl AgentQuestionDialog {
         self.scroll_max[self.question] = max_scroll;
         let focus_start = row_starts[focus_line];
         let focus_end = row_starts[focus_line + 1];
+        let cursor_row = if self.editing_custom && visible_height > 0 {
+            let height = row_counts[custom_line].min(u16::MAX as usize) as u16;
+            let area = Rect::new(0, 0, content.width.max(1), height);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            Paragraph::new(lines[custom_line].clone())
+                .wrap(Wrap { trim: true })
+                .render(area, &mut buffer);
+            buffer
+                .content()
+                .iter()
+                .position(|cell| cell.modifier.contains(Modifier::REVERSED))
+                .map(|index| row_starts[custom_line] + index / area.width as usize)
+        } else {
+            None
+        };
         let mut scroll = self.scroll_offsets[self.question].min(max_scroll);
         if visible_height > 0 && self.follow_focus {
-            if focus_start < scroll {
-                scroll = focus_start;
+            let visible_start = cursor_row.unwrap_or(focus_start);
+            let visible_end = cursor_row.map_or(focus_end, |row| row + 1);
+            if visible_start < scroll {
+                scroll = visible_start;
             }
-            if focus_end > scroll.saturating_add(visible_height) {
-                scroll = if focus_end - focus_start > visible_height {
-                    focus_start
+            if visible_end > scroll.saturating_add(visible_height) {
+                scroll = if visible_end - visible_start > visible_height {
+                    visible_start
                 } else {
-                    focus_end.saturating_sub(visible_height)
+                    visible_end.saturating_sub(visible_height)
                 };
             }
         }
         self.scroll_offsets[self.question] = scroll;
+        let visible_focus = cursor_row.unwrap_or(focus_start);
         self.focus_visible = visible_height > 0
-            && focus_start >= scroll
-            && focus_start < scroll.saturating_add(visible_height);
+            && visible_focus >= scroll
+            && visible_focus < scroll.saturating_add(visible_height);
         self.follow_focus = false;
 
         if visible_height > 0 {
@@ -598,6 +631,24 @@ mod tests {
         let custom = format!("{}custom-answer-tail", "custom answer ".repeat(20));
         dialog.handle_paste(&custom);
         assert!(render(&mut dialog).contains("custom-answer-tail"));
+
+        let custom = format!("{}tail-marker", "a".repeat(1500));
+        dialog.custom[0] = Input::default();
+        dialog.handle_paste(&custom);
+        assert!(render(&mut dialog).contains("tail-marker"));
+        let end_scroll = dialog.scroll_offsets[0];
+        dialog.handle_key(key(KeyCode::Home));
+        let start = render(&mut dialog);
+        assert!(start.contains(&"a".repeat(20)));
+        assert!(dialog.scroll_offsets[0] < end_scroll);
+        dialog.handle_key(key(KeyCode::End));
+        dialog.handle_paste("Z");
+        assert!(render(&mut dialog).contains("tail-markerZ"));
+        dialog.handle_paste(" word");
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Left));
+        }
+        assert!(render(&mut dialog).contains("|word"));
     }
     #[test]
     fn selection_requires_the_focused_option_to_be_visible() {
@@ -669,5 +720,17 @@ mod tests {
                     if answers[0].selected_options == ["option-00"]
             ));
         }
+
+        let mut long_question = prompt(false);
+        if let AgentIntegrationPrompt::Question { questions, .. } = &mut long_question {
+            questions[0].question = format!("{}x", "\u{00a0}".repeat(1500));
+        }
+        let mut dialog = AgentQuestionDialog::new(long_question);
+        let visible = render(&mut dialog);
+        assert!(visible.contains("option-00"));
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(answers) if answers[0].selected_options == ["option-00"]
+        ));
     }
 }

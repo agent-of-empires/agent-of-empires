@@ -196,7 +196,9 @@ pub(crate) fn wrapped_line_count(line: &ratatui::text::Line, width: u16) -> usiz
         if symbol_width > max || grapheme.contains(char::is_control) {
             continue;
         }
-        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let is_whitespace =
+            ratatui::text::StyledGrapheme::new(grapheme, ratatui::style::Style::default())
+                .is_whitespace();
         let word_found = non_whitespace_previous && is_whitespace;
         // Current word would overflow after removing whitespace.
         let trimmed_overflow = pending_line_width == 0 && word_width + symbol_width > max;
@@ -298,6 +300,8 @@ mod tests {
             // Control characters (e.g. tab) are dropped before wrapping, the
             // way Span::styled_graphemes filters them.
             (Line::from("a\tb"), 4, 1),
+            (Line::from(format!("a{}x", "\u{00a0}".repeat(10))), 4, 3),
+            (Line::from("ab\u{200b}cd"), 3, 2),
         ];
         for (line, width, expected) in cases {
             assert_eq!(wrapped_line_count(&line, width), expected, "{line:?}");
