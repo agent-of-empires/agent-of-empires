@@ -304,6 +304,7 @@ pub(crate) fn remove_confirmed_worktrees(
     orphans: &[WorktreeEntry],
     purging: &HashSet<PathBuf>,
 ) -> Result<usize> {
+    let _transition = crate::session::StorageTransition::acquire()?;
     let storages = crate::session::list_profiles()?
         .iter()
         .map(|profile| Storage::open_unwatched(profile))
@@ -594,6 +595,59 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(paths[0].exists() && paths[1].exists());
         assert!(!paths[2].exists());
+    }
+
+    /// A profile created while cleanup enumerates profiles must be read too, so cleanup holds the
+    /// catalogue lock from before the listing: profile creation waits for it.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_waits_for_a_profile_catalogue_transition() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git_wt = GitWorktree::new(repo.clone()).unwrap();
+        let path = tmp.path().join("wt");
+        git_wt.create_worktree("wt", &path, true, None).unwrap();
+        let path = path.canonicalize().unwrap();
+        let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
+        let purging = purging_paths(&orphans);
+        Storage::new_unwatched("main").unwrap();
+
+        let transition = crate::session::StorageTransition::acquire_exclusive(
+            &crate::session::get_app_dir().unwrap(),
+        )
+        .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            let removed = remove_confirmed_worktrees(&git_wt, &orphans, &purging);
+            done_tx.send(()).unwrap();
+            removed
+        });
+        // The profile appears while cleanup would be enumerating, before it could read the new row.
+        let late = crate::session::get_app_dir().unwrap().join("profiles/late");
+        std::fs::create_dir_all(&late).unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "cleanup ran while the profile catalogue was changing"
+        );
+        assert!(path.exists());
+
+        drop(transition);
+        assert_eq!(cleanup.join().unwrap().unwrap(), 1);
     }
 
     #[test]
