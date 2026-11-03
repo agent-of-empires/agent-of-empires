@@ -151,6 +151,7 @@ fn admit_batch(state: &Shared, items: Vec<Value>) -> (Vec<String>, Option<Value>
     let mut batches = state.lock().expect("batch state poisoned");
     let mut forward = Vec::new();
     let mut named = Vec::new();
+    let mut seen = HashSet::new();
     let mut anonymous = 0;
     let mut refused = Vec::new();
     for item in items {
@@ -158,7 +159,7 @@ fn admit_batch(state: &Shared, items: Vec<Value>) -> (Vec<String>, Option<Value>
             Expect::Named(id) => {
                 let taken = batches.owner.contains_key(&id)
                     || batches.standalone.contains(&id)
-                    || named.contains(&id);
+                    || !seen.insert(id.clone());
                 if taken {
                     refused.push(duplicate_id_error(&id));
                     continue;
