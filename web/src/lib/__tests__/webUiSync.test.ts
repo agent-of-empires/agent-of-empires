@@ -8,7 +8,7 @@ vi.mock("../api", () => ({
   patchWebUiState: (...args: unknown[]) => patchWebUiState(...args),
 }));
 
-import { hydrateWebUiStateFromServer, isSyncedKey } from "../webUiSync";
+import { hydrateWebUiStateFromServer, initWebUiSync, isSyncedKey } from "../webUiSync";
 import { configureStorageSync, safeRemoveItem, safeSetItem } from "../safeStorage";
 import { STATUS_COLLAPSE_PREFIX } from "../../hooks/useStatusGroups";
 
@@ -117,5 +117,20 @@ describe("hydrateWebUiStateFromServer", () => {
 
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("repo");
     expect(patchWebUiState).not.toHaveBeenCalled();
+  });
+});
+
+// Last in the file: `initWebUiSync` is one-shot per module, so this is the only case that arms it.
+describe("status collapse sync write", () => {
+  it("sends a status-collapse write to the server after the debounce", () => {
+    vi.useFakeTimers();
+    try {
+      initWebUiSync();
+      safeSetItem(`${STATUS_COLLAPSE_PREFIX}status:Waiting`, "1");
+      vi.advanceTimersByTime(400);
+      expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-status-collapsed-status:Waiting": "1" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
