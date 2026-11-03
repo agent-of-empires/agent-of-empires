@@ -4,6 +4,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Locator, Page } from "@playwright/test";
 import { installSidebarMocks, type MockSessionInput } from "./helpers/sidebarMocks";
+import { sessionResponse } from "./helpers/sessions";
 
 const HEADER = "[data-testid='sidebar-group-header']";
 const ROW = "[data-testid='sidebar-session-row']";
@@ -278,32 +279,117 @@ test.describe("sidebar status axis (#4867)", () => {
     await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
   });
 
-  test("the picker opens from the keyboard and its options are one Tab each", async ({ page }) => {
+  test("the picker follows the menu-button pattern: focus on open, arrows, Escape and Tab-out", async ({ page }) => {
     await installSidebarMocks(page, { sessions: statusSessions() });
     await gotoDesktop(page);
 
     const axisToggle = page.locator(AXIS_TOGGLE);
+    const menu = page.getByTestId("sidebar-axis-menu");
+    const option = (target: string) => page.getByTestId(`sidebar-axis-option-${target}`);
     await axisToggle.focus();
     await page.keyboard.press("Enter");
 
-    const menu = page.getByTestId("sidebar-axis-menu");
     await expect(menu).toBeVisible();
     // Same single-select menu semantics as the sort picker beside it.
     await expect(menu).toHaveAttribute("role", "menu");
-    await expect(page.getByTestId("sidebar-axis-option-repo")).toHaveAttribute("role", "menuitemradio");
+    await expect(option("repo")).toHaveAttribute("role", "menuitemradio");
+    // Focus enters on the checked option, and the menu owns the arrows, so options are not Tab stops.
+    await expect(option("repo")).toBeFocused();
+    await expect(option("repo")).toHaveAttribute("tabindex", "-1");
 
-    // Options follow the trigger in the tab order, in the order they render.
-    for (const target of ["repo", "org", "group", "repo+group", "status"]) {
-      await page.keyboard.press("Tab");
-      await expect(page.getByTestId(`sidebar-axis-option-${target}`)).toBeFocused();
-    }
+    await page.keyboard.press("ArrowDown");
+    await expect(option("org")).toBeFocused();
+    await page.keyboard.press("End");
+    await expect(option("status")).toBeFocused();
+    // Both ends wrap.
+    await page.keyboard.press("ArrowDown");
+    await expect(option("repo")).toBeFocused();
+    await page.keyboard.press("ArrowUp");
+    await expect(option("status")).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(option("repo")).toBeFocused();
 
+    // Escape closes without picking and hands the focus back to the trigger.
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(axisToggle).toBeFocused();
+    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
+
+    // Enter on an arrowed-to option commits it, and the trigger keeps the focus.
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
     await expect(menu).toBeHidden();
-    await expect(axisToggle).toHaveAttribute("data-axis", "status");
-    await expect(page.getByTestId("sidebar-axis-heading")).toHaveText("Status");
-    // The picked option unmounted; focus is back on the trigger, not <body>.
+    await expect(axisToggle).toHaveAttribute("data-axis", "org");
     await expect(axisToggle).toBeFocused();
+
+    // Tabbing out closes the menu instead of walking its options.
+    await page.keyboard.press("Enter");
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(menu).toBeHidden();
+  });
+
+  test("bulk archive targets each selected row's own session when one workspace straddles two buckets", async ({
+    page,
+  }) => {
+    // One workspace with a Waiting and a Running session: the status axis renders it twice, and the
+    // Waiting bucket sorts first, so the workspace id alone resolves to the Waiting session.
+    const sessions: MockSessionInput[] = [
+      {
+        id: "s-wait",
+        title: "wait-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Waiting" },
+      },
+      {
+        id: "s-run",
+        title: "run-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Running" },
+      },
+      {
+        id: "s-other",
+        title: "other-session",
+        project_path: "/tmp/other",
+        branch: "feat/other",
+        fields: { status: "Running" },
+      },
+    ];
+    const archived: string[] = [];
+    await installSidebarMocks(page, { sessions });
+    await page.route("**/api/sessions/*/archive", async (route) => {
+      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
+      const input = sessions.find((s) => s.id === id);
+      archived.push(id);
+      await route.fulfill({
+        json: sessionResponse({
+          id,
+          title: input?.title,
+          project_path: input?.project_path,
+          branch: input?.branch,
+          group_path: input?.group ?? "",
+          ...input?.fields,
+        }),
+      });
+    });
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
+
+    await expect(page.getByText("wait-session")).toBeVisible();
+    // Cmd rather than Ctrl: Chromium on macOS reads Ctrl+click as a secondary click.
+    const [runRow, otherRow] = ["run-session", "other-session"].map((title) =>
+      page.locator(ROW).filter({ hasText: title }),
+    );
+    await runRow!.click({ modifiers: ["Meta"] });
+    await otherRow!.click({ modifiers: ["Meta"] });
+    await otherRow!.click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-bulk-archive").click();
+
+    await expect.poll(() => archived.length).toBe(2);
+    expect([...archived].sort()).toEqual(["s-other", "s-run"]);
   });
 });
 

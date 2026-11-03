@@ -167,7 +167,6 @@ export function FlatGroupList({
               {live.map((v) => (
                 <SortableSessionRow
                   key={v.key}
-                  rowKey={v.key}
                   {...ctx.rowProps(v)}
                   onCreateSession={ctx.onCreateSession}
                   // Pinned rows float to the top of their group, so dragging them is meaningless.

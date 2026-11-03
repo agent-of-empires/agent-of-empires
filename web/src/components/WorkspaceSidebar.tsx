@@ -145,12 +145,34 @@ export function WorkspaceSidebar(props: Props) {
 
   const allWorkspaces = useMemo(() => uniqueWorkspaces(groups), [groups]);
   const triage = useSidebarTriage(allWorkspaces);
-  const orderedIds = useMemo(
-    () => renderedOrder(filteredGroups, hasFilter, sunkExpanded),
-    [filteredGroups, hasFilter, sunkExpanded],
-  );
+  // Rows, not workspaces: the status axis renders a workspace once per bucket, and each row's
+  // actions belong to its own session. Filtering keeps the selection, so ranges use `filtered`.
+  const [orderedIds, rows] = useMemo(() => {
+    const rendered = isNested
+      ? filteredNested.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? filteredOrgGroups.flatMap((og) => og.repos)
+        : filteredGroups;
+    const every = isNested
+      ? nestedGroups.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? orgGroups.flatMap((og) => og.repos)
+        : groups;
+    return [renderedOrder(rendered, hasFilter, sunkExpanded), every.flatMap((g) => g.workspaces)] as const;
+  }, [
+    isNested,
+    isOrgAxis,
+    groups,
+    nestedGroups,
+    orgGroups,
+    filteredGroups,
+    filteredNested,
+    filteredOrgGroups,
+    hasFilter,
+    sunkExpanded,
+  ]);
   const selection = useSidebarSelection({
-    allWorkspaces,
+    rows,
     orderedIds,
     triage,
     readOnly,
@@ -184,12 +206,13 @@ export function WorkspaceSidebar(props: Props) {
     onEditProjectSettings: props.onEditProjectSettings,
     onArchiveGroup,
     rowProps: (v: SidebarWorkspaceView) => ({
+      rowKey: v.key,
       workspace: v.workspace,
       observedById: props.observedById,
       runtimeEpoch: props.runtimeEpoch,
       onSessionMutation: props.onSessionMutation,
       isActive: v.workspace.id === selection.displayedActiveId,
-      isSelected: selection.isSelected(v.workspace.id),
+      isSelected: selection.isSelected(v.key),
       onActivate: selection.handleRowActivate,
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,

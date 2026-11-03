@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import type { SidebarWorkspaceView } from "../../lib/sidebarGroups";
 import type { Workspace } from "../../lib/types";
 import { EMPTY_SELECTION, classifyClick, selectionReducer } from "../../lib/sidebarSelection";
 import { bucketSelectionForBulk, summarizeBulkResults } from "../../lib/sidebarBulk";
@@ -10,14 +11,14 @@ type Triage = ReturnType<typeof useSidebarTriage>;
 
 /** Ephemeral multi-select, bulk triage, and click routing (navigate, toggle, or range) for sidebar rows. */
 export function useSidebarSelection({
-  allWorkspaces,
+  rows,
   orderedIds,
   triage,
   readOnly,
   activeId,
   onSelect,
 }: {
-  allWorkspaces: Workspace[];
+  rows: readonly SidebarWorkspaceView[];
   orderedIds: string[];
   triage: Triage;
   readOnly?: boolean;
@@ -30,16 +31,19 @@ export function useSidebarSelection({
   if (optimisticActive && optimisticActive.fromActiveId !== activeId) setOptimisticActive(null);
   const displayedActiveId = optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
 
-  // Prune only vanished workspaces; collapsing or filtering keeps the selection.
-  const existingIds = useMemo(() => new Set(allWorkspaces.map((w) => w.id)), [allWorkspaces]);
+  // Selection is keyed by the rendered row: the status axis slices one workspace into a row per
+  // status, and each row's actions belong to its own session.
+  const byKey = useMemo(() => new Map(rows.map((row) => [row.key, row])), [rows]);
+  const existingIds = useMemo(() => new Set(byKey.keys()), [byKey]);
+  // Prune only vanished rows; collapsing or filtering keeps the selection.
   useEffect(() => dispatch({ type: "prune", validIds: existingIds }), [existingIds]);
 
   // Read-only viewers cannot act on a selection, so none may accumulate.
   if (readOnly && selection.selectedIds.size > 0) dispatch({ type: "clear" });
 
   const selectedWorkspaces = useMemo(
-    () => allWorkspaces.filter((w) => selection.selectedIds.has(w.id)),
-    [allWorkspaces, selection.selectedIds],
+    () => rows.filter((row) => selection.selectedIds.has(row.key)).map((row) => row.workspace),
+    [rows, selection.selectedIds],
   );
 
   const runBulkAction = useCallback(
@@ -84,9 +88,9 @@ export function useSidebarSelection({
   });
   const rowBulkApi = useMemo<RowBulkApi>(
     () => ({
-      prepareScope: (ws) => {
+      prepareScope: (rowKey) => {
         const { selectedIds, selectedWorkspaces, triage, readOnly } = liveRef.current;
-        if (selectedIds.has(ws.id) && selectedIds.size > 1) {
+        if (selectedIds.has(rowKey) && selectedIds.size > 1) {
           return {
             kind: "bulk",
             count: selectedWorkspaces.length,
@@ -94,8 +98,8 @@ export function useSidebarSelection({
           };
         }
         // Right-clicking outside the selection makes that row the sole selection, without navigating.
-        if (!readOnly && !(selectedIds.has(ws.id) && selectedIds.size === 1)) {
-          dispatch({ type: "select-only", id: ws.id });
+        if (!readOnly && !(selectedIds.has(rowKey) && selectedIds.size === 1)) {
+          dispatch({ type: "select-only", id: rowKey });
         }
         return { kind: "single" };
       },
@@ -119,23 +123,25 @@ export function useSidebarSelection({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selection.selectedIds.size]);
 
-  // Selection uses workspace identity; navigation uses the clicked row's session.
+  // Selection uses row identity; navigation uses the clicked row's workspace and session.
   const handleRowActivate = useCallback<RowActivate>(
-    (workspaceId, e, sessionId) => {
+    (rowKey, e, sessionId) => {
       const intent = readOnly ? "navigate" : classifyClick(e);
       if (intent === "navigate") {
-        dispatch(readOnly ? { type: "clear" } : { type: "navigate", id: workspaceId });
+        dispatch(readOnly ? { type: "clear" } : { type: "navigate", id: rowKey });
+        // Rows outside the group lists (the Trash panel) key themselves by workspace id.
+        const workspaceId = byKey.get(rowKey)?.workspace.id ?? rowKey;
         setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
         onSelect(workspaceId, sessionId);
       } else if (intent === "toggle") {
-        dispatch({ type: "toggle", id: workspaceId });
+        dispatch({ type: "toggle", id: rowKey });
       } else {
-        dispatch({ type: "range", targetId: workspaceId, orderedIds, additive: intent === "additive-range" });
+        dispatch({ type: "range", targetId: rowKey, orderedIds, additive: intent === "additive-range" });
       }
     },
-    [activeId, onSelect, orderedIds, readOnly],
+    [activeId, byKey, onSelect, orderedIds, readOnly],
   );
 
-  const isSelected = (id: string) => !readOnly && selection.selectedIds.has(id);
+  const isSelected = (key: string) => !readOnly && selection.selectedIds.has(key);
   return { displayedActiveId, isSelected, rowBulkApi, handleRowActivate, onBulkArchive };
 }

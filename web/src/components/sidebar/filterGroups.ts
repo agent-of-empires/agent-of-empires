@@ -76,17 +76,17 @@ export const sunkViews = (groups: SidebarGroup[]) => {
   return [...byId.values()];
 };
 
-/** Workspace ids in render order, so Shift+click ranges only span visible rows; first occurrence wins. */
+/** Rendered row keys in render order, so Shift+click ranges only span visible rows. */
 export function renderedOrder(groups: SidebarGroup[], expandAll: boolean, sunkExpanded: boolean): string[] {
-  const ids = new Set<string>();
+  const keys = new Set<string>();
   for (const g of groups) {
     if (!sidebarGroupHasLiveWorkspace(g) || !(expandAll || !g.collapsed)) continue;
-    for (const v of g.workspaces) if (!workspaceIsSunk(v.workspace)) ids.add(v.workspace.id);
+    for (const v of g.workspaces) if (!workspaceIsSunk(v.workspace)) keys.add(v.key);
   }
   if (sunkExpanded) {
-    for (const g of groups) for (const v of g.workspaces) if (workspaceIsSunk(v.workspace)) ids.add(v.workspace.id);
+    for (const g of groups) for (const v of g.workspaces) if (workspaceIsSunk(v.workspace)) keys.add(v.key);
   }
-  return [...ids];
+  return [...keys];
 }
 
 /** Every workspace once, in group order; a workspace can appear under several groups. */

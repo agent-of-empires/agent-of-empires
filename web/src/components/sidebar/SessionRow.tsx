@@ -22,6 +22,8 @@ import type { RowActivate, RowBulkApi } from "./types";
 import { useLongPress } from "./useLongPress";
 
 export interface SessionRowProps extends SessionActionHandlers {
+  /** Identity of this rendered row; a workspace split across buckets has one per bucket. */
+  rowKey: string;
   workspace: Workspace;
   observedById: Record<string, RuntimeCursor>;
   runtimeEpoch: string | null;
@@ -36,7 +38,7 @@ export interface SessionRowProps extends SessionActionHandlers {
 }
 
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
-  const { workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
+  const { rowKey, workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
@@ -54,7 +56,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<SessionMenuState>(openedAtRef);
-  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(workspace) });
+  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(rowKey) });
   const longPress = useLongPress(!!sessionId && !isDeleting, (x, y) => {
     openedAtRef.current = Date.now();
     openMenuAt(x, y);
@@ -143,7 +145,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           if (e.button !== 0 || e.altKey) return;
           e.preventDefault();
           if (isDeleting || longPress.fired.current) return;
-          onActivate(workspace.id, e, navigationSessionId);
+          onActivate(rowKey, e, navigationSessionId);
         }}
         onContextMenu={(e) => {
           if (isDeleting) return;

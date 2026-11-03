@@ -140,6 +140,7 @@ function Row({
       readOnly={readOnly}
     >
       <SessionRow
+        rowKey={ws.id}
         workspace={canonical.workspace}
         observedById={canonical.observedById}
         runtimeEpoch="boot"
