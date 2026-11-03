@@ -50,7 +50,7 @@ where
     let state = Shared::default();
     // Replies the read pump answers itself, for the write pump to send.
     let (ready_tx, ready_rx) = mpsc::channel(REFUSAL_CAPACITY);
-    // A failed write to the agent retires the other pump too, closing the SDK end.
+    // Either pump exiting retires the other.
     let broken = CancellationToken::new();
     tokio::spawn(split_incoming(
         agent_out,
@@ -240,6 +240,7 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
     mut ready: mpsc::Receiver<Value>,
     broken: CancellationToken,
 ) {
+    let _retire = broken.drop_guard();
     let mut lines = BufReader::new(from_sdk).lines();
     loop {
         let out = tokio::select! {
@@ -258,7 +259,6 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
         };
         if let Err(error) = agent_in.write_all(format!("{out}\n").as_bytes()).await {
             tracing::debug!(target: "acp.protocol", %error, "agent stdin write failed");
-            broken.cancel();
             return;
         }
     }
@@ -451,6 +451,22 @@ mod tests {
         })
         .await;
         assert!(released.is_ok(), "the agent's stdout was never released");
+    }
+
+    #[tokio::test]
+    async fn an_idle_agent_stdout_is_released_when_the_sdk_end_drops() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, _agent_side_in) = tokio::io::duplex(4096);
+        drop(wrap(agent_out, agent_in));
+        // No line is sent, so the pump has nothing to fail on: it must notice alone.
+        let mut seen = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut agent_side_out, &mut seen),
+        )
+        .await
+        .expect("the idle pump kept the agent's stdout");
+        assert_eq!(read.unwrap(), 0);
     }
 
     #[tokio::test]
