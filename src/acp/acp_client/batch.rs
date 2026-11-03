@@ -5,13 +5,15 @@
 use agent_client_protocol::{RawJsonRpcMessage, TransportFrame};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
     WriteHalf,
 };
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 #[derive(Default)]
 struct Batches {
@@ -38,9 +40,43 @@ type Shared = Arc<Mutex<Batches>>;
 /// duplicate ids while not reading stdin; the transport is closed instead.
 const REFUSAL_CAPACITY: usize = 256;
 
-/// Sits between the agent's stdio and the SDK. Returns the end the SDK reads
-/// and writes.
-pub(super) fn wrap<R, W>(agent_out: R, agent_in: W) -> DuplexStream
+/// The end the SDK reads and writes. Dropping it retires both pumps, whatever
+/// they are blocked on.
+pub(super) struct Sdk {
+    io: DuplexStream,
+    _retire: DropGuard,
+}
+
+impl AsyncRead for Sdk {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Sdk {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// Sits between the agent's stdio and the SDK.
+pub(super) fn wrap<R, W>(agent_out: R, agent_in: W) -> Sdk
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
@@ -50,7 +86,7 @@ where
     let state = Shared::default();
     // Replies the read pump answers itself, for the write pump to send.
     let (ready_tx, ready_rx) = mpsc::channel(REFUSAL_CAPACITY);
-    // Either pump exiting retires the other.
+    // Either pump exiting, or the SDK end dropping, retires the other.
     let broken = CancellationToken::new();
     tokio::spawn(split_incoming(
         agent_out,
@@ -59,8 +95,12 @@ where
         ready_tx,
         broken.clone(),
     ));
+    let retire = broken.clone().drop_guard();
     tokio::spawn(group_outgoing(from_sdk, agent_in, state, ready_rx, broken));
-    sdk
+    Sdk {
+        io: sdk,
+        _retire: retire,
+    }
 }
 
 async fn split_incoming<R: AsyncRead + Unpin>(
@@ -240,7 +280,7 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
     mut ready: mpsc::Receiver<Value>,
     broken: CancellationToken,
 ) {
-    let _retire = broken.drop_guard();
+    let _retire = broken.clone().drop_guard();
     let mut lines = BufReader::new(from_sdk).lines();
     loop {
         let out = tokio::select! {
@@ -257,7 +297,12 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
             },
             Some(answer) = ready.recv() => answer.to_string(),
         };
-        if let Err(error) = agent_in.write_all(format!("{out}\n").as_bytes()).await {
+        let line = format!("{out}\n");
+        let written = tokio::select! {
+            _ = broken.cancelled() => return,
+            written = agent_in.write_all(line.as_bytes()) => written,
+        };
+        if let Err(error) = written {
             tracing::debug!(target: "acp.protocol", %error, "agent stdin write failed");
             return;
         }
@@ -467,6 +512,60 @@ mod tests {
         .await
         .expect("the idle pump kept the agent's stdout");
         assert_eq!(read.unwrap(), 0);
+    }
+
+    /// Signals its first write, then never completes one; the channel closes
+    /// when the writer is dropped.
+    struct Stalled(mpsc::Sender<()>);
+
+    impl AsyncWrite for Stalled {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let _ = self.0.try_send(());
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_agent_write_does_not_pin_the_pipes_after_the_sdk_drops() {
+        let deadline = std::time::Duration::from_secs(5);
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (stalled_tx, mut stalled_rx) = mpsc::channel(1);
+        let mut sdk = wrap(agent_out, Stalled(stalled_tx));
+        sdk.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":0}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(deadline, stalled_rx.recv())
+            .await
+            .expect("the agent write blocks")
+            .expect("the writer is alive");
+        // The agent never reads stdin; dropping the SDK end must still free both pipes.
+        drop(sdk);
+        let mut seen = Vec::new();
+        let read = tokio::time::timeout(
+            deadline,
+            tokio::io::AsyncReadExt::read_to_end(&mut agent_side_out, &mut seen),
+        )
+        .await
+        .expect("the stdout pump kept the agent's stdout");
+        assert_eq!(read.unwrap(), 0);
+        // A re-poll may have queued more signals; the channel closes with the writer.
+        tokio::time::timeout(deadline, async {
+            while stalled_rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("the write pump kept the agent's stdin");
     }
 
     #[tokio::test]
