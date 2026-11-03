@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { BackButton } from "./viewerChrome";
 import { getSessionFile, saveSessionFile, type SessionFileResponse } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import {
-  confirmFileEditNavigation,
+  FileEditorPaneContext,
+  confirmFileEditClose,
   fileDraftKey,
   getFileDraft,
   isFileSaving,
@@ -41,11 +42,12 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   const textarea = useRef<HTMLTextAreaElement>(null);
   const dirty = draft !== normalized;
   const latest = useLatestRef({ onCancel, onSaved });
+  const pane = useContext(FileEditorPaneContext);
 
   useEffect(() => {
     textarea.current?.focus();
-    return registerFileEditor(key, () => latest.current.onCancel());
-  }, [key, latest]);
+    return registerFileEditor(key, pane, () => latest.current.onCancel());
+  }, [key, pane, latest]);
 
   useEffect(() => {
     let cancelled = false;
@@ -130,7 +132,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
           <BackButton
             label="Files"
             onClick={() => {
-              if (confirmFileEditNavigation()) onBack();
+              if (confirmFileEditClose(key)) onBack();
             }}
           />
         )}

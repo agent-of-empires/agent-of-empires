@@ -5,9 +5,12 @@ import { TextFileEditor } from "../TextFileEditor";
 import * as api from "../../../lib/api";
 import * as clipboard from "../../../lib/clipboard";
 import {
+  FileEditorPaneContext,
   confirmFileEditNavigation,
+  confirmFileEditPanes,
   confirmFileEditRemoval,
   fileDraftKey,
+  getFileDraft,
   hasUnsavedFileEdits,
   installFileEditGuards,
   isFileEditorOpen,
@@ -20,6 +23,7 @@ installFileEditGuards();
 afterEach(() => {
   cleanup();
   setFileDraft(fileDraftKey("s1", "notes.txt"), null);
+  setFileDraft(fileDraftKey("s1", "other.txt"), null);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -215,8 +219,8 @@ describe("TextFileEditor", () => {
     const key = fileDraftKey("s1", "notes.txt");
     const first = vi.fn();
     const current = vi.fn();
-    const releaseFirst = registerFileEditor(key, first);
-    const releaseCurrent = registerFileEditor(key, current);
+    const releaseFirst = registerFileEditor(key, null, first);
+    const releaseCurrent = registerFileEditor(key, null, current);
     try {
       expect(first).toHaveBeenCalledOnce();
       releaseFirst();
@@ -250,6 +254,48 @@ describe("TextFileEditor", () => {
     expect((setup().editor as HTMLTextAreaElement).value).toBe("survives");
     expect(hasUnsavedFileEdits()).toBe(true);
   });
+  it("asks only for editors in the views being left", () => {
+    const onCancel = vi.fn();
+    render(
+      <FileEditorPaneContext.Provider value="files">
+        <TextFileEditor sessionId="s1" filePath="notes.txt" original={original} onSaved={vi.fn()} onCancel={onCancel} />
+      </FileEditorPaneContext.Provider>,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Edit notes.txt" }), { target: { value: "draft" } });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    expect(confirmFileEditPanes(["terminal:1", null])).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(confirmFileEditPanes(["files"])).toBe(false);
+    confirm.mockReturnValue(true);
+    expect(confirmFileEditPanes(["files"])).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it("closing one editor keeps another editor's draft", () => {
+    const onBack = vi.fn();
+    render(
+      <>
+        <TextFileEditor
+          sessionId="s1"
+          filePath="notes.txt"
+          original={original}
+          onBack={onBack}
+          onSaved={vi.fn()}
+          onCancel={vi.fn()}
+        />
+        <TextFileEditor sessionId="s1" filePath="other.txt" original={original} onSaved={vi.fn()} onCancel={vi.fn()} />
+      </>,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Edit notes.txt" }), { target: { value: "mine" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Edit other.txt" }), { target: { value: "theirs" } });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    expect(onBack).toHaveBeenCalledOnce();
+    expect(getFileDraft(fileDraftKey("s1", "notes.txt"))).toBeUndefined();
+    expect(getFileDraft(fileDraftKey("s1", "other.txt"))?.text).toBe("theirs");
+  });
+
   it("confirms removal of a Session with a parked draft without blocking removal of another Session", () => {
     const { editor } = setup();
     fireEvent.change(editor, { target: { value: "parked draft" } });

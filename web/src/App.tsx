@@ -12,6 +12,7 @@ import {
 import { Puzzle } from "lucide-react";
 import {
   confirmFileEditNavigation,
+  confirmFileEditPanes,
   confirmFileEditRemoval,
   hasUnsavedFileEdits,
   isFileEditorOpen,
@@ -68,7 +69,15 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
+import {
+  usePaneLayout,
+  dockTabs,
+  dockGroups,
+  dockOf,
+  isActiveTab,
+  isDockCollapsed,
+  renderedGroups,
+} from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -655,6 +664,18 @@ function AppContent({
   // Null until the active Session's row loads, so nothing is seeded from a guess.
   const activeRow = sessions.find((s) => s.id === activeSessionId);
   const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
+  );
   const {
     layout: paneLayout,
     openTab,
@@ -667,13 +688,7 @@ function AppContent({
     togglePlugin,
     syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId, activeOutsideRepository);
-  const pluginPanes = usePluginPanes(activeSessionId);
-  const pluginPaneById = useMemo(() => {
-    const m = new Map<string, PluginPane>();
-    for (const p of pluginPanes) m.set(p.id, p);
-    return m;
-  }, [pluginPanes]);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository, tabAvailable);
 
   // Auto-add newly available plugin panes as tabs in their default dock; the
   // layout suppresses any the user explicitly closed. With plugin auto-open
@@ -728,24 +743,8 @@ function AppContent({
     [pluginPaneById, pluginIdentityById],
   );
 
-  // A persisted tab is visible only if its backing pane currently exists: diff
-  // and terminals always do; a plugin tab does only while its plugin is loaded.
-  const tabAvailable = useCallback(
-    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
-    [pluginPaneById],
-  );
-  // A dock's groups reduced to what's actually shown: each surviving group keeps
-  // its persisted index (so a drop addresses the right group) and a valid active
-  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
   const renderGroups = useCallback(
-    (dock: DockLocation): DockGroupView[] =>
-      dockGroups(paneLayout, dock)
-        .map((g, group) => {
-          const tabs = g.tabs.filter(tabAvailable);
-          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
-          return { group, tabs, active };
-        })
-        .filter((g) => g.tabs.length > 0),
+    (dock: DockLocation): DockGroupView[] => renderedGroups(paneLayout, dock, tabAvailable),
     [paneLayout, tabAvailable],
   );
 
@@ -799,8 +798,6 @@ function AppContent({
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
         if (idx >= 1) {
-          // Confirm before the kill, which cannot be undone; the later closeTab then passes.
-          if (!confirmFileEditNavigation()) return;
           // Remove the tab only once the shell is actually killed; if the
           // DELETE fails, keep the tab so the user can retry instead of
           // silently leaking the shell with no way to close it.
@@ -1646,16 +1643,16 @@ function AppContent({
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
-      if (!confirmFileEditNavigation()) return;
+      if (view !== rightPanelView && !confirmFileEditPanes([null])) return;
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);
     },
-    [activeSessionId, transitionKeyboardProxy],
+    [activeSessionId, rightPanelView, transitionKeyboardProxy],
   );
 
   const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
-    if (!confirmFileEditNavigation()) return;
+    if (!confirmFileEditPanes([null])) return;
     setSelectedFile({ path, repoName, line });
   }, []);
 
@@ -1675,7 +1672,7 @@ function AppContent({
       // provenance-confined /file viewer, as does any out-of-repo absolute path
       // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
       if (resolved && !activeSession.scratch) {
-        if (!confirmFileEditNavigation()) return;
+        if (!confirmFileEditPanes([null])) return;
         setSelectedFile({
           path: resolved.relativePath,
           repoName: resolved.repoName,
@@ -1685,7 +1682,7 @@ function AppContent({
         return;
       }
       if (resolved || isAbsolutePath(ref.path)) {
-        if (!confirmFileEditNavigation()) return;
+        if (!confirmFileEditPanes([null])) return;
         setSelectedFile({
           path: resolved?.relativePath ?? ref.path,
           line: ref.line,
@@ -1700,7 +1697,7 @@ function AppContent({
   );
 
   const handleCloseFile = useCallback(() => {
-    if (!confirmFileEditNavigation()) return;
+    if (!confirmFileEditPanes([null])) return;
     setSelectedFile(null);
   }, []);
 
@@ -1819,7 +1816,7 @@ function AppContent({
       // a no-op. The paired shell mounts lazily on first activation, so its
       // PTY may not be ready when the dispatch fires; latch the intent too,
       // and PairedTerminal grabs focus once ready.
-      if (!confirmFileEditNavigation()) return;
+      if (!confirmFileEditPanes([null])) return;
       setRightPanelView(target);
       if (target === "paired") setPendingTerminalFocus("paired");
       requestAnimationFrame(() => dispatchFocusTerminal(target));
@@ -1853,7 +1850,7 @@ function AppContent({
       // Agent terminal is hidden under the diff viewer; close the diff first
       // so the wrapper un-hides, then dispatch on the next frame because
       // focus() on a display:none element is a no-op.
-      if (!confirmFileEditNavigation()) return;
+      if (!confirmFileEditPanes([null])) return;
       setSelectedFile(null);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
