@@ -21,7 +21,7 @@ The **?** in the sidebar header opens a legend of every glyph and mark: the stat
 
 Editing is off by default. Enable **Settings > Panels > Edit project text files** in the browser, then open an existing file in **Files** and select **Edit**.
 
-- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving unsaved changes. Unsaved text survives resizing or rotating across the phone layout. Resizing does not duplicate or cancel a pending save.
+- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving the edited view with unsaved changes; changing another pane does not ask. Unsaved text survives resizing or rotating across the phone layout. Resizing does not duplicate or cancel a pending save.
 - Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
 - Saves retain consistent LF, CRLF or CR endings and the edited text's trailing newline. Mixed endings follow line position and can shift after lines are inserted or removed.
 - Saves retain ordinary file permissions and clear special permission bits.

@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { fileDraftKey, registerFileEditor, setFileDraft } from "../fileEditGuard";
 
 import {
   addTab,
@@ -359,5 +361,73 @@ describe("seedLayout (auto-open pane prefs, #3035)", () => {
   it("is a no-op on an empty template", () => {
     const seeded = seedLayout(emptyLayout(), { diff: false, terminal: false });
     expect([dockTabs(seeded, "right"), dockTabs(seeded, "bottom")]).toEqual([[], []]);
+  });
+});
+
+describe("usePaneLayout file edit guard", () => {
+  const key = fileDraftKey("s1", "notes.txt");
+  const original = { content: "", version: "v1", is_binary: false, truncated: false };
+  afterEach(() => {
+    setFileDraft(key, null);
+    vi.restoreAllMocks();
+  });
+
+  /** A dirty Files editor in the right dock beside a terminal in the bottom dock. */
+  function editing(start = layout(["files"], ["terminal:0"]), tabAvailable?: (id: string) => boolean) {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({ version: 2, template: emptyLayout(), sessions: { s1: start }, provisional: {} }),
+    );
+    const discard = vi.fn();
+    setFileDraft(key, { original, text: "draft", pendingSave: null });
+    const release = registerFileEditor(key, "files", discard);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    return { result: renderHook(() => usePaneLayout("s1", false, tabAvailable)).result, discard, release, confirm };
+  }
+
+  it("changes the other dock without asking or discarding the visible draft", () => {
+    const { result, discard, release, confirm } = editing();
+    act(() => result.current.addTerminal("bottom"));
+    act(() => result.current.closeTab("terminal:0"));
+    act(() => result.current.setDockCollapsed("bottom", true));
+    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:1"]);
+    expect(isDockCollapsed(result.current.layout, "bottom")).toBe(true);
+    expect([confirm.mock.calls.length, discard.mock.calls.length]).toEqual([0, 0]);
+    release();
+  });
+
+  it("asks before hiding or moving the edited tab and keeps the layout when declined", () => {
+    const { result, discard, release, confirm } = editing();
+    act(() => result.current.openTab("terminal:1", "right"));
+    act(() => result.current.moveTab("files", "bottom"));
+    act(() => result.current.setDockCollapsed("right", true));
+    expect([dockTabs(result.current.layout, "right"), isDockCollapsed(result.current.layout, "right")]).toEqual([
+      ["files"],
+      false,
+    ]);
+    expect([confirm.mock.calls.length, discard.mock.calls.length]).toEqual([3, 0]);
+    confirm.mockReturnValue(true);
+    act(() => result.current.closeTab("files"));
+    expect(dockTabs(result.current.layout, "right")).toEqual([]);
+    expect(discard).toHaveBeenCalledOnce();
+    release();
+  });
+
+  it("asks when closing an earlier split group renumbers the edited one", () => {
+    const start = placeTab(layout(["terminal:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
+    const { result, discard, release, confirm } = editing(start);
+    act(() => result.current.closeTab("terminal:1"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:1", "files"]);
+    expect([confirm.mock.calls.length, discard.mock.calls.length]).toEqual([1, 0]);
+    release();
+  });
+
+  it("asks when the edited tab is shown in place of an unloaded plugin tab", () => {
+    const start = setActive(layout(["plugin:x:pane", "files"]), "right", "plugin:x:pane");
+    const { result, release, confirm } = editing(start, (id) => !id.startsWith("plugin:"));
+    act(() => result.current.addTerminal("right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:x:pane", "files"]);
+    expect(confirm).toHaveBeenCalledOnce();
+    release();
   });
 });

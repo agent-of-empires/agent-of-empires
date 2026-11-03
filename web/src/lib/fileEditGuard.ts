@@ -1,3 +1,5 @@
+import { createContext } from "react";
+
 import type { SessionFileResponse, saveSessionFile } from "./api";
 import { toastBus } from "./toastBus";
 
@@ -17,7 +19,10 @@ interface FileDraft {
 // Leaving an open editor asks first; a page unload loses every draft.
 const drafts = new Map<string, FileDraft>();
 // One editor owns each draft, even when multiple panes show the same file.
-const editors = new Map<string, () => void>();
+const editors = new Map<string, { pane: string | null; discard: () => void }>();
+
+/** The dock tab hosting an editor; null in the main view, which dock layout changes never unmount. */
+export const FileEditorPaneContext = createContext<string | null>(null);
 
 export function fileDraftKey(sessionId: string, filePath: string): string {
   return `${sessionId} ${filePath}`;
@@ -56,11 +61,12 @@ function isUnsaved(draft: FileDraft): boolean {
   return !draft.pendingSave?.result?.ok;
 }
 
-export function registerFileEditor(key: string, discard: () => void): () => void {
-  editors.get(key)?.();
-  editors.set(key, discard);
+export function registerFileEditor(key: string, pane: string | null, discard: () => void): () => void {
+  editors.get(key)?.discard();
+  const editor = { pane, discard };
+  editors.set(key, editor);
   return () => {
-    if (editors.get(key) === discard) editors.delete(key);
+    if (editors.get(key) === editor) editors.delete(key);
   };
 }
 
@@ -81,6 +87,21 @@ export function confirmFileEditNavigation(): boolean {
   return confirmDrafts(blockingDrafts());
 }
 
+/** Asks only for the editors in the views being left: dock tab ids, or null for the main view. */
+export function confirmFileEditPanes(panes: readonly (string | null)[]): boolean {
+  return confirmDrafts(
+    blockingDrafts().filter(([key]) => {
+      const editor = editors.get(key);
+      return editor !== undefined && panes.includes(editor.pane);
+    }),
+  );
+}
+
+/** Closing one editor leaves every other draft alone. */
+export function confirmFileEditClose(key: string): boolean {
+  return confirmDrafts(blockingDrafts().filter(([draftKey]) => draftKey === key));
+}
+
 /** Removing a Session also discards drafts parked outside the current layout. */
 export function confirmFileEditRemoval(sessionIds: readonly string[]): boolean {
   return confirmDrafts(
@@ -91,7 +112,7 @@ export function confirmFileEditRemoval(sessionIds: readonly string[]): boolean {
 }
 
 function confirmDrafts(affected: [string, FileDraft][]): boolean {
-  if ([...drafts.keys()].some(isFileSaving)) {
+  if (affected.some(([key]) => isFileSaving(key))) {
     toastBus.handler?.error("Wait for the file save to finish.");
     return false;
   }
@@ -99,7 +120,7 @@ function confirmDrafts(affected: [string, FileDraft][]): boolean {
   if (!window.confirm("Discard unsaved file changes?")) return false;
   affected.forEach(([key]) => {
     drafts.delete(key);
-    editors.get(key)?.();
+    editors.get(key)?.discard();
   });
   return true;
 }
