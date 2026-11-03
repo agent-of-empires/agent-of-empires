@@ -10,6 +10,7 @@ use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
     WriteHalf,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct Batches {
@@ -38,8 +39,15 @@ where
     let (ours, sdk) = tokio::io::duplex(64 * 1024);
     let (from_sdk, to_sdk) = tokio::io::split(ours);
     let state = Shared::default();
-    tokio::spawn(split_incoming(agent_out, to_sdk, state.clone()));
-    tokio::spawn(group_outgoing(from_sdk, agent_in, state));
+    // A failed write to the agent retires the other pump too, closing the SDK end.
+    let broken = CancellationToken::new();
+    tokio::spawn(split_incoming(
+        agent_out,
+        to_sdk,
+        state.clone(),
+        broken.clone(),
+    ));
+    tokio::spawn(group_outgoing(from_sdk, agent_in, state, broken));
     sdk
 }
 
@@ -47,9 +55,17 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     agent_out: R,
     mut to_sdk: WriteHalf<DuplexStream>,
     state: Shared,
+    broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(agent_out).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = tokio::select! {
+            _ = broken.cancelled() => break,
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => line,
+                _ => break,
+            },
+        };
         let singles = match serde_json::from_str::<Value>(line.trim()) {
             Ok(Value::Array(items)) if !items.is_empty() => {
                 track_requests(&state, &items);
@@ -64,11 +80,11 @@ async fn split_incoming<R: AsyncRead + Unpin>(
                 .await
                 .is_err()
             {
-                return;
+                break;
             }
         }
     }
-    // The agent's stdout ended: the SDK must see EOF, not a quiet pipe.
+    // The SDK must see EOF, not a quiet pipe.
     let _ = to_sdk.shutdown().await;
 }
 
@@ -130,6 +146,7 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
     from_sdk: ReadHalf<DuplexStream>,
     mut agent_in: W,
     state: Shared,
+    broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(from_sdk).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -141,11 +158,9 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
             },
             Err(_) => line,
         };
-        if agent_in
-            .write_all(format!("{out}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        if let Err(error) = agent_in.write_all(format!("{out}\n").as_bytes()).await {
+            tracing::debug!(target: "acp.protocol", %error, "agent stdin write failed");
+            broken.cancel();
             return;
         }
     }
@@ -297,6 +312,25 @@ mod tests {
         .await
         .expect("the batch is answered");
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_write_closes_the_sdk_transport() {
+        let (_agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, agent_side_in) = tokio::io::duplex(4096);
+        drop(agent_side_in);
+        let mut sdk = wrap(agent_out, agent_in);
+        sdk.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut sdk, &mut buf),
+        )
+        .await
+        .expect("the SDK end closes while the agent's stdout stays open");
+        assert_eq!(read.unwrap(), 0);
     }
 
     #[tokio::test]
