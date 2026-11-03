@@ -249,7 +249,8 @@ pub struct HomeView {
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
-    /// Sessions the open bulk-archive prompt counted, archived as-is on confirm.
+    /// Sessions the open bulk-archive prompt counted, archived as-is on confirm and
+    /// dropped on cancel.
     pub(super) pending_archive_group_ids: Option<Vec<String>>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,

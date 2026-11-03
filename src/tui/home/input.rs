@@ -1292,9 +1292,9 @@ impl HomeView {
         // Status buckets reshuffle while the dialog is open, so pin the set the
         // count describes instead of recomputing it on confirm.
         self.pending_archive_group_ids = Some(ids);
-        // Project/Org mode groups by repo or owner and Manual mode by assigned path, so
-        // name the scope accordingly and show the full path, or nested groups sharing a
-        // leaf segment would be ambiguous.
+        // Project/Org group by repo or owner, Manual by assigned path and Status by its
+        // bucket name, so name the scope and show the full path, or nested groups
+        // sharing a leaf segment would be ambiguous.
         let (title, scope) = match self.group_by {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),
@@ -1516,6 +1516,7 @@ impl HomeView {
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
+                        self.pending_archive_group_ids = None;
                         // Mirrors the keyboard route: Cancel means "don't discard", so
                         // settings stays open and `settings_close_confirm` resets.
                         self.settings_close_confirm = false;
@@ -2290,6 +2291,7 @@ impl HomeView {
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
+                    self.pending_archive_group_ids = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -4449,7 +4451,7 @@ impl HomeView {
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
-    /// (Project/Org), where there is no user-owned group to act on. `None` for `Manual`,
+    /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
     fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {

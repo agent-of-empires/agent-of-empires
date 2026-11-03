@@ -1175,6 +1175,90 @@ fn test_prompt_archive_selected_group() {
     assert!(env.view.confirm_dialog.is_none());
 }
 
+/// A status bucket gains members while its archive prompt is up, the same way a running
+/// session flips to Waiting mid-confirm. The confirm archives the set the prompt counted.
+#[test]
+#[serial]
+fn status_group_archive_keeps_the_members_the_prompt_counted() {
+    use crate::session::config::GroupByMode;
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut counted = Instance::new("counted", "/tmp/counted");
+    counted.status = Status::Running;
+    let mut late = Instance::new("late", "/tmp/late");
+    late.status = Status::Idle;
+    let instances = vec![counted, late];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Status;
+    view.flat_items = view.build_flat_items();
+
+    let running = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
+        .expect("Running header");
+    view.cursor = running;
+    view.update_selected();
+    assert_eq!(view.selected_group.as_deref(), Some("Running"));
+
+    // On a header, the archive hotkey prompts for the whole bucket instead of one row.
+    view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
+    assert_eq!(
+        view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("archive_group")
+    );
+
+    let id_of = |view: &HomeView, title: &str| {
+        view.instances()
+            .find(|i| i.title == title)
+            .map(|i| i.id.clone())
+            .expect("seeded instance")
+    };
+    let counted_id = id_of(&view, "counted");
+    let late_id = id_of(&view, "late");
+    view.instances.get_mut(&late_id).unwrap().status = Status::Running;
+    view.rebuild_flat_items();
+
+    let mut respond = view.session_feed.command_driver_for_test();
+    view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
+    assert!(view.confirm_dialog.is_none());
+
+    let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2,
+    }))
+    .unwrap();
+    assert!(
+        matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane)
+    );
+    assert_eq!(id, counted_id);
+    assert!(
+        respond(Ok(crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2
+        }))
+        .is_none(),
+        "a session the prompt never counted must not be torn down"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_delete_group_with_sessions_updates_groups_field() {
