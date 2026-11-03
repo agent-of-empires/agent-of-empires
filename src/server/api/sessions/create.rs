@@ -1436,13 +1436,17 @@ pub async fn create_session(
             if let Err(error) = state.runtime.publish(&state).await {
                 tracing::debug!(target: "server.runtime", %error, "publish after failed create failed");
             }
-            if e.is::<crate::server::session_spawn::CliCreationOutcomeUnknown>() {
-                tracing::warn!(target: "http.api.sessions", error = ?e, "CLI creation outcome unknown");
-                return create_failure_response(
-                    create_failure(&e, progress.stage(), &reference)
-                        .expect("unknown creation outcome"),
-                );
-            }
+            let failure = create_failure(&e, progress.stage(), &reference);
+            let failure = match failure {
+                Some(failure)
+                    if failure.code
+                        == crate::daemon::ApiErrorCode::CreateOutcomeUnknown.as_str() =>
+                {
+                    tracing::warn!(target: "http.api.sessions", error = ?e, "CLI creation outcome unknown");
+                    return create_failure_response(failure);
+                }
+                failure => failure,
+            };
             if e.is::<crate::server::session_service::CreationCancelled>() {
                 return crate::server::api::api_error_with_code_header(
                     crate::daemon::ApiErrorCode::CreationCancelled,
@@ -1478,10 +1482,10 @@ pub async fn create_session(
             if let Some(response) = local_create_hook_error_response(&e, local_owner) {
                 return response;
             }
-            create_failure_response(
-                create_failure(&e, progress.stage(), &reference)
-                    .expect("hooks_need_trust returned above"),
-            )
+            match failure {
+                Some(failure) => create_failure_response(failure),
+                None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
         }
     }
 }

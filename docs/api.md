@@ -414,7 +414,7 @@ Concurrent CLI requests with the same title and working directory cannot create 
 Interrupting the CLI while launch is pending leaves the created session intact;
 inspect Daemon state before retrying launch.
 If terminal finalization fails after creation commits, the Daemon returns `409`
-with `aoe-error-code: create_outcome_unknown` and retains the session and resources.
+with `aoe-error-code: create_outcome_unknown` and does not roll back the session or resources.
 The CLI checks canonical state without resubmitting creation. A healthy, finalized
 session confirms success; otherwise the CLI reports an unknown outcome.
 
