@@ -1018,12 +1018,9 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
 #[tokio::test]
 #[parallel]
 async fn native_creation_progress_reports_phases_to_the_local_stream() {
-    use agent_of_empires::{
-        acp::client::DaemonEndpoint,
-        daemon::{
-            ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
-            RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
-        },
+    use agent_of_empires::daemon::{
+        ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
+        DaemonEndpoint, RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
     };
     const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
@@ -1084,7 +1081,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         .timeout(PHASE_TIMEOUT * 5)
         .build()
         .unwrap();
-    let endpoint = DaemonEndpoint::local_unix(socket);
+    let endpoint = DaemonEndpoint::local_unix(socket, None);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
         connection.creation_progress().is_empty(),

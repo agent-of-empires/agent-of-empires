@@ -1106,7 +1106,7 @@ async fn test_b_opens_project_add_flow_when_no_projects() {
         test_support::build_router_for_test(state.clone()),
     )
     .await;
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket.clone(), None);
     let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
         .await
         .unwrap();

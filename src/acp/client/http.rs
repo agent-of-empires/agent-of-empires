@@ -10,7 +10,6 @@ use crate::daemon::transport::path_segment;
 use reqwest::{header, StatusCode};
 use thiserror::Error;
 
-use super::discovery::DaemonEndpoint;
 use super::passphrase_session::{
     self, may_retry_with_login, select_credential, Credential, PassphraseSessionCache,
 };
@@ -19,6 +18,7 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
+use crate::daemon::DaemonEndpoint;
 use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
@@ -1088,7 +1088,7 @@ fn classify_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
+    use crate::daemon::Source;
     use std::time::Duration;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
@@ -1450,7 +1450,7 @@ mod tests {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_stalled_replay(stream, r#"{"frames":["#).await;
                 });
-                (DaemonEndpoint::local_unix(path), server)
+                (DaemonEndpoint::local_unix(path, None), server)
             } else {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();

@@ -1933,9 +1933,9 @@ fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'sta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
-    use crate::acp::client::{DaemonEndpoint, HttpClient};
+    use crate::acp::client::HttpClient;
     use crate::acp::state::{AvailableCommand, Event, SessionNotice};
+    use crate::daemon::{DaemonEndpoint, Source};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 

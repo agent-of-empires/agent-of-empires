@@ -998,7 +998,7 @@ mod tests {
         let router = crate::server::test_support::build_router_for_test(state.clone());
         let server =
             crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
-        let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket);
+        let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket, None);
         let mut connection = RuntimeConnection::connect(&endpoint, Some("test"))
             .await
             .unwrap();
