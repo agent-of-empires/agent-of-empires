@@ -26,6 +26,9 @@ jobs:
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -39,12 +42,9 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          key: ${{ matrix.leg }}
-          # Only main saves: PR and queue entries would evict main's within
-          # the 10 GB repository budget.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: test-${{ matrix.leg }}
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         if: matrix.leg != 'web-e2e'
         with:
@@ -204,7 +204,7 @@ jobs:
       # Folded in from a former standalone `hook-privdrop` job. That job existed
       # only to build a lib test binary it could re-run under sudo, which meant a
       # third full compile of the crate at a third feature set (~1.7 min) plus
-      # its own 451MB rust-cache slot. This leg has already built the lib test
+      # its own cache slot. This leg has already built the lib test
       # binary, and the privdrop tests are core, so they are present in it.
       # Reusing that binary makes the privileged run nearly free.
       #
@@ -310,6 +310,9 @@ jobs:
     needs: macos-gate
     if: ${{ !cancelled() && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') }}
     runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
     steps:
@@ -321,9 +324,9 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: test-macos
       - name: Install tmux
         run: brew install tmux
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
@@ -539,6 +542,9 @@ jobs:
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -553,9 +559,9 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: playwright-live
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
       # Debug build instead of --release: --release with LTO and
