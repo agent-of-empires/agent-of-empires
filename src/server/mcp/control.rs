@@ -169,7 +169,8 @@ impl McpServer {
             return Err(refusal);
         }
         let structured = params.view == View::Structured;
-        // A terminal prompt is typed into a pane, so it gets what `send` does to keys.
+        // A terminal prompt is typed into the pane once the agent starts, so it gets what
+        // `send` does to keys.
         let prompt = if structured {
             params.prompt.clone().filter(|p| !p.trim().is_empty())
         } else {
@@ -177,7 +178,6 @@ impl McpServer {
         };
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
         let initial_turn = if structured { prompt.clone() } else { None };
-        // A terminal prompt is typed into the pane, so wait for the agent to start first.
         let wait_ready = !structured && prompt.is_some();
         let response =
             create_session_with(self.state.clone(), false, wait_ready, body, initial_turn).await;
@@ -523,7 +523,7 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
         ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
         SendKeysError::Tmux(e) => tool_error("send_failed", format!("tmux: {e:#}")),
-        SendKeysError::Internal => tool_error("send_failed", "Internal error"),
+        SendKeysError::Internal => tool_error("internal", "Internal error"),
     }
 }
 

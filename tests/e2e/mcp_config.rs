@@ -251,16 +251,18 @@ fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
 }
 
 /// A terminal `create_session` with a prompt waits for the agent, then types the prompt into
-/// its pane, where `read_output` reads it back.
+/// its pane, where `read_output` reads it back. The prompt carries a paste delimiter, which
+/// is stripped as `send` strips it; typed raw, the agent would receive it.
 #[test]
 #[parallel]
 fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
     crate::harness::require_tmux!();
     let mut h = TuiTestHarness::new("mcp_terminal_prompt");
-    // Stands in for `claude`: whatever is typed into its pane is echoed back.
+    // Stands in for `claude`: prints what it is typed, with control bytes made visible
+    // (`cat -v` shows ESC as `^[`). The tty's own echo is off, so the pane holds only that.
     let bin = h.home_path().join("fake-agent-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    crate::harness::write_executable(&bin.join("claude"), "#!/bin/sh\nexec cat\n");
+    crate::harness::write_executable(&bin.join("claude"), "#!/bin/sh\nstty -echo\nexec cat -v\n");
     h.add_path_dir(&bin);
     h.append_config("[web]\nmcp_enabled = true");
     h.stop_daemon_on_drop();
@@ -278,7 +280,7 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
             "create_session",
             json!({
                 "path": h.project_path(), "tool": "claude", "title": "mcp-terminal",
-                "prompt": "typed-into-the-agent",
+                "prompt": "typed-into\u{1b}[201~-the-agent",
             }),
         );
         let (status, body) = rpc(&url, &[], create).await;
@@ -298,6 +300,10 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
             let text = body["result"]["structuredContent"]["text"]
                 .as_str()
                 .unwrap_or("");
+            assert!(
+                !text.contains("^["),
+                "the agent received a raw escape: {text}"
+            );
             if text.contains("typed-into-the-agent") {
                 break;
             }
