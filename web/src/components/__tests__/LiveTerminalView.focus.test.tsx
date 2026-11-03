@@ -46,7 +46,8 @@ vi.mock("../MobileLiveTerminal", () => ({
 
 afterEach(() => {
   cleanup();
-  consumePendingTerminalFocus("paired");
+  setPendingTerminalFocus("agent");
+  consumePendingTerminalFocus("agent");
 });
 
 /** A paired terminal in each dock, as a right and a bottom group can show at once. */
