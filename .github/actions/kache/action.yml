@@ -35,9 +35,9 @@ runs:
         aws-region: us-east-1
         # Covers the longest job (90 min); the daemon keeps these credentials.
         role-duration-seconds: 7200
-    - uses: kunobi-ninja/kache-action@b3491d5f4893a6513cb0162a72c735357f066569 # v1
+    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
       with:
-        version: v1.2.2
+        version: v2.0.0
         s3-bucket: ${{ steps.role.outputs.role != '' && 'aoe-rust-kache' || '' }}
         s3-region: us-east-1
         save-cache: ${{ steps.role.outputs.role != '' }}
