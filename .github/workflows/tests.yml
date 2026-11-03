@@ -25,7 +25,7 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64', github.run_id) }}
     permissions:
       contents: read
       id-token: write
@@ -545,7 +545,7 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64', github.run_id) }}
     permissions:
       contents: read
       id-token: write
