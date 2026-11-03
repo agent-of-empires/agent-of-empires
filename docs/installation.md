@@ -52,7 +52,8 @@ Local Unix transport requires a current-user-owned `daemon/` directory with mode
 group-write bits, including under umask `002`; it does not change existing
 `~/.config` permissions. On each daemon start, AoE removes group and other write
 permissions from an existing application directory owned by the current user.
-Permission refusals name the highest unsafe ancestor when ancestor metadata is available.
+Permission refusals name the highest unsafe ancestor unless a higher ancestor
+cannot be verified.
 Repair unsafe ancestors from the highest down, or select a location with trusted
 ancestors, then retry before changing the refused directory. Once the parent
 chain is trusted, follow the recovery advice:

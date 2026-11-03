@@ -119,7 +119,11 @@ fn permission_refusal(
     for ancestor in path.ancestors().skip(1) {
         match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) if trusted_directory(&metadata, owner) => {}
-            Ok(_) => highest_unsafe_ancestor = Some(ancestor),
+            Ok(_) => {
+                highest_unsafe_ancestor = Some(ancestor);
+                // Lower metadata failures cannot hide a higher unsafe ancestor.
+                unverified_ancestor = None;
+            }
             Err(_) => unverified_ancestor = Some(ancestor),
         }
     }
@@ -764,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn unverifiable_upper_ancestors_suppress_copyable_recovery_commands() {
+    fn ancestor_metadata_failures_do_not_hide_higher_unsafe_components() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
         for ancestor in [base.join("missing"), base.join("not-a-directory")] {
@@ -772,11 +776,6 @@ mod tests {
                 std::fs::write(&ancestor, b"not a directory").unwrap();
             }
             let refused = ancestor.join("unverified/refused");
-            let unverified = if ancestor.is_file() {
-                refused.parent().unwrap()
-            } else {
-                ancestor.as_path()
-            };
             assert!(std::fs::symlink_metadata(refused.parent().unwrap()).is_err());
             for repair in [
                 PermissionRepair::Private,
@@ -787,7 +786,7 @@ mod tests {
                         .to_string();
                 assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
                 assert!(
-                    diagnostic.contains(&format!("{unverified:?}")),
+                    diagnostic.contains(&format!("{ancestor:?}")),
                     "{diagnostic}"
                 );
                 assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
