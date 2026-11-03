@@ -1454,15 +1454,9 @@ impl Session {
         Ok(())
     }
 
-    /// Sends exactly the given token sequence to the pane, in order, with no
-    /// implicit trailing key. Unlike [`send_keys_with_delay`](Self::send_keys_with_delay),
-    /// which always appends a submitting `Enter`, the caller's token list
-    /// fully controls what reaches the pane: a bare menu-digit selection
-    /// needs zero `Enter`s, while a multi-step button navigation needs
-    /// exactly as many as its shape requires. Used to answer an agent CLI's
-    /// own interactive permission prompt; see
-    /// [`crate::agents::PermissionResponse`].
-    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
+    /// Send exactly these tokens, with no implicit Enter, to answer an agent's own
+    /// permission prompt.
+    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken<'_>]) -> Result<()> {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
