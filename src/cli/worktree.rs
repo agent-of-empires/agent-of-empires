@@ -296,6 +296,38 @@ pub(crate) fn remove_orphaned_worktrees(
     removed
 }
 
+/// Removes the confirmed worktrees that no session in any profile sits on or inside. The rows are
+/// read, and the removal done, while every store is locked, so no session can adopt a path in
+/// between. Fails closed: if a store cannot be read, nothing is removed.
+pub(crate) fn remove_confirmed_worktrees(
+    git_wt: &GitWorktree,
+    orphans: &[WorktreeEntry],
+    purging: &HashSet<PathBuf>,
+) -> Result<usize> {
+    let storages = crate::session::list_profiles()?
+        .iter()
+        .map(|profile| Storage::open_unwatched(profile))
+        .collect::<Result<Vec<_>>>()?;
+    crate::session::with_storages_locked(&storages, || {
+        let mut session_paths = Vec::new();
+        for storage in &storages {
+            for inst in storage.load_instances_complete()? {
+                let path = PathBuf::from(&inst.project_path);
+                session_paths.extend(path.canonicalize().ok());
+                session_paths.push(path);
+            }
+        }
+        let (kept, free): (Vec<_>, Vec<_>) = orphans
+            .iter()
+            .cloned()
+            .partition(|wt| session_paths.iter().any(|path| path.starts_with(&wt.path)));
+        for wt in &kept {
+            eprintln!("✗ Skipped {}: a session now uses it", wt.path.display());
+        }
+        Ok(remove_orphaned_worktrees(git_wt, &free, purging))
+    })?
+}
+
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
@@ -389,7 +421,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
 
-        removed_count += remove_orphaned_worktrees(&git_wt, &orphaned_worktrees, &purging);
+        removed_count += remove_confirmed_worktrees(&git_wt, &orphaned_worktrees, &purging)?;
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -513,6 +545,55 @@ mod tests {
         assert_eq!(remove_orphaned_sessions(&storage, &orphans).unwrap(), 1);
         let left = storage.load().unwrap();
         assert_eq!(ids(&left), ["restored", "locked", "reserved"]);
+    }
+
+    /// A session created on, or inside, a listed candidate after listing keeps its checkout.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_spares_candidates_a_session_adopted_after_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git_wt = GitWorktree::new(repo.clone()).unwrap();
+        let mut paths = Vec::new();
+        for name in ["inside", "equal", "free"] {
+            let path = tmp.path().join(name);
+            git_wt.create_worktree(name, &path, true, None).unwrap();
+            paths.push(path.canonicalize().unwrap());
+        }
+
+        let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
+        assert_eq!(orphans.len(), 3);
+        let purging = purging_paths(&orphans);
+
+        let nested = paths[0].join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        for (profile, path) in [("one", &nested), ("two", &paths[1])] {
+            Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|instances, _groups| {
+                    instances.push(Instance::new("adopted", path.to_str().unwrap()));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let removed = remove_confirmed_worktrees(&git_wt, &orphans, &purging).unwrap();
+        assert_eq!(removed, 1);
+        assert!(paths[0].exists() && paths[1].exists());
+        assert!(!paths[2].exists());
     }
 
     #[test]
