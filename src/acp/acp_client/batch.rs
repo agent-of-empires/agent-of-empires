@@ -34,6 +34,10 @@ struct Open {
 
 type Shared = Arc<Mutex<Batches>>;
 
+/// Refusals waiting for the write pump. Overflow means the agent is flooding
+/// duplicate ids while not reading stdin; the transport is closed instead.
+const REFUSAL_CAPACITY: usize = 256;
+
 /// Sits between the agent's stdio and the SDK. Returns the end the SDK reads
 /// and writes.
 pub(super) fn wrap<R, W>(agent_out: R, agent_in: W) -> DuplexStream
@@ -45,7 +49,7 @@ where
     let (from_sdk, to_sdk) = tokio::io::split(ours);
     let state = Shared::default();
     // Replies the read pump answers itself, for the write pump to send.
-    let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = mpsc::channel(REFUSAL_CAPACITY);
     // A failed write to the agent retires the other pump too, closing the SDK end.
     let broken = CancellationToken::new();
     tokio::spawn(split_incoming(
@@ -63,7 +67,7 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     agent_out: R,
     mut to_sdk: WriteHalf<DuplexStream>,
     state: Shared,
-    ready: mpsc::UnboundedSender<Value>,
+    ready: mpsc::Sender<Value>,
     broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(agent_out).lines();
@@ -79,7 +83,9 @@ async fn split_incoming<R: AsyncRead + Unpin>(
             Ok(Value::Array(items)) if !items.is_empty() => {
                 let (forward, answer) = admit_batch(&state, items);
                 if let Some(answer) = answer {
-                    let _ = ready.send(answer);
+                    if !queue_refusal(&ready, answer) {
+                        break 'pump;
+                    }
                 }
                 forward
             }
@@ -87,7 +93,9 @@ async fn split_incoming<R: AsyncRead + Unpin>(
             _ => match admit_standalone(&state, &line) {
                 Ok(()) => vec![line],
                 Err(rejection) => {
-                    let _ = ready.send(rejection);
+                    if !queue_refusal(&ready, rejection) {
+                        break 'pump;
+                    }
                     continue;
                 }
             },
@@ -104,6 +112,16 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     }
     // The SDK must see EOF, not a quiet pipe.
     let _ = to_sdk.shutdown().await;
+}
+
+/// Hands a reply to the write pump without waiting: a blocked send could
+/// deadlock against an agent that stalls stdin while stdout is full.
+fn queue_refusal(ready: &mpsc::Sender<Value>, reply: Value) -> bool {
+    let queued = ready.try_send(reply).is_ok();
+    if !queued {
+        tracing::warn!(target: "acp.protocol", "cannot queue a refusal, closing the agent transport");
+    }
+    queued
 }
 
 /// What the SDK answers for one entry. Entries it cannot attribute to an id
@@ -219,7 +237,7 @@ async fn group_outgoing<W: AsyncWrite + Unpin>(
     from_sdk: ReadHalf<DuplexStream>,
     mut agent_in: W,
     state: Shared,
-    mut ready: mpsc::UnboundedReceiver<Value>,
+    mut ready: mpsc::Receiver<Value>,
     broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(from_sdk).lines();
@@ -524,6 +542,24 @@ mod tests {
         .await
         .expect("every request is answered, none hangs");
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_duplicate_ids_closes_the_transport_instead_of_queueing() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(1 << 20);
+        // Tiny and never read: the write pump blocks on its first refusal.
+        let (agent_in, _agent_side_in) = tokio::io::duplex(16);
+        let mut sdk = wrap(agent_out, agent_in);
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"x"}"#;
+        let flood = format!("{request}\n").repeat(REFUSAL_CAPACITY + 50);
+        agent_side_out.write_all(flood.as_bytes()).await.unwrap();
+        let mut seen = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut sdk, &mut seen),
+        )
+        .await;
+        assert!(closed.is_ok(), "the transport stayed open under the flood");
     }
 
     #[tokio::test]
