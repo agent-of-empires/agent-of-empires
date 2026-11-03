@@ -2946,6 +2946,7 @@ async fn prepare_agent_session_inner(
             if adopted {
                 outcome.map(Some)
             } else {
+                // Adoption fences runtime replacement, not the migration failure result.
                 match outcome {
                     Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => {
                         Err(error)
@@ -3138,29 +3139,36 @@ mod durable_stop_tests {
     );
     static ADOPTION_GATE: std::sync::Mutex<Option<AdoptionGate>> = std::sync::Mutex::new(None);
 
-    pub(super) async fn pause_before_adoption(id: &str) {
-        let gate = {
+    struct AdoptionGateGuard {
+        id: String,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for AdoptionGateGuard {
+        fn drop(&mut self) {
             let mut gate = ADOPTION_GATE.lock().unwrap();
-            if gate.as_ref().is_some_and(|(session, _, _)| session == id) {
-                gate.take()
-            } else {
-                None
+            if gate.as_ref().is_some_and(|(id, _, _)| id == &self.id) {
+                gate.take();
             }
-        };
-        if let Some((_, entered, release)) = gate {
-            let _ = entered.send(());
-            let _ = release.await;
         }
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn superseded_sandbox_launch_preserves_migration_failure() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+    struct MigrationFixture {
+        row: Instance,
+        private: std::path::PathBuf,
+        cause: Option<String>,
+        _path: crate::session::test_support::EnvGuard,
+        _env: crate::session::test_support::EnvGuard,
+        _home: crate::session::test_support::AppDirGuard,
+        root: tempfile::TempDir,
+    }
 
-        for case in ["deferred", "failed", "other"] {
+    impl MigrationFixture {
+        fn new(case: &str) -> anyhow::Result<Self> {
+            use std::os::unix::fs::PermissionsExt;
+
             let root = tempfile::tempdir()?;
-            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let home = crate::session::test_support::isolate_app_dir_at(root.path());
             crate::migrations::run_migrations()?;
             crate::session::config::update_app_state(|state| {
                 state.has_acknowledged_agent_hooks = true;
@@ -3170,7 +3178,7 @@ mod durable_stop_tests {
                 config.session.smart_rename = false;
                 config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
             })?;
-            let _env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
+            let env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
                 .and_set("DOCKER_HOST", "unix:///var/run/docker.sock")
                 .and_set(
                     "AOE_DEFER_SANDBOX_MIGRATION",
@@ -3191,7 +3199,7 @@ mod durable_stop_tests {
                 ))?;
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
             }
-            let _path = crate::session::test_support::path_prepended(&bin);
+            let path = crate::session::test_support::path_prepended(&bin);
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
             let mut raw =
@@ -3209,9 +3217,50 @@ mod durable_stop_tests {
             std::fs::create_dir_all(&source)?;
             let private = source.join("config.toml");
             std::fs::write(&private, b"private-content")?;
-            if case == "failed" {
-                std::fs::write(root.path().join(".codex/sandbox-v2"), b"not-a-directory")?;
+            let cause = if case == "failed" {
+                let blocker = root.path().join(".codex/sandbox-v2");
+                std::fs::write(&blocker, b"not-a-directory")?;
+                let error = std::fs::create_dir(blocker.join("child")).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+                Some(nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string())
+            } else {
+                None
+            };
+            Ok(Self {
+                row,
+                private,
+                cause,
+                _path: path,
+                _env: env,
+                _home: home,
+                root,
+            })
+        }
+    }
+
+    pub(super) async fn pause_before_adoption(id: &str) {
+        let gate = {
+            let mut gate = ADOPTION_GATE.lock().unwrap();
+            if gate.as_ref().is_some_and(|(session, _, _)| session == id) {
+                gate.take()
+            } else {
+                None
             }
+        };
+        if let Some((_, entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn superseded_sandbox_launch_preserves_migration_failure() -> anyhow::Result<()> {
+        for case in ["deferred", "failed", "other"] {
+            let fixture = MigrationFixture::new(case)?;
+            let row = fixture.row.clone();
+            let root = &fixture.root;
+            let private = &fixture.private;
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
                 vec![row.clone()],
@@ -3223,13 +3272,21 @@ mod durable_stop_tests {
             let id = row.id.clone();
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut gate = AdoptionGateGuard {
+                id: id.clone(),
+                release: Some(release_tx),
+            };
             *ADOPTION_GATE.lock().unwrap() = Some((id.clone(), entered_tx, release_rx));
-            let request = tokio::spawn(async move {
-                start_session(State(request_state), Path(id), Ok(None))
-                    .await
-                    .into_response()
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(20), entered_rx).await??;
+            let request = start_session(State(request_state), Path(id), Ok(None));
+            tokio::pin!(request);
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::select! {
+                    entered = entered_rx => entered?,
+                    _ = &mut request => anyhow::bail!("request completed before adoption gate"),
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
             let newer = {
                 let mut instances = state.instances.write().await;
                 let current = instances
@@ -3239,9 +3296,10 @@ mod durable_stop_tests {
                 current.title = "newer title".into();
                 current.clone()
             };
-            release_tx.send(()).unwrap();
-            let response =
-                tokio::time::timeout(std::time::Duration::from_secs(30), request).await??;
+            gate.release.take().unwrap().send(()).unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(30), &mut request)
+                .await?
+                .into_response();
             let expected = match case {
                 "deferred" => crate::daemon::ApiErrorCode::SandboxMigrationDeferred,
                 "failed" => crate::daemon::ApiErrorCode::SandboxMigrationFailed,
@@ -3274,7 +3332,7 @@ mod durable_stop_tests {
             }
             assert!(!public.contains(root.path().to_str().unwrap()));
             assert!(!public.contains("private-content"));
-            assert_eq!(std::fs::read(&private)?, b"private-content");
+            assert_eq!(std::fs::read(private)?, b"private-content");
             let instances = state.instances.read().await;
             let current = instances
                 .iter()
@@ -3291,7 +3349,6 @@ mod durable_stop_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn sandbox_migration_refusals_publish_known_sanitized_failures() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         for (deferred, target) in [
             (true, "start"),
             (false, "start"),
@@ -3300,64 +3357,16 @@ mod durable_stop_tests {
             (true, "container-terminal"),
             (false, "container-terminal"),
         ] {
-            let root = tempfile::tempdir()?;
-            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
-            crate::migrations::run_migrations()?;
-            crate::session::config::update_app_state(|state| {
-                state.has_acknowledged_agent_hooks = true;
-            })?;
-            crate::session::config::update_config(|config| {
-                config.systemd.enabled = false;
-                config.session.smart_rename = false;
-                config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
-            })?;
-            let _env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
-                .and_set("DOCKER_HOST", "unix:///var/run/docker.sock")
-                .and_set(
-                    "AOE_DEFER_SANDBOX_MIGRATION",
-                    if deferred { "1" } else { "" },
-                )
-                .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
-            let bin = root.path().join("bin");
-            std::fs::create_dir(&bin)?;
-            for runtime in ["docker", "podman", "container"] {
-                let path = bin.join(runtime);
-                std::fs::write(&path, "#!/bin/sh\ncase \"$*\" in *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\nexit 0\n")?;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-            }
-            let _path = crate::session::test_support::path_prepended(&bin);
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let mut raw = serde_json::to_value(Instance::new(
-                "migration refusal",
-                project.to_str().unwrap(),
-            ))?;
-            raw["tool"] = "codex".into();
-            raw["command"] = "codex".into();
-            raw["status"] = "stopped".into();
-            raw["sandbox_store_generation"] = 0.into();
-            raw["sandbox_info"] = serde_json::json!({
-                "enabled": true, "image": "test-image", "container_name": "migration",
-            });
-            let mut row: Instance = serde_json::from_value(raw)?;
-            row.source_profile = "default".into();
+            let fixture = MigrationFixture::new(if deferred { "deferred" } else { "failed" })?;
+            let root = &fixture.root;
+            let private = &fixture.private;
+            let source = private.parent().unwrap();
+            let cause = &fixture.cause;
+            let mut row = fixture.row.clone();
             if target == "restart" {
                 row.view = crate::session::View::Structured;
                 row.status = Status::Running;
             }
-            let source = root.path().join(".codex/sandbox").join(&row.id);
-            std::fs::create_dir_all(&source)?;
-            let private = source.join("config.toml");
-            std::fs::write(&private, b"private-content")?;
-            let cause = if deferred {
-                None
-            } else {
-                let blocker = root.path().join(".codex/sandbox-v2");
-                std::fs::write(&blocker, b"not-a-directory")?;
-                let error = std::fs::create_dir(blocker.join("child")).unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
-                Some(nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string())
-            };
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
                 vec![row.clone()],
