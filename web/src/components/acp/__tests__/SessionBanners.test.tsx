@@ -207,5 +207,6 @@ describe("StartupWaitLine", () => {
     act(() => vi.advanceTimersByTime(30_000));
     const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
+    expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
   });
 });
