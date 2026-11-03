@@ -274,7 +274,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
       if (policyRef.current.readOnly || !focusIntentMatches(detail, focusTarget, focusIndex)) return;
-      if (!focusSelf()) setPendingTerminalFocus(focusTarget, focusIndex);
+      // Latch the request's own index, so an indexless one stays open to any paired view.
+      if (!focusSelf()) setPendingTerminalFocus(focusTarget, detail.terminalIndex);
     };
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);

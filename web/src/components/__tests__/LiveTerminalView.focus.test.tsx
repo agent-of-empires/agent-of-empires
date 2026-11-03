@@ -79,4 +79,10 @@ describe("LiveTerminalView paired focus with two docked terminals", () => {
     const input = renderTwoPaired();
     await waitFor(() => expect(document.activeElement).toBe(input(2)));
   });
+
+  it("a focus request for any paired terminal, sent before either is ready, goes to the first ready", async () => {
+    const input = renderTwoPaired();
+    act(() => dispatchFocusTerminal("paired"));
+    await waitFor(() => expect(document.activeElement).toBe(input(1)));
+  });
 });
