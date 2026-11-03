@@ -217,6 +217,25 @@ describe("AssistantMessage thinking", () => {
     const reply = screen.getByText("Done.");
     expect(details!.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
+
+  it("renders each thought start as its own collapsed block", () => {
+    const rows: ActivityRow[] = [
+      { id: "thought-1", kind: "thinking", text: "Weighing PINEAPPLE-7", at: "2026-10-06T00:00:00Z" },
+      {
+        id: "thought-2",
+        kind: "thinking",
+        text: "Checking PINEAPPLE-8",
+        at: "2026-10-06T00:00:00Z",
+        messageStart: true,
+      },
+      { id: "msg-3", kind: "message", text: "Done.", at: "2026-10-06T00:00:00Z" },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    const blocks = container.querySelectorAll("details");
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].textContent).toContain("PINEAPPLE-7");
+    expect(blocks[1].textContent).toContain("PINEAPPLE-8");
+  });
 });
 
 describe("AssistantMessage table copy across an interrupted turn", () => {
