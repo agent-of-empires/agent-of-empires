@@ -842,6 +842,36 @@ describe("ensureTerminal", () => {
     offline();
     expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "offline" });
   });
+
+  describe("lifecycle_busy", () => {
+    const busy = () => json({ error: "lifecycle_busy", message: "busy" }, 409);
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("retries until the launch releases the reservation", async () => {
+      fetchSpy.mockResolvedValueOnce(busy()).mockResolvedValueOnce(busy()).mockResolvedValueOnce(empty());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await result).toEqual({ ok: true });
+      expect(fetchSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("gives the busy error back once the budget is spent", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      const calls = fetchSpy.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
+    it("does not retry other refusals", async () => {
+      fetchSpy.mockResolvedValueOnce(empty(500));
+      expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "Server error (500)" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 describe("startSession", () => {
   it.each([
