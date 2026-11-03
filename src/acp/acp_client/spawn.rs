@@ -186,7 +186,7 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
 /// AoE's own adapter defaults, applied below every explicit env layer so a
 /// user-set value always wins.
 pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    if config.spec.command != "claude-agent-acp" {
+    if std::path::Path::new(&config.spec.command).file_name() != Some("claude-agent-acp".as_ref()) {
         return Vec::new();
     }
     let display = config.claude_thinking_display;
@@ -776,8 +776,20 @@ mod tests {
             config
         };
         let explicit = || vec![(KEY.to_string(), "omitted".to_string())];
-        let cases: [(&str, SpawnConfig, Option<&str>); 6] = [
+        let cases: [(&str, SpawnConfig, Option<&str>); 7] = [
             ("default", base(), Some("summarized")),
+            (
+                "absolute path",
+                SpawnConfig {
+                    spec: crate::acp::AgentSpec::from_acp_cmd(
+                        "claude",
+                        "/opt/bin/claude-agent-acp",
+                    )
+                    .unwrap(),
+                    ..base()
+                },
+                Some("summarized"),
+            ),
             ("setting", omitted(base()), Some("omitted")),
             (
                 "codex",
