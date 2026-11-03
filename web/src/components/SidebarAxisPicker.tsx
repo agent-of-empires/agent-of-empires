@@ -44,7 +44,7 @@ export function SidebarAxisPicker({
 
   return (
     <div ref={ref} className="relative">
-      <Tooltip text={TOOLTIP[axis]}>
+      <Tooltip text={TOOLTIP[axis]} open={open ? false : undefined}>
         <button
           onClick={() => setOpen((o) => !o)}
           aria-haspopup="true"

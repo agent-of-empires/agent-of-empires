@@ -10,6 +10,7 @@ vi.mock("../api", () => ({
 
 import { hydrateWebUiStateFromServer, isSyncedKey } from "../webUiSync";
 import { configureStorageSync, safeRemoveItem, safeSetItem } from "../safeStorage";
+import { STATUS_COLLAPSE_PREFIX } from "../../hooks/useStatusGroups";
 
 beforeEach(() => {
   localStorage.clear();
@@ -59,6 +60,13 @@ describe("isSyncedKey", () => {
     ]) {
       expect(isSyncedKey(k), k).toBe(false);
     }
+  });
+});
+
+describe("status collapse keys", () => {
+  it("syncs the prefix the status axis writes collapse state under", () => {
+    expect(STATUS_COLLAPSE_PREFIX).toBe("aoe-status-collapsed-");
+    expect(isSyncedKey(`${STATUS_COLLAPSE_PREFIX}status:Waiting`)).toBe(true);
   });
 });
 

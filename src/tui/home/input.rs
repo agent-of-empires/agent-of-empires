@@ -3167,7 +3167,7 @@ impl HomeView {
                     .map(|g| crate::session::project_group_display_name(g).to_string())
             });
 
-        if prefill_path.is_some() || prefill_group.is_some() {
+        if prefill_path.is_some() || prefill_group.is_some() || self.selected_group.is_some() {
             let existing_groups: Vec<String> = self.all_group_paths();
             let current_profile = self
                 .profile_for_cursor(self.cursor)
