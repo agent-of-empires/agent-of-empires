@@ -87,8 +87,8 @@ pub(super) enum ConnectMode {
     Resume {
         acp_session_id: String,
         in_flight_turn: bool,
-        /// The same verified runner after a control loss still owns the turn,
-        /// so silence cannot end it.
-        live_recovery: bool,
+        /// Confirmation deadline for recovery of the same verified runner.
+        /// Once confirmed, replay and silence belong to the runner's live turn.
+        live_recovery: Option<tokio::time::Instant>,
     },
 }

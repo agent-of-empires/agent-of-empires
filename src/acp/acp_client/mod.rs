@@ -700,7 +700,7 @@ impl AcpClient {
         let mode = ConnectMode::Resume {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
-            live_recovery: false,
+            live_recovery: None,
         };
         Self::resume(spec, session_id, mode, deadline, launch_lease).await
     }
@@ -765,7 +765,7 @@ impl AcpClient {
         let mode = ConnectMode::Resume {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
-            live_recovery: true,
+            live_recovery: Some(deadline),
         };
         let mut client = Self::resume(
             spec,

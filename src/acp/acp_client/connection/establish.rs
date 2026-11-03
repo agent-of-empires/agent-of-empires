@@ -182,7 +182,7 @@ pub(super) async fn establish(
             live_recovery,
             ..
         } => (*in_flight_turn, *live_recovery),
-        ConnectMode::Fresh { .. } => (false, false),
+        ConnectMode::Fresh { .. } => (false, None),
     };
     shared
         .adopted_turn_active
@@ -225,7 +225,9 @@ pub(super) async fn establish(
         pending_prompts: VecDeque::new(),
     };
     session.acp_session_id = match ctx.mode {
-        ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,
+        ConnectMode::Resume { acp_session_id, .. } => {
+            session.resume(acp_session_id, live_recovery).await?
+        }
         ConnectMode::Fresh {
             stored_acp_session_id,
             seed_history_replay,
@@ -248,7 +250,7 @@ pub(super) async fn establish(
     };
     session.apply_default_model().await;
     session.apply_default_effort().await;
-    if adopted_turn && !live_recovery {
+    if adopted_turn && live_recovery.is_none() {
         spawn_resume_idle_watchdog(shared);
     }
     Ok(Some(session))
@@ -328,9 +330,18 @@ impl Session {
     /// The agent still owns the live session, so no load/new is sent. A prior
     /// daemon's reset may commit after our registry snapshot, so a runner's
     /// cached identity wins.
-    async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
+    async fn resume(
+        &self,
+        stored: String,
+        resume_by: Option<tokio::time::Instant>,
+    ) -> Result<SessionId, agent_client_protocol::Error> {
         let runner = match self.control.as_ref() {
-            Some(control) => control.resume_session().await?,
+            Some(control) => match resume_by {
+                Some(deadline) => tokio::time::timeout_at(deadline, control.resume_session())
+                    .await
+                    .map_err(|_| acp_internal_error("runner control resume timed out".into()))??,
+                None => control.resume_session().await?,
+            },
             None => stored.clone(),
         };
         info!(
@@ -350,7 +361,8 @@ impl Session {
                 })
                 .await;
         }
-        // Clears a sticky startup error in the UI; same-id is a no-op server-side.
+        // Confirmed replay must finish despite backpressure or the attempt deadline.
+        // Same-id assignment clears a sticky UI error without a server-side reset.
         let id = SessionId::from(runner);
         self.shared.commit_session(id.clone()).await?;
         Ok(id)
