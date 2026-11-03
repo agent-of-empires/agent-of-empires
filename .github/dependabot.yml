@@ -105,7 +105,7 @@ updates:
         applies-to: version-updates
         patterns:
           - "vitest"
-          - "@vitest/coverage-v8"
+          - "@vitest/*"
       web-minor-patch:
         patterns: ["*"]
         exclude-patterns:
