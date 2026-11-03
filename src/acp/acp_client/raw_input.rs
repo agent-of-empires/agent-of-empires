@@ -131,6 +131,27 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
     }
 }
 
+/// A successful `TaskStop`. Claude writes no `<task-notification>` for a task
+/// it killed, so the tool result is the only end signal.
+pub(super) fn background_task_stopped_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("TaskStop") {
+        return None;
+    }
+    let tr = cc.get("toolResponse")?;
+    if !tr
+        .get("message")?
+        .as_str()?
+        .starts_with("Successfully stopped task")
+    {
+        return None;
+    }
+    Some(Event::BackgroundTaskFinished {
+        task_id: tr.get("task_id")?.as_str()?.to_string(),
+        ended_at: Some(chrono::Utc::now()),
+    })
+}
+
 /// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
 /// `toolName: "Agent"` and a `toolResponse` whose `status` is
 /// `"async_launched"`. `agentId` is the only required field; anything else
@@ -213,6 +234,40 @@ mod tests {
             serde_json::json!({"stdout": "ok"})
         ))
         .is_none());
+    }
+
+    #[test]
+    fn task_stop_ends_the_task() {
+        let update = |tool: &str, response: serde_json::Value| serde_json::json!({"_meta": {"claudeCode": {"toolName": tool, "toolResponse": response}}});
+        let stopped = serde_json::json!({
+            "message": "Successfully stopped task: b21uzuute (cargo check)",
+            "task_id": "b21uzuute",
+        });
+        match background_task_stopped_from_value(&update("TaskStop", stopped.clone())) {
+            Some(Event::BackgroundTaskFinished { task_id, ended_at }) => {
+                assert_eq!(task_id, "b21uzuute");
+                assert!(ended_at.is_some());
+            }
+            other => panic!("expected BackgroundTaskFinished, got {other:?}"),
+        }
+        for (label, tool, response) in [
+            ("other tool", "Bash", stopped.clone()),
+            (
+                "not stopped",
+                "TaskStop",
+                serde_json::json!({"message": "No task found", "task_id": "b21uzuute"}),
+            ),
+            (
+                "no task id",
+                "TaskStop",
+                serde_json::json!({"message": "Successfully stopped task: x"}),
+            ),
+        ] {
+            assert!(
+                background_task_stopped_from_value(&update(tool, response)).is_none(),
+                "{label}"
+            );
+        }
     }
 
     #[test]

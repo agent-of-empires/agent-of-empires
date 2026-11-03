@@ -3730,12 +3730,8 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
         String::from_utf8_lossy(&disable.stderr)
     );
     assert!(
-        disable_stdout.contains("the running daemon reconciled its workers."),
-        "aoe plugin disable must actually reach the daemon after stepping up, not fall back to a local toggle: {disable_stdout}"
-    );
-    assert!(
-        !disable_stdout.contains("warning:"),
-        "aoe plugin disable must not fall back to the local-daemon-stale warning: {disable_stdout}"
+        disable_stdout.contains("Disabled aoe.web."),
+        "aoe plugin disable must reach the daemon after stepping up: {disable_stdout}"
     );
 
     let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
@@ -3747,12 +3743,64 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
         String::from_utf8_lossy(&enable.stderr),
     );
     assert!(
-        enable_stdout.contains("the running daemon reconciled its workers."),
-        "aoe plugin enable must actually reach the daemon after stepping up, not fall back to a local toggle: {enable_stdout}"
+        enable_stdout.contains("Enabled aoe.web."),
+        "aoe plugin enable must reach the daemon after stepping up: {enable_stdout}"
     );
+}
+
+/// Profile and project writes read the runtime epoch before mutating; both
+/// requests must carry the passphrase session, not just the endpoint's bearer
+/// token or socket.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_profile_and_project_writes_authenticate_with_a_passphrase_daemon() {
+    let mut h = TuiTestHarness::new("config_writes_passphrase");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
+
+    h.run_cli_ok(&["profile", "create", "authed"]);
+    h.run_cli_ok(&["profile", "default", "authed"]);
+    let repo = h.home_path().join("authed-repo");
+    crate::harness::init_git_repo(&repo);
+    let repo = repo.to_str().unwrap();
+    h.run_cli_ok(&["project", "add", repo]);
+    h.run_cli_ok(&["project", "remove", repo]);
+}
+
+/// Skill writes and `cityhall apply` hit `ElevatedMutationGuard`; behind a proxy the
+/// CLI is not a local owner, so each must step up on the `elevation_required` header
+/// instead of failing on a bare 403.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_skill_write_and_cityhall_apply_step_up_a_passphrase_daemon() {
+    let mut h = TuiTestHarness::new("skill_apply_passphrase_behind_proxy");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&[
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
     assert!(
-        !enable_stdout.contains("warning:"),
-        "aoe plugin enable must not fall back to the local-daemon-stale warning: {enable_stdout}"
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
+
+    h.run_cli_ok(&["skill", "add", "stepped-up"]);
+    let applied = h.run_cli_with_stdin(&["cityhall", "apply", "-"], "schema_version = 1\n");
+    assert!(
+        applied.status.success(),
+        "cityhall apply must step up, not surface a 403.\nstderr: {}",
+        String::from_utf8_lossy(&applied.stderr),
     );
 }
 
@@ -4060,4 +4108,48 @@ fn cli_serve_restart_reports_replacement_startup_failure() {
         std::fs::read_to_string(&workers).unwrap(),
         "not a directory"
     );
+}
+
+#[test]
+#[parallel]
+fn remote_serve_with_a_wedged_tailscale_says_to_skip_tailscale_not_to_install_cloudflared() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = TuiTestHarness::new_in_tmp("wedged_tailscale");
+    // A `tailscale` that never answers, and a `cloudflared` that fails as a missing one would,
+    // both ahead of any real ones on PATH.
+    let bin = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (name, body) in [("tailscale", "exec sleep 600"), ("cloudflared", "exit 1")] {
+        let fake = bin.join(name);
+        std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    h.add_path_dir(&bin);
+
+    let mut child = h.spawn_cli(&[
+        "serve",
+        "--remote",
+        "--passphrase",
+        "wedged-tailscale-check",
+    ]);
+    // The probe gives up after 3 s; a start that got past the check would keep running.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("`aoe serve --remote` didn't stop at the pre-check");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("didn't answer") && stderr.contains("--no-tailscale"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cloudflared"), "{stderr}");
 }

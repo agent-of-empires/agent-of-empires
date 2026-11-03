@@ -67,7 +67,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .get(&inst.id)
                 .cloned()
                 .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
-            let mut session = SessionResponse::from_instance_with_plan(
+            let mut session = session_response_from_instance_with_plan(
                 inst,
                 claude_fullscreen,
                 plan_summary,
