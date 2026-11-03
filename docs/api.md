@@ -63,8 +63,9 @@ without a token. To connect an agent, see
 
 Every tool declares an `outputSchema` and returns `structuredContent`. A refusal is a
 tool error (`isError`) whose `structuredContent` carries a `code`, such as
-`read_only`, `not_found`, `not_running`, `busy`, `invalid_request`,
-`parent_not_found`, `parent_is_sub_session` or `hooks_need_trust`, and a `message`.
+`read_only`, `not_found`, `not_running`, `busy` (retryable), `invalid_request`,
+`send_failed`, `internal`, `parent_not_found`, `parent_is_sub_session` or
+`hooks_need_trust`, and a `message`.
 `create_session` takes no hook-trust, callback, command-override, environment or
 fork fields, so repository hooks that need approval are refused with
 `hooks_need_trust` until someone trusts them in the dashboard.

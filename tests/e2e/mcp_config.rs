@@ -626,3 +626,63 @@ fn configured_mcp_respects_disabled_web_across_acquisition_and_reconnect() {
     assert_mcp_connects(&h);
     assert!(std::net::TcpStream::connect(("192.0.2.1", port)).is_err());
 }
+
+/// A terminal `create_session` with a prompt waits for the agent, then types the prompt into
+/// its pane, where `read_output` reads it back.
+#[test]
+#[parallel]
+fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("mcp_terminal_prompt");
+    // Stands in for `claude`: whatever is typed into its pane is echoed back.
+    let bin = h.home_path().join("fake-agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::harness::write_executable(&bin.join("claude"), "#!/bin/sh\nexec cat\n");
+    h.add_path_dir(&bin);
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let call = |name: &str, arguments: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+    };
+
+    block_on(async {
+        let create = call(
+            "create_session",
+            json!({
+                "path": h.project_path(), "tool": "claude", "title": "mcp-terminal",
+                "prompt": "typed-into-the-agent",
+            }),
+        );
+        let (status, body) = rpc(&url, &[], create).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = &body["result"]["structuredContent"];
+        assert_eq!(created["prompt_delivery"], "sent", "{body}");
+        assert_eq!(created["prompt_sent"], true, "{body}");
+        let id = created["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let read = call("read_output", json!({"session_id": id, "lines": 20}));
+            let (_, body) = rpc(&url, &[], read).await;
+            let text = body["result"]["structuredContent"]["text"]
+                .as_str()
+                .unwrap_or("");
+            if text.contains("typed-into-the-agent") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prompt never reached the pane: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+}
