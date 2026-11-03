@@ -46,16 +46,18 @@ impl ExpectedAgent {
         command
             .split_whitespace()
             .find_map(|token| {
-                let basename = token
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(token)
-                    .to_ascii_lowercase();
-                let stem = basename
-                    .strip_suffix(".exe")
-                    .or_else(|| basename.strip_suffix(".cmd"))
-                    .or_else(|| basename.strip_suffix(".bat"))
-                    .unwrap_or(&basename);
+                let basename = token.rsplit(['/', '\\']).next().unwrap_or(token);
+                // Windows extensions fold case; the name itself stays exact.
+                let stem = match basename.rsplit_once('.') {
+                    Some((stem, ext))
+                        if ["exe", "cmd", "bat"]
+                            .iter()
+                            .any(|e| ext.eq_ignore_ascii_case(e)) =>
+                    {
+                        stem
+                    }
+                    _ => basename,
+                };
                 match stem {
                     "claude-agent-acp" => Some(Self::ClaudeAgentAcp),
                     "codex-acp" => Some(Self::CodexAcp),
@@ -610,6 +612,10 @@ mod tests {
         }
         assert_eq!(
             ExpectedAgent::from_command("unknown-bin"),
+            ExpectedAgent::Other
+        );
+        assert_eq!(
+            ExpectedAgent::from_command("CLAUDE-AGENT-ACP"),
             ExpectedAgent::Other
         );
     }
