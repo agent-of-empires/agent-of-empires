@@ -461,7 +461,9 @@ impl Session {
             info!(target: "acp.protocol", session = %label, stored_id = %stored, "resuming session via session/load");
             // Set before sending: the adapter replays history during the load.
             // An import (#2276) has an empty store and wants the replay.
-            if !seed_history_replay {
+            if seed_history_replay {
+                self.shared.seed_user_replay.store(true, Ordering::Relaxed);
+            } else {
                 self.shared
                     .suppress_history_replay
                     .store(true, Ordering::Relaxed);
