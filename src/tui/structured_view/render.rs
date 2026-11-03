@@ -1376,6 +1376,20 @@ fn transcript_lines(
                 out.push(Line::default());
                 continue;
             }
+            TranscriptRowKind::Thinking => {
+                let group = &row.group_id;
+                let mut text = String::new();
+                while i < rows.len()
+                    && rows[i].kind == TranscriptRowKind::Thinking
+                    && &rows[i].group_id == group
+                {
+                    text.push_str(&rows[i].text);
+                    i += 1;
+                }
+                out.push(thinking_preview_line(&text));
+                out.push(Line::default());
+                continue;
+            }
             TranscriptRowKind::UserPrompt => {
                 // Note attachments so an image-only prompt doesn't look empty.
                 let mut text = match &row.origin_plugin {
@@ -1452,6 +1466,24 @@ fn transcript_lines(
         )));
     }
     out
+}
+
+/// One dim preview per thought: the TUI has no expansion state to show it all.
+fn thinking_preview_line(text: &str) -> Line<'static> {
+    const MAX_CHARS: usize = 120;
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut preview: String = first.chars().take(MAX_CHARS).collect();
+    if preview.len() < text.trim().len() {
+        preview.push('…');
+    }
+    Line::from(Span::styled(
+        format!("· Thinking: {preview}"),
+        Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+    ))
 }
 
 fn is_tool_terminal(kind: TranscriptRowKind) -> bool {
@@ -2377,6 +2409,34 @@ mod tests {
             "{out:?}"
         );
         assert!(out.contains("Building now"), "{out:?}");
+    }
+
+    /// #5088: each thought renders as one truncated preview line.
+    #[test]
+    fn thoughts_render_one_preview_line_each() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let long = "é".repeat(130);
+        let mut t = AcpTranscript::new("s-1");
+        t.server_rows = server_rows(&[
+            thought("Weighing ", "t-a"),
+            thought("options\nsecond line", "t-a"),
+            thought(&long, "t-b"),
+        ]);
+        let lines: Vec<String> = transcript_lines(&t, &Theme::default(), None)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .filter(|line: &String| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "· Thinking: Weighing options…".to_string(),
+                format!("· Thinking: {}…", "é".repeat(120)),
+            ]
+        );
     }
 
     #[test]

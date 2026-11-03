@@ -344,7 +344,13 @@ pub(super) fn map_update_to_events(
             }],
             other => vec![raw_event(&other)],
         },
-        SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Event::AgentThoughtChunk {
+                text: text.text,
+                message_id: chunk.message_id.map(|id| id.0.to_string()),
+            }],
+            _ => vec![Event::ThinkingStarted],
+        },
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty rather than "null" without raw_input (#1713).
@@ -697,6 +703,25 @@ mod tests {
                 message_id: None,
                 ..
             }
+        ));
+    }
+
+    /// #5088: a text thought keeps its text and id; other content only
+    /// signals thinking.
+    #[test]
+    fn agent_thought_chunk_keeps_text_and_message_id() {
+        use agent_client_protocol::schema::v1::ImageContent;
+        let thought = |content| SessionUpdate::AgentThoughtChunk(ContentChunk::new(content));
+        let text = ContentChunk::new(ContentBlock::Text(TextContent::new("hmm"))).message_id("m-1");
+        let events = claude(SessionUpdate::AgentThoughtChunk(text));
+        assert!(
+            matches!(events.as_slice(), [Event::AgentThoughtChunk { text, message_id }] if text == "hmm" && message_id.as_deref() == Some("m-1")),
+            "{events:?}"
+        );
+        let image = ContentBlock::Image(ImageContent::new("BASE64IMG", "image/png"));
+        assert!(matches!(
+            claude(thought(image)).as_slice(),
+            [Event::ThinkingStarted]
         ));
     }
 
@@ -1207,6 +1232,13 @@ mod tests {
             (
                 Event::AgentMessageChunk {
                     text: "Compacting...".into(),
+                    message_id: None,
+                },
+                true,
+            ),
+            (
+                Event::AgentThoughtChunk {
+                    text: "hmm".into(),
                     message_id: None,
                 },
                 true,

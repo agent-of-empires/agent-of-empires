@@ -63,7 +63,7 @@ const STOP_CASES = [
       { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Reasoning about the problem..." } },
       HOLD,
     ],
-    marker: "ThinkingStarted",
+    marker: "AgentThoughtChunk",
   },
   {
     name: "running a tool",

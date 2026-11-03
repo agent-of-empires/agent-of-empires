@@ -2489,6 +2489,18 @@
       "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
     },
     {
+      "id": "acp.thinking-row",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Summarized model thinking renders as a collapsed Thinking block in place among the reply's parts; adjacent chunks join, and a server-marked new thought or any other part splits them. Folding and grouping are covered by Rust transcript tests."
+    },
+    {
       "id": "acp.copy-message-markdown",
       "kind": "mocked-playwright",
       "risk": "low",
