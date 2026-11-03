@@ -50,6 +50,7 @@ fn spawn_config(
     }
     SpawnConfig {
         launch_lease: None,
+        claude_thinking_display: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

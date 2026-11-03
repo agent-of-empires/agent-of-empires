@@ -24,6 +24,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
     let shim = shim_path();
     SpawnConfig {
         launch_lease: None,
+        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),

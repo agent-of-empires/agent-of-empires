@@ -14,6 +14,7 @@ use crate::common::{shim_node, shim_path, shim_ready};
 fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
+        claude_thinking_display: Default::default(),
         wrapper_substitution: None,
         agent_key: "pi".into(),
         tool: "pi".into(),
