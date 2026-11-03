@@ -321,6 +321,48 @@ pub(crate) fn trashed_worktree_location_is_verified(inst: &Instance) -> bool {
         .any(|entry| entry.path == path && entry.branch.as_deref() == Some(info.branch.as_str()))
 }
 
+pub(crate) fn trashed_worktree_paths_are_missing(inst: &Instance) -> bool {
+    if !inst.is_trashed() || !is_managed_single_worktree(inst) {
+        return false;
+    }
+    let current = Path::new(&inst.project_path);
+    let original = inst
+        .pre_trash_project_path
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(current);
+    if !current.is_absolute()
+        || !original.is_absolute()
+        || (inst.pre_trash_project_path.is_none() && is_holding_path(current, &inst.id))
+    {
+        return false;
+    }
+    let Some(holding) = trash_holding_path(original, &inst.id) else {
+        return false;
+    };
+    let missing = |path: &Path| {
+        let mut candidate = path.components().as_path();
+        let mut absent = false;
+        loop {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(metadata) => return absent && metadata.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    absent = true;
+                    let Some(parent) = candidate.parent() else {
+                        return false;
+                    };
+                    candidate = parent;
+                }
+                Err(_) => return false,
+            }
+        }
+    };
+    // A missing leaf below a dangling link is not proven absence.
+    missing(current)
+        && (original == current || missing(original))
+        && (holding == current || holding == original || missing(&holding))
+}
+
 /// Recover a proven holding move while the caller owns a retried Trash transition.
 pub(crate) fn recover_trashed_worktree_move(inst: &mut Instance) -> Option<RelocateOutcome> {
     let ReconcilePlan::PointAtHolding { holding, original } = plan_trashed_reconcile(inst) else {

@@ -727,8 +727,9 @@ another lifecycle action.
 For an unfinished Trash transition, `aoe rm <id>` retries Trash even when
 `session.delete_to_trash` is disabled. `--purge` never performs this recovery.
 A terminal teardown or relocation failure leaves the session in Trash without
-preventing explicit Restore or Purge. Unconfirmed retained locations remain
-protected until a subsequent Trash request confirms them.
+preventing explicit Restore or Purge. A retry also settles the transition when
+all known worktree paths are proven absent. Unverified existing paths, unknown
+original locations, and filesystem lookup errors keep the transition protected.
 
 ## Explicit structured worker stop
 

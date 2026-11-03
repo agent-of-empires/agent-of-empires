@@ -808,17 +808,8 @@ pub async fn trash_session(
         let outcome = match &stopped {
             Ok(()) => {
                 let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
-                let outcome = if retrying && !matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
+                if retrying && !matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
                     crate::session::trash::recover_trashed_worktree_move(&mut instance).unwrap_or(outcome)
-                } else {
-                    outcome
-                };
-                if retrying && matches!(outcome, crate::session::trash::RelocateOutcome::Skipped)
-                    && !crate::session::trash::trashed_worktree_location_is_verified(&instance)
-                {
-                    crate::session::trash::RelocateOutcome::Failed {
-                        reason: "Retained worktree location is unproven; Trash transition remains unfinished".into(),
-                    }
                 } else {
                     outcome
                 }
@@ -832,7 +823,15 @@ pub async fn trash_session(
         };
         let terminal = !retrying
             || matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. })
-            || crate::session::trash::trashed_worktree_location_is_verified(&instance);
+            || crate::session::trash::trashed_worktree_location_is_verified(&instance)
+            || crate::session::trash::trashed_worktree_paths_are_missing(&instance);
+        let outcome = if retrying && !terminal && matches!(outcome, crate::session::trash::RelocateOutcome::Skipped) {
+            crate::session::trash::RelocateOutcome::Failed {
+                reason: "Retained worktree location is unproven; Trash transition remains unfinished".into(),
+            }
+        } else {
+            outcome
+        };
         store.update(|rows, _| {
             if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
                 let relocation = crate::session::trash::TrashRelocation {
