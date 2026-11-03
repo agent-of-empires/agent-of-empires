@@ -329,6 +329,39 @@ describe("read-only policy", () => {
   });
 });
 
+describe("transport reason", () => {
+  it("keeps the reason only while on the snapshot fallback", () => {
+    const { result, ws } = mount();
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    expect(result.current.state).toMatchObject({ transport: "snapshot", transportReason: "pipe_owned" });
+
+    ws.deliver({ type: "transport", grid: false });
+    expect(result.current.state).toMatchObject({ transport: "snapshot", transportReason: null });
+
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    ws.deliver({ type: "transport", grid: true });
+    expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
+  });
+
+  it("drops the previous connection's transport and reason when a replacement socket opens", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(result.current.state.transportReason).toBe("pipe_owned");
+
+      act(() => result.current.manualReconnect());
+      FakeWS.sockets[1]!.open();
+      expect(result.current.state).toMatchObject({ transport: null, transportReason: null });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("size owner", () => {
   it("claims a vacant lock on open and waits for the owner verdict", () => {
     const { result, ws } = mount();
