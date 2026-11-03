@@ -1961,6 +1961,54 @@ time.sleep(60)
             .contains(&("HOOK_VALUE".into(), "kept".into())));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn declared_codex_wrapper_dir_controls_spawn_environment_and_native_mcp() {
+        let (_home, temp) = isolate_home();
+        let account = temp.path().join("account");
+        let daemon_codex = dirs::home_dir().unwrap().join(".codex-work");
+        std::fs::create_dir_all(account.join(".codex-work")).unwrap();
+        std::fs::create_dir_all(&daemon_codex).unwrap();
+        std::fs::write(
+            account.join(".codex-work/config.toml"),
+            "[mcp_servers.account]\ncommand = \"account\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            daemon_codex.join("config.toml"),
+            "[mcp_servers.daemon]\ncommand = \"daemon\"\n",
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'HOME={}\\n'\"\n\
+                 [session.agent_detect_as]\nwork-codex = \"codex\"\n\
+                 [session.agent_config_dir]\nwork-codex = \"~/.codex-work\"\n",
+                account.display()
+            ),
+        )
+        .unwrap();
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("codex-wrapper");
+        request.agent = "work-codex".into();
+        request.tool = "work-codex".into();
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+
+        assert_eq!(mcp_names(&config.mcp_servers), ["account"]);
+        assert_eq!(
+            config
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CODEX_HOME")
+                .map(|(_, value)| value.as_str()),
+            account.join(".codex-work").to_str()
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn claude_route_distinguishes_implicit_explicit_and_custom_stores() {
