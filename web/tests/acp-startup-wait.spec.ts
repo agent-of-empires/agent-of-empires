@@ -71,7 +71,11 @@ test("a running Worker with no stored Agent session shows no startup line while 
   const mock = await mockAcpSession(page, {
     title: "story-running-cleared",
     workerState: "running",
-    initialEvents: [{ UserPromptSent: { text: "hi", prompt_id: "p1" } }, agentMessageChunk("hello")],
+    initialEvents: [
+      { AcpSessionAssigned: { acp_session_id: "acp-after-new" } },
+      { UserPromptSent: { text: "hi", prompt_id: "p1" } },
+      agentMessageChunk("hello"),
+    ],
   });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));

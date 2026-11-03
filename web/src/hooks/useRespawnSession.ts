@@ -22,7 +22,12 @@ interface RespawnSnapshot {
   detail: string | null;
 }
 
-export function useRespawnSession(sessionId: string, resetKey: string | null = null) {
+export function useRespawnSession(
+  sessionId: string,
+  resetKey: string | null = null,
+  /** Restart instead: stop the Worker or its start in progress, then start a replacement. */
+  { restart = false }: { restart?: boolean } = {},
+) {
   const [snapshot, setSnapshot] = useState<RespawnSnapshot>({
     resetKey,
     incident: 0,
@@ -50,7 +55,7 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
       );
     settle("retrying", null);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/${restart ? "restart" : "spawn"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
@@ -60,6 +65,11 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
         return true;
       }
       const body = failureText(await res.text().catch(() => ""));
+      // Another Device's restart is already doing this one's job.
+      if (restart && res.status === 409 && body.startsWith("restart_in_progress")) {
+        settle("ok", null);
+        return true;
+      }
       settle("failed", `Server returned ${res.status}. ${body.slice(0, 200)}`.trim(), body);
       return false;
     } catch (e) {

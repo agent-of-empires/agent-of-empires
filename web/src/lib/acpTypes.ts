@@ -561,6 +561,8 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** `session/new` or `session/load` answered, so the Agent's session exists. */
+  sessionAssigned: boolean;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -902,6 +904,7 @@ export function emptyAcpState(): AcpState {
     activity: [],
     optimisticRows: [],
     lastSeq: 0,
+    sessionAssigned: false,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1195,6 +1198,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("AcpSessionAssigned" in event) {
+    next.sessionAssigned = true;
     next.startupError = null;
     next.lastError = null;
     next.incompatibleAgent = null;
