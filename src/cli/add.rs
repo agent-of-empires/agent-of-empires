@@ -2262,6 +2262,42 @@ mod tests {
 
         #[tokio::test]
         #[serial]
+        async fn add_refuses_a_sub_session_as_parent() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut child =
+                        crate::session::Instance::new("child", project.path().to_str().unwrap());
+                    child.id = "child-id".to_string();
+                    child.parent_session_id = Some("top-id".into());
+                    *rows = vec![child];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--parent",
+                "child-id",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("sessions nest one level deep")
+                .to_string();
+            assert_eq!(
+                msg,
+                "Cannot create sub-session of a sub-session (single level only)"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn add_refuses_a_fork_child_under_another_agent() {
             let root = tempfile::tempdir().unwrap();
             let _guard = crate::session::test_support::isolate_app_dir_at(root.path());

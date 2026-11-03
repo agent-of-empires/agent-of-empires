@@ -10387,13 +10387,22 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
     child.id = "child".into();
     child.source_profile = "test".into();
     child.parent_session_id = Some("parent".into());
+    let mut trashed = Instance::new("trashed", "/tmp/aoe-trashed");
+    trashed.id = "trashed".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    crate::session::Storage::new_unwatched("other").unwrap();
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-elsewhere");
+    elsewhere.id = "other-parent".into();
+    elsewhere.source_profile = "other".into();
     crate::server::test_support::seed_instances_on_disk_for_test(
         "test",
-        vec![parent.clone(), child.clone()],
+        vec![parent.clone(), child.clone(), trashed.clone()],
     );
+    crate::server::test_support::seed_instances_on_disk_for_test("other", vec![elsewhere.clone()]);
     let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
     let state = crate::server::test_support::build_test_app_state_impl(
-        vec![parent, child],
+        vec![parent, child, trashed, elsewhere],
         Vec::new(),
         Vec::new(),
         None,
@@ -10406,6 +10415,9 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
     // (parent, refusal code, or None when created in the parent's group)
     let cases = [
         ("missing", Some("parent_not_found")),
+        // Another profile's session can't parent one created in this profile.
+        ("other-parent", Some("parent_not_found")),
+        ("trashed", Some("parent_not_found")),
         ("child", Some("parent_is_sub_session")),
         ("parent", None),
     ];
@@ -10421,7 +10433,7 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
         if let Some(code) = refusal {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {session}");
             assert_eq!(session["error"], code, "{parent_id}");
-            assert_eq!(state.instances.read().await.len(), 2, "{parent_id}");
+            assert_eq!(state.instances.read().await.len(), 4, "{parent_id}");
             continue;
         }
         assert_eq!(status, StatusCode::CREATED, "{parent_id}: {session}");

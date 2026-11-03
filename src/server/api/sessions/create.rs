@@ -995,14 +995,22 @@ pub(crate) async fn create_session_with(
 
     // A sub-session lives in its parent's group, as `aoe add --parent` places it.
     if let Some(parent_id) = body.parent_session_id.as_deref() {
-        // CityHall answers a terminal parent like a missing one, so the mode does not
-        // reveal which ids exist.
+        // The parent must be a live session in the profile this one is created in, as
+        // the CLI resolves it; the sidebar links parents by (profile, id). CityHall
+        // answers a terminal parent like a missing one, so the mode does not reveal
+        // which ids exist.
+        let profile = body.profile.as_deref().unwrap_or(&default_profile);
         let parent = state
             .instances
             .read()
             .await
             .iter()
-            .find(|i| i.id == parent_id && (!state.cityhall_mode || i.is_structured()))
+            .find(|i| {
+                i.id == parent_id
+                    && i.source_profile == profile
+                    && !i.is_trashed()
+                    && (!state.cityhall_mode || i.is_structured())
+            })
             .cloned();
         let Some(parent) = parent else {
             return api_error(
