@@ -1437,6 +1437,48 @@ mod tests {
         }
     }
 
+    /// A runner drops its control channel when a frame write takes over 2 s,
+    /// so a stalled save must not stop the drain reading the next frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
+        let (sink, store, _rx, tmp) = channel_sink();
+        let sup = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = sup.test_install_stdio(id).await;
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(64);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx.send(Event::ThinkingStarted).await.unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect("the drain must keep reading frames while a save is stalled");
+
+        // Closing the stream lets the drain take every frame before the flush.
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must end once its stream closes")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<u64> = store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, Event::ThinkingStarted))
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<u64>>(),
+            "every frame is stored once, in order"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_context_ack_does_not_publish_later_native_assignments() {

@@ -3032,11 +3032,11 @@ mod tests {
         let service = state.session_service.clone();
 
         // Publish through the real choke point.
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         assert!(
             sink.publish_persisted(
                 "sess-mid-turn",

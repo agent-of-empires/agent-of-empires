@@ -59,13 +59,115 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn delete_attachments_for_seq(&self, _session_id: &str, _seq: u64) {}
 }
 
+/// Publications queued for the writer thread. A worker's drain blocks only
+/// when this many are waiting, so a slow save does not stall its socket.
+const WRITE_QUEUE_CAPACITY: usize = 4096;
+
 /// The production sink: persist to the event store, fold the control cache,
-/// then broadcast.
+/// then broadcast, in seq order on one writer thread.
 pub struct ChannelSink {
-    pub tx: broadcast::Sender<crate::server::AcpBroadcastFrame>,
-    pub event_store: Arc<EventStore>,
+    persister: Arc<Persister>,
+    jobs: Option<std::sync::mpsc::SyncSender<Job>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+struct Persister {
+    tx: broadcast::Sender<crate::server::AcpBroadcastFrame>,
+    event_store: Arc<EventStore>,
     /// Live control-state projection read by prompt dispatch.
-    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+}
+
+struct Publication {
+    session_id: String,
+    seq: u64,
+    event: Event,
+    worker_generation: Option<u64>,
+    persisted: Option<std::sync::mpsc::SyncSender<bool>>,
+}
+
+enum Job {
+    Publish(Box<Publication>),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+impl ChannelSink {
+    pub fn new(
+        tx: broadcast::Sender<crate::server::AcpBroadcastFrame>,
+        event_store: Arc<EventStore>,
+        control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    ) -> Self {
+        let persister = Arc::new(Persister {
+            tx,
+            event_store,
+            control_cache,
+        });
+        let (jobs, queue) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
+        let worker = Arc::clone(&persister);
+        let writer = std::thread::Builder::new()
+            .name("acp-event-writer".into())
+            .spawn(move || {
+                for job in queue {
+                    worker.run(job);
+                }
+            })
+            .map_err(|e| {
+                tracing::warn!(target: "acp.event_store", "event writer thread failed to start; writing inline: {e}")
+            })
+            .ok();
+        Self {
+            persister,
+            jobs: writer.is_some().then_some(jobs),
+            writer,
+        }
+    }
+
+    /// Queue `job` behind earlier publications; run it inline if the writer is gone.
+    fn submit(&self, job: Job) {
+        use std::sync::mpsc::TrySendError;
+        let Some(jobs) = &self.jobs else {
+            return self.persister.run(job);
+        };
+        let job = match jobs.try_send(job) {
+            Ok(()) => return,
+            Err(TrySendError::Disconnected(job)) => job,
+            Err(TrySendError::Full(job)) => {
+                tracing::warn!(target: "acp.event_store", "event write queue full; waiting for the writer");
+                match blocking_io(|| jobs.send(job)) {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::SendError(job)) => job,
+                }
+            }
+        };
+        self.persister.run(job);
+    }
+
+    /// Wait until every earlier publication is stored and broadcast.
+    pub(super) fn flush(&self) {
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        self.submit(Job::Flush(done));
+        let _ = blocking_io(|| wait.recv());
+    }
+
+    fn store(&self) -> &EventStore {
+        &self.persister.event_store
+    }
+
+    /// Reads that must see this sink's earlier publications.
+    fn flushed_store(&self) -> &EventStore {
+        self.flush();
+        self.store()
+    }
+}
+
+impl Drop for ChannelSink {
+    /// Let the writer store what is queued before the sink goes away.
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
 }
 
 impl BroadcastSink for ChannelSink {
@@ -73,37 +175,56 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
+    /// Queued, not awaited: the drain reading the worker's socket must not
+    /// wait on SQLite.
     fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
-        self.publish_tagged(session_id, seq, event, Some(generation));
+        self.submit(Job::Publish(Box::new(Publication {
+            session_id: session_id.to_string(),
+            seq,
+            event: event.clone(),
+            worker_generation: Some(generation),
+            persisted: None,
+        })));
     }
 
     fn clear_session_events(&self, session_id: &str) {
-        self.event_store.delete_session(session_id);
-        self.control_cache.forget(session_id);
+        self.flushed_store().delete_session(session_id);
+        self.persister.control_cache.forget(session_id);
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
-        self.publish_tagged(session_id, seq, event, None)
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        self.submit(Job::Publish(Box::new(Publication {
+            session_id: session_id.to_string(),
+            seq,
+            event: event.clone(),
+            worker_generation: None,
+            persisted: Some(done),
+        })));
+        blocking_io(|| wait.recv()).unwrap_or(false)
     }
 
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_approval_nonces(session_id)
+        self.flushed_store().unresolved_approval_nonces(session_id)
     }
 
     fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_elicitation_nonces(session_id)
+        self.flushed_store()
+            .unresolved_elicitation_nonces(session_id)
     }
 
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
-        self.event_store.unresolved_background_agent_ids(session_id)
+        self.flushed_store()
+            .unresolved_background_agent_ids(session_id)
     }
 
     fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
-        self.event_store.unresolved_background_task_ids(session_id)
+        self.flushed_store()
+            .unresolved_background_task_ids(session_id)
     }
 
     fn unresolved_background_task_launches(&self, session_id: &str) -> Vec<BackgroundTaskLaunch> {
-        self.event_store
+        self.flushed_store()
             .unresolved_background_task_launches(session_id)
     }
 
@@ -111,16 +232,16 @@ impl BroadcastSink for ChannelSink {
         &self,
         session_id: &str,
     ) -> Vec<UnresolvedBackgroundAgentLaunch> {
-        self.event_store
+        self.flushed_store()
             .unresolved_background_agent_launches(session_id)
     }
 
     fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {
-        blocking_io(|| self.event_store.record_attachment(session_id, seq, blob))
+        blocking_io(|| self.store().record_attachment(session_id, seq, blob))
     }
 
     fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
-        blocking_io(|| self.event_store.delete_attachments_for_seq(session_id, seq))
+        blocking_io(|| self.store().delete_attachments_for_seq(session_id, seq))
     }
 }
 
@@ -140,7 +261,28 @@ fn inheritable_rate_limit_reset(
     previous?.resets_at.filter(|resets_at| *resets_at > now)
 }
 
-impl ChannelSink {
+impl Persister {
+    fn run(&self, job: Job) {
+        match job {
+            Job::Publish(publication) => {
+                let Publication {
+                    session_id,
+                    seq,
+                    event,
+                    worker_generation,
+                    persisted,
+                } = *publication;
+                let stored = self.publish_tagged(&session_id, seq, &event, worker_generation);
+                if let Some(persisted) = persisted {
+                    let _ = persisted.send(stored);
+                }
+            }
+            Job::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+
     fn publish_tagged(
         &self,
         session_id: &str,
