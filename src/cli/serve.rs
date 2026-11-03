@@ -2295,11 +2295,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let ready = dir.path().join("ready");
             let mut child = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "trap '{trap}' TERM; touch '{}'; while :; do sleep 0.05; done",
-                    ready.display()
-                ))
+                .args([
+                    "-c",
+                    r#"trap "$2" TERM; touch "$1"; while :; do sleep 0.05; done"#,
+                    "sh",
+                ])
+                .arg(&ready)
+                .arg(trap)
                 .spawn()
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
