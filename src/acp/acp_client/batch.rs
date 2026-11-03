@@ -4,7 +4,7 @@
 
 use agent_client_protocol::{RawJsonRpcMessage, TransportFrame};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
@@ -17,8 +17,10 @@ struct Batches {
     next: u64,
     /// Request id (as JSON text) to the batch awaiting its reply.
     owner: HashMap<String, u64>,
-    /// Oldest first: replies with a null id go to the oldest batch awaiting one.
-    open: BTreeMap<u64, Open>,
+    open: HashMap<u64, Open>,
+    /// Who is owed each `id: null` reply, in the order the SDK answers them:
+    /// a batch, or `None` for a standalone line.
+    anonymous_queue: VecDeque<Option<u64>>,
 }
 
 struct Open {
@@ -72,7 +74,10 @@ async fn split_incoming<R: AsyncRead + Unpin>(
                 items.iter().map(Value::to_string).collect()
             }
             // An empty array is not a batch; the SDK answers it with one error.
-            _ => vec![line],
+            _ => {
+                track_standalone(&state, &line);
+                vec![line]
+            }
         };
         for single in singles {
             if to_sdk
@@ -140,6 +145,24 @@ fn track_requests(state: &Shared, items: &[Value]) {
     for id in named {
         batches.owner.insert(id, batch);
     }
+    batches
+        .anonymous_queue
+        .extend(std::iter::repeat_n(Some(batch), anonymous));
+}
+
+/// A line outside any batch can also owe an `id: null` reply.
+fn track_standalone(state: &Shared, line: &str) {
+    let owes_null_reply = match serde_json::from_str::<Value>(line.trim()) {
+        Ok(Value::Array(_)) | Err(_) => true,
+        Ok(value) => matches!(expected_reply(&value), Expect::Anonymous),
+    };
+    if owes_null_reply {
+        state
+            .lock()
+            .expect("batch state poisoned")
+            .anonymous_queue
+            .push_back(None);
+    }
 }
 
 async fn group_outgoing<W: AsyncWrite + Unpin>(
@@ -182,13 +205,15 @@ fn claim_reply(state: &Shared, reply: Value) -> Claimed {
     let mut batches = state.lock().expect("batch state poisoned");
     let batch = match reply.get("id") {
         None => return Claimed::Single,
-        // ponytail: a null-id reply to a non-batch line sent while a batch
-        // awaits one can be grouped into that batch.
         Some(id) if id.is_null() => {
-            let Some((&batch, _)) = batches.open.iter().find(|(_, open)| open.anonymous > 0) else {
+            let Some(Some(batch)) = batches.anonymous_queue.pop_front() else {
                 return Claimed::Single;
             };
-            batches.open.get_mut(&batch).expect("found").anonymous -= 1;
+            batches
+                .open
+                .get_mut(&batch)
+                .expect("queued batch is open")
+                .anonymous -= 1;
             batch
         }
         Some(id) => {
@@ -346,6 +371,40 @@ mod tests {
         })
         .await;
         assert!(released.is_ok(), "the agent's stdout was never released");
+    }
+
+    #[tokio::test]
+    async fn a_standalone_null_id_error_is_not_grouped_into_a_later_batch() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, agent_side_in) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(wrap(agent_out, agent_in));
+        let agent = async move {
+            // `[]` is answered with one error; the batch owes its own.
+            let input = "[]\n[{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x/unknown\"}]\n";
+            agent_side_out.write_all(input.as_bytes()).await.unwrap();
+            let mut replies = BufReader::new(agent_side_in).lines();
+            let standalone = read_value(&mut replies).await;
+            assert_eq!(standalone["error"]["code"], -32600, "{standalone}");
+            let grouped = read_value(&mut replies).await;
+            let entries = grouped
+                .as_array()
+                .expect("the batch is answered as one array");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["error"]["code"], -32601, "{grouped}");
+        };
+        let client = Client.v1().connect_with(
+            ByteStreams::new(write.compat_write(), read.compat()),
+            async |_cx| {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok(())
+            },
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, agent)
+        })
+        .await
+        .expect("both replies arrive");
+        result.unwrap();
     }
 
     #[tokio::test]
