@@ -215,6 +215,7 @@ async fn auth_status_is_cleared_per_adapter_process() {
     let reattach = ConnectMode::Resume {
         acp_session_id: "s-auth".into(),
         in_flight_turn: false,
+        live_recovery: false,
     };
     let cases = [
         ("silent replacement", fresh(), false, vec![false]),

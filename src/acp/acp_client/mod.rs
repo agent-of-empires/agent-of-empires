@@ -40,6 +40,7 @@ mod watchdog;
 
 pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
+pub(crate) use control::ControlLoss;
 pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
@@ -124,6 +125,20 @@ pub struct AcpClient {
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
+    control_loss: Option<Arc<std::sync::OnceLock<control::ControlLoss>>>,
+    reattach: Option<Box<ReattachSpec>>,
+}
+
+/// What dialing the same runner again needs; resume sends no session/new or load.
+#[derive(Clone)]
+struct ReattachSpec {
+    socket_path: PathBuf,
+    cwd: PathBuf,
+    additional_dirs: Vec<PathBuf>,
+    sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+    agent_key: String,
+    source_profile: Option<String>,
+    claude_home: Option<PathBuf>,
 }
 
 impl Drop for AcpClient {
@@ -258,6 +273,8 @@ impl Launch {
             connection_shutdown: shutdown,
             connection_task: std::sync::Mutex::new(Some(task)),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, ready_rx)
     }
@@ -280,6 +297,8 @@ impl AcpClient {
             connection_shutdown: tokio_util::sync::CancellationToken::new(),
             connection_task: std::sync::Mutex::new(None),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, event_tx)
     }
@@ -534,10 +553,20 @@ impl AcpClient {
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client =
-                Self::connect_via_socket(socket_path, launch(sandbox, &native_store), None).await?;
+            let launch = launch(sandbox, &native_store);
+            let reattach = ReattachSpec {
+                socket_path: socket_path.clone(),
+                cwd: launch.cwd.clone(),
+                additional_dirs: launch.additional_dirs.clone(),
+                sandbox: launch.sandbox.clone(),
+                agent_key: config.agent_key.clone(),
+                source_profile: launch.source_profile.clone(),
+                claude_home: launch.claude_home.clone(),
+            };
+            let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;
+            client.reattach = Some(Box::new(reattach));
             return Ok(client);
         }
 
@@ -621,12 +650,14 @@ impl AcpClient {
         // Shuts the runner channel down if the handshake fails or is dropped.
         let mut handshake_control = ShutdownControlOnDrop(Some(control.clone()));
         let install_binary = launch.install_binary.clone();
+        let control_loss = control.loss_handle();
         let runner = RunnerLink {
             control,
             terminal_claim,
             prompt_in_flight,
         };
-        let (client, ready_rx) = launch.start(events, transport, None, Some(runner));
+        let (mut client, ready_rx) = launch.start(events, transport, None, Some(runner));
+        client.control_loss = Some(control_loss);
         if let Err(error) =
             wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await
         {
@@ -657,38 +688,96 @@ impl AcpClient {
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
     ) -> Result<Self, AcpError> {
-        // The binary name keeps the compatibility gate active on reattach; an
-        // unknown agent maps to `Other` anyway.
-        let install_binary = crate::acp::AgentRegistry::with_defaults()
-            .get(&agent_key)
-            .map(|spec| spec.command.clone())
-            .unwrap_or_default();
-        let launch = Launch {
-            session_id,
-            mode: ConnectMode::Resume {
-                acp_session_id: stored_acp_session_id,
-                in_flight_turn,
-            },
+        let spec = ReattachSpec {
+            socket_path,
             cwd,
             additional_dirs,
             sandbox,
-            profile: agent_profiles::resolve(&agent_key),
-            install_binary,
+            agent_key,
             source_profile,
+            claude_home,
+        };
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn,
+            live_recovery: false,
+        };
+        Self::resume(spec, session_id, mode, deadline, launch_lease).await
+    }
+
+    async fn resume(
+        spec: ReattachSpec,
+        session_id: AcpSessionId,
+        mode: ConnectMode,
+        deadline: Option<tokio::time::Instant>,
+        launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
+    ) -> Result<Self, AcpError> {
+        // The binary name keeps the compatibility gate active on reattach; an
+        // unknown agent maps to `Other` anyway.
+        let install_binary = crate::acp::AgentRegistry::with_defaults()
+            .get(&spec.agent_key)
+            .map(|agent| agent.command.clone())
+            .unwrap_or_default();
+        let launch = Launch {
+            session_id,
+            mode,
+            cwd: spec.cwd.clone(),
+            additional_dirs: spec.additional_dirs.clone(),
+            sandbox: spec.sandbox.clone(),
+            profile: agent_profiles::resolve(&spec.agent_key),
+            install_binary,
+            source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
             default_effort: None,
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
-            claude_home,
+            claude_home: spec.claude_home.clone(),
             cancellation: launch_lease
                 .as_ref()
                 .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
                     lease.cancellation().child_token()
                 }),
         };
-        Self::connect_via_socket(socket_path, launch, deadline).await
+        let mut client =
+            Self::connect_via_socket(spec.socket_path.clone(), launch, deadline).await?;
+        client.reattach = Some(Box::new(spec));
+        Ok(client)
+    }
+
+    /// Set once the runner side ended this client's control channel.
+    pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
+        self.control_loss.as_ref()?.get().copied()
+    }
+
+    /// Dial the same runner again after [`Self::control_loss`]. Succeeds only
+    /// once the runner has resumed its session; the caller bounds the whole
+    /// attempt with `deadline`.
+    pub(crate) async fn reattach(
+        &self,
+        stored_acp_session_id: String,
+        in_flight_turn: bool,
+        deadline: tokio::time::Instant,
+        launch_lease: crate::acp::runner_lifecycle::Lease,
+    ) -> Result<Self, AcpError> {
+        let spec = *self.reattach.clone().ok_or(AcpError::NotRunning)?;
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn,
+            live_recovery: true,
+        };
+        let mut client = Self::resume(
+            spec,
+            self.session_id.clone(),
+            mode,
+            Some(deadline),
+            Some(launch_lease),
+        )
+        .await?;
+        client.runner_pid = self.runner_pid;
+        client.native_store = self.native_store.clone();
+        Ok(client)
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {

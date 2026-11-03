@@ -355,6 +355,7 @@ pub(super) async fn run_connection_task<W, R>(
         ),
     );
 
+    let control_for_report = control.clone();
     let establish_ctx = establish::EstablishCtx {
         shared: shared.clone(),
         control: control.clone(),
@@ -394,8 +395,9 @@ pub(super) async fn run_connection_task<W, R>(
         )
         .await;
 
+    let control_lost = control_for_report.is_some_and(|control| control.lost());
     if let Err(e) = &result {
-        report_connection_error(e, &shared, &ready_tx).await;
+        report_connection_error(e, &shared, &ready_tx, control_lost).await;
     } else {
         info!(target: "acp.protocol", session = %label, "ACP connection task ended cleanly");
     }
@@ -426,6 +428,7 @@ async fn report_connection_error(
     e: &agent_client_protocol::Error,
     shared: &Shared,
     ready_tx: &ReadyTx,
+    control_lost: bool,
 ) {
     let label = &shared.session_label;
     let event_tx = &shared.event_tx;
@@ -455,6 +458,8 @@ async fn report_connection_error(
             None => AcpError::Spawn(message),
         };
         let _ = tx.send(Err(err));
+    } else if control_lost {
+        // The supervisor decides between reattaching and reporting the loss.
     } else if let Some(info) = rate_limit {
         info!(
             target: "acp.protocol",

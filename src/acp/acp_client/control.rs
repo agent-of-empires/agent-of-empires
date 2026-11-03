@@ -7,7 +7,7 @@ use agent_client_protocol::schema::v1::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -44,6 +44,17 @@ pub(super) struct DaemonControlClient {
     /// [`PromptCompletedMarker`], or until one of the reader's relays fails.
     settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
     raw_fd: RawFd,
+    closed_locally: Arc<AtomicBool>,
+    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+}
+
+/// The runner side ended a channel this daemon did not close. The runner may
+/// still be alive and attachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlLoss {
+    /// `None` for a clean EOF.
+    pub(crate) io_error: Option<std::io::ErrorKind>,
+    pub(crate) turn_in_flight: bool,
 }
 
 type LocalOutcome = (
@@ -129,8 +140,17 @@ async fn shim_write_line_releasing(
 
 impl DaemonControlClient {
     pub(super) fn shutdown(&self) {
+        self.closed_locally.store(true, AtomicOrdering::Release);
         // SAFETY: `self` keeps this exact socket alive for the call.
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
+    }
+
+    pub(super) fn lost(&self) -> bool {
+        self.loss.get().is_some()
+    }
+
+    pub(super) fn loss_handle(&self) -> Arc<std::sync::OnceLock<ControlLoss>> {
+        Arc::clone(&self.loss)
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
@@ -360,7 +380,27 @@ pub(super) async fn connect_runner_control_v3(
     let reader_correlation = correlation.clone();
     let ingress = Arc::new(SessionIngress::default());
     let reader_ingress = ingress.clone();
+    let closed_locally = Arc::new(AtomicBool::new(false));
+    let loss = Arc::new(std::sync::OnceLock::new());
+    let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
     tokio::spawn(async move {
+        let record_loss = |io_error| {
+            if reader_closed_locally.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            let loss = ControlLoss {
+                io_error,
+                turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
+            };
+            warn!(
+                target: "acp.protocol",
+                session = %reader_session,
+                io_error = ?loss.io_error,
+                turn_in_flight = loss.turn_in_flight,
+                "runner closed the control channel"
+            );
+            let _ = reader_loss.set(loss);
+        };
         async {
             loop {
             match control_protocol::read_frame_with_size(&mut read_half).await {
@@ -514,15 +554,24 @@ pub(super) async fn connect_runner_control_v3(
                     }
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => return,
-                Err(e) => {
-                    debug!(
-                        target: "acp.protocol",
-                        session = %reader_session,
-                        "runner control read ended: {e}"
-                    );
+                Ok(None) => {
+                    record_loss(None);
                     return;
                 }
+                Err(e) => match e.downcast_ref::<std::io::Error>() {
+                    Some(io) => {
+                        record_loss(Some(io.kind()));
+                        return;
+                    }
+                    None => {
+                        warn!(
+                            target: "acp.protocol",
+                            session = %reader_session,
+                            "undecodable runner control frame: {e}"
+                        );
+                        return;
+                    }
+                },
             }
         }
         }
@@ -686,6 +735,8 @@ pub(super) async fn connect_runner_control_v3(
             completion,
             settled,
             raw_fd,
+            closed_locally,
+            loss,
         }),
         crate_side,
     ))

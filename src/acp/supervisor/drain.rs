@@ -21,10 +21,14 @@ use super::{
     Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
     RESTART_WINDOW,
 };
-use crate::acp::acp_client::{AcpError, SpawnConfig};
+use crate::acp::acp_client::{AcpClient, AcpError, ControlLoss, SpawnConfig};
 use crate::acp::runner_lifecycle::{
-    InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
+    InstallError, Lease, LifecycleTable, PrimeOwnership, ProcessControl, RunnerIdentity,
 };
+
+/// Bounds recovery of a live runner whose control channel closed.
+const CONTROL_REATTACH_ATTEMPTS: u32 = 3;
+const CONTROL_REATTACH_DEADLINE: Duration = Duration::from_secs(3);
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry;
 
@@ -150,6 +154,12 @@ impl<S: BroadcastSink> Drain<S> {
                 lock_recover(&self.startup_failures).insert(self.session_id.clone());
                 self.drop_handle(&lease, None).await;
                 return;
+            }
+            if !end.agent_unresponsive {
+                if let Some(next_inbound) = self.recover_control_loss(&lease).await {
+                    inbound = next_inbound;
+                    continue;
+                }
             }
             let Some(config) = self.approve_respawn(&lease).await else {
                 return;
@@ -409,6 +419,188 @@ impl<S: BroadcastSink> Drain<S> {
             &self.session_id,
             "the worker that was tracking this sub-agent stopped; tracking stopped",
         );
+    }
+
+    /// A runner that closed only its control channel still owns its agent and
+    /// turn, so dial it again under the same lease rather than replace it.
+    /// Reports the loss when the worker cannot be recovered that way.
+    async fn recover_control_loss(&self, lease: &Lease) -> Option<mpsc::Receiver<Event>> {
+        let (client, loss) = {
+            let workers = self.workers.lock().await;
+            let handle = workers
+                .get(&self.session_id)
+                .filter(|handle| handle.lease == *lease)?;
+            if matches!(&handle.kind, WorkerKind::Runner { spawn_config } if spawn_config.uses_native_prime())
+            {
+                return None;
+            }
+            (Arc::clone(&handle.client), handle.client.control_loss()?)
+        };
+        let reattached = self.reattach_same_runner(lease, &client, loss).await;
+        if reattached.is_none() && !worker_registry::stop_requested(&self.session_id) {
+            if loss.turn_in_flight {
+                self.publish(Event::Stopped {
+                    reason: "runner_control_lost".into(),
+                });
+            }
+            self.publish(Event::AgentStartupError {
+                message: "ACP connection failed: runner control channel closed".into(),
+            });
+        }
+        reattached
+    }
+
+    async fn reattach_same_runner(
+        &self,
+        lease: &Lease,
+        lost: &Arc<AcpClient>,
+        loss: ControlLoss,
+    ) -> Option<mpsc::Receiver<Event>> {
+        let session_id = &self.session_id;
+        if lease.prime() != PrimeOwnership::NotPrime {
+            return None;
+        }
+        let identity = lock_recover(&self.lifecycle)
+            .running(session_id)
+            .filter(|(current, _)| current == lease)
+            .and_then(|(_, identity)| identity)
+            .filter(|identity| identity.birth_fingerprint.is_some())?;
+        if !self.admit_reattach(lease).await {
+            return None;
+        }
+        for attempt in 1..=CONTROL_REATTACH_ATTEMPTS {
+            if worker_registry::stop_requested(session_id) {
+                return None;
+            }
+            let record = match worker_registry::load_strict(session_id) {
+                Ok(Some(record))
+                    if identity.owns_record(&record)
+                        && worker_registry::is_record_live(&record) =>
+                {
+                    record
+                }
+                _ => {
+                    info!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        pid = identity.pid,
+                        "runner that lost its control channel is gone or replaced; not reattaching"
+                    );
+                    return None;
+                }
+            };
+            let stored_acp_session_id = record.stored_acp_session_id?;
+            let deadline = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
+            let attempt_result = tokio::time::timeout_at(
+                deadline,
+                lost.reattach(
+                    stored_acp_session_id,
+                    loss.turn_in_flight,
+                    deadline,
+                    lease.clone(),
+                ),
+            )
+            .await
+            .unwrap_or(Err(AcpError::AttachTimedOut));
+            match attempt_result {
+                Ok(next) => {
+                    return self
+                        .install_reattached(lease, identity, lost, next, loss)
+                        .await
+                }
+                Err(error) => warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    attempt,
+                    %error,
+                    "reattach after control channel loss failed"
+                ),
+            }
+            tokio::time::sleep(RESPAWN_BACKOFF).await;
+        }
+        None
+    }
+
+    /// Reattaches share the respawn budget, so a channel that keeps closing
+    /// ends in the ordinary park.
+    async fn admit_reattach(&self, lease: &Lease) -> bool {
+        let mut workers = self.workers.lock().await;
+        let Some(handle) = workers
+            .get_mut(&self.session_id)
+            .filter(|handle| handle.lease == *lease)
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        handle
+            .restart_history
+            .retain(|t| *t >= now - RESTART_WINDOW);
+        if handle.restart_history.len() as u32 >= MAX_RESPAWNS_IN_WINDOW {
+            return false;
+        }
+        handle.restart_history.push(now);
+        true
+    }
+
+    async fn install_reattached(
+        &self,
+        lease: &Lease,
+        identity: RunnerIdentity,
+        lost: &Arc<AcpClient>,
+        mut client: AcpClient,
+        loss: ControlLoss,
+    ) -> Option<mpsc::Receiver<Event>> {
+        let session_id = &self.session_id;
+        let inbound = client.take_inbound()?;
+        let client = Arc::new(client);
+        lease.retirement().replace_client(lost, &client);
+        let installed = {
+            let mut workers = self.workers.lock().await;
+            let current = !worker_registry::stop_requested(session_id)
+                && lock_recover(&self.lifecycle)
+                    .running(session_id)
+                    .is_some_and(|(current, running)| {
+                        current == *lease && running == Some(identity)
+                    });
+            match workers
+                .get_mut(session_id)
+                .filter(|handle| current && handle.lease == *lease)
+            {
+                Some(handle) => {
+                    handle.client = Arc::clone(&client);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !installed {
+            // Whatever won owns the runner; release only this channel.
+            let _ = client.shutdown().await;
+            return None;
+        }
+        // The runner settled the lost channel's reverse calls, and the lost
+        // connection's tailers ended with it.
+        super::publish::cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
+        let resumable = super::publish::collect_resumable_background_agent_launches(
+            &*self.sink,
+            &self.next_seqs,
+            session_id,
+        );
+        let open_tasks = self.sink.unresolved_background_task_launches(session_id);
+        if !resumable.is_empty() {
+            let _ = client.resume_background_tailing(resumable).await;
+        }
+        if !open_tasks.is_empty() {
+            let _ = client.resume_task_tailing(open_tasks).await;
+        }
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            pid = identity.pid,
+            turn_in_flight = loss.turn_in_flight,
+            "reattached to the same runner after its control channel closed"
+        );
+        Some(inbound)
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
@@ -2452,5 +2644,310 @@ mod tests {
             .await
             .expect("drain should stop")
             .unwrap();
+    }
+
+    /// Losing only the control channel of a live runner mid-turn reattaches
+    /// that runner and lets its turn finish, through a stalled attempt, a
+    /// second loss and a silence past the resume-idle grace. A dead runner,
+    /// an undecodable frame or a stop keeps the replacement or stop path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn control_channel_loss_reattaches_only_a_verified_live_runner() {
+        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
+        use std::os::unix::process::CommandExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::sync::oneshot;
+
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Loss {
+            LiveRunner,
+            DeadRunner,
+            Undecodable,
+            Stopped,
+        }
+        let _grace = crate::session::test_support::EnvGuard::set(&[
+            ("AOE_RESUME_IDLE_GRACE_MS", "100"),
+            ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "10"),
+        ]);
+        for case in [
+            Loss::LiveRunner,
+            Loss::DeadRunner,
+            Loss::Undecodable,
+            Loss::Stopped,
+        ] {
+            let (_home, tmp) = isolate_home();
+            let id = "s-control-loss";
+            let native = "native-control-loss";
+            let socket = tmp.path().join("runner.sock");
+            let listener = tokio::net::UnixListener::bind(
+                crate::process::worker::control_socket_sibling(&socket),
+            )
+            .unwrap();
+            let mut runner = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let record = worker_registry::WorkerRecord::new(
+                id.into(),
+                runner.id(),
+                socket.clone(),
+                "test-agent-acp".into(),
+                "test-agent".into(),
+                tmp.path().into(),
+                None,
+                vec![],
+                vec![],
+                Some(native.into()),
+                None,
+            )
+            .with_generation(7);
+            let identity = RunnerIdentity::from_record(&record);
+            assert!(identity.birth_fingerprint.is_some());
+            worker_registry::save(&record).unwrap();
+
+            // Connection 0 carries the prompt and is severed mid-turn. On a
+            // live runner, 1 withholds SessionReady, 2 resumes and is severed
+            // again, and 3 resumes, stays silent, then completes the turn.
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let (started_tx, started_rx) = oneshot::channel();
+            let (sever_tx, sever_rx) = oneshot::channel::<()>();
+            let (withheld_tx, withheld_rx) = oneshot::channel();
+            let (sever_again_tx, sever_again_rx) = oneshot::channel::<()>();
+            let (resumed_tx, resumed_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let peer = tokio::spawn({
+                let accepts = Arc::clone(&accepts);
+                async move {
+                    let mut started_tx = Some(started_tx);
+                    let mut sever_rx = Some(sever_rx);
+                    let mut withheld_tx = Some(withheld_tx);
+                    let mut sever_again_rx = Some(sever_again_rx);
+                    let mut resumed_tx = Some(resumed_tx);
+                    let mut release_rx = Some(release_rx);
+                    let write = |body| control_protocol::encode_frame(&body).unwrap();
+                    let ready = || ControlBody::SessionReady {
+                        acp_session_id: native.into(),
+                        result: serde_json::json!({}),
+                    };
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let connection = accepts.fetch_add(1, Ordering::SeqCst);
+                        stream
+                            .write_all(&write(ControlBody::Hello {
+                                control_protocol_version:
+                                    control_protocol::CONTROL_PROTOCOL_VERSION,
+                                session_id: id.into(),
+                            }))
+                            .await
+                            .unwrap();
+                        while let Ok(Some(frame)) = control_protocol::read_frame(&mut stream).await
+                        {
+                            match (frame, connection) {
+                                (ControlBody::Attach { .. }, _) => {}
+                                (ControlBody::Initialize { .. }, _) => {
+                                    let init = ControlBody::Initialized {
+                                        result: serde_json::json!({
+                                            "protocolVersion": 1, "agentCapabilities": {}
+                                        }),
+                                    };
+                                    stream.write_all(&write(init)).await.unwrap();
+                                }
+                                (ControlBody::ResumeSession, 0) => {
+                                    stream.write_all(&write(ready())).await.unwrap();
+                                }
+                                (ControlBody::Prompt { .. }, 0) => {
+                                    let started = ControlBody::PromptStarted { prompt_req_id: 77 };
+                                    stream.write_all(&write(started)).await.unwrap();
+                                    started_tx.take().unwrap().send(()).unwrap();
+                                    sever_rx.take().unwrap().await.unwrap();
+                                    if case == Loss::Undecodable {
+                                        stream.write_all(&[0, 0, 0, 1, b'{']).await.unwrap();
+                                        while let Ok(Some(_)) =
+                                            control_protocol::read_frame(&mut stream).await
+                                        {
+                                        }
+                                    }
+                                    break;
+                                }
+                                (ControlBody::ResumeSession, 1) => {
+                                    while let Ok(Some(_)) =
+                                        control_protocol::read_frame(&mut stream).await
+                                    {
+                                    }
+                                    withheld_tx.take().unwrap().send(()).unwrap();
+                                    break;
+                                }
+                                (ControlBody::ResumeSession, 2) => {
+                                    stream.write_all(&write(ready())).await.unwrap();
+                                    sever_again_rx.take().unwrap().await.unwrap();
+                                    break;
+                                }
+                                (ControlBody::ResumeSession, 3) => {
+                                    stream.write_all(&write(ready())).await.unwrap();
+                                    resumed_tx.take().unwrap().send(()).unwrap();
+                                    release_rx.take().unwrap().await.unwrap();
+                                    let chunk = ControlBody::Notify {
+                                        method: "session/update".into(),
+                                        params: serde_json::json!({
+                                            "sessionId": native,
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": {"type": "text", "text": "original turn completed"}
+                                            }
+                                        }),
+                                    };
+                                    let completed = ControlBody::PromptCompleted {
+                                        prompt_req_id: 77,
+                                        outcome: PromptOutcome::Completed {
+                                            stop_reason: Some("end_turn".into()),
+                                        },
+                                    };
+                                    stream.write_all(&write(chunk)).await.unwrap();
+                                    stream.write_all(&write(completed)).await.unwrap();
+                                }
+                                (frame, connection) => {
+                                    panic!("unexpected frame on connection {connection}: {frame:?}")
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let sink = VecSink::new();
+            let control = Arc::new(ObservedProcessControl::default());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let sup = Supervisor::new(sink.clone())
+                .with_process_control(control.clone())
+                .with_launcher(Arc::new({
+                    let launches = Arc::clone(&launches);
+                    move |_, _| {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Err(AcpError::Spawn("replacement refused".into())) })
+                    }
+                }));
+            let mut client = AcpClient::attach(
+                socket.clone(),
+                tmp.path().into(),
+                vec![],
+                native.into(),
+                false,
+                AcpSessionId(id.into()),
+                None,
+                "test-agent".into(),
+                None,
+                Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let inbound = client.take_inbound().unwrap();
+            let kind = WorkerKind::Runner {
+                spawn_config: Box::new(runner_config(socket.clone())),
+            };
+            let lease = sup
+                .test_install_handle(id, client, kind, Some(identity))
+                .await;
+            let current = || async { Arc::clone(&sup.workers.lock().await[id].client) };
+            let first = current().await;
+            // Launches register their client for retirement, as here.
+            lease.retirement().record_client(&first, false);
+            let drain = sup.start_drain_task(id.into(), lease, inbound, None);
+            first.send_prompt("run the tests", &[]).await.unwrap();
+            started_rx.await.unwrap();
+            match case {
+                Loss::DeadRunner => {
+                    runner.kill().unwrap();
+                    runner.wait().unwrap();
+                }
+                Loss::Stopped => {
+                    worker_registry::request_stop(&record).unwrap();
+                }
+                Loss::LiveRunner | Loss::Undecodable => {}
+            }
+            sever_tx.send(()).unwrap();
+
+            let events = || {
+                sink.frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, _, event)| event.clone())
+                    .collect::<Vec<_>>()
+            };
+            let progress = || {
+                format!(
+                    "replacement launches={}, stops={:?}, control connections={}",
+                    launches.load(Ordering::SeqCst),
+                    stopped_reasons(&sink, id),
+                    accepts.load(Ordering::SeqCst)
+                )
+            };
+            if case == Loss::LiveRunner {
+                let within = Duration::from_secs(10);
+                tokio::time::timeout(within, withheld_rx)
+                    .await
+                    .unwrap_or_else(|_| panic!("no bounded reattach attempt: {}", progress()))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + within;
+                while Arc::ptr_eq(&first, &current().await) {
+                    assert!(std::time::Instant::now() < deadline, "{}", progress());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                sever_again_tx.send(()).unwrap();
+                tokio::time::timeout(within, resumed_rx)
+                    .await
+                    .unwrap_or_else(|_| panic!("no second reattach: {}", progress()))
+                    .unwrap();
+                // Longer than the shortened resume-idle grace, with no events.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                release_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + within;
+                // Only the reattached runner's real completion carries this chunk.
+                while !events().iter().any(|event| {
+                    matches!(event,
+                    Event::AgentMessageChunk { text, .. } if text == "original turn completed")
+                }) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the original turn never completed: {}",
+                        progress()
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(launches.load(Ordering::SeqCst), 0, "no replacement");
+                assert_eq!(accepts.load(Ordering::SeqCst), 4);
+                assert!(control.signals().is_empty(), "{:?}", control.signals());
+                assert_eq!(stopped_reasons(&sink, id), ["prompt_complete"]);
+                assert!(!events()
+                    .iter()
+                    .any(|event| matches!(event, Event::AgentStartupError { .. })));
+                assert_eq!(sup.running_identity(id), Some(identity));
+                sup.detach_all().await;
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), drain)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case:?}: drain did not settle"))
+                    .unwrap();
+                assert_eq!(accepts.load(Ordering::SeqCst), 1, "{case:?}: no reattach");
+                assert_eq!(
+                    launches.load(Ordering::SeqCst),
+                    usize::from(case != Loss::Stopped),
+                    "{case:?}"
+                );
+                let stops = stopped_reasons(&sink, id);
+                assert_eq!(
+                    stops.contains(&"runner_control_lost".to_string()),
+                    case == Loss::DeadRunner,
+                    "{case:?}: {stops:?}"
+                );
+            }
+            peer.abort();
+            let _ = runner.kill();
+            let _ = runner.wait();
+        }
     }
 }

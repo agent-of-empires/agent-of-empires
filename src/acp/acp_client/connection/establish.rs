@@ -176,16 +176,17 @@ pub(super) async fn establish(
             "agent supports _session/steering; mid-turn prompts will be injected into the running turn"
         );
     }
-    let arm_resume_watchdog = matches!(
-        &ctx.mode,
+    let (adopted_turn, live_recovery) = match &ctx.mode {
         ConnectMode::Resume {
-            in_flight_turn: true,
+            in_flight_turn,
+            live_recovery,
             ..
-        }
-    );
+        } => (*in_flight_turn, *live_recovery),
+        ConnectMode::Fresh { .. } => (false, false),
+    };
     shared
         .adopted_turn_active
-        .store(arm_resume_watchdog, Ordering::Relaxed);
+        .store(adopted_turn, Ordering::Relaxed);
     info!(
         target: "acp.protocol",
         session = %label,
@@ -195,8 +196,8 @@ pub(super) async fn establish(
     );
     // Ready now: session/load can replay a whole transcript and must stay
     // outside the handshake timeout (#2276).
-    if let Some(tx) = ctx.ready_tx.lock().await.take() {
-        let _ = tx.send(Ok(()));
+    if !live_recovery {
+        signal_ready(&ctx.ready_tx).await;
     }
 
     let mcp_servers = mcp_config::filter_for_capabilities(
@@ -245,12 +246,21 @@ pub(super) async fn establish(
                 .await?
         }
     };
+    if live_recovery {
+        signal_ready(&ctx.ready_tx).await;
+    }
     session.apply_default_model().await;
     session.apply_default_effort().await;
-    if arm_resume_watchdog {
+    if adopted_turn && !live_recovery {
         spawn_resume_idle_watchdog(shared);
     }
     Ok(Some(session))
+}
+
+async fn signal_ready(ready_tx: &ReadyTx) {
+    if let Some(tx) = ready_tx.lock().await.take() {
+        let _ = tx.send(Ok(()));
+    }
 }
 
 /// Fallback when an adopted turn neither completes nor shows activity, so the
