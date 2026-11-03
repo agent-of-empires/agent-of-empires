@@ -106,6 +106,7 @@ updates:
         patterns:
           - "vitest"
           - "@vitest/*"
+        update-types: ["major"]
       web-minor-patch:
         patterns: ["*"]
         exclude-patterns:
