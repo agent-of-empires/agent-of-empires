@@ -127,8 +127,15 @@ describe("status collapse sync write", () => {
     try {
       initWebUiSync();
       safeSetItem(`${STATUS_COLLAPSE_PREFIX}status:Waiting`, "1");
+      expect(patchWebUiState).not.toHaveBeenCalled();
+      safeSetItem(`${STATUS_COLLAPSE_PREFIX}status:Idle`, "1");
+      expect(patchWebUiState).not.toHaveBeenCalled();
       vi.advanceTimersByTime(400);
-      expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-status-collapsed-status:Waiting": "1" });
+      expect(patchWebUiState).toHaveBeenCalledTimes(1);
+      expect(patchWebUiState).toHaveBeenCalledWith({
+        "aoe-status-collapsed-status:Waiting": "1",
+        "aoe-status-collapsed-status:Idle": "1",
+      });
     } finally {
       vi.useRealTimers();
     }
