@@ -511,7 +511,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e:#}")))
         })?;
         let mcp_servers = resolve_mcp_servers(
-            native,
+            discovery_key(req.sandbox_info.is_some(), &req.agent, native),
             &req.session_id,
             req.source_profile.clone(),
             req.cwd.clone(),
@@ -1378,6 +1378,16 @@ pub(super) fn apply_claude_store_pin(
     }
 }
 
+/// The agent key native MCP discovery reads. A sandbox applies no directory override, so the
+/// base key would read a different account's store than the wrapper the container launches.
+pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str) -> &'a str {
+    if sandboxed {
+        agent
+    } else {
+        native
+    }
+}
+
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
@@ -1964,34 +1974,7 @@ time.sleep(60)
     #[tokio::test]
     #[serial_test::serial]
     async fn declared_codex_wrapper_dir_controls_spawn_environment_and_native_mcp() {
-        let (_home, temp) = isolate_home();
-        let account = temp.path().join("account");
-        let daemon_codex = dirs::home_dir().unwrap().join(".codex-work");
-        std::fs::create_dir_all(account.join(".codex-work")).unwrap();
-        std::fs::create_dir_all(&daemon_codex).unwrap();
-        std::fs::write(
-            account.join(".codex-work/config.toml"),
-            "[mcp_servers.account]\ncommand = \"account\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            daemon_codex.join("config.toml"),
-            "[mcp_servers.daemon]\ncommand = \"daemon\"\n",
-        )
-        .unwrap();
-        let app_dir = crate::session::get_app_dir().unwrap();
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            format!(
-                "[host_hooks]\nbefore_session = \"printf 'HOME={}\\n'\"\n\
-                 [session.agent_detect_as]\nwork-codex = \"codex\"\n\
-                 [session.agent_config_dir]\nwork-codex = \"~/.codex-work\"\n",
-                account.display()
-            ),
-        )
-        .unwrap();
-
+        let (_home, _temp, account) = codex_wrapper_fixture();
         let supervisor = Supervisor::new(VecSink::new());
         let mut request = spawn_request("codex-wrapper");
         request.agent = "work-codex".into();
@@ -2007,6 +1990,12 @@ time.sleep(60)
                 .map(|(_, value)| value.as_str()),
             account.join(".codex-work").to_str()
         );
+    }
+
+    #[test]
+    fn sandbox_discovery_keeps_the_agent_key() {
+        assert_eq!(discovery_key(false, "work-codex", "codex"), "codex");
+        assert_eq!(discovery_key(true, "work-codex", "codex"), "work-codex");
     }
 
     #[test]
