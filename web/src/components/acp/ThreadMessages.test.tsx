@@ -233,6 +233,8 @@ describe("AssistantMessage thinking", () => {
     const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
     const blocks = container.querySelectorAll("details");
     expect(blocks).toHaveLength(2);
+    expect(blocks[0].open).toBe(false);
+    expect(blocks[1].open).toBe(false);
     expect(blocks[0].textContent).toContain("PINEAPPLE-7");
     expect(blocks[1].textContent).toContain("PINEAPPLE-8");
   });
