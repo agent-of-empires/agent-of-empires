@@ -101,6 +101,11 @@ updates:
           - "tailwindcss"
           - "@tailwindcss/*"
         update-types: ["minor", "patch"]
+      vitest:
+        applies-to: version-updates
+        patterns:
+          - "vitest"
+          - "@vitest/coverage-v8"
       web-minor-patch:
         patterns: ["*"]
         exclude-patterns:
