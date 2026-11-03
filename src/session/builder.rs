@@ -622,6 +622,18 @@ impl WorkspacePlan {
     }
 }
 
+/// Why [`build_instance`] refused before doing any work, typed so a remote
+/// caller can name the cause without the text.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildRefusal {
+    #[error("Container runtime is not installed. Please install a supported runtime to use sandbox mode.")]
+    RuntimeNotInstalled,
+    #[error("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.")]
+    RuntimeNotRunning,
+    #[error("Project path does not exist: {0}")]
+    WorkingDirMissing(String),
+}
+
 /// Build an instance with all setup (worktree resolution, sandbox config).
 ///
 /// This does NOT start the instance or create Docker containers - that happens
@@ -689,10 +701,10 @@ pub(crate) fn plan_instance(
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
-            bail!("Container runtime is not installed. Please install a supported runtime to use sandbox mode.");
+            return Err(BuildRefusal::RuntimeNotInstalled.into());
         }
         if !runtime.is_daemon_running() {
-            bail!("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.");
+            return Err(BuildRefusal::RuntimeNotRunning.into());
         }
     }
 
@@ -907,7 +919,7 @@ pub(crate) fn plan_instance(
     if !params.scratch && matches!(provisioning, Provisioning::None) {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
-            bail!("Project path does not exist: {}", final_path);
+            return Err(BuildRefusal::WorkingDirMissing(final_path.to_string()).into());
         }
         if !final_path_buf.is_dir() {
             bail!("Project path is not a directory: {}", final_path);
@@ -1320,8 +1332,7 @@ pub mod structured {
             "" => config.session.resolve_tool_command(choice.tool),
             command => command.to_string(),
         };
-        if let Some(ovr) =
-            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        if let Some(ovr) = crate::acp::supervisor::command_override_for_spawn(choice.tool, &command)
         {
             crate::acp::supervisor::apply_agent_command_override(
                 agent,

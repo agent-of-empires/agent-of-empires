@@ -143,7 +143,7 @@ test("wizard retries failed about without guessing the machine default or overwr
   await w.getByRole("button", { name: "Scratch", exact: true }).click();
   await w.getByRole("button", { name: "Use a scratch folder" }).click();
   await setTitle(page, "dirty-title");
-  await w.getByRole("switch", { name: "Auto-approve actions" }).click();
+  await w.getByRole("switch", { name: "Yolo mode" }).click();
   await expect(w.getByRole("button", { name: /Launch session/ })).toBeDisabled();
   expect(reads).toEqual([]);
   expect((await publishedRequests(page, "/api/projects", "GET")).length).toBe(0);
@@ -151,7 +151,7 @@ test("wizard retries failed about without guessing the machine default or overwr
   await retry.click();
   await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
   await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("dirty-title");
-  await expect(w.getByRole("switch", { name: "Auto-approve actions" })).toHaveAttribute("aria-checked", "true");
+  await expect(w.getByRole("switch", { name: "Yolo mode" })).toHaveAttribute("aria-checked", "true");
   expect(reads).toContain("Alpha");
   expect(reads).not.toContain("Main");
   await openPanel(page, "Project");
@@ -216,7 +216,7 @@ test("wizard switching explicit Beta back to unresolved Server default resets Be
   await w.getByRole("button", { name: "Done" }).click();
   await openPanel(page, "Profile");
   await w.getByRole("radio", { name: /^Beta/ }).click();
-  await expect(w.getByRole("switch", { name: "Auto-approve actions" })).toHaveAttribute("aria-checked", "true");
+  await expect(w.getByRole("switch", { name: "Yolo mode" })).toHaveAttribute("aria-checked", "true");
   await expect(w.getByRole("switch", { name: "Create a worktree" })).toHaveAttribute("aria-checked", "true");
   await openPanel(page, "Project");
   await selectProject(page, "/tmp/beta-only");
@@ -232,7 +232,7 @@ test("wizard switching explicit Beta back to unresolved Server default resets Be
   await expect(w.getByRole("button", { name: /Launch session/ })).toBeDisabled();
   await consume(page, heldAbout!, { profile: "Alpha" });
   await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
-  await expect(w.getByRole("switch", { name: "Auto-approve actions" })).toHaveAttribute("aria-checked", "false");
+  await expect(w.getByRole("switch", { name: "Yolo mode" })).toHaveAttribute("aria-checked", "false");
   await expect(w.getByRole("switch", { name: "Create a worktree" })).toHaveAttribute("aria-checked", "false");
   await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("kept-across-profile-switch");
   await openPanel(page, "Project");
@@ -338,7 +338,7 @@ for (const origin of ["session", "profiles"] as const) {
     await w.getByRole("button", { name: "Scratch", exact: true }).click();
     await w.getByRole("button", { name: "Use a scratch folder" }).click();
     await setTitle(page, "rename-dirty-title");
-    await w.getByRole("switch", { name: "Auto-approve actions" }).click();
+    await w.getByRole("switch", { name: "Yolo mode" }).click();
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeDisabled();
     expect(wizardReads).not.toContain("Alpha");
     holdAbout = false;
@@ -346,7 +346,7 @@ for (const origin of ["session", "profiles"] as const) {
     await w.getByRole("button", { name: "Retry server profile" }).click();
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
     await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("rename-dirty-title");
-    await expect(w.getByRole("switch", { name: "Auto-approve actions" })).toHaveAttribute("aria-checked", "true");
+    await expect(w.getByRole("switch", { name: "Yolo mode" })).toHaveAttribute("aria-checked", "true");
     await openPanel(page, "Project");
     await w.getByRole("button", { name: "Recent", exact: true }).click();
     await selectProject(page, "/tmp/example");
