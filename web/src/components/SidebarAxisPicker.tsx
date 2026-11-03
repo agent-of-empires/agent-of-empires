@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Activity, Building2, Check, Folder, FolderTree, Layers } from "lucide-react";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import { Tooltip } from "./Tooltip";
@@ -37,8 +37,18 @@ export function SidebarAxisPicker({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const restoreFocus = useRef(false);
 
   useOutsideDismiss(open, [ref], () => setOpen(false));
+
+  // The picked option unmounts with the menu, taking the focus with it; hand it back
+  // to the trigger once the menu is gone, after the axis change has re-rendered.
+  useLayoutEffect(() => {
+    if (open || !restoreFocus.current) return;
+    restoreFocus.current = false;
+    triggerRef.current?.focus({ preventScroll: true });
+  }, [open]);
 
   const active = AXES.find((a) => a.axis === axis) ?? AXES[0]!;
 
@@ -46,8 +56,9 @@ export function SidebarAxisPicker({
     <div ref={ref} className="relative">
       <Tooltip text={TOOLTIP[axis]} open={open ? false : undefined}>
         <button
+          ref={triggerRef}
           onClick={() => setOpen((o) => !o)}
-          aria-haspopup="true"
+          aria-haspopup="menu"
           aria-expanded={open}
           aria-label={`Group sessions, current: ${active.label}`}
           data-testid="sidebar-axis-toggle"
@@ -60,6 +71,7 @@ export function SidebarAxisPicker({
 
       {open && (
         <div
+          role="menu"
           data-testid="sidebar-axis-menu"
           className="absolute right-0 top-full mt-1 min-w-[190px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
         >
@@ -69,9 +81,11 @@ export function SidebarAxisPicker({
               <button
                 key={value}
                 type="button"
-                aria-pressed={selected}
+                role="menuitemradio"
+                aria-checked={selected}
                 data-testid={`sidebar-axis-option-${value}`}
                 onClick={() => {
+                  restoreFocus.current = true;
                   setOpen(false);
                   if (!selected) onAxisChange(value);
                 }}

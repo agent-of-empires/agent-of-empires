@@ -288,6 +288,9 @@ test.describe("sidebar status axis (#4867)", () => {
 
     const menu = page.getByTestId("sidebar-axis-menu");
     await expect(menu).toBeVisible();
+    // Same single-select menu semantics as the sort picker beside it.
+    await expect(menu).toHaveAttribute("role", "menu");
+    await expect(page.getByTestId("sidebar-axis-option-repo")).toHaveAttribute("role", "menuitemradio");
 
     // Options follow the trigger in the tab order, in the order they render.
     for (const target of ["repo", "org", "group", "repo+group", "status"]) {
@@ -299,6 +302,8 @@ test.describe("sidebar status axis (#4867)", () => {
     await expect(menu).toBeHidden();
     await expect(axisToggle).toHaveAttribute("data-axis", "status");
     await expect(page.getByTestId("sidebar-axis-heading")).toHaveText("Status");
+    // The picked option unmounted; focus is back on the trigger, not <body>.
+    await expect(axisToggle).toBeFocused();
   });
 });
 
