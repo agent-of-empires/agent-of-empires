@@ -3853,7 +3853,7 @@
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx"
       ],
-      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
+      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
     },
     {
       "id": "acp.startup-error-banner-actions",
