@@ -46,12 +46,16 @@ impl ExpectedAgent {
         command
             .split_whitespace()
             .find_map(|token| {
-                let basename = token.rsplit(['/', '\\']).next().unwrap_or(token);
+                let basename = token
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(token)
+                    .to_ascii_lowercase();
                 let stem = basename
                     .strip_suffix(".exe")
                     .or_else(|| basename.strip_suffix(".cmd"))
                     .or_else(|| basename.strip_suffix(".bat"))
-                    .unwrap_or(basename);
+                    .unwrap_or(&basename);
                 match stem {
                     "claude-agent-acp" => Some(Self::ClaudeAgentAcp),
                     "codex-acp" => Some(Self::CodexAcp),
@@ -591,6 +595,7 @@ mod tests {
             "/usr/local/bin/claude-agent-acp",
             "C:\\Users\\u\\AppData\\Roaming\\npm\\claude-agent-acp.cmd",
             "claude-agent-acp.exe",
+            "claude-agent-acp.EXE",
             "D:\\bin\\claude-agent-acp.bat",
             "claude-agent-acp --some-flag",
             "  /usr/local/bin/claude-agent-acp  ",
