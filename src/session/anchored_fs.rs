@@ -111,6 +111,7 @@ pub(crate) enum FileExchangePhase {
     AfterExchange,
     BeforeUndo,
     UndoExchange,
+    Probe,
 }
 
 #[cfg(test)]
@@ -938,20 +939,30 @@ impl AnchoredDir {
     pub(crate) fn supports_file_exchange(&self) -> Result<bool> {
         #[cfg(test)]
         FILE_EXCHANGE_CHECKS.set(FILE_EXCHANGE_CHECKS.get() + 1);
-        self.supports_file_exchange_cached(&mut FILE_EXCHANGE_DEVICES.lock())
+        self.supports_file_exchange_cached(&FILE_EXCHANGE_DEVICES)
     }
 
-    fn supports_file_exchange_cached(&self, supported: &mut HashSet<libc::dev_t>) -> Result<bool> {
+    /// Lock only for lookup and insert: a slow mount's probe must not block other editing requests.
+    fn supports_file_exchange_cached(
+        &self,
+        supported: &parking_lot::Mutex<HashSet<libc::dev_t>>,
+    ) -> Result<bool> {
         let device = self.identity()?.0;
-        if supported.contains(&device) {
+        if supported.lock().contains(&device) {
             return Ok(true);
         }
         let mut first = FileStage::new(&self.fd, &mut std::io::empty())?;
         let mut second = FileStage::new(&self.fd, &mut std::io::empty())?;
+        #[cfg(test)]
+        file_exchange_hook(
+            FileExchangePhase::Probe,
+            &self.root,
+            &self.root.join(&first.name),
+        );
         match crate::process::rename_exchange(&self.fd, &first.name, &self.fd, &second.name) {
             Ok(()) => {
                 std::mem::swap(&mut first.name, &mut second.name);
-                supported.insert(device);
+                supported.lock().insert(device);
                 Ok(true)
             }
             Err(error) if crate::process::exchange_unsupported(&error) => Ok(false),
@@ -1281,23 +1292,43 @@ mod tests {
         std::fs::create_dir(temporary.path().join("other")).unwrap();
         let other = root.child(Path::new("other")).unwrap();
         for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS, libc::EIO] {
-            let mut supported = HashSet::new();
+            let supported = parking_lot::Mutex::default();
             crate::process::EXCHANGE_ERROR.set(Some(errno));
-            let result = root.supports_file_exchange_cached(&mut supported);
+            let result = root.supports_file_exchange_cached(&supported);
             if errno == libc::EIO {
                 assert!(result.is_err());
             } else {
                 assert!(!result.unwrap());
             }
             crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
-            assert!(root.supports_file_exchange_cached(&mut supported).is_err());
+            assert!(root.supports_file_exchange_cached(&supported).is_err());
             crate::process::EXCHANGE_ERROR.set(None);
-            assert!(root.supports_file_exchange_cached(&mut supported).unwrap());
+            assert!(root.supports_file_exchange_cached(&supported).unwrap());
             crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
-            assert!(other.supports_file_exchange_cached(&mut supported).unwrap());
+            assert!(other.supports_file_exchange_cached(&supported).unwrap());
             assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
             assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn file_exchange_probe_runs_without_holding_the_cache_lock() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let _hooks = ResetExchangeHooks;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        let supported = Rc::new(parking_lot::Mutex::default());
+        let probes = Rc::new(Cell::new(0));
+        let (observed_lock, observed_probes) = (supported.clone(), probes.clone());
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, _, _| {
+            assert_eq!(phase, FileExchangePhase::Probe);
+            assert!(observed_lock.try_lock().is_some());
+            observed_probes.set(observed_probes.get() + 1);
+        })));
+        assert!(root.supports_file_exchange_cached(&supported).unwrap());
+        assert_eq!(probes.get(), 1);
     }
 
     #[test]
