@@ -719,7 +719,7 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Re-resolve what may have changed since the first launch: model pins,
-    /// host hook env, and MCP servers.
+    /// thinking display, host hook env, and MCP servers.
     async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
@@ -729,7 +729,10 @@ impl<S: BroadcastSink> Drain<S> {
         })
         .await;
         match &resolved {
-            Ok(cfg) => refresh_spawn_model_effort(config, cfg.acp.acp_defaults_for(&agent)),
+            Ok(cfg) => {
+                refresh_spawn_model_effort(config, cfg.acp.acp_defaults_for(&agent));
+                config.claude_thinking_display = cfg.acp.claude_thinking_display;
+            }
             Err(e) => warn!(
                 target: "acp.supervisor",
                 session = %session_id,
