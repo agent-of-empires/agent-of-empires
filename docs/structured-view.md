@@ -50,6 +50,8 @@ Each built-in adapter receives only verified provider variables from the Daemon'
 
 `vibe`, `pi`, `omp`, `kimi` and custom adapters have no ambient provider allowlist. Supply host auth through `extra_env`, `environment`, or opt-in `session.inherit_host_environment`. Sandbox auth uses `sandbox.environment`; whole-host inheritance never crosses that boundary. Verified provider keys can cross, but ambient file/directory selectors, including config roots and AWS credential files, cannot: managed config roots are already mounted at canonical container paths. Explicit `provider_env` values are separate from ambient filtering. Drops are logged under `acp` with the key and reason.
 
+The `claude` adapter also gets `CLAUDE_CODE_THINKING_DISPLAY` from `acp.claude_thinking_display` (default `summarized`), so Opus 5 and Sonnet 5 stream a thinking summary into the transcript. An entry in `environment`, `sandbox.environment` or an inherited host value wins over the setting; exporting it only in the Daemon's shell does not.
+
 ### Prime runtime ownership
 
 Native Prime Agent 0.10.x uses a daemon owned by each structured execution. Ownership follows the resolved ACP backend, including inherited custom agents, rather than the session tool label. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. Sandboxed preparation resolves Prime with the frontend’s executable, environment, working directory, and pinned container ID. AoE does not reuse a daemon launched with another session’s credentials.

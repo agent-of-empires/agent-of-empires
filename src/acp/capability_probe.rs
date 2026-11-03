@@ -65,6 +65,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         artifact_dir: None,
         claude_store_pin: None,
         provider_routing: Vec::new(),
+        claude_thinking_display: Default::default(),
         base_host_environment: Vec::new(),
     };
 

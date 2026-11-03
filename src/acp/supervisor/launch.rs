@@ -610,6 +610,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .as_deref()
                     .and_then(crate::session::environment::provider_override_env)
                     .unwrap_or_default(),
+                claude_thinking_display: resolved_cfg.acp.claude_thinking_display,
             },
             context_reset,
         ))

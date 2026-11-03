@@ -73,6 +73,8 @@ pub struct SpawnConfig {
     /// outrank both, and a respawn that re-derives `host_environment` from
     /// `base_host_environment` must not drop it.
     pub provider_routing: Vec<(String, String)>,
+    /// Sent to `claude-agent-acp` below every explicit env layer.
+    pub claude_thinking_display: crate::session::config::ClaudeThinkingDisplay,
 }
 
 impl SpawnConfig {
@@ -181,6 +183,19 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
     pairs
 }
 
+/// AoE's own adapter defaults, applied below every explicit env layer so a
+/// user-set value always wins.
+pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    if config.spec.command != "claude-agent-acp" {
+        return Vec::new();
+    }
+    let display = config.claude_thinking_display;
+    vec![(
+        crate::session::config::ClaudeThinkingDisplay::ENV.to_string(),
+        display.as_env_value().to_string(),
+    )]
+}
+
 /// Key names applied per layer, for the spawn log. Values are never logged.
 #[derive(Debug, Default)]
 pub(super) struct EnvKeys {
@@ -200,6 +215,10 @@ pub(super) fn apply_env_filter(
     extra_path_dirs: &[PathBuf],
 ) -> EnvKeys {
     let mut keys = EnvKeys::default();
+    for (key, value) in adapter_default_env_pairs(config) {
+        cmd.env(&key, value);
+        keys.forwarded.push(key);
+    }
     for (key, value) in inherited_host_env_pairs(config) {
         cmd.env(&key, value);
         keys.inherited.push(key);
@@ -727,6 +746,83 @@ mod tests {
             container_workdir: None,
         });
         assert!(inherited_host_env_pairs(&config).is_empty());
+    }
+
+    /// #5088: `claude-agent-acp` gets the thinking display setting, other
+    /// adapters do not, and every explicit env layer wins over it.
+    #[test]
+    #[serial_test::serial]
+    fn claude_thinking_display_is_the_lowest_env_layer() {
+        use crate::session::config::ClaudeThinkingDisplay;
+        const KEY: &str = ClaudeThinkingDisplay::ENV;
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let config_path = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let stdio_value = |config: &SpawnConfig| {
+            let mut cmd = tokio::process::Command::new("/bin/true");
+            apply_stdio_env(&mut cmd, config, &[]);
+            effective_env_value(cmd.as_std(), KEY)
+        };
+
+        let base = || {
+            let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+            config.spec = reg.get("claude").unwrap().clone();
+            config
+        };
+        let omitted = |mut config: SpawnConfig| {
+            config.claude_thinking_display = ClaudeThinkingDisplay::Omitted;
+            config
+        };
+        let explicit = || vec![(KEY.to_string(), "omitted".to_string())];
+        let cases: [(&str, SpawnConfig, Option<&str>); 6] = [
+            ("default", base(), Some("summarized")),
+            ("setting", omitted(base()), Some("omitted")),
+            (
+                "codex",
+                SpawnConfig {
+                    spec: reg.get("codex").unwrap().clone(),
+                    ..base()
+                },
+                None,
+            ),
+            (
+                "custom",
+                SpawnConfig {
+                    spec: crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").unwrap(),
+                    ..base()
+                },
+                None,
+            ),
+            (
+                "provider_env",
+                SpawnConfig {
+                    provider_env: explicit(),
+                    ..base()
+                },
+                Some("omitted"),
+            ),
+            (
+                "environment",
+                SpawnConfig {
+                    host_environment: explicit(),
+                    ..base()
+                },
+                Some("omitted"),
+            ),
+        ];
+        for (name, config, want) in cases {
+            assert_eq!(stdio_value(&config).as_deref(), want, "{name}");
+        }
+
+        std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n").unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[(KEY, "omitted")]);
+        assert_eq!(
+            stdio_value(&base()).as_deref(),
+            Some("omitted"),
+            "inherited"
+        );
     }
 
     /// #3238: each adapter receives only its own allowlisted credentials, and

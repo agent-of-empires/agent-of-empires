@@ -61,6 +61,7 @@ async fn list_with_spec(
         additional_dirs: Vec::new(),
         provider_env: Vec::new(),
         provider_routing: Vec::new(),
+        claude_thinking_display: Default::default(),
         host_environment,
         default_effort: None,
         default_effort_explicit: false,
