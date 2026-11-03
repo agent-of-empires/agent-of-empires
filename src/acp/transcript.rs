@@ -229,7 +229,7 @@ impl TranscriptModel {
                 if message_id.is_some() {
                     self.last_thought_id = message_id.clone();
                 }
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && self.open_thought_group.is_none() {
                     return Vec::new();
                 }
                 let group_id = match &self.open_thought_group {
@@ -1491,7 +1491,16 @@ mod tests {
         };
         let (a, b) = (Some("t-a"), Some("t-b"));
         // (events, (text, message_start) per thinking row, thinking groups)
-        let cases: [(Vec<Event>, Vec<(&str, bool)>, usize); 6] = [
+        let cases: [(Vec<Event>, Vec<(&str, bool)>, usize); 7] = [
+            (
+                vec![
+                    thought("Weighing", a),
+                    thought(" ", a),
+                    thought("options", a),
+                ],
+                vec![("Weighing", false), (" ", false), ("options", false)],
+                1,
+            ),
             (
                 vec![thought("one ", a), thought("two", a)],
                 vec![("one ", false), ("two", false)],
