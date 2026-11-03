@@ -65,6 +65,10 @@ jobs:
           tool: cargo-nextest
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
+      # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
+      - name: Keep inherited PATH in login shells
+        run: sudo sed -i '/runs-on\/env/d' /etc/profile
       - name: Install confined Local test prerequisites
         if: matrix.leg == 'web-e2e'
         run: |
@@ -101,15 +105,6 @@ jobs:
       # measured 336s -> 114s pinned to 4 cores, with identical results.
       # Raise this only with evidence; 4+ starts trading wall for flake risk on
       # the tests that wait on an ACP handshake.
-      # TEMP(runs-on): diagnose PATH loss in tmux panes on the RunsOn image.
-      - name: TEMP RunsOn PATH diagnostics
-        if: matrix.leg == 'web-e2e'
-        continue-on-error: true
-        run: |
-          for f in /etc/profile.d/01-locale-fix.sh /etc/profile.d/70-systemd-shell-extra.sh /etc/profile.d/80-systemd-osc-context.sh /etc/profile; do echo "=== $f"; cat "$f"; done
-          d=$(mktemp -d); h=$(mktemp -d)
-          HOME="$h" PATH="$d:$PATH" bash -lxc 'echo "login PATH=$PATH"' 2>&1 | grep -nE "PATH|^\++ (\.|source) " | cut -c1-200 | head -60
-          HOME="$h" PATH="$d:$PATH" sh -lc 'echo "sh login PATH=$PATH"' | cut -c1-120
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         env:

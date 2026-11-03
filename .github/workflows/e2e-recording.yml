@@ -32,6 +32,11 @@ jobs:
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
 
+      # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
+      # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
+      - name: Keep inherited PATH in login shells
+        run: sudo sed -i '/runs-on\/env/d' /etc/profile
+
       - name: Install asciinema
         run: pipx install asciinema
 
