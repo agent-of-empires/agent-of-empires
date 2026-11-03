@@ -169,9 +169,13 @@ pub(crate) struct PromptSubmitted {
     pub seq: Option<u64>,
 }
 
-/// Why [`submit_prompt`] refused a prompt. Every refusal leaves the transcript, the
-/// queue and the pending initial turn as they were, except `Turn(Send(_))`, which
-/// fails after the prompt was published.
+/// Why [`submit_prompt`] did not deliver a prompt.
+///
+/// `Enqueue`, and every `Turn` error except `Turn(RevivalRefused)`, come after the pending
+/// initial turn was cleared. The other variants leave the transcript, the queue and the
+/// pending initial turn as they were, though the session may already have been woken. A
+/// `Turn` error can also come after the prompt was published, so the transcript may show a
+/// prompt the agent never received.
 pub(crate) enum PromptSubmitError {
     SessionNotFound,
     RevivalRefused,
