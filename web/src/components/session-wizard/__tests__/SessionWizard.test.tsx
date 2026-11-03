@@ -1417,8 +1417,9 @@ describe("SessionWizard create failures", () => {
     expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
   });
 
-  /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard. */
-  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude") => {
+  /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.
+   *  `whileSending` runs after Launch, before the progress view replaces the form. */
+  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude", whileSending?: () => void) => {
     const toastAction = vi.fn();
     toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
     let finish!: (r: unknown) => void;
@@ -1435,6 +1436,7 @@ describe("SessionWizard create failures", () => {
       />,
     );
     await launch();
+    whileSending?.();
     fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
     await act(async () => finish(sent));
     await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
@@ -1464,6 +1466,16 @@ describe("SessionWizard create failures", () => {
     expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
     fireEvent.click(screen.getByTestId("create-failure-choose_project"));
     expect(screen.getByText("Back")).toBeTruthy();
+  });
+
+  it("Reopen restores the form as sent, not an edit made while the create ran", async () => {
+    const title = () => document.getElementById("wizard-title") as HTMLInputElement;
+    const { restore } = await backgroundFailure(UNAVAILABLE, "claude", () => {
+      fireEvent.change(title(), { target: { value: "edited while sending" } });
+      expect(title().value).toBe("edited while sending");
+    });
+    expect(payload().title).toBeUndefined();
+    expect(restore.data.title).toBe("");
   });
 
   // Try again sends the form as it stands, so it waits for the same loads as Launch.
