@@ -30,7 +30,6 @@ fn spawn_config(
 ) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),

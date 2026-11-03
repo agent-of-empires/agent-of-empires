@@ -318,7 +318,6 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
-        claude_thinking_display: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

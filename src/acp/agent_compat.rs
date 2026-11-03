@@ -70,6 +70,15 @@ impl ExpectedAgent {
             })
             .unwrap_or(Self::Other)
     }
+
+    /// Env defaults AoE gives this adapter.
+    pub fn default_env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            // Opus 5 and Sonnet 5 otherwise default to `omitted`.
+            Self::ClaudeAgentAcp => &[("CLAUDE_CODE_THINKING_DISPLAY", "summarized")],
+            _ => &[],
+        }
+    }
 }
 
 /// What the policy requires from the adapter's `InitializeResponse`.

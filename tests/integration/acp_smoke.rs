@@ -31,7 +31,6 @@ async fn shim_agent_round_trips_approval_allow() {
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -149,7 +148,6 @@ async fn shim_agent_round_trips_a_question_option_list() {
 
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
@@ -263,7 +261,6 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
 
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
@@ -355,7 +352,6 @@ async fn shim_agent_round_trips_fs() {
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -447,7 +443,6 @@ async fn shim_agent_round_trips_terminal() {
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -551,7 +546,6 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -639,7 +633,6 @@ async fn shim_agent_emits_rate_limit_event() {
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
         launch_lease: None,
-        claude_thinking_display: Default::default(),
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),

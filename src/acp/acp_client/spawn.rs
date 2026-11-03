@@ -73,8 +73,6 @@ pub struct SpawnConfig {
     /// outrank both, and a respawn that re-derives `host_environment` from
     /// `base_host_environment` must not drop it.
     pub provider_routing: Vec<(String, String)>,
-    /// Sent to `claude-agent-acp` below every explicit env layer.
-    pub claude_thinking_display: crate::session::config::ClaudeThinkingDisplay,
 }
 
 impl SpawnConfig {
@@ -186,15 +184,11 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
 /// AoE's own adapter defaults, applied below every explicit env layer so a
 /// user-set value always wins.
 pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    use crate::acp::agent_compat::ExpectedAgent;
-    if ExpectedAgent::from_command(&config.spec.command) != ExpectedAgent::ClaudeAgentAcp {
-        return Vec::new();
-    }
-    let display = config.claude_thinking_display;
-    vec![(
-        crate::session::config::ClaudeThinkingDisplay::ENV.to_string(),
-        display.as_env_value().to_string(),
-    )]
+    crate::acp::agent_compat::ExpectedAgent::from_command(&config.spec.command)
+        .default_env()
+        .iter()
+        .map(|&(key, value)| (key.to_string(), value.to_string()))
+        .collect()
 }
 
 /// Key names applied per layer, for the spawn log. Values are never logged.
@@ -749,13 +743,12 @@ mod tests {
         assert!(inherited_host_env_pairs(&config).is_empty());
     }
 
-    /// #5088: `claude-agent-acp` gets the thinking display setting, other
+    /// #5088: `claude-agent-acp` gets a summarized thinking default, other
     /// adapters do not, and every explicit env layer wins over it.
     #[test]
     #[serial_test::serial]
-    fn claude_thinking_display_is_the_lowest_env_layer() {
-        use crate::session::config::ClaudeThinkingDisplay;
-        const KEY: &str = ClaudeThinkingDisplay::ENV;
+    fn claude_thinking_default_is_the_lowest_env_layer() {
+        const KEY: &str = "CLAUDE_CODE_THINKING_DISPLAY";
         let tmp = tempfile::tempdir().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
         let config_path = crate::session::config::config_path().unwrap();
@@ -772,12 +765,8 @@ mod tests {
             config.spec = reg.get("claude").unwrap().clone();
             config
         };
-        let omitted = |mut config: SpawnConfig| {
-            config.claude_thinking_display = ClaudeThinkingDisplay::Omitted;
-            config
-        };
         let explicit = || vec![(KEY.to_string(), "omitted".to_string())];
-        let cases: [(&str, SpawnConfig, Option<&str>); 7] = [
+        let cases: [(&str, SpawnConfig, Option<&str>); 6] = [
             ("default", base(), Some("summarized")),
             (
                 "absolute .exe path",
@@ -791,7 +780,6 @@ mod tests {
                 },
                 Some("summarized"),
             ),
-            ("setting", omitted(base()), Some("omitted")),
             (
                 "codex",
                 SpawnConfig {

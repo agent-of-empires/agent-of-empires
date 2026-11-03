@@ -553,18 +553,6 @@ pub struct AcpConfig {
         validate = "range:1:2147483"
     )]
     pub notice_timeout_secs: u32,
-    /// Thinking display requested from Claude models in structured view
-    /// sessions, sent as `CLAUDE_CODE_THINKING_DISPLAY`. Summarized streams a
-    /// thinking summary; omitted sends none, the default on Opus 5 and
-    /// Sonnet 5. An explicit environment entry wins. Applies on the next
-    /// adapter spawn.
-    #[serde(default)]
-    #[setting(
-        label = "Claude thinking display",
-        widget = "select",
-        options = "summarized:Summarized,omitted:Omitted"
-    )]
-    pub claude_thinking_display: ClaudeThinkingDisplay,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -698,7 +686,6 @@ impl Default for AcpConfig {
             compaction_reminder_percent: default_compaction_reminder_percent(),
             notice_display: NoticeDisplay::default(),
             notice_timeout_secs: default_notice_timeout_secs(),
-            claude_thinking_display: ClaudeThinkingDisplay::default(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
@@ -1939,26 +1926,6 @@ pub enum NoticeDisplay {
     Persistent,
     Timeout,
     Hidden,
-}
-
-/// See `AcpConfig::claude_thinking_display`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaudeThinkingDisplay {
-    #[default]
-    Summarized,
-    Omitted,
-}
-
-impl ClaudeThinkingDisplay {
-    pub const ENV: &'static str = "CLAUDE_CODE_THINKING_DISPLAY";
-
-    pub fn as_env_value(self) -> &'static str {
-        match self {
-            Self::Summarized => "summarized",
-            Self::Omitted => "omitted",
-        }
-    }
 }
 
 /// Resolved notice display policy, shared by every structured view surface.
