@@ -45,6 +45,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -98,6 +99,7 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -170,6 +172,7 @@ jobs:
     # Also the skill check: both build xtask.
     name: Docs
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write

@@ -12,6 +12,7 @@ jobs:
     name: Record E2E Tests
     if: github.event.label.name == 'needs-recording'
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 45
     permissions:
       contents: write
       pull-requests: write
