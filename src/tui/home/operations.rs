@@ -1040,6 +1040,20 @@ impl HomeView {
                 .filter(|i| self.org_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
+            // Status headers key on the status's API spelling, the same key
+            // `build_flat_items_by_status` rewrites `group_path` to.
+            crate::session::config::GroupByMode::Status => self
+                .instances
+                .values()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| super::rows::status_group_key(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
             // Manual groups nest, so a session belongs when its path matches exactly or
             // sits beneath the group; scoped to the owning profile the same way
             // `delete_selected_group` does.

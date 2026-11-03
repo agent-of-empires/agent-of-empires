@@ -95,6 +95,14 @@ impl HomeView {
         Self::persist_app_state("org group collapsed", |s| s.org_group_collapsed = collapsed);
     }
 
+    pub(super) fn save_status_group_collapsed(&self) {
+        let known = self.known_group_paths(super::rows::status_group_key);
+        let collapsed = Self::collapsed_known_paths(&self.status_group_collapsed, known);
+        Self::persist_app_state("status group collapsed", |s| {
+            s.status_group_collapsed = collapsed
+        });
+    }
+
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
         let show = self.show_preview_info;

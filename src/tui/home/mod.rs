@@ -241,6 +241,7 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     pub(super) project_group_collapsed: HashMap<String, bool>,
     pub(super) org_group_collapsed: HashMap<String, bool>,
+    pub(super) status_group_collapsed: HashMap<String, bool>,
     pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     pub(super) registered_projects: Vec<crate::session::Project>,
 

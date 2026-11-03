@@ -2329,6 +2329,25 @@
       ]
     },
     {
+      "id": "sidebar.status-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
+    },
+    {
+      "id": "sidebar.status-axis-live",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "components": [
+        "web/src/components/SidebarAxisPicker.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useStatusGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",

@@ -1294,6 +1294,7 @@ impl HomeView {
         let (title, scope) = match self.group_by {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Status => ("Archive status", "status"),
             crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
@@ -3478,7 +3479,7 @@ impl HomeView {
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org => false,
+                GroupByMode::Org | GroupByMode::Status => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
@@ -4446,6 +4447,7 @@ impl HomeView {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Status => "Status",
         };
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
         Some((
@@ -4485,6 +4487,18 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_org_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Status {
+            let collapsed = self
+                .status_group_collapsed
+                .get(path)
+                .copied()
+                .unwrap_or(false);
+            self.status_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_status_group_collapsed();
             return;
         }
         let result = (|| -> anyhow::Result<()> {

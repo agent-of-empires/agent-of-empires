@@ -162,8 +162,8 @@ static CATALOG: &[Tip] = &[
         id: "group-sessions",
         title: "Organize sessions into groups",
         body: "Use the grouping toggle in the sidebar to switch between By repo, By org, By \
-               group, and By repo and group. Right-click a session and choose Edit group to \
-               file it under any name you like.",
+               group, By repo and group, and By status. Right-click a session and choose Edit \
+               group to file it under any name you like.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],
     },

@@ -41,6 +41,32 @@ function orgSessions(): MockSessionInput[] {
   ];
 }
 
+function statusSessions(): MockSessionInput[] {
+  return [
+    {
+      id: "s-idle",
+      title: "idle-session",
+      project_path: "/tmp/project",
+      branch: "feat/idle",
+      fields: { status: "Idle" },
+    },
+    {
+      id: "s-waiting",
+      title: "waiting-session",
+      project_path: "/tmp/project",
+      branch: "feat/waiting",
+      fields: { status: "Waiting" },
+    },
+    {
+      id: "s-running",
+      title: "running-session",
+      project_path: "/tmp/project",
+      branch: "feat/running",
+      fields: { status: "Running" },
+    },
+  ];
+}
+
 // Stub owner avatars so the test makes no network request.
 async function stubOwnerAvatars(page: Page) {
   await page.route("https://github.com/**", (r) => r.fulfill({ status: 404, body: "" }));
@@ -62,15 +88,10 @@ async function gotoDesktop(page: Page) {
   await page.goto("/");
 }
 
-// The toggle cycles repo, org, group, repo+group.
-async function cycleAxisTo(toggle: Locator, target: string) {
-  for (let i = 0; i < 3; i++) {
-    const current = await toggle.getAttribute("data-axis");
-    if (current === target) return;
-    await toggle.click();
-    // Wait for each advance so a pending render cannot cause an extra click.
-    await expect(toggle).not.toHaveAttribute("data-axis", current ?? "");
-  }
+// The axis picker sets any axis directly, so status is one pick from the default.
+async function pickAxis(page: Page, toggle: Locator, target: string) {
+  await toggle.click();
+  await page.getByTestId(`sidebar-axis-option-${target}`).click();
   await expect(toggle).toHaveAttribute("data-axis", target);
 }
 
@@ -144,7 +165,7 @@ test.describe("sidebar user-group axis (#1234)", () => {
 
     const axisToggle = page.locator(AXIS_TOGGLE);
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "group");
+    await pickAxis(page, axisToggle, "group");
     await expect(axisToggle).toHaveAttribute("data-axis", "group");
     await expect(axisHeading).toHaveText("Groups");
 
@@ -165,8 +186,8 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await expect(axisToggle).toHaveAttribute("data-axis", "group");
     await expect(featureHeader.locator("button[aria-expanded]")).toHaveAttribute("aria-expanded", "false");
 
-    // Collapse maps are per axis; repo is two clicks past group.
-    await cycleAxisTo(axisToggle, "repo");
+    // Collapse maps are per axis; the picker switches straight back to repo.
+    await pickAxis(page, axisToggle, "repo");
     await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
   });
 });
@@ -180,7 +201,7 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
 
     const axisToggle = page.locator(AXIS_TOGGLE);
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "repo+group");
+    await pickAxis(page, axisToggle, "repo+group");
 
     const repoBlocks = page.locator("[data-testid='sidebar-nested-repo']");
     await expect(repoBlocks).toHaveCount(1);
@@ -216,6 +237,48 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
   });
 });
 
+test.describe("sidebar status axis (#4867)", () => {
+  test("groups sessions by execution status in attention order; collapse persists and stays per axis", async ({
+    page,
+  }) => {
+    await installSidebarMocks(page, { sessions: statusSessions() });
+    await gotoDesktop(page);
+
+    const axisToggle = page.locator(AXIS_TOGGLE);
+    const axisHeading = page.getByTestId("sidebar-axis-heading");
+    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
+    await expect(page.locator(ROW)).toHaveCount(3);
+
+    await pickAxis(page, axisToggle, "status");
+    await expect(axisToggle).toHaveAttribute("data-axis", "status");
+    await expect(axisHeading).toHaveText("Status");
+
+    const headers = page.locator(HEADER);
+    await expect(headers).toHaveCount(3);
+    // The Attention sort's order: Waiting, then Idle, then Running.
+    await expect(headers.nth(0)).toHaveAttribute("data-group-id", "status:Waiting");
+    await expect(headers.nth(1)).toHaveAttribute("data-group-id", "status:Idle");
+    await expect(headers.nth(2)).toHaveAttribute("data-group-id", "status:Running");
+    await expect(page.locator(ROW)).toHaveCount(3);
+
+    const waitingExpand = page.locator(`${HEADER}[data-group-id='status:Waiting']`).locator("button[aria-expanded]");
+    await waitingExpand.click();
+    await expect(waitingExpand).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByText("waiting-session")).toBeHidden();
+    await expect(page.getByText("running-session")).toBeVisible();
+
+    await page.reload();
+    await expect(axisToggle).toHaveAttribute("data-axis", "status");
+    await expect(
+      page.locator(`${HEADER}[data-group-id='status:Waiting']`).locator("button[aria-expanded]"),
+    ).toHaveAttribute("aria-expanded", "false");
+
+    // Collapse keys are per axis; the repo header never collapsed.
+    await pickAxis(page, axisToggle, "repo");
+    await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
 test.describe("sidebar org axis (#3283)", () => {
   test("buckets repos by remote owner, No organization last; repo collapse within an org persists independently", async ({
     page,
@@ -226,7 +289,7 @@ test.describe("sidebar org axis (#3283)", () => {
 
     const axisToggle = page.locator(AXIS_TOGGLE);
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "org");
+    await pickAxis(page, axisToggle, "org");
 
     const orgBlocks = page.locator("[data-testid='sidebar-org-group']");
     await expect(orgBlocks).toHaveCount(2);

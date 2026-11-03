@@ -130,6 +130,16 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
+            status_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .status_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
             remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
