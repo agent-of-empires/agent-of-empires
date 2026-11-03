@@ -1976,26 +1976,63 @@ time.sleep(60)
     async fn declared_codex_wrapper_dir_controls_spawn_environment_and_native_mcp() {
         let (_home, _temp, account) = codex_wrapper_fixture();
         let supervisor = Supervisor::new(VecSink::new());
-        let mut request = spawn_request("codex-wrapper");
-        request.agent = "work-codex".into();
-        request.tool = "work-codex".into();
-        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        // A sandbox applies no override, so it must not read the base store or export CODEX_HOME.
+        for (sandboxed, expected, codex_home) in [
+            (
+                false,
+                vec!["account"],
+                account.join(".codex-work").to_str().map(String::from),
+            ),
+            (true, vec![], None),
+        ] {
+            let mut request = spawn_request("codex-wrapper");
+            request.agent = "work-codex".into();
+            request.tool = "work-codex".into();
+            if sandboxed {
+                let mut row = crate::session::Instance::new("codex-wrapper", "/tmp");
+                row.id = "codex-wrapper".into();
+                row.tool = "work-codex".into();
+                row.view = crate::session::View::Structured;
+                row.sandbox_info = Some(sandbox_info());
+                row.sandbox_store_generation =
+                    crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+                let app = crate::session::get_app_dir().unwrap();
+                for root in
+                    crate::migrations::v033_isolate_sandbox_content::instance_roots(&row).unwrap()
+                {
+                    std::fs::create_dir_all(&root.path).unwrap();
+                    let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+                    crate::migrations::v033_isolate_sandbox_content::certify_test_content(
+                        &app, &row.id, &root.path, &roles,
+                    )
+                    .unwrap();
+                }
+                request.sandbox_info = row.sandbox_info.clone();
+                crate::session::Storage::new_unwatched(&row.source_profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![row];
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
 
-        assert_eq!(mcp_names(&config.mcp_servers), ["account"]);
-        assert_eq!(
-            config
-                .host_environment
-                .iter()
-                .find(|(key, _)| key == "CODEX_HOME")
-                .map(|(_, value)| value.as_str()),
-            account.join(".codex-work").to_str()
-        );
-    }
-
-    #[test]
-    fn sandbox_discovery_keeps_the_agent_key() {
-        assert_eq!(discovery_key(false, "work-codex", "codex"), "codex");
-        assert_eq!(discovery_key(true, "work-codex", "codex"), "work-codex");
+            assert_eq!(
+                mcp_names(&config.mcp_servers),
+                expected,
+                "sandboxed={sandboxed}"
+            );
+            assert_eq!(
+                config
+                    .host_environment
+                    .iter()
+                    .find(|(key, _)| key == "CODEX_HOME")
+                    .map(|(_, value)| value.clone()),
+                codex_home,
+                "sandboxed={sandboxed}"
+            );
+        }
     }
 
     #[test]
