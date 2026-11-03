@@ -205,12 +205,14 @@ pub(super) fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it was last used less than 24 hours ago,
-/// otherwise generate a fresh one and persist it.
+/// How long an idle `serve.token` is reused across restarts.
+pub(crate) const TOKEN_REUSE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Load an existing auth token from disk if it was last used less than `TOKEN_REUSE_MAX_AGE`
+/// ago, otherwise generate a fresh one and persist it.
 pub(super) async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
-    let max_age = std::time::Duration::from_secs(24 * 60 * 60);
-    Ok(load_or_generate_token_at(&app_dir.join("serve.token"), max_age).await)
+    Ok(load_or_generate_token_at(&app_dir.join("serve.token"), TOKEN_REUSE_MAX_AGE).await)
 }
 
 pub(super) async fn load_or_generate_token_at(
