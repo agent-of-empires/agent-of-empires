@@ -11,11 +11,13 @@ jobs:
   record:
     name: Record E2E Tests
     if: github.event.label.name == 'needs-recording'
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
     permissions:
       contents: write
       pull-requests: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/rust-toolchain
