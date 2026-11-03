@@ -201,11 +201,12 @@ fn resolve_host_creation(
         }
     } else if !body.tool.trim().is_empty() {
         let name = body.tool.trim();
-        if let Some(command) = config.session.custom_agents.get(name) {
-            anyhow::ensure!(
-                !command.trim().is_empty(),
-                "custom agent '{name}' has an empty configured command"
-            );
+        if config
+            .session
+            .custom_agents
+            .get(name)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
             anyhow::ensure!(
                 body.command_override.is_empty(),
                 "--cmd-override cannot be used with configured custom agent --tool selections"
@@ -222,28 +223,50 @@ fn resolve_host_creation(
                 );
             }
             body.tool = name.to_owned();
+        } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
+            body.tool = tool.to_owned();
+        } else if crate::plugin::agent_integration::agent_command(
+            name,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+        .is_some()
+        {
+            anyhow::ensure!(
+                body.command_override.is_empty(),
+                "--cmd-override cannot be used with configured custom agent --tool selections"
+            );
+            body.tool = name.to_owned();
         } else {
-            body.tool = crate::agents::resolve_tool_name(name)
-                .with_context(|| unknown_tool(&format!("Unknown tool: {name}")))?
-                .to_owned();
+            anyhow::ensure!(
+                !config.session.custom_agents.contains_key(name),
+                "custom agent '{name}' has an empty command"
+            );
+            anyhow::bail!("{}", unknown_tool(&format!("Unknown tool: {name}")));
         }
     } else {
+        let available = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
         body.tool = inherited_tool
             .or_else(|| {
                 config.session.default_tool.as_deref().and_then(|name| {
-                    if config.session.custom_agents.contains_key(name) {
+                    if config
+                        .session
+                        .custom_agents
+                        .get(name)
+                        .is_some_and(|command| !command.trim().is_empty())
+                        || available.available_list().iter().any(|tool| tool == name)
+                    {
                         Some(name.to_owned())
                     } else {
                         crate::agents::resolve_tool_name(name).map(str::to_owned)
                     }
                 })
             })
-            .or_else(|| {
-                crate::tmux::AvailableTools::detect()
-                    .available_list()
-                    .first()
-                    .cloned()
-            })
+            .or_else(|| available.available_list().first().cloned())
             .unwrap_or_else(|| "claude".to_owned());
         if !config.session.custom_agents.contains_key(&body.tool) {
             if let Some(name) = crate::agents::resolve_tool_name(&body.tool) {
@@ -262,9 +285,13 @@ fn resolve_host_creation(
                 crate::tmux::is_binary_on_path(&binary),
                 "Configured agent binary is unavailable on the Daemon host: {binary}"
             );
-        } else if let Some(agent) = crate::agents::get_agent(&body.tool)
-            .filter(|_| !config.session.custom_agents.contains_key(&body.tool))
-        {
+        } else if let Some(agent) = crate::agents::get_agent(&body.tool).filter(|_| {
+            !config
+                .session
+                .custom_agents
+                .get(&body.tool)
+                .is_some_and(|command| !command.trim().is_empty())
+        }) {
             anyhow::ensure!(
                 crate::tmux::is_agent_available(agent),
                 "Agent '{}' is not installed on the Daemon host. Install with: {}",

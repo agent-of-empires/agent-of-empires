@@ -743,6 +743,73 @@ fn cli_add_resolves_tool_and_command_from_config() {
     }
 }
 
+#[test]
+#[parallel]
+fn cli_add_resolves_plugin_agents_on_daemon() {
+    for (config, flags) in [
+        ("", vec!["--tool", "plugin-helper"]),
+        ("[session]\ndefault_tool = \"plugin-helper\"", vec![]),
+        (
+            "[session]\ncustom_agents = { plugin-helper = \"\" }",
+            vec!["--tool", "plugin-helper"],
+        ),
+        (
+            "[session]\ncustom_agents = { plugin-helper = \"   \" }",
+            vec!["--tool", " plugin-helper "],
+        ),
+    ] {
+        let h = TuiTestHarness::new("cli_add_plugin");
+        if !config.is_empty() {
+            h.append_config(config);
+        }
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            r#"id = "acme.agent"
+name = "Agent"
+version = "1.0.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "bash -lc true"
+"#,
+        )
+        .unwrap();
+        h.run_cli_ok(&[
+            "plugin",
+            "install",
+            source.path().to_str().unwrap(),
+            "--yes",
+        ]);
+        let project = h.project_path();
+        let mut args = vec!["add", project.to_str().unwrap(), "-t", "PluginCase"];
+        args.extend(flags);
+        h.run_cli_ok(&args);
+        let sessions = h.read_sessions();
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+        assert_eq!(sessions[0]["tool"], "plugin-helper");
+        assert_eq!(sessions[0]["command"], "bash -lc true");
+        let rejected = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "OverrideCase",
+            "--tool",
+            "plugin-helper",
+            "--cmd-override",
+            "false",
+        ]);
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("--cmd-override cannot be used"),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert_eq!(h.read_sessions().as_array().unwrap().len(), 1);
+    }
+}
+
 /// `aoe add` rejects bad requests before writing anything, without leaking
 /// configured command strings.
 #[test]
@@ -1041,7 +1108,8 @@ fn cli_mcp_add_edit_remove_flow() {
 #[test]
 #[parallel]
 fn cli_skill_management_flow() {
-    let h = TuiTestHarness::new("cli_skill_management");
+    let mut h = TuiTestHarness::new_in_tmp("cli_skill_management");
+    h.stop_daemon_on_drop();
     let source = h.home_path().join(".claude/skills/review");
     std::fs::create_dir_all(&source).unwrap();
     let original = "---\nname: review\ndescription: Review code\n---\n\nOriginal body\n";

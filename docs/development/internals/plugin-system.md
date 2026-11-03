@@ -12,6 +12,7 @@ Host architecture and security boundaries. Plugin authors want [Writing plugins]
 | Discovery | `discover.rs`, `featured.rs`, `update_check.rs` |
 | Worker launch and supervision | `launch.rs`, `host.rs`, `protocol.rs` |
 | Worker RPCs | `host_api.rs`, `session_api.rs` |
+| Provider-native integrations | `src/plugin/agent_integration.rs`, `src/session/instance/status_update.rs` |
 | Host-rendered UI state | `ui_state.rs` |
 | Automation policy | `automation_policy.rs` |
 
@@ -27,7 +28,7 @@ Every worker needs `runtime.worker`; other capabilities gate host RPCs and are c
 
 ## Contributions
 
-Static manifest contributions are collected from active plugins: settings join the single settings schema and keep plugin ownership, themes resolve within the plugin directory, commands and keybindings are namespaced with core names taking precedence, status definitions provide host-rendered labels, the `pane`, `home-pane`, and `composer-action` slots render typed worker state, and a `page` slot serves its declared HTML entry.
+Static manifest contributions are collected from active plugins: settings join the single settings schema and keep plugin ownership, themes resolve within the plugin directory, commands and keybindings are namespaced with core names taking precedence, status definitions provide host-rendered labels, the `pane`, `home-pane`, and `composer-action` slots render typed worker state, and a `page` slot serves its declared HTML entry. `agent_integrations` optionally expose unique plugin-provided launch commands to the CLI and agent catalog; they do not implement session status, prompts, or resume behavior.
 
 Host-rendered slots run no plugin code in a frontend: workers publish typed state, the host stores the latest generation, and the web or daemon-connected TUI renders it; generation ids stop a stopped worker's late cleanup from deleting a newer worker's state. Pane actions return to the worker as JSON-RPC notifications. A `page` is the exception: its own HTML and inline script run in a sandboxed frame with an opaque origin, never on the dashboard origin.
 

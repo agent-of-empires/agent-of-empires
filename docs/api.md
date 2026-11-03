@@ -401,6 +401,10 @@ before provisioning begins. Failure to persist approval aborts creation.
 The optional `cli` object carries CLI selection intent: `parent`, `projects`,
 `command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
 Selectors, project registries, configuration and paths are resolved on the Daemon host.
+CLI agent selection also resolves approved plugin agents on the Daemon host.
+Nonblank configured custom commands take precedence over plugin commands; blank
+custom commands allow built-in or plugin fallback. Plugin `--tool` selections
+reject command overrides, matching configured custom-agent selections.
 A terminal creation with `cli` runs creation hooks and finishes **Stopped**, without
 launching the agent. Launch is a separate epoch-checked request. The CLI client
 allows up to 30 minutes for creation and launch, including host hooks. Requests without
