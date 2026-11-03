@@ -814,9 +814,10 @@ pub fn remove_guarded(
     profile: &str,
     scope: ProjectScope,
     name_or_path: &str,
+    anchored_path: Option<&str>,
     guard: impl FnOnce(&Project, &EffectiveChange) -> std::result::Result<(), RegistryError>,
 ) -> std::result::Result<ProjectCommit<Project>, RegistryError> {
-    let canonical_target = canonical_key(name_or_path);
+    let canonical_target = canonical_key(anchored_path.unwrap_or(name_or_path));
     locked_update_both(profile, scope, |global, scoped, shared| {
         let list = match scope {
             ProjectScope::Global => &*global,
@@ -824,9 +825,10 @@ pub fn remove_guarded(
         };
         let idx = list
             .iter()
-            .position(|p| {
-                p.name.eq_ignore_ascii_case(name_or_path)
-                    || canonical_key(&p.path) == canonical_target
+            .position(|p| p.name.eq_ignore_ascii_case(name_or_path))
+            .or_else(|| {
+                list.iter()
+                    .position(|p| canonical_key(&p.path) == canonical_target)
             })
             .ok_or_else(|| {
                 RegistryError::NotFound(format!(
@@ -1644,7 +1646,7 @@ mod tests {
         );
 
         // Removing the shadow reveals them again, though the removed entry holds none.
-        let commit = remove_guarded("default", ProjectScope::Profile, "p", |_, _| Ok(()))?;
+        let commit = remove_guarded("default", ProjectScope::Profile, "p", None, |_, _| Ok(()))?;
         let change = commit.effect.expect("guarded removal effect");
         assert!(commit.result.overrides.plugin_settings.is_empty());
         assert_eq!(
@@ -1654,16 +1656,24 @@ mod tests {
         assert!(!change.is_noop());
 
         // The shadow is gone again, so removing the global entry now drops the values for good.
-        let change = remove_guarded("default", ProjectScope::Global, "g", |entry, change| {
-            assert!(!entry.overrides.plugin_settings.is_empty());
-            assert!(!change.is_noop());
-            Ok(())
-        })?
+        let change = remove_guarded(
+            "default",
+            ProjectScope::Global,
+            "g",
+            None,
+            |entry, change| {
+                assert!(!entry.overrides.plugin_settings.is_empty());
+                assert!(!change.is_noop());
+                Ok(())
+            },
+        )?
         .effect
         .expect("guarded removal effect");
         assert_eq!(change.after, PluginValues::new());
         assert!(matches!(
-            remove_guarded("default", ProjectScope::Global, "missing", |_, _| Ok(())),
+            remove_guarded("default", ProjectScope::Global, "missing", None, |_, _| Ok(
+                ()
+            )),
             Err(RegistryError::NotFound(_))
         ));
 
@@ -1675,7 +1685,9 @@ mod tests {
         assert!(matches!(refusal, Err(RegistryError::Forbidden(_))));
         assert!(load_global()?.is_empty());
         fs::write(global_path()?, "{ not json")?;
-        assert!(remove_guarded("default", ProjectScope::Profile, "p", |_, _| Ok(())).is_err());
+        assert!(
+            remove_guarded("default", ProjectScope::Profile, "p", None, |_, _| Ok(())).is_err()
+        );
         assert!(add_guarded(
             "default",
             ProjectScope::Profile,
@@ -1755,12 +1767,18 @@ mod tests {
             });
             held_rx.recv().unwrap();
             let remover = s.spawn(|| {
-                remove_guarded("default", ProjectScope::Global, "g", |entry, change| {
-                    if entry.overrides.plugin_settings.is_empty() && change.is_noop() {
-                        return Ok(());
-                    }
-                    Err(RegistryError::Forbidden("needs elevation".into()))
-                })
+                remove_guarded(
+                    "default",
+                    ProjectScope::Global,
+                    "g",
+                    None,
+                    |entry, change| {
+                        if entry.overrides.plugin_settings.is_empty() && change.is_noop() {
+                            return Ok(());
+                        }
+                        Err(RegistryError::Forbidden("needs elevation".into()))
+                    },
+                )
             });
             release_tx.send(()).unwrap();
             writer.join().unwrap().expect("writer commits");
