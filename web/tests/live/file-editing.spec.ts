@@ -212,6 +212,33 @@ for (const permanent of [false, true]) {
   });
 }
 
+test("declining file discard prevents Trash from the command palette", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "file-palette", git: false, files: { "notes.txt": "original" } }),
+  });
+  await page.addInitScript(() => localStorage.setItem("aoe-web-settings", JSON.stringify({ fileEditing: true })));
+  const session = await openFile(page, serve);
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
+  await editor.fill("keep these edits");
+  const trashed: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith(`/api/sessions/${session.id}/trash`)) trashed.push(request.method());
+  });
+  await page.keyboard.press("ControlOrMeta+k");
+  await page.getByPlaceholder("Search actions, sessions, settings…").fill("Trash file-palette");
+  const declined = page.waitForEvent("dialog");
+  const attempt = page.keyboard.press("Enter");
+  const discard = await declined;
+  expect(discard.message()).toBe("Discard unsaved file changes?");
+  await discard.dismiss();
+  await attempt;
+  await expect(editor).toHaveValue("keep these edits");
+  const remaining = (await listSessions(serve.baseUrl)).find((item) => item.id === session.id);
+  expect(remaining?.trashed_at ?? null).toBeNull();
+  expect(trashed).toEqual([]);
+});
+
 test("mobile editing keeps controls usable and confirms leaving the Files pane", async ({
   page,
   spawnServe,

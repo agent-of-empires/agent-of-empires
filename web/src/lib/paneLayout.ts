@@ -389,7 +389,8 @@ export interface PaneLayoutApi {
   /** No-op if already open anywhere. */
   openTab: (tabId: TabId, dock: DockLocation) => void;
   addTerminal: (dock: DockLocation) => void;
-  closeTab: (tabId: TabId) => void;
+  /** Asks first, so an irreversible `before` (a shell kill) never runs for a declined close; closes once it resolves true. */
+  closeTab: (tabId: TabId, before?: () => Promise<boolean>) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
   moveTab: (tabId: TabId, toDock: DockLocation) => void;
   placeTab: (tabId: TabId, target: PlaceTarget) => void;
@@ -525,12 +526,18 @@ export function usePaneLayout(
   /* eslint-enable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates */
 
   const shownRef = useLatestRef({ layout, tabAvailable });
-  const guardedMutate = useCallback(
+  const confirmLeaving = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       const { layout: current, tabAvailable: available } = shownRef.current;
-      if (confirmFileEditPanes(leftTabs(current, fn(current), available))) mutate(fn);
+      return confirmFileEditPanes(leftTabs(current, fn(current), available));
     },
-    [mutate, shownRef],
+    [shownRef],
+  );
+  const guardedMutate = useCallback(
+    (fn: (l: DockLayout) => DockLayout) => {
+      if (confirmLeaving(fn)) mutate(fn);
+    },
+    [mutate, confirmLeaving],
   );
   const openTab = useCallback(
     (tabId: TabId, dock: DockLocation) => guardedMutate((l) => openOrRevealTab(l, tabId, dock)),
@@ -540,7 +547,17 @@ export function usePaneLayout(
     (dock: DockLocation) => guardedMutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
     [guardedMutate],
   );
-  const closeTab = useCallback((tabId: TabId) => guardedMutate((l) => removeTab(l, tabId)), [guardedMutate]);
+  const closeTab = useCallback(
+    (tabId: TabId, before?: () => Promise<boolean>) => {
+      const close = (l: DockLayout) => removeTab(l, tabId);
+      if (!before) return guardedMutate(close);
+      if (!confirmLeaving(close)) return;
+      void before().then((ok) => {
+        if (ok) mutate(close);
+      });
+    },
+    [mutate, guardedMutate, confirmLeaving],
+  );
   const activateTab = useCallback(
     (dock: DockLocation, tabId: TabId) => guardedMutate((l) => activateOrRevealTab(l, dock, tabId)),
     [guardedMutate],

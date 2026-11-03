@@ -834,11 +834,7 @@ function AppContent({
           // Remove the tab only once the shell is actually killed; if the
           // DELETE fails, keep the tab so the user can retry instead of
           // silently leaking the shell with no way to close it.
-          if (activeSessionId) {
-            void killTerminal(activeSessionId, idx).then((ok) => {
-              if (ok) closeTab(id);
-            });
-          }
+          if (activeSessionId) closeTab(id, () => killTerminal(activeSessionId, idx));
           return;
         }
       }
@@ -1992,6 +1988,7 @@ function AppContent({
         setSnoozeTargetId(id);
         return;
       }
+      if (action === "trash" && !confirmFileEditRemoval([id])) return;
       const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
         pin: () => setSessionPin(id, true),
         unpin: () => setSessionPin(id, false),

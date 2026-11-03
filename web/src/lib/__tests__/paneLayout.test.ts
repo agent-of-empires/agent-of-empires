@@ -430,4 +430,29 @@ describe("usePaneLayout file edit guard", () => {
     expect(confirm).toHaveBeenCalledOnce();
     release();
   });
+
+  it("asks before a close's side effect and skips it when declined or a save is pending", async () => {
+    const start = placeTab(layout(["terminal:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
+    const { result, release, confirm } = editing(start);
+    const kill = vi.fn(async () => true);
+    act(() => result.current.closeTab("terminal:1", kill));
+    expect([confirm.mock.calls.length, kill.mock.calls.length]).toEqual([1, 0]);
+    setFileDraft(key, { original, text: "draft", pendingSave: { promise: new Promise(() => {}) } });
+    act(() => result.current.closeTab("terminal:1", kill));
+    expect([confirm.mock.calls.length, kill.mock.calls.length]).toEqual([1, 0]);
+    setFileDraft(key, { original, text: "draft", pendingSave: null });
+    confirm.mockReturnValue(true);
+    await act(async () => result.current.closeTab("terminal:1", kill));
+    expect(kill).toHaveBeenCalledOnce();
+    expect(dockTabs(result.current.layout, "right")).toEqual(["files"]);
+    release();
+  });
+
+  it("keeps the tab when its close side effect fails", async () => {
+    const { result, release, confirm } = editing(layout(["files"], ["terminal:1"]));
+    await act(async () => result.current.closeTab("terminal:1", async () => false));
+    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:1"]);
+    expect(confirm).not.toHaveBeenCalled();
+    release();
+  });
 });
