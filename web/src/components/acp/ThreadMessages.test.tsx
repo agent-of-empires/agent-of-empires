@@ -202,6 +202,22 @@ describe("AssistantMessage compaction summary", () => {
   });
 });
 
+describe("AssistantMessage thinking", () => {
+  it("renders summarized thinking collapsed ahead of the reply", () => {
+    const rows: ActivityRow[] = [
+      { id: "thought-1", kind: "thinking", text: "Weighing PINEAPPLE-7", at: "2026-10-06T00:00:00Z" },
+      { id: "msg-2", kind: "message", text: "Done.", at: "2026-10-06T00:00:00Z" },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(details!.open).toBe(false);
+    expect(details!.querySelector("summary")?.textContent).toBe("Thinking");
+    expect(details!.textContent).toContain("PINEAPPLE-7");
+    expect(screen.getByText("Done.")).toBeTruthy();
+  });
+});
+
 describe("AssistantMessage table copy across an interrupted turn", () => {
   const at = "2026-05-12T00:00:00Z";
   const CUT_OFF = "| a | b |\n|---|---|\n| 1 | 2";
