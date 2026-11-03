@@ -213,6 +213,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 
 Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps recursively merge with global maps; scalar and array values replace global values. `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
 
+
 ### One CLI, two accounts
 
 A wrapper selecting another login may export a config-dir variable after AoE has chosen its hook files. Name that directory in `agent_config_dir` so folder trust and [native MCP discovery](mcp-servers.md) use the agent's actual config, until the conversation records its own store.

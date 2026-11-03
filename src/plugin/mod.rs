@@ -1,5 +1,6 @@
 //! Plugin registry, installation, contributions, discovery, and worker host.
 
+pub mod agent_integration;
 pub mod auto_update;
 pub mod changelog;
 pub mod contributions;

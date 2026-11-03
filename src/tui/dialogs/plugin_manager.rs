@@ -1392,6 +1392,26 @@ impl PluginManagerDialog {
                 )));
             }
         }
+        if !consent.agent_integrations.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Agent launch commands (run as you when launched):",
+                Style::default().fg(theme.waiting),
+            )));
+            for agent in &consent.agent_integrations {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}: {}",
+                        agent.tool,
+                        agent
+                            .command
+                            .as_deref()
+                            .map(crate::plugin::agent_integration::display_command)
+                            .unwrap_or_else(|| "No launch command declared".to_string())
+                    ),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+        }
         if !consent.ui.is_empty() {
             let mut slots: Vec<&str> = Vec::new();
             for u in &consent.ui {
@@ -1406,7 +1426,7 @@ impl PluginManagerDialog {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Approving trusts this plugin; a worker and build steps run without OS sandboxing.",
+            "Approving trusts this plugin; workers, agent commands and build steps run without OS sandboxing.",
             Style::default().fg(theme.dimmed),
         )));
         let footer = vec![Line::from(Span::styled(
@@ -1493,9 +1513,29 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.dimmed),
             )));
         }
+        if !consent.agent_integrations.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Agent launch commands (run as you when launched):",
+                Style::default().fg(theme.waiting),
+            )));
+            for agent in &consent.agent_integrations {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}: {}",
+                        agent.tool,
+                        agent
+                            .command
+                            .as_deref()
+                            .map(crate::plugin::agent_integration::display_command)
+                            .unwrap_or_else(|| "No launch command declared".to_string())
+                    ),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Approving trusts this plugin; a worker and build steps run without OS sandboxing.",
+            "Installing trusts this plugin; workers, agent commands and build steps run without OS sandboxing.",
             Style::default().fg(theme.dimmed),
         )));
         let footer = vec![Line::from(Span::styled(
@@ -1563,6 +1603,26 @@ impl PluginManagerDialog {
                 format!("UI slots: {}", slots.join(", ")),
                 Style::default().fg(theme.dimmed),
             )));
+        }
+        if !consent.agent_integrations.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Agent launch commands (run as you when launched):",
+                Style::default().fg(theme.waiting),
+            )));
+            for agent in &consent.agent_integrations {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}: {}",
+                        agent.tool,
+                        agent
+                            .command
+                            .as_deref()
+                            .map(crate::plugin::agent_integration::display_command)
+                            .unwrap_or_else(|| "No launch command declared".to_string())
+                    ),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -2202,5 +2262,57 @@ mod mouse_tests {
             None,
             "the list's hints are inert under a popup"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_consent_discloses_plugin_agent_launch_command() {
+        let mut dialog = PluginManagerDialog::new();
+        dialog.open_popup(Popup::Install(Box::new(
+            crate::plugin::install::InstallConsent {
+                id: "acme.widget".into(),
+                version: "1.0.0".into(),
+                source: "gh:acme/widget".into(),
+                notice: String::new(),
+                unverified: false,
+                validation: "verified".into(),
+                capabilities: Vec::new(),
+                ui: Vec::new(),
+                build_steps: Vec::new(),
+                agent_integrations: vec![
+                    aoe_plugin_api::agent_integration::AgentIntegrationContribution {
+                        tool: "session-helper".into(),
+                        command: Some("TOKEN=local session-helper --flag".into()),
+                    },
+                ],
+                fingerprint: "fingerprint".into(),
+            },
+        )));
+        let buffer = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
+        let _ = find(&buffer, "session-helper: TOKEN=local session-helper --flag");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reapprove_consent_discloses_agent_launch_commands_without_raw_controls() {
+        let mut dialog = PluginManagerDialog::new();
+        dialog.open_popup(Popup::Reapprove(crate::plugin::install::ReapproveConsent {
+            id: "acme.widget".into(),
+            version: "1.0.0".into(),
+            validation: "verified".into(),
+            capabilities: Vec::new(),
+            ui: Vec::new(),
+            agent_integrations: vec![
+                aoe_plugin_api::agent_integration::AgentIntegrationContribution {
+                    tool: "session-helper".into(),
+                    command: Some("x\u{1b}[2Jtail".into()),
+                },
+            ],
+            manifest_hash: "sha256:hash".into(),
+        }));
+        let buffer = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
+        // The command renders with visible escapes and its plain text intact,
+        // not with a raw escape sequence the manifest could hide text behind.
+        let _ = find(&buffer, "session-helper: x\\u{1b}[2Jtail");
     }
 }

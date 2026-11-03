@@ -762,6 +762,11 @@ export interface PluginUpdateChangelog {
   more_url: string | null;
 }
 
+export interface PluginAgentIntegration {
+  tool: string;
+  command?: string;
+}
+
 /** Structured disclosure for a capability-expanding plugin update, mirroring the
  *  Rust `UpdateConsent`. Drives the consent modal. */
 export interface PluginUpdateConsent {
@@ -773,6 +778,7 @@ export interface PluginUpdateConsent {
   added_capabilities: string[];
   removed_capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   runtime_change: string | null;
   trust_downgrade: boolean;
@@ -849,6 +855,7 @@ export interface PluginInstallConsent {
   validation: string;
   capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   fingerprint: string;
 }

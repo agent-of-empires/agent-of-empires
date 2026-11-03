@@ -2,7 +2,10 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
+use reqwest::Method;
 use std::io::{self, Write};
+
+use crate::daemon::transport::path_segment;
 
 use crate::session;
 
@@ -79,40 +82,16 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn create_profile(name: &str) -> Result<()> {
-    session::create_profile(name)?;
+    let body = serde_json::json!({ "name": name });
+    super::runtime_write(Method::POST, "/api/profiles", Some(body)).await?;
     println!("✓ Created profile: {}", name);
     println!("  Use with: aoe -p {}", name);
     Ok(())
 }
-async fn mutate_running_profile(mutation: crate::daemon::ProfileMutation) -> Result<bool> {
-    use crate::acp::client::discovery::{discover, DiscoveryError};
-    let endpoint = match discover() {
-        Ok(endpoint) => endpoint,
-        Err(DiscoveryError::NoLocalDaemon) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let client = endpoint.daemon_client()?;
-    let info = client.runtime_info().await?;
-    anyhow::ensure!(
-        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
-            && info.health == crate::daemon::RuntimeHealth::Healthy,
-        "Daemon runtime is not ready"
-    );
-    client.mutate_profile(&mutation, &info.epoch).await?;
-    Ok(true)
-}
-
 async fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if !mutate_running_profile(crate::daemon::ProfileMutation::Rename {
-        name: old_name.into(),
-        body: crate::daemon::RenameProfileBody {
-            new_name: new_name.into(),
-        },
-    })
-    .await?
-    {
-        session::rename_profile(old_name, new_name)?;
-    }
+    let path = format!("/api/profiles/{}/rename", path_segment(old_name)?);
+    let body = serde_json::json!({ "new_name": new_name });
+    super::runtime_write(Method::PATCH, &path, Some(body)).await?;
     println!("✓ Renamed profile: {} -> {}", old_name, new_name);
     Ok(())
 }
@@ -132,14 +111,8 @@ async fn delete_profile(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    if !mutate_running_profile(crate::daemon::ProfileMutation::Delete {
-        name: name.into(),
-        query: crate::daemon::DeleteProfileQuery::default(),
-    })
-    .await?
-    {
-        session::delete_profile(name)?;
-    }
+    let path = format!("/api/profiles/{}", path_segment(name)?);
+    super::runtime_write(Method::DELETE, &path, None).await?;
     println!("✓ Deleted profile: {}", name);
     Ok(())
 }
@@ -153,7 +126,8 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    session::set_default_profile(name)?;
+    let body = serde_json::json!({ "name": name });
+    super::runtime_write(Method::PATCH, "/api/default-profile", Some(body)).await?;
     println!("✓ Default profile set to: {}", name);
     Ok(())
 }

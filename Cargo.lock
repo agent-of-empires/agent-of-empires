@@ -173,6 +173,7 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "tui-input",
+ "unicode-general-category",
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",

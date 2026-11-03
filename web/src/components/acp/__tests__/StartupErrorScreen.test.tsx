@@ -511,9 +511,11 @@ describe("StartupErrorScreen", () => {
     expect(body).toContain(`Where${where}`);
     expect(body).toContain("initialize handshake");
     expect(body.includes("fixes new Sessions only")).toBe(sandboxed);
-    // The dashboard pulls the image itself, so the TUI isn't needed.
+    // The dashboard can pull the image, so the TUI isn't needed.
     expect(
-      body.includes('the dashboard\'s "Sandbox image update available" banner pulls it, or shows the command to run.'),
+      body.includes(
+        'the dashboard\'s "Sandbox image update available" banner offers Update now to pull it, or shows the command to run.',
+      ),
     ).toBe(sandboxed);
     expect(body).not.toContain("TUI");
   });
