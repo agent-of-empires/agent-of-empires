@@ -25,7 +25,7 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64', github.run_id) }}
     permissions:
       contents: read
       id-token: write
@@ -212,8 +212,8 @@ jobs:
       # binary, and the privdrop tests are core, so they are present in it.
       # Reusing that binary makes the privileged run nearly free.
       #
-      # The privileged step is safe only on a disposable GitHub-hosted runner.
-      # Do not move this leg to a persistent or self-hosted machine.
+      # The privileged step is safe only on a disposable runner (GitHub-hosted
+      # or single-job RunsOn). Do not move this leg to a persistent machine.
       - name: Exercise alien uid guards (privdrop)
         if: matrix.leg == 'core-rest'
         shell: bash
@@ -545,7 +545,7 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64', github.run_id) }}
     permissions:
       contents: read
       id-token: write
