@@ -322,6 +322,11 @@ impl Shared {
                 }
                 continue;
             }
+            // Only `TaskStop` ends a task here; the tailer publishes the end.
+            if let Event::BackgroundTaskFinished { task_id, .. } = &event {
+                self.bg_tasks.stop(task_id);
+                continue;
+            }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
                 break;

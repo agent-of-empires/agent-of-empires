@@ -183,16 +183,11 @@ fn run_info(id: &str) -> Result<()> {
 }
 
 async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
-    use crate::plugin::install::LiveToggle;
-    let outcome = crate::plugin::install::set_enabled_live(id, enabled).await?;
+    let endpoint = crate::acp::client::require_daemon().await?;
+    crate::acp::client::HttpClient::new(endpoint)?
+        .set_plugin_enabled(id, enabled)
+        .await?;
     println!("{} {id}.", if enabled { "Enabled" } else { "Disabled" });
-    match outcome {
-        LiveToggle::Daemon => println!("  the running daemon reconciled its workers."),
-        LiveToggle::Local => {}
-        LiveToggle::LocalDaemonStale { reason } => println!(
-            "  warning: a daemon is running but was not updated ({reason}); restart it or toggle from the dashboard."
-        ),
-    }
     Ok(())
 }
 

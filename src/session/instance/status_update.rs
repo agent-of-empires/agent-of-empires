@@ -1511,8 +1511,11 @@ HISTORY_READY",
             &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
         );
         assert!(wait_for_pane(&session_name, "HISTORY_READY"));
-        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
-        cache.force_present(&[session_name.as_str()]);
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        let poll = |inst: &mut Instance, metadata: &tmux::PaneMetadata| {
+            cache.force_present(&[session_name.as_str()]);
+            inst.update_status_with_metadata_inner(Some(metadata), Some(&session_name));
+        };
         let mut metadata = agent_pane_metadata("omp", None);
         metadata.pane_title = Some(String::new());
         for status in [
@@ -1526,7 +1529,7 @@ HISTORY_READY",
                 (status == Status::Error).then(|| "Provider denied request".to_owned());
             let diagnostic = inst.last_error.clone();
             for _ in 0..2 {
-                inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+                poll(&mut inst, &metadata);
                 assert_eq!(inst.status, status);
                 assert_eq!(inst.last_error, diagnostic);
             }
@@ -1534,9 +1537,8 @@ HISTORY_READY",
         inst.status = Status::Running;
         inst.last_error = None;
         metadata.pane_current_command = Some("bash".to_owned());
-        cache.force_stale();
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Idle,
@@ -1545,14 +1547,14 @@ HISTORY_READY",
         inst.last_error = None;
         metadata.pane_start_command_is_protected = true;
         inst.status = Status::Waiting;
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Waiting,
             "a live protected wrapper owns history"
         );
         metadata.pane_dead = true;
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Error,

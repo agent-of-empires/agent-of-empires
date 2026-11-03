@@ -45,15 +45,17 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: clippy
       # `--all-features` so the `web`-gated dashboard tree gets linted too.
       # The web-dist placeholder stands in for the npm bundle that build.rs
       # would otherwise build, so this job still needs no Node setup; same
@@ -94,6 +96,9 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read rust-version
@@ -103,10 +108,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: msrv
       # Lib and bins only: dev-dependencies such as `serial_test` may need a
       # newer compiler without affecting anyone building aoe.
       - name: Check the locked graph on rust-version (core)
@@ -162,13 +166,15 @@ jobs:
     # Also the skill check: both build xtask.
     name: Docs
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: docs
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
       # The workspace declares no `default-members`, so every other `cargo

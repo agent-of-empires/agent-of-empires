@@ -505,7 +505,7 @@ struct PropagationMarker {
 
 /// What a sync did, or refused to do, to one skill under one root. A sync never
 /// aborts on the first conflict, so a caller gets one of these per skill.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncOutcome {
     pub root: String,
@@ -515,7 +515,7 @@ pub struct SyncOutcome {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SyncStatus {
     Created,

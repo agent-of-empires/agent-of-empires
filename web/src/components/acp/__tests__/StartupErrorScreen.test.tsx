@@ -96,7 +96,7 @@ const stepTitles = (getByTestId: (id: string) => HTMLElement) =>
 /** A step names only buttons that render. */
 function expectStepsNameRenderedButtons(screen: HTMLElement, titles: string[]) {
   for (const title of titles) {
-    const named = /^Click (.+)$/.exec(title)?.[1];
+    const named = /^Click (.+?)(?: to .+)?$/.exec(title)?.[1];
     if (named) expect(buttons(screen), title).toContain(named);
   }
   for (const m of (screen.textContent ?? "").matchAll(/then (Check again|Update[^.:]*)/g)) {
@@ -435,47 +435,57 @@ describe("StartupErrorScreen", () => {
     expect(queryByTestId("adapter-install-error")).toBeNull();
   });
 
-  it("a stopped container reported by install-info gets its steps before any click", async () => {
-    const stopped = info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" });
-    const view = await renderScreen(incompatible(), stopped);
-    const { getByTestId, queryByTestId } = view;
-    const screen = getByTestId("startup-error-screen");
-    expect(getByTestId("startup-error-container-down").textContent).toContain("This Session's container isn't running");
-    expect(buttons(screen)).toEqual(["Start the container"]);
-    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+  // install-info names the stopped container before the install setting, so installs off still start it first.
+  it.each([
+    ["installs allowed", info({ ...sandbox, ...allowed }), "true"],
+    ["installs off", info({ ...sandbox }), null],
+  ])(
+    "a stopped container reported by install-info gets its steps before any click, %s",
+    async (_label, started, done) => {
+      const stopped = info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" });
+      const view = await renderScreen(incompatible(), stopped);
+      const { getByTestId, queryByTestId } = view;
+      const screen = getByTestId("startup-error-screen");
+      expect(getByTestId("startup-error-container-down").textContent).toContain(
+        "This Session's container isn't running",
+      );
+      expect(buttons(screen)).toEqual(["Start the container"]);
+      expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
 
-    fireEvent.click(getByTestId("startup-error-start-container"));
-    spawnCall();
-    fetchAgentInstallInfo.mockResolvedValue(info({ ...sandbox, ...allowed }));
-    view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
-    await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
-    expect(queryByTestId("startup-error-container-down")).toBeNull();
-    expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe("true");
-  });
+      fireEvent.click(getByTestId("startup-error-start-container"));
+      spawnCall();
+      fetchAgentInstallInfo.mockResolvedValue(started);
+      view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+      await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+      expect(queryByTestId("startup-error-container-down")).toBeNull();
+      expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe(done);
+    },
+  );
 
-  it("a stopped container leaves steps the Web dashboard can't run as they are", async () => {
+  it("a stopped container: Check again starts it before a manual step, and protocol steps stay", async () => {
     const stopped = { ...sandbox, install_allowed: false, install_blocked: "container_not_running" } as const;
-    const cases: [string, IncompatibleAgentDetail, AgentInstallInfo, string][] = [
+    const cases: [string, IncompatibleAgentDetail, AgentInstallInfo, string[]][] = [
       [
+        // Its command runs inside the container, so Check again starts that first.
         "manual-only",
         incompatible(false, OPENCODE),
         { ...opencode, ...stopped, container_install_command: null },
-        "Run this inside this Session's container",
+        ["Click Check again to start the container", "Run this inside this Session's container"],
       ],
       [
         "protocol",
         { kind: "unsupported_protocol_version", expected: "V1", received: "V2" },
         info(stopped),
-        "Install an adapter that speaks ACP protocol V1",
+        ["Install an adapter that speaks ACP protocol V1", "Click Check again"],
       ],
     ];
-    for (const [label, detail, answer, stepOne] of cases) {
+    for (const [label, detail, answer, steps] of cases) {
       const { getByTestId, queryByTestId } = await renderScreen(detail, answer);
       const screen = getByTestId("startup-error-screen");
       expect(queryByTestId("startup-error-container-down"), label).toBeNull();
       expect(buttons(screen), label).toEqual(["Check again"]);
       const titles = stepTitles(getByTestId);
-      expect(titles, label).toEqual([stepOne, "Click Check again"]);
+      expect(titles, label).toEqual(steps);
       expectStepsNameRenderedButtons(screen, titles);
       if (label === "manual-only") {
         expect(getByTestId("startup-error-install-command").textContent).toContain(OPENCODE_COMMAND);
@@ -511,9 +521,11 @@ describe("StartupErrorScreen", () => {
     expect(body).toContain(`Where${where}`);
     expect(body).toContain("initialize handshake");
     expect(body.includes("fixes new Sessions only")).toBe(sandboxed);
-    // The dashboard pulls the image itself, so the TUI isn't needed.
+    // The dashboard can pull the image, so the TUI isn't needed.
     expect(
-      body.includes('the dashboard\'s "Sandbox image update available" banner pulls it, or shows the command to run.'),
+      body.includes(
+        'the dashboard\'s "Sandbox image update available" banner offers Update now to pull it, or shows the command to run.',
+      ),
     ).toBe(sandboxed);
     expect(body).not.toContain("TUI");
   });

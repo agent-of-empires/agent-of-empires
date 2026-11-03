@@ -101,6 +101,12 @@ updates:
           - "tailwindcss"
           - "@tailwindcss/*"
         update-types: ["minor", "patch"]
+      vitest:
+        applies-to: version-updates
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+        update-types: ["major"]
       web-minor-patch:
         patterns: ["*"]
         exclude-patterns:
@@ -110,18 +116,13 @@ updates:
           - "@types/react-dom"
           - "tailwindcss"
           - "@tailwindcss/*"
-          # Pre-1.0 packages: a minor bump is a breaking change by semver
-          # convention, but dependabot still classifies it as "minor" and so
-          # would group it with the routine updates. Excluding them gives each
-          # its own PR, so one breaking library cannot hold the rest hostage.
-          # In #3394, @assistant-ui/react 0.14 to 0.15 dropped three hooks and
-          # blocked 15 unrelated bumps behind a red build.
+          # Pre-1.0 minor updates may break compatibility; project policy
+          # keeps them in separate PRs for review.
           - "@assistant-ui/*"
           - "eslint-plugin-react-refresh"
           - "oxfmt"
         update-types: ["minor", "patch"]
-      # Patch bumps of the pre-1.0 packages above are safe to batch; their
-      # minor bumps still get one PR each.
+      # Batch pre-1.0 patches by project choice, not a SemVer compatibility guarantee.
       web-pre1-patch:
         patterns:
           - "@assistant-ui/*"

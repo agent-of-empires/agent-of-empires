@@ -57,7 +57,7 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
     localStorage.clear();
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
     fetchProjects.mockResolvedValue([]);
-    fetchDockerStatus.mockResolvedValue({ available: false });
+    fetchDockerStatus.mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
     fetchProfiles.mockResolvedValue([]);
     fetchRecentProjects.mockResolvedValue({ projects: [] });
   });
@@ -258,7 +258,7 @@ describe("project sandbox override on the remembered last-used path", () => {
   });
 
   it("refuses to submit a seeded sandbox while Docker is unavailable", async () => {
-    fetchDockerStatus.mockResolvedValue({ available: false });
+    fetchDockerStatus.mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
     const { getByText, findByText } = renderWizard();
     await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
     await clickLaunch(getByText);
@@ -459,7 +459,7 @@ describe("project sandbox override on the remembered last-used path", () => {
         expect(getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true"),
       );
       // An unrelated edit makes the profile fields dirty, so the late settings take their dirty branch.
-      fireEvent.click(getByRole("switch", { name: "Auto-approve actions" }));
+      fireEvent.click(getByRole("switch", { name: "Yolo mode" }));
       await act(async () => initialSettings.resolve({ sandbox: { enabled_by_default: false } }));
 
       fireEvent.click(getByText("Project"));

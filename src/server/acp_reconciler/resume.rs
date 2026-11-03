@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use super::{is_resumable, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
-    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservationOutcome, SpawnRequest,
+    command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservationOutcome, SpawnRequest,
     Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
@@ -527,18 +527,6 @@ async fn build_spawn_request(
         seed_history_replay,
         prior_conversation,
         claude_store_pin,
-    })
-}
-
-/// Command override from a persisted launch command; `None` keeps the registry default.
-pub(crate) fn command_override_for_spawn(
-    tool: &str,
-    command: &str,
-) -> Option<AgentCommandOverride> {
-    let command = command.trim();
-    (!command.is_empty()).then(|| AgentCommandOverride {
-        logical_tool: tool.to_string(),
-        command: command.to_string(),
     })
 }
 
