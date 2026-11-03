@@ -100,6 +100,8 @@ fn permission_refusal(
     repair: PermissionRepair,
     owner: u32,
 ) -> anyhow::Error {
+    use std::fmt::Write;
+
     let (cause, template, manual) = match repair {
         PermissionRepair::Private => (
             "not private to its owner",
@@ -112,18 +114,37 @@ fn permission_refusal(
             "Remove group/other write permission from this directory",
         ),
     };
-    let upper_ancestors_are_trusted = path.ancestors().skip(1).all(|ancestor| {
-        std::fs::symlink_metadata(ancestor)
-            .is_ok_and(|metadata| trusted_directory(&metadata, owner))
-    });
-    let remedy = if upper_ancestors_are_trusted {
+    let mut highest_unsafe_ancestor = None;
+    let mut unverified_ancestor = None;
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if trusted_directory(&metadata, owner) => {}
+            Ok(_) => highest_unsafe_ancestor = Some(ancestor),
+            Err(_) => unverified_ancestor = Some(ancestor),
+        }
+    }
+    let remedy = if highest_unsafe_ancestor.is_none() && unverified_ancestor.is_none() {
         RuntimePathRemedy::Command { template, manual }
     } else {
         RuntimePathRemedy::Advice(
-            "Repair or replace the unsafe parent directories first, starting with the highest unsafe ancestor, or select a location with trusted ancestors. Then retry before changing this directory.",
+            "Repair or replace unsafe parent directories, or select a location with trusted ancestors. Then retry before changing this directory.",
         )
     };
-    anyhow::anyhow!(runtime_path_refusal(path, mode, cause, remedy))
+    let mut message = runtime_path_refusal(path, mode, cause, remedy);
+    if let Some(ancestor) = unverified_ancestor {
+        write!(
+            message,
+            " Ancestor trust could not be verified at {ancestor:?}; the highest unsafe ancestor cannot be determined."
+        )
+        .unwrap();
+    } else if let Some(ancestor) = highest_unsafe_ancestor {
+        write!(
+            message,
+            " Start with the highest unsafe ancestor: {ancestor:?}."
+        )
+        .unwrap();
+    }
+    anyhow::anyhow!(message)
 }
 
 fn trusted_directory(metadata: &std::fs::Metadata, owner: u32) -> bool {
@@ -711,62 +732,67 @@ mod tests {
     fn unsafe_upper_ancestors_suppress_copyable_recovery_commands() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let upper = root.path().canonicalize().unwrap().join("unsafe upper");
-        let lower = upper.join("unsafe lower");
-        let app = lower.join("app");
-        let socket = app.join("daemon");
-        std::fs::create_dir_all(&socket).unwrap();
-        for directory in [&upper, &lower] {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        for name in ["unsafe upper", "unsafe\x1b[31m\u{202e} upper"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let upper = root.path().canonicalize().unwrap().join(name);
+            let lower = upper.join("unsafe lower");
+            let app = lower.join("app");
+            let socket = app.join("daemon");
+            std::fs::create_dir_all(&socket).unwrap();
+            for directory in [&upper, &lower, &socket] {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
+            }
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let ancestor_diagnostic = prepare_runtime_directory(&socket).unwrap_err().to_string();
+            let socket_diagnostic =
+                check_ancestor(&socket, &socket, nix::unistd::geteuid().as_raw())
+                    .unwrap_err()
+                    .to_string();
+            for (diagnostic, refused) in [
+                (&ancestor_diagnostic, &lower),
+                (&socket_diagnostic, &socket),
+            ] {
+                assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
+                assert!(diagnostic.contains(&format!("{upper:?}")), "{diagnostic}");
+                assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+                assert!(!diagnostic.contains(['\x1b', '\u{202e}']), "{diagnostic:?}");
+            }
         }
-        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
 
-        let ancestor_error = prepare_runtime_directory(&socket).unwrap_err();
-        let ancestor_diagnostic = ancestor_error.to_string();
-        assert!(
-            ancestor_diagnostic.contains(&format!("{lower:?}")),
-            "{ancestor_diagnostic}"
-        );
-        assert!(
-            !ancestor_diagnostic.contains("`chmod"),
-            "{ancestor_diagnostic}"
-        );
-        assert!(
-            ancestor_diagnostic.contains("writable by its group or by others"),
-            "{ancestor_diagnostic}"
-        );
-        assert!(
-            ancestor_diagnostic.contains("starting with the highest unsafe ancestor"),
-            "{ancestor_diagnostic}"
-        );
-        assert!(
-            ancestor_diagnostic.contains("retry before changing this directory"),
-            "{ancestor_diagnostic}"
-        );
-
-        let socket_diagnostic = check_ancestor(&socket, &socket, nix::unistd::geteuid().as_raw())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            socket_diagnostic.contains(&format!("{socket:?}")),
-            "{socket_diagnostic}"
-        );
-        assert!(!socket_diagnostic.contains("`chmod"), "{socket_diagnostic}");
-        assert!(
-            socket_diagnostic.contains("not private to its owner"),
-            "{socket_diagnostic}"
-        );
-        assert!(
-            socket_diagnostic.contains("starting with the highest unsafe ancestor"),
-            "{socket_diagnostic}"
-        );
-        assert!(
-            socket_diagnostic.contains("retry before changing this directory"),
-            "{socket_diagnostic}"
-        );
+    #[test]
+    fn unverifiable_upper_ancestors_suppress_copyable_recovery_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        for ancestor in [base.join("missing"), base.join("not-a-directory")] {
+            if ancestor.ends_with("not-a-directory") {
+                std::fs::write(&ancestor, b"not a directory").unwrap();
+            }
+            let refused = ancestor.join("unverified/refused");
+            let unverified = if ancestor.is_file() {
+                refused.parent().unwrap()
+            } else {
+                ancestor.as_path()
+            };
+            assert!(std::fs::symlink_metadata(refused.parent().unwrap()).is_err());
+            for repair in [
+                PermissionRepair::Private,
+                PermissionRepair::RemoveGroupOtherWrite,
+            ] {
+                let diagnostic =
+                    permission_refusal(&refused, 0o777, repair, nix::unistd::geteuid().as_raw())
+                        .to_string();
+                assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
+                assert!(
+                    diagnostic.contains(&format!("{unverified:?}")),
+                    "{diagnostic}"
+                );
+                assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+            }
+        }
     }
 
     #[test]
