@@ -55,14 +55,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
-  const pushWithAction = useCallback(
-    (message: string, label: string, run: () => void) => {
-      const id = nextId.current++;
-      setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
-      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
-    },
-    [dismiss],
-  );
+  const pushWithAction = useCallback((message: string, label: string, run: () => void) => {
+    const id = nextId.current++;
+    // Stays until used or dismissed: its action can be the only way back to what failed.
+    setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
+  }, []);
 
   const api = useMemo<ToastApi>(
     () => ({

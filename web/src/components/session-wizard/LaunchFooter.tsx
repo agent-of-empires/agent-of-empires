@@ -58,8 +58,9 @@ export function LaunchFooter({
 
   return (
     <div>
-      {failure ??
-        (error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>)}
+      {failure}
+      {/* Shown with a failure, the error says why its actions are disabled. */}
+      {error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>}
       {offline && (
         <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
       )}

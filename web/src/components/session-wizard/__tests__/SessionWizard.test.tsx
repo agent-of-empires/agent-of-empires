@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
+import { initialData } from "../wizardReducer";
 import {
   fetchAgents,
   fetchCreateProgress,
@@ -779,6 +780,53 @@ describe("SessionWizard unknown create outcome", () => {
     renderWizard();
     expect(screen.queryByText(/may still be created/)).toBeNull();
   });
+
+  const REFUSED = {
+    ok: false,
+    error: "boom",
+    failure: { code: "create_failed", stage: "preparing", message: "boom", reference: null },
+  };
+
+  it("a wizard reopened from a failure sends its own form, not a closed wizard's unresolved create", async () => {
+    const { key } = await launchInBackgroundAndClose();
+    const restore = { data: { ...initialData, path: "/tmp/other", tool: "claude" }, failure: REFUSED.failure };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(screen.queryByText(/may still be created/)).toBeNull();
+    const before = createSession.mock.calls.length;
+    createSession.mockResolvedValue({ ok: true, session: { id: "s2" } });
+    const tryAgain = () => screen.getByTestId("create-failure-try_again") as HTMLButtonElement;
+    await waitFor(() => expect(tryAgain().disabled).toBe(false));
+    fireEvent.click(tryAgain());
+    await waitFor(() =>
+      expect(createSession.mock.calls.slice(before).map(([body]) => body.path)).toContain("/tmp/other"),
+    );
+    const sent = createSession.mock.calls.slice(before).find(([body]) => body.path === "/tmp/other")![0];
+    expect(sent.idempotency_key).not.toBe(key);
+  });
+
+  it("an adopted create refused in the background toasts plainly, since there is no form to reopen", async () => {
+    await launchInBackgroundAndClose();
+    const action = vi.fn();
+    toastBus.handler = { ...toastBus.handler!, action };
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValue(new Promise((r) => (finish = r)));
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={vi.fn()}
+        onReopenFailure={vi.fn()}
+        prefill={{ path: "/tmp/other", tool: "claude" }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    await launch();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await act(async () => finish(REFUSED));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Session was not created: boom"));
+    expect(action).not.toHaveBeenCalled();
+  });
 });
 
 describe("SessionWizard served-profile authority", () => {
@@ -1484,6 +1532,35 @@ describe("SessionWizard create failures", () => {
       expect(box().querySelector("button")?.textContent).toBe(primary);
     },
   );
+
+  it("a restored failure still says why its actions wait while the agent list fails", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue(null);
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude" },
+      failure: failure("create_failed", "preparing", "boom").failure,
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(box().textContent).toContain("boom");
+    expect(await screen.findByText(/Couldn't load the agent list/)).toBeTruthy();
+  });
+
+  it("a runtime check that answers late can't overwrite Retry's newer one", async () => {
+    let mount!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus)
+      .mockReturnValueOnce(new Promise((r) => (mount = r)))
+      .mockResolvedValueOnce({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
+      failure: UNAVAILABLE.failure,
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    await act(async () => mount({ available: false, runtime: "docker", runtime_name: "Docker" }));
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).not.toContain("is not running");
+  });
 
   it("a Retry that finds the runtime back up offers Retry again even when the form changed", async () => {
     createSession.mockResolvedValueOnce(UNAVAILABLE);

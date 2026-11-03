@@ -234,7 +234,10 @@ export function SessionWizard({
   const [showProgress, setShowProgress] = useState(false);
   // A create whose response never arrived; Launch and reconnects retry it under its key.
   // Seeded from a create an earlier wizard left unresolved, so Launch retries it under its key.
-  const [unknownOutcome, setUnknownOutcome] = useState<PendingCreate | null>(peekPendingCreate);
+  // A wizard reopened from a failure resends its own form, never another create.
+  const [unknownOutcome, setUnknownOutcome] = useState<PendingCreate | null>(() =>
+    restore ? null : peekPendingCreate(),
+  );
   const unknownOutcomeRef = useRef(unknownOutcome);
   useEffect(() => {
     unknownOutcomeRef.current = unknownOutcome;
@@ -250,6 +253,7 @@ export function SessionWizard({
   const [globConfirm, setGlobConfirm] = useState<{
     globs: VolumeIgnoresGlobPreview[];
     body: CreateSessionRequest;
+    sent: WizardData;
   } | null>(null);
   const [hooksTrust, setHooksTrust] = useState<{
     info: HooksNeedTrust;
@@ -257,6 +261,7 @@ export function SessionWizard({
     tool: string;
     fingerprint: CreationTrustFingerprint;
     mcpSummaries: string[];
+    sent?: WizardData;
   } | null>(null);
   const [defaultsProfile, setDefaultsProfile] = useState<string | null>(null);
   const defaultsReady = defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
@@ -268,6 +273,8 @@ export function SessionWizard({
   const [registryUnresolved, setRegistryUnresolved] = useState(false);
   const resolutionRef = useRef(0);
   const knownResolutionRef = useRef<string | null>(null);
+  // Runtime checks can answer out of order; only the newest one sets the Sandbox row.
+  const dockerSeq = useRef(0);
   const dataRef = useRef(state.data);
   useEffect(() => {
     dataRef.current = state.data;
@@ -335,9 +342,11 @@ export function SessionWizard({
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
-    fetchDockerStatus().then((d) =>
-      dispatch({ type: "SET_DOCKER", available: d.available, runtimeName: d.runtime_name ?? null }),
-    );
+    const seq = ++dockerSeq.current;
+    fetchDockerStatus().then((d) => {
+      if (seq !== dockerSeq.current) return;
+      dispatch({ type: "SET_DOCKER", available: d.available, runtimeName: d.runtime_name ?? null });
+    });
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
       .catch(() => {});
@@ -522,7 +531,11 @@ export function SessionWizard({
 
   /** Reviews the repository's hooks for a create, showing the trust dialog when it asks
    *  for one, and returns the body to send when the review asks for no trust at all. */
-  const openHooksTrust = async (body: CreateSessionRequest, tool: string): Promise<CreateSessionRequest | null> => {
+  const openHooksTrust = async (
+    body: CreateSessionRequest,
+    tool: string,
+    sent?: WizardData,
+  ): Promise<CreateSessionRequest | null> => {
     const review = await reviewCreationTrust({
       path: body.path,
       profile: body.profile,
@@ -546,13 +559,15 @@ export function SessionWizard({
       tool,
       fingerprint: review.review.fingerprint,
       mcpSummaries: review.review.mcp_summaries,
+      sent,
     });
     return null;
   };
 
   // `resume` continues a create whose first send already went out: every send is then
   // a retry naming the daemon run that took the first one.
-  const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate) => {
+  /** `sent` is the form `body` came from; an adopted create has none, so it can't be reopened. */
+  const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate, sent?: WizardData) => {
     // The last snapshot outlives the request: a failed hook's output tail comes from it.
     setProgress(null);
     // A create can be sent twice: once, then again after a review that asks for no trust.
@@ -621,8 +636,8 @@ export function SessionWizard({
         else onCreated(result.session);
       } else if (background) {
         const failure = result.failure;
-        if (failure && onReopenFailure) {
-          const restored = { data: dataRef.current, failure };
+        if (failure && onReopenFailure && sent) {
+          const restored = { data: sent, failure };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -636,6 +651,7 @@ export function SessionWizard({
         const reviewed = await openHooksTrust(
           result.trustChanged ? { ...body, trust_hooks: undefined, trust_review: undefined } : body,
           tool,
+          sent,
         );
         if (!reviewed) return;
         if (resend > 0) {
@@ -686,11 +702,11 @@ export function SessionWizard({
     if (d.sandboxEnabled && !d.scratch && d.path) {
       const preview = await fetchVolumeIgnoresPreview(d.path, d.profile || undefined);
       if (preview && !preview.acknowledged && preview.globs.length > 0) {
-        setGlobConfirm({ globs: preview.globs, body });
+        setGlobConfirm({ globs: preview.globs, body, sent: d });
         return;
       }
     }
-    await runCreate(body, d.tool);
+    await runCreate(body, d.tool, undefined, d);
   };
 
   // Own the adopted create while open; on close, hand an unresolved create back to the
@@ -733,14 +749,19 @@ export function SessionWizard({
     if (!pending) return;
     if (dontShowAgain) await markVolumeIgnoresGlobsAcknowledged();
     setGlobConfirm(null);
-    await runCreate(pending.body, state.data.tool);
+    await runCreate(pending.body, state.data.tool, undefined, pending.sent);
   };
 
   const handleHooksTrustConfirm = async () => {
     const pending = hooksTrust;
     if (!pending) return;
     setHooksTrust(null);
-    await runCreate({ ...pending.body, trust_hooks: true, trust_review: pending.fingerprint }, pending.tool);
+    await runCreate(
+      { ...pending.body, trust_hooks: true, trust_review: pending.fingerprint },
+      pending.tool,
+      undefined,
+      pending.sent,
+    );
   };
 
   const handleFailureAction = async (action: FailureAction) => {
@@ -748,10 +769,12 @@ export function SessionWizard({
       case "retry_runtime": {
         // The wizard's runtime check is from when it opened; ask again before resending.
         setRechecking(true);
+        const seq = ++dockerSeq.current;
         const status = await fetchDockerStatus();
         // Closed during the check: the user dismissed this create, so don't send it.
         if (unmountedRef.current) return;
         setRechecking(false);
+        if (seq !== dockerSeq.current) return;
         dispatch({ type: "SET_DOCKER", available: status.available, runtimeName: status.runtime_name ?? null });
         setRuntimeDown(!status.available);
         if (!status.available) return;

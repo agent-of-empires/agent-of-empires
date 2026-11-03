@@ -53,6 +53,20 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("keeps an action toast past a plain toast's lifetime until it is dismissed", () => {
+    renderProvider();
+    act(() => {
+      toastBus.handler?.error("plain");
+      toastBus.handler?.action("Session was not created", "Reopen", vi.fn());
+    });
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([
+      expect.stringContaining("Session was not created"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("renders info, push, and error toasts with their roles and dismisses on click", () => {
     const { container } = renderProvider();
     expect(container.querySelector("div.fixed")?.children.length).toBe(0);
