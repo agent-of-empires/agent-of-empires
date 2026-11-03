@@ -39,12 +39,15 @@ test("Restart on the startup line replaces a start stuck in session/new", async 
   const restart = line.getByRole("button", { name: "Restart Claude Code" });
   await expect(restart).toHaveCount(0);
 
-  // The line says the composer is open, so a prompt typed now must survive the Restart.
+  // The line says the composer is open; a prompt the daemon accepts now is stopped by a restart.
   const composer = page.locator('textarea[name="input"]');
   await composer.fill(PROMPT);
   await composer.press("Enter");
 
   await page.clock.fastForward(31_000);
+  await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(
+    "Restarting stops the message you sent. Send it again once Claude Code is ready.",
+  );
   const restarted = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
   const res = await restarted;
@@ -62,5 +65,20 @@ test("Restart on the startup line replaces a start stuck in session/new", async 
   await expect(page.getByTestId("startup-error-banner")).toHaveCount(0);
   const status = (await listSessions(serve.baseUrl)).find((s) => s.id === session!.id)?.status;
   expect(status).not.toBe("error");
+  await expect(page.getByText(PROMPT)).toBeVisible();
+  await expect(composer).toBeEnabled();
+  // The transcript's row for that empty turn doesn't carry the stop reason, so the event log is the check.
+  const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
+    ({ event }) => event,
+  );
+  const sent = events.findIndex((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
+  expect(sent).toBeGreaterThanOrEqual(0);
+  expect(events[sent + 1]).toEqual({ Stopped: { reason: "user_stopped" } });
+  expect(events.slice(sent + 1).some((e) => "AcpSessionAssigned" in e)).toBe(true);
+  expect(deliveries()).toBe(0);
+
+  // The caption's advice: sending again reaches the replacement once.
+  await composer.fill(PROMPT);
+  await composer.press("Enter");
   await expect.poll(deliveries, { timeout: 15_000 }).toBe(1);
 });
