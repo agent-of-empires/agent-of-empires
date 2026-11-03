@@ -44,7 +44,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     permissions:
       contents: read
       id-token: write
@@ -97,7 +97,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     permissions:
       contents: read
       id-token: write
@@ -169,7 +169,7 @@ jobs:
   docs:
     # Also the skill check: both build xtask.
     name: Docs
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     permissions:
       contents: read
       id-token: write
@@ -300,7 +300,7 @@ jobs:
 
   nix-build:
     name: Nix Build
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     timeout-minutes: 45
     # Builds the default (aoe) crate through crane. Nix Eval only evaluates
     # derivations, so a flake recipe that compiles nowhere (a bad source filter,
@@ -368,7 +368,7 @@ jobs:
 
   nix-build-web:
     name: Nix Build Web
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     timeout-minutes: 30
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
