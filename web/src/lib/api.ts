@@ -313,21 +313,31 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
+const TERMINAL_BUSY_BUDGET_MS = 30_000;
+
+// A launch holds the lifecycle reservation, so a terminal opened meanwhile gets 409 lifecycle_busy until it ends.
 export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  try {
-    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    const body = await res.json().catch(() => ({}));
-    return {
-      ok: false,
-      error: typeof body.error === "string" ? body.error : undefined,
-      message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
-    };
-  } catch (e) {
-    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+  let waited = 0;
+  for (let delay = 250; ; delay = Math.min(delay * 2, 1000)) {
+    let result: EnsureSessionResult;
+    try {
+      const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
+        method: "POST",
+      });
+      if (res.ok) return { ok: true };
+      const body = await res.json().catch(() => ({}));
+      result = {
+        ok: false,
+        error: typeof body.error === "string" ? body.error : undefined,
+        message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
+      };
+    } catch (e) {
+      return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+    }
+    if (result.error !== "lifecycle_busy" || waited >= TERMINAL_BUSY_BUDGET_MS) return result;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    waited += delay;
   }
 }
 
