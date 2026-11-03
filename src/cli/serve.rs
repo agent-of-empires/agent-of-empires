@@ -1934,12 +1934,16 @@ async fn await_daemon_ready<'a>(
 /// Longer than the Tailscale Funnel reset's 3 s bound, so a start in flight can undo itself.
 const UNREADY_DAEMON_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// SIGTERM, then SIGKILL after the grace. `child` is unreaped, so its pid cannot be reused.
+/// SIGTERM, then SIGKILL after the grace.
 async fn stop_unready_daemon(child: &mut std::process::Child) {
     stop_child_within(child, UNREADY_DAEMON_GRACE).await;
 }
 
 async fn stop_child_within(child: &mut std::process::Child, grace: std::time::Duration) {
+    // A reaped child's pid may be reused, so signal only one `try_wait` shows still running.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),
         nix::sys::signal::Signal::SIGTERM,
@@ -2266,6 +2270,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn an_already_exited_daemon_is_not_signalled() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Reap it as the readiness loop does, then keep the pid from a stale signal.
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let started = std::time::Instant::now();
+        stop_child_within(&mut child, std::time::Duration::from_secs(30)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[tokio::test]
     async fn an_unready_daemon_is_stopped_within_the_grace() {
