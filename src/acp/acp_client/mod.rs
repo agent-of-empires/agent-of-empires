@@ -751,9 +751,9 @@ impl AcpClient {
         self.control_loss.as_ref()?.get().copied()
     }
 
-    /// Dial the same runner again after [`Self::control_loss`]. Succeeds only
-    /// once the runner has resumed its session; the caller bounds the whole
-    /// attempt with `deadline`.
+    /// Dial the same runner again after [`Self::control_loss`]. Ready before
+    /// the resume, whose replay the caller must drain; `AcpSessionAssigned`
+    /// confirms it.
     pub(crate) async fn reattach(
         &self,
         stored_acp_session_id: String,

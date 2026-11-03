@@ -87,8 +87,8 @@ pub(super) enum ConnectMode {
     Resume {
         acp_session_id: String,
         in_flight_turn: bool,
-        /// The same verified runner after a control loss: it still owns the
-        /// turn, so silence cannot end it, and readiness waits for the resume.
+        /// The same verified runner after a control loss still owns the turn,
+        /// so silence cannot end it.
         live_recovery: bool,
     },
 }

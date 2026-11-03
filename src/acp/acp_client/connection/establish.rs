@@ -196,8 +196,8 @@ pub(super) async fn establish(
     );
     // Ready now: session/load can replay a whole transcript and must stay
     // outside the handshake timeout (#2276).
-    if !live_recovery {
-        signal_ready(&ctx.ready_tx).await;
+    if let Some(tx) = ctx.ready_tx.lock().await.take() {
+        let _ = tx.send(Ok(()));
     }
 
     let mcp_servers = mcp_config::filter_for_capabilities(
@@ -246,21 +246,12 @@ pub(super) async fn establish(
                 .await?
         }
     };
-    if live_recovery {
-        signal_ready(&ctx.ready_tx).await;
-    }
     session.apply_default_model().await;
     session.apply_default_effort().await;
     if adopted_turn && !live_recovery {
         spawn_resume_idle_watchdog(shared);
     }
     Ok(Some(session))
-}
-
-async fn signal_ready(ready_tx: &ReadyTx) {
-    if let Some(tx) = ready_tx.lock().await.take() {
-        let _ = tx.send(Ok(()));
-    }
 }
 
 /// Fallback when an adopted turn neither completes nor shows activity, so the

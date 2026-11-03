@@ -54,6 +54,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
             respawned_in_place: Arc::clone(&self.respawned_in_place),
+            recovery: None,
         };
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -77,6 +78,7 @@ struct Drain<S> {
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+    recovery: Option<Recovery>,
 }
 
 impl<S> Drain<S> {
@@ -97,6 +99,17 @@ struct StreamEnd {
     agent_unresponsive: bool,
     rate_limited: bool,
     startup_failed: bool,
+    established: bool,
+    /// A reattached connection did not confirm its resume in time.
+    resume_timed_out: bool,
+}
+
+/// One recovery of a runner whose control channel closed, spanning attempts.
+#[derive(Clone, Copy)]
+struct Recovery {
+    loss: ControlLoss,
+    attempts: u32,
+    resume_by: tokio::time::Instant,
 }
 
 #[derive(Debug)]
@@ -122,7 +135,8 @@ impl<S: BroadcastSink> Drain<S> {
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
         loop {
-            let end = self.pump(&mut inbound, lease.epoch()).await;
+            let resume_by = self.recovery.map(|recovery| recovery.resume_by);
+            let end = self.pump(&mut inbound, lease.epoch(), resume_by).await;
             warn!(
                 target: "acp.supervisor",
                 session = %self.session_id,
@@ -156,7 +170,7 @@ impl<S: BroadcastSink> Drain<S> {
                 return;
             }
             if !end.agent_unresponsive {
-                if let Some(next_inbound) = self.recover_control_loss(&lease).await {
+                if let Some(next_inbound) = self.recover_control_loss(&lease, &end).await {
                     inbound = next_inbound;
                     continue;
                 }
@@ -174,11 +188,31 @@ impl<S: BroadcastSink> Drain<S> {
         }
     }
 
-    /// Publish events until the worker's channel closes.
-    async fn pump(&mut self, inbound: &mut mpsc::Receiver<Event>, generation: u64) -> StreamEnd {
+    /// Publish events until the worker's channel closes. Past `resume_by`
+    /// without an established session, only this connection is closed and
+    /// whatever it already emitted is still published.
+    async fn pump(
+        &mut self,
+        inbound: &mut mpsc::Receiver<Event>,
+        generation: u64,
+        mut resume_by: Option<tokio::time::Instant>,
+    ) -> StreamEnd {
         let mut end = StreamEnd::default();
         let mut established = false;
-        while let Some(event) = inbound.recv().await {
+        loop {
+            let event = match resume_by.filter(|_| !established) {
+                Some(deadline) => tokio::select! {
+                    event = inbound.recv() => event,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        resume_by = None;
+                        end.resume_timed_out = true;
+                        self.shut_down_connection(generation).await;
+                        continue;
+                    }
+                },
+                None => inbound.recv().await,
+            };
+            let Some(event) = event else { break };
             match &event {
                 Event::Stopped { reason } => match reason.as_str() {
                     "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
@@ -289,7 +323,21 @@ impl<S: BroadcastSink> Drain<S> {
             self.sink
                 .publish_from_worker(&self.session_id, seq, &event, generation);
         }
+        end.established = established;
         end
+    }
+
+    async fn shut_down_connection(&self, generation: u64) {
+        let client = self
+            .workers
+            .lock()
+            .await
+            .get(&self.session_id)
+            .filter(|handle| handle.lease.epoch() == generation)
+            .map(|handle| Arc::clone(&handle.client));
+        if let Some(client) = client {
+            let _ = client.shutdown().await;
+        }
     }
 
     fn clear_pending_context_reset(&self) -> bool {
@@ -424,8 +472,15 @@ impl<S: BroadcastSink> Drain<S> {
     /// A runner that closed only its control channel still owns its agent and
     /// turn, so dial it again under the same lease rather than replace it.
     /// Reports the loss when the worker cannot be recovered that way.
-    async fn recover_control_loss(&self, lease: &Lease) -> Option<mpsc::Receiver<Event>> {
-        let (client, loss) = {
+    async fn recover_control_loss(
+        &mut self,
+        lease: &Lease,
+        end: &StreamEnd,
+    ) -> Option<mpsc::Receiver<Event>> {
+        if end.established {
+            self.recovery = None;
+        }
+        let (client, observed) = {
             let workers = self.workers.lock().await;
             let handle = workers
                 .get(&self.session_id)
@@ -434,28 +489,57 @@ impl<S: BroadcastSink> Drain<S> {
             {
                 return None;
             }
-            (Arc::clone(&handle.client), handle.client.control_loss()?)
+            (Arc::clone(&handle.client), handle.client.control_loss())
         };
-        let reattached = self.reattach_same_runner(lease, &client, loss).await;
-        if reattached.is_none() && !worker_registry::stop_requested(&self.session_id) {
-            if loss.turn_in_flight {
-                self.publish(Event::Stopped {
-                    reason: "runner_control_lost".into(),
-                });
+        // A failed attempt continues its recovery; anything else ends it.
+        let (loss, attempts) = match self.recovery.take() {
+            Some(recovery) if end.resume_timed_out || observed.is_some() => {
+                (recovery.loss, recovery.attempts)
             }
-            self.publish(Event::AgentStartupError {
-                message: "ACP connection failed: runner control channel closed".into(),
-            });
+            Some(recovery) => {
+                self.report_control_loss(recovery.loss);
+                return None;
+            }
+            None => (observed?, 0),
+        };
+        let reattached = self
+            .reattach_same_runner(lease, &client, loss, attempts)
+            .await;
+        match reattached {
+            Some((inbound, recovery)) => {
+                self.recovery = Some(recovery);
+                Some(inbound)
+            }
+            None => {
+                self.report_control_loss(loss);
+                None
+            }
         }
-        reattached
     }
 
+    fn report_control_loss(&self, loss: ControlLoss) {
+        if worker_registry::stop_requested(&self.session_id) {
+            return;
+        }
+        if loss.turn_in_flight {
+            self.publish(Event::Stopped {
+                reason: "runner_control_lost".into(),
+            });
+        }
+        self.publish(Event::AgentStartupError {
+            message: "ACP connection failed: runner control channel closed".into(),
+        });
+    }
+
+    /// Dials the runner until one attempt is installed; the drain then has
+    /// until `resume_by` to see the resumed session.
     async fn reattach_same_runner(
         &self,
         lease: &Lease,
         lost: &Arc<AcpClient>,
         loss: ControlLoss,
-    ) -> Option<mpsc::Receiver<Event>> {
+        attempts: u32,
+    ) -> Option<(mpsc::Receiver<Event>, Recovery)> {
         let session_id = &self.session_id;
         if lease.prime() != PrimeOwnership::NotPrime {
             return None;
@@ -465,10 +549,13 @@ impl<S: BroadcastSink> Drain<S> {
             .filter(|(current, _)| current == lease)
             .and_then(|(_, identity)| identity)
             .filter(|identity| identity.birth_fingerprint.is_some())?;
-        if !self.admit_reattach(lease).await {
+        if attempts == 0 && !self.admit_reattach(lease).await {
             return None;
         }
-        for attempt in 1..=CONTROL_REATTACH_ATTEMPTS {
+        for attempt in attempts + 1..=CONTROL_REATTACH_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(RESPAWN_BACKOFF).await;
+            }
             if worker_registry::stop_requested(session_id) {
                 return None;
             }
@@ -490,13 +577,13 @@ impl<S: BroadcastSink> Drain<S> {
                 }
             };
             let stored_acp_session_id = record.stored_acp_session_id?;
-            let deadline = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
+            let resume_by = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
             let attempt_result = tokio::time::timeout_at(
-                deadline,
+                resume_by,
                 lost.reattach(
                     stored_acp_session_id,
                     loss.turn_in_flight,
-                    deadline,
+                    resume_by,
                     lease.clone(),
                 ),
             )
@@ -504,9 +591,15 @@ impl<S: BroadcastSink> Drain<S> {
             .unwrap_or(Err(AcpError::AttachTimedOut));
             match attempt_result {
                 Ok(next) => {
-                    return self
+                    let inbound = self
                         .install_reattached(lease, identity, lost, next, loss)
-                        .await
+                        .await?;
+                    let recovery = Recovery {
+                        loss,
+                        attempts: attempt,
+                        resume_by,
+                    };
+                    return Some((inbound, recovery));
                 }
                 Err(error) => warn!(
                     target: "acp.supervisor",
@@ -516,7 +609,6 @@ impl<S: BroadcastSink> Drain<S> {
                     "reattach after control channel loss failed"
                 ),
             }
-            tokio::time::sleep(RESPAWN_BACKOFF).await;
         }
         None
     }
@@ -2648,8 +2740,9 @@ mod tests {
 
     /// Losing only the control channel of a live runner mid-turn reattaches
     /// that runner and lets its turn finish, through a stalled attempt, a
-    /// second loss and a silence past the resume-idle grace. A dead runner,
-    /// an undecodable frame or a stop keeps the replacement or stop path.
+    /// resume replaying more updates than the event channel holds, a second
+    /// loss and a silence past the resume-idle grace. A dead runner, an
+    /// undecodable frame or a stop keeps the replacement or stop path.
     #[tokio::test]
     #[serial_test::serial]
     async fn control_channel_loss_reattaches_only_a_verified_live_runner() {
@@ -2658,6 +2751,14 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::AsyncWriteExt as _;
         use tokio::sync::oneshot;
+
+        struct Runner(std::process::Child);
+        impl Drop for Runner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
 
         #[derive(Clone, Copy, PartialEq, Debug)]
         enum Loss {
@@ -2684,14 +2785,16 @@ mod tests {
                 crate::process::worker::control_socket_sibling(&socket),
             )
             .unwrap();
-            let mut runner = std::process::Command::new("sleep")
-                .arg("60")
-                .process_group(0)
-                .spawn()
-                .unwrap();
+            let mut runner = Runner(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
             let record = worker_registry::WorkerRecord::new(
                 id.into(),
-                runner.id(),
+                runner.0.id(),
                 socket.clone(),
                 "test-agent-acp".into(),
                 "test-agent".into(),
@@ -2708,8 +2811,20 @@ mod tests {
             worker_registry::save(&record).unwrap();
 
             // Connection 0 carries the prompt and is severed mid-turn. On a
-            // live runner, 1 withholds SessionReady, 2 resumes and is severed
-            // again, and 3 resumes, stays silent, then completes the turn.
+            // live runner, 1 withholds SessionReady, 2 resumes with a burst of
+            // updates and is severed again, and 3 resumes, stays silent, then
+            // completes the turn.
+            const BURST: usize = 100;
+            let update = move |text: String| ControlBody::Notify {
+                method: "session/update".into(),
+                params: serde_json::json!({
+                    "sessionId": native,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": text}
+                    }
+                }),
+            };
             let accepts = Arc::new(AtomicUsize::new(0));
             let (started_tx, started_rx) = oneshot::channel();
             let (sever_tx, sever_rx) = oneshot::channel::<()>();
@@ -2780,6 +2895,23 @@ mod tests {
                                     break;
                                 }
                                 (ControlBody::ResumeSession, 2) => {
+                                    for n in 0..BURST {
+                                        let burst = update(format!("progress {n}"));
+                                        stream.write_all(&write(burst)).await.unwrap();
+                                    }
+                                    // Ordered dispatch denies this foreign-session call
+                                    // after all updates reach pending admission.
+                                    let barrier = ControlBody::ServerCall {
+                                        call_id: 1,
+                                        method: "fs/read_text_file".into(),
+                                        params: serde_json::json!({
+                                            "sessionId": "unknown", "path": "/unused"
+                                        }),
+                                    };
+                                    stream.write_all(&write(barrier)).await.unwrap();
+                                }
+                                (ControlBody::ServerError { call_id: 1, error }, 2) => {
+                                    assert_eq!(error.code, -32602);
                                     stream.write_all(&write(ready())).await.unwrap();
                                     sever_again_rx.take().unwrap().await.unwrap();
                                     break;
@@ -2788,16 +2920,7 @@ mod tests {
                                     stream.write_all(&write(ready())).await.unwrap();
                                     resumed_tx.take().unwrap().send(()).unwrap();
                                     release_rx.take().unwrap().await.unwrap();
-                                    let chunk = ControlBody::Notify {
-                                        method: "session/update".into(),
-                                        params: serde_json::json!({
-                                            "sessionId": native,
-                                            "update": {
-                                                "sessionUpdate": "agent_message_chunk",
-                                                "content": {"type": "text", "text": "original turn completed"}
-                                            }
-                                        }),
-                                    };
+                                    let chunk = update("original turn completed".into());
                                     let completed = ControlBody::PromptCompleted {
                                         prompt_req_id: 77,
                                         outcome: PromptOutcome::Completed {
@@ -2851,8 +2974,7 @@ mod tests {
             let lease = sup
                 .test_install_handle(id, client, kind, Some(identity))
                 .await;
-            let current = || async { Arc::clone(&sup.workers.lock().await[id].client) };
-            let first = current().await;
+            let first = Arc::clone(&sup.workers.lock().await[id].client);
             // Launches register their client for retirement, as here.
             lease.retirement().record_client(&first, false);
             let drain = sup.start_drain_task(id.into(), lease, inbound, None);
@@ -2860,8 +2982,8 @@ mod tests {
             started_rx.await.unwrap();
             match case {
                 Loss::DeadRunner => {
-                    runner.kill().unwrap();
-                    runner.wait().unwrap();
+                    runner.0.kill().unwrap();
+                    runner.0.wait().unwrap();
                 }
                 Loss::Stopped => {
                     worker_registry::request_stop(&record).unwrap();
@@ -2892,17 +3014,47 @@ mod tests {
                     .await
                     .unwrap_or_else(|_| panic!("no bounded reattach attempt: {}", progress()))
                     .unwrap();
+                let chunks = || {
+                    events()
+                        .into_iter()
+                        .filter_map(|event| match event {
+                            Event::AgentMessageChunk { text, .. } => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
                 let deadline = std::time::Instant::now() + within;
-                while Arc::ptr_eq(&first, &current().await) {
-                    assert!(std::time::Instant::now() < deadline, "{}", progress());
+                while !chunks().contains(&format!("progress {}", BURST - 1)) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the resumed replay was not delivered: {} chunks, {}",
+                        chunks().len(),
+                        progress()
+                    );
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                assert_eq!(
+                    chunks(),
+                    (0..BURST)
+                        .map(|n| format!("progress {n}"))
+                        .collect::<Vec<_>>()
+                );
                 sever_again_tx.send(()).unwrap();
                 tokio::time::timeout(within, resumed_rx)
                     .await
                     .unwrap_or_else(|_| panic!("no second reattach: {}", progress()))
                     .unwrap();
-                // Longer than the shortened resume-idle grace, with no events.
+                let deadline = std::time::Instant::now() + within;
+                while events()
+                    .iter()
+                    .filter(|event| matches!(event, Event::AcpSessionAssigned { .. }))
+                    .count()
+                    < 3
+                {
+                    assert!(std::time::Instant::now() < deadline, "{}", progress());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // Observe silence beyond the idle grace after resume is committed.
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 release_tx.send(()).unwrap();
                 let deadline = std::time::Instant::now() + within;
@@ -2910,7 +3062,8 @@ mod tests {
                 while !events().iter().any(|event| {
                     matches!(event,
                     Event::AgentMessageChunk { text, .. } if text == "original turn completed")
-                }) {
+                }) || stopped_reasons(&sink, id).is_empty()
+                {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "the original turn never completed: {}",
@@ -2946,8 +3099,6 @@ mod tests {
                 );
             }
             peer.abort();
-            let _ = runner.kill();
-            let _ = runner.wait();
         }
     }
 }
