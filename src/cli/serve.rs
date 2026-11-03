@@ -1931,8 +1931,11 @@ async fn await_daemon_ready<'a>(
     })
 }
 
-/// Longer than the Tailscale Funnel reset's 3 s bound, so a start in flight can undo itself.
-const UNREADY_DAEMON_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Covers the Funnel guard's two sequential cleanup commands, each bounded by
+/// `FUNNEL_OFF_TIMEOUT`, plus margin.
+const UNREADY_DAEMON_GRACE: std::time::Duration = crate::server::tunnel::FUNNEL_OFF_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(std::time::Duration::from_secs(2));
 
 /// SIGTERM, then SIGKILL after the grace.
 async fn stop_unready_daemon(child: &mut std::process::Child) {
