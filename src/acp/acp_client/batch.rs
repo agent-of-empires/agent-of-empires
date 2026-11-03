@@ -388,6 +388,7 @@ mod tests {
             {"jsonrpc": "2.0", "method": "x/notification"},
             {"jsonrpc": "2.0", "id": 3, "result": 1},
         ]);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let agent = async move {
             agent_side_out
                 .write_all(format!("{batch}\n").as_bytes())
@@ -400,11 +401,13 @@ mod tests {
             assert_eq!(entries.len(), 4, "{reply}");
             assert_eq!(entries[0..1].iter().filter(|e| e["id"] == 1).count(), 1);
             assert_eq!(entries.iter().filter(|e| e["id"].is_null()).count(), 3);
+            let _ = done_tx.send(());
         };
         let client = Client.v1().connect_with(
             ByteStreams::new(write.compat_write(), read.compat()),
-            async |_cx| {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            async move |_cx| {
+                // Returning earlier would shut the connection down under the peer.
+                let _ = done_rx.await;
                 Ok(())
             },
         );
@@ -455,6 +458,7 @@ mod tests {
         let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
         let (agent_in, agent_side_in) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(wrap(agent_out, agent_in));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let agent = async move {
             // `[]` is answered with one error; the batch owes its own.
             let input = "[]\n[{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x/unknown\"}]\n";
@@ -468,11 +472,13 @@ mod tests {
                 .expect("the batch is answered as one array");
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0]["error"]["code"], -32601, "{grouped}");
+            let _ = done_tx.send(());
         };
         let client = Client.v1().connect_with(
             ByteStreams::new(write.compat_write(), read.compat()),
-            async |_cx| {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            async move |_cx| {
+                // Returning earlier would shut the connection down under the peer.
+                let _ = done_rx.await;
                 Ok(())
             },
         );
@@ -489,6 +495,7 @@ mod tests {
         let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
         let (agent_in, agent_side_in) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(wrap(agent_out, agent_in));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let agent = async move {
             // A duplicate inside a batch, then a batch and a standalone line
             // reusing an id the first batch still waits on.
@@ -528,11 +535,13 @@ mod tests {
                     .count(),
                 1
             );
+            let _ = done_tx.send(());
         };
         let client = Client.v1().connect_with(
             ByteStreams::new(write.compat_write(), read.compat()),
-            async |_cx| {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            async move |_cx| {
+                // Returning earlier would shut the connection down under the peer.
+                let _ = done_rx.await;
                 Ok(())
             },
         );
