@@ -618,7 +618,7 @@ mod tests {
         fs::set_permissions(&roots[0], fs::Permissions::from_mode(0o555)).unwrap();
         let failed = save_file(&roots, &instance, request("a.txt", &opened, "overwrite"));
         fs::set_permissions(&roots[0], fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(failed.is_err());
+        assert_eq!(failed.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
     }
