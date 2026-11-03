@@ -239,6 +239,60 @@ describe("SessionRow context menu", () => {
     for (const id of ["switch-agent", "new-session", "color-red", "color-clear"]) {
       expect(testId(`sidebar-context-menu-${id}`)).toBeNull();
     }
+    // Showing a session alone changes nothing on the server.
+    expect(testId("sidebar-context-menu-show-only")).not.toBeNull();
+  });
+});
+
+describe("SessionRow focus-mode entries", () => {
+  const originalLocation = Object.getOwnPropertyDescriptor(window, "location")!;
+  afterEach(() => {
+    Object.defineProperty(window, "location", originalLocation);
+    vi.restoreAllMocks();
+  });
+  const pointer = (coarse: boolean) =>
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({ matches: coarse && query === "(pointer: coarse)", media: query })),
+    );
+
+  it("shows the session alone in this window, or opens it in its own window, from More", () => {
+    pointer(false);
+    const replace = vi.fn();
+    Object.defineProperty(window, "location", { configurable: true, value: { ...window.location, replace } });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openRowMenu(ws({ id: "s 1" }), { expandMore: false });
+    const group = document.getElementById(
+      screen.getByTestId("sidebar-context-menu-more").getAttribute("aria-controls")!,
+    )!;
+    expect(group.contains(testId("sidebar-context-menu-show-only"))).toBe(true);
+    expect(testId("sidebar-context-menu-show-only")!.textContent).toBe("Show only this Session");
+    expect(testId("sidebar-context-menu-own-window")!.textContent).toBe("Open in its own window");
+
+    click("sidebar-context-menu-show-only");
+    expect(replace).toHaveBeenCalledWith("/session/s%201?focus=1");
+    expect(testId("sidebar-context-menu")).toBeNull();
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    click("sidebar-context-menu-more");
+    click("sidebar-context-menu-own-window");
+    expect(open).toHaveBeenCalledWith("/session/s%201?focus=1", "_blank");
+    expect(replace).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops Open in its own window on a phone, which cannot open a second window", () => {
+    pointer(true);
+    openRowMenu(ws());
+    expect(testId("sidebar-context-menu-show-only")).not.toBeNull();
+    expect(testId("sidebar-context-menu-own-window")).toBeNull();
+  });
+
+  it("offers neither for a trashed session", () => {
+    pointer(false);
+    openRowMenu(ws({ trashed_at: PAST }));
+    expect(testId("sidebar-context-menu-show-only")).toBeNull();
+    expect(testId("sidebar-context-menu-own-window")).toBeNull();
   });
 });
 
