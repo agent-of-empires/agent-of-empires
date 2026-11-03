@@ -296,6 +296,12 @@ pub(crate) fn remove_orphaned_worktrees(
     removed
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_PROFILE_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Removes the confirmed worktrees that no session in any profile sits on or inside. The rows are
 /// read, and the removal done, while every store is locked, so no session can adopt a path in
 /// between. Fails closed: if a store cannot be read, nothing is removed.
@@ -309,6 +315,10 @@ pub(crate) fn remove_confirmed_worktrees(
         .iter()
         .map(|profile| Storage::open_unwatched(profile))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_PROFILE_LISTING.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
     crate::session::with_storages_locked(&storages, || {
         let mut session_paths = Vec::new();
         for storage in &storages {
@@ -597,13 +607,14 @@ mod tests {
         assert!(!paths[2].exists());
     }
 
-    /// A profile created while cleanup enumerates profiles must be read too, so cleanup holds the
-    /// catalogue lock from before the listing: profile creation waits for it.
+    /// Cleanup holds the catalogue lock across the profile listing, so a profile cannot be created
+    /// after the listing and go unread.
     #[test]
     #[serial_test::serial]
-    fn cleanup_waits_for_a_profile_catalogue_transition() {
+    fn cleanup_blocks_profile_creation_after_listing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        Storage::new_unwatched("main").unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -617,37 +628,26 @@ mod tests {
         };
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        let git_wt = GitWorktree::new(repo.clone()).unwrap();
+        let git_wt = GitWorktree::new(repo).unwrap();
         let path = tmp.path().join("wt");
         git_wt.create_worktree("wt", &path, true, None).unwrap();
-        let path = path.canonicalize().unwrap();
         let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
-        let purging = purging_paths(&orphans);
-        Storage::new_unwatched("main").unwrap();
 
-        let transition = crate::session::StorageTransition::acquire_exclusive(
-            &crate::session::get_app_dir().unwrap(),
-        )
-        .unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let cleanup = std::thread::spawn(move || {
-            let removed = remove_confirmed_worktrees(&git_wt, &orphans, &purging);
-            done_tx.send(()).unwrap();
-            removed
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let creator_blocked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = creator_blocked.clone();
+        AFTER_PROFILE_LISTING.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let creator = crate::session::try_acquire_storage_flock(
+                    &app_dir,
+                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                )
+                .unwrap();
+                seen.set(Some(creator.is_none()));
+            }));
         });
-        // The profile appears while cleanup would be enumerating, before it could read the new row.
-        let late = crate::session::get_app_dir().unwrap().join("profiles/late");
-        std::fs::create_dir_all(&late).unwrap();
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "cleanup ran while the profile catalogue was changing"
-        );
-        assert!(path.exists());
-
-        drop(transition);
-        assert_eq!(cleanup.join().unwrap().unwrap(), 1);
+        remove_confirmed_worktrees(&git_wt, &orphans, &HashSet::new()).unwrap();
+        assert_eq!(creator_blocked.get(), Some(true));
     }
 
     #[test]
