@@ -17,7 +17,7 @@ use tracing::info;
 use super::access::{host_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
-use super::ip_discovery::{discover_tagged_ips, IpKind};
+use super::ip_discovery::{local_published_hosts, IpKind};
 use super::reload::load_all_instances;
 use super::router::build_router;
 use super::serve_snapshot::{
@@ -730,12 +730,10 @@ pub(crate) async fn start_server(
         // When bound to 0.0.0.0 we're reachable on all three; on a specific
         // host we just surface that one.
         let labeled_urls: Vec<(IpKind, String)> = if host == "0.0.0.0" {
-            let mut urls: Vec<(IpKind, String)> = discover_tagged_ips()
+            local_published_hosts()
                 .into_iter()
-                .map(|(kind, ip)| (kind, make_url(&ip.to_string())))
-                .collect();
-            urls.push((IpKind::Loopback, make_url("localhost")));
-            urls
+                .map(|(kind, host)| (kind, make_url(&host)))
+                .collect()
         } else {
             vec![(IpKind::Loopback, make_url(host))]
         };
