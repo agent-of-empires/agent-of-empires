@@ -158,11 +158,24 @@ impl AgentQuestionDialog {
                 self.question = (self.question + questions.len() - 1) % questions.len();
                 DialogResult::Continue
             }
-            KeyCode::Enter if self.question + 1 < questions.len() => {
-                self.question += 1;
-                DialogResult::Continue
-            }
             KeyCode::Enter => {
+                if !current.multi
+                    && self.selected[self.question].is_empty()
+                    && self.custom[self.question].value().trim().is_empty()
+                {
+                    if let Some(option) = current.options.get(self.option_cursor[self.question]) {
+                        Self::select(
+                            &mut self.selected[self.question],
+                            &mut self.custom[self.question],
+                            option.label.clone(),
+                            false,
+                        );
+                    }
+                }
+                if self.question + 1 < questions.len() {
+                    self.question += 1;
+                    return DialogResult::Continue;
+                }
                 if let Some(missing) = questions.iter().enumerate().position(|(i, question)| {
                     !question.multi
                         && self.selected[i].len()
@@ -389,6 +402,31 @@ mod tests {
             DialogResult::Submit(answers) if answers[0].selected_options == vec!["SQLite".to_owned()]
         ));
 
+        let mut unanswered = prompt.clone();
+        if let AgentIntegrationPrompt::Question { questions, .. } = &mut unanswered {
+            questions[0].recommended = None;
+        }
+        let mut dialog = AgentQuestionDialog::new(unanswered);
+        assert!(matches!(
+            dialog.handle_key(KeyEvent::new(
+                KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            DialogResult::Submit(answers) if answers[0].selected_options == ["SQLite"]
+        ));
+
+        let mut dialog = AgentQuestionDialog::new(prompt.clone());
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        dialog.handle_key(key(KeyCode::Char('c')));
+        dialog.handle_paste("Custom database");
+        dialog.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(answers)
+                if answers[0].selected_options.is_empty()
+                    && answers[0].custom_input.as_deref() == Some("Custom database")
+        ));
+
         let mut dialog = AgentQuestionDialog::new(prompt);
         dialog.handle_key(KeyEvent::new(
             KeyCode::Down,
@@ -425,8 +463,12 @@ mod tests {
                 recommended: None,
             }],
         };
-        let mut dialog = AgentQuestionDialog::new(prompt);
         let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        assert!(matches!(
+            AgentQuestionDialog::new(prompt.clone()).handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(answers) if answers[0].selected_options.is_empty()
+        ));
+        let mut dialog = AgentQuestionDialog::new(prompt);
         dialog.handle_key(key(KeyCode::Char(' ')));
         dialog.handle_key(key(KeyCode::Down));
         dialog.handle_key(key(KeyCode::Char(' ')));

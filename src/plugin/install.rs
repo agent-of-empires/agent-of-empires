@@ -1545,7 +1545,9 @@ mod tests {
     fn disclosure_integrations_escapes_commands_for_display_but_keeps_manifest_raw() {
         let raw = AgentIntegrationContribution {
             tool: "session-helper".into(),
+            provider_versions: Vec::new(),
             command: Some("x\u{202e}tail".into()),
+            replies: false,
         };
         let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
         // The consent that the CLI/TUI/web serialize carries the escaped form.
