@@ -123,6 +123,14 @@ pub enum PromptDisposition {
     ResetContext,
 }
 
+/// A published user prompt: how to route its text, and the seq of its
+/// `UserPromptSent` event, which is `None` when that event was not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedPrompt {
+    pub disposition: PromptDisposition,
+    pub seq: Option<u64>,
+}
+
 /// How this supervisor acquired the worker.
 enum WorkerKind {
     /// Spawned by this daemon; respawnable from its cached config.
