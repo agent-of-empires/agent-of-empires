@@ -236,6 +236,42 @@ test("mobile editing keeps controls usable and confirms leaving the Files pane",
   await expect(editor).toHaveCount(0);
 });
 
+test("changing the other dock keeps a visible draft without asking", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "file-docks", git: false, files: { "notes.txt": "original" } }),
+  });
+  await page.addInitScript(() => {
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ fileEditing: true }));
+    const group = (tab: string) => [{ tabs: [tab], active: tab }];
+    const template = {
+      right: group("files"),
+      bottom: group("terminal:0"),
+      nextTerminalIndex: 1,
+      closedPlugins: [],
+      collapsed: { right: false, bottom: false },
+    };
+    localStorage.setItem("aoe-pane-layout-v2", JSON.stringify({ version: 2, template, sessions: {}, provisional: {} }));
+  });
+  await openFile(page, serve);
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
+  await editor.fill("draft");
+  const dialogs: string[] = [];
+  page.on("dialog", (dialog) => {
+    dialogs.push(dialog.message());
+    void dialog.dismiss();
+  });
+  const newTerminal = page.getByRole("button", { name: "New terminal", exact: true });
+  await newTerminal.last().click();
+  await expect(page.getByRole("tab", { name: "Terminal 2" })).toBeVisible();
+  expect(dialogs).toEqual([]);
+  await expect(editor).toHaveValue("draft");
+  // Hiding the edited tab still asks; declining keeps it.
+  await newTerminal.first().click();
+  await expect.poll(() => dialogs.length).toBe(1);
+  await expect(editor).toHaveValue("draft");
+});
+
 test("an unsaved draft survives crossing the mobile breakpoint in both directions", async ({ page, spawnServe }) => {
   const serve = await spawnServe({
     seedFn: seedSessionViaAoeAdd({ title: "file-resize", git: false, files: { "notes.txt": "original" } }),
