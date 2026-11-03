@@ -58,7 +58,7 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(agent_out).lines();
-    loop {
+    'pump: loop {
         let line = tokio::select! {
             _ = broken.cancelled() => break,
             line = lines.next_line() => match line {
@@ -80,7 +80,7 @@ async fn split_incoming<R: AsyncRead + Unpin>(
                 .await
                 .is_err()
             {
-                break;
+                break 'pump;
             }
         }
     }
@@ -331,6 +331,21 @@ mod tests {
         .await
         .expect("the SDK end closes while the agent's stdout stays open");
         assert_eq!(read.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_stdout_is_released_after_the_sdk_end_closes() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, _agent_side_in) = tokio::io::duplex(4096);
+        drop(wrap(agent_out, agent_in));
+        // The pump must stop reading, dropping its end, so writes start to fail.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while agent_side_out.write_all(b"{}\n").await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the agent's stdout was never released");
     }
 
     #[tokio::test]
