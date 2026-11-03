@@ -277,6 +277,29 @@ test.describe("sidebar status axis (#4867)", () => {
     await pickAxis(page, axisToggle, "repo");
     await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
   });
+
+  test("the picker opens from the keyboard and its options are one Tab each", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: statusSessions() });
+    await gotoDesktop(page);
+
+    const axisToggle = page.locator(AXIS_TOGGLE);
+    await axisToggle.focus();
+    await page.keyboard.press("Enter");
+
+    const menu = page.getByTestId("sidebar-axis-menu");
+    await expect(menu).toBeVisible();
+
+    // Options follow the trigger in the tab order, in the order they render.
+    for (const target of ["repo", "org", "group", "repo+group", "status"]) {
+      await page.keyboard.press("Tab");
+      await expect(page.getByTestId(`sidebar-axis-option-${target}`)).toBeFocused();
+    }
+
+    await page.keyboard.press("Enter");
+    await expect(menu).toBeHidden();
+    await expect(axisToggle).toHaveAttribute("data-axis", "status");
+    await expect(page.getByTestId("sidebar-axis-heading")).toHaveText("Status");
+  });
 });
 
 test.describe("sidebar org axis (#3283)", () => {

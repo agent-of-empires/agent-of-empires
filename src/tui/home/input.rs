@@ -1284,10 +1284,14 @@ impl HomeView {
         let Some(group_path) = self.selected_group.clone() else {
             return;
         };
-        let count = self.active_sessions_in_selected_group().len();
+        let ids = self.active_sessions_in_selected_group();
+        let count = ids.len();
         if count == 0 {
             return;
         }
+        // Status buckets reshuffle while the dialog is open, so pin the set the
+        // count describes instead of recomputing it on confirm.
+        self.pending_archive_group_ids = Some(ids);
         // Project/Org mode groups by repo or owner and Manual mode by assigned path, so
         // name the scope accordingly and show the full path, or nested groups sharing a
         // leaf segment would be ambiguous.
@@ -3151,6 +3155,11 @@ impl HomeView {
                 }
             })
             .or_else(|| {
+                // Status headers name a state, not a group, so prefilling the field
+                // would create a manual group called "Waiting".
+                if self.group_by == GroupByMode::Status {
+                    return None;
+                }
                 // The scratch bucket's group_path is an internal sentinel; show
                 // its display label in the Group field, not the raw sentinel (#3237).
                 self.selected_group

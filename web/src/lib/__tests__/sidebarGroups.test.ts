@@ -331,6 +331,7 @@ describe("buildStatusGroups", () => {
     expect([wsIds(waiting!), wsIds(running!)]).toEqual([["w1"], ["w1"]]);
     expect(waiting!.workspaces[0]!.key).not.toBe(running!.workspaces[0]!.key);
     expect(waiting!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
+    expect(running!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
   });
 
   it("reflects collapse state and exposes no repo-only affordances", () => {

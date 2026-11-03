@@ -50,19 +50,30 @@ export function filterOrg(groups: OrgNestedGroup[], keep: RowFilter): OrgNestedG
     .filter((og) => og.repos.length > 0);
 }
 
-// Deduped by workspace: the status axis slices one workspace into a bucket per status, and the
-// footer lists it once. First occurrence wins, matching the group order.
+// Deduped by workspace: the status axis slices one workspace into a bucket per status, so the
+// footer lists it once with every archived session from those buckets. First bucket wins for
+// the row identity, matching the group order.
 export const sunkViews = (groups: SidebarGroup[]) => {
-  const seen = new Set<string>();
-  const views: SidebarWorkspaceView[] = [];
+  const byId = new Map<string, SidebarWorkspaceView>();
   for (const g of groups) {
     for (const v of g.workspaces) {
-      if (!workspaceIsSunk(v.workspace) || workspaceIsTrashed(v.workspace) || seen.has(v.workspace.id)) continue;
-      seen.add(v.workspace.id);
-      views.push(v);
+      if (!workspaceIsSunk(v.workspace) || workspaceIsTrashed(v.workspace)) continue;
+      const kept = byId.get(v.workspace.id);
+      if (!kept) {
+        byId.set(v.workspace.id, v);
+        continue;
+      }
+      const alreadyShown = new Set(kept.workspace.sessions.map((s) => s.id));
+      const extra = v.workspace.sessions.filter((s) => !alreadyShown.has(s.id));
+      if (extra.length > 0) {
+        byId.set(v.workspace.id, {
+          ...kept,
+          workspace: { ...kept.workspace, sessions: [...kept.workspace.sessions, ...extra] },
+        });
+      }
     }
   }
-  return views;
+  return [...byId.values()];
 };
 
 /** Workspace ids in render order, so Shift+click ranges only span visible rows; first occurrence wins. */

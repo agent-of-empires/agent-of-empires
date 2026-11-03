@@ -47,7 +47,7 @@ export function SidebarAxisPicker({
       <Tooltip text={TOOLTIP[axis]}>
         <button
           onClick={() => setOpen((o) => !o)}
-          aria-haspopup="menu"
+          aria-haspopup="true"
           aria-expanded={open}
           aria-label={`Group sessions, current: ${active.label}`}
           data-testid="sidebar-axis-toggle"
@@ -60,7 +60,6 @@ export function SidebarAxisPicker({
 
       {open && (
         <div
-          role="menu"
           data-testid="sidebar-axis-menu"
           className="absolute right-0 top-full mt-1 min-w-[190px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
         >
@@ -69,8 +68,8 @@ export function SidebarAxisPicker({
             return (
               <button
                 key={value}
-                role="menuitemradio"
-                aria-checked={selected}
+                type="button"
+                aria-pressed={selected}
                 data-testid={`sidebar-axis-option-${value}`}
                 onClick={() => {
                   setOpen(false);

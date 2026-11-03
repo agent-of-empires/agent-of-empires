@@ -146,6 +146,7 @@ impl HomeView {
             help_scroll: 0,
             new_dialog: None,
             confirm_dialog: None,
+            pending_archive_group_ids: None,
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,

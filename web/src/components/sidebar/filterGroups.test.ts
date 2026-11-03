@@ -14,13 +14,15 @@ const archived = (status: string, workspaceId: string, sessionId: string): Sideb
 });
 
 describe("sunkViews", () => {
-  it("lists a workspace sliced across status buckets once", () => {
+  it("lists a workspace sliced across status buckets once, with every archived session", () => {
     const groups = [
       group("status:Idle", [archived("Idle", "w1", "s-idle")]),
       group("status:Running", [archived("Running", "w1", "s-running")]),
       group("status:Stopped", [archived("Stopped", "w2", "s-stopped")]),
     ];
-    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["w1", "w2"]);
+    const views = sunkViews(groups);
+    expect(views.map((v) => v.workspace.id)).toEqual(["w1", "w2"]);
+    expect(views[0]!.workspace.sessions.map((s) => s.id)).toEqual(["s-idle", "s-running"]);
   });
 
   it("leaves live and trashed workspaces to the main list and the trash menu", () => {

@@ -3107,4 +3107,16 @@ fn status_grouping_orders_headers_and_persists_collapse() {
     view.save_status_group_collapsed();
     let state = AppStateConfig::load().unwrap();
     assert_eq!(state.status_group_collapsed, vec!["Waiting".to_string()]);
+
+    let fresh = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.status_group_collapsed.get("Waiting"),
+        Some(&true),
+        "a relaunched HomeView should restore the collapsed Waiting group"
+    );
 }

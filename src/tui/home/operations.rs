@@ -1074,7 +1074,12 @@ impl HomeView {
     /// Queue the whole group's archive before submitting any row. The daemon
     /// tears down each pane and publishes its committed state.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
+        // Prefer the set captured when the prompt opened: a status bucket can gain
+        // members while the dialog is up, and those were never counted in it.
+        let ids = match self.pending_archive_group_ids.take() {
+            Some(ids) => ids,
+            None => self.active_sessions_in_selected_group(),
+        };
         if ids.is_empty() {
             return Ok(());
         }
