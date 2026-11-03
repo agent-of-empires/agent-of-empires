@@ -331,6 +331,7 @@ describe("updates", () => {
           removed_capabilities: [],
           ui: [],
           build_steps: ["sh build.sh"],
+          agent_integrations: [{ tool: "session-agent", command: "TOKEN=local agent --flag" }],
           runtime_change: null,
           trust_downgrade: false,
           fingerprint: "treeB||community",
@@ -375,11 +376,48 @@ describe("updates", () => {
     await waitFor(() => expect(api.previewPluginUpdate).toHaveBeenCalledWith("example.plugin"));
     expect((await screen.findByTestId("plugin-update-added-caps")).textContent).toContain("fs.read");
     expect(screen.getByTestId("plugin-update-build-steps").textContent).toContain("sh build.sh");
+    expect(screen.getByTestId("plugin-update-agent-integrations").textContent).toContain(
+      "session-agent: TOKEN=local agent --flag",
+    );
     expect(screen.getByTestId("plugin-update-changelog").textContent).toContain("v0.2.0");
     await click("plugin-update-approve");
     await waitFor(() => expect(api.applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
     await waitFor(() => expect(screen.queryByTestId("plugin-update-consent-modal")).toBeNull());
     await screen.findByTestId("plugin-job-modal");
+  });
+  it("discloses plugin agent commands when they are the only update access", async () => {
+    await openReview(
+      consentPreview({
+        prior_capabilities: [],
+        new_capabilities: [],
+        added_capabilities: [],
+        removed_capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent", command: "TOKEN=local agent --flag" }],
+      }),
+    );
+    expect((await screen.findByTestId("plugin-update-agent-integrations")).textContent).toContain(
+      "session-agent: TOKEN=local agent --flag",
+    );
+  });
+  it("shows a fallback when an update agent integration declares no command, and approves", async () => {
+    await openReview(
+      consentPreview({
+        prior_capabilities: [],
+        new_capabilities: [],
+        added_capabilities: [],
+        removed_capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent" }],
+      }),
+    );
+    expect((await screen.findByTestId("plugin-update-agent-integrations")).textContent).toContain(
+      "session-agent: No launch command declared",
+    );
+    await click("plugin-update-approve");
+    await waitFor(() => expect(api.applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
   });
 
   it("renders removed caps, runtime change, trust downgrade, and an empty changelog", async () => {
@@ -481,6 +519,7 @@ describe("marketplace", () => {
       capabilities: ["net"],
       ui: [],
       build_steps: ["sh build.sh"],
+      agent_integrations: [{ tool: "session-agent", command: "agent --flag" }],
       fingerprint: "treeA||community",
     },
   };
@@ -497,11 +536,52 @@ describe("marketplace", () => {
     await click("plugins-install-gh:acme/widget");
     await waitFor(() => expect(api.previewPluginInstall).toHaveBeenCalledWith("gh:acme/widget"));
     expect((await screen.findByTestId("plugin-install-caps")).textContent).toContain("net");
+    expect(screen.getByTestId("plugin-install-agent-integrations").textContent).toContain(
+      "session-agent: agent --flag",
+    );
     expect(screen.getByTestId("plugin-install-build-steps").textContent).toContain("sh build.sh");
     await click("plugin-install-approve");
     await waitFor(() => expect(api.startPluginInstall).toHaveBeenCalledWith("gh:acme/widget", "treeA||community"));
     await waitFor(() => expect(screen.queryByTestId("plugin-install-consent-modal")).toBeNull());
     await screen.findByTestId("plugin-job-modal");
+  });
+  it("discloses plugin agent commands when they are the only install access", async () => {
+    if (installConsent.kind !== "ok") throw new Error("expected an install consent fixture");
+    api.previewPluginInstall.mockResolvedValue({
+      kind: "ok",
+      consent: {
+        ...installConsent.consent,
+        capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent", command: "TOKEN=local agent --flag" }],
+      },
+    });
+    await search();
+    await click("plugins-install-gh:acme/widget");
+    expect((await screen.findByTestId("plugin-install-agent-integrations")).textContent).toContain(
+      "session-agent: TOKEN=local agent --flag",
+    );
+  });
+  it("shows a fallback when an install agent integration declares no command, and approves", async () => {
+    if (installConsent.kind !== "ok") throw new Error("expected an install consent fixture");
+    api.previewPluginInstall.mockResolvedValue({
+      kind: "ok",
+      consent: {
+        ...installConsent.consent,
+        capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent" }],
+      },
+    });
+    await search();
+    await click("plugins-install-gh:acme/widget");
+    expect((await screen.findByTestId("plugin-install-agent-integrations")).textContent).toContain(
+      "session-agent: No launch command declared",
+    );
+    await click("plugin-install-approve");
+    await waitFor(() => expect(api.startPluginInstall).toHaveBeenCalledWith("gh:acme/widget", "treeA||community"));
   });
 
   it("surfaces a preview error without opening the consent modal", async () => {

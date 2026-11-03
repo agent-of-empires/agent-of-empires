@@ -36,7 +36,7 @@ A plain New session opens on the project you launched last; pick another from Re
 
 ## Command palette
 
-The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a session, toggle the right panel.
+The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a session, toggle the right panel. With a session open, **Show only this Session** and **Open in its own window** do the same as the session menu entries in [Showing one session](#showing-one-session); "focus" and "pop out" find them too. In such a window, **Show all Sessions** returns to the regular view, and the commands that switch or create sessions are left out.
 
 When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
 
@@ -91,6 +91,10 @@ The right-click (long-press on touch) context menu on any session row exposes th
 - **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. Favorites keep their `✦` marker in both normal and compact sidebars. On the web, favorite stays a within-tier Attention signal; in the TUI it pins to the top of its sibling scope in every sort order while `session.favorites_first` is on (the default).
 - **Archive**: tears down every tmux session the workspace owns (agent, web terminal, container terminal, and tool sub-sessions; pass `kill_pane: false` in the API body, or `--no-kill` on the CLI, to skip the tmux teardown) and shuts down the structured-view worker for ACP sessions, then sinks the row into the collapsible "Snoozed & archived" footer. Daemon restarts skip archived sessions. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first. See #1868.
 - **Snooze**: sinks the row for a chosen duration (presets: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w). Wakes when the timer expires; sending a message wakes it early.
+
+### Showing one session
+
+Under **More** in the same menu, **Show only this Session** reloads the window to show that session alone: no sidebar and no way to switch sessions. The tab is titled after the session, and a note, shown until you dismiss it once, reminds you that other sessions still notify through your system. Badges, sounds and in-app toasts cover only that session. Links to other sessions, plugin pages and settings open in a new window. **All Sessions** at the top left reloads the window back to the regular view, and a reload keeps the mode. If the session is trashed or deleted, the window names it and offers **Show all Sessions** to return to the dashboard. On desktop, **Open in its own window** opens the session the same way in a new window and leaves the current one as it is. The mode lives in the URL (`/session/<id>?focus=1`), so it never spreads to other windows.
 
 Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 

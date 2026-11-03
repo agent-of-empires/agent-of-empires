@@ -52,7 +52,7 @@ import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateProgressView } from "./CreateProgressView";
-import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
+import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
 import { buildCreateRequest } from "./createRequest";
@@ -823,12 +823,15 @@ export function SessionWizard({
 
       <RowGroup>
         {d.structuredViewOffered && (
-          <SwitchRow
-            label="Structured"
-            switchLabel="Use structured view"
-            checked={acpCapable && d.useStructuredView}
-            onChange={(v) => handleChange("useStructuredView", v)}
-            disabled={!acpCapable}
+          <SegmentedRow
+            label="View"
+            testId="wizard-view-row"
+            value={acpCapable && d.useStructuredView ? "structured" : "terminal"}
+            onChange={(v) => handleChange("useStructuredView", v === "structured")}
+            options={[
+              { value: "structured", label: "Structured", name: "Structured view", disabled: !acpCapable },
+              { value: "terminal", label: "Terminal", name: "Terminal view" },
+            ]}
             summary={
               !acpCapable
                 ? selectedAgent?.acp_allowed === false
@@ -837,8 +840,8 @@ export function SessionWizard({
                     ? "needs agent_acp_cmd"
                     : "no ACP adapter, terminal only"
                 : d.useStructuredView
-                  ? "plan, tool calls and diffs"
-                  : "raw terminal"
+                  ? "plan, tool calls and diffs as cards"
+                  : "the Agent's own terminal UI"
             }
           />
         )}

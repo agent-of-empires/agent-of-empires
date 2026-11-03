@@ -119,6 +119,24 @@ describe("TopBar", () => {
     expect(queryByText("breadcrumb-feature")).toBeNull();
   });
 
+  it("replaces the sidebar toggle and dashboard link with an All Sessions button in focus mode", () => {
+    const onToggleSidebar = vi.fn();
+    const onExitFocusMode = vi.fn();
+    const { getByRole, queryByRole } = render(
+      <TopBar {...topBarProps({ onToggleSidebar, waitingCount: 1 })} onExitFocusMode={onExitFocusMode} />,
+      { wrapper: MemoryRouter },
+    );
+    expect(queryByRole("button", { name: /Toggle sidebar/ })).toBeNull();
+    expect(queryByRole("button", { name: "Go to dashboard" })).toBeNull();
+    // The button is the only left control, and its visible label names what it brings back.
+    const exit = getByRole("button", { name: "All Sessions, 0 unread, 1 waiting for your input" });
+    expect(exit.textContent).toContain("All Sessions");
+    expect(exit.closest("header")!.querySelector('img[src="/icon-192.png"]')).toBeNull();
+    fireEvent.click(exit);
+    expect(onExitFocusMode).toHaveBeenCalledTimes(1);
+    expect(onToggleSidebar).not.toHaveBeenCalled();
+  });
+
   it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {
     const onOpenTips = vi.fn();
     const { getByRole } = renderTopBar({ onOpenTips });

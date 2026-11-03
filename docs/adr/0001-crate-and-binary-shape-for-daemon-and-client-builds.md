@@ -26,6 +26,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 ## Consequences
 
 - The existing `src/daemon/` module is the client side of the Daemon API, so the name `daemon` in code already means "Daemon client". Renaming it is a follow-up, as already scoped in #2734.
+- Wire DTOs own serialization, not backend conversion. `src/server/api/sessions/model.rs` converts a backend Session (`Instance`) and its runtime inputs into `SessionResponse`; the wire type has no inherent backend constructors.
 - The current monolith reuses `reqwest` for TCP. `hyper` drives HTTP/1 on the exact UID/PID-checked Unix stream, with `hyper-util`'s `TokioIo` adapter. Plain and `web` builds both include this transport; `web` adds dashboard assets. The future Client crate must own the portable HTTP dependencies and target-gate its Unix adapter without importing backend or `session` edges. This PR does not implement that extraction or verify Windows builds.
 - Where `session`, `tmux` and `hooks` sit relative to `aoe-daemon-client` is not decided here (see the Not yet specified section of #2734).
 - Explicit `aoe tui` and `aoe web` subcommands are a follow-up.

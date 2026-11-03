@@ -1,10 +1,11 @@
 //! Shared gate for secret- or exec-bearing config mutations.
 
 use axum::extract::FromRequestParts;
-use axum::http::{request::Parts, StatusCode};
+use axum::http::request::Parts;
 use axum::response::Response;
 
-use super::{api_error, AppState};
+use super::{api_error_with_code_header, AppState};
+use crate::daemon::ApiErrorCode;
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
 use crate::server::principal::{authorize, Capability, Principal};
 
@@ -20,9 +21,8 @@ async fn mutation_gate(
         return Err(response);
     }
     if !handler_elevated(state, session, local_owner).await {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "elevation_required",
+        return Err(api_error_with_code_header(
+            ApiErrorCode::ElevationRequired,
             "Re-enter the passphrase to continue",
         ));
     }

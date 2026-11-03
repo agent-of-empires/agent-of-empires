@@ -46,6 +46,8 @@ interface Props {
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
   onGoDashboard: () => void;
+  /** Set in a focus-mode window: an "All Sessions" button replaces the sidebar toggle and the dashboard logo. */
+  onExitFocusMode?: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects view), the header's left zone widens
    *  to match the sidebar column and the divider runs vertically through the header instead of a bottom border, so
    *  the top-left of the header reads as part of the sidebar. */
@@ -78,6 +80,7 @@ export function TopBar({
   isDevBuild,
   onOpenTips,
   onGoDashboard,
+  onExitFocusMode,
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
@@ -96,6 +99,7 @@ export function TopBar({
   // the wordmark in that combination.
   const { settings: webSettings } = useWebSettings();
   const hideWordmark = sidebarColumnVisible && webSettings.sidebarCompact;
+  const toggleLabel = onExitFocusMode ? "All Sessions" : "Toggle sidebar";
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
@@ -107,49 +111,60 @@ export function TopBar({
         }`}
       >
         <button
-          onClick={onToggleSidebar}
-          className="relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
-          title="Toggle sidebar"
+          onClick={onExitFocusMode ?? onToggleSidebar}
+          className={`h-8 flex items-center shrink-0 cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50 ${
+            onExitFocusMode ? "pr-2.5" : ""
+          }`}
+          title={toggleLabel}
+          data-testid={onExitFocusMode ? "topbar-exit-focus" : undefined}
           aria-label={
             unreadCount > 0 || waitingCount > 0
-              ? `Toggle sidebar, ${unreadCount} unread, ${waitingCount} waiting for your input`
-              : "Toggle sidebar"
+              ? `${toggleLabel}, ${unreadCount} unread, ${waitingCount} waiting for your input`
+              : toggleLabel
           }
         >
-          <StrokeIcon size={16} strokeWidth="1.5">
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <line x1="9" y1="3" x2="9" y2="21" />
-          </StrokeIcon>
-          {unreadCount > 0 && (
-            // Positioned on this wrapper, not the pill inside Tooltip: Tooltip's own trigger span is an
-            // in-flow inline-flex box, and leaving it in flow would inflate the button's own `relative` box.
-            // aria-hidden: the button's own aria-label and the live region below carry the accessible counts.
-            <span className="absolute -top-1 -right-1" aria-hidden="true">
-              <Tooltip text={`${unreadCount} unread`}>
-                {/* Solid fill in the theme's own resolved accent, with a foreground picked at render time (not a
+          {/* The badges are pinned to this icon box, not the button, so a labelled button keeps them on the icon. */}
+          <span className="relative w-8 h-8 flex items-center justify-center shrink-0">
+            <StrokeIcon size={16} strokeWidth="1.5">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <line x1="9" y1="3" x2="9" y2="21" />
+            </StrokeIcon>
+            {unreadCount > 0 && (
+              // Positioned on this wrapper, not the pill inside Tooltip: Tooltip's own trigger span is an
+              // in-flow inline-flex box, and leaving it in flow would inflate the button's own `relative` box.
+              // aria-hidden: the button's own aria-label and the live region below carry the accessible counts.
+              <span className="absolute -top-1 -right-1" aria-hidden="true">
+                <Tooltip text={`${unreadCount} unread`}>
+                  {/* Solid fill in the theme's own resolved accent, with a foreground picked at render time (not a
                    fixed class) from that same resolved color: `waiting`/`unread` are user-configurable per theme
                    (resolved.rs), so no single hardcoded foreground clears WCAG AA against every possible accent. */}
-                <span
-                  className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
-                  style={{ backgroundColor: attentionBadgeColors.unreadBg, color: attentionBadgeColors.unreadFg }}
-                  data-testid="topbar-unread-badge"
-                >
-                  {unreadCount}
-                </span>
-              </Tooltip>
-            </span>
-          )}
-          {waitingCount > 0 && (
-            <span className="absolute -bottom-1 -right-1" aria-hidden="true">
-              <Tooltip text={`${waitingCount} waiting for your input`}>
-                <span
-                  className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
-                  style={{ backgroundColor: attentionBadgeColors.waitingBg, color: attentionBadgeColors.waitingFg }}
-                  data-testid="topbar-waiting-badge"
-                >
-                  {waitingCount}
-                </span>
-              </Tooltip>
+                  <span
+                    className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
+                    style={{ backgroundColor: attentionBadgeColors.unreadBg, color: attentionBadgeColors.unreadFg }}
+                    data-testid="topbar-unread-badge"
+                  >
+                    {unreadCount}
+                  </span>
+                </Tooltip>
+              </span>
+            )}
+            {waitingCount > 0 && (
+              <span className="absolute -bottom-1 -right-1" aria-hidden="true">
+                <Tooltip text={`${waitingCount} waiting for your input`}>
+                  <span
+                    className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
+                    style={{ backgroundColor: attentionBadgeColors.waitingBg, color: attentionBadgeColors.waitingFg }}
+                    data-testid="topbar-waiting-badge"
+                  >
+                    {waitingCount}
+                  </span>
+                </Tooltip>
+              </span>
+            )}
+          </span>
+          {onExitFocusMode && (
+            <span className="text-xs leading-none whitespace-nowrap" aria-hidden="true">
+              All Sessions
             </span>
           )}
         </button>
@@ -161,16 +176,18 @@ export function TopBar({
           {`${unreadCount} unread, ${waitingCount} waiting for your input`}
         </span>
 
-        <button
-          onClick={onGoDashboard}
-          className="flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
-          aria-label="Go to dashboard"
-        >
-          <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
-          {/* This zone matches the sidebar column, so a compact rail leaves no room for the wordmark next to the
-             toggle and the logo: it would sit flush against the divider and read as clipped. */}
-          <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
-        </button>
+        {!onExitFocusMode && (
+          <button
+            onClick={onGoDashboard}
+            className="flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
+            aria-label="Go to dashboard"
+          >
+            <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
+            {/* This zone matches the sidebar column, so a compact rail leaves no room for the wordmark next to the
+               toggle and the logo: it would sit flush against the divider and read as clipped. */}
+            <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
+          </button>
+        )}
         {/* The left zone is content-sized unless the sidebar column is showing, so the chips are capped and hidden
            below md instead of pushing the core controls off-screen. Also hidden with the wordmark: the compact rail
            leaves no room beside the logo. */}
