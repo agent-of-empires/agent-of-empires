@@ -10365,3 +10365,96 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
     assert!(kept.is_trashed());
     Ok(())
 }
+
+/// A sub-session is created in its parent's group, and only a top-level session can be a
+/// parent, as `aoe add --parent` decides.
+#[tokio::test]
+async fn create_with_a_parent_joins_its_group_one_level_deep() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let mut parent = Instance::new("parent", "/tmp/aoe-parent");
+    parent.id = "parent".into();
+    parent.source_profile = "test".into();
+    parent.group_path = "team".into();
+    let mut child = Instance::new("child", "/tmp/aoe-child");
+    child.id = "child".into();
+    child.source_profile = "test".into();
+    child.parent_session_id = Some("parent".into());
+    let mut trashed = Instance::new("trashed", "/tmp/aoe-trashed");
+    trashed.id = "trashed".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    crate::session::Storage::new_unwatched("other").unwrap();
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-elsewhere");
+    elsewhere.id = "other-parent".into();
+    elsewhere.source_profile = "other".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![parent.clone(), child.clone(), trashed.clone()],
+    );
+    crate::server::test_support::seed_instances_on_disk_for_test("other", vec![elsewhere.clone()]);
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![parent, child, trashed, elsewhere],
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    // (parent, refusal code, or None when created in the parent's group)
+    let cases = [
+        ("missing", Some("parent_not_found")),
+        // Another profile's session can't parent one created in this profile.
+        ("other-parent", Some("parent_not_found")),
+        ("trashed", Some("parent_not_found")),
+        ("child", Some("parent_is_sub_session")),
+        ("parent", None),
+    ];
+    for (parent_id, refusal) in cases {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "scratch": true,
+                "view": "structured", "group": "elsewhere", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        if let Some(code) = refusal {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {session}");
+            assert_eq!(session["error"], code, "{parent_id}");
+            assert_eq!(state.instances.read().await.len(), 4, "{parent_id}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::CREATED, "{parent_id}: {session}");
+        let id = session["id"].as_str().unwrap();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(row.group_path, "team");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}

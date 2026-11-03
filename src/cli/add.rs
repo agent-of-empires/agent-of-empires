@@ -515,9 +515,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
         let parent = super::resolve_session(parent_ref, &instances)?;
-        if parent.is_sub_session() {
-            bail!("Cannot create sub-session of a sub-session (single level only)");
-        }
+        parent.ensure_can_parent()?;
         group_path = Some(parent.group_path.clone());
         Some(parent.id.clone())
     } else {
@@ -2371,6 +2369,42 @@ command = "plugin-helper --safe"
                 crate::session::ForkDenied::NoParentSession
                     .user_message("parent", parent_id, "real"),
                 "the CLI and the REST election must refuse the row the same way"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_a_sub_session_as_parent() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut child =
+                        crate::session::Instance::new("child", project.path().to_str().unwrap());
+                    child.id = "child-id".to_string();
+                    child.parent_session_id = Some("top-id".into());
+                    *rows = vec![child];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--parent",
+                "child-id",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("sessions nest one level deep")
+                .to_string();
+            assert_eq!(
+                msg,
+                "Cannot create sub-session of a sub-session (single level only)"
             );
         }
 
