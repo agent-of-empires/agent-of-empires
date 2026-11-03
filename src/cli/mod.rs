@@ -72,14 +72,13 @@ pub(crate) async fn runtime_write(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value> {
-    let endpoint = crate::acp::client::require_daemon().await?;
+    let endpoint = crate::acp::client::daemon_manager::require_config_daemon().await?;
     let client = crate::acp::client::HttpClient::new(endpoint)?;
     // Its client carries the passphrase session, which a bare endpoint's does not.
     let info = client.daemon_client().await?.runtime_info().await?;
     anyhow::ensure!(
-        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
-            && info.health == crate::daemon::RuntimeHealth::Healthy,
-        "Daemon runtime is not ready"
+        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION,
+        "Daemon runtime protocol is incompatible"
     );
     Ok(client
         .mutate_with(method, path, |request| {
