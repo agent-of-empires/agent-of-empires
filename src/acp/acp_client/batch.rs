@@ -4,12 +4,13 @@
 
 use agent_client_protocol::{RawJsonRpcMessage, TransportFrame};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
     WriteHalf,
 };
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -17,6 +18,8 @@ struct Batches {
     next: u64,
     /// Request id (as JSON text) to the batch awaiting its reply.
     owner: HashMap<String, u64>,
+    /// Outstanding request ids sent outside a batch.
+    standalone: HashSet<String>,
     open: HashMap<u64, Open>,
     /// Who is owed each `id: null` reply, in the order the SDK answers them:
     /// a batch, or `None` for a standalone line.
@@ -41,15 +44,18 @@ where
     let (ours, sdk) = tokio::io::duplex(64 * 1024);
     let (from_sdk, to_sdk) = tokio::io::split(ours);
     let state = Shared::default();
+    // Replies the read pump answers itself, for the write pump to send.
+    let (ready_tx, ready_rx) = mpsc::unbounded_channel();
     // A failed write to the agent retires the other pump too, closing the SDK end.
     let broken = CancellationToken::new();
     tokio::spawn(split_incoming(
         agent_out,
         to_sdk,
         state.clone(),
+        ready_tx,
         broken.clone(),
     ));
-    tokio::spawn(group_outgoing(from_sdk, agent_in, state, broken));
+    tokio::spawn(group_outgoing(from_sdk, agent_in, state, ready_rx, broken));
     sdk
 }
 
@@ -57,6 +63,7 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     agent_out: R,
     mut to_sdk: WriteHalf<DuplexStream>,
     state: Shared,
+    ready: mpsc::UnboundedSender<Value>,
     broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(agent_out).lines();
@@ -70,14 +77,20 @@ async fn split_incoming<R: AsyncRead + Unpin>(
         };
         let singles = match serde_json::from_str::<Value>(line.trim()) {
             Ok(Value::Array(items)) if !items.is_empty() => {
-                track_requests(&state, &items);
-                items.iter().map(Value::to_string).collect()
+                let (forward, answer) = admit_batch(&state, items);
+                if let Some(answer) = answer {
+                    let _ = ready.send(answer);
+                }
+                forward
             }
             // An empty array is not a batch; the SDK answers it with one error.
-            _ => {
-                track_standalone(&state, &line);
-                vec![line]
-            }
+            _ => match admit_standalone(&state, &line) {
+                Ok(()) => vec![line],
+                Err(rejection) => {
+                    let _ = ready.send(rejection);
+                    continue;
+                }
+            },
         };
         for single in singles {
             if to_sdk
@@ -93,8 +106,8 @@ async fn split_incoming<R: AsyncRead + Unpin>(
     let _ = to_sdk.shutdown().await;
 }
 
-/// What the SDK answers for one batch entry. Entries it cannot attribute to an
-/// id (malformed, non-objects, null-id requests) get an `id: null` error.
+/// What the SDK answers for one entry. Entries it cannot attribute to an id
+/// (malformed, non-objects, null-id requests) get an `id: null` error.
 enum Expect {
     Nothing,
     Named(String),
@@ -118,20 +131,49 @@ fn expected_reply(entry: &Value) -> Expect {
     }
 }
 
-fn track_requests(state: &Shared, items: &[Value]) {
+/// Replies cannot be matched to two outstanding requests with one id, so the
+/// later one is refused instead of reaching the SDK.
+fn duplicate_id_error(id: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::from_str::<Value>(id).unwrap_or(Value::Null),
+        "error": {
+            "code": -32600,
+            "message": "Invalid request",
+            "data": "duplicate request id",
+        },
+    })
+}
+
+/// Registers a batch. Returns the entries to forward to the SDK, and the
+/// finished reply when nothing forwarded is left to wait for.
+fn admit_batch(state: &Shared, items: Vec<Value>) -> (Vec<String>, Option<Value>) {
+    let mut batches = state.lock().expect("batch state poisoned");
+    let mut forward = Vec::new();
     let mut named = Vec::new();
     let mut anonymous = 0;
+    let mut refused = Vec::new();
     for item in items {
-        match expected_reply(item) {
-            Expect::Named(id) => named.push(id),
+        match expected_reply(&item) {
+            Expect::Named(id) => {
+                let taken = batches.owner.contains_key(&id)
+                    || batches.standalone.contains(&id)
+                    || named.contains(&id);
+                if taken {
+                    refused.push(duplicate_id_error(&id));
+                    continue;
+                }
+                named.push(id);
+            }
             Expect::Anonymous => anonymous += 1,
             Expect::Nothing => {}
         }
+        forward.push(item.to_string());
     }
     if named.is_empty() && anonymous == 0 {
-        return;
+        let answer = (!refused.is_empty()).then(|| Value::Array(refused));
+        return (forward, answer);
     }
-    let mut batches = state.lock().expect("batch state poisoned");
     let batch = batches.next;
     batches.next += 1;
     batches.open.insert(
@@ -139,7 +181,7 @@ fn track_requests(state: &Shared, items: &[Value]) {
         Open {
             named: named.len(),
             anonymous,
-            replies: Vec::new(),
+            replies: refused,
         },
     );
     for id in named {
@@ -148,38 +190,52 @@ fn track_requests(state: &Shared, items: &[Value]) {
     batches
         .anonymous_queue
         .extend(std::iter::repeat_n(Some(batch), anonymous));
+    (forward, None)
 }
 
-/// A line outside any batch can also owe an `id: null` reply.
-fn track_standalone(state: &Shared, line: &str) {
-    let owes_null_reply = match serde_json::from_str::<Value>(line.trim()) {
-        Ok(Value::Array(_)) | Err(_) => true,
-        Ok(value) => matches!(expected_reply(&value), Expect::Anonymous),
+/// Tracks a line outside any batch: it can owe an `id: null` reply, and its
+/// request id must not collide with one a batch is waiting on. `Err` carries
+/// the refusal to send instead of forwarding the line.
+fn admit_standalone(state: &Shared, line: &str) -> Result<(), Value> {
+    let mut batches = state.lock().expect("batch state poisoned");
+    let expect = match serde_json::from_str::<Value>(line.trim()) {
+        Ok(Value::Array(_)) | Err(_) => Expect::Anonymous,
+        Ok(value) => expected_reply(&value),
     };
-    if owes_null_reply {
-        state
-            .lock()
-            .expect("batch state poisoned")
-            .anonymous_queue
-            .push_back(None);
+    match expect {
+        Expect::Named(id) => {
+            if batches.owner.contains_key(&id) || !batches.standalone.insert(id.clone()) {
+                return Err(duplicate_id_error(&id));
+            }
+        }
+        Expect::Anonymous => batches.anonymous_queue.push_back(None),
+        Expect::Nothing => {}
     }
+    Ok(())
 }
 
 async fn group_outgoing<W: AsyncWrite + Unpin>(
     from_sdk: ReadHalf<DuplexStream>,
     mut agent_in: W,
     state: Shared,
+    mut ready: mpsc::UnboundedReceiver<Value>,
     broken: CancellationToken,
 ) {
     let mut lines = BufReader::new(from_sdk).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let out = match serde_json::from_str::<Value>(line.trim()) {
-            Ok(reply) => match claim_reply(&state, reply) {
-                Claimed::Held => continue,
-                Claimed::Complete(replies) => Value::Array(replies).to_string(),
-                Claimed::Single => line,
+    loop {
+        let out = tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => match serde_json::from_str::<Value>(line.trim()) {
+                    Ok(reply) => match claim_reply(&state, reply) {
+                        Claimed::Held => continue,
+                        Claimed::Complete(replies) => Value::Array(replies).to_string(),
+                        Claimed::Single => line,
+                    },
+                    Err(_) => line,
+                },
+                _ => return,
             },
-            Err(_) => line,
+            Some(answer) = ready.recv() => answer.to_string(),
         };
         if let Err(error) = agent_in.write_all(format!("{out}\n").as_bytes()).await {
             tracing::debug!(target: "acp.protocol", %error, "agent stdin write failed");
@@ -217,7 +273,9 @@ fn claim_reply(state: &Shared, reply: Value) -> Claimed {
             batch
         }
         Some(id) => {
-            let Some(batch) = batches.owner.remove(&id.to_string()) else {
+            let id = id.to_string();
+            let Some(batch) = batches.owner.remove(&id) else {
+                batches.standalone.remove(&id);
                 return Claimed::Single;
             };
             batches
@@ -404,6 +462,66 @@ mod tests {
         })
         .await
         .expect("both replies arrive");
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_ids_are_refused_inside_the_batch_reply() {
+        let (mut agent_side_out, agent_out) = tokio::io::duplex(4096);
+        let (agent_in, agent_side_in) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(wrap(agent_out, agent_in));
+        let agent = async move {
+            // A duplicate inside a batch, then a batch and a standalone line
+            // reusing an id the first batch still waits on.
+            let input = concat!(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"x/unknown"},{"jsonrpc":"2.0","id":1,"method":"x/unknown"}]"#,
+                "\n",
+                r#"[{"jsonrpc":"2.0","id":1,"method":"x/unknown"}]"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":1,"method":"x/unknown"}"#,
+                "\n",
+            );
+            agent_side_out.write_all(input.as_bytes()).await.unwrap();
+            let mut replies = BufReader::new(agent_side_in).lines();
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                seen.push(read_value(&mut replies).await);
+            }
+            let refused = |v: &Value| v["error"]["data"] == "duplicate request id";
+            // The refused batch is answered alone, the standalone one bare.
+            let lone = seen
+                .iter()
+                .find(|v| v.as_array().is_some_and(|a| a.len() == 1 && refused(&a[0])))
+                .unwrap_or_else(|| panic!("a lone refusal batch in {seen:?}"));
+            assert_eq!(lone[0]["id"], 1);
+            assert!(seen.iter().any(refused), "bare refusal in {seen:?}");
+            // The first batch: its own reply plus the refused duplicate.
+            let first = seen
+                .iter()
+                .find(|v| v.as_array().is_some_and(|a| a.len() == 2))
+                .unwrap_or_else(|| panic!("a two-entry batch in {seen:?}"));
+            assert_eq!(
+                first
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| refused(e))
+                    .count(),
+                1
+            );
+        };
+        let client = Client.v1().connect_with(
+            ByteStreams::new(write.compat_write(), read.compat()),
+            async |_cx| {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok(())
+            },
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, agent)
+        })
+        .await
+        .expect("every request is answered, none hangs");
         result.unwrap();
     }
 
