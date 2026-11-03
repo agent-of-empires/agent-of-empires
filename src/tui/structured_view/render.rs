@@ -1468,7 +1468,7 @@ fn transcript_lines(
     out
 }
 
-/// One dim line per thought: the TUI has no expansion state to show it all.
+/// One dim preview per thought: the TUI has no expansion state to show it all.
 fn thinking_preview_line(text: &str) -> Line<'static> {
     const MAX_CHARS: usize = 120;
     let first = text
