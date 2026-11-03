@@ -57,13 +57,23 @@ without a token. To connect an agent, see
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
 | `whoami` | none | `null`; no session credential is currently available. |
+| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, prompt_sent, prompt_delivery}`. A structured session stores `prompt` as its first turn (`pending_initial_turn`); a terminal session waits for its agent and types it (`sent`, or `not_running` when the session did not start). |
+| `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. |
+| `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. |
 
-Both tools declare an `outputSchema` and return `structuredContent`.
+Every tool declares an `outputSchema` and returns `structuredContent`. A refusal is a
+tool error (`isError`) whose `structuredContent` carries a `code`, such as
+`read_only`, `not_found`, `not_running`, `busy`, `invalid_request`,
+`parent_not_found`, `parent_is_sub_session` or `hooks_need_trust`, and a `message`.
+`create_session` takes no hook-trust, callback, command-override, environment or
+fork fields, so repository hooks that need approval are refused with
+`hooks_need_trust` until someone trusts them in the dashboard.
 Listing does not persist workspace ordering or rebuild rows from mutable state.
-Read-only mode permits these reads. CityHall rejects `POST /mcp` with `403`,
+Read-only mode permits `list_sessions`, `whoami` and `read_output`, and refuses
+`create_session` and `send` with `read_only`. CityHall rejects `POST /mcp` with `403`,
 as it does other non-allowlisted POST routes, including over the owner socket.
 MCP POST requests remain tracked runtime work: shutdown interrupts them, and a
-long-running request can delay draining. No mutation or automatic replay is added.
+long-running request can delay draining. No request is replayed automatically.
 
 ## Skills
 
