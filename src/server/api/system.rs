@@ -3694,7 +3694,11 @@ mod tests {
             ("my-settl", (true, false)),
         ] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
-            assert_eq!((entry.always_yolo, entry.acp_always_yolo), expected, "{name}");
+            assert_eq!(
+                (entry.always_yolo, entry.acp_always_yolo),
+                expected,
+                "{name}"
+            );
         }
     }
 
