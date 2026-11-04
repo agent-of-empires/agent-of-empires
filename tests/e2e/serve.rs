@@ -2848,6 +2848,61 @@ fn cli_serve_restart_replays_launch_state() {
     );
 }
 
+#[cfg(feature = "web")]
+#[test]
+#[parallel]
+fn cli_serve_disabled_web_replay_preserves_owner_and_credentials() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("disabled_web_replay");
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.remove_env("AOE_CITYHALL_MODE");
+    h.stop_daemon_on_drop();
+    let passphrase = "retained-web-policy-passphrase";
+
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    let port = h.start_daemon_with(&["--passphrase", passphrase]);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    let predecessor = daemon_pid(&h).unwrap();
+    h.run_cli_err(&["serve", "--restart"]);
+    assert_eq!(daemon_pid(&h), Some(predecessor));
+    assert_original_passphrase_login(&h, passphrase);
+
+    h.run_cli_ok(&["serve", "--rollback"]);
+    h.run_cli_err(&["mcp", "config"]);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    h.run_cli_ok(&["serve", "--restart"]);
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    h.run_cli_ok(&["serve", "--stop"]);
+
+    h.start_daemon_with(&["--passphrase", passphrase]);
+    let app = app_dir_in(h.home_path());
+    let version_path = app.join(".schema_version");
+    let version = std::fs::read(&version_path).unwrap();
+    std::fs::write(&version_path, "39").unwrap();
+    let workers = app.join("acp-workers");
+    block_workers_dir(&workers);
+    h.run_cli_err(&["serve", "--restart"]);
+    std::fs::remove_file(&workers).unwrap();
+    std::fs::create_dir(&workers).unwrap();
+    std::fs::write(&version_path, version).unwrap();
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    let predecessor = daemon_pid(&h).unwrap();
+
+    h.run_cli_err(&["serve", "--rollback"]);
+    assert_eq!(daemon_pid(&h), Some(predecessor));
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
+    h.run_cli_err(&["mcp", "config"]);
+
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    h.run_cli_ok(&["serve", "--rollback"]);
+    assert_original_passphrase_login(&h, passphrase);
+}
+
 #[test]
 #[parallel]
 fn cli_serve_replay_rejects_missing_or_unbound_passphrases() {

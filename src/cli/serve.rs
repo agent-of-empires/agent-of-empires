@@ -1262,6 +1262,13 @@ pub(crate) fn web_daemon_pid() -> Option<u32> {
 
 async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMode> {
     crate::session::require_known_profile(profile)?;
+    if !args.core_only
+        && crate::cli::graft::web_disabled(&crate::session::config::Config::load_or_warn())
+    {
+        bail!(
+            "Web serving is disabled; run `aoe plugin enable aoe.web` before starting a TCP daemon"
+        );
+    }
     let auth_mode = if args.core_only {
         AuthMode::None
     } else {

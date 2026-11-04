@@ -11,7 +11,7 @@ The server is off by default. Turn on the **MCP server** toggle in Settings, or 
 mcp_enabled = true
 ```
 
-The daemon reads this global setting at startup. With it enabled, a fresh CLI or TUI acquisition opens the existing TCP API and dashboard surface on loopback with token authentication, unless the registered `aoe.web` plugin is disabled. This includes MCP over Streamable HTTP at `/mcp`. It does not request a LAN bind or a tunnel. Passphrase and CityHall protections still apply.
+The daemon reads this global setting at startup. With it enabled, a fresh CLI or TUI acquisition opens the existing TCP API on loopback with token authentication, unless the registered `aoe.web` plugin is disabled. This includes MCP over Streamable HTTP at `/mcp`. Builds with the `web` Cargo feature also serve the dashboard. It does not request a LAN bind or a tunnel. Passphrase and CityHall protections still apply.
 
 The private local runtime and `aoe plugin enable aoe.web` remain available while that plugin is disabled. Re-enabling it does not promote an existing private daemon. Explicit TCP starts remain rejected until the plugin is enabled.
 
