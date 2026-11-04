@@ -397,6 +397,7 @@ describe("agent list per profile", () => {
     ["a failed load for beta drops alpha's list", [failed("beta")], "beta", "failed", 0],
     ["a missing beta drops alpha's list", [failed("beta", true)], "beta", "missing", 0],
     ["a failed retry for alpha keeps alpha's list", [failed("alpha")], "alpha", "failed", 1],
+    ["a missing alpha keeps alpha's list", [failed("alpha", true)], "alpha", "missing", 1],
   ] as const)("%s", (_label, actions, profile, status, count) => {
     const loaded = reducer(
       { ...makeState(), agentsStatus: "loading" },

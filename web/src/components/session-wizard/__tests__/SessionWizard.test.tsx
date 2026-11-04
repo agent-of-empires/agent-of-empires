@@ -1243,6 +1243,14 @@ describe("SessionWizard Yolo mode", () => {
     await waitFor(() => expect(launchButton().disabled).toBe(false));
   });
 
+  it("keeps the Profile row hidden for one Profile while its agent list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(screen.queryByText("Profile")).toBeNull();
+  });
+
   it("names a deleted Profile even when its project lookup failed too", async () => {
     vi.mocked(fetchProfileAgents).mockResolvedValue("profile_not_found");
     vi.mocked(fetchProjects).mockResolvedValue(null);
