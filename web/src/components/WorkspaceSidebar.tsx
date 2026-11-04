@@ -63,6 +63,7 @@ interface Props {
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
+  activeSessionId: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
@@ -100,7 +101,17 @@ interface Props {
 }
 
 export function WorkspaceSidebar(props: Props) {
-  const { groups, nestedGroups, orgGroups, trashedWorkspaces = [], activeId, open, readOnly, axis } = props;
+  const {
+    groups,
+    nestedGroups,
+    orgGroups,
+    trashedWorkspaces = [],
+    activeId,
+    activeSessionId,
+    open,
+    readOnly,
+    axis,
+  } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
   const compact = webSettings.sidebarCompact;
@@ -184,6 +195,7 @@ export function WorkspaceSidebar(props: Props) {
     triage,
     readOnly,
     activeId,
+    activeSessionId,
     onSelect: props.onSelect,
   });
   const { onBulkArchive } = selection;
@@ -205,6 +217,7 @@ export function WorkspaceSidebar(props: Props) {
     readOnly,
     offline,
     displayedActiveId: selection.displayedActiveId,
+    displayedActiveSessionId: selection.displayedActiveSessionId,
     onNew: props.onNew,
     onCreateSession: props.onCreateSession,
     onUpdateAppearance: props.onUpdateRepoAppearance,
@@ -218,7 +231,10 @@ export function WorkspaceSidebar(props: Props) {
       observedById: props.observedById,
       runtimeEpoch: props.runtimeEpoch,
       onSessionMutation: props.onSessionMutation,
-      isActive: v.workspace.id === selection.displayedActiveId,
+      isActive:
+        v.workspace.id === selection.displayedActiveId &&
+        (selection.displayedActiveSessionId == null ||
+          v.workspace.sessions.some((s) => s.id === selection.displayedActiveSessionId)),
       isSelected: selection.isSelected(v.key),
       onActivate: selection.handleRowActivate,
       onDelete: props.onDeleteSession,

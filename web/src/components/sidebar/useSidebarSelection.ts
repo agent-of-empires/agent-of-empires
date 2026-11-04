@@ -16,6 +16,7 @@ export function useSidebarSelection({
   triage,
   readOnly,
   activeId,
+  activeSessionId,
   onSelect,
 }: {
   rows: readonly SidebarWorkspaceView[];
@@ -23,13 +24,21 @@ export function useSidebarSelection({
   triage: Triage;
   readOnly?: boolean;
   activeId: string | null;
+  activeSessionId: string | null;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
 }) {
   const [selection, dispatch] = useReducer(selectionReducer, EMPTY_SELECTION);
-  const [optimisticActive, setOptimisticActive] = useState<{ id: string; fromActiveId: string | null } | null>(null);
+  const [optimisticActive, setOptimisticActive] = useState<{
+    id: string;
+    sessionId: string | null;
+    fromActiveId: string | null;
+  } | null>(null);
   // Drop the hint once activeId moves, so navigating back to `fromActiveId` cannot revive a stale id.
   if (optimisticActive && optimisticActive.fromActiveId !== activeId) setOptimisticActive(null);
   const displayedActiveId = optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
+  // A status slice holds one session, so an active row must match it, not just the workspace id.
+  const displayedActiveSessionId =
+    optimisticActive?.fromActiveId === activeId ? optimisticActive.sessionId : activeSessionId;
 
   // Selection is keyed by the rendered row: the status axis slices one workspace into a row per
   // status, and each row's actions belong to its own session.
@@ -131,7 +140,7 @@ export function useSidebarSelection({
         dispatch(readOnly ? { type: "clear" } : { type: "navigate", id: rowKey });
         // Rows outside the group lists (the Trash panel) key themselves by workspace id.
         const workspaceId = byKey.get(rowKey)?.workspace.id ?? rowKey;
-        setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+        setOptimisticActive({ id: workspaceId, sessionId, fromActiveId: activeId });
         onSelect(workspaceId, sessionId);
       } else if (intent === "toggle") {
         dispatch({ type: "toggle", id: rowKey });
@@ -143,5 +152,12 @@ export function useSidebarSelection({
   );
 
   const isSelected = (key: string) => !readOnly && selection.selectedIds.has(key);
-  return { displayedActiveId, isSelected, rowBulkApi, handleRowActivate, onBulkArchive };
+  return {
+    displayedActiveId,
+    displayedActiveSessionId,
+    isSelected,
+    rowBulkApi,
+    handleRowActivate,
+    onBulkArchive,
+  };
 }

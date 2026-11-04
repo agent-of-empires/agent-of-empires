@@ -434,6 +434,135 @@ test.describe("sidebar status axis (#4867)", () => {
     await expect.poll(() => archived.length).toBe(2);
     expect([...archived].sort()).toEqual(["s-other", "s-run"]);
   });
+
+  test("a workspace split across buckets marks only the slice showing the active session", async ({ page }) => {
+    const sessions: MockSessionInput[] = [
+      {
+        id: "s-wait",
+        title: "wait-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Waiting" },
+      },
+      {
+        id: "s-run",
+        title: "run-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Running" },
+      },
+    ];
+    await installSidebarMocks(page, { sessions });
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
+
+    await page.locator(ROW).filter({ hasText: "run-session" }).click();
+    await expect(page).toHaveURL(/\/session\/s-run/);
+    // Both slices share the workspace id, but only the Running one shows the open session.
+    const active = page.locator("[data-active-session-row]");
+    await expect(active).toHaveCount(1);
+    await expect(active).toContainText("run-session");
+  });
+
+  test("a range across the footer selects each workspace once, not its hidden status slices", async ({ page }) => {
+    const archivedUntil = { archived_at: "2026-01-01T00:00:00Z" };
+    const sessions: MockSessionInput[] = [
+      {
+        id: "s-w1-waiting",
+        title: "w1-waiting",
+        project_path: "/tmp/w1",
+        branch: "feat/w1",
+        fields: { status: "Waiting", ...archivedUntil },
+      },
+      {
+        id: "s-w1-running",
+        title: "w1-running",
+        project_path: "/tmp/w1",
+        branch: "feat/w1",
+        fields: { status: "Running", ...archivedUntil },
+      },
+      {
+        id: "s-w2-idle",
+        title: "w2-idle",
+        project_path: "/tmp/w2",
+        branch: "feat/w2",
+        fields: { status: "Idle", ...archivedUntil },
+      },
+    ];
+    const unarchived: string[] = [];
+    await installSidebarMocks(page, { sessions });
+    await page.route("**/api/sessions/*/archive", async (route) => {
+      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
+      unarchived.push(id);
+      await route.fulfill({ json: sessionResponse({ id }) });
+    });
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
+    await page.getByTestId("sidebar-sunk-toggle").click();
+
+    // One footer row per workspace: W1 is sliced into Waiting and Running buckets internally.
+    const footerRows = page.locator(`[data-testid='sidebar-sunk-section'] ${ROW}`);
+    await expect(footerRows).toHaveCount(2);
+
+    await footerRows.nth(0).click();
+    await footerRows.nth(1).click({ modifiers: ["Shift"] });
+    await footerRows.nth(1).click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-bulk-unarchive").click();
+
+    await expect.poll(() => unarchived.length).toBe(2);
+    expect([...unarchived].sort()).toEqual(["s-w1-waiting", "s-w2-idle"]);
+  });
+
+  test("snoozing one status slice leaves its sibling row and bulk eligibility alone", async ({ page }) => {
+    const sessions: MockSessionInput[] = [
+      {
+        id: "s-wait",
+        title: "wait-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Waiting" },
+      },
+      {
+        id: "s-run",
+        title: "run-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Running" },
+      },
+    ];
+    const snoozed: string[] = [];
+    await installSidebarMocks(page, { sessions });
+    await page.route("**/api/sessions/*/snooze", async (route) => {
+      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
+      snoozed.push(id);
+      const { minutes } = route.request().postDataJSON() as { minutes: number | null };
+      await route.fulfill({
+        json: sessionResponse({ id, snoozed_until: minutes == null ? null : "2099-01-01T00:00:00Z" }),
+      });
+    });
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
+
+    const waitingRow = page.locator(ROW).filter({ hasText: "wait-session" });
+    const runningRow = page.locator(ROW).filter({ hasText: "run-session" });
+    await runningRow.click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-snooze").click();
+    await page.getByTestId("snooze-modal-preset-60").click();
+    await expect.poll(() => snoozed).toEqual(["s-run"]);
+
+    // Only the Running row carries the pending snooze.
+    await expect(runningRow.getByLabel("Snoozed")).toBeVisible();
+    await expect(waitingRow.getByLabel("Snoozed")).toHaveCount(0);
+
+    // Bulk buckets follow the same scope: one snoozable row, one unsnoozable. A plain click first
+    // clears the single selection the snooze row's right-click left behind.
+    await waitingRow.click();
+    await waitingRow.click({ modifiers: ["Meta"] });
+    await runningRow.click({ modifiers: ["Meta"] });
+    await runningRow.click({ button: "right" });
+    await expect(page.getByTestId("sidebar-context-menu-bulk-unsnooze")).toHaveText("Unsnooze 1");
+    await expect(page.getByText("Snooze 1", { exact: true })).toBeVisible();
+  });
 });
 
 test.describe("sidebar org axis (#3283)", () => {
