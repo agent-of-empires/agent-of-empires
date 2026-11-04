@@ -866,6 +866,19 @@ describe("ensureTerminal", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(calls);
     });
 
+    it("stops retrying once its signal aborts", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(300);
+      const calls = fetchSpy.mock.calls.length;
+      expect(calls).toBeGreaterThan(0);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
     it("does not retry other refusals", async () => {
       fetchSpy.mockResolvedValueOnce(empty(500));
       expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "Server error (500)" });
