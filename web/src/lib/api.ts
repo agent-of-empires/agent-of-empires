@@ -316,14 +316,21 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
 const TERMINAL_BUSY_BUDGET_MS = 30_000;
 
 // A launch holds the lifecycle reservation, so a terminal opened meanwhile gets 409 lifecycle_busy until it ends.
-export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
+export async function ensureTerminal(
+  id: string,
+  index = 0,
+  container = false,
+  signal?: AbortSignal,
+): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
   let waited = 0;
   for (let delay = 250; ; delay = Math.min(delay * 2, 1000)) {
+    if (signal?.aborted) return { ok: false, error: "aborted" };
     let result: EnsureSessionResult;
     try {
       const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
         method: "POST",
+        signal,
       });
       if (res.ok) return { ok: true };
       const body = await res.json().catch(() => ({}));
@@ -333,6 +340,7 @@ export async function ensureTerminal(id: string, index = 0, container = false): 
         message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
       };
     } catch (e) {
+      if (signal?.aborted) return { ok: false, error: "aborted" };
       return { ok: false, message: e instanceof Error ? e.message : "Network error" };
     }
     if (result.error !== "lifecycle_busy" || waited >= TERMINAL_BUSY_BUDGET_MS) return result;
