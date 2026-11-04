@@ -10458,3 +10458,96 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
         .await;
     }
 }
+
+/// CityHall answers a Terminal view parent like a missing one, so the mode doesn't reveal which
+/// ids exist, and neither refusal writes a child; a Structured view parent still works.
+#[tokio::test]
+async fn cityhall_create_hides_terminal_parents_like_missing_ones() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    // CityHall creates only in a configured project.
+    let project = tempfile::tempdir().unwrap();
+    crate::session::projects::add(
+        "test",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "cityhall",
+            project.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    let mut structured = Instance::new("structured-parent", "/tmp/aoe-structured-parent");
+    structured.id = "structured-parent".into();
+    structured.source_profile = "test".into();
+    structured.view = crate::session::View::Structured;
+    structured.group_path = "team".into();
+    let mut terminal = Instance::new("terminal-parent", "/tmp/aoe-terminal-parent");
+    terminal.id = "terminal-parent".into();
+    terminal.source_profile = "test".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![structured.clone(), terminal.clone()],
+    );
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![structured, terminal],
+        Vec::new(),
+        Vec::new(),
+        None,
+        true,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for parent_id in ["terminal-parent", "missing"] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {body}");
+        assert_eq!(body["error"], "parent_not_found", "{parent_id}");
+        assert_eq!(state.instances.read().await.len(), 2, "{parent_id}");
+    }
+
+    let (status, session) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "sub", "path": "", "tool": "claude", "parent_session_id": "structured-parent",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["id"].as_str().unwrap();
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row.parent_session_id.as_deref(), Some("structured-parent"));
+    assert_eq!(row.group_path, "team");
+    assert!(row.is_structured());
+    wait_for("launcher-rejected startup", || {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .iter()
+            .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+    })
+    .await;
+}
