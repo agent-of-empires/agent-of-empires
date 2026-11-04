@@ -995,9 +995,10 @@ export function SessionWizard({
               isSubmitting={state.isSubmitting}
               error={
                 state.error ??
+                // A deleted Profile also fails the project lookup, which reselecting can't fix.
+                (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
                 (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
                 (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
-                (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
                 (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
               }
               onSubmit={handleSubmit}

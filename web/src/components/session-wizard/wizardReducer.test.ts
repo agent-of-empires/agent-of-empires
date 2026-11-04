@@ -389,37 +389,20 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
 
 describe("agent list per profile", () => {
   const claude = { name: "claude" } as WizardState["agents"][number];
+  const failed = (agentsFor: string, missing = false): Action => ({ type: "AGENTS_FAILED", agentsFor, missing });
+  // Each row starts from a list loaded for alpha.
   it.each([
-    [
-      "a list for alpha reads as itself for alpha",
+    ["alpha's list reads as itself for alpha", [], "alpha", "ready", 1],
+    ["alpha's list is still loading for beta", [], "beta", "loading", 0],
+    ["a failed load for beta drops alpha's list", [failed("beta")], "beta", "failed", 0],
+    ["a missing beta drops alpha's list", [failed("beta", true)], "beta", "missing", 0],
+    ["a failed retry for alpha keeps alpha's list", [failed("alpha")], "alpha", "failed", 1],
+  ] as const)("%s", (_label, actions, profile, status, count) => {
+    const loaded = reducer(
+      { ...makeState(), agentsStatus: "loading" },
       { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
-      "alpha",
-      "ready",
-      1,
-    ],
-    [
-      "a list for alpha is still loading for beta",
-      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
-      "beta",
-      "loading",
-      0,
-    ],
-    [
-      "a failed load for alpha is still loading for beta",
-      { type: "AGENTS_FAILED", agentsFor: "alpha", missing: false },
-      "beta",
-      "loading",
-      0,
-    ],
-    [
-      "a missing profile reads as missing for itself",
-      { type: "AGENTS_FAILED", agentsFor: "gone", missing: true },
-      "gone",
-      "missing",
-      0,
-    ],
-  ] as const)("%s", (_label, action, profile, status, count) => {
-    const view = agentsView(reducer({ ...makeState(), agentsStatus: "loading" }, action as Action), profile);
+    );
+    const view = agentsView(actions.reduce<WizardState>(reducer, loaded), profile);
     expect(view.agentsStatus).toBe(status);
     expect(view.agents).toHaveLength(count);
   });

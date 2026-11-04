@@ -277,7 +277,13 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SET_AGENTS":
       return { ...state, agents: action.agents, agentsStatus: "ready", agentsFor: action.agentsFor };
     case "AGENTS_FAILED":
-      return { ...state, agentsStatus: action.missing ? "missing" : "failed", agentsFor: action.agentsFor };
+      return {
+        ...state,
+        // A retry for the same Profile keeps its list; another Profile's list must not be read for it.
+        agents: action.agentsFor === state.agentsFor ? state.agents : [],
+        agentsStatus: action.missing ? "missing" : "failed",
+        agentsFor: action.agentsFor,
+      };
     case "SET_GROUPS":
       return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":

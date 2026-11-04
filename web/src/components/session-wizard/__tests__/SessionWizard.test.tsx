@@ -1228,6 +1228,38 @@ describe("SessionWizard Yolo mode", () => {
     }
   });
 
+  it("names a deleted Profile even when its project lookup failed too", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue("profile_not_found");
+    vi.mocked(fetchProjects).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "gone" }));
+    await act(async () => {});
+    expect(screen.getByText('The profile "gone" no longer exists. Choose another profile to launch.')).toBeTruthy();
+    expect(screen.queryByText(/Could not load this project's settings/)).toBeNull();
+  });
+
+  it("drops the last Profile's agents when the next one's list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([
+      { name: "alpha", is_default: true },
+      { name: "beta", is_default: false },
+    ]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "alpha" ? [agent("claude"), agent("aider")] : null),
+    );
+    const agentButton = () => screen.queryByRole("button", { name: /^aider/ });
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "alpha");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
+    await screen.findByText(/Couldn't load the agent list/);
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).toBeNull();
+  });
+
   it("launches a name-only form without the agent list", async () => {
     // The retry never answers, so the list stays failed.
     vi.mocked(fetchProfileAgents)
