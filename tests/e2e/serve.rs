@@ -83,7 +83,7 @@ fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
     })
 }
 
-fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
+pub(super) fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -157,7 +157,7 @@ fn wait_for_login_status(h: &TuiTestHarness) -> bool {
 }
 
 /// Re-execute Local flows with no interface connected to the host network.
-fn isolated_local_network() -> bool {
+pub(super) fn isolated_local_network() -> bool {
     #[cfg(target_os = "linux")]
     {
         const MARKER: &str = "AOE_LOCAL_NETWORK_TEST";

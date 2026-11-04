@@ -45,9 +45,13 @@ Run only the private local API, without TCP or a dashboard, with:
 aoe serve --core-only --daemon
 ```
 
+Fresh CLI and TUI autostarts resolve global service opt-ins through the same launch preparation as explicit serving. With no inbound service enabled they stay private. Enabling the [MCP server](mcp-control.md) requests the existing loopback TCP API and dashboard surface, not a public bind or tunnel. Profile overrides cannot change this global policy. Explicit `--core-only` still suppresses TCP.
+
 An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 
 `aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop` or when the web plugin is disabled. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.
+
+An absent daemon is different from a restart: the next autostart resolves current configuration, not the vanished daemon's recorded exposure flags. It does not restore a previous LAN bind or tunnel. Persisted Web serving and Tunnel settings remain tracked separately in [#4476](https://github.com/agent-of-empires/agent-of-empires/issues/4476).
 
 Local restarts from the TUI preserve the running dashboard's effective passphrase, including when a newly opened TUI has no `AOE_SERVE_PASSPHRASE` variable. Restart refuses before stopping the running Daemon if its required credential cannot be recovered. Generating a new Tunnel passphrase explicitly replaces that credential.
 
