@@ -51,7 +51,7 @@ A repo config is code you did not write, so the keys that decide what AoE launch
 | `[hooks]` | everything, behind the trust prompt | |
 | `[session]` | `agent_detect_as` | `custom_agents`, `default_tool`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd`, `yolo_mode_default`, and the rest |
 | `[sandbox]` | `volume_ignores`, `port_mappings`, `cpu_limit`, `memory_limit`, `auto_cleanup`, `default_terminal_mode` | `enabled_by_default`, `default_image`, `container_runtime`, `environment`, `extra_volumes`, `mount_ssh`, `selinux_relabel`, `privileged`, `cap_add`, `cap_drop`, `security_opt`, `extra_run_args` |
-| `[worktree]` | `auto_cleanup`, `delete_branch_on_cleanup` | `enabled`, `path_template`, `bare_repo_path_template`, `workspace_path_template` |
+| `[worktree]` | `auto_cleanup`, `delete_branch_on_cleanup`, `workspace_by_default` | `enabled`, `path_template`, `bare_repo_path_template`, `workspace_path_template` |
 
 `[tmux]`, `[sound]`, `[updates]`, and `[diff]` are personal settings and are not read from a repo at all. `sandbox.environment` is denied because its bare `KEY` and `KEY=$VAR` forms copy host variables into the container, and `default_tool` because session launch prefers an exact `custom_agents` match, which would let a repo select a user-defined host command. `container_runtime` is global-only everywhere.
 

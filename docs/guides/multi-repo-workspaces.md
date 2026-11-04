@@ -45,6 +45,16 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them with ordinary `cd` and git commands; AoE imposes no cross-repo orchestration.
 
+### Starting as a single-repo workspace
+
+A workspace can hold just one repo. Starting that way puts the session in the workspace root from the first turn, so a later **Add project** joins the existing workspace without moving the session or its conversation.
+
+```bash
+aoe add /path/to/backend -w feat/auth-rewrite -b --workspace
+```
+
+TUI: in the worktree configuration (`Ctrl+P` on **Worktree**), tick **Workspace**. It is ticked and locked whenever extra repos are listed. To make this the default for new worktree sessions, set `workspace_by_default = true` under `[worktree]` (Settings, Worktree tab); `aoe add --no-workspace` opts one session out.
+
 ### Adding a repo to an existing session
 
 Add a repository without recreating the session:
@@ -59,7 +69,7 @@ What that means for the session depends on the shape it started in:
 
 | Session was | What happens | Working directory |
 |---|---|---|
-| A multi-repo workspace | The new repo's worktree joins the existing workspace | Unchanged |
+| A workspace (one repo or more) | The new repo's worktree joins the existing workspace | Unchanged |
 | A worktree session | A workspace is created and the session's worktree moves into it, so uncommitted work travels | Moves |
 | An in-place session | A workspace is created with a *fresh* worktree of the session's repo | Moves |
 
