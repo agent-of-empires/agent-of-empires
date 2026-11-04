@@ -122,6 +122,40 @@ describe("agent message boundaries", () => {
   });
 });
 
+describe("thinking rows", () => {
+  const thought = (text: string, id: string, extra: Partial<ActivityRow> = {}) => row(id, "thinking", text, extra);
+  const shape = (rows: ActivityRow[]) => assistantParts(rows).map((p) => [p.type, p.text]);
+  it.each([
+    [
+      "adjacent chunks join one reasoning part",
+      [thought("Weighing ", "t1"), thought("options", "t2"), message("Done.")],
+      [
+        ["reasoning", "Weighing options"],
+        ["text", "Done."],
+      ],
+    ],
+    [
+      "a new thought starts its own part",
+      [thought("One.", "t1"), thought("Two.", "t2", { messageStart: true })],
+      [
+        ["reasoning", "One."],
+        ["reasoning", "Two."],
+      ],
+    ],
+    [
+      "a tool call between thoughts keeps its place",
+      [thought("Plan.", "t1"), toolStart("x"), thought("Check.", "t2")],
+      [
+        ["reasoning", "Plan."],
+        ["tool-call", undefined],
+        ["reasoning", "Check."],
+      ],
+    ],
+  ])("%s", (_label, rows, expected) => {
+    expect(shape(rows)).toEqual(expected);
+  });
+});
+
 describe("clearFoldGeneration", () => {
   const TURNS = [user("q1"), message("a1"), user("q2", "u2"), message("a2", "m2")];
   const cleared = [...TURNS, row("c1", "session_cleared", "cleared")];

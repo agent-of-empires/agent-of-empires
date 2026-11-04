@@ -32,6 +32,16 @@ pub fn classify_ip(ip: std::net::Ipv4Addr) -> IpKind {
     IpKind::Lan
 }
 
+/// The hosts a Local (0.0.0.0) server publishes: this machine's addresses, then `localhost`.
+pub fn local_published_hosts() -> Vec<(IpKind, String)> {
+    let mut hosts: Vec<(IpKind, String)> = discover_tagged_ips()
+        .into_iter()
+        .map(|(kind, ip)| (kind, ip.to_string()))
+        .collect();
+    hosts.push((IpKind::Loopback, "localhost".to_string()));
+    hosts
+}
+
 /// Discover non-loopback IPv4 addresses on all network interfaces, tagged by kind and
 /// sorted so the preferred URL (Tailscale > LAN) is first.
 pub fn discover_tagged_ips() -> Vec<(IpKind, std::net::Ipv4Addr)> {

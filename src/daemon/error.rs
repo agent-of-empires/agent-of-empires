@@ -150,6 +150,8 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             b"wrapper_contract_required" => ManagedResumeCause::WrapperContractRequired,
             b"unsupported_managed_arguments" => ManagedResumeCause::UnsupportedManagedArguments,
             b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
+            b"pi_transcript_binding_required" => ManagedResumeCause::PiTranscriptBindingRequired,
+            b"omp_transcript_binding_required" => ManagedResumeCause::OmpTranscriptBindingRequired,
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
@@ -285,10 +287,26 @@ mod tests {
             ("wrapper_contract_required", WrapperContractRequired),
             ("unsupported_managed_arguments", UnsupportedManagedArguments),
             ("opencode_schema_unattested", OpenCodeSchemaUnattested),
+            (
+                "pi_transcript_binding_required",
+                PiTranscriptBindingRequired,
+            ),
+            (
+                "omp_transcript_binding_required",
+                OmpTranscriptBindingRequired,
+            ),
             ("execution_context_unattested", ExecutionContextUnattested),
             ("secret-token", ExecutionContextUnattested),
             (
                 "wrapper_contract_required, secret-token",
+                ExecutionContextUnattested,
+            ),
+            (
+                "omp_transcript_binding_required, execution_context_unattested",
+                ExecutionContextUnattested,
+            ),
+            (
+                "pi_transcript_binding_required, execution_context_unattested",
                 ExecutionContextUnattested,
             ),
             ("", ExecutionContextUnattested),

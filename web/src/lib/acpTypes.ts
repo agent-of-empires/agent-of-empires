@@ -403,6 +403,7 @@ export type AcpEvent =
       };
     }
   | { AgentMessageChunk: { text: string; message_id?: string } }
+  | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
@@ -759,7 +760,7 @@ export interface ActivityRow {
 export interface TranscriptRow {
   id: string;
   group_id: string;
-  kind: Exclude<ActivityRow["kind"], "thinking">;
+  kind: ActivityRow["kind"];
   at: string;
   text: string;
   tool_call_id?: string;
@@ -1000,6 +1001,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
     }
+    return next;
+  }
+  if ("AgentThoughtChunk" in event) {
+    // Same turn signal as `ThinkingStarted`.
+    next.serverTurnActive = true;
+    next.turnActive = true;
     return next;
   }
   if ("ToolCallStarted" in event) {

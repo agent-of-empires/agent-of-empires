@@ -686,20 +686,34 @@ pub(crate) fn legacy_unknown_scope_absent(
     }
 }
 
-/// Units named as releases before scope custody named this session's scopes.
-fn legacy_scope_units(session_id: &str) -> anyhow::Result<Vec<String>> {
+/// Units earlier releases named for a session, to adopt, and whether every
+/// other unknown scope is proven absent.
+pub(crate) struct LegacyScopeInspection {
+    pub(crate) adopted: Vec<String>,
+    pub(crate) absent: bool,
+}
+
+fn inspect_legacy_scopes(
+    session_id: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<LegacyScopeInspection> {
     #[cfg(target_os = "linux")]
     {
+        anyhow::ensure!(
+            crate::session::is_valid_session_id(session_id),
+            "Invalid legacy session identity"
+        );
         let prefix = format!("{}-", escaped_id(session_id));
-        Ok(super::linux::legacy_scope_unit_names(&prefix)?
-            .into_iter()
-            .filter(|unit| is_legacy_unit_name(&prefix, unit))
-            .collect())
+        super::linux::inspect_legacy_scopes(&prefix, known, |unit| {
+            is_legacy_unit_name(&prefix, unit)
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = session_id;
-        Ok(Vec::new())
+        Ok(LegacyScopeInspection {
+            adopted: Vec::new(),
+            absent: legacy_unknown_scope_absent(session_id, known)?,
+        })
     }
 }
 
@@ -718,22 +732,16 @@ pub(crate) fn resolve_unknown_scopes(
     session_id: &str,
     recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
 ) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
-    resolve_unknown_scopes_with(
-        session_id,
-        recorded,
-        legacy_scope_units,
-        legacy_unknown_scope_absent,
-    )
+    resolve_unknown_scopes_with(session_id, recorded, inspect_legacy_scopes)
 }
 
 fn resolve_unknown_scopes_with(
     session_id: &str,
     recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
-    legacy_units: impl FnOnce(&str) -> anyhow::Result<Vec<String>>,
-    unknown_absent: impl FnOnce(
+    inspect: impl FnOnce(
         &str,
         &[crate::process::worker_registry::ScopeOwnership],
-    ) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<LegacyScopeInspection>,
 ) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
     use crate::process::worker_registry::ScopeOwnership;
     let mut known: Vec<ScopeOwnership> = recorded
@@ -745,14 +753,15 @@ fn resolve_unknown_scopes_with(
     if recorded.is_some_and(|scopes| scopes.len() == known.len()) {
         return Ok(known);
     }
-    for unit in legacy_units(session_id)? {
+    let inspection = inspect(session_id, &known)?;
+    for unit in inspection.adopted {
         let owned = ScopeOwnership::Owned { unit };
         if !known.contains(&owned) {
             known.push(owned);
         }
     }
     anyhow::ensure!(
-        unknown_absent(session_id, &known)?,
+        inspection.absent,
         "Terminal scope ownership is unresolved and an unknown scope is live; resources retained"
     );
     Ok(known)
@@ -953,16 +962,14 @@ mod tests {
         ];
         for (recorded, absent, want) in cases {
             let consulted = std::cell::Cell::new(false);
-            let got = resolve_unknown_scopes_with(
-                id,
-                recorded.as_deref(),
-                |_| Ok(vec![legacy.clone()]),
-                |_, known| {
-                    consulted.set(true);
-                    assert!(known.iter().all(|scope| *scope != Unresolved));
-                    Ok(absent)
-                },
-            );
+            let got = resolve_unknown_scopes_with(id, recorded.as_deref(), |_, known| {
+                assert!(!consulted.replace(true), "inspected more than once");
+                assert!(known.iter().all(|scope| *scope != Unresolved));
+                Ok(LegacyScopeInspection {
+                    adopted: vec![legacy.clone()],
+                    absent,
+                })
+            });
             match want {
                 Ok(want) => assert_eq!(got.unwrap(), want, "{recorded:?}"),
                 Err(()) => assert!(got.is_err(), "{recorded:?}"),
