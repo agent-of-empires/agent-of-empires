@@ -11,7 +11,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::acp::mcp_rewrite::{context_params, McpRewriteContext, PluginServed};
+use crate::acp::mcp_rewrite::{context_params, McpCredentialVar, McpRewriteContext, PluginServed};
 use crate::plugin::worker_call::WorkerCall;
 use crate::plugin::worker_requests::WorkerRequestError;
 use crate::server::daemon_endpoint::{plugin_route, PluginRoute};
@@ -190,7 +190,8 @@ pub async fn session_plugin_entries(ctx: &McpRewriteContext) -> (Vec<PluginServe
     }
 }
 
-/// One entry per served server, authenticated with the credential for exactly that server.
+/// One entry per served server, authenticated with the credential for exactly that server,
+/// which the entry names by reference and `PluginServed::credential` carries by value.
 pub fn plugin_entries(
     secret: &McpSessionSecret,
     route: PluginRoute<'_>,
@@ -201,12 +202,14 @@ pub fn plugin_entries(
     served
         .iter()
         .map(|s| {
-            let credential = secret.plugin_server_credential_for(&s.plugin_id, &s.name, session_id);
+            let value = secret.plugin_server_credential_for(&s.plugin_id, &s.name, session_id);
+            let name = credential_var_name(&value);
+            let reference = format!("${{{name}}}");
             let transport = match route {
                 PluginRoute::Http(base_url) => ProjectMcpTransport::Http {
                     url: format!("{base_url}/mcp/plugins/{}/{}", s.plugin_id, s.name),
                     headers: [
-                        ("Authorization".to_string(), format!("Bearer {credential}")),
+                        ("Authorization".to_string(), format!("Bearer {reference}")),
                         ("X-AoE-Session".to_string(), session_id.to_string()),
                     ]
                     .into(),
@@ -220,7 +223,7 @@ pub fn plugin_entries(
                         s.name.clone(),
                     ],
                     env: [
-                        (socket::TOKEN_ENV.to_string(), credential),
+                        (socket::TOKEN_ENV.to_string(), reference),
                         (socket::SESSION_ENV.to_string(), session_id.to_string()),
                     ]
                     .into(),
@@ -228,6 +231,12 @@ pub fn plugin_entries(
             };
             PluginServed {
                 plugin_id: s.plugin_id.clone(),
+                credential: McpCredentialVar {
+                    name,
+                    value,
+                    owner: s.entry_key.clone(),
+                    expected: transport.clone(),
+                },
                 server: ProjectMcpServer {
                     name: s.entry_key.clone(),
                     transport,
@@ -235,6 +244,19 @@ pub fn plugin_entries(
             }
         })
         .collect()
+}
+
+/// Prefix of the environment variables that carry minted plugin credentials.
+pub(crate) const CREDENTIAL_VAR_PREFIX: &str = "AOE_PLUGIN_MCP_CRED_";
+
+/// The variable holding one minted credential. Derived from the credential, a 256-bit
+/// secret, so the name cannot be computed from public data such as plugin and server names;
+/// it is unique per (plugin, server, session) and the same on every launch.
+pub(crate) fn credential_var_name(credential: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(credential.as_bytes());
+    let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{CREDENTIAL_VAR_PREFIX}{tag}")
 }
 
 /// A key several plugins produce goes to a prefixed entry over an unprefixed one, so no
@@ -380,17 +402,35 @@ pub(crate) mod test_support {
         caller: FakeCaller,
         manifests: Vec<PluginManifest>,
         fail_hook: bool,
+        edit: Option<fn(Vec<ProjectMcpServer>) -> Vec<ProjectMcpServer>>,
         pub(crate) requests: Mutex<Vec<Value>>,
         skipped: Mutex<Vec<(String, String)>>,
     }
 
     impl ServingRewriter {
         pub(crate) fn new(replies: Vec<(&str, Reply)>, fail_hook: bool) -> std::sync::Arc<Self> {
+            Self::build(replies, fail_hook, None)
+        }
+
+        /// Like `new`, but the hook returns `edit(servers)` instead of the servers it got.
+        pub(crate) fn editing(
+            replies: Vec<(&str, Reply)>,
+            edit: fn(Vec<ProjectMcpServer>) -> Vec<ProjectMcpServer>,
+        ) -> std::sync::Arc<Self> {
+            Self::build(replies, false, Some(edit))
+        }
+
+        fn build(
+            replies: Vec<(&str, Reply)>,
+            fail_hook: bool,
+            edit: Option<fn(Vec<ProjectMcpServer>) -> Vec<ProjectMcpServer>>,
+        ) -> std::sync::Arc<Self> {
             let manifests = replies.iter().map(|(id, _)| manifest(id, true)).collect();
             std::sync::Arc::new(Self {
                 caller: FakeCaller::with(replies),
                 manifests,
                 fail_hook,
+                edit,
                 requests: Mutex::new(Vec::new()),
                 skipped: Mutex::new(Vec::new()),
             })
@@ -432,7 +472,10 @@ pub(crate) mod test_support {
                     cause: "failed".into(),
                 })
             } else {
-                Ok(servers.into())
+                Ok(self
+                    .edit
+                    .map_or(servers.clone(), |edit| edit(servers))
+                    .into())
             };
             Box::pin(std::future::ready(out))
         }
@@ -786,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_entries_point_at_the_daemon_with_the_server_credential() {
+    fn plugin_entries_point_at_the_daemon_with_a_credential_reference() {
         use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
         let dir = tempfile::tempdir().unwrap();
@@ -797,63 +840,139 @@ mod tests {
             "sess-1",
             &[served("acme.a", "docs"), served("acme.b", "git.v2")],
         );
-        let entry = |plugin: &str, name: &str| PluginServed {
-            plugin_id: plugin.into(),
-            server: ProjectMcpServer {
-                name: format!("{}__{}", mcp_prefix(plugin), name),
-                transport: ProjectMcpTransport::Http {
-                    url: format!("http://127.0.0.1:4321/mcp/plugins/{plugin}/{name}"),
-                    headers: [
-                        (
-                            "Authorization".to_string(),
-                            format!(
-                                "Bearer {}",
-                                secret.plugin_server_credential_for(plugin, name, "sess-1")
-                            ),
-                        ),
-                        ("X-AoE-Session".to_string(), "sess-1".to_string()),
-                    ]
-                    .into(),
+        let entry = |plugin: &str, name: &str| {
+            let value = secret.plugin_server_credential_for(plugin, name, "sess-1");
+            let var = credential_var_name(&value);
+            let key = format!("{}__{}", mcp_prefix(plugin), name);
+            let transport = ProjectMcpTransport::Http {
+                url: format!("http://127.0.0.1:4321/mcp/plugins/{plugin}/{name}"),
+                headers: [
+                    ("Authorization".to_string(), format!("Bearer ${{{var}}}")),
+                    ("X-AoE-Session".to_string(), "sess-1".to_string()),
+                ]
+                .into(),
+            };
+            PluginServed {
+                plugin_id: plugin.into(),
+                server: ProjectMcpServer {
+                    name: key.clone(),
+                    transport: transport.clone(),
                 },
-            },
+                credential: McpCredentialVar {
+                    name: var,
+                    value,
+                    owner: key,
+                    expected: transport,
+                },
+            }
         };
         assert_eq!(out, [entry("acme.a", "docs"), entry("acme.b", "git.v2")]);
+        let again = plugin_entries(
+            &secret,
+            PluginRoute::Http("http://127.0.0.1:4321"),
+            "sess-1",
+            &[served("acme.a", "docs"), served("acme.b", "git.v2")],
+        );
+        assert_eq!(
+            again, out,
+            "every launch derives the same entries and pairs"
+        );
+        let serialized = format!("{:?}", out.iter().map(|p| &p.server).collect::<Vec<_>>());
+        for p in &out {
+            assert!(!serialized.contains(&p.credential.value));
+        }
     }
 
-    /// Sandboxes reach the socket through the mounted forwarder; the credential travels in
-    /// env, never in argv.
+    /// Sandboxes reach the socket through the mounted forwarder. The entry holds a reference:
+    /// an entry `env` is serialized into the agent's command line, so a value there is
+    /// readable by every local user.
     #[test]
-    fn socket_entries_run_the_forwarder_with_the_server_credential() {
+    fn socket_entries_run_the_forwarder_with_a_credential_reference() {
         use crate::server::plugin_mcp_socket::{SESSION_ENV, TOKEN_ENV};
 
         let dir = tempfile::tempdir().unwrap();
         let secret = McpSessionSecret::load_or_generate(&dir.path().join("secret")).unwrap();
         let docs = ServedServer::new("acme.a", "docs".into(), false);
         let out = plugin_entries(&secret, PluginRoute::Socket, "sess-1", &[docs]);
-        let credential = secret.plugin_server_credential_for("acme.a", "docs", "sess-1");
+        let value = secret.plugin_server_credential_for("acme.a", "docs", "sess-1");
+        let var = credential_var_name(&value);
+        let transport = ProjectMcpTransport::Stdio {
+            command: "node".into(),
+            args: vec![
+                "/aoe/plugin-mcp/forward.mjs".into(),
+                "/aoe/plugin-mcp/mcp.sock".into(),
+                "acme.a".into(),
+                "docs".into(),
+            ],
+            env: [
+                (TOKEN_ENV.to_string(), format!("${{{var}}}")),
+                (SESSION_ENV.to_string(), "sess-1".to_string()),
+            ]
+            .into(),
+        };
         assert_eq!(
             out,
             [PluginServed {
                 plugin_id: "acme.a".into(),
                 server: ProjectMcpServer {
                     name: "docs".into(),
-                    transport: ProjectMcpTransport::Stdio {
-                        command: "node".into(),
-                        args: vec![
-                            "/aoe/plugin-mcp/forward.mjs".into(),
-                            "/aoe/plugin-mcp/mcp.sock".into(),
-                            "acme.a".into(),
-                            "docs".into(),
-                        ],
-                        env: [
-                            (TOKEN_ENV.to_string(), credential),
-                            (SESSION_ENV.to_string(), "sess-1".to_string()),
-                        ]
-                        .into(),
-                    },
+                    transport: transport.clone(),
+                },
+                credential: McpCredentialVar {
+                    name: var,
+                    value,
+                    owner: "docs".into(),
+                    expected: transport,
                 },
             }]
         );
+    }
+
+    /// The name comes from the credential, so public inputs cannot predict it.
+    #[test]
+    fn credential_var_names_are_valid_unique_stable_and_unguessable() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = McpSessionSecret::load_or_generate(&dir.path().join("secret")).unwrap();
+        let tuples = [
+            ("acme.a", "docs", "s1"),
+            ("acme.a", "git", "s1"),
+            ("acme.b", "docs", "s1"),
+            ("acme.a", "docs", "s2"),
+        ];
+        let names: Vec<String> = tuples
+            .iter()
+            .map(|(p, n, sess)| {
+                credential_var_name(&secret.plugin_server_credential_for(p, n, sess))
+            })
+            .collect();
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+        for name in &names {
+            assert!(name.starts_with(CREDENTIAL_VAR_PREFIX), "{name}");
+            assert!(
+                crate::session::environment::is_valid_env_key(name),
+                "{name}"
+            );
+        }
+        let again =
+            credential_var_name(&secret.plugin_server_credential_for("acme.a", "docs", "s1"));
+        assert_eq!(names[0], again);
+        // The scheme before this one hashed the public plugin id and server name.
+        for (plugin, server, _) in tuples {
+            let mut hash = Sha256::new();
+            for part in [plugin, server] {
+                hash.update((part.len() as u32).to_be_bytes());
+                hash.update(part.as_bytes());
+            }
+            let tag: String = hash.finalize()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let guess = format!("{CREDENTIAL_VAR_PREFIX}{tag}");
+            assert!(!names.contains(&guess), "{guess}");
+        }
     }
 
     #[tokio::test]
