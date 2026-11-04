@@ -48,7 +48,7 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             acp-worker/test-shim/package-lock.json
-      - name: Validate web lockfile before compiling
+      - name: Validate web lockfile
         if: matrix.leg == 'web-e2e'
         working-directory: web
         run: npm ci --dry-run --ignore-scripts --no-audit --no-fund
@@ -562,7 +562,7 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install web deps before compiling
+      - name: Install web deps
         working-directory: web
         run: npm ci
       - uses: ./.github/actions/rust-toolchain
