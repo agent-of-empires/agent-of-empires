@@ -4971,6 +4971,49 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
     assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
 }
 
+#[test]
+fn diff_base_target_defaults_only_an_unambiguous_workspace_repo() {
+    let with_repos = |names: &[&str]| {
+        let mut inst = make_test_instance();
+        if !names.is_empty() {
+            inst.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feature/x".to_string(),
+                workspace_dir: "/ws".to_string(),
+                repos: names
+                    .iter()
+                    .map(|n| crate::session::WorkspaceRepo {
+                        name: n.to_string(),
+                        source_path: format!("/src/{n}"),
+                        branch: "feature/x".to_string(),
+                        worktree_path: format!("/ws/{n}"),
+                        main_repo_path: format!("/src/{n}"),
+                        managed_by_aoe: true,
+                        branch_preexisting: false,
+                        base_branch: None,
+                        base_branch_override: None,
+                    })
+                    .collect(),
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            });
+        }
+        inst
+    };
+    let named = |n: &str| Some(n.to_string());
+    let cases: &[(&[&str], Option<String>, Result<Option<String>, ()>)] = &[
+        (&[], None, Ok(None)),
+        (&["api"], None, Ok(named("api"))),
+        (&["api"], named("api"), Ok(named("api"))),
+        (&["api"], named("web"), Err(())),
+        (&["api", "web"], None, Err(())),
+        (&["api", "web"], named("web"), Ok(named("web"))),
+    ];
+    for (repos, requested, want) in cases {
+        let got = diff_base_target(&with_repos(repos), requested.clone()).map_err(|_| ());
+        assert_eq!(&got, want, "{repos:?} {requested:?}");
+    }
+}
+
 /// An expired snooze stays on disk for the next mutation to rewrite, but the
 /// wire value is gated on `is_snoozed()` so the web never renders "snoozed 0m".
 #[test]

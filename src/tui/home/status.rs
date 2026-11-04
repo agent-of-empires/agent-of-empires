@@ -852,7 +852,10 @@ impl HomeView {
             self.session_feed
                 .applied_session(diff.session_id.as_deref()?)
                 .filter(|row| row.profile == diff.profile)
-                .and_then(|row| row.base_branch_override.as_deref())
+                .and_then(|row| match row.workspace_repos.as_slice() {
+                    [only] => only.base_branch_override.as_deref(),
+                    _ => row.base_branch_override.as_deref(),
+                })
         });
         let diff_changed = self
             .diff_view
