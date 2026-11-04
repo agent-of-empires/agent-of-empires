@@ -219,6 +219,28 @@ describe("SessionWizard structured view payload", () => {
       agent_effort: "high",
     });
   });
+
+  it("drops the previous agent's model and effort after switching agent", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: { default_tool: "opencode" },
+      acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
+      sandbox: {},
+    } as never);
+    vi.mocked(fetchAgents).mockResolvedValueOnce([
+      agent("opencode", { acp_installed: true }),
+      agent("claude", { acp_installed: true }),
+    ]);
+    renderWizard({ path: "/tmp/proj" });
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    fireEvent.click(await screen.findByRole("button", { name: /^claude/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload().tool).toBe("claude");
+    expect(payload().agent_model).toBeUndefined();
+    expect(payload().agent_effort).toBeUndefined();
+  });
 });
 
 describe("SessionWizard last instruction memory", () => {
