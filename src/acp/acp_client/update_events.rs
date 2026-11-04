@@ -333,7 +333,7 @@ pub(super) fn map_update_to_events(
             }
             other => vec![raw_event(&other)],
         },
-        // Only seen on replay (#2276): live prompts record UserPromptSent.
+        // Import replay only (#2276); `Shared` drops live echoes, which duplicate UserPromptSent.
         SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
                 text: text.text,
