@@ -817,7 +817,8 @@ export function SessionWizard({
   ) : (
     <div className="space-y-4">
       <RowGroup>
-        {state.profiles.length > 1 && (
+        {/* A deleted Profile needs a way out even when only one other is left. */}
+        {(state.profiles.length > 1 || agentsStatus === "missing") && (
           <NavRow
             label="Profile"
             value={`${d.profile || "Server default"}${d.profile && d.profileDirty ? " (custom)" : ""}`}

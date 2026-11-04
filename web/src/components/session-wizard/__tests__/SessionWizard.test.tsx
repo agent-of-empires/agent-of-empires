@@ -1223,9 +1223,24 @@ describe("SessionWizard Yolo mode", () => {
       fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
       await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
       expect(screen.queryByText(/no longer exists/)).toBeNull();
+      await waitFor(() => expect(launchButton().disabled).toBe(false));
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("offers the Profile row for a deleted served Profile with one Profile left", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "gone" ? "profile_not_found" : AGENTS),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await screen.findByText(/The profile "gone" no longer exists/);
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /^default/ }));
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    expect(screen.queryByText(/no longer exists/)).toBeNull();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
   });
 
   it("names a deleted Profile even when its project lookup failed too", async () => {
