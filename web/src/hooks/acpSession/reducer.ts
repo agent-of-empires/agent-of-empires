@@ -184,6 +184,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
         currentModeId: state.currentModeId ?? hs.currentModeId,
         availableCommands: state.availableCommands.length > 0 ? state.availableCommands : hs.availableCommands,
         configOptions: state.configOptions.length > 0 ? state.configOptions : hs.configOptions,
+        // The assignment can sit only in the prefix, and a forwarded `/new` clears the stored id.
+        sessionAssigned: state.sessionAssigned || hs.sessionAssigned,
       };
     }
     case "lagged":

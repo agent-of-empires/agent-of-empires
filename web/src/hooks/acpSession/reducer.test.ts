@@ -292,6 +292,9 @@ describe("recent-first paging", () => {
     const filled = reducer(empty(), { kind: "handshake", frames: [caps] });
     expect(filled.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true, steering: false });
     expect(filled.activity).toHaveLength(0);
+    expect(filled.sessionAssigned).toBe(false);
+    const assigned: AcpFrame = { session_id: "s", seq: 2, event: { AcpSessionAssigned: { acp_session_id: "acp-1" } } };
+    expect(reducer(empty(), { kind: "handshake", frames: [caps, assigned] }).sessionAssigned).toBe(true);
   });
 });
 
