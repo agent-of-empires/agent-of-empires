@@ -66,6 +66,9 @@ pub struct CliCreationOptions {
     pub generated_name: bool,
     #[serde(default)]
     pub no_submodules: bool,
+    /// `None` follows `worktree.workspace_by_default` on the Daemon host.
+    #[serde(default)]
+    pub workspace: Option<bool>,
     pub worktree_path_id: Option<String>,
 }
 

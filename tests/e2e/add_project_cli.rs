@@ -195,3 +195,56 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
         "the single-repo worktree record is superseded by the workspace entry"
     );
 }
+
+/// `--workspace` starts a worktree session as a one-repo workspace, so a later
+/// attach appends beside it and the session's working directory never moves.
+#[test]
+#[parallel]
+fn a_workspace_session_attaches_a_project_without_moving() {
+    let h = TuiTestHarness::new("add_project_workspace_start");
+    let backend = h.home_path().join("backend");
+    let frontend = h.home_path().join("frontend");
+    init_repo(&backend);
+    init_repo(&frontend);
+
+    h.run_cli_ok(&[
+        "add",
+        backend.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "Solo",
+        "-w",
+        "feat/solo",
+        "-b",
+        "--workspace",
+    ]);
+    let sessions = h.read_sessions();
+    let before = session_by_title(&sessions, "Solo");
+    let workspace_dir = before["workspace_info"]["workspace_dir"]
+        .as_str()
+        .expect("--workspace records a workspace")
+        .to_string();
+    assert_eq!(
+        before["project_path"].as_str(),
+        Some(workspace_dir.as_str())
+    );
+    assert_eq!(
+        before["workspace_info"]["repos"].as_array().unwrap().len(),
+        1
+    );
+    assert!(before["worktree_info"].is_null());
+
+    h.run_cli_ok(&["session", "add-project", "Solo", frontend.to_str().unwrap()]);
+    let sessions = h.read_sessions();
+    let after = session_by_title(&sessions, "Solo");
+    assert_eq!(after["project_path"].as_str(), Some(workspace_dir.as_str()));
+    let names: Vec<&str> = after["workspace_info"]["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["backend", "frontend"]);
+    assert!(Path::new(&workspace_dir).join("frontend/.git").exists());
+}

@@ -117,6 +117,22 @@ pub struct AddArgs {
     #[arg(long = "no-submodules")]
     no_submodules: bool,
 
+    /// Create the worktree inside a workspace directory (from
+    /// `worktree.workspace_path_template`) even with no `--repo`/`--project`,
+    /// so more projects can be attached later without moving the session
+    /// (use with --worktree). Overrides `worktree.workspace_by_default`.
+    #[arg(
+        long = "workspace",
+        requires = "worktree_branch",
+        conflicts_with_all = ["no_workspace", "generated_name"]
+    )]
+    workspace: bool,
+
+    /// Create a plain worktree even when `worktree.workspace_by_default` is
+    /// on. Ignored when `--repo`/`--project` make a multi-repo workspace.
+    #[arg(long = "no-workspace")]
+    no_workspace: bool,
+
     /// Run session in a container sandbox
     #[arg(short = 's', long)]
     sandbox: bool,
@@ -185,6 +201,7 @@ pub struct AddArgs {
             "extra_repos",
             "projects",
             "no_submodules",
+            "workspace",
         ]
     )]
     scratch: bool,
@@ -225,6 +242,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if args.generated_name && (!args.extra_repos.is_empty() || !args.projects.is_empty()) {
         bail!("--generated-name does not apply to multi-repo workspaces");
+    }
+    if args.workspace && branch.is_none() {
+        bail!("--workspace requires --worktree with a non-empty branch name");
     }
     let endpoint = require_daemon().await?;
     let local = endpoint.unix_path().is_some();
@@ -321,6 +341,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         yolo_mode: args.yolo,
         worktree_enabled: branch.is_some(),
         worktree_branch: branch.map(str::to_owned),
+        workspace: false,
         create_new_branch: args.create_branch,
         base_branch: args.base_branch,
         sandbox,
@@ -375,6 +396,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             fork_source: args.fork_from,
             generated_name: args.generated_name,
             no_submodules: args.no_submodules,
+            workspace: match (args.workspace, args.no_workspace) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
             worktree_path_id: review.worktree_path_id,
         }),
     };
@@ -867,6 +893,38 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!submitted.get());
+    }
+
+    #[test]
+    fn workspace_flags_parse_only_with_a_worktree() {
+        use clap::Parser;
+        for argv in [
+            &["aoe", "add", ".", "--workspace"][..],
+            &[
+                "aoe",
+                "add",
+                ".",
+                "-w",
+                "b",
+                "--workspace",
+                "--no-workspace",
+            ][..],
+            &[
+                "aoe",
+                "add",
+                ".",
+                "-w",
+                "b",
+                "--workspace",
+                "--generated-name",
+            ][..],
+            &["aoe", "add", "--scratch", "--workspace"][..],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(
+            crate::cli::Cli::try_parse_from(["aoe", "add", ".", "-w", "b", "--workspace"]).is_ok()
+        );
     }
 
     #[test]

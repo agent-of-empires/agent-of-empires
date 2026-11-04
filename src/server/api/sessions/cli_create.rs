@@ -178,6 +178,18 @@ fn resolve_host_creation(
         !options.generated_name || body.extra_repo_paths.is_empty(),
         "--generated-name does not apply to multi-repo workspaces"
     );
+    anyhow::ensure!(
+        !options.generated_name || options.workspace != Some(true),
+        "--generated-name does not apply to a workspace"
+    );
+    body.workspace = wants_workspace(
+        options.workspace,
+        options.generated_name,
+        body.worktree_branch
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty()),
+        config.worktree.workspace_by_default,
+    );
     let unknown_tool = |description: &str| {
         let mut names = crate::agents::agent_names();
         names.extend(config.session.custom_agents.keys().map(String::as_str));
@@ -395,4 +407,40 @@ fn resolve_host_creation(
     }
     body.cli = Some(options);
     Ok((body, warnings))
+}
+
+/// An explicit flag wins over the setting. The setting only applies to a
+/// worktree session, and `--generated-name` opts out because a workspace
+/// directory ignores the title.
+fn wants_workspace(
+    flag: Option<bool>,
+    generated_name: bool,
+    has_worktree: bool,
+    workspace_by_default: bool,
+) -> bool {
+    flag.unwrap_or(workspace_by_default && has_worktree && !generated_name)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::wants_workspace;
+
+    #[test]
+    fn workspace_flag_overrides_the_setting() {
+        let cases = [
+            (None, false, true, false, false),
+            (None, false, true, true, true),
+            (None, false, false, true, false),
+            (None, true, true, true, false),
+            (Some(true), false, true, false, true),
+            (Some(false), false, true, true, false),
+        ];
+        for (flag, generated, worktree, default, want) in cases {
+            assert_eq!(
+                wants_workspace(flag, generated, worktree, default),
+                want,
+                "{flag:?} generated={generated} worktree={worktree} default={default}"
+            );
+        }
+    }
 }
