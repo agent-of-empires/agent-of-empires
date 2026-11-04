@@ -2286,7 +2286,7 @@ mod tests {
                 .mcp_servers
                 .iter()
                 .map(|server| match server {
-                    agent_client_protocol::schema::v1::McpServer::Stdio(server) => {
+                    agent_client_protocol::v1::schema::McpServer::Stdio(server) => {
                         server.name.as_str()
                     }
                     _ => "unknown",

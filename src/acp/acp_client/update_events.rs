@@ -710,7 +710,7 @@ mod tests {
     /// signals thinking.
     #[test]
     fn agent_thought_chunk_keeps_text_and_message_id() {
-        use agent_client_protocol::schema::v1::ImageContent;
+        use agent_client_protocol::v1::schema::ImageContent;
         let thought = |content| SessionUpdate::AgentThoughtChunk(ContentChunk::new(content));
         let text = ContentChunk::new(ContentBlock::Text(TextContent::new("hmm"))).message_id("m-1");
         let events = claude(SessionUpdate::AgentThoughtChunk(text));
