@@ -220,7 +220,7 @@ impl ServeArgs {
     fn resolve_launch(&mut self, requested: Option<LaunchMode>) {
         let mode = requested.unwrap_or_else(|| {
             let config = crate::session::config::Config::load_or_warn();
-            if config.web.mcp_enabled {
+            if config.web.mcp_enabled && !crate::cli::graft::web_disabled(&config) {
                 LaunchMode::Tcp
             } else {
                 LaunchMode::CoreOnly

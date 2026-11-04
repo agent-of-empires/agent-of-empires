@@ -497,3 +497,66 @@ fn configured_autostart_keeps_security_policy() {
         }
     }
 }
+
+#[cfg(feature = "web")]
+#[test]
+#[parallel]
+fn configured_mcp_respects_disabled_web_across_acquisition_and_reconnect() {
+    crate::harness::require_tmux!();
+    if !crate::serve::isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("configured_disabled_web");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let app = app_dir_in(h.home_path());
+    let port = if cfg!(debug_assertions) { 8081 } else { 8080 };
+    let assert_private = |h: &TuiTestHarness| {
+        assert!(h
+            .run_cli_ok(&["--no-autostart", "profile", "list"])
+            .contains("default"));
+        assert!(h.run_cli_err(&["mcp", "config"]).contains("core-only"));
+        assert!(!app.join("serve.url").exists());
+        let probe = std::net::TcpListener::bind(("0.0.0.0", port))
+            .expect("private acquisition must not open TCP");
+        drop(probe);
+    };
+
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    assert_mcp_connects(&h);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.wait_for("Not responding");
+    h.send_keys("r");
+    h.wait_for_runtime_ready();
+    assert_private(&h);
+    h.kill_tui();
+    h.run_cli_ok(&["serve", "--stop"]);
+
+    h.run_cli_ok(&["profile", "list"]);
+    assert_private(&h);
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    assert_private(&h);
+    h.kill_tui();
+    h.run_cli_ok(&["serve", "--stop"]);
+
+    let refused = h.run_cli_err(&["serve", "--daemon"]);
+    assert!(
+        refused.contains("unrecognized subcommand 'serve'"),
+        "{refused}"
+    );
+    assert!(!app.join("serve.pid").exists());
+    assert!(std::os::unix::net::UnixStream::connect(app.join("daemon/api.sock")).is_err());
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    assert_private(&h);
+    h.run_cli_ok(&["serve", "--restart"]);
+    assert_private(&h);
+    h.run_cli_ok(&["serve", "--stop"]);
+
+    h.run_cli_ok(&["profile", "list"]);
+    assert_mcp_connects(&h);
+    assert!(std::net::TcpStream::connect(("192.0.2.1", port)).is_err());
+}
