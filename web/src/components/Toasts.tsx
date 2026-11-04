@@ -115,9 +115,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   // Action toasts stay until used, so the column can outgrow the screen; keep the newest in view.
   const listRef = useRef<HTMLDivElement>(null);
   const newestId = toasts.at(-1)?.id;
+  // Ids only increase, so a smaller newest id means the newest was removed, not that one arrived.
+  const scrolledFor = useRef(0);
   useLayoutEffect(() => {
     const list = listRef.current;
-    if (list && newestId !== undefined) list.scrollTop = list.scrollHeight;
+    if (!list || newestId === undefined || newestId <= scrolledFor.current) return;
+    scrolledFor.current = newestId;
+    list.scrollTop = list.scrollHeight;
   }, [newestId]);
 
   return (

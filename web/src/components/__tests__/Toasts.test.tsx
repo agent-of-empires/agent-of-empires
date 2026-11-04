@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { ToastBusBridge, ToastProvider } from "../Toasts";
 import { toastBus } from "../../lib/toastBus";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -67,19 +67,29 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("scrolls the column to a newly added toast, but not when an older one is dismissed", () => {
+  it("scrolls the column to a newly added toast, but not when one is dismissed", () => {
     renderProvider();
     const list = screen.getByTestId("toast-list");
     let top = 0;
     Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => 500 });
     Object.defineProperty(list, "scrollTop", { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    const dismiss = (message: string) =>
+      fireEvent.click(
+        within(screen.getByText(message).closest("[role]") as HTMLElement).getByRole("button", { name: "Dismiss" }),
+      );
     act(() => toastBus.handler?.action("first", "Reopen", vi.fn()));
     expect(top).toBe(500);
     top = 0;
     act(() => toastBus.handler?.action("second", "Reopen", vi.fn()));
     expect(top).toBe(500);
+    // Removing the newest leaves an older one newest; nothing arrived.
     top = 120;
-    fireEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[0]!);
+    dismiss("second");
+    expect(top).toBe(120);
+    act(() => toastBus.handler?.action("third", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    top = 120;
+    dismiss("first");
     expect(top).toBe(120);
   });
 
