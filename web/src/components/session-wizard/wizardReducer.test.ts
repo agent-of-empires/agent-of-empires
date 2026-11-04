@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
+import { agentsView, initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
 
 function makeState(data: Partial<WizardData> = {}): WizardState {
   return {
@@ -9,6 +9,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     error: null,
     agents: [],
     agentsStatus: "ready",
+    agentsFor: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -383,5 +384,43 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
     expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
     const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
+  });
+});
+
+describe("agent list per profile", () => {
+  const claude = { name: "claude" } as WizardState["agents"][number];
+  it.each([
+    [
+      "a list for alpha reads as itself for alpha",
+      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
+      "alpha",
+      "ready",
+      1,
+    ],
+    [
+      "a list for alpha is still loading for beta",
+      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
+      "beta",
+      "loading",
+      0,
+    ],
+    [
+      "a failed load for alpha is still loading for beta",
+      { type: "AGENTS_FAILED", agentsFor: "alpha", missing: false },
+      "beta",
+      "loading",
+      0,
+    ],
+    [
+      "a missing profile reads as missing for itself",
+      { type: "AGENTS_FAILED", agentsFor: "gone", missing: true },
+      "gone",
+      "missing",
+      0,
+    ],
+  ] as const)("%s", (_label, action, profile, status, count) => {
+    const view = agentsView(reducer({ ...makeState(), agentsStatus: "loading" }, action as Action), profile);
+    expect(view.agentsStatus).toBe(status);
+    expect(view.agents).toHaveLength(count);
   });
 });

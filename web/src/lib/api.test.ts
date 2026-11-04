@@ -780,6 +780,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
   ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
 ];
@@ -1043,6 +1044,25 @@ describe("project mutations", () => {
     expect(await call()).toEqual({ ok: false, error: "Server error (500)" });
     offline();
     expect(await call()).toEqual({ ok: false, error: "offline" });
+  });
+});
+
+describe("fetchProfileAgents", () => {
+  it.each([
+    ["a list", () => json([{ id: "claude" }]), [{ id: "claude" }]],
+    ["an unknown profile", () => json({ error: "profile_not_found", message: "no" }, 404), "profile_not_found"],
+    ["another 404", () => json({ error: "not_found" }, 404), null],
+    ["a 404 without JSON", () => new Response("gone", { status: 404 }), null],
+    ["a server error", () => json({ error: "profile_not_found" }, 500), null],
+  ])("reads %s", async (_name, respond, result) => {
+    fetchSpy.mockResolvedValueOnce(respond());
+    expect(await api.fetchProfileAgents("work")).toEqual(result);
+    expect(lastCall().url).toBe("/api/agents?profile=work");
+  });
+
+  it("is null for fetchAgents when the profile is unknown", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "profile_not_found" }, 404));
+    expect(await api.fetchAgents("work")).toBeNull();
   });
 });
 
