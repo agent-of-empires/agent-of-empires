@@ -43,6 +43,7 @@ const GENERIC_MESSAGE = "Failed to create session";
 export function failureFields(failure: CreateFailure): readonly ("path" | "sandboxEnabled" | "sandboxImage")[] {
   switch (failure.code) {
     case "working_dir_missing":
+    case "hook_failed":
       return ["path"];
     case "sandbox_unavailable":
       return ["sandboxEnabled"];

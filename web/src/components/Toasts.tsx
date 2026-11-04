@@ -1,4 +1,14 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { openPluginLink } from "../lib/pluginCommands";
@@ -102,10 +112,22 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     };
   }, [push, pushWithSession]);
 
+  // Action toasts stay until used, so the column can outgrow the screen; keep the newest in view.
+  const listRef = useRef<HTMLDivElement>(null);
+  const newestId = toasts.at(-1)?.id;
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (list && newestId !== undefined) list.scrollTop = list.scrollHeight;
+  }, [newestId]);
+
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm">
+      <div
+        ref={listRef}
+        data-testid="toast-list"
+        className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto"
+      >
         {toasts.map((t) => {
           const clickable = !!t.sessionId || !!t.href;
           const onToastClick = () => {

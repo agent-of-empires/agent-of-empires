@@ -431,7 +431,7 @@ describe("submit failures", () => {
       field("sandboxEnabled", false),
       false,
     ],
-    ["a new Project leaves a failed hook", "hook_failed", null, field("path", "/elsewhere"), false],
+    ["a new Project clears a failed hook", "hook_failed", null, field("path", "/elsewhere"), true],
     [
       "a new image clears a container that failed to start",
       "create_failed",

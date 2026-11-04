@@ -67,6 +67,22 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("scrolls the column to a newly added toast, but not when an older one is dismissed", () => {
+    renderProvider();
+    const list = screen.getByTestId("toast-list");
+    let top = 0;
+    Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => 500 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    act(() => toastBus.handler?.action("first", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    top = 0;
+    act(() => toastBus.handler?.action("second", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    top = 120;
+    fireEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[0]!);
+    expect(top).toBe(120);
+  });
+
   it("renders info, push, and error toasts with their roles and dismisses on click", () => {
     const { container } = renderProvider();
     expect(container.querySelector("div.fixed")?.children.length).toBe(0);

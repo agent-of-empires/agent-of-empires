@@ -689,4 +689,39 @@ test.describe("create failure", () => {
       await expect(page.getByTestId("session-wizard")).toHaveCount(0);
     });
   }
+
+  test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await startWizard(page, {
+      onCreate: async (_body, route) => {
+        await held;
+        await route.fulfill({
+          status: 400,
+          json: { error: "hook_failed", message: "An on_create hook exited with code 1.", stage: "running_hooks" },
+        });
+        return true;
+      },
+    });
+    await page.setViewportSize({ width: 375, height: 600 });
+    await launch(page);
+    await wizard(page).getByRole("button", { name: "Continue in background" }).click();
+    await expect(wizard(page)).toHaveCount(0);
+    await page.evaluate(() => {
+      for (let i = 1; i <= 15; i++) {
+        navigator.serviceWorker.dispatchEvent(
+          new MessageEvent("message", { data: { type: "aoe-push", payload: { title: `Earlier notice ${i}` } } }),
+        );
+      }
+    });
+    release();
+
+    const reopen = page.getByRole("button", { name: "Reopen" });
+    await expect(reopen).toBeInViewport();
+    const list = page.getByTestId("toast-list");
+    expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+    // The oldest is still reachable by scrolling the column.
+    await list.evaluate((el) => (el.scrollTop = 0));
+    await expect(page.getByText("Earlier notice 1", { exact: true })).toBeInViewport();
+  });
 });
