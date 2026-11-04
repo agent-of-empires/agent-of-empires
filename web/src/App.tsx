@@ -105,6 +105,8 @@ import {
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
+import { onServerDownChange } from "./lib/connectionState";
+import { ABOUT_RETRY_DELAYS_MS, fetchAboutRetrying } from "./lib/serverAbout";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
@@ -912,7 +914,7 @@ function AppContent({
     commentsEnabled &&
     !activeSession?.trashed_at &&
     !activeSession?.archived_at &&
-    (activeSession?.view === "structured" || !serverAbout?.read_only);
+    (activeSession?.view === "structured" || !caps.readOnly);
   const commentSendDisabledReason = !activeSession
     ? "Select a session to send comments to the agent."
     : activeSession?.trashed_at
@@ -1192,7 +1194,11 @@ function AppContent({
   useEffect(() => {
     let active = true;
     const generation = ++serverAboutGeneration.current;
-    void fetchAbout()
+    void fetchAboutRetrying(
+      fetchAbout,
+      ABOUT_RETRY_DELAYS_MS,
+      () => !active || generation !== serverAboutGeneration.current,
+    )
       .then((about) => {
         if (!active || generation !== serverAboutGeneration.current) return;
         if (about) {
@@ -1204,9 +1210,9 @@ function AppContent({
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
       })
-      // `serverAboutLoaded` gates the shell render, so it must flip on a failed
-      // or missing /api/about too, not only on success. Otherwise the shell
-      // would hang on its placeholder.
+      // `serverAboutLoaded` gates the shell render, so it must flip once the tries
+      // run out too, not only on success. Otherwise the shell would hang on its
+      // placeholder; it then renders read-only with a Retry notice.
       .finally(() => {
         if (active && generation === serverAboutGeneration.current) setServerAboutLoaded(true);
       });
@@ -1225,6 +1231,14 @@ function AppContent({
     };
   }, []);
 
+  // A failed /api/about leaves write actions hidden, so ask again once the server answers.
+  useEffect(() => {
+    if (!serverAboutLoaded || serverAbout) return;
+    return onServerDownChange((down) => {
+      if (!down) void refreshServerAbout();
+    });
+  }, [serverAboutLoaded, serverAbout, refreshServerAbout]);
+
   // Telemetry: report that the acp web UI was opened, folded into the
   // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
   // `activeSession` drives both the desktop and mobile acp mounts, so this
@@ -1234,10 +1248,10 @@ function AppContent({
   // (decremented by exactly what each snapshot reported), so re-fires on
   // session switch are harmless. See #1882.
   useEffect(() => {
-    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    if (!serverAboutLoaded || caps.readOnly) return;
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");
-  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.view]);
+  }, [serverAboutLoaded, caps.readOnly, activeSession?.view]);
 
   const handleTelemetryConsent = useCallback((enabled: boolean) => {
     setTelemetryConsentNeeded(false);
@@ -1408,9 +1422,9 @@ function AppContent({
   }, []);
   // The startup error banner's way out, where the server allows the switch. Each
   // mounted Structured view switches its own Session.
-  const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
+  const canSwitchToTerminal = !caps.readOnly && caps.canUseTerminal;
   // The server refuses a restart on a read-only or CityHall server.
-  const canRestartAgent = !serverAbout?.read_only && !caps.cityhall;
+  const canRestartAgent = !caps.readOnly && !caps.cityhall;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1735,16 +1749,16 @@ function AppContent({
   // caller (keyboard shortcut, command palette) is a no-op rather than opening
   // a wizard that 403s on submit. Caught by the live read-only-mode spec.
   const handleNewSession = useCallback(() => {
-    if (serverAbout?.read_only) return;
+    if (caps.readOnly) return;
     setWizardPrefill(undefined);
     setShowSessionWizard(true);
-  }, [serverAbout?.read_only]);
+  }, [caps.readOnly]);
 
   const handleNewScratch = useCallback(() => {
-    if (serverAbout?.read_only) return;
+    if (caps.readOnly) return;
     setWizardPrefill({ scratch: true });
     setShowSessionWizard(true);
-  }, [serverAbout?.read_only]);
+  }, [caps.readOnly]);
 
   const handleCloneFromUrl = useCallback(() => {
     setWizardPrefill({ initialTab: "clone" });
@@ -1897,6 +1911,8 @@ function AppContent({
         focusMode,
       ],
     ),
+    // New session and scratch wait for the read-only answer, so a key before it would be dropped.
+    serverAboutLoaded,
   );
 
   // Palette triage toggles for the active session. "snooze" needs a duration,
@@ -1931,7 +1947,7 @@ function AppContent({
     activeSession: activeSession ?? null,
     loginRequired,
     hasActiveSession: !!activeSession,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     onNewSession: handleNewSession,
     onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
@@ -1961,7 +1977,7 @@ function AppContent({
   );
   const settingsCommands = useSettingsCommands({
     open: showPalette,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     onOpenSettingsTab: openSettingsTab,
   });
   const { actions: pluginCommandActions, overlay: pluginLinkPicker } = usePluginCommands(
@@ -2026,7 +2042,7 @@ function AppContent({
       const terminalIndex = isTerminalTabId(id) ? terminalIndexOf(id) : 0;
       return (
         <PairedShellPane
-          readOnly={!!serverAbout?.read_only}
+          readOnly={caps.readOnly}
           session={activeSession ?? null}
           sessionId={activeSessionId}
           terminalIndex={terminalIndex}
@@ -2092,7 +2108,7 @@ function AppContent({
                     />
                   ) : (
                     <TerminalSessionStack
-                      readOnly={!!serverAbout?.read_only}
+                      readOnly={caps.readOnly}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
@@ -2133,7 +2149,7 @@ function AppContent({
                   onActivate={(id) => activateTab("right", id)}
                   onMove={movePaneAny}
                   onClose={closePaneAny}
-                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
+                  onNewTerminal={caps.readOnly ? undefined : () => addTerminal("right")}
                 />
               </div>
             }
@@ -2146,7 +2162,7 @@ function AppContent({
               onActivate={(id) => activateTab("bottom", id)}
               onMove={movePaneAny}
               onClose={closePaneAny}
-              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+              onNewTerminal={caps.readOnly ? undefined : () => addTerminal("bottom")}
             />
           )}
         </PaneDndController>
@@ -2191,7 +2207,7 @@ function AppContent({
           pluginId={pluginPageMatch.params.pluginId ?? ""}
           pageId={pluginPageMatch.params.pageId ?? ""}
           onBack={handleClosePluginPage}
-          readOnly={serverAbout?.read_only ?? false}
+          readOnly={caps.readOnly}
           cityhall={caps.cityhall}
           theme={resolvedTheme}
           link={searchParams.get("link")}
@@ -2205,7 +2221,7 @@ function AppContent({
             <PluginSessionMenu
               request={request}
               workspaces={workspaces}
-              readOnly={serverAbout?.read_only ?? false}
+              readOnly={caps.readOnly}
               observedById={observedById}
               runtimeEpoch={runtimeEpoch}
               handlers={{
@@ -2253,7 +2269,7 @@ function AppContent({
             next.set("profile", p);
             setSearchParams(next, { replace: true });
           }}
-          readOnly={serverAbout?.read_only}
+          readOnly={caps.readOnly}
           cityhall={caps.cityhall}
         />
       );
@@ -2290,7 +2306,7 @@ function AppContent({
           onNewSession={handleNewSession}
           onCloneFromUrl={handleCloneFromUrl}
           onToggleSidebar={handleToggleSidebar}
-          readOnly={serverAbout?.read_only}
+          readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
         />
       );
@@ -2308,7 +2324,7 @@ function AppContent({
       return (
         <MobileMainPane
           onStartSession={(id) => void handleStartSession(id)}
-          readOnly={!!serverAbout?.read_only}
+          readOnly={caps.readOnly}
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
@@ -2443,14 +2459,14 @@ function AppContent({
   // resolves so the two never overlap on first load.
   const welcome = useWelcomePhase({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     autoLaunchReady: tourAutoLaunchReady,
     tourSeen,
     tourSeenKnown,
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: serverAbout?.read_only,
+    readOnly: caps.readOnly,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
@@ -2537,7 +2553,7 @@ function AppContent({
         runtimeEpoch={runtimeEpoch}
         observedById={observedById}
         onSessionMutation={applySessionMutation}
-        readOnly={serverAbout?.read_only}
+        readOnly={caps.readOnly}
         available={!error}
       >
         <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
@@ -2578,7 +2594,7 @@ function AppContent({
             />
           </CollapsibleRegion>
 
-          <BannerStack />
+          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void refreshServerAbout()} />
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
@@ -2640,7 +2656,7 @@ function AppContent({
                 onStartSession={handleStartSession}
                 onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
-                readOnly={serverAbout?.read_only}
+                readOnly={caps.readOnly}
                 canManageProjects={caps.canManageProjects}
                 sortMode={sidebarSortMode}
                 onSortModeChange={selectSidebarSortMode}
