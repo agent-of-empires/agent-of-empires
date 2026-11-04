@@ -11179,14 +11179,21 @@ async fn cli_post_commit_failure_preserves_creation_and_reports_unknown_on_repla
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
-async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
+async fn cli_shell_validation_preserves_owner_literals_and_remote_word_boundaries() {
+    use crate::server::peer::ConnectionPeer;
     use crate::server::test_support as support;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tower::ServiceExt;
     let _home = crate::session::test_support::isolate_app_dir();
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("agent");
     let observed = root.path().join("arguments");
     let injected = root.path().join("must-not-run");
+    let project = root.path().join("project;literal");
+    std::fs::create_dir(&project).unwrap();
+    let alias = root.path().join("safe-alias");
+    symlink(&project, &alias).unwrap();
+    let hook_effect = root.path().join("created");
     std::fs::write(
         &script,
         format!(
@@ -11202,26 +11209,130 @@ async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
             "lenovo-claude".into(),
             script.to_string_lossy().into_owned(),
         );
+        config.hooks.on_create = vec![format!(
+            "printf x >> {}",
+            shell_words::quote(hook_effect.to_str().unwrap())
+        )];
     })
     .unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
-    let state = support::build_test_app_state(Vec::new());
+    let state = support::build_test_app_state_with_policy(
+        Vec::new(),
+        vec!["localhost".into()],
+        Vec::new(),
+        Some("shell-policy-token".into()),
+    );
     support::refresh_canonical_metadata_for_test(&state).await;
+    let app = support::build_router_for_test(state.clone());
+    let request = |peer, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer shell-policy-token")
+            .extension(axum::extract::ConnectInfo(peer))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
     let literal = format!("$(touch {})", injected.display());
     let args = format!(
         "--append-system-prompt \"hello world\" --model opus[1m] '{}'",
         literal
     );
-    for (index, tool) in ["", " lenovo-claude "].into_iter().enumerate() {
-        let (status, result) = post_create(
-            &state,
-            serde_json::json!({
-                "path": root.path(), "tool": tool, "profile": "test",
-                "title": format!("literal arguments {index}"),
-                "extra_args": args, "cli": {},
-            }),
-        )
-        .await;
+    for peer in [
+        ConnectionPeer::Tcp("127.0.0.1:4521".parse().unwrap()),
+        ConnectionPeer::Tcp("192.0.2.1:4521".parse().unwrap()),
+    ] {
+        for (path, extra_args, scratch, field) in [
+            (project.as_path(), "", false, "path"),
+            (alias.as_path(), "", false, "path"),
+            (root.path(), args.as_str(), false, "extra_args"),
+            (
+                std::path::Path::new(""),
+                "'literal;value'",
+                true,
+                "extra_args",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    peer,
+                    serde_json::json!({
+                        "path": path, "tool": "", "profile": "test",
+                        "extra_args": extra_args, "scratch": scratch, "cli": {},
+                    }),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{peer:?}: {result}");
+            assert_eq!(result["error"], "validation_failed");
+            assert!(
+                result["message"].as_str().unwrap().contains(field),
+                "{result}"
+            );
+            assert!(Storage::open_unwatched("test")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty());
+            assert!(state.instances.read().await.is_empty());
+            assert!(!hook_effect.exists());
+        }
+    }
+    let safe_args = "--append-system-prompt \"hello world\" ''";
+    for (index, (peer, tool, extra_args, expected)) in [
+        (
+            ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+            "",
+            args.as_str(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n"),
+        ),
+        (
+            ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+            " lenovo-claude ",
+            args.as_str(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n"),
+        ),
+        (
+            ConnectionPeer::Tcp("127.0.0.1:4521".parse().unwrap()),
+            "",
+            safe_args,
+            "--append-system-prompt\nhello world\n\n".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let owner = matches!(peer, ConnectionPeer::UnixOwner { .. });
+        let response = app
+            .clone()
+            .oneshot(request(
+                peer,
+                serde_json::json!({
+                    "path": if owner { project.as_path() } else { root.path() },
+                    "tool": tool, "profile": "test",
+                    "title": format!("literal arguments {index}"),
+                    "extra_args": extra_args, "cli": {},
+                }),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(status, StatusCode::CREATED, "{result}");
         let row = state
             .instances
@@ -11237,22 +11348,22 @@ async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
             .status()
             .unwrap();
         assert!(launched.success());
-        assert_eq!(
-            std::fs::read_to_string(&observed).unwrap(),
-            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n")
-        );
+        assert_eq!(std::fs::read_to_string(&observed).unwrap(), expected);
         assert!(!injected.exists());
     }
     for cli in [serde_json::Value::Null, serde_json::json!({})] {
-        let (status, _) = post_create(
-            &state,
-            serde_json::json!({
-                "path": root.path(), "tool": "", "profile": "test", "extra_args": "'unterminated",
-                "cli": cli,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(request(
+                ConnectionPeer::UnixOwner { uid: nix::unistd::geteuid().as_raw() },
+                serde_json::json!({
+                    "path": root.path(), "tool": "", "profile": "test", "extra_args": "'unterminated",
+                    "cli": cli,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
 

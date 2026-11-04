@@ -433,11 +433,15 @@ running engine, when no effective `on_create` hooks need a container. Container
 creation hooks and later launch still require the engine. Non-CLI creation
 retains its existing readiness checks.
 
-With CLI intent, `extra_args` uses shell-style word grouping, then each argument
-is quoted for literal delivery. Quotes group text; shell operators and substitutions
-are arguments, not scripts. Other API callers retain their existing input validation.
-With `cli`, project paths are canonicalized on the Daemon host, not shell-quoted.
-The field expresses selection intent; any authenticated caller can supply it.
+With CLI intent, `extra_args` uses shell-style word grouping and each decoded
+argument is quoted for literal delivery. Only the authenticated owner on the
+Daemon's Unix socket may use shell metacharacters in decoded arguments or
+canonical project paths. HTTP callers retain the shared shell-metacharacter
+gate, even with `cli`: grouping quotes and empty arguments are accepted, but
+quoted substitutions and model values such as `opus[1m]` are rejected.
+Project paths are canonicalized on the Daemon host before this check, not
+shell-quoted. `cli` expresses selection intent, not authenticated origin.
+Requests without `cli` retain their existing input validation.
 
 Host launches and structured creations that need agent-hook approval return `409`
 with `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon

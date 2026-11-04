@@ -1010,12 +1010,11 @@ pub async fn create_session(
         );
     }
 
-    // `cli` selects behavior, not an authenticated origin. Its paths are canonicalized
-    // on the Daemon; only extra_args is parsed and shell-quoted here.
+    // Only the authenticated Unix owner may bypass the shell-metacharacter policy.
     let mut shell_checks: Vec<(&str, &str)> = Vec::new();
     if body.cli.is_some() {
-        body.extra_args = match shell_words::split(&body.extra_args) {
-            Ok(args) => shell_words::join(args),
+        let args = match shell_words::split(&body.extra_args) {
+            Ok(args) => args,
             Err(error) => {
                 return api_error(
                     StatusCode::BAD_REQUEST,
@@ -1024,10 +1023,18 @@ pub async fn create_session(
                 )
             }
         };
+        if !local_owner {
+            for arg in &args {
+                if let Err(msg) = super::validate_shell_fields(&[(arg.as_str(), "extra_args")]) {
+                    return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
+                }
+            }
+        }
+        body.extra_args = shell_words::join(args);
     } else {
         shell_checks.push((body.extra_args.as_str(), "extra_args"));
     }
-    if !body.scratch && body.cli.is_none() {
+    if !body.scratch && (!local_owner || body.cli.is_none()) {
         shell_checks.push((body.path.as_str(), "path"));
     }
     if let Err(msg) = super::validate_shell_fields(&shell_checks) {
