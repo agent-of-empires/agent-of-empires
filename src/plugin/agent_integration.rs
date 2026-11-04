@@ -223,9 +223,13 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     }
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
-    read_report(&instance.id, &instance.tool, plugin)
-        .ok()
-        .flatten()
+    match read_report(&instance.id, &instance.tool, plugin) {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::debug!(instance_id = %instance.id, error = %format_args!("{error:#}"), "integration report rejected");
+            None
+        }
+    }
 }
 
 pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::Status {
@@ -242,12 +246,15 @@ pub(crate) fn session_status_override(
     status: Option<AgentIntegrationStatus>,
 ) -> Option<crate::session::Status> {
     if !configured {
-        None
-    } else if pane_dead {
-        Some(crate::session::Status::Error)
-    } else {
-        status.map(session_status)
+        return None;
     }
+    status.map(|status| {
+        if pane_dead {
+            crate::session::Status::Error
+        } else {
+            session_status(status)
+        }
+    })
 }
 
 fn check_file(meta: &std::fs::Metadata) -> Result<()> {
@@ -717,6 +724,7 @@ replies = true
         let mut instance = Instance::new("integration-reply-test", "/tmp");
         instance.tool = "reply-agent".into();
         instance.status = crate::session::Status::Running;
+        assert!(super::snapshot(&instance).is_none());
         let tmux = crate::tmux::Session::new(&instance.id, &instance.title).unwrap();
         tmux.create("/tmp", Some("od -An -tx1"), "default").unwrap();
         struct KillSession(crate::tmux::Session);
@@ -737,6 +745,18 @@ replies = true
             dir.as_fd(),
             report_name,
             &serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert!(super::snapshot(&instance).is_some());
+        std::fs::set_permissions(
+            _base_path.join(&instance.id).join(report_name),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(super::snapshot(&instance).is_none());
+        std::fs::set_permissions(
+            _base_path.join(&instance.id).join(report_name),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .unwrap();
 
@@ -929,6 +949,7 @@ replies = true
         }
         assert_eq!(session_status_override(false, false, None), None);
         assert_eq!(session_status_override(true, false, None), None);
+        assert_eq!(session_status_override(true, true, None), None);
         assert_eq!(
             session_status_override(true, true, Some(AgentIntegrationStatus::Running)),
             Some(crate::session::Status::Error)
