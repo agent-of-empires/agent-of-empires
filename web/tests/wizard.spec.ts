@@ -316,7 +316,13 @@ test.describe("agents and presets", () => {
 
   test("a custom agent's locked Yolo mode follows the profile the session is created in", async ({ page }) => {
     // Alpha's wrapper runs an always-Yolo base; Beta's runs one that asks first.
-    const wrapper = (always_yolo: boolean) => ({ ...CLAUDE_AGENT, name: "wrapper", kind: "custom", always_yolo });
+    const wrapper = (always_yolo: boolean) => ({
+      ...CLAUDE_AGENT,
+      name: "wrapper",
+      kind: "custom",
+      always_yolo,
+      acp_always_yolo: always_yolo,
+    });
     const agentsProfiles: string[] = [];
     page.on("request", (req) => {
       const url = new URL(req.url());

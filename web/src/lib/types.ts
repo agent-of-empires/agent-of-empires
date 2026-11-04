@@ -300,8 +300,10 @@ export interface AgentInfo {
   kind: "builtin" | "custom" | "plugin";
   binary: string;
   host_only: boolean;
-  /** Always runs in Yolo mode, so the wizard locks the switch on. */
+  /** Always runs in Yolo mode in a terminal session, so the wizard locks the switch on. */
   always_yolo?: boolean;
+  /** The same for a structured session, which can run a custom agent's own adapter instead. */
+  acp_always_yolo?: boolean;
   installed: boolean;
   install_hint: string;
   /** Has a one-shot mode for smart rename. Always false for custom agents. */

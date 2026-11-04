@@ -838,7 +838,8 @@ export function SessionWizard({
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
   // Locked on without touching the stored value, so another agent gets it back.
-  const alwaysYolo = selectedAgent?.always_yolo === true;
+  const alwaysYolo =
+    (acpCapable && d.useStructuredView ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
   const effectiveProfile = d.profile || servedProfile;
