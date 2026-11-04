@@ -377,7 +377,7 @@ pub fn load_native_mcp_servers_checked_from_home(
         native_config_for(agent_key),
         Some(NativeMcpConfig::StandardJson(_))
     );
-    let native_config_override = matches!(agent_key, "claude" | "claude-code")
+    let native_config_override = matches!(agent_key, "claude" | "claude-code" | "codex")
         .then_some(native_config_override)
         .flatten()
         .map(Path::to_path_buf);
@@ -997,6 +997,25 @@ enabled = true
         };
         assert_eq!(names(&read(Some(declared.path()))), vec!["declared"]);
         assert_eq!(names(&read(None)), vec!["home"]);
+    }
+
+    #[test]
+    fn codex_discovery_honors_the_launch_resolved_dir() {
+        let declared = tempfile::tempdir().unwrap();
+        write(
+            declared.path(),
+            "config.toml",
+            "[mcp_servers.declared]\ncommand = \"d\"\n",
+        );
+        let read = load_native_mcp_servers_checked_from_home(
+            "codex",
+            None,
+            &[],
+            Some(declared.path()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(names(&read.servers), vec!["declared"]);
     }
 
     #[test]

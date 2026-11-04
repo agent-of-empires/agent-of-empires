@@ -133,7 +133,9 @@ export function AssistantMessage() {
   return (
     <MessagePrimitive.Root className="acp-copy-host group mt-4 mr-auto w-full">
       <div className="text-sm text-text-primary leading-relaxed">
-        <MessagePrimitive.Parts components={{ Text: AssistantText, tools: { Override: AssistantToolCall } }} />
+        <MessagePrimitive.Parts
+          components={{ Text: AssistantText, Reasoning: AssistantReasoning, tools: { Override: AssistantToolCall } }}
+        />
       </div>
       <MessageCopyMenu />
     </MessagePrimitive.Root>
@@ -172,6 +174,19 @@ function AssistantText({ text }: { text: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+/** Summarized model thinking, collapsed so it never crowds the reply. */
+function AssistantReasoning({ text }: { text: string }) {
+  if (!text.trim()) return null;
+  return (
+    <details className="my-1 rounded border border-surface-800 bg-surface-900/40">
+      <summary className="cursor-pointer select-none px-3 py-1 text-text-dim hover:text-text-secondary">
+        Thinking
+      </summary>
+      <div className="max-h-80 overflow-y-auto whitespace-pre-wrap px-3 pb-2 text-text-dim italic">{text}</div>
+    </details>
   );
 }
 

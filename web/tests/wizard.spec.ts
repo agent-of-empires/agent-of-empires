@@ -28,8 +28,8 @@ test.describe("essentials", () => {
     await expect(w.getByTestId("wizard-project-row")).toContainText("/tmp/example");
     await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("");
     await expect(w.getByTestId("wizard-agent-row")).toContainText("claude");
-    await expect(switchNamed(page, "Use structured view")).toHaveAttribute("aria-checked", "true");
-    await expect(switchNamed(page, "Auto-approve actions")).toHaveAttribute("aria-checked", "false");
+    await expect(wizard(page).getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "true");
+    await expect(switchNamed(page, "Yolo mode")).toHaveAttribute("aria-checked", "false");
     await expect(switchNamed(page, "Create a worktree")).toHaveAttribute("aria-checked", "true");
     await expect(w.getByTestId("wizard-worktree-row")).toContainText("auto, new branch");
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeVisible();
@@ -49,12 +49,9 @@ test.describe("essentials", () => {
     await expect(group).toHaveValue("backend");
   });
 
-  test("structured_view = terminal opens the switch unticked and creates a terminal (#3517)", async ({ page }) => {
+  test("structured_view = terminal selects Terminal view and creates a terminal (#3517)", async ({ page }) => {
     const created = await startWizard(page, { settings: { acp: { structured_view: "terminal" } } });
-    await expect(wizard(page).getByRole("switch", { name: "Use structured view" })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    await expect(wizard(page).getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "false");
     await launch(page);
     await expect.poll(() => created[0]?.view).toBe("terminal");
   });
@@ -305,7 +302,7 @@ test.describe("agents and presets", () => {
 
     await w.getByRole("radio", { name: /yolo-sandbox/ }).click();
     // A pick returns to the form.
-    for (const label of ["Run in a safe container", "Auto-approve actions"]) {
+    for (const label of ["Run in a safe container", "Yolo mode"]) {
       await expect(switchNamed(page, label)).toHaveAttribute("aria-checked", "true");
     }
     expect(settingsProfiles).toContain("yolo-sandbox");
@@ -315,6 +312,40 @@ test.describe("agents and presets", () => {
     await startWizard(page);
     await expect(switchNamed(page, "Run in a safe container")).toBeDisabled();
     await expect(wizard(page).getByTestId("wizard-sandbox-row")).toContainText("Docker is not running");
+  });
+
+  test("a custom agent's locked Yolo mode follows the profile the session is created in", async ({ page }) => {
+    // Alpha's wrapper runs an always-Yolo base; Beta's runs one that asks first.
+    const wrapper = (always_yolo: boolean) => ({ ...CLAUDE_AGENT, name: "wrapper", kind: "custom", always_yolo });
+    const agentsProfiles: string[] = [];
+    page.on("request", (req) => {
+      const url = new URL(req.url());
+      if (url.pathname === "/api/agents") agentsProfiles.push(url.searchParams.get("profile") ?? "");
+    });
+    const created = await startWizard(page, {
+      servedProfile: "Alpha",
+      profiles: [
+        { name: "Alpha", is_default: true },
+        { name: "Beta", is_default: false },
+      ],
+      profileSettings: {
+        Alpha: { session: { yolo_mode_default: false, default_tool: "wrapper" } },
+        Beta: { session: { yolo_mode_default: false, default_tool: "wrapper" } },
+      },
+      profileAgents: { Alpha: [CLAUDE_AGENT, wrapper(true)], Beta: [CLAUDE_AGENT, wrapper(false)] },
+    });
+    const yoloRow = wizard(page).getByTestId("wizard-yolo-row");
+    await expect(yoloRow).toContainText("always on for wrapper");
+    await expect(switchNamed(page, "Yolo mode")).toBeDisabled();
+
+    await openPanel(page, "Profile");
+    await wizard(page).getByRole("radio", { name: /Beta/ }).click();
+    await expect.poll(() => agentsProfiles).toContain("Beta");
+    await expect(yoloRow).toContainText("asks before running commands");
+    await expect(switchNamed(page, "Yolo mode")).toBeEnabled();
+    await expect(switchNamed(page, "Yolo mode")).toHaveAttribute("aria-checked", "false");
+    await launch(page);
+    await expect.poll(() => created[0]).toMatchObject({ profile: "Beta", tool: "wrapper", yolo_mode: false });
   });
 
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({ page }) => {
@@ -344,7 +375,7 @@ test.describe("agents and presets", () => {
     await selectAgent(page, /remote-helper/);
     await expectHidden(hidden);
     // Without agent_acp_cmd a custom agent is terminal-only; the override preview may show its binary by design.
-    await expect(switchNamed(page, "Use structured view")).toBeDisabled();
+    await expect(w.getByRole("radio", { name: "Structured view" })).toBeDisabled();
     await expect(w.getByText(/needs agent_acp_cmd/)).toBeVisible();
     await openPanel(page, "Agent");
     await expectHidden(hidden.slice(1));
@@ -546,5 +577,151 @@ test.describe("Group field", () => {
       const row = (await w.getByRole("option").first().boundingBox())!;
       expect(row.height).toBeGreaterThanOrEqual(44);
     });
+  });
+});
+
+test.describe("View row", () => {
+  test("arrow keys move between Structured view and Terminal view", async ({ page }) => {
+    const created = await startWizard(page);
+    const w = wizard(page);
+    const group = w.getByRole("radiogroup", { name: "View" });
+    const structured = group.getByRole("radio", { name: "Structured view" });
+    const terminal = group.getByRole("radio", { name: "Terminal view" });
+    await expect(structured).toHaveAttribute("aria-checked", "true");
+    // At md and up, label, summary and segments share one line.
+    const row = w.getByTestId("wizard-view-row");
+    const middle = async (el: import("@playwright/test").Locator) => {
+      const box = (await el.boundingBox())!;
+      return box.y + box.height / 2;
+    };
+    const line = await middle(group);
+    expect(Math.abs((await middle(row.getByText("View", { exact: true }))) - line)).toBeLessThan(4);
+    expect(Math.abs((await middle(row.getByText("plan, tool calls and diffs as cards"))) - line)).toBeLessThan(4);
+    expect(
+      await row.getByText("plan, tool calls and diffs as cards").evaluate((el) => el.scrollWidth <= el.clientWidth),
+    ).toBe(true);
+    await structured.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(terminal).toHaveAttribute("aria-checked", "true");
+    await expect(terminal).toBeFocused();
+    await expect(w.getByTestId("wizard-view-row")).toContainText("the Agent's own terminal UI");
+    await launch(page);
+    await expect.poll(() => created[0]?.view).toBe("terminal");
+  });
+
+  test.describe("at 375px", () => {
+    test.use({ viewport: { width: 375, height: 812 } });
+
+    test("the summary wraps under the label and segments, with nothing cut off", async ({ page }) => {
+      await startWizard(page);
+      await page.setViewportSize({ width: 375, height: 812 });
+      const row = wizard(page).getByTestId("wizard-view-row");
+      const label = (await row.getByText("View", { exact: true }).boundingBox())!;
+      const segments = (await row.getByRole("radiogroup").boundingBox())!;
+      const summary = row.getByText("plan, tool calls and diffs as cards");
+      const summaryBox = (await summary.boundingBox())!;
+      // Label and segments share the first line; the summary starts below them.
+      expect(Math.abs(label.y + label.height / 2 - (segments.y + segments.height / 2))).toBeLessThan(6);
+      expect(summaryBox.y).toBeGreaterThanOrEqual(segments.y + segments.height - 1);
+      expect((await row.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      // Nothing is truncated or pushed sideways.
+      expect(await summary.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+    });
+  });
+});
+
+test.describe("create failure", () => {
+  for (const width of [1280, 375]) {
+    test(`a refused create shows its step, reference and a relaunch without Sandbox at ${width}px`, async ({
+      page,
+    }) => {
+      let refusals = 0;
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      const created = await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true } },
+        onCreate: (_body, route) =>
+          refusals++ === 0
+            ? route
+                .fulfill({
+                  status: 400,
+                  json: {
+                    error: "sandbox_unavailable",
+                    message: "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+                    stage: "starting_container",
+                    reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
+                  },
+                })
+                .then(() => true)
+            : undefined,
+      });
+      await page.setViewportSize({ width, height: width < 768 ? 812 : 900 });
+      const w = wizard(page);
+      await expect(switchNamed(page, "Run in a safe container")).toHaveAttribute("aria-checked", "true");
+      await launch(page);
+
+      const box = w.getByRole("alert").filter({ hasText: "The Sandbox couldn't start" });
+      await expect(box).toBeFocused();
+      await expect(box).toContainText("It failed while starting the container.");
+      await expect(box).toContainText("Reference 3f9c1a2b… · in debug.log");
+      await expect(w.getByTestId("wizard-sandbox-row")).toContainText("couldn't start");
+      const relaunch = box.getByRole("button", { name: "Launch without Sandbox" });
+      await expect(relaunch).toBeInViewport();
+      await expect(w.getByRole("button", { name: /Launch session/ })).toBeInViewport();
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+      const step = (await box.getByText("It failed while starting the container.").boundingBox())!;
+      expect(step.height).toBeLessThanOrEqual(2 * 24);
+
+      await relaunch.click();
+      await expect.poll(() => created.length).toBe(2);
+      expect(created[0]!.sandbox).toBeTruthy();
+      expect(created[1]!.sandbox).toBeFalsy();
+      expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+      await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    });
+  }
+
+  test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await startWizard(page, {
+      onCreate: async (_body, route) => {
+        await held;
+        await route.fulfill({
+          status: 400,
+          json: { error: "hook_failed", message: "An on_create hook exited with code 1.", stage: "running_hooks" },
+        });
+        return true;
+      },
+    });
+    await page.setViewportSize({ width: 375, height: 600 });
+    await launch(page);
+    await wizard(page).getByRole("button", { name: "Continue in background" }).click();
+    await expect(wizard(page)).toHaveCount(0);
+    await page.evaluate(() => {
+      for (let i = 1; i <= 15; i++) {
+        navigator.serviceWorker.dispatchEvent(
+          new MessageEvent("message", { data: { type: "aoe-push", payload: { title: `Earlier notice ${i}` } } }),
+        );
+      }
+    });
+    release();
+
+    const reopen = page.getByRole("button", { name: "Reopen" });
+    await expect(reopen).toBeInViewport();
+    const list = page.getByTestId("toast-list");
+    expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+    // The oldest is still reachable by scrolling the column.
+    await list.evaluate((el) => (el.scrollTop = 0));
+    await expect(page.getByText("Earlier notice 1", { exact: true })).toBeInViewport();
   });
 });

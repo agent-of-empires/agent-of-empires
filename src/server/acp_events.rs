@@ -1113,6 +1113,7 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::ElicitationRequested { .. }
         | Event::ElicitationResolved { .. }
         | Event::ThinkingStarted
+        | Event::AgentThoughtChunk { .. }
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. }
         | Event::Stopped { .. }

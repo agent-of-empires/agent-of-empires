@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import { ProjectsSection } from "../ProjectsSection";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
+import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import type { ProjectInfo, RepoGroup } from "../../lib/types";
 
 afterEach(cleanup);
@@ -73,6 +74,14 @@ describe("ProjectsSection", () => {
     expect(h.onAddProject).toHaveBeenCalled();
     fireEvent.click(screen.getByTitle("New session in alpha"));
     expect(h.onCreateSession).toHaveBeenCalledWith("/work/alpha");
+  });
+
+  it("explains the ◇ marker with the shared Project tooltip, not a native title", () => {
+    renderSection();
+    const mark = screen.getByText("◇");
+    expect(mark.hasAttribute("title")).toBe(false);
+    fireEvent.mouseEnter(mark.parentElement!);
+    expect(screen.getByRole("tooltip").textContent).toBe(meaningText(MARK_MEANING.project));
   });
 
   it("hides add and disables create for read-only viewers", () => {

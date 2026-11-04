@@ -52,6 +52,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
+    /// Provider-native status and terminal prompt replies. Requires API v19
+    /// and the `session.integration` capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
+
     /// Host-rendered UI slots the plugin may populate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -966,6 +971,74 @@ impl PluginManifest {
                 format!("status[{i}].id must not be empty"),
             );
         }
+        let mut integration_tools = std::collections::HashSet::new();
+        let status_integration = self
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "session.integration");
+        for (i, integration) in self.agent_integrations.iter().enumerate() {
+            check(
+                if status_integration {
+                    !integration.provider_versions.is_empty()
+                        && integration.provider_versions.iter().all(|range| {
+                            !range.trim().is_empty() && semver::VersionReq::parse(range).is_ok()
+                        })
+                } else {
+                    integration.provider_versions.is_empty()
+                },
+                format!(
+                    "agent_integrations[{i}].provider_versions must be empty for launch-only agents or valid semver requirements for status integrations"
+                ),
+            );
+            check(
+                !integration.tool.is_empty()
+                    && integration.tool.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    }),
+                format!("agent_integrations[{i}].tool must be a nonempty lowercase agent id"),
+            );
+            check(
+                integration
+                    .command
+                    .as_ref()
+                    .is_none_or(|command| !command.trim().is_empty()),
+                format!("agent_integrations[{i}].command must not be blank"),
+            );
+            if let Some(command) = integration
+                .command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
+            {
+                check(
+                    crate::agent_integration::launch_prefix(command).is_some(),
+                    format!(
+                        "agent_integrations[{i}].command {command:?} must start with literal \
+                         NAME=value assignments and a literal executable that does not begin \
+                         with `-`; quotes, backslashes, `$`, backticks, `~`, `#`, empty words, \
+                         invalid assignment names, command separators, redirections, globs, \
+                         braces and whitespace other than single spaces or tabs are not \
+                         supported there (arguments after the executable are free-form)"
+                    ),
+                );
+            }
+            check(
+                integration_tools.insert(integration.tool.as_str()),
+                format!(
+                    "agent_integrations must not repeat tool {:?}",
+                    integration.tool
+                ),
+            );
+        }
+        if self
+            .agent_integrations
+            .iter()
+            .any(|integration| integration.replies || !integration.provider_versions.is_empty())
+        {
+            check(
+                status_integration,
+                "provider status integrations require the session.integration capability".into(),
+            );
+        }
         check(
             self.screenshots.len() <= MAX_SCREENSHOTS,
             format!(
@@ -1101,6 +1174,19 @@ impl PluginManifest {
             check(
                 self.settings.iter().all(|s| !s.per_project),
                 "per_project settings require api_version >= 18".into(),
+            );
+        }
+        if self.api_version < 19 {
+            check(
+                self.agent_integrations.is_empty(),
+                "agent_integrations require api_version >= 19".into(),
+            );
+            check(
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.integration"),
+                "the session.integration capability requires api_version >= 19".into(),
             );
         }
         for key in self.setting_defaults.keys() {

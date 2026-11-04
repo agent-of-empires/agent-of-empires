@@ -148,6 +148,24 @@ pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>)
         .map(|_| base.clone())
 }
 
+/// Whether `agent` always runs in Yolo mode: a built-in that does, or a custom
+/// agent with no valid adapter of its own whose inherited base does.
+pub fn runs_always_yolo(
+    agent: &str,
+    agent_acp_cmd: &HashMap<String, String>,
+    agent_detect_as: &HashMap<String, String>,
+) -> bool {
+    if crate::agents::get_agent(agent).is_some() {
+        return crate::agents::is_always_yolo(agent);
+    }
+    let own_adapter = agent_acp_cmd
+        .get(agent)
+        .is_some_and(|cmd| AgentSpec::from_acp_cmd(agent, cmd).is_ok());
+    !own_adapter
+        && inherited_acp_base(agent, agent_detect_as)
+            .is_some_and(|base| crate::agents::is_always_yolo(&base))
+}
+
 /// The name users know a registry agent by, for headlines such as
 /// "Codex couldn't start".
 pub fn display_name_for(agent: &str) -> Option<&'static str> {

@@ -2,11 +2,11 @@
 //!
 //! `HttpClient` sends `Authorization: Bearer <token>` when a token resolves.
 //! A passphrase daemon never mints one, so when only a passphrase resolves
-//! (`DaemonEndpoint::resolved_passphrase`), the client performs the same
+//! (`discovery::resolved_passphrase`), the client performs the same
 //! `POST /api/login` handshake the web UI does (see `server::login`) and
 //! sends the resulting `aoe_session` cookie instead. The device-binding
 //! secret and the session cookie are cached under an owner-only directory
-//! (see `DaemonEndpoint::session_cache_dir`) so a repeated CLI invocation
+//! (see `discovery::session_cache_dir`) so a repeated CLI invocation
 //! reuses one long-lived login rather than minting a fresh device session
 //! every process.
 
@@ -17,8 +17,9 @@ use std::sync::{Arc, RwLock};
 use reqwest::header::{self, HeaderMap};
 use reqwest::StatusCode;
 
-use super::discovery::DaemonEndpoint;
+use super::discovery::{resolved_passphrase, session_cache_dir};
 use super::http::HttpError;
+use crate::daemon::DaemonEndpoint;
 
 const DEVICE_BINDING_FILENAME: &str = "cli_device_binding";
 const SESSION_COOKIE_FILENAME: &str = "cli_login_session";
@@ -33,7 +34,7 @@ pub(crate) struct PassphraseSession {
 }
 
 /// In-memory cache for one `HttpClient`, backed by an on-disk cache (see
-/// `DaemonEndpoint::session_cache_dir`).
+/// `discovery::session_cache_dir`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PassphraseSessionCache(Arc<RwLock<Option<PassphraseSession>>>);
 
@@ -55,7 +56,7 @@ impl PassphraseSessionCache {
     /// device-binding secret is left in place; the new login reuses it.
     pub(crate) fn invalidate(&self, endpoint: &DaemonEndpoint) {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some(dir) = endpoint.session_cache_dir() {
+        if let Some(dir) = session_cache_dir(endpoint) {
             let _ = std::fs::remove_file(dir.join(SESSION_COOKIE_FILENAME));
         }
     }
@@ -84,7 +85,7 @@ pub(crate) enum Credential {
 /// authorizes the request, and never without one resolving (`--auth=none`).
 /// `resolved_passphrase` also refuses a plaintext `http://` non-loopback URL.
 pub(crate) fn can_login(endpoint: &DaemonEndpoint) -> bool {
-    endpoint.unix_path().is_none() && endpoint.resolved_passphrase().is_some()
+    endpoint.unix_path().is_none() && resolved_passphrase(endpoint).is_some()
 }
 
 /// A cached session wins, then a bearer token (`--auth=token`), then a fresh
@@ -123,9 +124,7 @@ pub(crate) async fn login(
     endpoint: &DaemonEndpoint,
     cache: &PassphraseSessionCache,
 ) -> Result<PassphraseSession, HttpError> {
-    let passphrase = endpoint
-        .resolved_passphrase()
-        .ok_or(HttpError::Unauthorized)?;
+    let passphrase = resolved_passphrase(endpoint).ok_or(HttpError::Unauthorized)?;
     let binding_secret = device_binding_secret(endpoint);
     let (client, url) = login_client(format!("{}/api/login", endpoint.base_url))?;
     let body = serde_json::json!({
@@ -168,9 +167,7 @@ pub(super) async fn elevate(
     cache: &PassphraseSessionCache,
 ) -> Result<(), HttpError> {
     let session = cache.get(endpoint).ok_or(HttpError::Unauthorized)?;
-    let passphrase = endpoint
-        .resolved_passphrase()
-        .ok_or(HttpError::Unauthorized)?;
+    let passphrase = resolved_passphrase(endpoint).ok_or(HttpError::Unauthorized)?;
     let (client, url) = login_client(format!("{}/api/login/elevate", endpoint.base_url))?;
     let body = serde_json::json!({ "passphrase": passphrase });
     let res = client
@@ -207,7 +204,7 @@ fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 fn device_binding_secret(endpoint: &DaemonEndpoint) -> String {
-    let Some(dir) = endpoint.session_cache_dir() else {
+    let Some(dir) = session_cache_dir(endpoint) else {
         return generate_binding_secret();
     };
     let path = dir.join(DEVICE_BINDING_FILENAME);
@@ -232,14 +229,14 @@ fn generate_binding_secret() -> String {
 }
 
 fn persist_session(endpoint: &DaemonEndpoint, session: &PassphraseSession) {
-    let Some(dir) = endpoint.session_cache_dir() else {
+    let Some(dir) = session_cache_dir(endpoint) else {
         return;
     };
     write_owner_only(&dir.join(SESSION_COOKIE_FILENAME), &session.cookie);
 }
 
 fn load_persisted(endpoint: &DaemonEndpoint) -> Option<PassphraseSession> {
-    let dir = endpoint.session_cache_dir()?;
+    let dir = session_cache_dir(endpoint)?;
     let binding_secret = std::fs::read_to_string(dir.join(DEVICE_BINDING_FILENAME)).ok()?;
     let binding_secret = binding_secret.trim().to_string();
     crate::server::login::decode_binding_secret(&binding_secret)?;
@@ -300,7 +297,7 @@ fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
+    use crate::daemon::Source;
 
     fn cached_endpoint() -> (
         crate::session::test_support::AppDirGuard,
@@ -314,7 +311,7 @@ mod tests {
             "cache-fixture",
         )]);
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
-        let cache_dir = endpoint.session_cache_dir().unwrap();
+        let cache_dir = session_cache_dir(&endpoint).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         (app, env, endpoint, cache_dir)
     }
@@ -650,7 +647,7 @@ pub(crate) mod test_daemon {
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
-    use crate::acp::client::discovery::{DaemonEndpoint, Source};
+    use crate::daemon::{DaemonEndpoint, Source};
 
     pub(crate) const PASSPHRASE: &str = "hunter2";
 

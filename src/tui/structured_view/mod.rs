@@ -30,12 +30,12 @@ use self::state::{
     ToastBanner, ToastKind,
 };
 use crate::acp::client::{
-    ensure_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
-    PluginCommandView, WsMessage, REPLAY_PAGE_SIZE,
+    ensure_daemon, ws_connect_with, HttpClient, HttpError, ManagerError, PluginCommandView,
+    WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
-use crate::daemon::{QueuedPromptEntry, WsError};
+use crate::daemon::{DaemonEndpoint, QueuedPromptEntry, WsError};
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -1882,7 +1882,7 @@ async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
+    use crate::daemon::Source;
 
     fn test_state() -> StructuredViewState {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);

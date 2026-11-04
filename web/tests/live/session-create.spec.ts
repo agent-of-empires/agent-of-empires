@@ -49,14 +49,12 @@ async function waitForReadOnlyDashboard(page: Page, serve: ServeHandle) {
 }
 
 test.describe("wizard", () => {
-  test("wizard with Use structured view on creates a structured_view session", async ({ page, spawnServe }) => {
-    // #1841: the structured view toggle defaults on for an ACP-capable agent.
+  test("wizard with Structured view selected creates a structured_view session", async ({ page, spawnServe }) => {
+    // #1841: Structured view is selected by default for an ACP-capable agent.
     const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
-    const acpToggle = wizard.getByRole("switch", {
-      name: "Use structured view",
-    });
+    const acpToggle = wizard.getByRole("radio", { name: "Structured view" });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
@@ -66,21 +64,16 @@ test.describe("wizard", () => {
     await waitForView(serve.baseUrl, sessions[0]!.id, "structured");
   });
 
-  test("wizard auto-approve starts Codex in full-access mode", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      acp: true,
-      extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" },
-    });
+  test("wizard Yolo mode starts Codex in full-access mode", async ({ page, spawnServe }) => {
+    const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" } });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
     await wizard.getByTestId("wizard-agent-row").click();
     await wizard.getByRole("button", { name: "codex", exact: true }).click();
     await wizard.getByRole("button", { name: "Done" }).click();
-    const autoApprove = wizard.getByRole("switch", {
-      name: "Auto-approve actions",
-    });
-    await autoApprove.click();
-    await expect(autoApprove).toBeChecked();
+    const yolo = wizard.getByRole("switch", { name: "Yolo mode" });
+    await yolo.click();
+    await expect(yolo).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
 
     await waitForStructuredView(page);

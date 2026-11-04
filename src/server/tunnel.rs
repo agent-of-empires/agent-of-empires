@@ -674,7 +674,7 @@ async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::F
 }
 
 /// How long turning the Funnel back off may take.
-const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Turns off the :443 Funnel a Tailscale start switched on, unless the start finishes.
 /// Every error return after `--bg` starts awaits [`Self::fail`]; `Drop` covers a start that was

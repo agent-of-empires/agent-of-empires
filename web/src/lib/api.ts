@@ -15,7 +15,9 @@ import type {
   ProjectInfo,
   ProjectOverrides,
   DockerStatusResponse,
+  CreateFailure,
   CreateProgress,
+  CreateStage,
   CreateSessionRequest,
   CreationTrustFingerprint,
   ImportableSession,
@@ -762,6 +764,11 @@ export interface PluginUpdateChangelog {
   more_url: string | null;
 }
 
+export interface PluginAgentIntegration {
+  tool: string;
+  command?: string;
+}
+
 /** Structured disclosure for a capability-expanding plugin update, mirroring the
  *  Rust `UpdateConsent`. Drives the consent modal. */
 export interface PluginUpdateConsent {
@@ -773,6 +780,7 @@ export interface PluginUpdateConsent {
   added_capabilities: string[];
   removed_capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   runtime_change: string | null;
   trust_downgrade: boolean;
@@ -849,6 +857,7 @@ export interface PluginInstallConsent {
   validation: string;
   capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   fingerprint: string;
 }
@@ -1958,8 +1967,10 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 // --- Wizard APIs ---
 
-export async function fetchAgents(): Promise<AgentInfo[]> {
-  return (await fetchJson<AgentInfo[]>("/api/agents")) ?? [];
+/** Null when the request failed, so callers can tell "no agents" from "unknown". */
+export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {
@@ -2148,7 +2159,13 @@ export async function updateProject(
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  return (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? { available: false, runtime: null };
+  return (
+    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
+      available: false,
+      runtime: null,
+      runtime_name: null,
+    }
+  );
 }
 
 /** The repo's hooks need approval before this session can be created
@@ -2245,6 +2262,9 @@ export async function reviewCreationTrust(
   }
 }
 
+// The Daemon's create stages; anything else from the wire is no stage.
+const CREATE_STAGES: readonly CreateStage[] = ["preparing", "starting_container", "running_hooks", "starting"];
+
 export async function createSession(body: CreateSessionRequest): Promise<{
   ok: boolean;
   error?: string;
@@ -2256,6 +2276,8 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   network?: boolean;
   /** A restarted daemon cannot tell whether the first attempt ran; retrying stops here. */
   outcomeUnknown?: boolean;
+  /** Set for any typed refusal other than the ones flagged above. */
+  failure?: CreateFailure;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
@@ -2283,7 +2305,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
     if (data.error === "create_outcome_unknown") {
       return { ok: false, error: data.message || "Whether the session was created is unknown.", outcomeUnknown: true };
     }
-    if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
+    if (data.error !== "hooks_need_trust") {
+      const message = data.message || `Server error (${res.status})`;
+      if (typeof data.error !== "string") return { ok: false, error: message };
+      const stage = CREATE_STAGES.find((known) => known === data.stage) ?? null;
+      const reference = typeof data.reference === "string" ? data.reference : res.headers.get("x-request-id");
+      return { ok: false, error: message, failure: { code: data.error, message, stage, reference } };
+    }
     return {
       ok: false,
       error: data.message || "Repository hooks require trust",
@@ -2589,6 +2617,15 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
 /** Restarts a sandboxed session on a new container from the current local image. */
 export async function recreateSessionContainer(id: string): Promise<{ ok: boolean; message?: string }> {
   return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/recreate-container`, { method: "POST" });
+}
+
+/** Restarts a session's Agent, replacing a running structured worker; the conversation resumes. */
+export async function restartSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
 }
 
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */

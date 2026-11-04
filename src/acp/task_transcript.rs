@@ -142,12 +142,18 @@ fn shared_watch() -> Arc<FileWatchService> {
 #[derive(Default)]
 pub(crate) struct ActiveTasks {
     owners: Mutex<HashMap<String, Arc<TaskOwner>>>,
+    /// Tasks `TaskStop` ended before any tailer followed them, as when the
+    /// result is replayed ahead of the resumed tailing.
+    stopped_early: Mutex<HashSet<String>>,
     publication: tokio::sync::Mutex<()>,
 }
 
 struct TaskOwner {
     tool_call_id: Option<String>,
+    /// Another launch took over the task: stop without reporting an end.
     cancellation: CancellationToken,
+    /// `TaskStop` killed the task: settle its agents, then report the end.
+    stop: CancellationToken,
 }
 
 impl ActiveTasks {
@@ -157,6 +163,28 @@ impl ActiveTasks {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// Ends `task_id` because `TaskStop` killed it. A following tailer
+    /// publishes the end itself; with none, the stop is kept for the resumed
+    /// tailer that registers next.
+    pub(crate) fn stop(&self, task_id: &str) {
+        match self.lock().get(task_id) {
+            Some(owner) => owner.stop.cancel(),
+            None => {
+                self.stopped_early
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(task_id.to_string());
+            }
+        }
+    }
+
+    fn take_early_stop(&self, task_id: &str) -> bool {
+        self.stopped_early
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(task_id)
     }
 
     fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
@@ -216,8 +244,15 @@ impl TaskTailer {
             let owner = Arc::new(TaskOwner {
                 tool_call_id: self.tool_call_id.clone(),
                 cancellation: CancellationToken::new(),
+                stop: CancellationToken::new(),
             });
             owners.insert(self.task_id.clone(), owner.clone());
+            // Under the owners lock, so a concurrent `stop` either finds this
+            // owner or leaves its marker here. A live launch supersedes a
+            // stale marker.
+            if self.active.take_early_stop(&self.task_id) && self.start == TailerStart::Resumed {
+                owner.stop.cancel();
+            }
             owner
         };
         let guard = ActiveGuard {
@@ -241,6 +276,7 @@ impl TaskTailer {
             });
             let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
+                () = owner.stop.cancelled() => Some(Utc::now()),
                 ended_at = self.follow() => ended_at,
             };
             ended.cancel();
@@ -699,11 +735,20 @@ mod tests {
 
     impl Fixture {
         async fn spawn_with(&self, watch: Arc<FileWatchService>, start: TailerStart) {
+            self.spawn_task("t-1", watch, start).await;
+        }
+
+        async fn spawn_task(
+            &self,
+            task_id: &str,
+            watch: Arc<FileWatchService>,
+            start: TailerStart,
+        ) {
             let _ = TaskTailer {
                 tool_call_id: Some("toolu_1".into()),
                 claude_home: Some(self.home.clone()),
                 watch,
-                task_id: "t-1".into(),
+                task_id: task_id.into(),
                 session_id: "sess".into(),
                 active: self.active.clone(),
                 event_tx: self.tx.as_ref().expect("sender kept").downgrade(),
@@ -753,6 +798,16 @@ mod tests {
             self.tx = None;
         }
 
+        async fn released_task(&self, task_id: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.active.lock().contains_key(task_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the tailer released its slot");
+        }
+
         async fn released(&self) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !self.active.is_empty() {
@@ -799,17 +854,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stopped_task_reports_one_end_and_releases_its_slot() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.spawn(TailerStart::Live).await;
+        f.parked().await;
+        f.active.stop("t-1");
+        match f.next().await {
+            Event::BackgroundTaskFinished { task_id, ended_at } => {
+                assert_eq!(task_id, "t-1");
+                assert!(ended_at.is_some());
+            }
+            other => panic!("expected BackgroundTaskFinished, got {other:?}"),
+        }
+        f.released().await;
+        f.active.stop("t-1");
+        assert!(
+            f.active.take_early_stop("t-1"),
+            "a stop with no tailer is kept"
+        );
+        f.append(&notification_line("t-1", Some("completed")));
+        f.drop_sender();
+        assert!(f.rx.recv().await.is_none(), "no second end event");
+    }
+
+    #[tokio::test]
+    async fn a_new_launch_forgets_an_earlier_stop_of_its_id() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        f.spawn(TailerStart::Live).await;
+        assert!(!f.active.take_early_stop("t-1"));
+        f.drop_sender();
+        f.released().await;
+    }
+
+    /// A task still open in the persisted log whose `TaskStop` result arrives
+    /// before tailing resumes ends Idle.
+    #[tokio::test]
+    async fn a_stop_before_resume_ends_the_persisted_task() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::session::Status;
+
+        let mut state = AcpState::new(
+            AcpSessionId("s-1".into()),
+            AgentName("aoe-agent".into()),
+            None,
+        );
+        let started = Event::BackgroundTaskStarted {
+            task_id: "t-1".into(),
+            tool_call_id: Some("toolu_1".into()),
+            description: String::new(),
+            workflow: None,
+        };
+        state.apply_event(1, started).unwrap();
+
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        f.spawn(TailerStart::Resumed).await;
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-1");
+        state.apply_event(2, finished).unwrap();
+        assert_eq!(state.sidebar_status(), Status::Idle);
+        f.released().await;
+    }
+
+    /// Stopping one of two tracked tasks leaves the other followed and the
+    /// session Running until it ends too.
+    #[tokio::test]
+    async fn a_stop_leaves_the_other_tracked_task_running() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::session::Status;
+
+        let mut state = AcpState::new(
+            AcpSessionId("s-1".into()),
+            AgentName("aoe-agent".into()),
+            None,
+        );
+        for (seq, id) in [(1, "t-1"), (2, "t-2")] {
+            let started = Event::BackgroundTaskStarted {
+                task_id: id.into(),
+                tool_call_id: Some("toolu_1".into()),
+                description: String::new(),
+                workflow: None,
+            };
+            state.apply_event(seq, started).unwrap();
+        }
+
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        for id in ["t-1", "t-2"] {
+            f.spawn_task(id, FileWatchService::new().unwrap(), TailerStart::Live)
+                .await;
+            f.parked().await;
+        }
+        f.active.stop("t-1");
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-1");
+        state.apply_event(3, finished).unwrap();
+        f.released_task("t-1").await;
+        assert!(f.active.lock().contains_key("t-2"), "t-2 is still followed");
+        assert_eq!(state.sidebar_status(), Status::Running);
+
+        f.append(&notification_line("t-2", Some("completed")));
+        let finished = f.next().await;
+        assert_eq!(finished_id(finished.clone()), "t-2");
+        state.apply_event(4, finished).unwrap();
+        assert_eq!(state.sidebar_status(), Status::Idle);
+        f.released().await;
+    }
+
+    #[tokio::test]
+    async fn a_workflow_stopped_before_resume_settles_its_agents() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        f.active.stop("t-1");
+        spawn_workflow_tailer(&f).await;
+        assert_agent_settled_then_finished(&mut f).await;
+    }
+
+    #[tokio::test]
     async fn a_notification_before_the_tailer_started_is_still_found() {
         let mut f = fixture(&notification_line("t-1", Some("failed")));
         f.spawn(TailerStart::Live).await;
         assert_eq!(finished_id(f.next().await), "t-1");
     }
 
-    /// A resumed workflow run whose journal is gone settles the agents the log
-    /// recorded before the task reports its end.
-    #[tokio::test]
-    async fn a_workflow_run_settles_its_agents_before_it_finishes() {
-        let mut f = fixture(&notification_line("t-1", Some("completed")));
+    /// A resumed run of workflow `t-1` with agent `a1` open and no journal.
+    async fn spawn_workflow_tailer(f: &Fixture) {
         let tx = f.tx.as_ref().expect("sender kept").downgrade();
         let _ = TaskTailer {
             tool_call_id: Some("toolu_1".into()),
@@ -841,12 +1009,32 @@ mod tests {
         }
         .spawn(None)
         .await;
+    }
+
+    async fn assert_agent_settled_then_finished(f: &mut Fixture) {
         assert!(matches!(
             f.next().await,
             Event::BackgroundAgentCompleted { agent_id, status: crate::acp::state::BackgroundAgentStatus::Detached, .. }
                 if agent_id == "a1"
         ));
         assert_eq!(finished_id(f.next().await), "t-1");
+    }
+
+    /// A resumed workflow run whose journal is gone settles the agents the log
+    /// recorded before the task reports its end.
+    #[tokio::test]
+    async fn a_workflow_run_settles_its_agents_before_it_finishes() {
+        let mut f = fixture(&notification_line("t-1", Some("completed")));
+        spawn_workflow_tailer(&f).await;
+        assert_agent_settled_then_finished(&mut f).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_workflow_settles_its_agents_before_it_finishes() {
+        let mut f = fixture("{\"type\":\"user\"}\n");
+        spawn_workflow_tailer(&f).await;
+        f.active.stop("t-1");
+        assert_agent_settled_then_finished(&mut f).await;
     }
 
     #[tokio::test]

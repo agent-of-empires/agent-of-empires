@@ -43,6 +43,10 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
+    /// Set from an import's `session/load` until the first prompt, when
+    /// replayed user messages are the only record of them (#2276). Any other
+    /// `user_message_chunk` is the agent echoing a prompt already recorded.
+    pub(super) seed_user_replay: AtomicBool,
     /// Epoch-ms of the last inbound notification, for the resume-idle
     /// watchdog.
     pub(super) last_event_at: AtomicI64,
@@ -103,6 +107,7 @@ impl Shared {
             session_label,
             profile,
             suppress_history_replay: AtomicBool::new(false),
+            seed_user_replay: AtomicBool::new(false),
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
@@ -249,7 +254,13 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
-        let mut events = map_update_to_events(notification.update, self.profile);
+        let mut events = if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && !self.seed_user_replay.load(Ordering::Relaxed)
+        {
+            Vec::new()
+        } else {
+            map_update_to_events(notification.update, self.profile)
+        };
         events.extend(restored_wake_event);
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
@@ -322,6 +333,11 @@ impl Shared {
                 }
                 continue;
             }
+            // Only `TaskStop` ends a task here; the tailer publishes the end.
+            if let Event::BackgroundTaskFinished { task_id, .. } = &event {
+                self.bg_tasks.stop(task_id);
+                continue;
+            }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
                 break;
@@ -371,5 +387,53 @@ impl Shared {
             retained,
             "observed adapter rate-limit meta"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+
+    async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+        let shared = Shared::new(
+            event_tx,
+            "s-echo".to_string(),
+            &crate::acp::agent_profiles::CLAUDE,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+            None,
+        );
+        shared
+            .seed_user_replay
+            .store(seed_user_replay, Ordering::Relaxed);
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
+        shared
+            .handle_notification(
+                SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
+                true,
+            )
+            .await;
+        drop(shared);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn user_message_chunk_records_only_while_seeding_import_replay() {
+        // Live echo is already recorded locally (#5224); import replay is not.
+        assert!(user_echo_events(false).await.is_empty());
+        assert!(matches!(
+            user_echo_events(true).await.as_slice(),
+            [Event::UserPromptSent { text, .. }] if text == "hello"
+        ));
     }
 }

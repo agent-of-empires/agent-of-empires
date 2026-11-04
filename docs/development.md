@@ -72,7 +72,7 @@ Debug also uses an app-directory tmux socket, which `AOE_TMUX_SOCKET` overrides.
 
 ## Build cache across worktrees
 
-Each worktree has its own `target/`. Developers with many worktrees can opt into [kache](https://github.com/kunobi-ninja/kache), which shares dependency artifacts through a local content-addressed store. It is optional and unused by the repository, CI, Nix, and release builds.
+Each worktree has its own `target/`. Developers with many worktrees can opt into [kache](https://github.com/kunobi-ninja/kache), which shares dependency artifacts through a local content-addressed store. It is optional locally; CI uses it through `.github/actions/kache`, and Nix and release builds do not use it.
 
 ```sh
 cargo binstall kache
@@ -82,6 +82,19 @@ cargo build --all-features
 ```
 
 Install kache before exporting `RUSTC_WRAPPER`, to avoid a bootstrap loop, and unset the variable to disable it. The cache and the worktrees must share a filesystem for linking; crates with native linking may still rebuild. `kache monitor` and `kache stats` inspect it, and `scripts/verify-shared-target.sh` verifies shared artifacts.
+
+Maintainers can share artifacts through the `aoe-rust-kache` S3 bucket. Ask a maintainer with AWS access for an access key for your `kache-<github-user>` IAM user, store it as the `aoe-kache` profile with `aws configure --profile aoe-kache`, then add this to `~/.config/kache/config.toml` and check it with `kache doctor`:
+
+```toml
+[cache.remote]
+type = "s3"
+bucket = "aoe-rust-kache"
+region = "us-east-1"
+prefix = "maint"
+profile = "aoe-kache"
+```
+
+Maintainer keys can only read and write `maint/`, so CI never consumes artifacts built on a laptop.
 
 ## Demo recordings
 
