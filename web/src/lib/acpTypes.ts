@@ -1391,12 +1391,12 @@ function closeWorkflowRun(
   return key ? { ...runs, [key]: { ...runs[key]!, finished: true, endedAt } } : runs;
 }
 
-/** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
 function endRestart(next: AcpState): void {
   next.restartInFlight = false;
   next.restartEpoch += 1;
 }
 
+/** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
 export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }
