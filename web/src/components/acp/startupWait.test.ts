@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { applyEvent, emptyAcpState, type AcpEvent } from "../../lib/acpTypes";
+import { reducer } from "../../hooks/acpSession/reducer";
 import { hasStartedBefore, isNewSessionStarting } from "./startupWait";
 
 type Connection = Parameters<typeof isNewSessionStarting>[1];
@@ -23,8 +24,12 @@ describe("isNewSessionStarting", () => {
     { AvailableCommandsUpdated: { commands: [] } },
   ];
   const assigned = replay(...beforeSessionNew, { AcpSessionAssigned: { acp_session_id: "acp-1" } });
+  const restarted = reducer(replay(...beforeSessionNew, { Stopped: { reason: "user_stopped" } }), {
+    kind: "restart_started",
+  });
   it.each<[string, Parameters<typeof isNewSessionStarting>, boolean]>([
     ["the Worker is starting a new Session", [state(), connection(), "resuming", false], true],
+    ["the startup line restarted the start", [restarted, connection(), "resuming", false], true],
     [
       "the first connection is opening",
       [state(), connection({ status: "connecting", hasEverOpened: false }), "absent", false],

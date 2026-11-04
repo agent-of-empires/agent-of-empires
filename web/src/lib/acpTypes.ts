@@ -564,6 +564,8 @@ export interface AcpState {
   lastSeq: number;
   /** `session/new` or `session/load` answered, so the Agent's session exists. */
   sessionAssigned: boolean;
+  /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
+  restartInFlight: boolean;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -906,6 +908,7 @@ export function emptyAcpState(): AcpState {
     optimisticRows: [],
     lastSeq: 0,
     sessionAssigned: false,
+    restartInFlight: false,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1122,8 +1125,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
       next.rateLimit = null;
     }
+    // A restart stops the old Worker as `user_stopped`; any other stop ends the restart.
+    if (event.Stopped.reason !== "user_stopped") next.restartInFlight = false;
     if (event.Stopped.reason === "user_stopped") {
-      next.workerStopped = true;
+      next.workerStopped = !state.restartInFlight;
       next.workerRestarting = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = false;
@@ -1160,6 +1165,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
+    next.restartInFlight = false;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1206,6 +1212,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AcpSessionAssigned" in event) {
     next.sessionAssigned = true;
+    next.restartInFlight = false;
     next.startupError = null;
     next.lastError = null;
     next.incompatibleAgent = null;

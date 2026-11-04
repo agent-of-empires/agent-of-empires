@@ -335,3 +335,32 @@ describe("prepend seam dedupe (#2711)", () => {
     expect(starts(next.activity, "call_X")).toHaveLength(1);
   });
 });
+
+describe("a restart of a start in progress", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
+  const restarted: Action = { kind: "restart_started" };
+  it.each<[string, Action[], boolean, boolean]>([
+    ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
+    ["its stop applied after doesn't either", [restarted, stop(1)], false, true],
+    [
+      "a real Stop after the replacement is assigned latches again",
+      [stop(1), restarted, frame(2, { AcpSessionAssigned: { acp_session_id: "acp-2" } }), stop(3)],
+      true,
+      false,
+    ],
+    [
+      "a startup error ends it",
+      [restarted, frame(1, { AgentStartupError: { message: "boom" } }), stop(2)],
+      true,
+      false,
+    ],
+    ["another stop ends it", [restarted, stop(1, "idle_auto_stop"), stop(2)], true, false],
+  ])("%s", (_label, actions, workerStopped, restartInFlight) => {
+    const state = run(empty(), ...actions);
+    expect([state.workerStopped, state.restartInFlight]).toEqual([workerStopped, restartInFlight]);
+  });
+});

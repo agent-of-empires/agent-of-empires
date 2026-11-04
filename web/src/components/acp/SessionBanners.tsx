@@ -20,6 +20,7 @@ export function SessionBanners({
   dismissError,
   startingAgent,
   canRestart,
+  onRestarted,
 }: {
   sessionId: string;
   state: AcpState;
@@ -27,6 +28,7 @@ export function SessionBanners({
   startingAgent: string | null;
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart: boolean;
+  onRestarted?: () => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -68,8 +70,10 @@ export function SessionBanners({
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
-          promptPending={state.turnActive || state.queuedPrompts.length > 0}
+          sentPending={state.turnActive}
+          queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
+          onRestarted={onRestarted}
         />
       ) : (
         acpWorkerState === "resuming" &&
@@ -108,14 +112,19 @@ const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce
 export function StartupWaitLine({
   sessionId,
   agent,
-  promptPending,
+  sentPending,
+  queuedPending,
   canRestart,
+  onRestarted,
 }: {
   sessionId: string;
   agent: string;
-  /** A sent or queued prompt waits on this start; a restart stops it. */
-  promptPending: boolean;
+  /** A sent prompt waits on this start; a restart stops it. */
+  sentPending: boolean;
+  /** Queued prompts wait on this start; the Daemon sends them to the replacement. */
+  queuedPending: boolean;
   canRestart: boolean;
+  onRestarted?: () => void;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
@@ -135,10 +144,17 @@ export function StartupWaitLine({
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
   const restart = async () => {
     if (!(await respawn())) return;
+    onRestarted?.();
     setStartedAt(Date.now());
     setSeconds(0);
   };
   const costId = useId();
+  const cost = [
+    sentPending && `Restarting stops the message you sent. Send it again once ${agent} is ready.`,
+    queuedPending && `Queued messages are sent once ${agent} is ready.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
   const offerRestart =
     canRestart && (seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed");
   return (
@@ -162,17 +178,17 @@ export function StartupWaitLine({
           data-testid="startup-wait-restart"
           onClick={() => void restart()}
           disabled={restartState === "retrying"}
-          aria-describedby={promptPending ? costId : undefined}
+          aria-describedby={cost ? costId : undefined}
           className={`${SECONDARY_BUTTON} shrink-0`}
         >
           {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
         </button>
       )}
-      {offerRestart && promptPending && (
+      {offerRestart && cost && (
         <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
-          Restarting stops the message you sent. Send it again once {agent} is ready.
+          {cost}
         </span>
-      )}
+      )}{" "}
       {restartState === "failed" && restartError && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
           Restart failed: {restartError}
