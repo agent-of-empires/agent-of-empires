@@ -815,8 +815,7 @@ export function SessionWizard({
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
-  const formReady =
-    defaultsReady && (nameOnly || agentsStatus === "ready") && !profileSwitching && !projectUnresolved;
+  const formReady = defaultsReady && (nameOnly || agentsStatus === "ready") && !profileSwitching && !projectUnresolved;
   const canResend = launchEligible(d, { ready: formReady, offline, nameOnly });
   const canResendRef = useRef(canResend);
   useEffect(() => {
