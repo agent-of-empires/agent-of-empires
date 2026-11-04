@@ -145,16 +145,26 @@ export function StartupWaitLine({
   }, [still]);
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  // The restart's own stop clears `sentPending`, so remember the stopped message until it is sent again.
+  const [sentStopped, setSentStopped] = useState(false);
+  const [sentBefore, setSentBefore] = useState(sentPending);
+  if (sentPending !== sentBefore) {
+    setSentBefore(sentPending);
+    if (sentPending) setSentStopped(false);
+  }
   const restart = async () => {
     const epoch = restartEpoch;
+    const stopsSent = sentPending;
     if (!(await respawn())) return;
     onRestarted?.(epoch);
+    if (stopsSent) setSentStopped(true);
     setStartedAt(Date.now());
     setSeconds(0);
   };
   const costId = useId();
   const cost = [
     sentPending && `Restarting stops the message you sent. Send it again once ${agent} is ready.`,
+    !sentPending && sentStopped && `The message you sent was stopped. Send it again once ${agent} is ready.`,
     queuedPending && `Queued messages are sent once ${agent} is ready.`,
   ]
     .filter(Boolean)

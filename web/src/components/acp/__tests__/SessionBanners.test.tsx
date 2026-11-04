@@ -238,6 +238,36 @@ describe("StartupWaitLine", () => {
     expect(onRestarted.mock.calls).toEqual([[0]]);
   });
 
+  it("keeps saying the sent message was stopped until it is sent again", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, text: () => Promise.resolve("") }));
+    const line = (sentPending: boolean) => (
+      <StartupWaitLine
+        sessionId="s1"
+        agent="Claude Code"
+        sentPending={sentPending}
+        queuedPending={false}
+        canRestart
+        restartEpoch={0}
+      />
+    );
+    const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
+    const { rerender } = render(line(true));
+    act(() => vi.advanceTimersByTime(30_000));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    });
+    // The restart's stop ends the sent turn; the replacement stalls too.
+    rerender(line(false));
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(cost()).toBe("The message you sent was stopped. Send it again once Claude Code is ready.");
+    rerender(line(true));
+    expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
+    rerender(line(false));
+    expect(cost()).toBeUndefined();
+  });
+
   it.each([
     [
       "warns that a sent prompt will be stopped",
