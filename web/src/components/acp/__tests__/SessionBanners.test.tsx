@@ -2,8 +2,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { emptyAcpState } from "../../../lib/acpTypes";
 import {
   ScheduledWakeupBanner,
+  SessionBanners,
   SnoozedWorkerStoppedBanner,
   StartupWaitLine,
   TrashedWorkerStoppedBanner,
@@ -118,7 +120,7 @@ describe("StartupWaitLine", () => {
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
     reducedMotion(false);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} canRestart />);
     expect(line().textContent).toContain("Starting Claude Code… You can type now.");
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
     act(() => vi.advanceTimersByTime(6_000));
@@ -143,7 +145,7 @@ describe("StartupWaitLine", () => {
   ])("%s", (_label, reduce) => {
     vi.useFakeTimers();
     reducedMotion(reduce);
-    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" promptPending={false} />);
+    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" promptPending={false} canRestart />);
     const glyph = () => line().firstElementChild!.textContent;
     const first = glyph();
     act(() => vi.advanceTimersByTime(180 * 4));
@@ -177,7 +179,7 @@ describe("StartupWaitLine", () => {
       text: () => Promise.resolve(status === 200 ? "" : "worker_not_stopped"),
     });
     vi.stubGlobal("fetch", spawn);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} canRestart />);
     const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
     expect(restart()).toBeNull();
@@ -203,10 +205,36 @@ describe("StartupWaitLine", () => {
   ])("Restart %s", (_label, promptPending, description) => {
     vi.useFakeTimers();
     reducedMotion(true);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={promptPending} />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={promptPending} canRestart />);
     act(() => vi.advanceTimersByTime(30_000));
     const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
     expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
+  });
+});
+
+describe("SessionBanners startup line", () => {
+  it.each([
+    ["offers Restart where the server allows it", true],
+    ["keeps only the elapsed line on read-only and CityHall dashboards", false],
+  ])("%s", (_label, canRestart) => {
+    vi.useFakeTimers();
+    render(
+      <SessionBanners
+        sessionId="s1"
+        state={{ ...emptyAcpState(), turnActive: true }}
+        startingAgent="Claude Code"
+        canRestart={canRestart}
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(31_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
+    expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
+    expect(screen.queryByTestId("startup-wait-restart-cost") !== null).toBe(canRestart);
   });
 });
