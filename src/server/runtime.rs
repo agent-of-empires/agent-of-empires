@@ -167,19 +167,35 @@ pub(crate) fn sandbox_reporter(
     let log = crate::migrations::progress::tracing_reporter();
     let reporter = Arc::new(move |event: crate::migrations::progress::Event| {
         log(event.clone());
-        let mut console = console.lock().expect("sandbox progress poisoned");
-        console.apply(event);
-        let activity = console.activity().unwrap_or_else(|| "finishing".into());
-        state.runtime.sandbox_progress.send_modify(|progress| {
-            if let Some(item) = progress
-                .iter_mut()
-                .find(|item| item.operation_id == operation_id)
-            {
-                item.activity = activity.chars().take(512).collect();
-            }
-        });
+        update_sandbox_progress(
+            &state.runtime.sandbox_progress,
+            &operation_id,
+            &console,
+            event,
+        );
     });
     (reporter, guard)
+}
+
+fn update_sandbox_progress(
+    progress: &watch::Sender<Vec<crate::daemon::SandboxProgress>>,
+    operation_id: &str,
+    console: &std::sync::Mutex<crate::migrations::progress::ConsoleProgress>,
+    event: crate::migrations::progress::Event,
+) {
+    let Ok(mut console) = console.lock() else {
+        return;
+    };
+    console.apply(event);
+    let activity = console.activity().unwrap_or_else(|| "finishing".into());
+    progress.send_modify(|progress| {
+        if let Some(item) = progress
+            .iter_mut()
+            .find(|item| item.operation_id == operation_id)
+        {
+            item.activity = activity.chars().take(512).collect();
+        }
+    });
 }
 
 impl NativeRuntime {
@@ -766,6 +782,57 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_progress_poison_keeps_last_activity_without_publishing() {
+        use crate::migrations::progress::{ConsoleProgress, Event};
+
+        let initial = crate::daemon::SandboxProgress {
+            operation_id: "copy".into(),
+            session_id: "session".into(),
+            profile: "test".into(),
+            activity: "starting".into(),
+        };
+        let (progress, mut receiver) = watch::channel(vec![initial]);
+        let console = std::sync::Mutex::new(ConsoleProgress::default());
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Started {
+                version: 27,
+                name: "isolate_sandbox_stores",
+                position: 1,
+                total: 1,
+            },
+        );
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Step("copying store".into()),
+        );
+        let previous = receiver.borrow_and_update().clone();
+        assert!(previous[0].activity.starts_with("copying store ("));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = console.lock().unwrap();
+            panic!("poison progress renderer");
+        });
+        assert!(poisoned.is_err());
+        assert!(console.is_poisoned());
+
+        for event in [
+            Event::Progress("discarded update".into()),
+            Event::Finished {
+                version: 27,
+                elapsed: Duration::from_secs(1),
+            },
+        ] {
+            update_sandbox_progress(&progress, "copy", &console, event);
+            assert_eq!(*receiver.borrow(), previous);
+            assert!(!receiver.has_changed().unwrap());
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

@@ -308,6 +308,7 @@ Activity is bounded display text, not a stable machine-readable phase. It may
 contain host paths, so only a Daemon-authorized local-owner stream receives this
 frame. TCP bearer clients, including loopback clients, and remote clients do not.
 Progress is not a canonical revision, completion receipt, or attachment grant.
+Display-update failures must not fail the migration.
 Use canonical snapshots and mutation receipts to settle the original operation;
 a disconnect does not cancel admitted work or authorize replay.
 
