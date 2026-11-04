@@ -27,6 +27,7 @@ describe("isNewSessionStarting", () => {
   const restarted = reducer(replay(...beforeSessionNew, { Stopped: { reason: "user_stopped" } }), {
     kind: "restart_started",
     epoch: 0,
+    stoppedSent: false,
   });
   it.each<[string, Parameters<typeof isNewSessionStarting>, boolean]>([
     ["the Worker is starting a new Session", [state(), connection(), "resuming", false], true],

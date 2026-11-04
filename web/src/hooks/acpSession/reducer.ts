@@ -55,7 +55,7 @@ export type Action =
   | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
-  | { kind: "restart_started"; epoch: number }
+  | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -283,7 +283,13 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // The restart already ended when `epoch` moved on; its replacement's stops are real.
       if (action.epoch !== state.restartEpoch) return state;
       // The stop this restart caused may already be applied; it isn't the Worker stopping.
-      return { ...state, workerStopped: false, workerRestarting: false, restartInFlight: true };
+      return {
+        ...state,
+        workerStopped: false,
+        workerRestarting: false,
+        restartInFlight: true,
+        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+      };
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };
     case "dismiss_rejected_prompt":
