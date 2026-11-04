@@ -1610,11 +1610,11 @@ describe("SessionWizard create failures", () => {
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
         release = () => answer({} as never);
       } else {
-        vi.mocked(fetchAgents).mockResolvedValueOnce([helper]);
+        vi.mocked(fetchProfileAgents).mockResolvedValueOnce([helper]);
         const { restore } = await backgroundFailure(failure("create_failed", "preparing", "boom"), "helper");
         expect(payload(0).view).toBe("structured");
         let answer!: (v: AgentInfo[]) => void;
-        vi.mocked(fetchAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        vi.mocked(fetchProfileAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
         render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
         release = () => answer([helper]);
       }
@@ -1655,7 +1655,7 @@ describe("SessionWizard create failures", () => {
   );
 
   it("a restored failure still says why its actions wait while the agent list fails", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue(null);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
     const restore = {
       data: { ...initialData, path: "/tmp/proj", tool: "claude" },
       failure: failure("create_failed", "preparing", "boom").failure,
