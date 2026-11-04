@@ -272,6 +272,7 @@ function AcpChrome({
         dismissError={ctx.dismissError}
         startingAgent={startingAgent}
         canRestart={!!view.canRestartAgent}
+        onRestarted={ctx.markRestartStarted}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">

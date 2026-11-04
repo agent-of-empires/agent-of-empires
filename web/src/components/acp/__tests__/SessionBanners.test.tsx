@@ -120,7 +120,7 @@ describe("StartupWaitLine", () => {
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
     reducedMotion(false);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} canRestart />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" sentPending={false} queuedPending={false} canRestart />);
     expect(line().textContent).toContain("Starting Claude Code… You can type now.");
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
     act(() => vi.advanceTimersByTime(6_000));
@@ -145,7 +145,9 @@ describe("StartupWaitLine", () => {
   ])("%s", (_label, reduce) => {
     vi.useFakeTimers();
     reducedMotion(reduce);
-    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" promptPending={false} canRestart />);
+    const { unmount } = render(
+      <StartupWaitLine sessionId="s1" agent="Codex" sentPending={false} queuedPending={false} canRestart />,
+    );
     const glyph = () => line().firstElementChild!.textContent;
     const first = glyph();
     act(() => vi.advanceTimersByTime(180 * 4));
@@ -179,7 +181,17 @@ describe("StartupWaitLine", () => {
       text: () => Promise.resolve(status === 200 ? "" : "worker_not_stopped"),
     });
     vi.stubGlobal("fetch", spawn);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={false} canRestart />);
+    const onRestarted = vi.fn();
+    render(
+      <StartupWaitLine
+        sessionId="s1"
+        agent="Claude Code"
+        sentPending={false}
+        queuedPending={false}
+        canRestart
+        onRestarted={onRestarted}
+      />,
+    );
     const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
     expect(restart()).toBeNull();
@@ -193,19 +205,41 @@ describe("StartupWaitLine", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
     expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
+    expect(onRestarted).toHaveBeenCalledTimes(failure === null ? 1 : 0);
   });
 
   it.each([
     [
-      "warns that a pending prompt will be stopped",
+      "warns that a sent prompt will be stopped",
       true,
+      false,
       "Restarting stops the message you sent. Send it again once Claude Code is ready.",
     ],
-    ["has no warning without a pending prompt", false, ""],
-  ])("Restart %s", (_label, promptPending, description) => {
+    [
+      "says queued messages still go to the replacement",
+      false,
+      true,
+      "Queued messages are sent once Claude Code is ready.",
+    ],
+    [
+      "says both when a sent and a queued prompt wait",
+      true,
+      true,
+      "Restarting stops the message you sent. Send it again once Claude Code is ready. Queued messages are sent once Claude Code is ready.",
+    ],
+    ["has no caption with nothing pending", false, false, ""],
+  ])("Restart %s", (_label, sentPending, queuedPending, description) => {
     vi.useFakeTimers();
     reducedMotion(true);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" promptPending={promptPending} canRestart />);
+    render(
+      <StartupWaitLine
+        sessionId="s1"
+        agent="Claude Code"
+        sentPending={sentPending}
+        queuedPending={queuedPending}
+        canRestart
+      />,
+    );
     act(() => vi.advanceTimersByTime(30_000));
     const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
