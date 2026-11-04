@@ -342,13 +342,27 @@ describe("a restart of a start in progress", () => {
     frame: { session_id: "s", seq, event },
   });
   const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
-  const restarted: Action = { kind: "restart_started" };
+  // Acknowledges a restart requested before any of these frames.
+  const restarted: Action = { kind: "restart_started", epoch: 0 };
+  const assigned = (seq: number) => frame(seq, { AcpSessionAssigned: { acp_session_id: "acp-2" } });
   it.each<[string, Action[], boolean, boolean]>([
     ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
     ["its stop applied after doesn't either", [restarted, stop(1)], false, true],
     [
       "a real Stop after the replacement is assigned latches again",
-      [stop(1), restarted, frame(2, { AcpSessionAssigned: { acp_session_id: "acp-2" } }), stop(3)],
+      [stop(1), restarted, assigned(2), stop(3)],
+      true,
+      false,
+    ],
+    [
+      "an acknowledgement landing after the assignment doesn't re-arm it",
+      [stop(1), assigned(2), restarted, stop(3)],
+      true,
+      false,
+    ],
+    [
+      "an acknowledgement landing after a startup error doesn't re-arm it",
+      [frame(1, { AgentStartupError: { message: "boom" } }), restarted, stop(2)],
       true,
       false,
     ],

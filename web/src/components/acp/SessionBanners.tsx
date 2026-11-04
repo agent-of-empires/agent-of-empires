@@ -28,7 +28,7 @@ export function SessionBanners({
   startingAgent: string | null;
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart: boolean;
-  onRestarted?: () => void;
+  onRestarted?: (epoch: number) => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -73,6 +73,7 @@ export function SessionBanners({
           sentPending={state.turnActive}
           queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
+          restartEpoch={state.restartEpoch}
           onRestarted={onRestarted}
         />
       ) : (
@@ -115,6 +116,7 @@ export function StartupWaitLine({
   sentPending,
   queuedPending,
   canRestart,
+  restartEpoch,
   onRestarted,
 }: {
   sessionId: string;
@@ -124,7 +126,8 @@ export function StartupWaitLine({
   /** Queued prompts wait on this start; the Daemon sends them to the replacement. */
   queuedPending: boolean;
   canRestart: boolean;
-  onRestarted?: () => void;
+  restartEpoch: number;
+  onRestarted?: (epoch: number) => void;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
@@ -143,8 +146,9 @@ export function StartupWaitLine({
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
   const restart = async () => {
+    const epoch = restartEpoch;
     if (!(await respawn())) return;
-    onRestarted?.();
+    onRestarted?.(epoch);
     setStartedAt(Date.now());
     setSeconds(0);
   };

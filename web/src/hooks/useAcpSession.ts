@@ -417,7 +417,7 @@ export function useAcpSession(
       dismissModeSwitchFailed: () => dispatch({ kind: "dismiss_mode_switch_failed" }),
       dismissSessionNotice: (id: string) => dispatch({ kind: "dismiss_session_notice", id }),
       dismissConfigOptionSwitchFailed: () => dispatch({ kind: "dismiss_config_option_switch_failed" }),
-      markRestartStarted: () => dispatch({ kind: "restart_started" }),
+      markRestartStarted: (epoch: number) => dispatch({ kind: "restart_started", epoch }),
     }),
     [],
   );
