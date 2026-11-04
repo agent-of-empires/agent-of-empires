@@ -25,7 +25,7 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -355,8 +355,11 @@ jobs:
 
   vitest:
     name: Vitest
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 15
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
@@ -461,8 +464,11 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
