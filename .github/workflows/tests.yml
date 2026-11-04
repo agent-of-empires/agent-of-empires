@@ -277,6 +277,7 @@ jobs:
             // Existing macOS-only bodies can change without touching their cfg.
             const exact = [
               'src/hooks/dir_guard.rs', 'src/server/api/system.rs',
+              'src/server/api/sessions/file_edit.rs', 'src/session/anchored_fs.rs',
               'src/session/mod.rs', 'src/sound/playback.rs',
               'src/tui/clipboard.rs', 'src/tui/open_url.rs',
               'src/session/config/container_config.rs',
