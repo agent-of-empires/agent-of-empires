@@ -31,7 +31,8 @@ import {
   makeRowFilter,
   renderedOrder,
   sunkViews,
-  uniqueWorkspaces,
+  visibleOrgRepos,
+  visibleSubgroups,
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
@@ -143,22 +144,26 @@ export function WorkspaceSidebar(props: Props) {
   const isNested = axis === "repo+group";
   const isOrgAxis = axis === "org";
 
-  const allWorkspaces = useMemo(() => uniqueWorkspaces(groups), [groups]);
-  const triage = useSidebarTriage(allWorkspaces);
   // Rows, not workspaces: the status axis renders a workspace once per bucket, and each row's
   // actions belong to its own session. Filtering keeps the selection, so ranges use `filtered`.
   const [orderedIds, rows] = useMemo(() => {
-    const rendered = isNested
+    const filteredAll = isNested
       ? filteredNested.flatMap((ng) => ng.subgroups)
       : isOrgAxis
         ? filteredOrgGroups.flatMap((og) => og.repos)
+        : filteredGroups;
+    // A collapsed repo or org hides its children, so a range must skip the rows it hides.
+    const rendered = isNested
+      ? visibleSubgroups(filteredNested, hasFilter)
+      : isOrgAxis
+        ? visibleOrgRepos(filteredOrgGroups, hasFilter)
         : filteredGroups;
     const every = isNested
       ? nestedGroups.flatMap((ng) => ng.subgroups)
       : isOrgAxis
         ? orgGroups.flatMap((og) => og.repos)
         : groups;
-    return [renderedOrder(rendered, hasFilter, sunkExpanded), every.flatMap((g) => g.workspaces)] as const;
+    return [renderedOrder(rendered, hasFilter, sunkExpanded, filteredAll), every.flatMap((g) => g.workspaces)] as const;
   }, [
     isNested,
     isOrgAxis,
@@ -171,6 +176,8 @@ export function WorkspaceSidebar(props: Props) {
     hasFilter,
     sunkExpanded,
   ]);
+  const tracked = useMemo(() => rows.map((row) => row.workspace), [rows]);
+  const triage = useSidebarTriage(tracked);
   const selection = useSidebarSelection({
     rows,
     orderedIds,
@@ -220,7 +227,7 @@ export function WorkspaceSidebar(props: Props) {
       onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
-      optimistic: triage.optimisticFor(v.workspace.id),
+      optimistic: triage.optimisticFor(v.workspace),
       onPinToggle: triage.pinToggle,
       onArchiveToggle: triage.archiveToggle,
       onSnooze: triage.snooze,

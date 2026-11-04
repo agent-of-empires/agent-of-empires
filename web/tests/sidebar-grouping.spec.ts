@@ -236,6 +236,49 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     await repoHeader.locator("button[aria-expanded]").click();
     await expect(page.locator("[data-testid='sidebar-nested-subgroup']")).toHaveCount(0);
   });
+
+  test("a Shift+click range skips the rows hidden under a collapsed repo", async ({ page }) => {
+    const sessions: MockSessionInput[] = ["a", "b", "c"].map((name) => ({
+      id: `s-${name}`,
+      title: `${name}-session`,
+      project_path: `/tmp/repo-${name}`,
+      branch: `feat/${name}`,
+      group: "feature",
+    }));
+    const archived: string[] = [];
+    await installSidebarMocks(page, { sessions });
+    await page.route("**/api/sessions/*/archive", async (route) => {
+      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
+      const input = sessions.find((s) => s.id === id);
+      archived.push(id);
+      await route.fulfill({
+        json: sessionResponse({
+          id,
+          title: input?.title,
+          project_path: input?.project_path,
+          branch: input?.branch,
+          group_path: input?.group ?? "",
+          ...input?.fields,
+        }),
+      });
+    });
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "repo+group");
+
+    // Hide repo B's row, then range from A to C across it.
+    const repoB = page.locator("[data-testid='sidebar-nested-repo'][data-repo-id='/tmp/repo-b']");
+    await repoB.locator(HEADER).first().locator("button[aria-expanded]").click();
+    await expect(page.getByText("b-session")).toBeHidden();
+
+    const row = (title: string) => page.locator(ROW).filter({ hasText: title });
+    await row("a-session").click({ modifiers: ["Meta"] });
+    await row("c-session").click({ modifiers: ["Shift"] });
+    await row("c-session").click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-bulk-archive").click();
+
+    await expect.poll(() => archived.length).toBe(2);
+    expect([...archived].sort()).toEqual(["s-a", "s-c"]);
+  });
 });
 
 test.describe("sidebar status axis (#4867)", () => {

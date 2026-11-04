@@ -1081,10 +1081,11 @@ impl HomeView {
             None => self.active_sessions_in_selected_group(),
         };
         // Trash wins over archive and keeps the flags it was trashed with, so archiving
-        // a member now would only change where it restores to. It also left the view.
+        // a member now would only change where it restores to. A member removed while the
+        // prompt was up has no row left at all. Skip both.
         let ids: Vec<String> = ids
             .into_iter()
-            .filter(|id| !self.instances.get(id).is_some_and(|i| i.is_trashed()))
+            .filter(|id| self.instances.get(id).is_some_and(|i| !i.is_trashed()))
             .collect();
         if ids.is_empty() {
             return Ok(());

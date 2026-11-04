@@ -50,10 +50,10 @@ describe("resolveActionTargets", () => {
 
   it("hides Start while an archive is pending, and allows it once unarchiving", () => {
     const stopped = [sibling("a", { status: "Stopped" }), sibling("b", { status: "Stopped", archived_at: "x" })];
-    const pending = (archived: boolean, archivedSessionId: string) => ({
+    const pending = (archived: boolean, sessionId: string) => ({
       ...EMPTY_OPTIMISTIC,
       archived,
-      archivedSessionId,
+      sessionId,
     });
     expect(ids(resolveActionTargets(stopped, pending(true, "a")).start)).toEqual([]);
     expect(ids(resolveActionTargets(stopped, pending(false, "b")).start)).toEqual(["a", "b"]);

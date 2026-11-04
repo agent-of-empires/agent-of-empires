@@ -3,8 +3,8 @@ import { useCallback, useState } from "react";
 import { setSessionArchive, setSessionPin, setSessionSnooze, setSessionUnread } from "../lib/api";
 import { reportError } from "../lib/toastBus";
 import {
-  EMPTY_OPTIMISTIC,
   makeOptimisticSnoozedUntil,
+  optimisticForRow,
   reconcileOptimistic,
   withOverride,
   type OptimisticTriage,
@@ -38,7 +38,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
   }, []);
 
   const optimisticFor = useCallback(
-    (workspaceId: string): OptimisticTriage => overlay.get(workspaceId) ?? EMPTY_OPTIMISTIC,
+    (workspace: Workspace): OptimisticTriage => optimisticForRow(overlay, workspace),
     [overlay],
   );
 
@@ -51,7 +51,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     ): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
-      setOverride(ws.id, optimistic);
+      setOverride(ws.id, { ...optimistic, sessionId });
       if (await call(sessionId)) return { workspaceId: ws.id, ok: true };
       setOverride(ws.id, revert);
       return { workspaceId: ws.id, ok: false };
@@ -66,12 +66,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const archive = useCallback(
     (ws: Workspace, archived: boolean) =>
-      triage(
-        ws,
-        { archived, archivedSessionId: ws.sessions[0]?.id ?? null },
-        { archived: null, archivedSessionId: null },
-        (id) => setSessionArchive(id, archived),
-      ),
+      triage(ws, { archived }, { archived: null }, (id) => setSessionArchive(id, archived)),
     [triage],
   );
 

@@ -1342,6 +1342,87 @@ fn status_group_archive_skips_members_trashed_while_the_prompt_was_up() {
     assert!(trashed.is_trashed() && !trashed.is_archived());
 }
 
+/// A session removed while the prompt was up has no row left to archive; submitting it would
+/// only surface a runtime-change error for a session that is gone.
+#[test]
+#[serial]
+fn status_group_archive_skips_members_removed_while_the_prompt_was_up() {
+    use crate::session::config::GroupByMode;
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut kept = Instance::new("kept", "/tmp/kept");
+    kept.status = Status::Running;
+    let mut gone = Instance::new("gone", "/tmp/gone");
+    gone.status = Status::Running;
+    let instances = vec![kept, gone];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Status;
+    view.flat_items = view.build_flat_items();
+
+    let running = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
+        .expect("Running header");
+    view.cursor = running;
+    view.update_selected();
+    view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
+    assert_eq!(
+        view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("archive_group")
+    );
+
+    let id_of = |view: &HomeView, title: &str| {
+        view.instances()
+            .find(|i| i.title == title)
+            .map(|i| i.id.clone())
+            .expect("seeded instance")
+    };
+    let kept_id = id_of(&view, "kept");
+    let gone_id = id_of(&view, "gone");
+    view.instances.shift_remove(&gone_id);
+    view.rebuild_flat_items();
+
+    let mut respond = view.session_feed.command_driver_for_test();
+    view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
+    assert!(view.confirm_dialog.is_none());
+
+    let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2,
+    }))
+    .unwrap();
+    assert!(
+        matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane)
+    );
+    assert_eq!(id, kept_id);
+    assert!(
+        respond(Ok(crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2
+        }))
+        .is_none(),
+        "a session removed while the prompt was up must not be archived"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_delete_group_with_sessions_updates_groups_field() {

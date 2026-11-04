@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { bucketSelectionForBulk, summarizeBulkResults } from "../sidebarBulk";
-import { EMPTY_OPTIMISTIC, withOverride } from "../sidebarOptimistic";
+import { EMPTY_OPTIMISTIC, optimisticForRow, withOverride } from "../sidebarOptimistic";
 import type { SessionResponse, Workspace } from "../types";
 
 function ws(id: string, over: Partial<SessionResponse>): Workspace {
@@ -39,9 +39,20 @@ describe("bucketSelectionForBulk", () => {
   it("respects an optimistic override over the server value", () => {
     const workspaces = [ws("w", {})];
     const overlay = new Map([["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })]]);
-    const b = bucketSelectionForBulk(workspaces, (id) => overlay.get(id) ?? EMPTY_OPTIMISTIC);
+    const b = bucketSelectionForBulk(workspaces, (workspace) => optimisticForRow(overlay, workspace));
     expect(b.pinnable).toHaveLength(0);
     expect(b.unpinnable.map((w) => w.id)).toEqual(["w"]);
+  });
+
+  it("keeps a sibling row eligible when an override targets the other session", () => {
+    const snoozed = ws("shared", { id: "a", snoozed_until: "2099-01-01T00:00:00Z" });
+    const live = ws("shared", { id: "b" });
+    const overlay = new Map([
+      ["shared", withOverride(EMPTY_OPTIMISTIC, { snoozedUntil: "2099-01-01T00:00:00Z", sessionId: "a" })],
+    ]);
+    const buckets = bucketSelectionForBulk([snoozed, live], (workspace) => optimisticForRow(overlay, workspace));
+    expect(buckets.unsnoozable.map((w) => w.sessions[0]!.id)).toEqual(["a"]);
+    expect(buckets.archivable.map((w) => w.sessions[0]!.id)).toEqual(["b"]);
   });
 });
 
