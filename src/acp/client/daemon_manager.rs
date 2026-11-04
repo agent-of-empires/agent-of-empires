@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
+use super::discovery::{discover, discover_env, DiscoveryError};
 use super::http::HttpError;
+use crate::daemon::DaemonEndpoint;
 
 #[derive(Debug, Error)]
 pub enum ManagerError {

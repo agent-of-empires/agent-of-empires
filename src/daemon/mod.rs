@@ -1,5 +1,8 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
+mod endpoint;
+pub use endpoint::{DaemonEndpoint, Source};
+
 mod error;
 pub use error::{ApiErrorCode, ERROR_CODE_HEADER, MANAGED_RESUME_CAUSE_HEADER};
 

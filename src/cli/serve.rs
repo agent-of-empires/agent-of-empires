@@ -1564,7 +1564,7 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
 pub(crate) async fn ensure_local_daemon(
     native_profile: Option<&str>,
     allow_start: bool,
-) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
+) -> Result<(crate::daemon::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let existing = match daemon_status() {
@@ -1609,7 +1609,7 @@ pub(crate) async fn ensure_local_daemon(
     } else {
         None
     };
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
@@ -1658,7 +1658,7 @@ pub(crate) async fn start_dashboard_for_tui(
     let instance = launch
         .instance_id
         .context("Successor instance proof is missing")?;
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let connection = crate::daemon::RuntimeConnection::connect(
@@ -1856,7 +1856,7 @@ async fn start_daemon(
         return Err(error);
     }
     drop(_state_lock);
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
