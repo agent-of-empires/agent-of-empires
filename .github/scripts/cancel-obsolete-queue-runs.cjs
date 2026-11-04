@@ -44,7 +44,7 @@ module.exports = async ({ github, context, core }) => {
     return sameWorkflow(run, current, repositoryId) &&
       candidate?.base === key.base && candidate.number === key.number &&
       run.run_number < current.run_number && run.head_sha !== current.head_sha &&
-      active.includes(run.status);
+      run.run_attempt === 1 && active.includes(run.status);
   };
   // Snapshot every page before cancelling: mutations can shift API pagination.
   const candidates = new Map();
