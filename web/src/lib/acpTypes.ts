@@ -566,6 +566,8 @@ export interface AcpState {
   sessionAssigned: boolean;
   /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
   restartInFlight: boolean;
+  /** Counts restarts ended by assignment, startup error or another stop, so a late acknowledgement is ignored. */
+  restartEpoch: number;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -909,6 +911,7 @@ export function emptyAcpState(): AcpState {
     lastSeq: 0,
     sessionAssigned: false,
     restartInFlight: false,
+    restartEpoch: 0,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1126,7 +1129,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.rateLimit = null;
     }
     // A restart stops the old Worker as `user_stopped`; any other stop ends the restart.
-    if (event.Stopped.reason !== "user_stopped") next.restartInFlight = false;
+    if (event.Stopped.reason !== "user_stopped") endRestart(next);
     if (event.Stopped.reason === "user_stopped") {
       next.workerStopped = !state.restartInFlight;
       next.workerRestarting = false;
@@ -1165,7 +1168,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    next.restartInFlight = false;
+    endRestart(next);
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1212,7 +1215,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AcpSessionAssigned" in event) {
     next.sessionAssigned = true;
-    next.restartInFlight = false;
+    endRestart(next);
     next.startupError = null;
     next.lastError = null;
     next.incompatibleAgent = null;
@@ -1389,6 +1392,11 @@ function closeWorkflowRun(
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
+function endRestart(next: AcpState): void {
+  next.restartInFlight = false;
+  next.restartEpoch += 1;
+}
+
 export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }

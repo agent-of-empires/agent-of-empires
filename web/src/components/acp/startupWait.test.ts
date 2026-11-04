@@ -26,6 +26,7 @@ describe("isNewSessionStarting", () => {
   const assigned = replay(...beforeSessionNew, { AcpSessionAssigned: { acp_session_id: "acp-1" } });
   const restarted = reducer(replay(...beforeSessionNew, { Stopped: { reason: "user_stopped" } }), {
     kind: "restart_started",
+    epoch: 0,
   });
   it.each<[string, Parameters<typeof isNewSessionStarting>, boolean]>([
     ["the Worker is starting a new Session", [state(), connection(), "resuming", false], true],

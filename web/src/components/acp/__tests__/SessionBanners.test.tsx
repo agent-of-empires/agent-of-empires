@@ -189,6 +189,7 @@ describe("StartupWaitLine", () => {
         sentPending={false}
         queuedPending={false}
         canRestart
+        restartEpoch={3}
         onRestarted={onRestarted}
       />,
     );
@@ -205,7 +206,36 @@ describe("StartupWaitLine", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
     expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
-    expect(onRestarted).toHaveBeenCalledTimes(failure === null ? 1 : 0);
+    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3]] : []);
+  });
+
+  it("acknowledges a restart with the epoch it was requested in", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    let respond!: (res: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise((resolve) => (respond = resolve))),
+    );
+    const onRestarted = vi.fn();
+    const line = (restartEpoch: number) => (
+      <StartupWaitLine
+        sessionId="s1"
+        agent="Claude Code"
+        sentPending={false}
+        queuedPending={false}
+        canRestart
+        restartEpoch={restartEpoch}
+        onRestarted={onRestarted}
+      />
+    );
+    const { rerender } = render(line(0));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    // The replacement is assigned before the restart request answers.
+    rerender(line(1));
+    await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
+    expect(onRestarted.mock.calls).toEqual([[0]]);
   });
 
   it.each([
@@ -238,6 +268,7 @@ describe("StartupWaitLine", () => {
         sentPending={sentPending}
         queuedPending={queuedPending}
         canRestart
+        restartEpoch={0}
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
