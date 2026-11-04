@@ -28,7 +28,7 @@ export function SessionBanners({
   startingAgent: string | null;
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart: boolean;
-  onRestarted?: (epoch: number) => void;
+  onRestarted?: (epoch: number, stoppedSent: boolean) => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -74,6 +74,7 @@ export function SessionBanners({
           queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
           restartEpoch={state.restartEpoch}
+          sentStopped={state.restartStoppedSent}
           onRestarted={onRestarted}
         />
       ) : (
@@ -117,6 +118,7 @@ export function StartupWaitLine({
   queuedPending,
   canRestart,
   restartEpoch,
+  sentStopped,
   onRestarted,
 }: {
   sessionId: string;
@@ -127,7 +129,9 @@ export function StartupWaitLine({
   queuedPending: boolean;
   canRestart: boolean;
   restartEpoch: number;
-  onRestarted?: (epoch: number) => void;
+  /** A restart stopped the sent message and it hasn't been sent again. */
+  sentStopped: boolean;
+  onRestarted?: (epoch: number, stoppedSent: boolean) => void;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
@@ -145,19 +149,11 @@ export function StartupWaitLine({
   }, [still]);
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-  // The restart's own stop clears `sentPending`, so remember the stopped message until it is sent again.
-  const [sentStopped, setSentStopped] = useState(false);
-  const [sentBefore, setSentBefore] = useState(sentPending);
-  if (sentPending !== sentBefore) {
-    setSentBefore(sentPending);
-    if (sentPending) setSentStopped(false);
-  }
   const restart = async () => {
     const epoch = restartEpoch;
     const stopsSent = sentPending;
     if (!(await respawn())) return;
-    onRestarted?.(epoch);
-    if (stopsSent) setSentStopped(true);
+    onRestarted?.(epoch, stopsSent);
     setStartedAt(Date.now());
     setSeconds(0);
   };

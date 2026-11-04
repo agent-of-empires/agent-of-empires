@@ -346,7 +346,7 @@ describe("a restart of a start in progress", () => {
   });
   const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
   // Acknowledges a restart requested before any of these frames.
-  const restarted: Action = { kind: "restart_started", epoch: 0 };
+  const restarted: Action = { kind: "restart_started", epoch: 0, stoppedSent: false };
   const assigned = (seq: number) => frame(seq, { AcpSessionAssigned: { acp_session_id: "acp-2" } });
   it.each<[string, Action[], boolean, boolean]>([
     ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
@@ -379,5 +379,15 @@ describe("a restart of a start in progress", () => {
   ])("%s", (_label, actions, workerStopped, restartInFlight) => {
     const state = run(empty(), ...actions);
     expect([state.workerStopped, state.restartInFlight]).toEqual([workerStopped, restartInFlight]);
+  });
+
+  const stoppedSent: Action = { kind: "restart_started", epoch: 0, stoppedSent: true };
+  it.each<[string, Action[], boolean]>([
+    ["a restart that stopped the sent prompt remembers it", [stop(1), stoppedSent], true],
+    ["a later restart that stopped nothing keeps it", [stoppedSent, restarted], true],
+    ["sending again clears it", [stoppedSent, frame(1, { UserPromptSent: { text: "hi" } })], false],
+    ["a late acknowledgement doesn't set it", [stop(1), assigned(2), stoppedSent], false],
+  ])("%s", (_label, actions, expected) => {
+    expect(run(empty(), ...actions).restartStoppedSent).toBe(expected);
   });
 });

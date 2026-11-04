@@ -2,7 +2,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { emptyAcpState } from "../../../lib/acpTypes";
+import { useReducer } from "react";
+
+import { emptyAcpState, type AcpEvent } from "../../../lib/acpTypes";
+import { reducer, type Action } from "../../../hooks/acpSession/reducer";
+import { isNewSessionStarting } from "../startupWait";
 import {
   ScheduledWakeupBanner,
   SessionBanners,
@@ -190,6 +194,7 @@ describe("StartupWaitLine", () => {
         queuedPending={false}
         canRestart
         restartEpoch={3}
+        sentStopped={false}
         onRestarted={onRestarted}
       />,
     );
@@ -206,7 +211,7 @@ describe("StartupWaitLine", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
     expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
-    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3]] : []);
+    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3, false]] : []);
   });
 
   it("acknowledges a restart with the epoch it was requested in", async () => {
@@ -226,6 +231,7 @@ describe("StartupWaitLine", () => {
         queuedPending={false}
         canRestart
         restartEpoch={restartEpoch}
+        sentStopped={false}
         onRestarted={onRestarted}
       />
     );
@@ -235,37 +241,63 @@ describe("StartupWaitLine", () => {
     // The replacement is assigned before the restart request answers.
     rerender(line(1));
     await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
-    expect(onRestarted.mock.calls).toEqual([[0]]);
+    expect(onRestarted.mock.calls).toEqual([[0, false]]);
   });
 
-  it("keeps saying the sent message was stopped until it is sent again", async () => {
+  it("keeps saying the sent message was stopped when the restart's stop lands first and the replacement stalls", async () => {
     vi.useFakeTimers();
     reducedMotion(true);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, text: () => Promise.resolve("") }));
-    const line = (sentPending: boolean) => (
-      <StartupWaitLine
-        sessionId="s1"
-        agent="Claude Code"
-        sentPending={sentPending}
-        queuedPending={false}
-        canRestart
-        restartEpoch={0}
-      />
+    let respond!: (res: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise((resolve) => (respond = resolve))),
     );
-    const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
-    const { rerender } = render(line(true));
-    act(() => vi.advanceTimersByTime(30_000));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    const frame = (seq: number, event: AcpEvent): Action => ({
+      kind: "frame",
+      frame: { session_id: "s1", seq, event },
     });
-    // The restart's stop ends the sent turn; the replacement stalls too.
-    rerender(line(false));
+    let dispatch!: (action: Action) => void;
+    // The owner StructuredView gives SessionBanners: the line shows while the new Session is starting.
+    function Owner() {
+      const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
+      dispatch = send;
+      const connection = {
+        status: "open",
+        hasEverOpened: true,
+        reconnecting: false,
+        retryCount: 0,
+        maxRetries: 7,
+      } as const;
+      return (
+        <SessionBanners
+          sessionId="s1"
+          state={state}
+          startingAgent={isNewSessionStarting(state, connection, "resuming", false) ? "Claude Code" : null}
+          canRestart
+          onRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
+          acpWorkerState="resuming"
+          trashedAt={null}
+          archivedAt={null}
+          snoozedUntil={null}
+          dismissError={vi.fn()}
+        />
+      );
+    }
+    const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
+    render(<Owner />);
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
+    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    // The Daemon answers the restart only after the old Worker stopped, so its stop arrives first.
+    act(() => dispatch(frame(2, { Stopped: { reason: "user_stopped" } })));
+    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
+    await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
+    expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
+    // The replacement stalls too.
     act(() => vi.advanceTimersByTime(30_000));
     expect(cost()).toBe("The message you sent was stopped. Send it again once Claude Code is ready.");
-    rerender(line(true));
+    act(() => dispatch(frame(3, { UserPromptSent: { text: "hi" } })));
     expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
-    rerender(line(false));
-    expect(cost()).toBeUndefined();
   });
 
   it.each([
@@ -299,6 +331,7 @@ describe("StartupWaitLine", () => {
         queuedPending={queuedPending}
         canRestart
         restartEpoch={0}
+        sentStopped={false}
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
