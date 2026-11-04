@@ -101,6 +101,7 @@ fn resolve_served(
                 for p in plugin_entries(secret, route, &ctx.session_id, &[served]) {
                     out.served_by.insert(p.server.name.clone(), p.plugin_id);
                     out.servers.push(p.server);
+                    out.credentials.push(p.credential);
                 }
             }
             (McpEntry::Serve { served }, Err(_)) => {
@@ -480,6 +481,8 @@ mod tests {
         assert_eq!(out, Rewritten::from(servers));
     }
 
+    use crate::acp::mcp_rewrite::McpCredentialVar;
+    use crate::plugin::mcp_serve::credential_var_name;
     use crate::server::session_credential::McpSessionSecret;
     use std::collections::BTreeMap;
 
@@ -507,16 +510,33 @@ mod tests {
         name: &str,
         key: &str,
     ) -> ProjectMcpServer {
-        let credential = secret.plugin_server_credential_for(plugin, name, "s");
+        let value = secret.plugin_server_credential_for(plugin, name, "s");
+        let reference = format!("${{{}}}", credential_var_name(&value));
         ProjectMcpServer {
             name: key.into(),
             transport: ProjectMcpTransport::Http {
                 url: format!("{base}/mcp/plugins/{plugin}/{name}"),
                 headers: BTreeMap::from([
-                    ("Authorization".to_string(), format!("Bearer {credential}")),
+                    ("Authorization".to_string(), format!("Bearer {reference}")),
                     ("X-AoE-Session".to_string(), "s".to_string()),
                 ]),
             },
+        }
+    }
+
+    /// The credential variable `plugin_entries` mints for `plugin`/`name` in session `s`.
+    fn plugin_cred(
+        secret: &McpSessionSecret,
+        plugin: &str,
+        name: &str,
+        key: &str,
+    ) -> McpCredentialVar {
+        let value = secret.plugin_server_credential_for(plugin, name, "s");
+        McpCredentialVar {
+            name: credential_var_name(&value),
+            value,
+            owner: key.into(),
+            expected: plugin_http(secret, "http://127.0.0.1:4321", plugin, name, key).transport,
         }
     }
 
@@ -576,6 +596,10 @@ mod tests {
             Rewritten {
                 servers: vec![stdio("keep"), docs, fs],
                 served_by: served_by(&[("acme_a__docs", "acme.a"), ("fs", "acme.a")]),
+                credentials: vec![
+                    plugin_cred(&ep.secret, "acme.a", "docs", "acme_a__docs"),
+                    plugin_cred(&ep.secret, "acme.a", "fs", "fs"),
+                ],
             }
         );
         assert!(caller.serve_failures.lock().unwrap().is_empty());
@@ -617,6 +641,12 @@ mod tests {
                         "acme_a__docs",
                     )],
                     served_by: served_by(&[("acme_a__docs", "acme.b")]),
+                    credentials: vec![plugin_cred(
+                        &ep.secret,
+                        "acme.b",
+                        "acme_a__docs",
+                        "acme_a__docs",
+                    )],
                 },
             ),
         ];
@@ -795,6 +825,12 @@ mod tests {
         c.plugin_served = vec![crate::acp::mcp_rewrite::PluginServed {
             plugin_id: "acme.s".into(),
             server: injected.clone(),
+            credential: McpCredentialVar {
+                name: "AOE_PLUGIN_MCP_CRED_0".into(),
+                value: "fake".into(),
+                owner: "acme_s__docs".into(),
+                expected: injected.transport.clone(),
+            },
         }];
         let caller = FakeCaller::new(vec![
             Ok(json!({"add":[
@@ -879,6 +915,7 @@ mod tests {
                     plugin_http(&ep.secret, base, "acme.a", "fs", "fs")
                 ],
                 served_by: served_by(&[("fs", "acme.a")]),
+                credentials: vec![plugin_cred(&ep.secret, "acme.a", "fs", "fs")],
             }
         );
         assert!(caller.serve_failures.lock().unwrap().is_empty());
@@ -896,6 +933,7 @@ mod tests {
         c.plugin_served = vec![crate::acp::mcp_rewrite::PluginServed {
             plugin_id: "acme.a".into(),
             server: winner.clone(),
+            credential: plugin_cred(&ep.secret, "acme.a", "docs", "docs"),
         }];
         let caller = FakeCaller::new(vec![Ok(
             json!({"add":[{"name":"docs","serve":{"prefix":false}}]}),
@@ -914,6 +952,7 @@ mod tests {
             Rewritten {
                 servers: vec![plugin_http(&ep.secret, base, "acme.z", "docs", "docs")],
                 served_by: served_by(&[("docs", "acme.z")]),
+                credentials: vec![plugin_cred(&ep.secret, "acme.z", "docs", "docs")],
             }
         );
     }

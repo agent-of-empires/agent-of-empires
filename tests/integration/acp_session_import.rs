@@ -30,6 +30,7 @@ fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
         additional_dirs: vec![],
         provider_env: env,
         provider_routing: vec![],
+        mcp_credentials: Default::default(),
         host_environment: vec![],
         default_effort_explicit: false,
         default_effort: None,

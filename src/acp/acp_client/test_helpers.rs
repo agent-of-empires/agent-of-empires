@@ -42,6 +42,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -92,6 +93,7 @@ pub(super) fn reset_fake_spawn_config(
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "codex".into(),
         tool: "codex".into(),

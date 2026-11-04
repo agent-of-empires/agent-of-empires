@@ -75,6 +75,10 @@ pub struct SpawnConfig {
     /// outrank both, and a respawn that re-derives `host_environment` from
     /// `base_host_environment` must not drop it.
     pub provider_routing: Vec<(String, String)>,
+    /// `(variable, credential)` pairs the agent's MCP entries reference as `${variable}`.
+    /// Recomputed on every launch, and applied only to the agent process environment, which
+    /// other local users cannot read, unlike the command line the entries end up on.
+    pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
 }
 
 impl SpawnConfig {
@@ -302,11 +306,12 @@ fn apply_stdio_env(
     let mut keys = apply_env_filter(cmd.as_std_mut(), config, extra_path_dirs);
     // Last, so trusted operator config outranks request-sourced env, and the
     // session's provider pick outranks even that. The runner path carries both
-    // on `ACP_AGENT_ENV` instead.
+    // on `ACP_AGENT_ENV` instead. The minted MCP credentials come after all of them.
     for (key, value) in config
         .host_environment
         .iter()
         .chain(&config.provider_routing)
+        .chain(&config.mcp_credentials)
     {
         if let Some(reason) = host_environment_denyreason(key) {
             warn!(target: "acp", key = %key, reason, "rejecting configured host environment key");
@@ -743,6 +748,25 @@ mod tests {
             container_workdir: None,
         });
         assert!(inherited_host_env_pairs(&config).is_empty());
+    }
+
+    /// The minted MCP credentials land in the in-process agent's environment last.
+    #[test]
+    fn stdio_env_applies_mcp_credentials_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.host_environment = vec![("AOE_PLUGIN_MCP_CRED_01".into(), "operator".into())];
+        config.mcp_credentials = vec![(
+            "AOE_PLUGIN_MCP_CRED_01".to_string(),
+            "fake-credential".to_string(),
+        )]
+        .into();
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        apply_stdio_env(&mut cmd, &config, &[]);
+        assert_eq!(
+            effective_env_value(cmd.as_std(), "AOE_PLUGIN_MCP_CRED_01").as_deref(),
+            Some("fake-credential")
+        );
     }
 
     /// #5088: `claude-agent-acp` gets a summarized thinking default, other

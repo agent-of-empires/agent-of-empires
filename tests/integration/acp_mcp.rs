@@ -25,6 +25,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -126,6 +127,7 @@ enabled = false
             })
             .collect(),
         &[],
+        mcp_config::PluginCredentials::Literal(&[]),
     );
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-codex-disabled".into()))
@@ -181,7 +183,11 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
         .provider_env
         .push(("SHIM_MCP_CAPABILITY".into(), "http".into()));
     config.host_environment = session_env.clone();
-    config.mcp_servers = mcp_config::project_servers_to_acp(servers, &session_env);
+    config.mcp_servers = mcp_config::project_servers_to_acp(
+        servers,
+        &session_env,
+        mcp_config::PluginCredentials::Literal(&[]),
+    );
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-header-expansion".into()))
         .await
