@@ -21,8 +21,12 @@
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/PairedShellPane.test.tsx"],
-      "components": ["web/src/components/PairedTerminal.tsx"]
+      "specs": [
+        "src/components/__tests__/PairedShellPane.test.tsx",
+        "src/hooks/__tests__/usePairedTerminalReveal.test.ts"
+      ],
+      "components": ["web/src/components/PairedTerminal.tsx", "web/src/hooks/usePairedTerminalReveal.ts"],
+      "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock."
     },
     {
       "id": "app-shell.docks",
@@ -212,6 +216,14 @@
       "risk": "high",
       "specs": ["src/hooks/useLiveTerminal.test.ts"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/live-terminal/TermRow.tsx"]
+    },
+    {
+      "id": "terminal.live-pipe-contention-notice",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it."
     },
     {
       "id": "terminal.live-alt-screen-scroll",
@@ -1212,7 +1224,7 @@
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
         "web/src/components/session-wizard/steps/LaunchFields.tsx"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits; the unavailable Sandbox names the configured Container runtime from /api/docker/status."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -2479,6 +2491,18 @@
       "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
       "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
       "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
+    },
+    {
+      "id": "acp.thinking-row",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Summarized model thinking renders as a collapsed Thinking block in place among the reply's parts; adjacent chunks join, and a server-marked new thought or any other part splits them. Folding and grouping are covered by Rust transcript tests."
     },
     {
       "id": "acp.copy-message-markdown",
@@ -3855,9 +3879,10 @@
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
-        "web/src/components/acp/RecoveryActionRow.tsx"
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
+      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -4655,7 +4680,27 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
-      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "A signed-out label is a button opening the Agent's sign-in steps; Open Terminal and Restart Agent follow the server's terminal and mutation gates."
+    },
+    {
+      "id": "acp.sign-in-steps",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-sign-in-steps.spec.ts"],
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/components/acp/signInSteps.ts",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/hooks/usePairedShellModes.ts",
+        "web/src/hooks/usePairedTerminalReveal.ts"
+      ],
+      "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command. A sandboxed Session's open Host shell switches to a focused Container shell, and a collapsed dock whose active tab is the terminal is revealed."
     },
     {
       "id": "story.wizard-open-close",

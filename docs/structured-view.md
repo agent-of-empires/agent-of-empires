@@ -17,8 +17,8 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
-| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
-| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
+| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude auth login`, or `ANTHROPIC_API_KEY` |
+| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or `codex login` (`codex login --device-auth` in a Container) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` (deprecated) | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
@@ -49,6 +49,8 @@ Each built-in adapter receives only verified provider variables from the Daemon'
 | `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, and its verified provider, Vertex, Bedrock and AWS credential-chain keys. See the [adapter allowlists](https://github.com/agent-of-empires/agent-of-empires/blob/main/src/acp/install_hints.rs). |
 
 `vibe`, `pi`, `omp`, `kimi` and custom adapters have no ambient provider allowlist. Supply host auth through `extra_env`, `environment`, or opt-in `session.inherit_host_environment`. Sandbox auth uses `sandbox.environment`; whole-host inheritance never crosses that boundary. Verified provider keys can cross, but ambient file/directory selectors, including config roots and AWS credential files, cannot: managed config roots are already mounted at canonical container paths. Explicit `provider_env` values are separate from ambient filtering. Drops are logged under `acp` with the key and reason.
+
+The `claude` adapter also gets `CLAUDE_CODE_THINKING_DISPLAY=summarized`, so Opus 5 and Sonnet 5 stream a thinking summary into the transcript. To turn it off, set `CLAUDE_CODE_THINKING_DISPLAY=omitted` in `environment`, `sandbox.environment` or an inherited host value; exporting it only in the Daemon's shell does not override the default.
 
 ### Prime runtime ownership
 
@@ -121,7 +123,7 @@ aoe add . --agent codex --effort high
 ## Requirements
 
 - Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess); `aoe-agent` needs 22.6+ for `--experimental-strip-types` and declares `engines.node: >=22.6.0`.
-- For Claude Code, a `claude login` session.
+- For Claude Code, a `claude auth login` session.
 
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:
 

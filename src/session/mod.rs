@@ -120,7 +120,9 @@ pub(crate) use storage::observe_lock_contention_for_test;
 pub(crate) use storage::{
     duplicate_reports, reconcile_profile_duplicates, DuplicateIdReport, ProfileMovePlan,
 };
-pub(crate) use storage::{try_acquire_terminal_handoff_driver, TerminalHandoffDriver};
+pub(crate) use storage::{
+    try_acquire_terminal_handoff_driver, with_storages_locked, TerminalHandoffDriver,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

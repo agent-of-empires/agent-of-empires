@@ -779,6 +779,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Summarized model thinking. Never fed back as context.
+    AgentThoughtChunk {
+        text: String,
+        /// The ACP message this chunk belongs to; a change starts a new thought.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// aoe sent `session/cancel` and armed the escalation watchdog.
     CancelRequested {
         escalates_at: DateTime<Utc>,
@@ -1017,7 +1024,7 @@ impl AcpState {
                     .saturating_sub(Self::MAX_RECENT_DIFFS);
                 self.recent_diffs.drain(..excess);
             }
-            Event::ThinkingStarted => {
+            Event::ThinkingStarted | Event::AgentThoughtChunk { .. } => {
                 self.thinking = Some(ThinkingSignal {
                     started_at: Utc::now(),
                 });

@@ -1867,38 +1867,31 @@ async fn start_daemon(
     } else {
         std::time::Duration::from_secs(60)
     };
-    let deadline = tokio::time::Instant::now() + readiness;
-    let ready = tokio::time::timeout_at(deadline, async {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("Daemon exited before readiness: {status}");
-            }
-            if client.local_daemon_ready(pid).await.unwrap_or(false)
-                && daemon_pid() == Some(pid)
-                && launch
-                    .instance_id
-                    .as_deref()
-                    .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
-                && crate::process::process_birth_identity(pid)
-                    .is_ok_and(|current| current.as_ref() == Some(&birth))
-            {
-                return Ok::<(), anyhow::Error>(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
+    let log = stdio_redirect_path()
+        .map(|p| format!(" See {}.", p.display()))
+        .unwrap_or_default();
+    let ready = await_daemon_ready(
+        pid,
+        &log,
+        tokio::time::Instant::now() + readiness,
+        || Ok(child.try_wait()?),
+        || {
+            Box::pin(async {
+                client.local_daemon_ready(pid).await.unwrap_or(false)
+                    && daemon_pid() == Some(pid)
+                    && launch
+                        .instance_id
+                        .as_deref()
+                        .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                    && crate::process::process_birth_identity(pid)
+                        .is_ok_and(|current| current.as_ref() == Some(&birth))
+            })
+        },
+    )
     .await;
-    match ready {
-        Ok(Ok(())) => {}
-        result => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return match result {
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(anyhow::anyhow!("Daemon readiness timed out")),
-                Ok(Ok(())) => unreachable!(),
-            };
-        }
+    if let Err(error) = ready {
+        stop_unready_daemon(&mut child).await;
+        return Err(error);
     }
 
     if announce {
@@ -1906,6 +1899,64 @@ async fn start_daemon(
         println!("Stop with: aoe serve --stop");
     }
     Ok(())
+}
+
+/// Polls until `ready`, the child exits, or `deadline`. The deadline error is
+/// "unconfirmed" because the daemon may still have been starting.
+async fn await_daemon_ready<'a>(
+    pid: u32,
+    log: &str,
+    deadline: tokio::time::Instant,
+    mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
+    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let wait = tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(status) = exited()? {
+                anyhow::bail!("Daemon exited before readiness ({status}).{log}");
+            }
+            if ready().await {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    wait.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "Daemon startup remains unconfirmed after {}s (PID {pid}); stopping it.{log}",
+            started.elapsed().as_secs()
+        ))
+    })
+}
+
+/// Covers the Funnel guard's two sequential cleanup commands, each bounded by
+/// `FUNNEL_OFF_TIMEOUT`, plus margin.
+const UNREADY_DAEMON_GRACE: std::time::Duration = crate::server::tunnel::FUNNEL_OFF_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(std::time::Duration::from_secs(2));
+
+/// SIGTERM, then SIGKILL after the grace.
+async fn stop_unready_daemon(child: &mut std::process::Child) {
+    stop_child_within(child, UNREADY_DAEMON_GRACE).await;
+}
+
+async fn stop_child_within(child: &mut std::process::Child, grace: std::time::Duration) {
+    // A reaped child's pid may be reused, so signal only one `try_wait` shows still running.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let deadline = tokio::time::Instant::now() + grace;
+    while !matches!(child.try_wait(), Ok(Some(_))) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 async fn migrate_managed_launch(
@@ -2171,7 +2222,105 @@ pub fn cached_serve_mode_label() -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn daemon_readiness_outcomes() {
+        use std::os::unix::process::ExitStatusExt;
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let mut polls = 0;
+        await_daemon_ready(
+            7,
+            "",
+            far,
+            || Ok(None),
+            || {
+                polls += 1;
+                Box::pin(std::future::ready(polls == 3))
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = await_daemon_ready(
+            7,
+            " See /log.",
+            far,
+            || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
+            || Box::pin(async { false }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exited before readiness") && err.ends_with("See /log."),
+            "{err}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let err = await_daemon_ready(
+            7,
+            " See /log.",
+            deadline,
+            || Ok(None),
+            || Box::pin(async { false }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "Daemon startup remains unconfirmed after 105s (PID 7); stopping it. See /log."
+        );
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn an_already_exited_daemon_is_not_signalled() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Reap it as the readiness loop does, then keep the pid from a stale signal.
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let started = std::time::Instant::now();
+        stop_child_within(&mut child, std::time::Duration::from_secs(30)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn an_unready_daemon_is_stopped_within_the_grace() {
+        // The ready file is touched once the shell has installed its trap.
+        for (trap, kill_expected) in [("exit 0", false), ("", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let mut child = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"trap "$2" TERM; touch "$1"; while :; do sleep 0.05; done"#,
+                    "sh",
+                ])
+                .arg(&ready)
+                .arg(trap)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(std::time::Instant::now() < deadline, "shell never started");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let grace = std::time::Duration::from_millis(500);
+            let started = std::time::Instant::now();
+            stop_child_within(&mut child, grace).await;
+            let elapsed = started.elapsed();
+            assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+            if kill_expected {
+                assert!(elapsed >= grace, "{elapsed:?}");
+            } else {
+                assert!(elapsed < grace, "{elapsed:?}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cityhall_refusal_cannot_reflect_the_bearer_into_errors() {
