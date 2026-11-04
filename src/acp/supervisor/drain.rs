@@ -1078,7 +1078,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.host_environment = host_environment;
         }
 
-        config.mcp_servers = resolve_mcp_servers(
+        let resolved_mcp = resolve_mcp_servers(
             discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
@@ -1097,6 +1097,8 @@ impl<S: BroadcastSink> Drain<S> {
             "MCP re-resolution on respawn failed",
         )
         .await;
+        config.mcp_servers = resolved_mcp.servers;
+        config.mcp_credentials = resolved_mcp.credentials;
     }
 
     /// Route an archived, trashed or purged row through the stop path, so the cancellation retires
@@ -2860,10 +2862,9 @@ mod tests {
         };
         assert_eq!(server.name, "acme_a__docs");
         assert_eq!(server.url, "http://127.0.0.1:4321/mcp/plugins/acme.a/docs");
-        let bearer = format!(
-            "Bearer {}",
-            secret.plugin_server_credential_for("acme.a", "docs", "s-plugin")
-        );
+        let credential = secret.plugin_server_credential_for("acme.a", "docs", "s-plugin");
+        let var = crate::plugin::mcp_serve::credential_var_name(&credential);
+        let bearer = format!("Bearer ${{{var}}}");
         assert!(
             server
                 .headers
@@ -2871,6 +2872,12 @@ mod tests {
                 .any(|h| h.name == "Authorization" && h.value == bearer),
             "{:?}",
             server.headers
+        );
+        let want = vec![(var, credential)];
+        assert_eq!(
+            config.mcp_credentials,
+            want.into(),
+            "the respawn recomputes the pair from the derivation"
         );
         assert_eq!(
             rewriter.requests.lock().unwrap()[0]["servers"][0]["plugin"],

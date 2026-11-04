@@ -33,11 +33,78 @@ pub struct McpRewriteContext {
     pub unreachable_notified: Vec<String>,
 }
 
-/// A session entry for a server a plugin serves through the daemon.
+/// A session entry for a server a plugin serves through the daemon. The entry carries
+/// `credential.reference()` where the bearer goes, never the credential itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginServed {
     pub plugin_id: String,
     pub server: ProjectMcpServer,
+    pub credential: McpCredentialVar,
+}
+
+/// One minted plugin credential, held in the agent's environment as `name`. It belongs to
+/// exactly the entry `owner` whose transport is still `expected`, the transport aoe minted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpCredentialVar {
+    pub name: String,
+    pub value: String,
+    pub owner: String,
+    pub expected: ProjectMcpTransport,
+}
+
+impl McpCredentialVar {
+    /// The `${NAME}` form an MCP entry carries in place of the value.
+    pub fn reference(&self) -> String {
+        format!("${{{}}}", self.name)
+    }
+
+    /// Whether the entry is the one aoe minted this credential for, unmodified.
+    pub fn owns(&self, key: &str, transport: &ProjectMcpTransport) -> bool {
+        self.owner == key && self.expected == *transport
+    }
+}
+
+impl std::fmt::Debug for McpCredentialVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCredentialVar")
+            .field("name", &self.name)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `(variable, credential)` pairs for an agent's environment. Debug shows names only, so a
+/// `{:?}` of a spawn config cannot print a credential.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct McpCredentialEnv(Vec<(String, String)>);
+
+impl McpCredentialEnv {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<(String, String)>> for McpCredentialEnv {
+    fn from(pairs: Vec<(String, String)>) -> Self {
+        Self(pairs)
+    }
+}
+
+impl<'a> IntoIterator for &'a McpCredentialEnv {
+    type Item = &'a (String, String);
+    type IntoIter = std::slice::Iter<'a, (String, String)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for McpCredentialEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| k))
+            .finish()
+    }
 }
 
 impl McpRewriteContext {
@@ -469,6 +536,8 @@ pub fn apply_edit(entries: Vec<McpEntry>, edit: McpEdit) -> Vec<McpEntry> {
 pub struct Rewritten {
     pub servers: Vec<ProjectMcpServer>,
     pub served_by: BTreeMap<String, String>,
+    /// The credentials the hook-served entries reference.
+    pub credentials: Vec<McpCredentialVar>,
 }
 
 impl From<Vec<ProjectMcpServer>> for Rewritten {
@@ -476,6 +545,7 @@ impl From<Vec<ProjectMcpServer>> for Rewritten {
         Self {
             servers,
             served_by: BTreeMap::new(),
+            credentials: Vec::new(),
         }
     }
 }
@@ -765,6 +835,12 @@ mod tests {
         c.plugin_served = vec![PluginServed {
             plugin_id: "acme.a".into(),
             server: injected.clone(),
+            credential: McpCredentialVar {
+                name: "AOE_PLUGIN_MCP_CRED_0".into(),
+                value: "fake".into(),
+                owner: "acme_a__docs".into(),
+                expected: injected.transport.clone(),
+            },
         }];
         let replaced = http("acme_a__docs", "http://gateway/docs", &[]);
         let p = initial_params(&c, &[injected, stdio("ha", &[])]);

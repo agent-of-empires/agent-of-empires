@@ -86,6 +86,7 @@ fn spawn_config(
         claude_store_pin: None,
         base_host_environment: vec![],
         provider_routing: routing_for(provider),
+        mcp_credentials: Default::default(),
     }
 }
 
