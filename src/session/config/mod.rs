@@ -2624,6 +2624,17 @@ pub struct WorktreeConfig {
     )]
     pub workspace_path_template: String,
 
+    /// Create new worktree sessions inside a workspace directory even with one
+    /// repository, so more projects can be attached later without moving the
+    /// session.
+    #[serde(default)]
+    #[setting(
+        label = "Workspace by Default",
+        widget = "toggle",
+        web = "elevation:worktree config affects host filesystem"
+    )]
+    pub workspace_by_default: bool,
+
     /// Run `git submodule update --init --recursive` after creating a worktree
     /// when the checkout contains a `.gitmodules` file. Disable for repos with
     /// large or deeply-nested submodule trees that you don't need inside agent
@@ -2671,6 +2682,7 @@ impl Default for WorktreeConfig {
             auto_cleanup: true,
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
+            workspace_by_default: false,
             init_submodules: true,
             default_base_branch: None,
         }

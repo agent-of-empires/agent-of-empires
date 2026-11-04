@@ -103,6 +103,9 @@ pub struct CreateSessionBody {
     pub hook_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
+    /// Create the worktree inside a workspace directory even with no extra repos.
+    #[serde(default)]
+    pub workspace: bool,
     /// Repository names or paths override the shared base_branch.
     #[serde(default)]
     pub repo_bases: Vec<RepoBaseInput>,

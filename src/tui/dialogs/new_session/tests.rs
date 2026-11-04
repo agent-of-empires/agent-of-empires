@@ -1997,3 +1997,50 @@ fn inherited_modes_stop_where_the_form_does() {
         "no container runtime to sandbox in"
     );
 }
+
+#[test]
+fn workspace_toggle_follows_config_and_is_forced_by_extra_repos() {
+    for default in [false, true] {
+        let mut config = Config::default();
+        config.worktree.enabled = true;
+        config.worktree.workspace_by_default = default;
+        let dialog = NewSessionDialog::new_with_config(vec!["claude"], TEST_PATH.into(), config);
+        assert_eq!(dialog.workspace, default);
+    }
+
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    for _ in 0..WT_WORKSPACE_FIELD {
+        dialog.handle_key(key(KeyCode::Tab));
+    }
+    assert_eq!(dialog.worktree_config_focused_field, WT_WORKSPACE_FIELD);
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+    assert!(data.extra_repo_paths.is_empty());
+
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    let (col, row) = find(&draw(&mut dialog), "Workspace:");
+    dialog.handle_click(col, row);
+    assert!(dialog.workspace);
+    dialog.handle_click(col, row);
+    assert!(!dialog.workspace);
+
+    // Extra repos need a workspace, so the toggle reads on and ignores input.
+    dialog.workspace_repos = vec!["/repo/one".into()];
+    dialog.worktree_config_focused_field = WT_WORKSPACE_FIELD;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(!dialog.workspace);
+    assert!(screen_text(&draw(&mut dialog)).contains("required by extra repos"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+
+    // Without a worktree there is no workspace to make.
+    let mut dialog = single_tool_dialog();
+    dialog.workspace = true;
+    dialog.title = Input::new("t".to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(!data.workspace);
+}

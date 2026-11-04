@@ -7555,6 +7555,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            workspace: false,
             sandbox: true,
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,

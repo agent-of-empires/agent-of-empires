@@ -947,6 +947,7 @@ pub async fn create_session(
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
+        body.workspace = false;
         body.view = crate::session::View::Structured;
         // Fork and import resume an existing agent session and would bypass the
         // server-derived path and ACP gate, so they are not honored here.
@@ -989,6 +990,13 @@ pub async fn create_session(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "Cannot combine scratch with extra_repo_paths",
+        );
+    }
+    if body.workspace && !create_body_uses_worktree(&body) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "Workspace mode requires worktree mode",
         );
     }
     // The builder ignores `path` in scratch mode, but accepting both silently
@@ -1356,6 +1364,7 @@ pub async fn create_session(
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
+        workspace: body.workspace,
         repo_base_branches: body
             .repo_bases
             .into_iter()

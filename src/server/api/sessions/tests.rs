@@ -4259,6 +4259,27 @@ fn create_body_flags_resolve_worktree_scratch_and_seed_conflicts() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn create_rejects_a_workspace_without_a_worktree() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let (status, json) = post_create(
+        &state,
+        serde_json::json!({
+            "path": project.path().to_string_lossy(),
+            "tool": "claude",
+            "title": "ws",
+            "workspace": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["message"], "Workspace mode requires worktree mode");
+    assert!(state.instances.read().await.is_empty());
+}
+
 #[test]
 fn fork_from_rejects_ambiguous_parent_session_id() {
     let binding = |store: &str| crate::session::ConversationBinding {
