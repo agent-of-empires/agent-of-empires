@@ -1,5 +1,6 @@
-import type { AgentInfo, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
+import type { AgentInfo, CreateFailure, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
 import { normalizeProjectPathKey } from "../../lib/registeredProjects";
+import { failureFields } from "./createFailureView";
 import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -63,6 +64,8 @@ export interface WizardState {
   data: WizardData;
   isSubmitting: boolean;
   error: string | null;
+  /** A create the server refused, shown as the failure box instead of `error`. */
+  failure: CreateFailure | null;
   agents: AgentInfo[];
   /** Until "ready", which agents always run in Yolo mode is unknown. "missing": the profile is gone. */
   agentsStatus: "loading" | "ready" | "failed" | "missing";
@@ -83,6 +86,7 @@ export type Action =
   | { type: "SET_FIELD"; field: string; value: unknown }
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
+  | { type: "SUBMIT_FAILED"; failure: CreateFailure }
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string }
@@ -238,6 +242,14 @@ export function agentsView(
 }
 
 export function reducer(state: WizardState, action: Action): WizardState {
+  const next = reduce(state, action);
+  const { failure } = next;
+  if (failure && failure === state.failure && failureFields(failure).some((f) => next.data[f] !== state.data[f]))
+    return { ...next, failure: null };
+  return next;
+}
+
+function reduce(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
@@ -269,13 +281,15 @@ export function reducer(state: WizardState, action: Action): WizardState {
       };
     }
     case "SUBMIT_START":
-      return { ...state, isSubmitting: true, error: null };
+      return { ...state, isSubmitting: true, error: null, failure: null };
     case "SUBMIT_ERROR":
-      return { ...state, isSubmitting: false, error: action.error };
+      return { ...state, isSubmitting: false, error: action.error, failure: null };
+    case "SUBMIT_FAILED":
+      return { ...state, isSubmitting: false, error: null, failure: action.failure };
     case "SUBMIT_SUCCESS":
       return { ...state, isSubmitting: false };
     case "SUBMIT_CANCEL":
-      return { ...state, isSubmitting: false, error: null };
+      return { ...state, isSubmitting: false, error: null, failure: null };
     case "SET_AGENTS":
       return { ...state, agents: action.agents, agentsStatus: "ready", agentsFor: action.agentsFor };
     case "AGENTS_FAILED":

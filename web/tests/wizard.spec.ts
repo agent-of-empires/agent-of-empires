@@ -633,3 +633,95 @@ test.describe("View row", () => {
     });
   });
 });
+
+test.describe("create failure", () => {
+  for (const width of [1280, 375]) {
+    test(`a refused create shows its step, reference and a relaunch without Sandbox at ${width}px`, async ({
+      page,
+    }) => {
+      let refusals = 0;
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      const created = await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true } },
+        onCreate: (_body, route) =>
+          refusals++ === 0
+            ? route
+                .fulfill({
+                  status: 400,
+                  json: {
+                    error: "sandbox_unavailable",
+                    message: "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+                    stage: "starting_container",
+                    reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
+                  },
+                })
+                .then(() => true)
+            : undefined,
+      });
+      await page.setViewportSize({ width, height: width < 768 ? 812 : 900 });
+      const w = wizard(page);
+      await expect(switchNamed(page, "Run in a safe container")).toHaveAttribute("aria-checked", "true");
+      await launch(page);
+
+      const box = w.getByRole("alert").filter({ hasText: "The Sandbox couldn't start" });
+      await expect(box).toBeFocused();
+      await expect(box).toContainText("It failed while starting the container.");
+      await expect(box).toContainText("Reference 3f9c1a2b… · in debug.log");
+      await expect(w.getByTestId("wizard-sandbox-row")).toContainText("couldn't start");
+      const relaunch = box.getByRole("button", { name: "Launch without Sandbox" });
+      await expect(relaunch).toBeInViewport();
+      await expect(w.getByRole("button", { name: /Launch session/ })).toBeInViewport();
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+      const step = (await box.getByText("It failed while starting the container.").boundingBox())!;
+      expect(step.height).toBeLessThanOrEqual(2 * 24);
+
+      await relaunch.click();
+      await expect.poll(() => created.length).toBe(2);
+      expect(created[0]!.sandbox).toBeTruthy();
+      expect(created[1]!.sandbox).toBeFalsy();
+      expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+      await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    });
+  }
+
+  test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await startWizard(page, {
+      onCreate: async (_body, route) => {
+        await held;
+        await route.fulfill({
+          status: 400,
+          json: { error: "hook_failed", message: "An on_create hook exited with code 1.", stage: "running_hooks" },
+        });
+        return true;
+      },
+    });
+    await page.setViewportSize({ width: 375, height: 600 });
+    await launch(page);
+    await wizard(page).getByRole("button", { name: "Continue in background" }).click();
+    await expect(wizard(page)).toHaveCount(0);
+    await page.evaluate(() => {
+      for (let i = 1; i <= 15; i++) {
+        navigator.serviceWorker.dispatchEvent(
+          new MessageEvent("message", { data: { type: "aoe-push", payload: { title: `Earlier notice ${i}` } } }),
+        );
+      }
+    });
+    release();
+
+    const reopen = page.getByRole("button", { name: "Reopen" });
+    await expect(reopen).toBeInViewport();
+    const list = page.getByTestId("toast-list");
+    expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+    // The oldest is still reachable by scrolling the column.
+    await list.evaluate((el) => (el.scrollTop = 0));
+    await expect(page.getByText("Earlier notice 1", { exact: true })).toBeInViewport();
+  });
+});

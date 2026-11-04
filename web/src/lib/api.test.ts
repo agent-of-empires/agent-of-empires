@@ -1143,11 +1143,30 @@ describe("createSession errors", () => {
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
+  it.each([
+    ["the body's reference", { reference: "body-ref" }, { "x-request-id": "header-ref" }, "body-ref"],
+    ["the echoed request id without one", {}, { "x-request-id": "header-ref" }, "header-ref"],
+  ])("keeps the failure's code, stage and %s", async (_label, extra, headers, reference) => {
+    const failed = { error: "sandbox_unavailable", message: "Podman isn't running.", stage: "starting_container" };
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ ...failed, ...extra }), { status: 400, headers }));
+    expect((await api.createSession(body)).failure).toEqual({
+      code: "sandbox_unavailable",
+      message: "Podman isn't running.",
+      stage: "starting_container",
+      reference,
+    });
+  });
+
   it("maps plain JSON, text, and network errors", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),
+      new Response(JSON.stringify({ error: "create_failed", message: "nope", stage: "__proto__" }), { status: 400 }),
     );
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "nope" });
+    // An unknown stage reads as none, so the box never looks it up.
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "nope",
+      failure: { code: "create_failed", message: "nope", stage: null, reference: null },
+    });
     // A proxy's page is no verdict: the create may still be running behind it.
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
     expect(await api.createSession(body)).toMatchObject({ ok: false, network: true });
@@ -1161,7 +1180,11 @@ describe("createSession errors", () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(JSON.stringify({ error: "create_failures_full", message: "try later" }), { status: 503 }),
     );
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "try later" });
+    expect(await api.createSession(body)).toMatchObject({
+      ok: false,
+      error: "try later",
+      failure: { code: "create_failures_full" },
+    });
     fetchSpy.mockResolvedValueOnce(new Response("too large", { status: 413 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (413): too large" });
     // A restarted daemon that cannot see the first attempt: settled, and not a failure.
