@@ -77,8 +77,10 @@ pub struct AgentInfo {
     pub display_name: String,
     pub binary: String,
     pub host_only: bool,
-    /// The agent always runs in Yolo mode, so the wizard locks the switch on.
+    /// The agent always runs in Yolo mode in a terminal session, so the wizard locks the switch on.
     pub always_yolo: bool,
+    /// The same for a structured session, which can run a custom agent's own adapter instead.
+    pub acp_always_yolo: bool,
     pub installed: bool,
     pub install_hint: String,
     /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
@@ -180,7 +182,18 @@ fn build_custom_agent_infos(
                 display_name: name.clone(),
                 binary: name.clone(),
                 host_only: false,
-                always_yolo: crate::acp::runs_always_yolo(name, agent_acp_cmd, agent_detect_as),
+                always_yolo: crate::acp::runs_always_yolo(
+                    name,
+                    crate::session::View::Terminal,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
+                acp_always_yolo: crate::acp::runs_always_yolo(
+                    name,
+                    crate::session::View::Structured,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
                 installed: true,
                 install_hint: "Configured custom agent".to_string(),
                 oneshot_capable: false,
@@ -258,6 +271,7 @@ pub async fn list_agents(
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
                     always_yolo: crate::agents::is_always_yolo(a.name),
+                    acp_always_yolo: crate::agents::is_always_yolo(a.name),
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
@@ -289,6 +303,13 @@ pub async fn list_agents(
                 host_only: false,
                 always_yolo: crate::acp::runs_always_yolo(
                     integration.tool,
+                    crate::session::View::Terminal,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
+                acp_always_yolo: crate::acp::runs_always_yolo(
+                    integration.tool,
+                    crate::session::View::Structured,
                     agent_acp_cmd,
                     agent_detect_as,
                 ),
@@ -3650,19 +3671,30 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_agent_is_always_yolo_only_when_it_runs_an_always_yolo_base() {
+    fn a_custom_agent_is_always_yolo_only_in_the_views_that_run_an_always_yolo_base() {
         let custom = custom_agents(&[
             ("my-pi", "pi --profile work"),
             ("own-pi", "pi"),
             ("my-claude", "claude"),
+            ("my-settl", "settl"),
         ]);
-        let detect_as =
-            custom_agents(&[("my-pi", "pi"), ("own-pi", "pi"), ("my-claude", "claude")]);
+        let detect_as = custom_agents(&[
+            ("my-pi", "pi"),
+            ("own-pi", "pi"),
+            ("my-claude", "claude"),
+            ("my-settl", "settl"),
+        ]);
         let acp = custom_agents(&[("own-pi", "own-pi-acp")]);
         let entries = build_custom_agent_infos(&custom, &acp, &detect_as, &unrestricted());
-        for (name, expected) in [("my-pi", true), ("own-pi", false), ("my-claude", false)] {
+        // (terminal, structured): a terminal session runs the base CLI, a structured one its adapter.
+        for (name, expected) in [
+            ("my-pi", (true, true)),
+            ("own-pi", (true, false)),
+            ("my-claude", (false, false)),
+            ("my-settl", (true, false)),
+        ] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
-            assert_eq!(entry.always_yolo, expected, "{name}");
+            assert_eq!((entry.always_yolo, entry.acp_always_yolo), expected, "{name}");
         }
     }
 
