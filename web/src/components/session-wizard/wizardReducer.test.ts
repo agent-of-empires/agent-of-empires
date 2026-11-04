@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { CreateStage } from "../../lib/types";
 import { initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
 
 function makeState(data: Partial<WizardData> = {}): WizardState {
@@ -7,6 +8,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     data: { ...initialData, ...data },
     isSubmitting: false,
     error: null,
+    failure: null,
     agents: [],
     agentsStatus: "ready",
     groups: [],
@@ -393,5 +395,73 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
     expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
     const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
+  });
+});
+
+describe("submit failures", () => {
+  const failure = { code: "hook_failed", message: "m", stage: "running_hooks" as const, reference: "r" };
+  it.each<[string, Action, Partial<WizardState>]>([
+    ["a refused create is kept for the box", { type: "SUBMIT_FAILED", failure }, { failure, error: null }],
+    ["a new Launch clears it", { type: "SUBMIT_START" }, { failure: null, isSubmitting: true }],
+    ["a plain error replaces it", { type: "SUBMIT_ERROR", error: "e" }, { failure: null, error: "e" }],
+  ])("%s", (_label, action, expected) => {
+    const failed = reducer(makeState(), { type: "SUBMIT_FAILED", failure });
+    expect(reducer(action.type === "SUBMIT_FAILED" ? makeState() : failed, action)).toMatchObject(expected);
+  });
+
+  const field = (name: string, value: unknown): Action => ({ type: "SET_FIELD", field: name, value });
+  it.each<[string, string, CreateStage | null, Action, boolean]>([
+    [
+      "a new Project clears a missing Working directory",
+      "working_dir_missing",
+      null,
+      field("path", "/elsewhere"),
+      true,
+    ],
+    ["a new image clears a failed pull", "sandbox_image_pull_failed", null, field("sandboxImage", "img:2"), true],
+    [
+      "the Sandbox turned off clears an unavailable runtime",
+      "sandbox_unavailable",
+      null,
+      field("sandboxEnabled", false),
+      true,
+    ],
+    [
+      "a Profile that turns the Sandbox off clears an unavailable runtime",
+      "sandbox_unavailable",
+      null,
+      defaults({ sandboxEnabled: false, skipIfDirty: false }),
+      true,
+    ],
+    ["a new image leaves an unavailable runtime", "sandbox_unavailable", null, field("sandboxImage", "img:2"), false],
+    [
+      "the Sandbox leaves a missing Working directory",
+      "working_dir_missing",
+      null,
+      field("sandboxEnabled", false),
+      false,
+    ],
+    ["a new Project clears a failed hook", "hook_failed", null, field("path", "/elsewhere"), true],
+    [
+      "a new image clears a container that failed to start",
+      "create_failed",
+      "starting_container",
+      field("sandboxImage", "img:2"),
+      true,
+    ],
+    [
+      "a new image leaves a create that failed while preparing",
+      "create_failed",
+      "preparing",
+      field("sandboxImage", "img:2"),
+      false,
+    ],
+  ])("%s", (_label, code, stage, action, cleared) => {
+    const failure = { code, message: "m", stage, reference: "r" };
+    const failed = reducer(makeState({ path: "/repo", sandboxEnabled: true, sandboxImage: "img:1" }), {
+      type: "SUBMIT_FAILED",
+      failure,
+    });
+    expect(reducer(failed, action).failure).toBe(cleared ? null : failure);
   });
 });
