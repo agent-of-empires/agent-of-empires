@@ -231,7 +231,7 @@ describe("SessionWizard structured view payload", () => {
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
-    vi.mocked(fetchAgents).mockResolvedValueOnce([
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([
       agent("opencode", { acp_installed: true }),
       agent("claude", { acp_installed: true }),
     ]);
