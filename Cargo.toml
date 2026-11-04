@@ -109,7 +109,7 @@ unicode-segmentation = "1"
 # 0.2.3 widens U+FF9E/U+FF9F to one cell, which ratatui-core 0.1.2's `CellWidth`
 # already adds, so every halfwidth dakuten counts twice. Lift once ratatui-core
 # stops compensating.
-unicode-width = "=0.2.2"
+unicode-width = "=0.2.3"
 
 # Terminal spinners
 rattles = "0.3"
