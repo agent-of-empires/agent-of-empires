@@ -341,7 +341,7 @@ export async function ensureTerminal(
   signal?: AbortSignal,
 ): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  let waited = 0;
+  const deadline = Date.now() + TERMINAL_BUSY_BUDGET_MS;
   for (let delay = 250; ; delay = Math.min(delay * 2, 1000)) {
     if (signal?.aborted) return { ok: false, error: "aborted" };
     let result: EnsureSessionResult;
@@ -361,9 +361,9 @@ export async function ensureTerminal(
       if (signal?.aborted) return { ok: false, error: "aborted" };
       return { ok: false, message: e instanceof Error ? e.message : "Network error" };
     }
-    if (result.error !== "lifecycle_busy" || waited >= TERMINAL_BUSY_BUDGET_MS) return result;
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    waited += delay;
+    const remaining = deadline - Date.now();
+    if (result.error !== "lifecycle_busy" || remaining <= 0) return result;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(delay, remaining)));
   }
 }
 
