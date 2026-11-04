@@ -162,6 +162,16 @@ describe("leaving an import under structured_view off", () => {
 });
 
 describe("SET_FIELD mutual exclusion", () => {
+  it("switching agent drops the previous agent's seeded model and effort", () => {
+    const seeded = makeState({ tool: "pi", agentModel: "p/m", agentEffort: "high" });
+    expect(reducer(seeded, set("tool", "claude")).data).toMatchObject({
+      tool: "claude",
+      agentModel: "",
+      agentEffort: "",
+    });
+    expect(reducer(seeded, set("tool", "pi")).data).toMatchObject({ agentModel: "p/m", agentEffort: "high" });
+  });
+
   it("enabling scratch clears path sources, worktree, import id and a stale non-repo probe", () => {
     const seeded = makeState({
       path: "/old",

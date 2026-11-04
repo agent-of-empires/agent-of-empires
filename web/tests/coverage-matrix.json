@@ -1303,6 +1303,14 @@
       ]
     },
     {
+      "id": "wizard.agent-switch-model-reset",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/wizardReducer.test.ts"],
+      "components": ["web/src/components/session-wizard/wizardReducer.ts"],
+      "notes": "Switching the wizard agent clears the seeded model and effort so the create request omits them and the server uses the new agent's defaults; re-selecting the same agent keeps them."
+    },
+    {
       "id": "wizard.project-sandbox-override",
       "notes": "Tri-state project container defaults resolve from the acknowledged served or explicitly selected profile; registry retries preserve unknown versus empty, profile switches commit atomically, manual edits and host-only imports outrank late defaults, and saves preserve explicit false while omitting inherited values.",
       "kind": "vitest",
