@@ -73,8 +73,12 @@ test("Restart on the startup line replaces a start stuck in session/new", async 
   );
   const sent = events.findIndex((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
   expect(sent).toBeGreaterThanOrEqual(0);
-  expect(events[sent + 1]).toEqual({ Stopped: { reason: "user_stopped" } });
-  expect(events.slice(sent + 1).some((e) => "AcpSessionAssigned" in e)).toBe(true);
+  const after = events.slice(sent + 1);
+  const stop = after.findIndex((e) => "Stopped" in e);
+  expect(after[stop]).toEqual({ Stopped: { reason: "user_stopped" } });
+  // The replacement's initialize can log before the stop does; nothing else may.
+  expect(after.slice(0, stop).every((e) => "AuthStatusUpdated" in e || "PromptCapabilities" in e)).toBe(true);
+  expect(after.some((e) => "AcpSessionAssigned" in e)).toBe(true);
   expect(deliveries()).toBe(0);
 
   // The caption's advice: sending again reaches the replacement once.
