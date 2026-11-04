@@ -384,6 +384,10 @@ impl Session {
         prior_conversation: bool,
     ) -> Result<SessionId, agent_client_protocol::Error> {
         let label = self.shared.session_label.clone();
+        // An import or fork seeds an empty store from the replay.
+        if seed_history_replay {
+            self.shared.seed_user_replay.store(true, Ordering::Relaxed);
+        }
         let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
         // Lost resume context is announced only once a replacement succeeds.
         let mut context_reset_reason = initial_reset_reason(
@@ -461,9 +465,7 @@ impl Session {
             info!(target: "acp.protocol", session = %label, stored_id = %stored, "resuming session via session/load");
             // Set before sending: the adapter replays history during the load.
             // An import (#2276) has an empty store and wants the replay.
-            if seed_history_replay {
-                self.shared.seed_user_replay.store(true, Ordering::Relaxed);
-            } else {
+            if !seed_history_replay {
                 self.shared
                     .suppress_history_replay
                     .store(true, Ordering::Relaxed);
