@@ -157,6 +157,8 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   }
   // Any branch edit, even clearing it, stops the title mirror.
   if (field === "worktreeBranch") next.worktreeBranchDirty = true;
+  // The seeded model and effort belong to the previous agent; unset, the server uses the new agent's defaults.
+  if (field === "tool" && value !== data.tool) Object.assign(next, { agentModel: "", agentEffort: "" });
   if (field === "scratch" && value === true) {
     Object.assign(next, {
       path: "",
