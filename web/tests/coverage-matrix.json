@@ -24,9 +24,14 @@
       "specs": [
         "src/components/__tests__/PairedShellPane.test.tsx",
         "src/components/__tests__/LiveTerminalView.focus.test.tsx",
-        "src/hooks/__tests__/usePairedTerminalReveal.test.ts"
+        "src/hooks/__tests__/usePairedTerminalReveal.test.ts",
+        "src/lib/api.test.ts"
       ],
-      "components": ["web/src/components/PairedTerminal.tsx", "web/src/hooks/usePairedTerminalReveal.ts"],
+      "components": [
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/hooks/usePairedTerminalReveal.ts",
+        "web/src/lib/api.ts"
+      ],
       "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
