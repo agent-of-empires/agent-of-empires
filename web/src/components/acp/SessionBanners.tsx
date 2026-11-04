@@ -19,11 +19,14 @@ export function SessionBanners({
   onSwitchToTerminal,
   dismissError,
   startingAgent,
+  canRestart,
 }: {
   sessionId: string;
   state: AcpState;
   /** Set while a new Session starts: the Agent, as copy names it. */
   startingAgent: string | null;
+  /** False where the server refuses a restart: read-only and CityHall dashboards. */
+  canRestart: boolean;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -66,6 +69,7 @@ export function SessionBanners({
           sessionId={sessionId}
           agent={startingAgent}
           promptPending={state.turnActive || state.queuedPrompts.length > 0}
+          canRestart={canRestart}
         />
       ) : (
         acpWorkerState === "resuming" &&
@@ -105,11 +109,13 @@ export function StartupWaitLine({
   sessionId,
   agent,
   promptPending,
+  canRestart,
 }: {
   sessionId: string;
   agent: string;
   /** A sent or queued prompt waits on this start; a restart stops it. */
   promptPending: boolean;
+  canRestart: boolean;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
@@ -133,7 +139,8 @@ export function StartupWaitLine({
     setSeconds(0);
   };
   const costId = useId();
-  const offerRestart = seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed";
+  const offerRestart =
+    canRestart && (seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed");
   return (
     <div
       data-testid="startup-wait-line"
