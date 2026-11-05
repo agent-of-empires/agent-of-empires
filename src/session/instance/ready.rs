@@ -17,6 +17,8 @@ pub enum EnsureReadyOutcome {
     /// Resume failed ambiguously while trying to start or respawn the pane.
     /// The durable sid remains stored for an explicit retry.
     ResumeFailed { sid: String },
+    /// Readiness is unknown. No input may be sent on this outcome.
+    Indeterminate { cause: LaunchIndeterminateCause },
 }
 
 /// Errors `ensure_pane_ready` can return. Separating transient lifecycle
@@ -146,6 +148,9 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
+                StartOutcome::Indeterminate { cause } => {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause });
+                }
                 StartOutcome::Resumed
                 | StartOutcome::Fresh
                 | StartOutcome::FreshAfterFailedResume { .. } => {}
@@ -159,6 +164,9 @@ impl Instance {
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
+                }
+                StartOutcome::Indeterminate { cause } => {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause });
                 }
                 StartOutcome::Resumed
                 | StartOutcome::Fresh

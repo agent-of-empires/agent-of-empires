@@ -262,6 +262,33 @@ impl Instance {
         Ok(())
     }
 
+    pub(super) fn release_indeterminate_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) -> Result<()> {
+        let status = storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            if row.active_execution == self.active_execution {
+                row.capture_started_at = self.capture_started_at;
+                row.started_at = self.started_at;
+                row.launch_executable = self.launch_executable.clone();
+            }
+            row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(row.status)
+        })?;
+        self.lifecycle_reservation = None;
+        self.status = status;
+        Ok(())
+    }
+
     /// Publish the outcome of a creation that released its reservation when
     /// its registration window closed.
     ///

@@ -83,7 +83,7 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub use resume::ManagedResumeCause;
+pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use resume::{
     LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
 };
