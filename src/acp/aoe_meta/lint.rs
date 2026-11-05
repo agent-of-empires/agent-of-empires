@@ -44,6 +44,7 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
     let mut keys: HashMap<String, serde_json::Value> = HashMap::new();
     let mut leases: HashSet<String> = HashSet::new();
     let mut order: ArrivalOrder<Seen> = ArrivalOrder::default();
+    let mut session: Option<String> = None;
 
     for (index, line) in reader.lines().enumerate() {
         let n = index + 1;
@@ -62,6 +63,16 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
                 continue;
             }
         };
+
+        // A session/new result with a new id starts a fresh key space, as the
+        // runtime's reset commit does.
+        if let Some(id) = frame.pointer("/result/sessionId").and_then(|v| v.as_str()) {
+            if session.as_deref().is_some_and(|current| current != id) {
+                keys.clear();
+                order.session_reset();
+            }
+            session = Some(id.to_string());
+        }
 
         if let Some(meta) = frame
             .pointer("/result/_meta")
@@ -305,6 +316,28 @@ mod tests {
                 vec![
                     update(r#"{"v":1,"key":"a","ephemeral":true}"#),
                     update(r#"{"v":1,"key":"a","ephemeral":false}"#),
+                ],
+                false,
+                vec!["key_conflict"],
+            ),
+            (
+                "key reused for a different update after a new session",
+                vec![
+                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "key reused for a different update in the same session",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s1"}}"#.into(),
+                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
                 ],
                 false,
                 vec!["key_conflict"],
