@@ -162,9 +162,7 @@ worker cannot settle before the bounded shutdown wait, the endpoint returns a
 `503` settlement error and leaves the replacement admission to a retry. A
 separate `409 worker_not_stopped` response is used when the worker is still
 present after a successful shutdown wait. The restart request is runtime-owned,
-so disconnecting the HTTP client does not leave the session half-restarted. Web
-startup and Retry adoption of this endpoint are follow-up UI work; the current
-Retry flow still uses `/acp/spawn`.
+so disconnecting the HTTP client does not leave the session half-restarted.
 
 ## Agent switching
 

@@ -77,8 +77,19 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 // (text alone would drain a degraded prompt on reload), so none of them are persisted.
 function toPersistedState(state: AcpState): AcpState {
   const base: AcpState =
-    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0
-      ? { ...state, optimisticRows: [], inflightPromptIds: [] }
+    state.optimisticRows.length > 0 ||
+    state.inflightPromptIds.length > 0 ||
+    state.restartInFlight ||
+    state.restartStoppedSent ||
+    state.restartFailure !== null
+      ? {
+          ...state,
+          optimisticRows: [],
+          inflightPromptIds: [],
+          restartInFlight: false,
+          restartStoppedSent: false,
+          restartFailure: null,
+        }
       : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
