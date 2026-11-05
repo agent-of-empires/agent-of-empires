@@ -219,6 +219,11 @@ describe("applyEvent control state", () => {
       { turnActive: false, startupError: "boom" },
     ],
     [
+      "IntegrationLost closes the turn and surfaces the reason",
+      [prompt(), { IntegrationLost: { reason: { kind: "contract_violation", detail: "bad key" } } }],
+      { turnActive: false, startupError: "Agent integration lost: bad key" },
+    ],
+    [
       "a reset after a prompt arms the primer",
       [usage(100), prompt(), reset("bad id")],
       {
