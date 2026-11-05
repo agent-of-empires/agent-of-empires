@@ -566,12 +566,13 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `403` | `{"error": "read_only"}` | Server is in read-only mode |
 | `404` | `{"error": "not_found"}` | No session with that id |
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
-| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
+| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID, binding and durable failure marker are preserved; exit does not prove that history was never loaded. |
+| `409` | `{"error": "managed_resume_refused", "message": "..."}` | A previous failed probe blocks revival before another native invocation. The cause header is `previous_probe_failed`; input is not sent to a new conversation. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
-After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
+After a failed resume probe, `Default` start/restart, automatic recovery and send-driven revival preserve the conversation instead of automatically starting Fresh. Retrying the same target requires an explicit qualified assertion, except for a persistent `Use` pin retried manually. Fresh is separate intent and never replays a blocked message. Manual configured-Fresh behavior with `auto_resume_on_restart = false` does not authorize automatic recovery or send substitution. See the canonical [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation).
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes
@@ -669,10 +670,12 @@ message delivery. Transport loss or malformed mutation receipts remain unknown;
 effect-free daemon refusals do not acknowledge a commit.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
-`aoe-managed-resume-cause` header supplies an application-owned recovery reason.
+`aoe-managed-resume-cause` header supplies an application-owned recovery reason,
+including `previous_probe_failed` for a retained failed target and
+`automatic_resume_disabled` for automatic recovery under the opt-out setting.
 Missing, unknown, or ambiguous cause metadata keeps the refusal generic; native
 clients do not read response bodies to derive that reason. See
-[managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
+[managed resume recovery](guides/session-resume.md#pinning-or-resetting-a-conversation).
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
 includes the finite code header and its canonical receipt; clients wait for that

@@ -100,7 +100,7 @@ For sandboxed sessions, pin while the container is running. Resolving a new nati
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
-When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
+When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID and binding, records a durable failure marker, and returns `resume_failed` without starting fresh in that call. A confirmed pane exit does not establish that native history was missing or never loaded.
 
 If a resume or fresh-pinned readiness probe cannot observe the exact owned pane, AoE returns `launch_indeterminate`, not `resume_failed` or ready success. Command timeouts, failed or malformed tmux observations, and changed ownership do not prove that the Agent exited. Expiry of the stabilization window is a separate outcome and proves neither death nor loaded history.
 
@@ -110,17 +110,17 @@ A renamed pane is not confirmed absence: AoE checks its captured session and pan
 
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
-On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
+After that failure, `Default` start and restart, automatic recovery, attach preparation, and send-driven revival refuse with `managed_resume_refused` and cause `previous_probe_failed` before another native invocation. They preserve the target and marker, do not choose Fresh, and do not transfer input to another conversation. `aoe session attach` only attaches an existing live runtime without replacing it.
 
-AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.
+An explicitly selected Fresh launch reports success only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting Fresh success with the old association still stored.
 
-To retry the original conversation through the restart cascade, first restore its original configuration and store, then run `aoe session set-session-id <session> <native-id>`, using `--store` with the exact store or transcript where required. That assertion clears the failure marker. An intentional configured-fresh restart remains available; use the empty-ID command below for a one-shot fresh conversation.
+To retry the original conversation, first restore its original configuration and store, then run `aoe session set-session-id <session> <native-id>`, using `--store` with the exact store or transcript where required. That qualified assertion clears the failure marker. A manual start or restart under `Default` with `auto_resume_on_restart = false` may instead use the configured Fresh policy. Automatic recovery refuses that substitution with cause `automatic_resume_disabled`; send-driven revival does not substitute Fresh for a failed target. Use the empty-ID command below for a separate one-shot Fresh intent.
 
-Direct `aoe session start` keeps its separate policy: it may retry a previously failed ID when native execution and target validation succeed. It performs that shared preflight before replacing an ordinary dead pane, but does not run the cascade's final resume probe. A successful start therefore does not prove that the native conversation loaded.
+Direct `aoe session start` uses the same failure-marker and configured-Fresh admission before replacing an ordinary dead pane. It does not run the restart cascade's final resume probe, so successful start does not prove that the native conversation loaded.
 
 An explicit pin or fork that migration left unqualified resumes against the store current configuration resolves. Agents that resolve their store or transcript before that check still refuse, for the reasons listed in [Supported managed contexts](#supported-managed-contexts). An armed pin is the exception to the rule above: no capture qualifies the binding it names.
 
-An agent that publishes its own conversation spends the pin at launch; its recorded binding remains unqualified until a capture qualifies it. A spent pin follows the `Default` failed-probe policy above. An agent without such a publisher keeps its persistent `Use` pin armed, including after a failed probe; that pin remains retryable without another assertion. Each retry still validates the resolved execution context and any qualified binding. A dispatched fork is always spent, whether or not it resumes. `set-session-id` is the only way to assert a store without launching:
+An agent that publishes its own conversation spends the pin at launch; its recorded binding remains unqualified until a capture qualifies it. A spent pin follows the `Default` failed-probe policy above and needs a new assertion to retry the same target. An agent without such a publisher keeps its persistent `Use` pin armed, including after a failed probe; an explicit manual retry can use that exact target without another assertion. Each retry still validates the resolved execution context and any qualified binding. Automatic recovery and send-driven revival do not retry a failed pin. A dispatched fork is always spent, whether or not it resumes. `set-session-id` is the only way to assert a store without launching:
 
 ```sh
 aoe session set-session-id <session> <native-id> --store /absolute/native/store
@@ -134,7 +134,7 @@ To start fresh once:
 aoe session set-session-id <session-name-or-id> ""
 ```
 
-This records fresh intent without launching. Start or restart separately to replace the current AoE conversation association. The command neither deletes nor recovers the original transcript; the recorded observed ID can remain visible until that launch.
+This records Fresh intent without launching or replaying a blocked message. Start or restart separately to replace the current AoE conversation association. The command neither deletes nor recovers the original transcript; the recorded observed ID can remain visible until that launch.
 
 Automatic capture then takes over where supported. The abandoned conversation stays excluded only in its recorded agent, store, and filesystem namespace. Legacy exclusions without a known namespace remain ID-wide.
 

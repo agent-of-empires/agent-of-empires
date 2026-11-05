@@ -397,11 +397,8 @@ pub(super) async fn prepared_agent_target_response(
             crate::session::StartOutcome::Resumed => "resumed",
             crate::session::StartOutcome::Fresh => "fresh",
             crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
-            crate::session::StartOutcome::Indeterminate { .. } => unreachable!("indeterminate launch cannot produce a ready target"),
-            crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
-                body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
-                body["prior_session_id"] = sid.into();
-                "fresh_after_failed_resume"
+            crate::session::StartOutcome::Indeterminate { .. } => {
+                unreachable!("indeterminate launch cannot produce a ready target")
             }
         }
         .into();

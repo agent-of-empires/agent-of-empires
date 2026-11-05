@@ -86,10 +86,6 @@ pub enum StartOutcome {
     /// actually occurred this call depends on the caller having killed
     /// any pre-existing pane first.
     Fresh,
-    /// A previous resume probe failed for `sid`; this attempt started fresh
-    /// instead of retrying it. The old conversation remains in native history,
-    /// but is no longer this session's active association.
-    FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -213,6 +209,7 @@ impl Instance {
             }
             self.ensure_startable()?;
         }
+        self.check_resume_attempt(ResumeAttemptPolicy::HonorAutoResumeSetting)?;
         if let Some((key, allow_retry)) = handoff {
             anyhow::ensure!(allow_retry || !self.validate_terminal_handoff(storage, key)?.launch_started,
                 "previous terminal launch did not remain live; retry disable explicitly after correcting its error");
@@ -259,10 +256,16 @@ impl Instance {
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
         self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));
-        if let Err(error) = self.preflight_resume_launch() {
+        if let Err(error) = self
+            .apply_resume_policy(ResumeAttemptPolicy::HonorAutoResumeSetting)
+            .and_then(|()| self.preflight_resume_launch())
+        {
             self.adopt_conversation_state(expected);
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
+        }
+        if std::mem::take(&mut self.force_fresh_next_launch) {
+            self.resume_intent = ResumeIntent::Cleared;
         }
 
         let mut prepared =
@@ -1700,12 +1703,8 @@ mod tests {
             .start_with_size_opts(None, true)
             .expect_err("unattested arguments must refuse before replacing the dead pane");
         assert!(error.is::<ManagedResumeRefused>(), "{error:#}");
-        let public_error = instance.last_error.as_deref().unwrap();
+        let public_error = error.to_string();
         assert!(!public_error.contains(sid), "{public_error}");
-        assert!(
-            public_error.contains("aoe session set-session-id <session> \"\""),
-            "{public_error}"
-        );
         assert_eq!(only_pane_id(&name), pane);
         assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
         assert_eq!(pane_field(&pane, "#{pane_dead}"), "1");
@@ -1731,6 +1730,28 @@ mod tests {
             .into_iter()
             .find(|row| row.id == instance.id)
             .expect("fresh durable action");
+        let error = instance
+            .start_with_size_opts(None, true)
+            .expect_err("restoring configuration does not reassert failed history");
+        assert!(error.is::<ManagedResumeRefused>());
+        assert_eq!(only_pane_id(&name), pane);
+        assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
+        assert!(!ready.exists());
+        store
+            .update(|rows, _| {
+                let row = &mut rows[0];
+                row.resume_binding = Some(row.asserted_resume_binding(sid, None)?);
+                row.resume_intent = ResumeIntent::Use(sid.into());
+                row.resume_probe_failed_sid = None;
+                Ok(())
+            })
+            .unwrap();
+        instance = store
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap();
         let outcome = instance.start_with_size_opts(None, true).unwrap();
         assert_eq!(outcome, LaunchSidOutcome::Existing { sid: sid.into() });
         let replacement = only_pane_id(&name);

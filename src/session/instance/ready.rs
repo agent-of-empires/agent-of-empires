@@ -412,9 +412,7 @@ impl Instance {
             StartOutcome::Indeterminate { cause } => {
                 return Ok(EnsureReadyOutcome::Indeterminate { cause });
             }
-            StartOutcome::Resumed
-            | StartOutcome::Fresh
-            | StartOutcome::FreshAfterFailedResume { .. } => {}
+            StartOutcome::Resumed | StartOutcome::Fresh => {}
         }
         // A peer may have supplied a live pane before launch admission.
         if self.lifecycle_generation == generation {
