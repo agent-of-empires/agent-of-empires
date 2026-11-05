@@ -117,7 +117,10 @@ test("SIGTERM surfaces the alert; restart() clears it and flashes reconnected", 
   const reconnectedBanner = page.getByRole("status").filter({ hasText: /reconnected/i });
   await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
   // The first successful sessions poll must land before the kill, or "Reconnected" fires early.
-  await page.waitForResponse((r) => r.url().endsWith("/api/sessions") && r.status() === 200, { timeout: 10_000 });
+  await page.waitForResponse(
+    (r) => new URL(r.url()).pathname === "/api/sessions" && r.request().method() === "GET" && r.status() === 200,
+    { timeout: 10_000 },
+  );
   await expect(alertBanner).toBeHidden();
   await expect(reconnectedBanner).toBeHidden();
 

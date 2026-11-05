@@ -505,6 +505,27 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
     )
 }
 
+/// Whether `If-None-Match` names `etag`; weak comparison, so an intermediary's `W/` prefix does not matter.
+pub(crate) fn if_none_match(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(axum::http::header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(entity_tags)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag)
+}
+
+/// Splits a header value at the commas outside quoted tags, which may themselves contain commas.
+fn entity_tags(value: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    value
+        .split(move |c| {
+            quoted ^= c == '"';
+            c == ',' && !quoted
+        })
+        .map(str::trim)
+}
+
 pub(crate) fn mutation_response(cursor: &RuntimeCursor, body: impl IntoResponse) -> Response {
     let revision = cursor.revision.to_string();
     (
@@ -902,6 +923,29 @@ mod tests {
     }
 
     /// Only kernel-authenticated Unix owners receive hook output.
+    #[test]
+    fn if_none_match_compares_weakly_across_a_list() {
+        let etag = "\"e.1.None\"";
+        for (header, expected) in [
+            ("\"e.1.None\"", true),
+            ("W/\"e.1.None\"", true),
+            ("\"x\", W/\"e.1.None\"", true),
+            ("*", true),
+            ("\"a,*,b\"", false),
+            ("\"a,e.1.None\"", false),
+            ("\"e.2.None\"", false),
+            ("", false),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.append(
+                axum::http::header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_str(header).unwrap(),
+            );
+            assert_eq!(if_none_match(&headers, etag), expected, "{header:?}");
+        }
+        assert!(!if_none_match(&axum::http::HeaderMap::new(), etag));
+    }
+
     #[test]
     fn creation_progress_is_granted_only_to_the_local_owner() {
         assert!(creation_progress_granted(Some(&Principal::LocalPeer {

@@ -23,7 +23,8 @@ import { createToasts, focusNavigation, noticedSessions, withFocusMode } from ".
 import { FocusModeNote } from "./components/FocusModeNote";
 import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
-import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
+import { clearDraft } from "./lib/acpDrafts";
+import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
@@ -50,7 +51,7 @@ import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
-import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
+import { clearStoredComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
@@ -409,6 +410,9 @@ function AppContent({
     markLocalOrderingUpdate,
     error,
     loaded: sessionsLoaded,
+    trashedCount,
+    trashLoaded,
+    loadTrash,
     injectSession,
     setSessionStatus,
     clearDeletingStatus,
@@ -443,6 +447,16 @@ function AppContent({
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+  // The list omits the trash, so a link to a trashed session finds no row until the trash is loaded.
+  const openedSessionId = focusSessionId ?? activeSessionId;
+  useEffect(() => {
+    if (sessionsLoaded && !trashLoaded && openedSessionId && !sessions.some((s) => s.id === openedSessionId)) {
+      loadTrash();
+    }
+  }, [sessionsLoaded, trashLoaded, openedSessionId, sessions, loadTrash]);
+  // An opened session missing from the list is neither gone nor trashed until the trash read has landed.
+  const openedSessionSettled =
+    sessionsLoaded && (trashLoaded || error || !openedSessionId || sessions.some((s) => s.id === openedSessionId));
 
   // What this window notices: a focus-mode window ignores every other session's attention and sounds.
   const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
@@ -459,35 +473,16 @@ function AppContent({
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
-  useLastSessionRestore({ activeSessionId: focusMode ? null : activeSessionId, sessions, sessionsLoaded });
+  useLastSessionRestore({
+    activeSessionId: focusMode ? null : activeSessionId,
+    sessions,
+    sessionsLoaded,
+    trashedCount,
+    trashLoaded,
+    loadTrash,
+  });
 
-  // One-shot orphan-draft sweep once useSessions has settled its first
-  // fetch (success or null). Catches acp:draft:<id> keys left behind
-  // by deletions that happened in another tab or on another device since
-  // the last load (#1358). The local-tab delete path calls clearDraft
-  // directly so it does not need to wait for this. Gating on
-  // `sessionsLoaded` rather than `sessions.length > 0` covers the
-  // legitimate empty-server case: a brand-new user with zero sessions
-  // must still get prior orphan drafts swept. Bounded by localStorage
-  // entry count; cheap.
-  const sweptDraftsRef = useRef(false);
-  useEffect(() => {
-    if (sweptDraftsRef.current) return;
-    if (!sessionsLoaded) return;
-    sweptDraftsRef.current = true;
-    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
-  }, [sessionsLoaded, sessions]);
-
-  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
-  // deleted sessions and retroactively removes empty keys written before the
-  // empty-removal fix. Mirrors the draft sweep above.
-  const sweptCommentsRef = useRef(false);
-  useEffect(() => {
-    if (sweptCommentsRef.current) return;
-    if (!sessionsLoaded) return;
-    sweptCommentsRef.current = true;
-    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
-  }, [sessionsLoaded, sessions]);
+  useOrphanSweep(sessions, sessionsLoaded && !error, trashedCount);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
@@ -871,7 +866,7 @@ function AppContent({
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
-  const focusSession = useFocusSession(focusSessionId, activeSession, sessionsLoaded);
+  const focusSession = useFocusSession(focusSessionId, activeSession, openedSessionSettled);
   const allPaneIds: string[] = [
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
@@ -2265,7 +2260,7 @@ function AppContent({
     // reappears once the fetch lands. Hold the minimal pre-auth shell
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
-    if (activeSessionId && !sessionsLoaded) {
+    if (activeSessionId && !openedSessionSettled) {
       // The shell (TopBar + sidebar) already renders around this; fill the main
       // pane with a skeleton rather than blanking it until the first fetch lands.
       return <MainPaneSkeleton />;
@@ -2609,6 +2604,9 @@ function AppContent({
                 nestedGroups={nestedGroups}
                 orgGroups={orgGroups}
                 trashedWorkspaces={trashedWorkspaces}
+                trashedCount={trashedCount}
+                trashLoaded={trashLoaded}
+                onLoadTrash={loadTrash}
                 onToggleSubgroup={toggleSubgroupCollapsed}
                 onToggleOrg={toggleOrgCollapsed}
                 onToggleOrgRepo={toggleOrgRepoCollapsed}
