@@ -1321,7 +1321,10 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = SidebarPhase::Idle;
+        // A lost integration is an error until a new connection restores it.
+        if self.integration_lost.is_none() {
+            self.sidebar_phase = SidebarPhase::Idle;
+        }
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -2522,5 +2525,28 @@ mod tests {
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+    }
+
+    /// The turn that ends after an integration loss must not heal the Error
+    /// phase; a new connection (`AcpSessionAssigned`) does.
+    #[test]
+    fn integration_loss_keeps_the_error_phase_until_a_new_session() {
+        let mut state = AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+        let lost = Event::IntegrationLost {
+            reason: IntegrationLostReason::HoldOverflow,
+        };
+        let stopped = Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "s2".into(),
+        };
+        for (seq, event) in [lost, stopped].into_iter().enumerate() {
+            state.apply_event(seq as u64 + 1, event).unwrap();
+        }
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state.apply_event(3, assigned).unwrap();
+        assert!(state.integration_lost.is_none());
+        assert_ne!(state.sidebar_phase, SidebarPhase::Error);
     }
 }
