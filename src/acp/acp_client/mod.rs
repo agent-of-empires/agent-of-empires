@@ -433,6 +433,31 @@ impl AcpClient {
         (client, event_tx, cmds)
     }
 
+    /// Appends the text of every prompt to `prompts`.
+    #[cfg(test)]
+    pub fn fake_for_test_prompt_recording(
+        session_id: AcpSessionId,
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (Self, mpsc::Sender<Event>) {
+        Self::fake_with_consumer(session_id, move |cmd| match cmd {
+            ClientCmd::Prompt(blocks) => {
+                if let Some(ContentBlock::Text(text)) = blocks.first() {
+                    prompts.lock().expect("prompt log").push(text.text.clone());
+                }
+            }
+            ClientCmd::DeleteSession { respond_to, .. } => {
+                let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+            }
+            ClientCmd::CloseSession(respond_to) => {
+                let _ = respond_to.send(CloseSessionOutcome::Unsupported);
+            }
+            ClientCmd::FlushForTest(done) => {
+                let _ = done.send(());
+            }
+            _ => {}
+        })
+    }
+
     /// Fails every driven reset with `message`.
     #[cfg(test)]
     pub fn fake_for_test_reset_failure(

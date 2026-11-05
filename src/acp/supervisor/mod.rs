@@ -61,6 +61,18 @@ pub(crate) type Launcher = Arc<
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
 type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
+/// Stop reason for a restart that carries unassigned prompts to the replacement;
+/// teardown publishes no `Stopped`, so their turns stay open.
+pub(crate) const RESTART_HANDOFF_STOP_REASON: &str = "restart_handoff";
+
+/// A prompt accepted before its worker's session was assigned.
+pub(crate) struct UnassignedPrompt {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<crate::acp::event_store::AttachmentBlob>,
+}
+
+/// Per session, present while the worker has no ACP session yet.
+type UnassignedPrompts = Arc<std::sync::Mutex<HashMap<String, Vec<UnassignedPrompt>>>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
@@ -218,6 +230,7 @@ pub struct Supervisor<S: BroadcastSink> {
     pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
     respawned_in_place: SharedSet,
+    unassigned_prompts: UnassignedPrompts,
     max_concurrent_workers: u32,
 }
 
@@ -487,6 +500,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             startup_failures: Arc::default(),
             pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
+            unassigned_prompts: Arc::default(),
             max_concurrent_workers,
         }
     }
