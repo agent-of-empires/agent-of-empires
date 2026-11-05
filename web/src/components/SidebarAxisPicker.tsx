@@ -127,7 +127,7 @@ export function SidebarAxisPicker({
           role="menu"
           data-testid="sidebar-axis-menu"
           onKeyDown={onMenuKeyDown}
-          className="absolute right-0 top-full mt-1 min-w-[190px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
+          className="absolute left-0 top-full mt-1 min-w-[190px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
         >
           {AXES.map(({ axis: value, label, Icon }, index) => {
             const selected = value === axis;
