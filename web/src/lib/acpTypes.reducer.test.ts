@@ -21,6 +21,7 @@ import {
   type ReducedState,
   type TranscriptRow,
   type ToolCall,
+  type SessionRecovery,
 } from "./acpTypes";
 import { workflowRunning } from "../components/acp/backgroundAgentsContext";
 
@@ -934,5 +935,69 @@ describe("current native snapshot authority", () => {
     expect(state.turnActive).toBe(false);
     expect(state.pendingApprovals).toEqual([]);
     expect(state.pendingElicitations).toEqual([]);
+  });
+});
+
+describe("current shared recovery projection", () => {
+  const recovery: SessionRecovery = {
+    reason: "operation_failed",
+    diagnostic: "Safe original failure",
+    evidence: null,
+    runtime: "acp_transport_ready",
+    work_in_progress: false,
+    uncertainty: "Delivery may be ambiguous.",
+    guidance: "Observe the same retained conversation.",
+    actions: { attach: true, retry_operation: false, restart_same: false, stop: true, fresh: false },
+    expected: "opaque-selection",
+  };
+  const snapshot = (state: AcpState, seq: number, projection: Partial<ReducedState>) =>
+    applyReducedState(state, reducedState({ connection_ready: true, ...projection }), [], seq);
+
+  it("restores a cold-open diagnostic from the server, not replay or session opening", () => {
+    let state = snapshot(emptyAcpState(), 10, { recovery });
+    expect(state.recovery).toEqual(recovery);
+    expect(state.lastError).toBe(recovery.diagnostic);
+    state = ev(state, 5, { AcpSessionAssigned: { acp_session_id: "same-native-history" } });
+    expect(state.recovery).toEqual(recovery);
+    expect(state.lastError).toBe(recovery.diagnostic);
+    state = reducer(state, { kind: "user_prompt", id: "explicit-new", text: "New composition" });
+    expect(state.lastError).toBe(recovery.diagnostic);
+    expect(state.recoveryNotice?.diagnostic).toBe(recovery.diagnostic);
+  });
+
+  it("revokes missing, disconnected and newer-uncovered permissions without erasing the failure", () => {
+    const live = snapshot(emptyAcpState(), 10, { recovery });
+    for (const state of [revokeNativeAuthority(live), snapshot(live, 10, {}), ev(live, 11, "ThinkingStarted")]) {
+      expect(state.recovery).toBeNull();
+      expect(state.recoveryNotice?.diagnostic).toBe(recovery.diagnostic);
+      expect(state.lastError).toBe(recovery.diagnostic);
+    }
+    const stale = snapshot(live, 9, { recovery: { ...recovery, expected: "old" } });
+    expect(stale.recovery?.expected).toBe(recovery.expected);
+  });
+
+  it("does not let history-only recovery grant current actions or disturb Original custody", () => {
+    const historical = applyReducedState(emptyAcpState(), reducedState({ recovery }));
+    expect(historical.recovery).toBeNull();
+    expect(historical.recoveryNotice?.diagnostic).toBe(recovery.diagnostic);
+    const current = snapshot(emptyAcpState(), 10, {
+      recovery,
+      connection_ready: false,
+      original_decision_nonces: ["original-exact-nonce"],
+    });
+    expect(current.originalDecisionNonces).toEqual(["original-exact-nonce"]);
+    expect(nativeInputAvailable(current)).toBe(false);
+    expect(current.recovery?.actions.stop).toBe(true);
+  });
+
+  it("retires the failure only when a current superseding projection arrives, never from stale replay", () => {
+    let state = snapshot(emptyAcpState(), 10, { recovery });
+    state = snapshot(state, 11, { recovery: null });
+    expect(state.recovery).toBeNull();
+    expect(state.recoveryNotice).toBeNull();
+    expect(state.lastError).toBeNull();
+    state = ev(state, 9, { PromptRuntimeError: { message: "older failure" } });
+    expect(state.lastError).toBeNull();
+    expect(state.recoveryNotice).toBeNull();
   });
 });

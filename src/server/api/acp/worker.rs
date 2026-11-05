@@ -369,7 +369,7 @@ pub async fn restart_acp(
     let work = state.runtime.work.clone();
     match work
         .run("server.acp.restart", async move {
-            restart_acp_inner(state, id, req).await
+            restart_acp_inner(state, id, req, None).await
         })
         .await
     {
@@ -378,7 +378,69 @@ pub async fn restart_acp(
     }
 }
 
-async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
+/// The public restart route shares this worker admission, not another HTTP handler.
+pub(crate) async fn restart_session_recovery(
+    state: Arc<AppState>,
+    id: String,
+    recovery: crate::session::SessionRecoveryRequest,
+) -> Response {
+    let request = SpawnAcpRequest {
+        agent: None,
+        model: None,
+        recovery: None,
+        additional_dirs: Vec::new(),
+        provider_env: Vec::new(),
+    };
+    let work = state.runtime.work.clone();
+    let request_state = state.clone();
+    let request_id = id.clone();
+    // Keep the restart state machine out of by-value moves through the work registry and task spawn.
+    let response = match work
+        .run(
+            "server.session.recovery",
+            Box::pin(restart_acp_inner(
+                request_state,
+                request_id,
+                request,
+                Some(recovery),
+            )),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if !response.status().is_success() {
+        return response;
+    }
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned();
+    let Some(row) = row else {
+        return session_not_found();
+    };
+    crate::server::runtime::session_mutation_response(
+        &state,
+        &id,
+        Some(crate::daemon::RestartOutcome {
+            lifecycle_generation: row.lifecycle_generation,
+            profile: row.source_profile,
+            target: None,
+        }),
+    )
+    .await
+}
+
+async fn restart_acp_inner(
+    state: Arc<AppState>,
+    id: String,
+    req: SpawnAcpRequest,
+    session_recovery: Option<crate::session::SessionRecoveryRequest>,
+) -> Response {
     let restart = match state
         .acp_supervisor
         .try_begin_restart_with_reason(&id)
@@ -449,16 +511,33 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             Ok(false) => {}
             Err(response) => return response,
         }
-    } else if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
-        return supervisor_error_response("restart refused", &refusal.into());
+    } else if session_recovery.is_none() {
+        if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
+            return supervisor_error_response("restart refused", &refusal.into());
+        }
     }
 
-    let stop_request = state
-        .acp_supervisor
-        .begin_stop_request(&id, "user_stopped", None, true)
-        .await;
     let was_resuming =
         state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming;
+    if session_recovery.is_some() && was_resuming {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "recovery_unavailable",
+            "Native establishment is still in progress; observe its original requests",
+        );
+    }
+    let stop_request = if session_recovery.is_none() {
+        Some(
+            state
+                .acp_supervisor
+                .begin_stop_request(&id, "user_stopped", None, true)
+                .await,
+        )
+    } else {
+        // Shared recovery admits its frozen selection before any cancellation.
+        // Captured teardown below uses the existing non-cancelling retirement barrier.
+        None
+    };
     let mut establishment = None;
     // A running worker must finish its current submission before restart
     // tears it down. Hold only this barrier here; the full launch exclusion
@@ -478,8 +557,14 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
     if was_resuming {
-        match retire_restart_worker(&state, &preflight_instance, &restart, req.recovery.clone())
-            .await
+        match retire_restart_worker(
+            &state,
+            &preflight_instance,
+            &restart,
+            req.recovery.clone(),
+            session_recovery.clone(),
+        )
+        .await
         {
             Ok(attempt) => establishment = Some(attempt),
             Err(response) => return response,
@@ -538,7 +623,15 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
     // Running workers are stopped only after the submission barrier is held.
     if !was_resuming {
-        match retire_restart_worker(&state, &instance, &restart, req.recovery.clone()).await {
+        match retire_restart_worker(
+            &state,
+            &instance,
+            &restart,
+            req.recovery.clone(),
+            session_recovery.clone(),
+        )
+        .await
+        {
             Ok(attempt) => establishment = Some(attempt),
             Err(response) => return response,
         }
@@ -813,6 +906,7 @@ async fn retire_restart_worker(
     expected: &crate::session::Instance,
     restart: &crate::acp::supervisor::RestartRequestGuard,
     recovery: Option<crate::acp::establishment::EstablishmentRecovery>,
+    session_recovery: Option<crate::session::SessionRecoveryRequest>,
 ) -> Result<Arc<crate::acp::establishment::EstablishmentAttempt>, Response> {
     if restart.is_cancelled() {
         return Err(supervisor_error_response(
@@ -820,6 +914,25 @@ async fn retire_restart_worker(
             &SupervisorError::SpawnCancelled(expected.id.clone()),
         ));
     }
+    let folded = if session_recovery.is_some() {
+        Some(
+            state
+                .session_service
+                .fold_control_history(&expected.id)
+                .await
+                .map_err(|error| restart_retirement_error("recovery observation failed", &error))?,
+        )
+    } else {
+        None
+    };
+    let current = if session_recovery.is_some() {
+        state
+            .acp_supervisor
+            .current_native_availability(&expected.id)
+            .await
+    } else {
+        None
+    };
     let owner = state.clone();
     let id = expected.id.clone();
     let prepare_id = id.clone();
@@ -862,6 +975,69 @@ async fn retire_restart_worker(
                 && row.acp_establishment == expected_authority,
             crate::session::LifecycleReservationError::Superseded
         );
+        let recovery = if let Some(request) = &session_recovery {
+            use crate::acp::establishment::{
+                EstablishmentExpected, EstablishmentRecovery, EstablishmentRecoveryAction,
+                EstablishmentRefusal,
+            };
+            anyhow::ensure!(
+                request.expected
+                    == crate::session::projection::recovery_selection(&row, native.storage())?,
+                EstablishmentRefusal::Superseded
+            );
+            let context = crate::acp::state::NativeEventContext::capture(&row, native.storage())?;
+            let mut current = current;
+            let current_valid = if let Some(current) = current.as_mut() {
+                let selected = current
+                    .scope
+                    .choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.matches(&row));
+                current.scope.context == context
+                    && current.refresh(&row.id, selected).unwrap_or(false)
+                    && current.qualify_owner(&row.id).unwrap_or(false)
+            } else {
+                false
+            };
+            let folded = folded.as_ref().expect("shared recovery observation");
+            let folded = owner
+                .acp_control_cache
+                .get_or_hydrate(&row.id, || Ok((folded.clone(), folded.last_seq)))?;
+            let historical = folded.native_availability;
+            let historical_current = historical
+                .is_some_and(|(_, subject)| subject.unavailability_still_applies(&row.id));
+            let availability = crate::acp::state::NativeAvailabilityProjection::resolve(
+                historical,
+                Some(context),
+                current.as_ref().filter(|_| current_valid),
+                historical_current,
+                crate::process::worker_registry::control_admission(&row.id).err(),
+            );
+            let projected = crate::session::projection::current_recovery(
+                &row,
+                native.storage(),
+                Some(&folded),
+                availability,
+                true,
+            )?
+            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+            let (admitted, action) = match request.action {
+                crate::session::SessionRecoveryAction::Same => (
+                    projected.actions.restart_same,
+                    EstablishmentRecoveryAction::Same,
+                ),
+                crate::session::SessionRecoveryAction::Fresh => {
+                    (projected.actions.fresh, EstablishmentRecoveryAction::Fresh)
+                }
+            };
+            anyhow::ensure!(admitted, EstablishmentRefusal::Unconfirmed);
+            Some(EstablishmentRecovery {
+                expected: EstablishmentExpected::capture(&row, native.storage())?,
+                action,
+            })
+        } else {
+            recovery
+        };
         let target = owner.acp_supervisor.capture_retirement(&row.id)?;
         if let Some(lease) = &target.lease {
             if let Some(scope) = lease
@@ -887,15 +1063,36 @@ async fn retire_restart_worker(
             native.storage(),
         )?;
         let mut attempt = None;
+        let mut retired_input = Vec::new();
         let store: &dyn crate::session::SessionStore = &native;
         store.update(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == prepare_id)
                 .ok_or(crate::session::SessionGone)?;
+            if let Some(request) = &session_recovery {
+                anyhow::ensure!(
+                    request.expected
+                        == crate::session::projection::recovery_selection(row, native.storage())?,
+                    crate::acp::establishment::EstablishmentRefusal::Superseded
+                );
+            }
             attempt = Some(row.arm_acp_establishment(native.storage(), recovery.as_ref())?);
+            if session_recovery.as_ref().is_some_and(|request| {
+                request.action == crate::session::SessionRecoveryAction::Fresh
+            }) {
+                // Fresh is explicit abandonment, after selection and original retirement custody admission.
+                // Never carry a blocked or possibly accepted AoE input into the replacement.
+                row.pending_initial_turn = None;
+                retired_input = std::mem::take(&mut row.queued_prompts);
+            }
             Ok(())
         })?;
+        for prompt in retired_input {
+            owner
+                .acp_event_store
+                .delete_pending_attachments_for_ref(&prepare_id, &prompt.id);
+        }
         let attempt = attempt
             .ok_or_else(|| anyhow::anyhow!("native establishment mutation was not applied"))?;
         let row = native
@@ -2342,7 +2539,7 @@ mod tests {
                 let restart = state.acp_supervisor.try_begin_restart_with_reason(&id).await.unwrap();
                 // This is an ordinary retained Applied restart, not a Fresh or
                 // unresolved-attempt recovery request.
-                if let Err(response) = retire_restart_worker(&state, &row, &restart, None).await {
+                if let Err(response) = retire_restart_worker(&state, &row, &restart, None, None).await {
                     let status = response.status();
                     let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
                     panic!("restart retirement failed: {status}: {}", String::from_utf8_lossy(&body));

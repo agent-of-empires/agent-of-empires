@@ -17,6 +17,13 @@ type TextareaRef = React.RefObject<HTMLTextAreaElement | null>;
 /** The slice of `aui.composer` the Composer drives. */
 export type ComposerClient = Pick<ReturnType<typeof useAui>["composer"], "getState" | "setText">;
 
+export interface ComposerCompositionControl {
+  reset: () => void;
+  restoreText: (text: string) => void;
+}
+
+export type CompositionSendResult = "consumed" | "retained";
+
 /** A stable client over `aui.composer`, whose identity changes on every store
  *  update. `draftTextRef` is stamped synchronously on `setText`, because the
  *  store applies it a tick later and a persist in that window would restore a
@@ -237,9 +244,14 @@ export function useAttachments(
   promptCapabilities: PromptCapabilities | null,
   pendingAttachments: PromptAttachmentInput[],
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>,
+  readGenerationRef: React.RefObject<number>,
 ) {
+  const invalidateReads = useCallback(() => {
+    readGenerationRef.current += 1;
+  }, [readGenerationRef]);
   const addFiles = useCallback(
     async (files: FileList | File[]) => {
+      const generation = readGenerationRef.current;
       // Encode only what fits, so a large drop does not stall on discarded files.
       const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
       if (remaining === 0) return;
@@ -248,6 +260,7 @@ export function useAttachments(
         const kind = mimeToKind(file.type || "application/octet-stream");
         if (!kindSupported(kind, promptCapabilities)) continue;
         const dataB64 = await fileToBase64(file);
+        if (generation !== readGenerationRef.current) return;
         if (!dataB64) continue;
         accepted.push({
           kind,
@@ -259,7 +272,7 @@ export function useAttachments(
       if (accepted.length === 0) return;
       setPendingAttachments((prev) => prev.concat(accepted).slice(0, MAX_ATTACHMENTS));
     },
-    [pendingAttachments.length, promptCapabilities, setPendingAttachments],
+    [pendingAttachments.length, promptCapabilities, readGenerationRef, setPendingAttachments],
   );
   const supported = useMemo(
     () =>
@@ -279,5 +292,5 @@ export function useAttachments(
   const enabled =
     !!promptCapabilities &&
     (promptCapabilities.image || promptCapabilities.audio || promptCapabilities.embeddedContext);
-  return { addFiles, supported, remove, enabled };
+  return { addFiles, supported, remove, enabled, invalidateReads };
 }

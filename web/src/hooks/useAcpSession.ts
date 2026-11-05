@@ -218,7 +218,7 @@ export function useAcpSession(
       text: string,
       attachments?: PromptAttachmentInput[],
       queuedPromptId?: string,
-      admission: "prompt_intent" | "authorized_snooze_wake" = "prompt_intent",
+      admission: "native" | "prompt_intent" | "authorized_snooze_wake" = "prompt_intent",
     ): Promise<PromptSendResult> => {
       if (!sessionId) return { kind: "retryable_failure" };
       const previews: AcpAttachment[] = (attachments ?? []).map((a, i) => ({
@@ -242,6 +242,7 @@ export function useAcpSession(
           jsonPost({
             text,
             prompt_id: promptId,
+            ...(admission === "native" ? { no_revive: true } : {}),
             ...(queuedPromptId ? { queued_prompt_id: queuedPromptId } : {}),
             attachments: (attachments ?? []).map((a) => ({
               kind: a.kind,
@@ -373,6 +374,31 @@ export function useAcpSession(
       inputStateRef,
       connectionStatusRef,
     ],
+  );
+
+  const retryOperation = useCallback(
+    async (text: string, attachments: PromptAttachmentInput[] | undefined, expected: string): Promise<boolean> => {
+      const current = inputStateRef.current;
+      if (
+        connectionStatusRef.current !== "open" ||
+        !nativeInputAvailable(current) ||
+        current.recovery?.expected !== expected ||
+        !current.recovery.actions.retry_operation
+      ) {
+        dispatch({ kind: "error", message: "Operation retry is no longer offered; no input sent." });
+        return false;
+      }
+      const result = await dispatchPromptNow(text, attachments, undefined, "native");
+      if (result.kind === "queued") {
+        showServerQueued(result.queuedId, text, attachments);
+        return true;
+      }
+      if (result.kind === "worker_not_ready") {
+        dispatch({ kind: "error", message: "The existing Agent is unavailable; input was not queued or replayed." });
+      }
+      return result.kind === "dispatched";
+    },
+    [inputStateRef, connectionStatusRef, dispatchPromptNow, showServerQueued],
   );
 
   // Listing is safe on socket open. Re-sending unconfirmed cached intent must
@@ -526,6 +552,7 @@ export function useAcpSession(
     resolveApproval,
     resolveElicitation,
     sendPrompt,
+    retryOperation,
     cancelPrompt,
     forceEndTurn,
     ...dismissers,

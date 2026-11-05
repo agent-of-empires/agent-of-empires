@@ -119,6 +119,10 @@ pub(crate) use instance::{
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
+pub use projection::{
+    RecoveryActions, SessionRecovery, SessionRecoveryAction, SessionRecoveryReason,
+    SessionRecoveryRequest,
+};
 pub(crate) use storage::acquire_session_identity_lock;
 #[cfg(test)]
 pub(crate) use storage::observe_lock_contention_for_test;

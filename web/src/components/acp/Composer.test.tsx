@@ -64,6 +64,9 @@ function Harness({
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
+        operationRetryActive={false}
+        compositionControlRef={{ current: null }}
+        attachmentReadGenerationRef={{ current: 0 }}
         queuedPrompts={[]}
         editQueuedPrompt={() => {}}
         {...overrides}

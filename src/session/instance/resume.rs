@@ -51,7 +51,10 @@ impl ManagedResumeCause {
                 "Managed resume refused: wrapper contract missing.\n\
                  Restore truthful session.agent_execution_as and\n\
                  session.agent_config_dir in trusted global/profile config.\n\
-                 Both must match the original agent and store."
+                 Both must match the original agent and store.\n\
+                 Keep the Native conversation ID while repairing this configuration.\n\
+                 Fresh abandons pending AoE input without replay and omits AoE restore flags.\n\
+                 An undeclared wrapper may still restore its own history; Fresh does not promise a new native conversation."
             ),
             Self::UnsupportedManagedArguments => recovery_message!(
                 "Managed resume refused: unsupported command or arguments.\n\
@@ -632,6 +635,40 @@ impl Instance {
         drop(lifecycle_lock);
         drop(title_lock);
         Ok(generation)
+    }
+
+    /// Explicit Same reasserts an already bound target, never an unqualified raw ID.
+    /// The launch repeats this validation after hooks, under its existing fences.
+    pub(crate) fn qualify_recovery_same(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(
+                self.resume_intent,
+                ResumeIntent::Fork { .. } | ResumeIntent::Cleared
+            ),
+            "Same recovery cannot replace a Fresh or fork selection"
+        );
+        let (sid, binding, _) = self
+            .conversation_target()
+            .context("Same recovery has no selected conversation")?;
+        let binding = binding
+            .filter(|binding| binding.is_known() && binding.session_id == sid)
+            .context("Same recovery requires an execution-qualified conversation binding")?
+            .clone();
+        let sid = sid.to_owned();
+        self.resume_binding = Some(binding);
+        self.resume_intent = ResumeIntent::Use(sid);
+        self.force_fresh_next_launch = false;
+        self.preflight_resume_launch()?;
+        Ok(())
+    }
+
+    pub(crate) fn select_recovery_fresh(&mut self) {
+        self.resume_intent = ResumeIntent::Cleared;
+        self.resume_binding = None;
+        self.force_fresh_next_launch = false;
+        self.resume_probe_failed_sid = None;
+        self.pending_initial_turn = None;
+        self.queued_prompts.clear();
     }
 
     pub(super) fn capture_resume_launch_target_in(&mut self, stores: CaptureStorage<'_>) {

@@ -2365,6 +2365,63 @@ impl Instance {
             .ok_or(EstablishmentRefusal::NoSelection)
     }
 
+    fn same_recovery_target(
+        &self,
+        storage: &Storage,
+    ) -> anyhow::Result<Option<&EstablishmentTarget>> {
+        let Some(attempt) = self
+            .acp_establishment
+            .as_ref()
+            .and_then(AcpEstablishment::attempt)
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            attempt.profile == storage.profile()
+                && attempt.session_id == self.id
+                && attempt.created_at == self.created_at
+                && attempt.generation == self.lifecycle_generation
+                && attempt.context == NativeEventContext::capture(self, storage)?
+                && attempt.destination.selection_matches(self),
+            EstablishmentRefusal::Superseded
+        );
+        Ok(Some(&attempt.target))
+    }
+
+    fn same_recovery_is_unissued_new(&self) -> bool {
+        self.acp_establishment
+            .as_ref()
+            .and_then(AcpEstablishment::attempt)
+            .is_some_and(|attempt| {
+                attempt.target == EstablishmentTarget::New
+                    && (attempt.producer.is_none()
+                        || matches!(
+                            self.acp_establishment,
+                            Some(AcpEstablishment::Blocked {
+                                reason: EstablishmentBlockReason::NotIssued,
+                                ..
+                            })
+                        ))
+            })
+    }
+
+    /// The existing Same admission predicate, without arming or allocating a new attempt.
+    pub(crate) fn check_acp_recovery_same(&self, storage: &Storage) -> anyhow::Result<()> {
+        match self.same_recovery_target(storage)? {
+            Some(EstablishmentTarget::New) => {
+                anyhow::ensure!(
+                    self.same_recovery_is_unissued_new(),
+                    EstablishmentRefusal::Unresolved
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.selected_acp_target()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Caller owns the native CAS. Only the absent-row factory passes `creation`.
     /// A missing legacy selection never becomes permission to create a conversation.
     pub(crate) fn arm_acp_establishment(
@@ -2415,43 +2472,14 @@ impl Instance {
         }
         let original_target =
             if recovery.is_some_and(|r| r.action == EstablishmentRecoveryAction::Same) {
-                self.acp_establishment
-                    .as_ref()
-                    .and_then(AcpEstablishment::attempt)
-                    .map(|attempt| {
-                        anyhow::ensure!(
-                            attempt.profile == storage.profile()
-                                && attempt.session_id == self.id
-                                && attempt.created_at == self.created_at
-                                && attempt.generation == self.lifecycle_generation
-                                && attempt.context == NativeEventContext::capture(self, storage)?
-                                && attempt.destination.selection_matches(self),
-                            EstablishmentRefusal::Superseded
-                        );
-                        Ok::<_, anyhow::Error>(attempt.target.clone())
-                    })
-                    .transpose()?
+                self.same_recovery_target(storage)?.cloned()
             } else {
                 None
             };
         let preimage = NativeBindingState::capture(self);
         let unissued_new = recovery.is_some_and(|recovery| {
             recovery.action == EstablishmentRecoveryAction::Same
-                && self
-                    .acp_establishment
-                    .as_ref()
-                    .and_then(AcpEstablishment::attempt)
-                    .is_some_and(|attempt| {
-                        attempt.target == EstablishmentTarget::New
-                            && (attempt.producer.is_none()
-                                || matches!(
-                                    self.acp_establishment,
-                                    Some(AcpEstablishment::Blocked {
-                                        reason: EstablishmentBlockReason::NotIssued,
-                                        ..
-                                    })
-                                ))
-                    })
+                && self.same_recovery_is_unissued_new()
         });
         let creation_new = creation
             && self.acp_session_id.is_none()

@@ -1,7 +1,12 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState } from "../../lib/acpTypes";
+import type { RecoveryActions, RuntimeEvidence, SessionRecovery } from "../../lib/acpTypes";
+import { recoverSession, stopSession } from "../../lib/api";
+import { Dialog, CancelButton, ConfirmButton, DANGER_BUTTON } from "../Dialog";
+import { useConfirmKeys, useDialogFocus } from "../dialogHooks";
+import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { RATTLES } from "../../lib/rattles";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
@@ -18,6 +23,11 @@ export function SessionBanners({
   onSwitchToTerminal,
   dismissError,
   startingAgent,
+  recoveryCurrent = false,
+  readOnly = false,
+  onAttach,
+  onRetryOperation,
+  onRestarted,
 }: {
   sessionId: string;
   state: AcpState;
@@ -30,6 +40,11 @@ export function SessionBanners({
   onRestore?: () => Promise<boolean> | void;
   onSwitchToTerminal?: () => void;
   dismissError: () => void;
+  recoveryCurrent?: boolean;
+  readOnly?: boolean;
+  onAttach?: () => void;
+  onRetryOperation?: () => void;
+  onRestarted?: () => void;
 }) {
   const nativeReady = nativeInputAvailable(state);
   const startupDiagnosticOnly = nativeReady || state.connectionUnavailable !== null;
@@ -47,10 +62,11 @@ export function SessionBanners({
     !state.connectionUnavailable &&
     (!state.startupError || nativeReady);
   const idle = healthy && !state.turnActive;
-  const errorMessage = state.interactionError?.message ?? state.lastError;
+  const recovery = state.recovery ?? state.recoveryNotice;
+  const errorMessage = state.interactionError?.message ?? (recovery ? null : state.lastError);
   return (
     <>
-      {state.startupError && !startupDiagnosticOnly && (
+      {state.startupError && !startupDiagnosticOnly && !recovery && (
         <StartupErrorBanner
           sessionId={sessionId}
           message={state.startupError}
@@ -82,8 +98,8 @@ export function SessionBanners({
       {variant === "snoozed" && snoozedUntil && (
         <SnoozedWorkerStoppedBanner sessionId={sessionId} snoozedUntil={snoozedUntil} />
       )}
-      {variant === "generic" && <WorkerStoppedBanner sessionId={sessionId} />}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+      {variant === "generic" && !recovery && !state.lastError && <WorkerStoppedBanner sessionId={sessionId} />}
+      {state.workerRestarting && !state.startupError && !state.workerStopped && !recovery && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {startingAgent ? (
@@ -106,6 +122,19 @@ export function SessionBanners({
         <ChipBanner tone="violet" icon="👁" detail={state.monitorDescription}>
           Monitoring a background job
         </ChipBanner>
+      )}
+      {recovery && (
+        <SessionRecoveryBanner
+          key={sessionId}
+          sessionId={sessionId}
+          recovery={recovery}
+          current={recoveryCurrent && state.recovery !== null}
+          readOnly={readOnly}
+          requestBusy={state.inflightPromptIds.length > 0}
+          onAttach={onAttach}
+          onRetryOperation={onRetryOperation}
+          onRestarted={onRestarted}
+        />
       )}
       {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
@@ -215,21 +244,239 @@ function ChipBanner({
   );
 }
 
-function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+function InteractionErrorBanner({
+  message,
+  onDismiss,
+  children,
+}: {
+  message: string;
+  onDismiss?: () => void;
+  children?: React.ReactNode;
+}) {
   return (
     <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">Action did not complete</div>
         <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
+        {children}
       </div>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
-      >
-        Dismiss
-      </button>
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
+        >
+          Dismiss
+        </button>
+      )}
     </div>
+  );
+}
+
+function runtimeObservation(runtime: RuntimeEvidence): string {
+  if (typeof runtime === "object") {
+    const code = runtime.pane_exited.exit_code;
+    return `Terminal process exit observed${code === null ? "" : ` (code ${code})`}.`;
+  }
+  switch (runtime) {
+    case "pane_alive":
+      return "Terminal pane observed alive.";
+    case "acp_transport_ready":
+      return "Native channel ready. Channel readiness does not prove the OS process is alive.";
+    case "acp_transport_closed":
+      return "Native channel closed. Channel loss does not prove the OS process exited.";
+    case "unknown":
+      return "Runtime liveness is unknown.";
+  }
+}
+
+/** Render server diagnostics and admission without deriving another lifecycle policy. */
+export function SessionRecoveryBanner({
+  sessionId,
+  recovery,
+  current,
+  readOnly,
+  onAttach,
+  requestBusy = false,
+  onRetryOperation,
+  onRestarted,
+}: {
+  sessionId: string;
+  recovery: SessionRecovery;
+  current: boolean;
+  readOnly: boolean;
+  requestBusy?: boolean;
+  onAttach?: () => void;
+  onRetryOperation?: () => void;
+  onRestarted?: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const pending = useRef(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [freshConsent, setFreshConsent] = useState<string | null>(null);
+  if (freshConsent !== null && (!current || readOnly || freshConsent !== recovery.expected)) setFreshConsent(null);
+  const admission = useRef({
+    sessionId,
+    recovery,
+    current,
+    readOnly,
+    requestBusy,
+    onAttach,
+    onRetryOperation,
+    onRestarted,
+  });
+  useLayoutEffect(() => {
+    admission.current = {
+      sessionId,
+      recovery,
+      current,
+      readOnly,
+      requestBusy,
+      onAttach,
+      onRetryOperation,
+      onRestarted,
+    };
+  });
+  useLayoutEffect(
+    () => () => {
+      admission.current.current = false;
+    },
+    [],
+  );
+  const run = useCallback(
+    async (action: keyof RecoveryActions) => {
+      const latest = admission.current;
+      if (
+        pending.current ||
+        latest.requestBusy ||
+        !latest.current ||
+        latest.sessionId !== sessionId ||
+        latest.recovery.expected !== recovery.expected ||
+        !latest.recovery.actions[action] ||
+        (action !== "attach" && latest.readOnly)
+      )
+        return;
+      if (action === "attach") return latest.onAttach?.();
+      if (action === "retry_operation") return latest.onRetryOperation?.();
+      pending.current = true;
+      setBusy(true);
+      setRequestError(null);
+      setFreshConsent(null);
+      try {
+        const result: { ok: boolean; message?: string } =
+          action === "stop"
+            ? { ok: (await stopSession(sessionId)) !== null }
+            : await recoverSession(sessionId, action === "fresh" ? "fresh" : "same", recovery.expected);
+        if (admission.current.sessionId === sessionId) {
+          setRequestError(
+            result.ok
+              ? null
+              : (result.message ?? "Recovery request did not complete. Refresh the current observation."),
+          );
+          if (result.ok && action !== "stop") admission.current.onRestarted?.();
+        }
+      } finally {
+        pending.current = false;
+        setBusy(false);
+      }
+    },
+    [sessionId, recovery.expected],
+  );
+  const handleAction = useCallback(
+    (key: keyof RecoveryActions) => {
+      if (key === "fresh") setFreshConsent(recovery.expected);
+      else void run(key);
+    },
+    [recovery.expected, run],
+  );
+  const action = (key: keyof RecoveryActions, label: string, available = true): RecoveryAction => ({
+    label,
+    testId: `session-recovery-${key.replaceAll("_", "-")}`,
+    disabled: !current || busy || requestBusy || !recovery.actions[key] || !available || (key !== "attach" && readOnly),
+    onClick: () => handleAction(key),
+    describedBy: `session-recovery-guidance-${sessionId}`,
+  });
+  return (
+    <section data-testid="session-recovery" data-reason={recovery.reason} data-session-id={sessionId}>
+      <InteractionErrorBanner message={recovery.diagnostic}>
+        <div className="mt-1 space-y-1 text-xs text-text-secondary">
+          <p data-testid="session-recovery-reason">Reason: {recovery.reason.replaceAll("_", " ")}</p>
+          <p data-testid="session-recovery-scope">
+            Operation: {recovery.evidence?.operation.replaceAll("_", " ") ?? "unknown"}. Blocking scope:{" "}
+            {recovery.evidence?.blocking_scope ?? "unknown"}.
+          </p>
+          <p data-testid="session-recovery-runtime">
+            {current ? runtimeObservation(recovery.runtime) : "Current runtime observation is unavailable."}
+          </p>
+          <p data-testid="session-recovery-work">
+            {!current
+              ? "Current Agent work is unknown."
+              : recovery.work_in_progress
+                ? "Agent work or retry is ongoing."
+                : "No current Agent work is reported."}
+          </p>
+          {recovery.uncertainty && <p data-testid="session-recovery-uncertainty">{recovery.uncertainty}</p>}
+          {!current && (
+            <p data-testid="session-recovery-stale">
+              Previous diagnostic. Current recovery permissions are unavailable; wait for a current server observation.
+            </p>
+          )}
+          <p id={`session-recovery-guidance-${sessionId}`} data-testid="session-recovery-guidance">
+            {recovery.guidance}
+          </p>
+        </div>
+        <RecoveryActionRow
+          primary={action("attach", "Attach / observe", !!onAttach)}
+          secondary={[
+            action("retry_operation", "Compose retry", !!onRetryOperation),
+            action("restart_same", "Restart Same"),
+            action("stop", "Stop"),
+            action("fresh", "Fresh / launch without restore flags"),
+          ]}
+          install={{ error: null, output: null }}
+        />
+        {requestError && (
+          <p role="alert" className="mt-2 text-xs">
+            {requestError}
+          </p>
+        )}
+      </InteractionErrorBanner>
+      {freshConsent === recovery.expected && current && recovery.actions.fresh && !readOnly && (
+        <FreshRecoveryConfirm onCancel={() => setFreshConsent(null)} onConfirm={() => void run("fresh")} />
+      )}
+    </section>
+  );
+}
+
+function FreshRecoveryConfirm({ onCancel, onConfirm }: { onCancel: () => void; onConfirm: () => void }) {
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
+  useDialogFocus(confirmRef);
+  useConfirmKeys(onCancel, onConfirm);
+  return (
+    <Dialog
+      id="session-recovery-fresh-dialog"
+      title="Launch without restore flags?"
+      onDismiss={onCancel}
+      footer={
+        <>
+          <CancelButton onClick={onCancel} />
+          <ConfirmButton
+            buttonRef={confirmRef}
+            onClick={onConfirm}
+            testId="session-recovery-fresh-confirm"
+            className={DANGER_BUTTON}
+          >
+            Launch without restore flags
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] text-text-secondary">
+        This stops the current runtime and launches without AoE restore flags. Existing native history is not deleted.
+        An undeclared wrapper may still restore its own history; this does not promise a new native conversation.
+        Pending AoE input is discarded. Blocked or possibly accepted prompts will not be replayed.
+      </p>
+    </Dialog>
   );
 }
 

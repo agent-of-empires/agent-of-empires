@@ -327,6 +327,27 @@ an object tagged by `state`, with a `reason` on every state but `available`.
 A daemon older than this field omits it entirely. Treat an absent
 `context_resume` as unreported rather than as `unavailable`.
 
+### Shared recovery observations
+
+Session rows and CLI `session show --json` expose nullable `recovery`. It contains
+`reason`, a public-safe `diagnostic`, optional historical operation `evidence`,
+the independent current `runtime` observation, `work_in_progress`, optional
+`uncertainty`, actionable `guidance`, `actions`, and opaque `expected`.
+The action keys are `attach`, `retry_operation`, `restart_same`, `stop`, and
+`fresh`. Clients render these server grants rather than infer them from `Error`,
+a raw Native session ID, a tool label or a historical Ready event.
+
+`evidence` describes the failed operation, not current liveness. Unknown or
+absent retryability is not permission to retry. ACP transport readiness is not
+proof that the OS process is alive. A stale or partial observation does not
+grant mutation permission. WebSocket omission of recovery is not a clear:
+an explicit current `null` clears it.
+
+`last_error` and `recovery` are runtime observations, not persisted session
+fields or a cross-daemon-restart retention guarantee. See the canonical
+[recovery actions and consequences](guides/session-resume.md#diagnosing-and-recovering-an-existing-session).
+
+
 **Example**
 
 ```bash
@@ -540,6 +561,26 @@ not a ready target or a confirmed Agent exit. The response retains a mutation
 receipt when launch state was committed; no wake message or pending send is
 delivered. See [Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
 for preservation and inspection guidance.
+
+An explicit recovery uses the current row's `expected` selection witness:
+
+```json
+{ "recovery": { "action": "same", "expected": "<current opaque value>" } }
+```
+
+`action` is `same` or `fresh`. This cannot also change execution settings or
+send a nonempty wake message. The server rechecks the current selection and
+admission before committing; an unknown, withdrawn or changed selection refuses
+without substituting Fresh. `expected` is only a concurrency witness, not Native
+identity or authority. Do not decode it or construct it from a saved ID.
+
+Same preserves the exact qualified target and sends no previous input. Fresh
+abandons pending AoE input and attachments without replay and retains native
+and transcript history. Omitting AoE restore flags cannot prevent an undeclared
+wrapper from restoring its own history. The
+[canonical recovery workflow](guides/session-resume.md#diagnosing-and-recovering-an-existing-session)
+describes CLI and interactive consent.
+
 
 ## POST /api/sessions/{id}/send
 

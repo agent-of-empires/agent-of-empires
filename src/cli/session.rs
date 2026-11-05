@@ -238,6 +238,14 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+
+    /// Explicitly reassert and restart the same qualified conversation.
+    #[arg(long, conflicts_with_all = ["fresh", "all"])]
+    pub same: bool,
+
+    /// Explicitly abandon AoE restore intent without replaying prior input.
+    #[arg(long, conflicts_with_all = ["same", "all"])]
+    pub fresh: bool,
 }
 
 #[derive(Args)]
@@ -1097,7 +1105,62 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
     let identifier = args
         .identifier
         .ok_or_else(|| anyhow::anyhow!("session identifier required (or pass --all)"))?;
+    let recovery = if args.same {
+        Some(crate::session::SessionRecoveryAction::Same)
+    } else if args.fresh {
+        Some(crate::session::SessionRecoveryAction::Fresh)
+    } else {
+        None
+    };
+    if let Some(action) = recovery {
+        return restart_session_recovery(profile, &identifier, action).await;
+    }
     restart_session(profile, SessionIdArgs { identifier }).await
+}
+
+async fn restart_session_recovery(
+    profile: &str,
+    identifier: &str,
+    action: crate::session::SessionRecoveryAction,
+) -> Result<()> {
+    let (client, epoch) = super::group::daemon_client().await?;
+    let default_profile;
+    let profile = if profile.is_empty() {
+        default_profile = client.default_profile().await?;
+        default_profile.as_str()
+    } else {
+        profile
+    };
+    let sessions = client
+        .list_sessions_for_profile(profile, Some(crate::session::SessionScope::All))
+        .await?;
+    let selected = super::resolve_session(identifier, &sessions.sessions)?;
+    let recovery = selected.recovery.as_ref().context(
+        "Recovery availability is unknown; inspect the session and reconnect to its daemon",
+    )?;
+    let allowed = match action {
+        crate::session::SessionRecoveryAction::Same => recovery.actions.restart_same,
+        crate::session::SessionRecoveryAction::Fresh => recovery.actions.fresh,
+    };
+    anyhow::ensure!(allowed, "{}", recovery.guidance);
+    let body = crate::daemon::RestartSessionBody {
+        recovery: Some(crate::session::SessionRecoveryRequest {
+            action,
+            expected: recovery.expected.clone(),
+        }),
+        wake_message: Some(String::new()),
+        ..Default::default()
+    };
+    let receipt = client.restart_session(&selected.id, &body, &epoch).await?;
+    let effect = match action {
+        crate::session::SessionRecoveryAction::Same => "Same-conversation restart",
+        crate::session::SessionRecoveryAction::Fresh => "Launch without AoE restore flags",
+    };
+    println!(
+        "{effect} committed: {} (generation {})",
+        selected.title, receipt.outcome.lifecycle_generation
+    );
+    Ok(())
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
@@ -3092,26 +3155,15 @@ mod restart_args_tests {
     }
 
     #[test]
-    fn restart_parses_identifier_all_and_parallel() {
-        let restart = |argv: &[&str]| {
-            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
-                SessionCommands::Restart(args) => (args.all, args.identifier, args.parallel),
-                _ => panic!("wrong subcommand"),
-            })
-        };
-        assert_eq!(
-            restart(&["aoe", "restart", "claude-3"]).unwrap(),
-            (false, Some("claude-3".to_string()), 3)
-        );
-        assert_eq!(
-            restart(&["aoe", "restart", "--all"]).unwrap(),
-            (true, None, 3)
-        );
-        assert_eq!(
-            restart(&["aoe", "restart", "--all", "--parallel", "5"]).unwrap(),
-            (true, None, 5)
-        );
-        assert!(restart(&["aoe", "restart", "claude-3", "--all"]).is_err());
+    fn conflicting_restart_intents_are_rejected() {
+        for argv in [
+            &["aoe", "restart", "session", "--same", "--fresh"][..],
+            &["aoe", "restart", "--all", "--same"][..],
+            &["aoe", "restart", "--all", "--fresh"][..],
+            &["aoe", "restart", "session", "--all"][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]

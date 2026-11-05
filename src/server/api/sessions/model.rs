@@ -89,6 +89,7 @@ impl SessionResponse {
             idle_entered_at: timestamp(row.idle_entered_at),
             last_error: row.last_error.map(str::to_string),
             last_error_evidence: row.last_error_evidence,
+            recovery: row.recovery.clone(),
             branch: row.worktree.map(|w| w.branch.clone()),
             main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
             base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
@@ -294,19 +295,19 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     out
 }
 
-/// A plain session keeps `RuntimeCheckRequired` until a resume probe runs, so a captured
-/// agent session id is the evidence that a restart keeps the conversation.
+/// A raw stored ID or cached capability is not a context-preservation receipt.
 pub(super) fn update_restart_resumable(
     inst: &Instance,
     resume: &ContextResumeAvailability,
 ) -> bool {
-    match resume {
-        ContextResumeAvailability::Available => true,
-        ContextResumeAvailability::Indeterminate {
-            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
-        } => inst.agent_session_id.is_some(),
-        _ => false,
-    }
+    matches!(resume, ContextResumeAvailability::Available)
+        && if inst.is_structured() {
+            inst.require_resolved_acp_selection().is_ok()
+                && inst.acp_load_session_capable == Some(true)
+                && inst.selected_acp_target().is_ok()
+        } else {
+            inst.clone().qualify_recovery_same().is_ok()
+        }
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
@@ -321,7 +322,9 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
             }
         } else {
             match inst.acp_load_session_capable {
-                Some(true) => ContextResumeAvailability::Available,
+                Some(true) => ContextResumeAvailability::Indeterminate {
+                    reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+                },
                 Some(false) => ContextResumeAvailability::Unavailable {
                     reason: ContextResumeUnavailableReason::AgentUnsupported,
                 },
@@ -333,7 +336,17 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     }
 
     match inst.terminal_context_resume_cached() {
-        TerminalContextResume::Available => ContextResumeAvailability::Available,
+        TerminalContextResume::Available if inst.clone().qualify_recovery_same().is_ok() => {
+            ContextResumeAvailability::Available
+        }
+        TerminalContextResume::Available => ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        },
+        TerminalContextResume::RuntimeCheckRequired
+            if inst.clone().qualify_recovery_same().is_ok() =>
+        {
+            ContextResumeAvailability::Available
+        }
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
         },

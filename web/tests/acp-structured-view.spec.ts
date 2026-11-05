@@ -16,6 +16,7 @@ import {
 } from "./helpers/acpMock";
 import { iPhone13 } from "./helpers/viewports";
 
+import type { SessionRecovery } from "../src/lib/acpTypes";
 const composerBox = (page: Page) => page.getByRole("textbox", { name: /Send a message/i });
 const acpViewport = (page: Page) => page.getByTestId("acp-viewport");
 
@@ -1012,4 +1013,64 @@ test.describe("current native control authority", () => {
     expect(mock.promptBodies.map((body) => body.text)).toEqual(["one governed wake intent"]);
     expect(mock.configOptionBodies).toEqual([]);
   });
+});
+
+test("shared recovery opens a blank explicit composition and keeps native controls independent from stale recovery", async ({
+  page,
+}) => {
+  const recovery: SessionRecovery = {
+    reason: "operation_failed",
+    diagnostic: "The provider rejected this operation.",
+    evidence: {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      blocking_scope: "operation",
+      retryable: true,
+      observed_at_ms: 10,
+    },
+    runtime: "acp_transport_ready",
+    work_in_progress: false,
+    uncertainty: null,
+    guidance: "Repair provider configuration in the Agent, then compose a new operation.",
+    actions: { attach: true, retry_operation: true, restart_same: false, stop: true, fresh: false },
+    expected: "opaque-current-exact-selection",
+  };
+  const mutations: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /\/(?:restart|ensure|spawn)$/.test(new URL(request.url()).pathname)) {
+      mutations.push(request.url());
+    }
+  });
+  const mock = await mockAcpSession(page, {
+    title: "shared-recovery",
+    acpSessionId: "original-exact-native-history",
+    recovery,
+    onPrompt: () => [agentMessageChunk("Explicit operation completed."), stopped()],
+  });
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  await expect(page.getByTestId("session-recovery")).toHaveAttribute("data-session-id", mock.sessionId);
+  await expect(page.getByTestId("session-recovery")).toHaveAttribute("data-reason", "operation_failed");
+  const composer = composerBox(page);
+  await composer.fill("retained draft must not be replayed");
+  await page.getByTestId("session-recovery-retry-operation").click();
+  await expect(composer).toHaveValue("");
+  expect(mock.promptBodies).toEqual([]);
+  expect(mutations).toEqual([]);
+
+  mock.setNativeState({ ready: true });
+  await expect(page.getByTestId("session-recovery-retry-operation")).toBeDisabled();
+  await expect(page.getByText(recovery.diagnostic)).toBeVisible();
+  // Missing recovery does not revoke C's independently qualified native input.
+  await expect(page.getByRole("button", { name: "Send message" })).toBeVisible();
+  mock.setNativeState({ ready: true, recovery });
+  await expect(page.getByTestId("session-recovery-retry-operation")).toBeEnabled();
+  await composer.fill("new explicit operation");
+  await composer.press("Enter");
+  await expect(page.getByText("Explicit operation completed.")).toBeVisible();
+  expect(mock.promptBodies.map((body) => body.text)).toEqual(["new explicit operation"]);
+  expect(mutations).toEqual([]);
+  mock.setNativeState({ ready: true, recovery: null });
+  await expect(page.getByTestId("session-recovery")).toHaveCount(0);
 });

@@ -11,6 +11,8 @@ interface SessionState {
   sessions: SessionResponse[];
   observedById: Record<string, RuntimeCursor>;
   epoch: string | null;
+  pushed: ReadonlyMap<string, PushedStatus>;
+  observationCurrent: boolean;
 }
 
 function mergeSession(session: SessionResponse, previous: SessionResponse): SessionResponse {
@@ -37,7 +39,13 @@ function withPushedStatus(row: SessionResponse, observed: RuntimeCursor, held: P
 }
 
 export function useSessions() {
-  const [state, setState] = useState<SessionState>({ sessions: [], observedById: {}, epoch: null });
+  const [state, setState] = useState<SessionState>(() => ({
+    sessions: [],
+    observedById: {},
+    epoch: null,
+    pushed: new Map(),
+    observationCurrent: false,
+  }));
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -46,9 +54,6 @@ export function useSessions() {
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
-  // Newest pushed status per row. A push is a partial observation: it is compared with each row's own observation,
-  // never with the global floor, and one from an epoch not yet installed waits for a read of that epoch.
-  const pushedRef = useRef(new Map<string, PushedStatus>());
 
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
@@ -71,17 +76,24 @@ export function useSessions() {
       if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
       if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
       floorGet.current = cursor;
-      const pushed = pushedRef.current;
       const present = new Set(data.sessions.map((s) => s.id));
-      const sessions = data.sessions.map((s) => withPushedStatus(s, cursor, pushed.get(s.id)));
-      for (const [id, held] of pushed) {
-        const waiting = held.cursor.epoch !== cursor.epoch && !abandonedEpochs.current.has(held.cursor.epoch);
-        if (!present.has(id) || !(outranks(held, cursor) || waiting)) pushed.delete(id);
-      }
-      setState({
-        sessions,
-        observedById: Object.fromEntries(data.sessions.map((session) => [session.id, cursor])),
-        epoch: cursor.epoch,
+      setState((prev) => {
+        const sessions = data.sessions.map((s) => withPushedStatus(s, cursor, prev.pushed.get(s.id)));
+        let pushed: Map<string, PushedStatus> | undefined;
+        for (const [id, held] of prev.pushed) {
+          const waiting = held.cursor.epoch !== cursor.epoch && !abandonedEpochs.current.has(held.cursor.epoch);
+          if (!present.has(id) || !(outranks(held, cursor) || waiting)) {
+            pushed ??= new Map(prev.pushed);
+            pushed.delete(id);
+          }
+        }
+        return {
+          sessions,
+          observedById: Object.fromEntries(data.sessions.map((session) => [session.id, cursor])),
+          epoch: cursor.epoch,
+          pushed: pushed ?? prev.pushed,
+          observationCurrent: true,
+        };
       });
       // Ignore server ordering while a local drag's PUT may still be landing.
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
@@ -90,6 +102,7 @@ export function useSessions() {
     } else {
       setError(true);
       setServerDown(true);
+      setState((previous) => (previous.observationCurrent ? { ...previous, observationCurrent: false } : previous));
     }
   }, []);
 
@@ -140,14 +153,19 @@ export function useSessions() {
   // The server sends a move only after publishing a snapshot that includes it, and stamps it with that cursor.
   const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
     if (abandonedEpochs.current.has(cursor.epoch)) return;
-    const held = pushedRef.current.get(id);
-    if (held && held.cursor.epoch === cursor.epoch && held.cursor.revision >= cursor.revision) return;
-    pushedRef.current.set(id, { status, cursor });
     setState((prev) => {
-      if (prev.epoch !== cursor.epoch) return prev;
+      const held = prev.pushed.get(id);
+      if (held && held.cursor.epoch === cursor.epoch && held.cursor.revision >= cursor.revision) return prev;
       const observed = prev.observedById[id];
       if (observed?.epoch === cursor.epoch && observed.revision >= cursor.revision) return prev;
-      return { ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) };
+      const pushed = new Map(prev.pushed);
+      pushed.set(id, { status, cursor });
+      return {
+        ...prev,
+        pushed,
+        sessions:
+          prev.epoch === cursor.epoch ? prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) : prev.sessions,
+      };
     });
   }, []);
 
@@ -200,10 +218,9 @@ export function useSessions() {
       // A mutation response cannot resurrect an id absent from the canonical list.
       if (!prev.sessions.some((s) => s.id === session.id)) return prev;
       return {
+        ...prev,
         sessions: prev.sessions.map((s) =>
-          s.id === session.id
-            ? withPushedStatus(mergeSession(session, s), cursor, pushedRef.current.get(session.id))
-            : s,
+          s.id === session.id ? withPushedStatus(mergeSession(session, s), cursor, prev.pushed.get(session.id)) : s,
         ),
         observedById: { ...prev.observedById, [session.id]: cursor },
         epoch: cursor.epoch,
@@ -211,8 +228,23 @@ export function useSessions() {
     });
   }, []);
 
+  // Partial status pushes do not refresh recovery admission. Wait for a full canonical row.
+  const recoveryCurrentIds = !state.observationCurrent
+    ? []
+    : state.sessions
+        .filter((session) => {
+          const observed = state.observedById[session.id];
+          const held = state.pushed.get(session.id);
+          return (
+            !!observed &&
+            observed.epoch === state.epoch &&
+            (!held || (held.cursor.epoch === observed.epoch && !outranks(held, observed)))
+          );
+        })
+        .map((session) => session.id);
   return {
     sessions: state.sessions,
+    recoveryCurrentIds,
     observedById: state.observedById,
     runtimeEpoch: state.epoch,
     workspaceOrdering,

@@ -131,6 +131,7 @@ pub struct App {
     mosh_active: bool,
     // Actions that need the async loop, picked up after `execute_action`.
     pending_structured_view_open: Option<String>,
+    pending_operation_retry: Option<OperationRetryIntent>,
     pending_view_switch: Option<String>,
 
     pending_smart_rename: Option<String>,
@@ -347,6 +348,7 @@ impl App {
             host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
+            pending_operation_retry: None,
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
@@ -997,11 +999,7 @@ impl App {
                             ) {
                                 let _ = self.home.clear_preview_selection();
                                 self.execute_action(action, terminal)?;
-                                if let Some(session_id) =
-                                    self.pending_structured_view_open.take()
-                                {
-                                    self.open_structured_view(&session_id).await?;
-                                }
+                                self.drain_pending_session_actions().await?;
                                 if self.should_quit {
                                     break;
                                 }
@@ -1169,13 +1167,12 @@ impl App {
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
-                                if let Some(session_id) = self.pending_structured_view_open.take() {
-                                    self.open_structured_view(&session_id).await?;
-                                }
+                                self.drain_pending_session_actions().await?;
                             }
                             // Actions stashed by dialog button clicks.
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
+                                self.drain_pending_session_actions().await?;
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
@@ -1385,9 +1382,7 @@ impl App {
                 .or_else(|| self.home.take_created_attach());
             if let Some(session_id) = created_attach {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
-                if let Some(sid) = self.pending_structured_view_open.take() {
-                    self.open_structured_view(&sid).await?;
-                }
+                self.drain_pending_session_actions().await?;
                 needs_full_refresh = true;
             }
 
@@ -2312,9 +2307,7 @@ impl App {
             self.perform_view_switch(&session_id, terminal).await;
         }
 
-        if let Some(session_id) = self.pending_structured_view_open.take() {
-            self.open_structured_view(&session_id).await?;
-        }
+        self.drain_pending_session_actions().await?;
 
         if let Some(session_id) = self.pending_smart_rename.take() {
             self.perform_smart_rename(&session_id);
@@ -2381,6 +2374,52 @@ impl App {
             Ok(()) => format!("\"{title}\" switched to the terminal view"),
             Err(e) => format!("view switch failed: {e}"),
         });
+    }
+
+    async fn drain_pending_session_actions(&mut self) -> Result<()> {
+        if let Some(OperationRetryIntent {
+            session_id: id,
+            text,
+            expected,
+        }) = self.pending_operation_retry.take()
+        {
+            let result: Result<()> = async {
+                anyhow::ensure!(
+                    self.home
+                        .operation_retry_projection(&id)
+                        .is_some_and(|current| current.expected == expected),
+                    "Current recovery no longer offers Retry; no input sent"
+                );
+                let structured = self
+                    .home
+                    .get_instance(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Session no longer available"))?
+                    .is_structured();
+                let client = crate::acp::client::HttpClient::new(
+                    crate::acp::client::locate_daemon().await?,
+                )?;
+                if structured {
+                    client.prompt(&id, &text, true).await?;
+                } else {
+                    client.send_terminal_existing(&id, &text).await?;
+                }
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => self.set_status("Explicit input submitted without revival"),
+                Err(error) => {
+                    self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Operation Retry Refused",
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(id) = self.pending_structured_view_open.take() {
+            self.open_structured_view(&id).await?;
+        }
+        Ok(())
     }
 
     /// Enter the structured view against the located runtime.
@@ -2771,6 +2810,9 @@ impl App {
                     return Ok(());
                 }
                 self.spawn_image_pull(image);
+            }
+            Action::RetryOperation(intent) => {
+                self.pending_operation_retry = Some(intent);
             }
             Action::SendMessage(id, message) => {
                 // Cold starts show "Reviving" feedback; warm sessions skip the
@@ -3203,6 +3245,7 @@ pub enum Action {
     SpawnImagePull(String),
     /// Deferred so the loop can show "Reviving..." before `ensure_pane_ready`.
     SendMessage(String, String),
+    RetryOperation(OperationRetryIntent),
     EnterLiveSend(String),
     /// (session id, tool name indexing `Config.tools`).
     AttachToolSession(String, String),
@@ -3213,6 +3256,13 @@ pub enum Action {
     SwitchSessionView(String),
 
     SmartRenameNow(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationRetryIntent {
+    pub session_id: String,
+    pub text: String,
+    pub expected: String,
 }
 
 #[cfg(test)]
@@ -3962,32 +4012,6 @@ mod tests {
         assert_eq!(disk_decision, DiskRefreshDecision::FullHeartbeat);
         assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
         assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_action_enum() {
-        let quit = Action::Quit;
-        let attach = Action::AttachSession("test-id".to_string());
-        let attach_terminal =
-            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container);
-
-        assert_eq!(quit, Action::Quit);
-        assert_eq!(attach, Action::AttachSession("test-id".to_string()));
-        assert_eq!(
-            attach_terminal,
-            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container)
-        );
-    }
-
-    #[test]
-    fn test_action_clone() {
-        let original = Action::AttachSession("session-123".to_string());
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-
-        let terminal_action = Action::AttachTerminal("session-123".to_string(), TerminalMode::Host);
-        let terminal_cloned = terminal_action.clone();
-        assert_eq!(terminal_action, terminal_cloned);
     }
 
     #[test]

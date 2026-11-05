@@ -101,6 +101,9 @@ it("the committed Composer Stop cancels its current turn before SDK passive publ
               promptCapabilities={ctx.state.promptCapabilities}
               pendingAttachments={ctx.pendingAttachments}
               setPendingAttachments={ctx.setPendingAttachments}
+              operationRetryActive={ctx.operationRetryActive}
+              compositionControlRef={ctx.compositionControlRef}
+              attachmentReadGenerationRef={ctx.attachmentReadGenerationRef}
               queuedPrompts={ctx.state.queuedPrompts}
               editQueuedPrompt={ctx.editQueuedPrompt}
             />

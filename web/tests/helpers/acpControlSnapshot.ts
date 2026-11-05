@@ -8,6 +8,7 @@ export function currentControlSnapshot(
     unavailable?: AcpConnectionUnavailability | null;
     wakeEligible?: boolean;
     rateLimitPark?: ReducedState["rate_limit_park"];
+    recovery?: ReducedState["recovery"];
   },
   seq = state.lastSeq,
 ): { kind: "reduced_state"; seq: number; state: ReducedState; unchanged: string[] } {
@@ -45,6 +46,7 @@ export function currentControlSnapshot(
         ended_at: run.endedAt ?? null,
       })),
       operation_error: state.lastErrorEvidence,
+      recovery: receipt.recovery,
       connection_unavailable: unavailable,
       connection_ready: receipt.ready && unavailable === null,
       prompt_wake_eligible: receipt.wakeEligible === true && unavailable === null,

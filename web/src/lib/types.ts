@@ -1,4 +1,4 @@
-import type { OperationErrorEvidence, RateLimitInfo } from "./acpTypes";
+import type { OperationErrorEvidence, RateLimitInfo, SessionRecovery } from "./acpTypes";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import type { SchemaSettings } from "./generated/settingsKeys";
@@ -25,6 +25,7 @@ export interface SessionResponse {
   idle_entered_at: string | null;
   last_error: string | null;
   last_error_evidence?: OperationErrorEvidence | null;
+  recovery?: SessionRecovery | null;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */

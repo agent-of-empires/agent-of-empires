@@ -216,12 +216,22 @@ impl NativeRuntime {
         // observers retain that flock while publishing. Never acquire lifecycle
         // under publication or instances exclusion and complete that lock cycle.
         let worker_states = state.acp_supervisor.worker_states_snapshot().await;
+        let recovery = state
+            .session_service
+            .recovery_snapshots(
+                !state.read_only
+                    && !state.cityhall_mode
+                    && *state.canonical_health.read().await == RuntimeHealth::Healthy,
+            )
+            .await?;
         let _publication = state.publication.read().await;
         let mutation_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
-        let sessions = super::api::sessions::project_sessions(state, &worker_states).await?;
+        let sessions =
+            super::api::sessions::project_sessions_with_recovery(state, &worker_states, &recovery)
+                .await?;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);

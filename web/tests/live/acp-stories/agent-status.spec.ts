@@ -14,7 +14,8 @@ import {
   startAcpSession,
   waitForReplayContains,
 } from "../../helpers/acp";
-import { seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import type { SessionRecovery } from "../../../src/lib/acpTypes";
 
 // The fake reports the reset only on a usage_update's meta, like claude-agent-acp.
 const rateLimitedTurn = (resetsAt: number, extra: object = {}) => ({
@@ -178,3 +179,85 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   await page.getByTestId("acp-agent-log-refresh").click();
   await expect(body).toBeVisible({ timeout: 5_000 });
 });
+
+for (const incident of [
+  { name: "provider", message: "Provider request failed" },
+  { name: "auth", message: "Authentication required in the Agent" },
+]) {
+  test(`${incident.name} operation failure survives reopen and accepts only a new explicit operation on the same native history`, async ({
+    page,
+    spawnServe,
+  }) => {
+    const { serve, sessionId } = await startAcpSession(spawnServe, {
+      title: `shared-recovery-${incident.name}`,
+      fakeAcpScript: script(
+        {
+          updates: [chunk("Partial work before the rejected operation.")],
+          error: { code: -32603, message: incident.message, data: { provider_body: "PRIVATE_PROVIDER_BODY_5055" } },
+        },
+        endTurn(chunk("The new explicit operation completed.")),
+      ),
+    });
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)?.acp_session_id, {
+        timeout: 20_000,
+      })
+      .toEqual(expect.any(String));
+    const before = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    const mutations: Array<{ path: string; body: unknown }> = [];
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (request.method() === "POST" && path.startsWith(`/api/sessions/${sessionId}/`)) {
+        mutations.push({ path, body: request.postDataJSON() });
+      }
+    });
+    const rejected = `original blocked operation ${incident.name}`;
+    await openStructuredView(page, serve, sessionId, rejected);
+    let diagnostic = "";
+    await expect
+      .poll(
+        async () => {
+          const current = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+          const projection = current.recovery as SessionRecovery | null | undefined;
+          diagnostic = projection?.diagnostic ?? "";
+          return projection?.reason;
+        },
+        { timeout: 20_000 },
+      )
+      .toBe("operation_failed");
+    const banner = page.getByTestId("session-recovery");
+    await expect(banner).toHaveAttribute("data-session-id", sessionId);
+    await expect(banner).toHaveAttribute("data-reason", "operation_failed");
+    await expect(banner).toContainText(diagnostic);
+    await expect(page.getByTestId("session-recovery-scope")).toContainText("Blocking scope: operation");
+    await expect(page.getByTestId("session-recovery-runtime")).toContainText("does not prove the OS process is alive");
+    // A generic RPC result contains no affirmative retryability evidence.
+    await expect(page.getByTestId("session-recovery-retry-operation")).toBeDisabled();
+    await expect(page.getByText("PRIVATE_PROVIDER_BODY_5055")).toHaveCount(0);
+
+    await page.reload();
+    await expect(banner).toContainText(diagnostic);
+    await page.getByTestId("session-recovery-attach").click();
+    const reopened = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    expect(reopened.acp_session_id).toBe(before.acp_session_id);
+    expect(reopened.id).toBe(before.id);
+    expect(mutations.filter(({ path }) => /\/(?:restart|ensure|spawn)$/.test(path))).toEqual([]);
+    expect(mutations.filter(({ path }) => path.endsWith("/acp/prompt")).map(({ body }) => body)).toEqual([
+      expect.objectContaining({ text: rejected }),
+    ]);
+
+    const composer = page.getByRole("textbox", { name: /Send a message/i });
+    const explicit = `new explicit operation after ${incident.name} intervention`;
+    await composer.fill(explicit);
+    await composer.press("Enter");
+    await expect(page.getByText("The new explicit operation completed.")).toBeVisible({ timeout: 20_000 });
+    await expect(banner).toHaveCount(0);
+    const after = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    expect(after.acp_session_id).toBe(before.acp_session_id);
+    expect(mutations.filter(({ path }) => path.endsWith("/acp/prompt")).map(({ body }) => body)).toEqual([
+      expect.objectContaining({ text: rejected }),
+      expect.objectContaining({ text: explicit }),
+    ]);
+    expect(mutations.filter(({ path }) => /\/(?:restart|ensure|spawn)$/.test(path))).toEqual([]);
+  });
+}

@@ -90,6 +90,16 @@ pub(super) enum PermissionResponseTarget {
     Structured { session_id: String, nonce: String },
 }
 
+pub(super) enum MessageIntent {
+    Send(String),
+    RetryExisting { id: String, expected: String },
+}
+
+pub(super) enum StopIntent {
+    Ordinary(String),
+    Recovery { id: String, expected: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
@@ -301,7 +311,7 @@ pub struct HomeView {
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
-    pub(super) pending_send_session: Option<String>,
+    pub(super) pending_message: Option<MessageIntent>,
     pub(super) pending_send_target: live_send::LiveSendTarget,
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
     pending_native_attachment: Option<panes::PendingNativeAttachment>,
@@ -329,7 +339,7 @@ pub struct HomeView {
     pub(super) pending_paste: Option<String>,
     pub(super) pending_paste_for_structured_view: HashMap<String, String>,
     pub(super) pending_attach_after_warning: Option<String>,
-    pub(super) pending_stop_session: Option<String>,
+    pub(super) pending_stop_session: Option<StopIntent>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
     pending_legacy_tool_preparation: Option<panes::PendingLegacyToolPreparation>,

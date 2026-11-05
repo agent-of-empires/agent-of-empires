@@ -3,7 +3,7 @@
 
 import { ComposerPrimitive } from "@assistant-ui/react";
 import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
@@ -57,6 +57,8 @@ import {
   useQueueRecall,
   useTriggerAdapters,
   type ComposerClient,
+  type ComposerCompositionControl,
+  type CompositionSendResult,
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { useProviderSwitch } from "./useProviderSwitch";
@@ -91,11 +93,17 @@ interface Props {
   /** Mid-turn the textarea stays editable and sends go through the queue. */
   turnActive: boolean;
   /** Queue path used by the custom send buttons and mid-turn Enter, which the primitive blocks. */
-  enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>;
+  enqueuePrompt: (
+    text: string,
+    attachments?: PromptAttachmentInput[],
+  ) => void | CompositionSendResult | Promise<void | CompositionSendResult>;
   promptCapabilities: PromptCapabilities | null;
   /** Owned by AcpRuntime so the idle Enter path can read them on submit. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
+  operationRetryActive: boolean;
+  compositionControlRef: React.RefObject<ComposerCompositionControl | null>;
+  attachmentReadGenerationRef: React.RefObject<number>;
   /** Replaces the text and focuses; a fresh `id` re-applies the same text. */
   primerPrefill?: { id: string; text: string } | null;
   /** Oldest first; source for ArrowUp/ArrowDown recall. */
@@ -107,12 +115,18 @@ const POPOVER_CLASS =
   "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
 
 export function Composer(props: Props) {
-  const { sessionId, turnActive, connected, canSubmit, promptCapabilities, queuedPrompts } = props;
+  const { sessionId, turnActive, connected, canSubmit, promptCapabilities, queuedPrompts, compositionControlRef } =
+    props;
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { client, composerText, draftTextRef } = useComposerClient();
   const loadText = useLoadText(client, taRef);
-  const attachments = useAttachments(promptCapabilities, props.pendingAttachments, props.setPendingAttachments);
+  const attachments = useAttachments(
+    promptCapabilities,
+    props.pendingAttachments,
+    props.setPendingAttachments,
+    props.attachmentReadGenerationRef,
+  );
   const { fileAdapter, slashAdapter } = useTriggerAdapters(sessionId, props.availableCommands);
   const skillIndex = useSkillIndex();
   const isMobile = useIsMobileInput();
@@ -120,13 +134,29 @@ export function Composer(props: Props) {
   // Regular iOS Safari already lifts the composer by keyboardHeight; only the PWA needs this.
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
+  const { invalidateReads } = attachments;
+  const { applyRecall } = recall;
+  useLayoutEffect(() => {
+    const control: ComposerCompositionControl = {
+      reset: () => {
+        invalidateReads();
+        applyRecall(null);
+        loadText("");
+      },
+      restoreText: loadText,
+    };
+    compositionControlRef.current = control;
+    return () => {
+      if (compositionControlRef.current === control) compositionControlRef.current = null;
+    };
+  }, [invalidateReads, loadText, compositionControlRef, applyRecall]);
   const canSend = canSubmit && (composerText.trim().length > 0 || attachments.supported.length > 0);
   const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
     if (!canSubmit) return;
     const cur = recall.recallRef.current;
-    if (cur) {
+    if (cur && !props.operationRetryActive) {
       recall.applyRecall(null);
       const text = client.getState().text.trim();
       // Submitting while browsing edits in place; if the entry drained, send normally so nothing is lost.
@@ -137,8 +167,14 @@ export function Composer(props: Props) {
         return;
       }
     }
-    sendFromTextarea(taRef, client, props.enqueuePrompt, sessionId, attachments.supported, () =>
-      props.setPendingAttachments([]),
+    void sendFromTextarea(
+      taRef,
+      client,
+      props.enqueuePrompt,
+      sessionId,
+      attachments.supported,
+      () => props.setPendingAttachments([]),
+      props.operationRetryActive,
     );
   }, [canSubmit, client, props, sessionId, attachments.supported, queuedPrompts, recall]);
 
@@ -179,7 +215,7 @@ export function Composer(props: Props) {
       browsing: recall.recallRef.current != null,
       queueLen: queuedPrompts.length,
     });
-    if (recallAction !== "default") {
+    if (!props.operationRetryActive && recallAction !== "default") {
       e.preventDefault();
       e.stopPropagation();
       recall.recall(recallAction);
@@ -196,7 +232,14 @@ export function Composer(props: Props) {
       e.stopPropagation();
       return;
     }
-    if (decideEnterAction(keys, { isMobile, turnActive }) === "default") return;
+    const enterAction = decideEnterAction(keys, { isMobile, turnActive });
+    const retryEnter =
+      props.operationRetryActive &&
+      e.key === "Enter" &&
+      !e.shiftKey &&
+      !e.nativeEvent.isComposing &&
+      (!isMobile || e.ctrlKey || e.metaKey);
+    if (enterAction === "default" && !retryEnter) return;
     e.preventDefault();
     e.stopPropagation();
     submitComposer();
@@ -482,11 +525,11 @@ function usePrimerPrefill(primerPrefill: Props["primerPrefill"], loadText: (text
   // Mirrored into refs so the effect keys on the id alone.
   const primerIdRef = useRef(primerId);
   const primerTextRef = useRef(primerText);
-  useEffect(() => {
+  useLayoutEffect(() => {
     primerIdRef.current = primerId;
     primerTextRef.current = primerText;
   }, [primerId, primerText]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!primerIdRef.current || primerTextRef.current == null) return;
     loadText(primerTextRef.current);
   }, [loadText, primerId]);
@@ -509,19 +552,20 @@ function useInitialFocus(isMobile: boolean, taRef: React.RefObject<HTMLTextAreaE
   }, [isMobile, taRef]);
 }
 
-/** Send text and staged attachments through the queue, then clear the composer.
- *  The persisted draft clears synchronously so a racing remount cannot restore it. */
-function sendFromTextarea(
+/** Ordinary sends clear synchronously; explicit Retry retains its draft until admission succeeds. */
+async function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   client: ComposerClient,
   enqueuePrompt: Props["enqueuePrompt"],
   sessionId: string,
   attachments: PromptAttachmentInput[],
   clearAttachments: () => void,
-): void {
+  preserveUntilAccepted: boolean,
+): Promise<void> {
   const text = client.getState().text.trim();
   if (!text && attachments.length === 0) return;
-  void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
+  const admission = enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
+  if (preserveUntilAccepted && (await admission) !== "consumed") return;
   client.setText("");
   clearDraft(sessionId);
   clearAttachments();

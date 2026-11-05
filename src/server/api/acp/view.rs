@@ -2575,13 +2575,17 @@ mod tests {
             .is_err());
         tokio::time::timeout(Duration::from_secs(10), state.runtime.work.drain()).await?;
         assert!(deleted.load(Ordering::SeqCst));
-        assert!(worker_registry::load_strict(&row.id)?.is_none());
+        // Draining admitted mutations does not exclude independent registry observations.
+        // Wait only for readable evidence; never treat contention as proof of retirement.
+        assert!(
+            observe_handoff_registry(&row.id, || worker_registry::load_strict(&row.id))
+                .await?
+                .is_none()
+        );
         assert!(!state.acp_supervisor.is_owned(&row.id).await);
-        assert!(state
-            .acp_supervisor
-            .capture_retirement(&row.id)?
-            .lease
-            .is_none());
+        let retired = capture_handoff_retirement(&state, &row.id).await?;
+        assert!(retired.lease.is_none());
+        assert!(retired.identity.is_none());
         let stored = storage.load()?;
         let terminal = stored.iter().find(|session| session.id == row.id).unwrap();
         assert_eq!(terminal.view, View::Terminal);

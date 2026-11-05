@@ -495,6 +495,8 @@ Restart session (or all sessions with `--all`)
 * `--parallel <PARALLEL>` — Concurrency cap for `--all`. Restarting many sandboxed sessions in parallel pressures dockerd, so the default is intentionally modest. Ignored when `--all` is not set
 
   Default value: `3`
+* `--same` — Explicitly reassert and restart the same qualified conversation
+* `--fresh` — Explicitly abandon AoE restore intent without replaying prior input
 
 
 

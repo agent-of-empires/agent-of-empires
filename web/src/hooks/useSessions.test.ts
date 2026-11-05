@@ -100,4 +100,44 @@ describe("useSessions / pushed status", () => {
     await act(async () => resolvers[1]!(envelope([row("a", "Running")], 1n, "restarted")));
     expect(result.current.sessions[0]!.status).toBe("Waiting");
   });
+
+  it("withdraws recovery freshness on a newer partial push, unversioned response, or failed poll without dropping rows", async () => {
+    const { result, resolvers, row, envelope } = mountWithReads();
+    const original = row("original", "Error");
+    await act(async () => resolvers[0]!(envelope([original], 1n)));
+    expect(result.current.recoveryCurrentIds).toEqual(["original"]);
+    act(() => result.current.applyPushedStatus("original", "Running", cursor(2n)));
+    expect(result.current.recoveryCurrentIds).toEqual([]);
+    expect(result.current.sessions[0]!.id).toBe("original");
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope([original], 2n)));
+    expect(result.current.recoveryCurrentIds).toEqual(["original"]);
+    act(() => result.current.applySession(original));
+    expect(result.current.recoveryCurrentIds).toEqual([]);
+    act(() => result.current.refresh());
+    await act(async () => resolvers[2]!(envelope([original], 3n)));
+    expect(result.current.recoveryCurrentIds).toEqual(["original"]);
+    act(() => result.current.refresh());
+    await act(async () => resolvers[3]!(null));
+    expect(result.current.recoveryCurrentIds).toEqual([]);
+    expect(result.current.sessions).toEqual([original]);
+    act(() => result.current.refresh());
+    await act(async () => resolvers[4]!(envelope([original], 2n)));
+    expect(result.current.recoveryCurrentIds).toEqual([]);
+    expect(result.current.error).toBe(false);
+    act(() => result.current.refresh());
+    await act(async () => resolvers[5]!(envelope([original], 4n)));
+    expect(result.current.recoveryCurrentIds).toEqual(["original"]);
+    expect(result.current.error).toBe(false);
+  });
+
+  it("does not use a previous runtime namespace's recovery selection after a new-epoch push", async () => {
+    const { result, resolvers, row, envelope } = mountWithReads();
+    await act(async () => resolvers[0]!(envelope([row("original", "Error")], 1n)));
+    act(() => result.current.applyPushedStatus("original", "Running", cursor(1n, "new-boot")));
+    expect(result.current.recoveryCurrentIds).toEqual([]);
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope([row("original", "Running")], 1n, "new-boot")));
+    expect(result.current.recoveryCurrentIds).toEqual(["original"]);
+  });
 });

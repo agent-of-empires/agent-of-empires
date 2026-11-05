@@ -1,5 +1,4 @@
-//! Small popup menu anchored at a screen position, used for right-click
-//! context actions on the sidebar list (Rename / Delete).
+//! Sidebar context actions anchored at the pointer.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -49,6 +48,10 @@ pub enum ContextMenuAction {
     ToggleSectionCollapse,
     /// Restore a trashed session.
     Restore,
+    Recovery,
+    ObserveExisting,
+    RetryOperation,
+    StopExisting,
 }
 
 pub struct ContextMenuDialog {
@@ -138,6 +141,40 @@ impl ContextMenuDialog {
             ContextMenuAction::RestartForUpdate,
             "Restart to apply update",
         ));
+        self
+    }
+
+    pub fn with_recovery(
+        mut self,
+        recovery: Option<&crate::session::SessionRecovery>,
+        current: bool,
+        controls_available: bool,
+    ) -> Self {
+        let Some(recovery) = recovery else {
+            return self;
+        };
+        self.items.push((
+            ContextMenuAction::Recovery,
+            "Recovery diagnostic and choices",
+        ));
+        if current && recovery.actions.attach {
+            self.items.push((
+                ContextMenuAction::ObserveExisting,
+                "Observe existing runtime / transcript",
+            ));
+        }
+        if current && controls_available {
+            if recovery.actions.retry_operation {
+                self.items.push((
+                    ContextMenuAction::RetryOperation,
+                    "Retry operation with explicit input",
+                ));
+            }
+            if recovery.actions.stop {
+                self.items
+                    .push((ContextMenuAction::StopExisting, "Stop owned runtime"));
+            }
+        }
         self
     }
 

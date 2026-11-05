@@ -882,6 +882,7 @@ mod tests {
     /// 80x24 frame: transcript rows 0-19, status row 20, composer rows 21-23.
     fn layout() -> ViewLayout {
         ViewLayout {
+            recovery: Rect::default(),
             transcript: Rect::new(0, 0, 80, 20),
             status: Rect::new(0, 20, 80, 1),
             approval: Rect::new(0, 21, 80, 0),

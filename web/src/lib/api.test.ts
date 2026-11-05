@@ -1662,3 +1662,17 @@ describe("restartSessionForUpdate", () => {
     expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
   });
 });
+
+describe("explicit shared recovery", () => {
+  it("uses only the server safe refusal, never raw response bodies", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("PRIVATE_PROVIDER_BODY", { status: 500 }));
+    expect(await api.recoverSession("original", "same", "opaque")).toEqual({ ok: false, message: undefined });
+    fetchSpy.mockResolvedValueOnce(json({ message: "The recovery selection changed." }, 409));
+    expect(await api.recoverSession("original", "fresh", "opaque")).toEqual({
+      ok: false,
+      message: "The recovery selection changed.",
+    });
+    offline();
+    expect(await api.recoverSession("original", "same", "opaque")).toEqual({ ok: false });
+  });
+});

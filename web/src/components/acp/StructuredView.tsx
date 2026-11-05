@@ -48,6 +48,7 @@ type WorkerState = "absent" | "resuming" | "running" | "stopping";
 
 interface Props {
   sessionId: string;
+  readOnly?: boolean;
   /** False for a retained view that is hidden or covered: no keyboard reservation. */
   active?: boolean;
   /** False for a non-selected retained view: no chime. Stays true while the stack is covered. */
@@ -197,7 +198,7 @@ function AcpChrome({
     ? agentName(state.agent ?? acpAgent)
     : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
-  const readOnly = !!view.trashedAt || !!view.archivedAt;
+  const readOnly = !!view.readOnly || !!view.trashedAt || !!view.archivedAt;
   const nativeReady = status === "open" && nativeInputAvailable(state);
   const canDecide = (nonce: string) => !readOnly && status === "open" && canDecideRequest(state, nonce);
   // Rows before the latest `/clear` divider are the hidden history.
@@ -228,7 +229,7 @@ function AcpChrome({
   });
 
   // Structured compatibility diagnostics do not override a current healthy native receipt.
-  if (state.incompatibleAgent && !nativeReady) {
+  if (state.incompatibleAgent && !nativeReady && !state.recovery && !state.recoveryNotice) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
         <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={view.isSandboxed} />
@@ -273,6 +274,14 @@ function AcpChrome({
         onSwitchToTerminal={view.onSwitchToTerminal}
         dismissError={ctx.dismissError}
         startingAgent={startingAgent}
+        readOnly={readOnly}
+        recoveryCurrent={status === "open" && !state.lagged && state.nativeSnapshotSeq !== null}
+        onAttach={scrollToBottom}
+        onRestarted={ctx.manualReconnect}
+        onRetryOperation={() => {
+          if (!ctx.beginOperationRetry()) return;
+          setComposerCollapsed(false);
+        }}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -506,7 +515,9 @@ function ComposerDock({
 
       <CompactionReminderBanner
         state={state}
-        onCompact={() => ctx.sendPrompt("/compact")}
+        onCompact={async () => {
+          await ctx.sendPrompt("/compact");
+        }}
         onDismiss={ctx.dismissCompactionReminder}
       />
 
@@ -520,6 +531,23 @@ function ComposerDock({
           controlsId={`conversation-composer-${sessionId}`}
           testId="composer-collapse-toggle"
         />
+      )}
+
+      {ctx.operationRetryActive && (
+        <div
+          data-testid="operation-retry-composition"
+          className="flex items-center justify-between gap-2 border-t border-surface-700 px-4 py-2 text-xs text-text-secondary"
+        >
+          <span>New input for this operation retry. Cancel discards this unsent draft.</span>
+          <button
+            type="button"
+            data-testid="operation-retry-cancel"
+            className="shrink-0 rounded border border-surface-600 px-2 py-1 text-text-primary hover:bg-surface-800"
+            onClick={ctx.cancelOperationRetry}
+          >
+            Cancel retry
+          </button>
+        </div>
       )}
 
       <CollapsibleRegion id={`conversation-composer-${sessionId}`} collapsed={collapsible && collapsed}>
@@ -548,6 +576,9 @@ function ComposerDock({
           promptCapabilities={state.promptCapabilities}
           pendingAttachments={ctx.pendingAttachments}
           setPendingAttachments={ctx.setPendingAttachments}
+          operationRetryActive={ctx.operationRetryActive}
+          compositionControlRef={ctx.compositionControlRef}
+          attachmentReadGenerationRef={ctx.attachmentReadGenerationRef}
           primerPrefill={primerPrefill}
           queuedPrompts={state.queuedPrompts}
           editQueuedPrompt={ctx.editQueuedPrompt}
@@ -557,7 +588,7 @@ function ComposerDock({
   );
 }
 
-function EmptyState({ onPick }: { onPick: (text: string) => Promise<void> }) {
+function EmptyState({ onPick }: { onPick: (text: string) => Promise<unknown> }) {
   return (
     <div className="mt-12 flex flex-col items-center gap-4 text-center">
       <div className="text-sm text-text-muted">Ask the agent anything about this workspace.</div>

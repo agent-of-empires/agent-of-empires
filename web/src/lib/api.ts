@@ -2600,6 +2600,18 @@ export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean
   }
 }
 
+/** Explicit shared recovery. Never replay a prompt or reinterpret the server's selection token. */
+export async function recoverSession(
+  id: string,
+  action: "same" | "fresh",
+  expected: string,
+): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(
+    `/api/sessions/${encodeURIComponent(id)}/restart`,
+    jsonInit("POST", { recovery: { action, expected } }),
+  );
+}
+
 /**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be

@@ -137,6 +137,18 @@ async fn run_read(
         return;
     };
     let runtime = &RUNTIME;
+    let recovery = match state
+        .session_service
+        .recovery_snapshots(!state.read_only && !state.cityhall_mode)
+        .await
+    {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            tracing::warn!(target: "runtime.ws", %error, "recovery observation unavailable");
+            socket.close().await;
+            return;
+        }
+    };
     let (sessions, cache, observed_at) = {
         let instances = state.instances.read().await;
         let cache = state
@@ -148,7 +160,20 @@ async fn run_read(
             instances
                 .iter()
                 .chain(cache.alias_only_instances.iter())
-                .map(SessionRead::from_instance),
+                .map(|inst| {
+                    let mut row = SessionRead::from_instance(inst);
+                    if let Some(snapshot) = recovery
+                        .get(&inst.id)
+                        .filter(|snapshot| snapshot.matches(inst))
+                    {
+                        row.recovery = snapshot.recovery.clone();
+                        if let Some(recovery) = &row.recovery {
+                            row.last_error = Some(recovery.diagnostic.clone());
+                            row.last_error_evidence = recovery.evidence;
+                        }
+                    }
+                    row
+                }),
         );
         let metadata = super::reload::RuntimeReadCache {
             inventory: cache.inventory.clone(),
@@ -1208,7 +1233,10 @@ mod tests {
     async fn native_session_ids(state: &Arc<AppState>) -> Vec<String> {
         let response = super::super::api::list_sessions(
             axum::extract::State(state.clone()),
-            axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
+            axum::extract::Query(crate::daemon::ListSessionsQuery {
+                state: None,
+                profile: None,
+            }),
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);

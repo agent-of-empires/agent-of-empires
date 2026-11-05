@@ -9,6 +9,7 @@ import {
   revokeNativeAuthority,
   type AcpConnectionUnavailability,
   type AcpEvent,
+  type SessionRecovery,
 } from "../../src/lib/acpTypes";
 import { currentControlSnapshot } from "./acpControlSnapshot";
 
@@ -44,6 +45,7 @@ export interface AcpSessionMockOptions {
   rateLimitAutoResume?: boolean;
   /** Initial daemon control state; native receipts remain independently declared. */
   reducedState?: Record<string, unknown>;
+  recovery?: SessionRecovery | null;
   /** This fixture's current native receipt, independent of historical events/SIDs. */
   nativeAvailable?: boolean;
   nativeUnavailability?: AcpConnectionUnavailability | null;
@@ -157,6 +159,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     ready: opts.nativeAvailable ?? !(opts.workerStarting || opts.trashedAt || opts.archivedAt),
     unavailable: opts.nativeUnavailability ?? null,
     wakeEligible: opts.promptWakeEligible ?? false,
+    recovery: opts.recovery,
   };
   const sendNativeSnapshot = (atSeq = seq) => {
     ws?.send(JSON.stringify(currentControlSnapshot(controlState, nativeReceipt, atSeq)));

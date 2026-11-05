@@ -18,6 +18,19 @@ pub(super) fn permission_response_tokens(
 }
 
 impl HomeView {
+    pub(in crate::tui) fn operation_retry_projection(
+        &self,
+        id: &str,
+    ) -> Option<&crate::session::SessionRecovery> {
+        if !self.session_feed.current_observation_applied() || !self.session_feed.can_submit(id) {
+            return None;
+        }
+        self.session_feed
+            .applied_session(id)
+            .and_then(|row| row.recovery.as_ref())
+            .filter(|recovery| recovery.actions.retry_operation)
+    }
+
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
         self.mutate_instance(id, |inst| inst.status = status);
     }

@@ -26,6 +26,7 @@ interface Props {
   /** Start a Session, for a queued row's "Start and send". */
   onStartSession?: (sessionId: string) => void;
   readOnly: boolean;
+  recoveryCurrentIds?: readonly string[];
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
@@ -75,6 +76,7 @@ function layerClass(active: boolean): string {
 export function MobileMainPane({
   onStartSession,
   readOnly,
+  recoveryCurrentIds,
   view,
   pluginPanes,
   onBackToAgent,
@@ -149,6 +151,7 @@ export function MobileMainPane({
                     active={active}
                     selected={selected}
                     sessionId={session.id}
+                    readOnly={readOnly}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
@@ -176,6 +179,7 @@ export function MobileMainPane({
             <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
               <TerminalSessionStack
                 readOnly={readOnly}
+                recoveryCurrentIds={recoveryCurrentIds}
                 active={view === "agent"}
                 activeSessionId={activeSessionId!}
                 sessions={sessions.filter((session) => session.view !== "structured")}

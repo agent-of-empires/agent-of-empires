@@ -3,6 +3,61 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "session.shared-recovery-diagnostics",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/acp/__tests__/SessionRecovery.test.tsx",
+        "src/components/__tests__/LiveTerminalView.recover.test.tsx",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/hooks/useSessions.test.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/TerminalConnectionBanners.tsx",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/TerminalView.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/lib/types.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "#5055: server-owned provider failure, authentication intervention, ongoing Agent retry/work, unknown runtime liveness, confirmed process exit, and unattested/undeclared wrapper cases retain safe diagnostic, operation/blocking scope, current observation, uncertainty and guidance. Channel readiness never proves OS liveness. Actions require current server admission; cache/reopen, missing projection, disconnect, partial status pushes and namespace changes revoke permissions without erasing diagnostics. Same/Fresh relay exact opaque selection, Stop uses its existing endpoint, Fresh requires confirmation and never promises wrapper-native history. Explicit retry opens blank composition without loading or replaying a stored prompt. Exited sockets do not disable server-authorized Same; agent recovery never changes paired/tool terminals. Original request custody and C native input remain independent."
+    },
+    {
+      "id": "session.shared-recovery-composition",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/__tests__/OperationRetry.test.tsx",
+        "src/components/acp/__tests__/AcpRuntime.test.tsx",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/useComposerHooks.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5055: explicit Retry synchronously blanks text, exits queue recall without server queue writes, and fences both stored attachment hydration and already-running file reads. Deliberate new files work normally. Held admission and Native-unavailable refusal retain the new unsent composition. Lost retry permission never turns that draft into an ordinary wakeable send; explicit Cancel retry discards it without sending and frees normal composition. Existing native no_revive admission, Original custody and ordinary draft/unmount behavior remain covered. Browser composition never performs implicit ensure, spawn, Same, Fresh or old-prompt replay."
+    },
+    {
+      "id": "session.shared-recovery-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
+      "components": ["web/src/components/acp/SessionBanners.tsx", "web/src/components/acp/StructuredView.tsx"],
+      "notes": "#5055: isolated real server/Native RPC stories induce provider and auth failures, reopen the browser, observe the retained transcript, then send new explicit input. They assert safe visible diagnostic, operation scope, channel-not-process observation, conservative retry refusal without affirmative retryability, exact session/native identity and no implicit Fresh, ensure, spawn or blocked-prompt replay. Active work, unknown liveness, confirmed exit and wrapper admission permutations also have component coverage in session.shared-recovery-diagnostics; full controlled Native/browser proof belongs to integration."
+    },
+    {
       "id": "acp.operation-error-evidence",
       "kind": "vitest",
       "risk": "high",

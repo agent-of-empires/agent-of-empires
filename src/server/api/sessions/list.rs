@@ -23,7 +23,7 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Worker presence is sampled before publication/instance exclusion, never under it.
+#[cfg(test)]
 pub(crate) async fn project_sessions(
     state: &Arc<AppState>,
     worker_states: &HashMap<
@@ -33,6 +33,24 @@ pub(crate) async fn project_sessions(
             Option<crate::daemon::AcpWorkerStart>,
         ),
     >,
+) -> anyhow::Result<Vec<SessionResponse>> {
+    let recovery = state
+        .session_service
+        .recovery_snapshots(!state.read_only && !state.cityhall_mode)
+        .await?;
+    project_sessions_with_recovery(state, worker_states, &recovery).await
+}
+
+pub(crate) async fn project_sessions_with_recovery(
+    state: &Arc<AppState>,
+    worker_states: &HashMap<
+        String,
+        (
+            crate::daemon::AcpWorkerState,
+            Option<crate::daemon::AcpWorkerStart>,
+        ),
+    >,
+    recovery: &HashMap<String, crate::server::session_service::RecoverySnapshot>,
 ) -> anyhow::Result<Vec<SessionResponse>> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -86,6 +104,22 @@ pub(crate) async fn project_sessions(
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
+            if let Some(snapshot) = recovery
+                .get(&inst.id)
+                .filter(|snapshot| snapshot.matches(inst))
+            {
+                session.recovery = snapshot.recovery.clone();
+                if snapshot.context_resume_available {
+                    session.context_resume = Some(ContextResumeAvailability::Available);
+                }
+                if let Some(recovery) = &session.recovery {
+                    session.last_error = Some(recovery.diagnostic.clone());
+                    session.last_error_evidence = recovery.evidence;
+                    if recovery.actions.restart_same {
+                        session.context_resume = Some(ContextResumeAvailability::Available);
+                    }
+                }
+            }
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -107,15 +141,17 @@ pub(crate) async fn project_sessions(
                     })
                     .collect();
             }
-            session.update_restart = crate::session::update_restart::offer_pending(
-                inst,
-                session
-                    .context_resume
-                    .as_ref()
-                    .is_some_and(|resume| update_restart_resumable(inst, resume)),
-                acp_worker_state == crate::daemon::AcpWorkerState::Running
-                    && session.pending_approvals.is_empty(),
-            );
+            session.update_restart =
+                crate::session::update_restart::offer_pending(
+                    inst,
+                    session
+                        .context_resume
+                        .as_ref()
+                        .is_some_and(|resume| update_restart_resumable(inst, resume)),
+                    session.context_resume.as_ref().is_some_and(|resume| {
+                        matches!(resume, ContextResumeAvailability::Available)
+                    }) && session.pending_approvals.is_empty(),
+                );
             session
         })
         .collect();
@@ -382,24 +418,30 @@ pub(crate) struct SessionFilter {
     pub scope: Option<crate::session::SessionScope>,
     pub group: Option<String>,
     pub children_of: Option<String>,
+    pub profile: Option<String>,
 }
 
 impl SessionFilter {
     fn matches(&self, row: &SessionResponse) -> bool {
-        crate::session::SessionScope::matches(
-            self.scope,
-            row.archived_at.is_some(),
-            row.trashed_at.is_some(),
-        ) && self.group.as_deref().is_none_or(|group| {
-            row.group_path == group
-                || row
-                    .group_path
-                    .strip_prefix(group)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }) && self
-            .children_of
+        self.profile
             .as_deref()
-            .is_none_or(|parent| row.parent_session_id.as_deref() == Some(parent))
+            .is_none_or(|profile| row.profile == profile)
+            && crate::session::SessionScope::matches(
+                self.scope,
+                row.archived_at.is_some(),
+                row.trashed_at.is_some(),
+            )
+            && self.group.as_deref().is_none_or(|group| {
+                row.group_path == group
+                    || row
+                        .group_path
+                        .strip_prefix(group)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            && self
+                .children_of
+                .as_deref()
+                .is_none_or(|parent| row.parent_session_id.as_deref() == Some(parent))
     }
 }
 
@@ -461,10 +503,42 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
 ) -> axum::response::Response {
+    let _namespace = state.profile_namespace.read().await;
+    let profile = if let Some(requested) = query.profile.as_deref() {
+        let selectable =
+            match tokio::task::spawn_blocking(crate::server::reload::selectable_profiles).await {
+                Ok(Ok(profiles)) => profiles,
+                _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+        let Some(selected) = selectable.iter().find(|profile| {
+            profile.name == requested || profile.aliases.iter().any(|alias| alias == requested)
+        }) else {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "profile_not_found",
+                "Profile is not selectable",
+            );
+        };
+        let inventory = state
+            .runtime_read_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(accepted) = inventory
+            .inventory
+            .iter()
+            .find(|profile| profile.identity == selected.identity)
+        else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        Some(accepted.name.clone())
+    } else {
+        None
+    };
     let view = match list_sessions_envelope(
         &state,
         SessionFilter {
             scope: query.state,
+            profile,
             ..SessionFilter::default()
         },
     )
@@ -639,7 +713,9 @@ mod context_resume_tests {
         structured.acp_load_session_capable = Some(true);
         assert_eq!(
             context_resume_for(&structured),
-            ContextResumeAvailability::Available
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
         );
 
         structured.fork_pending = Some("opaque-parent".to_string());
@@ -702,6 +778,7 @@ mod workspace_ordering_tests {
             idle_entered_at: None,
             last_error: None,
             last_error_evidence: None,
+            recovery: None,
             branch: branch.map(str::to_string),
             main_repo_path: None,
             base_branch: None,
@@ -997,7 +1074,10 @@ mod workspace_ordering_tests {
         let response = json(
             list_sessions(
                 State(state.clone()),
-                axum::extract::Query(ListSessionsQuery { state: None }),
+                axum::extract::Query(ListSessionsQuery {
+                    state: None,
+                    profile: None,
+                }),
             )
             .await,
         )
@@ -1063,5 +1143,655 @@ mod workspace_ordering_tests {
         for (sessions, existing, expected) in cases {
             assert_eq!(compute_merged_ordering(&sessions, &existing), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_recovery_tests {
+    use super::*;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    use crate::server::test_support::managed_control_session;
+    use crate::session::{
+        RuntimeEvidence, SessionRecoveryAction, SessionRecoveryReason, SessionRecoveryRequest,
+    };
+
+    async fn projected(state: &Arc<AppState>, id: &str) -> SessionResponse {
+        let workers = state.acp_supervisor.worker_states_snapshot().await;
+        project_sessions(state, &workers)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+    }
+
+    async fn partial_output(live: &crate::server::test_support::ManagedControlSession) {
+        live.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":live.sid,"update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"partial native output before failure"}
+                    }
+                }
+            }))
+            .await;
+    }
+
+    async fn auth_failure(
+        live: &mut crate::server::test_support::ManagedControlSession,
+        request: &serde_json::Value,
+    ) {
+        live.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0","id":request["id"],"error":{
+                    "code":-32603,
+                    "message":"Sign in required sk-ant-abcdefghijklmnop1234567890",
+                    "data":{"details":"Repair agent authentication","trace":"privateTokenMarker"}
+                }
+            }))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if matches!(live.client.next_event().await.unwrap(),
+                    crate::acp::Event::Stopped { reason } if reason == "prompt_failed")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn background_agent(
+        live: &crate::server::test_support::ManagedControlSession,
+        agent_id: &str,
+        output_file: &str,
+    ) {
+        live.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":live.sid,"update":{
+                        "sessionUpdate":"tool_call_update","toolCallId":format!("{agent_id}-tool"),
+                        "_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{
+                            "agentId":agent_id,"description":"background recovery guard",
+                            "prompt":"keep working","resolvedModel":"test-model",
+                            "outputFile":output_file,"status":"async_launched"
+                        }}}
+                    }
+                }
+            }))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let folded = live
+                    .state
+                    .session_service
+                    .fold_control_state(live.id())
+                    .await
+                    .unwrap();
+                if folded.background_agents.iter().any(|agent| {
+                    agent.agent_id == agent_id
+                        && agent.resource_ref.is_some() == !output_file.is_empty()
+                        && agent.ended_at.is_none()
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Native background launch reaches its qualified fold");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_refuses_unresolved_queue_without_output_uncertainty_and_preserves_all_input() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_control_session(scope, "shared-recovery-queued-input").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let prompt = live.start_prompt("failed explicit input").await;
+                live.finish_prompt(&prompt, Some("provider_failure")).await;
+                let folded = state.session_service.fold_control_state(&id).await.unwrap();
+                assert!(!folded.operation_output_uncertain);
+                assert!(
+                    projected(&state, &id)
+                        .await
+                        .recovery
+                        .unwrap()
+                        .actions
+                        .restart_same
+                );
+                state
+                    .session_service
+                    .enqueue_prompt(
+                        &id,
+                        "unresolved-queue".into(),
+                        "do not replay this queued input".into(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for pending_initial in [false, true] {
+                    if pending_initial {
+                        state
+                            .session_service
+                            .set_pending_initial_turn(
+                                &id,
+                                "retain blocked initial input".into(),
+                                Vec::new(),
+                            )
+                            .await;
+                    }
+                    let recovery = projected(&state, &id).await.recovery.unwrap();
+                    assert!(!recovery.actions.restart_same && recovery.actions.fresh);
+                    assert!(!recovery.work_in_progress && recovery.uncertainty.is_none());
+                    let original = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    let storage =
+                        crate::session::Storage::open_unwatched(&original.source_profile).unwrap();
+                    let persisted = storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap();
+                    let methods = live.native.requests();
+                    let owner = live.client.actual().connected_runner();
+                    let response = crate::server::api::sessions::restart_session(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Ok(Some(Json(crate::daemon::RestartSessionBody {
+                            recovery: Some(SessionRecoveryRequest {
+                                action: SessionRecoveryAction::Same,
+                                expected: recovery.expected,
+                            }),
+                            ..Default::default()
+                        }))),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    let current = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    assert_eq!(
+                        serde_json::to_value(&current).unwrap(),
+                        serde_json::to_value(&original).unwrap()
+                    );
+                    let saved = storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(saved).unwrap(),
+                        serde_json::to_value(persisted).unwrap()
+                    );
+                    assert_eq!(live.client.actual().connected_runner(), owner);
+                    assert_eq!(live.native.requests(), methods);
+                    assert!(
+                        state
+                            .session_service
+                            .fold_control_state(&id)
+                            .await
+                            .unwrap()
+                            .connection_ready
+                    );
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn qualified_background_work_refuses_concurrent_same_and_fresh() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live =
+                    managed_control_session(scope, "shared-recovery-current-background").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let prompt = live.start_prompt("failed main turn").await;
+                live.finish_prompt(&prompt, Some("provider_failure")).await;
+                let actual = live.client.actual();
+                let store = actual.native_store.as_ref().unwrap().stores[0].clone();
+                let project = store.join("projects/-managed");
+                std::fs::create_dir_all(project.join("subagents")).unwrap();
+                std::fs::write(project.join(format!("{}.jsonl", live.sid)), "").unwrap();
+                let transcript = project.join("subagents/current-background.jsonl");
+                std::fs::write(&transcript, "").unwrap();
+                background_agent(&live, "current-background", transcript.to_str().unwrap()).await;
+                let folded = state.session_service.fold_control_state(&id).await.unwrap();
+                assert!(!folded.turn_active && folded.has_qualified_background_work());
+                let recovery = projected(&state, &id).await.recovery.unwrap();
+                assert!(
+                    recovery.work_in_progress && recovery.actions.attach && recovery.actions.stop
+                );
+                assert!(
+                    !recovery.actions.restart_same
+                        && !recovery.actions.fresh
+                        && !recovery.actions.retry_operation
+                );
+                let original = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                let methods = live.native.requests();
+                for action in [SessionRecoveryAction::Same, SessionRecoveryAction::Fresh] {
+                    let response = crate::server::api::sessions::restart_session(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Ok(Some(Json(crate::daemon::RestartSessionBody {
+                            recovery: Some(SessionRecoveryRequest {
+                                action,
+                                expected: recovery.expected.clone(),
+                            }),
+                            ..Default::default()
+                        }))),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    let current = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    assert_eq!(
+                        serde_json::to_value(&current).unwrap(),
+                        serde_json::to_value(&original).unwrap()
+                    );
+                    assert_eq!(live.native.requests(), methods);
+                    let folded = state.session_service.fold_control_state(&id).await.unwrap();
+                    assert!(folded.connection_ready && folded.has_qualified_background_work());
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn actual_prompt_failure_reaches_canonical_consumers_without_replacing_its_live_native() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_control_session(scope, "shared-recovery-error").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let owner = live.client.actual().connected_runner();
+                let prompt = live.start_prompt("original explicit input").await;
+                partial_output(&live).await;
+                auth_failure(&mut live, &prompt).await;
+                let response = projected(&state, &id).await;
+                let recovery = response
+                    .recovery
+                    .as_ref()
+                    .expect("current failure is public");
+                assert_eq!(response.acp_session_id.as_deref(), Some(live.sid.as_str()));
+                assert_eq!(
+                    response.last_error.as_deref(),
+                    Some(recovery.diagnostic.as_str())
+                );
+                assert_eq!(response.last_error_evidence, recovery.evidence);
+                assert_eq!(recovery.reason, SessionRecoveryReason::OperationFailed);
+                assert_eq!(recovery.runtime, RuntimeEvidence::AcpTransportReady);
+                assert_eq!(recovery.evidence.unwrap().runtime, RuntimeEvidence::Unknown);
+                assert_eq!(recovery.evidence.unwrap().retryable, None);
+                assert_eq!(recovery.evidence.unwrap().origin, None);
+                assert!(!recovery
+                    .diagnostic
+                    .contains("sk-ant-abcdefghijklmnop1234567890"));
+                assert!(!recovery.diagnostic.contains("privateTokenMarker"));
+                assert!(!recovery.work_in_progress);
+                assert!(recovery.uncertainty.is_some());
+                assert!(
+                    recovery.actions.attach
+                        && recovery.actions.restart_same
+                        && recovery.actions.stop
+                        && recovery.actions.fresh
+                );
+                assert!(!recovery.actions.retry_operation);
+                let before = live.native.requests();
+                state.acp_control_cache.forget(&id);
+                let reloaded = projected(&state, &id).await;
+                assert_eq!(reloaded.recovery, response.recovery);
+                assert_eq!(live.native.requests(), before);
+                assert_eq!(live.client.actual().connected_runner(), owner);
+
+                // Admitting new work supersedes the error, not opening or replaying the view.
+                let next = live.start_prompt("new explicitly composed input").await;
+                let rejected = crate::server::api::sessions::restart_session(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Some(Json(crate::daemon::RestartSessionBody {
+                        recovery: Some(SessionRecoveryRequest {
+                            action: SessionRecoveryAction::Same,
+                            expected: recovery.expected.clone(),
+                        }),
+                        ..Default::default()
+                    }))),
+                )
+                .await;
+                assert_eq!(rejected.status(), StatusCode::CONFLICT);
+                let current = state.session_service.fold_control_state(&id).await.unwrap();
+                assert!(current.turn_active && current.connection_ready);
+                assert!(current.operation_diagnostic.is_none());
+                assert_eq!(live.client.actual().connected_runner(), owner);
+                assert_eq!(
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| method.as_str() == "session/prompt")
+                        .count(),
+                    2
+                );
+                assert_eq!(next["params"]["sessionId"], live.sid);
+                live.finish_prompt(&next, None).await;
+                assert!(projected(&state, &id).await.recovery.is_none());
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_and_fresh_use_real_qualified_control_paths_without_replaying_or_erasing_history()
+    {
+        for action in [SessionRecoveryAction::Same, SessionRecoveryAction::Fresh] {
+            with_managed(move |scope| Box::pin(async move {
+                let mut live = managed_control_session(scope, "shared-explicit-recovery").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let prompt = live.start_prompt("input that must never be replayed").await;
+                partial_output(&live).await;
+                live.finish_prompt(&prompt, Some("provider_failure")).await;
+                if action == SessionRecoveryAction::Same {
+                    background_agent(&live, "historical-untracked-launch", "").await;
+                    let folded = state.session_service.fold_control_state(&id).await.unwrap();
+                    assert!(folded.has_active_background_agent());
+                    assert!(!folded.has_qualified_background_work());
+                }
+                if action == SessionRecoveryAction::Fresh {
+                    state.session_service.set_pending_initial_turn(
+                        &id, "blocked automatic continuation".into(), Vec::new(),
+                    ).await;
+                    state.session_service.enqueue_prompt(
+                        &id, "pending-user-input".into(), "pending AoE input".into(),
+                        Vec::new(), None, None,
+                    ).await.unwrap();
+                }
+                let selected = projected(&state, &id).await;
+                let recovery = selected.recovery.unwrap();
+                let original = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                if action == SessionRecoveryAction::Fresh {
+                    assert!(!recovery.actions.restart_same && recovery.actions.fresh);
+                    let before = serde_json::to_value((
+                        &original.pending_initial_turn, &original.queued_prompts,
+                    )).unwrap();
+                    let refused = crate::server::api::sessions::restart_session(
+                        State(state.clone()), Path(id.clone()),
+                        Ok(Some(Json(crate::daemon::RestartSessionBody {
+                            recovery: Some(SessionRecoveryRequest {
+                                action: SessionRecoveryAction::Same,
+                                expected: recovery.expected.clone(),
+                            }),
+                            ..Default::default()
+                        }))),
+                    ).await;
+                    assert_eq!(refused.status(), StatusCode::CONFLICT);
+                    let current = state.instances.read().await.iter()
+                        .find(|row| row.id == id).unwrap().clone();
+                    assert_eq!(serde_json::to_value((
+                        &current.pending_initial_turn, &current.queued_prompts,
+                    )).unwrap(), before);
+                    assert!(original.conversation_state().matches_checkpoint(&current));
+                    assert_eq!(original.acp_establishment, current.acp_establishment);
+                }
+                let store = original.agent_session_binding.as_ref()
+                    .and_then(|binding| binding.execution.as_ref())
+                    .expect("real Native establishment records its selected store")
+                    .stores.first().unwrap();
+                std::fs::create_dir_all(store).unwrap();
+                let history = store.join("old-native-history.jsonl");
+                std::fs::write(&history, b"retained native history").unwrap();
+                let expected_sid = if action == SessionRecoveryAction::Same {
+                    live.sid.clone()
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
+                let next_sid = expected_sid.clone();
+                let original_sid = live.sid.clone();
+                let project = original.project_path.clone();
+                let (config, replacement) = scope.native_peer(
+                    project.into(), "claude", "claude",
+                    move |request| match request["method"].as_str().unwrap() {
+                        "initialize" => Some(serde_json::json!({
+                            "jsonrpc":"2.0","id":request["id"],
+                            "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}
+                        })),
+                        "session/load" => {
+                            assert_eq!(action, SessionRecoveryAction::Same);
+                            assert_eq!(request["params"]["sessionId"], original_sid);
+                            Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"sessionId":next_sid}}))
+                        }
+                        "session/new" => {
+                            assert_eq!(action, SessionRecoveryAction::Fresh);
+                            Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"sessionId":next_sid}}))
+                        }
+                        other => panic!("unexpected recovery Native method: {other}"),
+                    },
+                );
+                let events = scope.bind_external_launch(&id, config);
+                let response = crate::server::api::sessions::restart_session(
+                    State(state.clone()), Path(id.clone()),
+                    Ok(Some(Json(crate::daemon::RestartSessionBody {
+                        recovery: Some(SessionRecoveryRequest { action, expected: recovery.expected }),
+                        ..Default::default()
+                    }))),
+                ).await;
+                assert!(response.status().is_success(), "recovery returned {}", response.status());
+                let resumed = scope.observe_external_resume(id.clone(), events).await;
+                resumed.ready().await;
+                let current = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                assert_eq!(current.acp_session_id.as_deref(), Some(expected_sid.as_str()));
+                assert_eq!(current.id, id);
+                assert!(current.pending_initial_turn.is_none());
+                assert!(current.queued_prompts.is_empty());
+                state.session_service.drain_pending_initial_turn(&id).await;
+                state.session_service.drain_queued_prompts_once(&id).await;
+                assert!(projected(&state, &id).await.recovery.is_none());
+                assert_eq!(std::fs::read(&history).unwrap(), b"retained native history");
+                assert_eq!(live.native.requests().iter().filter(|method| method.as_str() == "session/prompt").count(), 1);
+                assert!(!replacement.requests().iter().any(|method| method == "session/prompt"));
+                assert_eq!(replacement.requests().iter().filter(|method| method.as_str() == "session/new").count(),
+                    usize::from(action == SessionRecoveryAction::Fresh));
+                assert_eq!(replacement.requests().iter().filter(|method| method.as_str() == "session/load").count(),
+                    usize::from(action == SessionRecoveryAction::Same));
+            })).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_current_owner_revokes_actions_and_preserves_the_real_error_and_identity() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_control_session(scope, "shared-unknown-owner").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let prompt = live.start_prompt("one explicit input").await;
+                partial_output(&live).await;
+                live.finish_prompt(&prompt, Some("provider_failure")).await;
+                state
+                    .session_service
+                    .set_pending_initial_turn(
+                        &id,
+                        "retained blocked continuation".into(),
+                        Vec::new(),
+                    )
+                    .await;
+                state
+                    .session_service
+                    .enqueue_prompt(
+                        &id,
+                        "retained-queue".into(),
+                        "retained queued input".into(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let input_before = {
+                    let rows = state.instances.read().await;
+                    let row = rows.iter().find(|row| row.id == id).unwrap();
+                    serde_json::to_value((&row.pending_initial_turn, &row.queued_prompts)).unwrap()
+                };
+                let before = projected(&state, &id).await;
+                let path = crate::process::worker_registry::record_path(&id).unwrap();
+                struct Restore(std::path::PathBuf, Vec<u8>);
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        crate::session::atomic_write(&self.0, &self.1).unwrap();
+                    }
+                }
+                let restore = Restore(path.clone(), std::fs::read(&path).unwrap());
+                crate::session::atomic_write(&path, b"privateTokenMarker malformed registry")
+                    .unwrap();
+                let unknown = projected(&state, &id).await;
+                let recovery = unknown.recovery.unwrap();
+                assert_eq!(recovery.runtime, RuntimeEvidence::Unknown);
+                assert_eq!(unknown.acp_session_id, before.acp_session_id);
+                assert_eq!(
+                    recovery.diagnostic,
+                    before.recovery.as_ref().unwrap().diagnostic
+                );
+                assert_eq!(
+                    recovery.evidence,
+                    before.recovery.as_ref().unwrap().evidence
+                );
+                assert_eq!(
+                    recovery.uncertainty,
+                    before.recovery.as_ref().unwrap().uncertainty
+                );
+                assert!(recovery.actions.attach);
+                assert!(!recovery.actions.retry_operation && !recovery.actions.restart_same);
+                assert!(!recovery.actions.stop && !recovery.actions.fresh);
+                let methods = live.native.requests();
+                let response = crate::server::api::sessions::restart_session(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Some(Json(crate::daemon::RestartSessionBody {
+                        recovery: Some(SessionRecoveryRequest {
+                            action: SessionRecoveryAction::Fresh,
+                            expected: before.recovery.unwrap().expected,
+                        }),
+                        ..Default::default()
+                    }))),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let input_after = {
+                    let rows = state.instances.read().await;
+                    let row = rows.iter().find(|row| row.id == id).unwrap();
+                    serde_json::to_value((&row.pending_initial_turn, &row.queued_prompts)).unwrap()
+                };
+                assert_eq!(input_after, input_before);
+                assert_eq!(live.native.requests(), methods);
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    b"privateTokenMarker malformed registry"
+                );
+                drop(restore);
+            })
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod profile_selection_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn physical_profile_aliases_select_canonical_rows_without_creating_an_alias_owner() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut first = Instance::new("first", "/tmp/profile-first");
+        first.source_profile = "canonical".into();
+        let mut second = Instance::new("second", "/tmp/profile-second");
+        second.source_profile = "other".into();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "canonical",
+            vec![first.clone()],
+        );
+        crate::server::test_support::seed_instances_on_disk_for_test("other", vec![second.clone()]);
+        let state =
+            crate::server::test_support::build_test_app_state(vec![first.clone(), second.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let alias = crate::session::get_profile_dir_path("selected-alias").unwrap();
+        std::os::unix::fs::symlink(
+            crate::session::get_profile_dir_path("canonical").unwrap(),
+            &alias,
+        )
+        .unwrap();
+        for (requested, expected_id, expected_profile) in [
+            ("selected-alias", first.id.as_str(), "canonical"),
+            ("other", second.id.as_str(), "other"),
+        ] {
+            let response = list_sessions(
+                State(state.clone()),
+                axum::extract::Query(ListSessionsQuery {
+                    state: Some(crate::session::SessionScope::All),
+                    profile: Some(requested.into()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: crate::daemon::SessionsEnvelope = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.sessions.len(), 1);
+            assert_eq!(body.sessions[0].id, expected_id);
+            assert_eq!(body.sessions[0].profile, expected_profile);
+            assert!(body.sessions[0].recovery.is_none());
+        }
+        let refused = list_sessions(
+            State(state),
+            axum::extract::Query(ListSessionsQuery {
+                state: None,
+                profile: Some("missing".into()),
+            }),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 }

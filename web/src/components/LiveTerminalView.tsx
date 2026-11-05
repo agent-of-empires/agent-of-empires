@@ -11,6 +11,7 @@ import { ArrowJoystick } from "./ArrowJoystick";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
+import { SessionRecoveryBanner } from "./acp/SessionBanners";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
@@ -29,6 +30,7 @@ interface Props {
   readOnly: boolean;
   session: SessionResponse;
   active?: boolean;
+  recoveryCurrent?: boolean;
   /** Which tmux surface this view renders. */
   surface?: "agent" | "paired-host" | "paired-container";
   /** Paired-terminal instance index for the tabbed terminal groups (#2437).
@@ -47,7 +49,14 @@ const SURFACES = {
 };
 
 /** Touch-device agent terminal: chrome around the capture-snapshot live pane (MobileLiveTerminal). */
-export function LiveTerminalView({ session, readOnly, active = true, surface = "agent", terminalIndex = 0 }: Props) {
+export function LiveTerminalView({
+  session,
+  readOnly,
+  active = true,
+  surface = "agent",
+  terminalIndex = 0,
+  recoveryCurrent = false,
+}: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
   // Paired terminals carry their instance index as a query param so the
@@ -56,6 +65,32 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is pointless with a physical keyboard, so it
   // stays off fine-pointer devices now that this view also renders on desktop.
   const coarse = useIsCoarsePointer();
+  const [recoverySnapshot, setRecoverySnapshot] = useState({
+    id: session.id,
+    projection: session.recovery,
+    current: recoveryCurrent,
+    diagnostic: session.recovery ?? null,
+  });
+  if (
+    recoverySnapshot.id !== session.id ||
+    recoverySnapshot.projection !== session.recovery ||
+    recoverySnapshot.current !== recoveryCurrent
+  ) {
+    setRecoverySnapshot({
+      id: session.id,
+      projection: session.recovery,
+      current: recoveryCurrent,
+      diagnostic:
+        recoverySnapshot.id === session.id &&
+        (session.recovery === undefined || (!recoveryCurrent && session.recovery === null))
+          ? recoverySnapshot.diagnostic
+          : (session.recovery ?? null),
+    });
+  }
+  const recovery =
+    surface === "agent"
+      ? (session.recovery ?? (recoverySnapshot.id === session.id ? recoverySnapshot.diagnostic : null))
+      : null;
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureWarning, setEnsureWarning] = useState<string | null>(null);
   const [ensureError, setEnsureError] = useState<string | null>(null);
@@ -80,7 +115,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   );
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
-    readOnly || ensureState === "ready" ? session.id : null,
+    readOnly || ensureState === "ready" || recovery ? session.id : null,
     readOnly,
     wsPath,
     receiveAgentClipboard,
@@ -108,6 +143,15 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     ctrlActiveRef.current = ctrlActive;
   }, [ctrlActive]);
   const [composeOpen, setComposeOpen] = useState(false);
+  const [retryCompose, setRetryCompose] = useState<{ version: number; sessionId: string; expected: string } | null>(
+    null,
+  );
+  const retryComposeAllowed =
+    retryCompose === null ||
+    (recoveryCurrent &&
+      session.recovery?.actions.retry_operation === true &&
+      retryCompose.sessionId === session.id &&
+      retryCompose.expected === session.recovery.expected);
 
   const notOwner = live.state.ownerKnown && !live.state.isOwner;
   const lastUndeliveredToastRef = useRef(0);
@@ -152,13 +196,17 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   );
   const submitCompose = useCallback(
     (text: string, submit: boolean) => {
+      if (!retryComposeAllowed) return false;
       invalidateRetainedImeContext(inputRef.current);
       return sendPasteOrReport(text, submit);
     },
-    [sendPasteOrReport],
+    [sendPasteOrReport, retryComposeAllowed],
   );
   const { settings: webSettings } = useWebSettings();
-  const openCompose = useCallback(() => flushSync(() => setComposeOpen(true)), []);
+  const openCompose = useCallback(() => {
+    setRetryCompose(null);
+    flushSync(() => setComposeOpen(true));
+  }, []);
   const closeCompose = useCallback((refocusTerminal: boolean) => {
     // Focus first, inside the tap, so iOS keeps the keyboard up for the terminal.
     if (refocusTerminal && !policyRef.current.readOnly) inputRef.current?.focus();
@@ -213,6 +261,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
 
   const retryEnsure = useCallback(() => {
     const policy = policyRef.current;
+    if (surface === "agent" && recovery) return;
     if (
       policy.readOnly ||
       policy.sessionId !== session.id ||
@@ -245,7 +294,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       .finally(() => {
         if (ensureRequestRef.current === controller) ensureRequestRef.current = null;
       });
-  }, [session.id, surface, terminalIndex]);
+  }, [session.id, surface, terminalIndex, recovery]);
 
   // A refused ensure re-runs once the session is unarchived or restored.
   const shelved = !!session.archived_at || !!session.trashed_at;
@@ -294,11 +343,11 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     if (connected && !wasConnectedRef.current) startedRef.current = false;
     wasConnectedRef.current = connected;
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (surface === "agent" && paneDead && startedRef.current) {
+    if (surface === "agent" && !recovery && paneDead && startedRef.current) {
       startedRef.current = false;
       retryEnsure();
     }
-  }, [session.id, session.status, sessionActive, paneDead, connected, surface, retryEnsure, readOnly]);
+  }, [session.id, session.status, sessionActive, paneDead, connected, surface, retryEnsure, readOnly, recovery]);
 
   // Focus/blur MUST be first in the handler so iOS keeps the user-gesture
   // chain and actually shows the keyboard.
@@ -310,7 +359,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     else ta.focus();
   }, [inputFocused]);
 
-  if (!readOnly && ensureState === "pending") {
+  if (!readOnly && !recovery && ensureState === "pending") {
     return (
       <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
         <span className="text-xs">Starting session...</span>
@@ -318,7 +367,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     );
   }
 
-  if (!readOnly && ensureState === "error") {
+  if (!readOnly && !recovery && ensureState === "error") {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-surface-950 gap-2 px-4 text-center">
         <span className="text-xs text-status-error max-w-md break-words">
@@ -357,6 +406,27 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         }`}
       />
 
+      {recovery && (
+        <SessionRecoveryBanner
+          key={session.id}
+          sessionId={session.id}
+          recovery={recovery}
+          current={recoveryCurrent && session.recovery != null}
+          readOnly={readOnly}
+          onAttach={live.manualReconnect}
+          onRestarted={live.manualReconnect}
+          onRetryOperation={() => {
+            const current = session.recovery;
+            if (!recoveryCurrent || !current?.actions.retry_operation) return;
+            setRetryCompose((previous) => ({
+              version: (previous?.version ?? 0) + 1,
+              sessionId: session.id,
+              expected: current.expected,
+            }));
+            flushSync(() => setComposeOpen(true));
+          }}
+        />
+      )}
       <TerminalConnectionBanners
         connected={live.state.connected}
         reconnecting={live.state.reconnecting}
@@ -365,7 +435,9 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         maxRetries={live.maxRetries}
         onRetry={live.manualReconnect}
         paneDead={live.state.paneDead}
-        onRestart={readOnly ? undefined : retryEnsure}
+        onRestart={surface === "agent" || readOnly ? undefined : retryEnsure}
+        observeAllowed={!recovery || (recoveryCurrent && recovery.actions.attach)}
+        paneDeadLabel={surface === "agent" ? "Terminal stream closed" : undefined}
       />
 
       {ensureWarning && (
@@ -455,9 +527,11 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
 
       {composeOpen && (
         <TerminalComposeSheet
+          key={retryCompose?.version ?? 0}
           draftKey={`${session.id}:${surface}:${terminalIndex}`}
+          freshDraft={retryCompose !== null}
           bottomInset={keyboardHeight}
-          readOnly={readOnly}
+          readOnly={readOnly || !retryComposeAllowed}
           onSubmit={submitCompose}
           onClose={closeCompose}
         />

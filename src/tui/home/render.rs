@@ -972,6 +972,19 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
+        if let Some(dialog) = &mut self.restart_dialog {
+            let transport_available = self
+                .selected_session
+                .as_deref()
+                .is_some_and(|id| self.session_feed.can_submit(id));
+            let current_recovery = self
+                .selected_session
+                .as_deref()
+                .and_then(|id| self.session_feed.applied_session(id))
+                .and_then(|row| row.recovery.as_ref())
+                .filter(|_| self.session_feed.current_observation_applied());
+            dialog.set_current_recovery(current_recovery, transport_available);
+        }
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
@@ -2415,7 +2428,13 @@ impl HomeView {
         }) else {
             return;
         };
-        let output = preview::PreviewLayout::compute(rect, compact, false, info_height).output;
+        let recovery = terminal_focused
+            .then(|| self.session_feed.applied_session(&id))
+            .flatten()
+            .and_then(|row| row.recovery.as_ref());
+        let output = preview::PreviewLayout::compute(rect, compact, false, info_height)
+            .with_recovery(recovery)
+            .output;
         self.apply_split_capture(output.width, output.height, select);
         select(self).ensure_parsed();
         let cache = match (terminal_focused, container) {
@@ -2438,6 +2457,10 @@ impl HomeView {
                 frame,
                 rect,
                 inst,
+                self.session_feed
+                    .applied_session(&id)
+                    .and_then(|row| row.recovery.as_ref()),
+                self.session_feed.current_observation_applied(),
                 cached,
                 scroll_offset,
                 theme,
@@ -2823,6 +2846,11 @@ impl HomeView {
                 compact,
                 show_info,
                 preview::agent_info_height(inst),
+            )
+            .with_recovery(
+                self.session_feed
+                    .applied_session(id)
+                    .and_then(|row| row.recovery.as_ref()),
             )
             .output;
             if output.width == 0 || output.height == 0 {
@@ -3354,7 +3382,13 @@ impl HomeView {
             return;
         }
 
-        if selected_stopped {
+        if selected_stopped
+            && self
+                .selected_session
+                .as_deref()
+                .and_then(|id| self.session_feed.applied_session(id))
+                .is_none_or(|row| row.recovery.is_none())
+        {
             self.render_stopped_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
@@ -3461,6 +3495,11 @@ impl HomeView {
                                 show_info,
                                 preview::agent_info_height(inst),
                             )
+                            .with_recovery(
+                                self.session_feed
+                                    .applied_session(&inst.id)
+                                    .and_then(|row| row.recovery.as_ref()),
+                            )
                             .output
                         })
                         .unwrap_or(inner);
@@ -3488,6 +3527,10 @@ impl HomeView {
                                 frame,
                                 inner,
                                 inst,
+                                self.session_feed
+                                    .applied_session(id)
+                                    .and_then(|row| row.recovery.as_ref()),
+                                self.session_feed.current_observation_applied(),
                                 CachedPreview::new(
                                     self.preview_cache.parsed_text.as_ref(),
                                     self.preview_cache.is_pending_for(id),

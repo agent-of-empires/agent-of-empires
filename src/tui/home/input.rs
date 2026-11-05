@@ -7,8 +7,8 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{
-    live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
-    TerminalMode, ViewMode,
+    live_send, DragKind, HomeView, MessageIntent, NamespaceIntent, PermissionResponseTarget,
+    PreviewSelection, StopIntent, TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
@@ -1095,7 +1095,30 @@ impl HomeView {
                 }
                 None
             }
-            "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "stop_session" => match self.pending_stop_session.take() {
+                Some(StopIntent::Ordinary(id)) => Some(Action::StopSession(id)),
+                Some(StopIntent::Recovery { id, expected }) => {
+                    let admitted = self.session_feed.current_observation_applied()
+                        && self.session_feed.can_submit(&id)
+                        && self
+                            .session_feed
+                            .applied_session(&id)
+                            .and_then(|row| row.recovery.as_ref())
+                            .is_some_and(|current| {
+                                current.expected == expected && current.actions.stop
+                            });
+                    if admitted {
+                        Some(Action::StopSession(id))
+                    } else {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Recovery Selection Changed",
+                            "Stop was not submitted. Reopen the current diagnostic before choosing another action.",
+                        ));
+                        None
+                    }
+                }
+                None => None,
+            },
             "resume_reveal" => {
                 if let Some(intent) = self.retained_reveal.take() {
                     if let Err(error) = self.continue_reveal(intent) {
@@ -2396,6 +2419,17 @@ impl HomeView {
         }
 
         if let Some(dialog) = &mut self.restart_dialog {
+            let transport_available = self
+                .selected_session
+                .as_deref()
+                .is_some_and(|id| self.session_feed.can_submit(id));
+            let current_recovery = self
+                .selected_session
+                .as_deref()
+                .and_then(|id| self.session_feed.applied_session(id))
+                .and_then(|row| row.recovery.as_ref())
+                .filter(|_| self.session_feed.current_observation_applied());
+            dialog.set_current_recovery(current_recovery, transport_available);
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
@@ -2407,12 +2441,13 @@ impl HomeView {
                     let tool = data.tool.as_deref();
                     let extra_args = data.extra_args.as_deref();
                     let command_override = data.command_override.as_deref();
-                    if let Err(e) =
+                    let result = if let Some(recovery) = data.recovery {
+                        self.restart_selected_recovery(recovery)
+                    } else {
                         self.restart_selected_session(profile, tool, extra_args, command_override)
-                    {
-                        // Surface the restart error in an InfoDialog, not just the log:
-                        // the user initiated this and needs to know it failed.
-                        tracing::warn!("restart_selected_session failed: {}", e);
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("Session restart refused: {e}");
                         self.info_dialog = Some(InfoDialog::new(
                             "Restart Failed",
                             &format!("Could not restart session: {e}"),
@@ -2586,16 +2621,36 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.send_message_dialog = None;
-                    self.pending_send_session = None;
+                    self.pending_message = None;
                     self.pending_send_target = live_send::LiveSendTarget::Agent;
                 }
                 DialogResult::Submit(message) => {
+                    if let Some(MessageIntent::RetryExisting { id, expected }) =
+                        self.pending_message.as_ref()
+                    {
+                        if self
+                            .operation_retry_projection(id)
+                            .is_none_or(|current| current.expected != *expected)
+                        {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Recovery Selection Changed",
+                                "Reopen Retry from the current diagnostic. This draft was not sent.",
+                            ));
+                            return None;
+                        }
+                    }
                     self.send_message_dialog = None;
-                    if let Some(session_id) = self.pending_send_session.take() {
-                        // Defer the work to execute_action so the loop can render a
-                        // status indicator first: the send path may start a container or
-                        // wait out an agent splash, which inline would freeze the TUI.
-                        return Some(Action::SendMessage(session_id, message));
+                    if let Some(intent) = self.pending_message.take() {
+                        return Some(match intent {
+                            MessageIntent::Send(id) => Action::SendMessage(id, message),
+                            MessageIntent::RetryExisting { id, expected } => {
+                                Action::RetryOperation(crate::tui::app::OperationRetryIntent {
+                                    session_id: id,
+                                    text: message,
+                                    expected,
+                                })
+                            }
+                        });
                     }
                 }
             }
@@ -3538,15 +3593,37 @@ impl HomeView {
             ViewMode::Structured => {}
         }
         if let Some(session_id) = &self.selected_session {
+            let recovery = self
+                .session_feed
+                .applied_session(session_id)
+                .and_then(|row| row.recovery.as_ref());
+            if let Some(recovery) = recovery {
+                if !self.session_feed.current_observation_applied()
+                    || !self.session_feed.can_submit(session_id)
+                    || !recovery.actions.stop
+                {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Stop Unavailable", &recovery.guidance));
+                    return;
+                }
+            }
             if let Some(inst) = self.get_instance(session_id) {
-                if matches!(
-                    inst.status,
-                    Status::Stopped | Status::Deleting | Status::Creating
-                ) {
+                if recovery.is_none()
+                    && matches!(
+                        inst.status,
+                        Status::Stopped | Status::Deleting | Status::Creating
+                    )
+                {
                     return;
                 }
                 let message = format!("Are you sure you want to stop '{}'?", inst.title);
-                self.pending_stop_session = Some(session_id.clone());
+                self.pending_stop_session = Some(match recovery {
+                    Some(current) => StopIntent::Recovery {
+                        id: session_id.clone(),
+                        expected: current.expected.clone(),
+                    },
+                    None => StopIntent::Ordinary(session_id.clone()),
+                });
                 self.confirm_dialog = Some(
                     self.confirm_by_repeating(
                         ActionId::Stop,
@@ -4973,6 +5050,16 @@ impl HomeView {
                     unread,
                     can_fork,
                     switch_view,
+                )
+                .with_recovery(
+                    self.selected_session
+                        .as_deref()
+                        .and_then(|id| self.session_feed.applied_session(id))
+                        .and_then(|row| row.recovery.as_ref()),
+                    self.session_feed.current_observation_applied(),
+                    self.selected_session
+                        .as_deref()
+                        .is_some_and(|id| self.session_feed.can_submit(id)),
                 );
                 if update_restart {
                     menu.with_restart_for_update()
@@ -5045,6 +5132,55 @@ impl HomeView {
             return;
         }
         match action {
+            ContextMenuAction::Recovery => {
+                let has_recovery = self
+                    .selected_session
+                    .as_deref()
+                    .and_then(|id| self.session_feed.applied_session(id))
+                    .is_some_and(|row| row.recovery.is_some());
+                if has_recovery {
+                    self.open_restart_dialog();
+                } else {
+                    self.flash_status("Recovery selection is unavailable; no restart submitted");
+                }
+            }
+            ContextMenuAction::ObserveExisting => {
+                let allowed = self.selected_session.as_deref().is_some_and(|id| {
+                    self.session_feed.current_observation_applied()
+                        && self
+                            .session_feed
+                            .applied_session(id)
+                            .and_then(|row| row.recovery.as_ref())
+                            .is_some_and(|recovery| recovery.actions.attach)
+                });
+                if allowed {
+                    self.exit_live_send_if_active();
+                    self.view_mode = ViewMode::Structured;
+                    if !self.sidebar_collapsed {
+                        self.toggle_sidebar_collapsed();
+                    }
+                    self.flash_status(
+                        "Observing existing output only; no Agent started or replaced",
+                    );
+                }
+            }
+            ContextMenuAction::RetryOperation => self.open_operation_retry_dialog(),
+            ContextMenuAction::StopExisting => {
+                let allowed = self.selected_session.as_deref().is_some_and(|id| {
+                    self.session_feed.can_submit(id)
+                        && self
+                            .session_feed
+                            .applied_session(id)
+                            .and_then(|row| row.recovery.as_ref())
+                            .is_some_and(|recovery| recovery.actions.stop)
+                });
+                if allowed {
+                    self.view_mode = ViewMode::Structured;
+                    self.stop_selected();
+                } else {
+                    self.flash_status("Current recovery does not offer Stop");
+                }
+            }
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
             ContextMenuAction::ToggleArchive => {
@@ -6144,7 +6280,7 @@ impl HomeView {
         // Losing dictation is worse than silently catching it.
         if let Some((id, title, target)) = self.resolve_send_target() {
             let label = live_send::format_target_label(&title, &target);
-            self.pending_send_session = Some(id);
+            self.pending_message = Some(MessageIntent::Send(id));
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
             dialog.handle_paste(text);
@@ -6164,12 +6300,6 @@ impl HomeView {
     /// AI engine; submit restarts it, optionally migrating profile and/or swapping the
     /// engine. No-op with no selection or a mid-transition session.
     fn open_restart_dialog(&mut self) {
-        // Match the new-session paths: bail with the no-agents modal when no tool is
-        // installed, rather than opening a picker with an empty tool list.
-        if !self.available_tools.any_available() {
-            self.show_no_agents();
-            return;
-        }
         let Some(id) = self.selected_session.clone() else {
             return;
         };
@@ -6179,6 +6309,15 @@ impl HomeView {
         if matches!(inst.status, Status::Deleting | Status::Creating) {
             return;
         }
+        let recovery = self
+            .session_feed
+            .applied_session(&id)
+            .and_then(|row| row.recovery.clone());
+        if recovery.is_none() && !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
+        let controls_available = self.session_feed.can_submit(&id);
         let current_title = inst.title.clone();
         let current_profile = if inst.source_profile.is_empty() {
             self.active_profile
@@ -6193,15 +6332,18 @@ impl HomeView {
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
-        self.restart_dialog = Some(RestartDialog::new(
-            &current_title,
-            &current_profile,
-            &current_tool,
-            &current_command,
-            &current_extra_args,
-            profiles,
-            tools,
-        ));
+        self.restart_dialog = Some(
+            RestartDialog::new(
+                &current_title,
+                &current_profile,
+                &current_tool,
+                &current_command,
+                &current_extra_args,
+                profiles,
+                tools,
+            )
+            .with_recovery(recovery, controls_available),
+        );
     }
 
     /// Try to enter live-send against the selected session. Unlike `resolve_send_target`
@@ -6711,7 +6853,7 @@ impl HomeView {
             return;
         };
         let label = live_send::format_target_label(&title, &target);
-        self.pending_send_session = Some(id);
+        self.pending_message = Some(MessageIntent::Send(id));
         self.pending_send_target = target;
         let mut dialog = SendMessageDialog::new(&label);
         if let Some(buf) = self.pending_paste.take() {
@@ -6719,6 +6861,27 @@ impl HomeView {
                 dialog.handle_paste(&buf);
             }
         }
+        self.send_message_dialog = Some(dialog);
+    }
+
+    fn open_operation_retry_dialog(&mut self) {
+        let Some(id) = self.selected_session.as_deref() else {
+            return;
+        };
+        let Some(recovery) = self.operation_retry_projection(id) else {
+            self.flash_status("Current recovery does not offer an operation retry");
+            return;
+        };
+        let expected = recovery.expected.clone();
+        let Some(inst) = self.get_instance(id) else {
+            return;
+        };
+        let dialog = SendMessageDialog::new(&inst.title);
+        self.pending_message = Some(MessageIntent::RetryExisting {
+            id: id.to_owned(),
+            expected,
+        });
+        self.pending_send_target = live_send::LiveSendTarget::Agent;
         self.send_message_dialog = Some(dialog);
     }
 
@@ -6794,7 +6957,7 @@ impl HomeView {
 
         if let Some((id, title, target)) = self.resolve_send_target() {
             let label = live_send::format_target_label(&title, &target);
-            self.pending_send_session = Some(id);
+            self.pending_message = Some(MessageIntent::Send(id));
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
             dialog.handle_paste(&s);

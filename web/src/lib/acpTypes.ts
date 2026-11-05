@@ -294,13 +294,47 @@ export type IncompatibleAgentDetail =
 export interface OperationErrorEvidence {
   source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
   operation: "prompt" | "context_reset" | "terminal_observation";
-  runtime: "unknown" | "pane_alive" | { pane_exited: { exit_code: number | null } } | "acp_transport_closed";
+  runtime: RuntimeEvidence;
   origin?: "tmux_observation" | "acp_transport" | null;
   blocking_scope?: "operation" | "runtime" | null;
   retryable?: boolean | null;
   reported_code?: number | null;
   observed_at_ms: number;
   generation?: { terminal_lifecycle: number } | { acp_worker: number } | null;
+}
+
+export type RuntimeEvidence =
+  | "unknown"
+  | "pane_alive"
+  | { pane_exited: { exit_code: number | null } }
+  | "acp_transport_closed"
+  | "acp_transport_ready";
+
+/** Ephemeral server projection. `expected` is opaque selection, not native authority. */
+export interface SessionRecovery {
+  reason:
+    | "operation_failed"
+    | "channel_unavailable"
+    | "probe_failed"
+    | "identity_unattested"
+    | "runtime_exited"
+    | "observation_unknown";
+  diagnostic: string;
+  evidence: OperationErrorEvidence | null;
+  runtime: RuntimeEvidence;
+  work_in_progress: boolean;
+  uncertainty: string | null;
+  guidance: string;
+  actions: RecoveryActions;
+  expected: string;
+}
+
+export interface RecoveryActions {
+  attach: boolean;
+  retry_operation: boolean;
+  restart_same: boolean;
+  stop: boolean;
+  fresh: boolean;
 }
 
 // One variant per Event::* in src/acp/state.rs, externally tagged.
@@ -561,6 +595,7 @@ export interface ReducedState {
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
   operation_error?: OperationErrorEvidence | null;
+  recovery?: SessionRecovery | null;
   connection_unavailable?: AcpConnectionUnavailability | null;
   connection_ready?: boolean | null;
   original_decision_nonces?: string[];
@@ -614,6 +649,10 @@ export interface AcpState {
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
   lastErrorEvidence: OperationErrorEvidence | null;
+  recovery: SessionRecovery | null;
+  /** Retained diagnostic only. Cache and disconnect never retain action authority. */
+  recoveryNotice: SessionRecovery | null;
+  recoverySnapshotSeq: number | null;
   connectionUnavailable: AcpConnectionUnavailability | null;
   /** Historical diagnostic, never permission to control a native runtime. */
   connectionUnavailableNotice: AcpConnectionUnavailability | null;
@@ -972,6 +1011,9 @@ export function emptyAcpState(): AcpState {
     incompatibleAgent: null,
     lastError: null,
     lastErrorEvidence: null,
+    recovery: null,
+    recoveryNotice: null,
+    recoverySnapshotSeq: null,
     connectionUnavailable: null,
     connectionUnavailableNotice: null,
     connectionReady: false,
@@ -1052,6 +1094,8 @@ export function canSubmitPromptIntent(
 /** A cache or a new socket dial is historical data, not a current native receipt. */
 export function revokeNativeAuthority(state: AcpState): AcpState {
   if (
+    state.recovery === null &&
+    state.recoverySnapshotSeq === null &&
     !state.connectionReady &&
     !state.promptWakeEligible &&
     state.nativeSnapshotSeq == null &&
@@ -1062,6 +1106,9 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     return state;
   return {
     ...state,
+    recoveryNotice: state.recovery ?? state.recoveryNotice,
+    recovery: null,
+    recoverySnapshotSeq: null,
     connectionReady: false,
     nativeSnapshotSeq: null,
     originalDecisionNonces: [],
@@ -1082,6 +1129,8 @@ function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.lastError = null;
   next.lastErrorEvidence = null;
+  next.recovery = null;
+  next.recoveryNotice = null;
   next.interactionError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
   next.cancelEscalatesAt = null;
@@ -1164,6 +1213,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   next.currentModeId = state.currentModeId;
   next.authStatus = state.authStatus;
   next.lastErrorEvidence = state.lastErrorEvidence;
+  next.recovery = state.recovery;
+  next.recoveryNotice = state.recoveryNotice;
+  next.recoverySnapshotSeq = state.recoverySnapshotSeq;
+  if (state.recoverySnapshotSeq !== null) next.lastError = state.lastError;
   next.connectionReady = state.connectionReady;
   next.connectionUnavailable = state.connectionUnavailable;
   next.connectionUnavailableNotice = state.connectionUnavailable ?? next.connectionUnavailableNotice;
@@ -1206,6 +1259,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   const next = {
     ...state,
     lastSeq: frame.seq,
+    recovery: covered ? state.recovery : null,
+    recoveryNotice: state.recovery ?? state.recoveryNotice,
+    recoverySnapshotSeq: covered ? state.recoverySnapshotSeq : null,
     serverTurnActive: rawTurnActive,
     // A current loss cannot change whether an older raw prompt began a turn.
     connectionUnavailable: covered ? null : state.connectionUnavailable,
@@ -1637,6 +1693,14 @@ export function applyReducedState(
     rateLimitRetriesExhausted:
       authoritative && reduced.rate_limit_park != null ? reduced.rate_limit_park === "exhausted" : null,
     lastErrorEvidence: reduced.operation_error ?? null,
+    lastError:
+      authoritative && reduced.recovery !== undefined ? (reduced.recovery?.diagnostic ?? null) : state.lastError,
+    recoverySnapshotSeq: authoritative && reduced.recovery !== undefined ? snapshotSeq : null,
+    recovery: authoritative ? (reduced.recovery ?? null) : null,
+    recoveryNotice:
+      authoritative && reduced.recovery !== undefined
+        ? reduced.recovery
+        : (reduced.recovery ?? state.recovery ?? state.recoveryNotice),
     connectionUnavailable,
     connectionUnavailableNotice: connectionUnavailable ?? state.connectionUnavailableNotice,
     connectionReady,
@@ -1889,6 +1953,9 @@ export function normaliseTurnState(
   const next: AcpState = {
     ...state,
     oldestSeq,
+    recovery: null,
+    recoveryNotice: state.recovery ?? state.recoveryNotice ?? null,
+    recoverySnapshotSeq: null,
     connectionUnavailable: state.connectionUnavailable ?? null,
     connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
     connectionReady: state.connectionReady === true,

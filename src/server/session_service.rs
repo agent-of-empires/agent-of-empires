@@ -17,6 +17,28 @@ use crate::daemon::{CreationPhase, CreationProgress};
 use crate::server::session_spawn::{spawn_structured_session, SpawnOutcome, StructuredSessionSpec};
 use crate::session::{Instance, PluginCreateIdempotency};
 
+pub(crate) struct RecoverySnapshot {
+    row: Instance,
+    pub recovery: Option<crate::session::SessionRecovery>,
+    pub context_resume_available: bool,
+}
+
+impl RecoverySnapshot {
+    pub(crate) fn matches(&self, row: &Instance) -> bool {
+        self.row.source_profile == row.source_profile
+            && self.row.view == row.view
+            && self.row.created_at == row.created_at
+            && self.row.lifecycle_generation == row.lifecycle_generation
+            && self.row.conversation_state().matches_checkpoint(row)
+            && self.row.acp_establishment == row.acp_establishment
+            && self.row.command == row.command
+            && self.row.extra_args == row.extra_args
+            && self.row.resume_probe_failed_sid == row.resume_probe_failed_sid
+            && self.row.omp_capture_generation == row.omp_capture_generation
+            && self.row.capture_started_at == row.capture_started_at
+    }
+}
+
 /// A create currently being built for a `(plugin_id, idempotency_key)` scope.
 /// Present only between the idempotency claim and the end of the build, so a
 /// concurrent retry of the same key waits for the winner instead of
@@ -1971,7 +1993,7 @@ impl SessionService {
     /// The fold is cached because rebuilding it per call measured 68ms at 20k
     /// events and 342ms at 100k, holding the event store's connection mutex
     /// for the whole scan, which stalls event recording daemon-wide.
-    pub(crate) async fn fold_control_state(
+    pub(crate) async fn fold_control_history(
         &self,
         id: &str,
     ) -> anyhow::Result<crate::acp::state::AcpState> {
@@ -2007,13 +2029,21 @@ impl SessionService {
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-        let mut reduced = match reduced {
+        let reduced = match reduced {
             Ok(reduced) => reduced,
             Err(error) => {
                 tracing::error!(target: "acp.control_state", session = id, %error, "cannot read session control state");
                 return Err(error);
             }
         };
+        Ok(reduced)
+    }
+
+    pub(crate) async fn fold_control_state(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<crate::acp::state::AcpState> {
+        let mut reduced = self.fold_control_history(id).await?;
         let projection = self
             .native_control_projection(id, reduced.native_availability, reduced.native_control_seq)
             .await;
@@ -2024,6 +2054,100 @@ impl SessionService {
             .await?
             .apply(&mut reduced);
         Ok(reduced)
+    }
+
+    /// Sample outside publication/instance exclusion: Native observation may wait on its fence.
+    pub(crate) async fn recovery_snapshots(
+        &self,
+        mutations: bool,
+    ) -> anyhow::Result<HashMap<String, RecoverySnapshot>> {
+        let rows = self.instances.read().await.clone();
+        let mut snapshots = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let folded = if row.is_structured() {
+                Some(self.fold_control_history(&row.id).await?)
+            } else {
+                None
+            };
+            let native = if let Some(folded) = folded.as_ref() {
+                self.native_control_projection(
+                    &row.id,
+                    folded.native_availability,
+                    folded.native_control_seq,
+                )
+                .await
+            } else {
+                Default::default()
+            };
+            let context_resume_available = native.ready
+                && row.acp_load_session_capable == Some(true)
+                && row.require_resolved_acp_selection().is_ok()
+                && row.selected_acp_target().is_ok();
+            let recovery = self
+                .recovery_projection(&row, folded, native, mutations)
+                .await?;
+            snapshots.insert(
+                row.id.clone(),
+                RecoverySnapshot {
+                    row,
+                    recovery,
+                    context_resume_available,
+                },
+            );
+        }
+        Ok(snapshots)
+    }
+
+    pub(crate) async fn recovery_projection(
+        &self,
+        row: &Instance,
+        folded: Option<crate::acp::state::AcpState>,
+        native: crate::acp::state::NativeAvailabilityProjection,
+        mutations: bool,
+    ) -> anyhow::Result<Option<crate::session::SessionRecovery>> {
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || {
+            match crate::session::Storage::open_reference(&row.source_profile).and_then(|storage| {
+                crate::session::projection::current_recovery(
+                    &row,
+                    &storage,
+                    folded.as_ref(),
+                    native,
+                    mutations,
+                )
+            }) {
+                Ok(recovery) => Ok(recovery),
+                Err(_) => Ok(crate::session::SessionRecovery::project(
+                    &row,
+                    crate::session::projection::RecoveryObservation {
+                        managed_resume_cause: None,
+                        operation_failed: folded
+                            .as_ref()
+                            .is_some_and(|state| state.operation_diagnostic.is_some()),
+                        diagnostic: folded.as_ref().and_then(|state| {
+                            state
+                                .operation_diagnostic
+                                .as_deref()
+                                .or(state.startup_diagnostic.as_deref())
+                        }),
+                        evidence: folded.as_ref().and_then(|state| state.operation_error),
+                        runtime: crate::session::RuntimeEvidence::Unknown,
+                        work_in_progress: folded.as_ref().is_none_or(|state| state.turn_active),
+                        output_uncertain: folded
+                            .as_ref()
+                            .is_some_and(|state| state.operation_output_uncertain),
+                        owned_input: false,
+                        owned_runtime: false,
+                        same_qualified: false,
+                        replacement_qualified: false,
+                        channel_unavailable: false,
+                    },
+                    String::new(),
+                    false,
+                )),
+            }
+        })
+        .await?
     }
 
     pub(crate) async fn native_control_projection(

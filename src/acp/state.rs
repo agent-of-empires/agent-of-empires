@@ -1134,6 +1134,17 @@ pub struct AcpState {
     /// The diagnostic message stays in the event/transcript, independently of liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_error: Option<crate::session::OperationErrorEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_diagnostic: Option<String>,
+    #[serde(skip)]
+    operation_diagnostic_origin: Option<NativeEventOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_diagnostic: Option<String>,
+    #[serde(default)]
+    pub operation_output_uncertain: bool,
+    /// Live server overlay only; cached data never supplies action authority.
+    #[serde(default, skip_serializing)]
+    pub recovery: Option<crate::session::SessionRecovery>,
     /// Missing means no recorded unavailability, not affirmative native-channel health.
     #[serde(default)]
     pub connection_unavailable: Option<AcpConnectionUnavailability>,
@@ -1599,6 +1610,7 @@ impl AcpState {
             && projection.owner.is_some()
             && self.sidebar_phase == SidebarPhase::Error
             && self.operation_error.is_none()
+            && self.operation_diagnostic.is_none()
             && self.native_availability.is_some_and(|(_, subject)| {
                 Some(subject.context) == projection.context
                     && subject.owner == projection.owner
@@ -1648,7 +1660,7 @@ impl AcpState {
         }
     }
 
-    fn has_qualified_background_work(&self) -> bool {
+    pub(crate) fn has_qualified_background_work(&self) -> bool {
         self.background_tasks
             .iter()
             .any(|task| task.resource_ref.is_some())
@@ -1675,6 +1687,14 @@ impl AcpState {
             {
                 self.open_turn();
                 self.native_control_seq = self.native_control_seq.max(seq);
+            }
+            if metadata.output_uncertainty.is_some()
+                && matches!(
+                    event,
+                    Event::PromptRuntimeError { .. } | Event::Stopped { .. }
+                )
+            {
+                self.operation_output_uncertain = true;
             }
             return self.apply_current_event(
                 seq,
@@ -2013,8 +2033,13 @@ impl AcpState {
                     reason: reason.clone(),
                 });
             }
-            Event::PromptRuntimeError { evidence, .. } => {
+            Event::PromptRuntimeError {
+                message, evidence, ..
+            } => {
+                self.operation_diagnostic =
+                    Some(crate::acp::acp_client::public_diagnostic(message));
                 self.operation_error = *evidence;
+                self.operation_diagnostic_origin = origin;
                 self.end_turn("prompt_failed");
                 self.sidebar_phase = SidebarPhase::Error;
             }
@@ -2034,9 +2059,11 @@ impl AcpState {
                 self.connection_ready = false;
             }
             Event::AgentStartupError {
+                message,
                 native_subject: Some(subject),
                 ..
             } => {
+                self.startup_diagnostic = Some(crate::acp::acp_client::public_diagnostic(message));
                 match subject.kind {
                     NativeSubjectEvent::ChannelUnavailable(unavailable) => {
                         self.connection_unavailable = Some(unavailable);
@@ -2069,7 +2096,8 @@ impl AcpState {
                 }
                 self.connection_ready = false;
             }
-            Event::AgentStartupError { .. } => {
+            Event::AgentStartupError { message, .. } => {
+                self.startup_diagnostic = Some(crate::acp::acp_client::public_diagnostic(message));
                 self.turn_active = false;
                 self.cancelling = false;
                 self.sidebar_phase = SidebarPhase::Error;
@@ -2094,17 +2122,42 @@ impl AcpState {
                     self.connection_unavailable = None;
                     self.native_availability = native_subject.map(|subject| (seq, subject));
                     self.startup_error = None;
+                    self.startup_diagnostic = None;
+                    if self
+                        .operation_diagnostic_origin
+                        .zip(origin)
+                        .is_some_and(|(failed, current)| failed != current)
+                    {
+                        // A different qualified Native establishment supersedes the failed operation.
+                        // Reopening the same actor or replaying its Ready event does not.
+                        self.operation_error = None;
+                        self.operation_diagnostic = None;
+                        self.operation_diagnostic_origin = None;
+                        self.operation_output_uncertain = false;
+                        self.recovery = None;
+                    }
                     self.rate_limit = None;
                     self.heal_sidebar_phase();
                 }
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
-            Event::SessionContextReset { .. } => self.usage = None,
+            Event::SessionContextReset { .. } => {
+                self.usage = None;
+                self.operation_error = None;
+                self.operation_diagnostic = None;
+                self.operation_diagnostic_origin = None;
+                self.operation_output_uncertain = false;
+                self.recovery = None;
+            }
             // Clears the conversation; adapter-scoped commands, modes and
             // selectors are never re-announced, so they stay.
             Event::SessionCleared => {
                 self.usage = None;
                 self.operation_error = None;
+                self.operation_diagnostic = None;
+                self.operation_diagnostic_origin = None;
+                self.operation_output_uncertain = false;
+                self.recovery = None;
                 if self.sidebar_phase == SidebarPhase::PromptFailed {
                     self.sidebar_phase = SidebarPhase::Idle;
                 }
@@ -2322,6 +2375,10 @@ impl AcpState {
         self.turn_active = true;
         self.sidebar_phase = SidebarPhase::Active;
         self.operation_error = None;
+        self.operation_diagnostic = None;
+        self.operation_diagnostic_origin = None;
+        self.operation_output_uncertain = false;
+        self.recovery = None;
         if !steered {
             self.cancelling = false;
         }
@@ -2333,7 +2390,10 @@ impl AcpState {
 
     /// A fresh worker attached: a startup error no longer holds the row.
     fn heal_sidebar_phase(&mut self) {
-        if self.sidebar_phase == SidebarPhase::Error && self.operation_error.is_none() {
+        if self.sidebar_phase == SidebarPhase::Error
+            && self.operation_error.is_none()
+            && self.operation_diagnostic.is_none()
+        {
             self.sidebar_phase = SidebarPhase::Idle;
         }
     }
@@ -2363,6 +2423,10 @@ impl AcpState {
         self.agent = AgentName(to.clone());
         self.rate_limit = None;
         self.operation_error = None;
+        self.operation_diagnostic = None;
+        self.operation_diagnostic_origin = None;
+        self.operation_output_uncertain = false;
+        self.recovery = None;
         if self.sidebar_phase == SidebarPhase::PromptFailed {
             self.sidebar_phase = SidebarPhase::Idle;
         }

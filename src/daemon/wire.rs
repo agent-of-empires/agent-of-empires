@@ -388,6 +388,8 @@ pub struct StartSessionBody {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartSessionBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::session::SessionRecoveryRequest>,
     pub size: Option<TerminalSize>,
     pub profile: Option<String>,
     pub tool: Option<String>,
@@ -1120,6 +1122,9 @@ pub struct SessionResponse {
     /// lifecycle transition. This does not report current start eligibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_resume: Option<ContextResumeAvailability>,
+    /// Ephemeral shared diagnostic and current, source-qualified recovery admission.
+    #[serde(default)]
+    pub recovery: Option<crate::session::SessionRecovery>,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
     /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
@@ -1327,6 +1332,8 @@ pub struct SessionsEnvelope {
 pub struct ListSessionsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<SessionScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[cfg(test)]

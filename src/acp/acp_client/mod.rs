@@ -47,6 +47,7 @@ mod watchdog;
 pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub use delete::DeleteSessionOutcome;
+pub(crate) use errors::public_diagnostic;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub(crate) use list::probe_option_catalog;
 pub use list::{list_native_sessions, ListSessionsError};

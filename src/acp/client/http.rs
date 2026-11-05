@@ -326,6 +326,15 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Explicit composition for an existing owned terminal only; never revive or prepare a runtime.
+    pub async fn send_terminal_existing(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<(), HttpError> {
+        self.send_message(session_id, text, true).await
+    }
+
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
     /// (host-rendered slots + notifications) the web dashboard polls; the
     /// native structured view renders the TUI-applicable subset (#2402).
@@ -1561,34 +1570,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_revive_refusal_explains_the_conflict_without_reading_its_body() {
+    async fn no_revive_refusal_is_typed_without_waiting_for_its_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            assert!(stream.read(&mut request).await.unwrap() > 0);
-            stream.write_all(b"HTTP/1.1 409 Conflict\r\nAoE-Error-Code: no_revive\r\nContent-Length: 100\r\n\r\n").await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let client =
-            HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.prompt("session", "hello", true),
-        )
-        .await;
-        server.abort();
-        let error = result
-            .expect("classification must not wait for the stalled body")
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("reviving the session is required"),
-            "{error}"
-        );
+        for structured in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(b"HTTP/1.1 409 Conflict\r\nAoE-Error-Code: no_revive\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                if structured {
+                    client
+                        .prompt("session", "explicit input", true)
+                        .await
+                        .map(|_| ())
+                } else {
+                    client
+                        .send_terminal_existing("session", "explicit input")
+                        .await
+                }
+            })
+            .await;
+            server.abort();
+            let error = result
+                .expect("classification must not wait for the stalled body")
+                .unwrap_err();
+            assert!(matches!(error, HttpError::RevivalRequired));
+        }
     }
 
     #[tokio::test]

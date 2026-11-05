@@ -3274,6 +3274,120 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
 
 #[test]
 #[serial]
+fn recovery_retry_is_blank_and_cannot_retarget_or_fall_back_to_ordinary_actions() {
+    use crate::tui::{app::Action, dialogs::ContextMenuAction};
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    let _driver = env.view.session_feed.request_driver_for_test();
+    let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Error");
+    row.recovery = Some(crate::session::SessionRecovery {
+        reason: crate::session::SessionRecoveryReason::OperationFailed,
+        diagnostic: "Provider rejected the operation.".into(),
+        evidence: None,
+        runtime: crate::session::RuntimeEvidence::AcpTransportReady,
+        work_in_progress: false,
+        uncertainty: None,
+        guidance: "Compose explicit new input in the existing Agent.".into(),
+        actions: crate::session::RecoveryActions {
+            attach: true,
+            retry_operation: true,
+            restart_same: true,
+            stop: true,
+            fresh: true,
+        },
+        expected: "selection-a".into(),
+    });
+    publish_canonical_snapshot(&mut env, vec![row.clone()], vec![], 1);
+    env.view.pending_paste = Some("DO_NOT_REPLAY_OLD_INPUT".into());
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::RetryOperation);
+    assert!(env.view.send_message_dialog.is_some());
+    assert!(env.view.handle_key(key(KeyCode::Enter), None).is_none());
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::RetryOperation);
+    for character in "explicit new input".chars() {
+        env.view.handle_key(key(KeyCode::Char(character)), None);
+    }
+    row.recovery.as_mut().unwrap().expected = "selection-b".into();
+    publish_canonical_snapshot(&mut env, vec![row.clone()], vec![], 2);
+    assert!(env.view.handle_key(key(KeyCode::Enter), None).is_none());
+    assert!(
+        env.view.send_message_dialog.is_some(),
+        "stale selection retains the unsent draft"
+    );
+    env.view.handle_key(key(KeyCode::Esc), None);
+    env.view.handle_key(key(KeyCode::Esc), None);
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::RetryOperation);
+    for character in "new current input".chars() {
+        env.view.handle_key(key(KeyCode::Char(character)), None);
+    }
+    assert!(matches!(
+        env.view.handle_key(key(KeyCode::Enter), None),
+        Some(Action::RetryOperation(intent)) if intent.session_id == id && intent.text == "new current input"
+    ));
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::StopExisting);
+    assert!(env.view.confirm_dialog.is_some());
+    row.recovery.as_mut().unwrap().actions.stop = false;
+    publish_canonical_snapshot(&mut env, vec![row.clone()], vec![], 3);
+    assert!(env.view.handle_key(key(KeyCode::Char('y')), None).is_none());
+    assert!(env.view.confirm_dialog.is_none());
+    assert!(
+        env.view.info_dialog.is_some(),
+        "withdrawn Stop is refused after explicit confirmation"
+    );
+    env.view.handle_key(key(KeyCode::Esc), None);
+    row.recovery = None;
+    row.status = "Running".into();
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 4);
+    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Running);
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::Recovery);
+    assert!(env.view.restart_dialog.is_none() && env.view.no_agents_dialog.is_none());
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::StopExisting);
+    assert!(
+        env.view.confirm_dialog.is_none(),
+        "missing recovery is not ordinary Stop"
+    );
+}
+
+#[test]
+#[serial]
+fn stopped_recovery_keeps_confirmed_exit_diagnostic_visible() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    let _driver = env.view.session_feed.request_driver_for_test();
+    let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Stopped");
+    row.view = crate::session::View::Terminal;
+    row.recovery = Some(crate::session::SessionRecovery {
+        reason: crate::session::SessionRecoveryReason::RuntimeExited,
+        diagnostic: "CONFIRMED_NATIVE_EXIT".into(),
+        evidence: None,
+        runtime: crate::session::RuntimeEvidence::PaneExited {
+            exit_code: Some(17),
+        },
+        work_in_progress: false,
+        uncertainty: None,
+        guidance: "REVIEW_EXPLICIT_RECOVERY_CHOICES".into(),
+        actions: crate::session::RecoveryActions::default(),
+        expected: "exit-selection".into(),
+    });
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Stopped);
+    assert!(screen.contains("CONFIRMED_NATIVE_EXIT"), "{screen}");
+    assert!(
+        screen.contains("REVIEW_EXPLICIT_RECOVERY_CHOICES"),
+        "{screen}"
+    );
+}
+
+#[test]
+#[serial]
 fn indeterminate_launch_refuses_attachment_without_resubmitting() {
     use crate::tui::home::panes::{NativePane, PaneIntent};
     let mut env = create_test_env_with_sessions(1);

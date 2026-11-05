@@ -4,6 +4,8 @@ import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LiveTerminalView } from "../LiveTerminalView";
+import type * as ApiModule from "../../lib/api";
+import type { SessionRecovery } from "../../lib/acpTypes";
 import { makeSession } from "./fixtures";
 
 const live = vi.hoisted(() => ({
@@ -14,32 +16,30 @@ const live = vi.hoisted(() => ({
     retryCountdown: 0,
     frame: null,
     reading: false,
-    isOwner: false,
-    ownerKnown: false,
+    isOwner: true,
+    ownerKnown: true,
     transport: null,
     paneDead: true,
     stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
   },
   ensureSession: vi.fn(async () => ({ ok: true, message: null })),
+  ensureTerminal: vi.fn(async () => ({ ok: true, message: null })),
+  manualReconnect: vi.fn(),
+  sendData: vi.fn(),
+  sendPaste: vi.fn(() => true),
 }));
 
 vi.mock("../../hooks/useLiveTerminal", () => ({
-  useLiveTerminal: () => ({
-    ...live,
-    sendData: vi.fn(),
-    sendPaste: vi.fn(),
-    maxRetries: 7,
-    manualReconnect: vi.fn(),
-    claim: vi.fn(),
-  }),
+  useLiveTerminal: () => ({ ...live, maxRetries: 7, claim: vi.fn() }),
 }));
 vi.mock("../../hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => true }));
 vi.mock("../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: () => ({ keyboardHeight: 0, keyboardOpen: false }),
 }));
-vi.mock("../../lib/api", () => ({
+vi.mock("../../lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof ApiModule>()),
   ensureSession: live.ensureSession,
-  ensureTerminal: async () => ({ ok: true, message: null }),
+  ensureTerminal: live.ensureTerminal,
   pasteImage: vi.fn(),
   isStartRefusal: () => false,
 }));
@@ -49,73 +49,148 @@ vi.mock("../MobileLiveTerminal", () => ({
   ),
 }));
 
+const recovery = (over: Partial<SessionRecovery> = {}): SessionRecovery => ({
+  reason: "operation_failed",
+  diagnostic: "The operation failed; the original native conversation remains selected.",
+  evidence: {
+    source: "local_prompt_result",
+    operation: "prompt",
+    runtime: "unknown",
+    blocking_scope: "operation",
+    observed_at_ms: 1,
+  },
+  runtime: "acp_transport_ready",
+  work_in_progress: false,
+  uncertainty: null,
+  guidance: "Observe the retained conversation before writing another operation.",
+  actions: { attach: true, retry_operation: true, restart_same: false, stop: true, fresh: false },
+  expected: "opaque-exact-binding",
+  ...over,
+});
+const fetchSpy = vi.fn<typeof fetch>();
 beforeEach(() => {
   live.state.paneDead = true;
   live.state.connected = false;
   live.ensureSession.mockClear();
+  live.ensureTerminal.mockClear();
+  live.manualReconnect.mockClear();
+  live.sendData.mockClear();
+  live.sendPaste.mockClear();
+  fetchSpy.mockReset().mockResolvedValue(new Response("{}", { status: 200 }));
+  vi.stubGlobal("fetch", fetchSpy);
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
-const mountDead = async (status: "Running" | "Stopped" = "Running") => {
-  const utils = render(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status })} />);
-  await screen.findByRole("button", { name: "Restart" });
-  await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
-  return utils;
-};
-
-describe("LiveTerminalView after the agent exits", () => {
-  it("Restart re-runs ensure so the pane is revived and redialed", async () => {
-    await mountDead();
-    fireEvent.click(screen.getByRole("button", { name: "Restart" }));
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(2));
-    expect(screen.queryByText("Connection lost")).toBeNull();
+describe("terminal shared recovery", () => {
+  it("mounts and observes a failed operation without ensuring, replacing or resending", () => {
+    const projection = recovery();
+    render(
+      <LiveTerminalView
+        readOnly={false}
+        recoveryCurrent
+        session={makeSession({ id: "original", status: "Error", recovery: projection })}
+      />,
+    );
+    expect(screen.getByText(projection.diagnostic)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("session-recovery-attach"));
+    expect(live.manualReconnect).toHaveBeenCalledOnce();
+    expect(live.ensureSession).not.toHaveBeenCalled();
+    expect(live.sendData).not.toHaveBeenCalled();
+    expect(live.sendPaste).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Restart" })).toBeNull();
   });
 
-  it("re-ensures once when the session goes from stopped to running", async () => {
-    const { rerender } = await mountDead("Stopped");
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(2));
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    expect(live.ensureSession).toHaveBeenCalledTimes(2);
+  it("keeps server-authorized Same usable after confirmed exit even though terminal WS is closed", async () => {
+    const projection = recovery({
+      reason: "runtime_exited",
+      runtime: { pane_exited: { exit_code: 9 } },
+      actions: { attach: true, retry_operation: false, restart_same: true, stop: false, fresh: true },
+    });
+    render(
+      <LiveTerminalView
+        readOnly={false}
+        recoveryCurrent
+        session={makeSession({ id: "original", status: "Error", recovery: projection })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("session-recovery-restart-same"));
+    await waitFor(() => expect(live.manualReconnect).toHaveBeenCalledOnce());
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(live.ensureSession).not.toHaveBeenCalled();
+    expect(live.sendPaste).not.toHaveBeenCalled();
+    expect(screen.getByText(projection.diagnostic)).toBeTruthy();
   });
 
-  it("keeps the Start edge until the dead-pane close arrives", async () => {
-    live.state.paneDead = false;
+  it("keeps a missing or stale projection diagnostic visible without retaining permissions", () => {
+    const session = makeSession({ id: "original", recovery: recovery() });
+    const { rerender } = render(<LiveTerminalView readOnly={false} recoveryCurrent session={session} />);
+    rerender(
+      <LiveTerminalView readOnly={false} recoveryCurrent={false} session={{ ...session, recovery: undefined }} />,
+    );
+    expect(screen.getByText(session.recovery!.diagnostic)).toBeTruthy();
+    rerender(<LiveTerminalView readOnly={false} recoveryCurrent={false} session={{ ...session, recovery: null }} />);
+    expect(screen.getByText(session.recovery!.diagnostic)).toBeTruthy();
+    for (const action of ["attach", "retry-operation", "restart-same", "stop", "fresh"]) {
+      expect((screen.getByTestId(`session-recovery-${action}`) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(screen.getByTestId(`session-recovery-${action}`));
+    }
+    expect(live.ensureSession).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("opens an empty recovery composition instead of restoring the saved prompt, then sends only new explicit input", async () => {
     live.state.connected = true;
-    const { rerender } = render(
-      <LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Stopped" })} />,
+    live.state.paneDead = false;
+    const session = makeSession({ id: "draft-recovery" });
+    const { rerender } = render(<LiveTerminalView readOnly={false} session={session} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Compose" }));
+    fireEvent.input(screen.getByLabelText("Message"), { target: { value: "possibly accepted original prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const failed = { ...session, recovery: recovery() };
+    rerender(<LiveTerminalView readOnly={false} recoveryCurrent session={failed} />);
+    fireEvent.click(screen.getByTestId("session-recovery-retry-operation"));
+    expect(screen.getByLabelText<HTMLTextAreaElement>("Message").value).toBe("");
+    expect(live.sendPaste).not.toHaveBeenCalled();
+    fireEvent.input(screen.getByLabelText("Message"), { target: { value: "new explicit operation" } });
+    rerender(<LiveTerminalView readOnly={false} recoveryCurrent={false} session={failed} />);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(live.sendPaste).not.toHaveBeenCalled();
+    rerender(
+      <LiveTerminalView
+        readOnly={false}
+        recoveryCurrent
+        session={{ ...failed, recovery: recovery({ expected: "different-native-binding" }) }}
+      />,
     );
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    expect(live.ensureSession).toHaveBeenCalledTimes(1);
-    live.state.connected = false;
-    live.state.paneDead = true;
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(live.sendPaste).not.toHaveBeenCalled();
+    expect(screen.getByLabelText<HTMLTextAreaElement>("Message").value).toBe("new explicit operation");
+    rerender(<LiveTerminalView readOnly={false} recoveryCurrent session={failed} />);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(live.sendPaste).toHaveBeenCalledExactlyOnceWith("new explicit operation", true);
+    expect(live.ensureSession).toHaveBeenCalledOnce();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("does not treat Idle to Running as a Start, so a later exit is not auto-restarted", async () => {
-    live.state.paneDead = false;
-    live.state.connected = true;
-    const { rerender } = render(
-      <LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Idle" })} />,
+  it("does not apply agent recovery to paired or tool terminals", async () => {
+    render(
+      <LiveTerminalView
+        readOnly={false}
+        surface="paired-host"
+        terminalIndex={2}
+        recoveryCurrent
+        session={makeSession({ id: "paired", recovery: recovery() })}
+      />,
     );
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    live.state.connected = false;
-    live.state.paneDead = true;
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    await screen.findByRole("button", { name: "Restart" });
-    expect(live.ensureSession).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not re-ensure on a status change while the pane is alive", async () => {
-    live.state.paneDead = false;
-    const { rerender } = render(
-      <LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Stopped" })} />,
-    );
-    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
-    rerender(<LiveTerminalView readOnly={false} session={makeSession({ id: "dead", status: "Running" })} />);
-    expect(live.ensureSession).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(live.ensureTerminal).toHaveBeenCalledExactlyOnceWith("paired", 2, false));
+    expect(screen.queryByTestId("session-recovery")).toBeNull();
+    expect(live.ensureSession).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: "Restart" }));
+    await waitFor(() => expect(live.ensureTerminal).toHaveBeenCalledTimes(2));
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

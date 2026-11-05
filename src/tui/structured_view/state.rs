@@ -176,6 +176,7 @@ impl ChoicePicker {
 /// The input layer maps mouse clicks to focus regions against it.
 #[derive(Debug, Clone, Copy)]
 pub struct ViewLayout {
+    pub recovery: Rect,
     pub transcript: Rect,
     pub status: Rect,
     pub approval: Rect,

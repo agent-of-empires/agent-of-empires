@@ -265,9 +265,7 @@ impl HomeView {
     ///   the field is updated before respawn so the new agent binary starts
     ///   on the next launch.
     ///
-    /// Launch edits travel with the restart command. Only the daemon may commit
-    /// them after lifecycle admission; a disconnected or refused request leaves
-    /// both this view and the stored session untouched.
+    /// The daemon admits launch edits before committing them to the stored session.
     pub(super) fn restart_selected_session(
         &mut self,
         new_profile: Option<&str>,
@@ -281,49 +279,57 @@ impl HomeView {
             new_extra_args,
             new_command_override,
             false,
+            None,
         )
     }
 
-    /// Whether the session runs an agent binary replaced since launch and may be restarted for
-    /// it now. Structured rows are left to the web dashboard: this restart path cannot respawn a
-    /// structured worker.
-    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
-        self.get_instance(id).is_some_and(|inst| {
-            crate::session::update_restart::offer_pending(
-                inst,
-                match inst.terminal_context_resume_cached() {
-                    crate::session::TerminalContextResume::Available => true,
-                    crate::session::TerminalContextResume::RuntimeCheckRequired => {
-                        inst.agent_session_id.is_some()
-                    }
-                    _ => false,
-                },
-                false,
-            )
-        })
+    pub(super) fn restart_selected_recovery(
+        &mut self,
+        recovery: crate::session::SessionRecoveryRequest,
+    ) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.as_deref() else {
+            return Ok(());
+        };
+        let current = self
+            .session_feed
+            .applied_session(id)
+            .and_then(|row| row.recovery.as_ref())
+            .filter(|current| current.expected == recovery.expected)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Recovery selection changed; reopen its current diagnostic")
+            })?;
+        let allowed = match recovery.action {
+            crate::session::SessionRecoveryAction::Same => current.actions.restart_same,
+            crate::session::SessionRecoveryAction::Fresh => current.actions.fresh,
+        };
+        anyhow::ensure!(
+            self.session_feed.current_observation_applied()
+                && self.session_feed.can_submit(id)
+                && allowed,
+            "{}",
+            current.guidance
+        );
+        self.restart_selected_session_with_wake(None, None, None, None, false, Some(recovery))
     }
 
-    /// Restart the selected session onto the updated agent, with no wake-up message. The restart
-    /// resumes through `auto_resume_on_restart`, so the offer's "conversation kept" promise only
-    /// holds while that is on.
+    /// Use the daemon's current update-restart admission.
+    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
+        self.session_feed.can_submit(id)
+            && self
+                .session_feed
+                .applied_session(id)
+                .is_some_and(|row| row.update_restart)
+    }
+
+    /// Restart with the daemon's update admission and no wake-up message.
     pub(super) fn restart_selected_for_update(&mut self) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.clone() else {
+        let Some(id) = self.selected_session.as_deref() else {
             return Ok(());
         };
-        let Some(profile) = self
-            .get_instance(&id)
-            .filter(|_| self.update_restart_offered(&id))
-            .map(|inst| inst.effective_profile())
-        else {
+        if !self.update_restart_offered(id) {
             return Ok(());
-        };
-        let auto_resume = crate::session::resolve_config(&profile)
-            .map(|c| c.session.auto_resume_on_restart)
-            .unwrap_or(true);
-        if !auto_resume {
-            anyhow::bail!("auto_resume_on_restart is off, so a restart would start a new conversation. Restart with 'e' if that is intended");
         }
-        self.restart_selected_session_with_wake(None, None, None, None, true)
+        self.restart_selected_session_with_wake(None, None, None, None, true, None)
     }
 
     /// `for_update` sends no wake-up message and has the daemon refuse a session that is no longer
@@ -335,6 +341,7 @@ impl HomeView {
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
         for_update: bool,
+        recovery: Option<crate::session::SessionRecoveryRequest>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -391,8 +398,9 @@ impl HomeView {
             extra_args: new_extra_args.map(str::to_owned),
             command_override: new_command_override.map(str::to_owned),
             unsnooze: wake_snooze,
-            wake_message: for_update.then(String::new),
+            wake_message: (for_update || recovery.is_some()).then(String::new),
             only_if_idle: for_update,
+            recovery,
             ..Default::default()
         };
         if let Err(error) = self

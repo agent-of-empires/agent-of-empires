@@ -140,6 +140,65 @@ Automatic capture then takes over where supported. The abandoned conversation st
 
 Structured-view conversations remain managed by ACP. For a Claude terminal handoff, AoE records the native execution resolved for the current ACP ID. A handoff whose store cannot be resolved, or which the structured worker does not share, is refused before worker teardown with recovery guidance. Other structured resume-target changes are rejected.
 
+## Diagnosing and recovering an existing session
+
+`Error` means an operation needs attention, not that the Agent crashed. A provider
+or authentication error can leave the original Native process and conversation
+usable. Historical error evidence and the current runtime observation are
+separate: an ACP channel observed ready does not prove OS-process liveness, and a
+lost channel does not prove process exit. Unknown identity grants no retry or
+Same shortcut.
+
+Inspect the shared diagnostic before acting:
+
+```sh
+aoe session show <session>
+aoe session show <session> --json
+```
+
+CLI output, Home's preview and F5 recovery dialog, and the web recovery banner
+expose the available diagnostic, blocked operation, runtime observation,
+uncertainty and server-authorized actions. Stale or disconnected observations
+cannot authorize a recovery. `last_error` and the recovery projection are not
+durable session fields; retained Native events may reconstruct a diagnostic, but
+it is not guaranteed to survive a daemon restart.
+
+| Action | Effect |
+| --- | --- |
+| Attach / observe | Observe the existing runtime and transcript without replacing the Agent. |
+| Compose retry | Start a blank composition for the existing qualified Agent, only when the server affirmatively allows it. This is not replay of the previous prompt. |
+| Restart Same | Revalidate the exact qualified conversation selection and restart it, without sending previous input or a wake message. |
+| Stop | Explicitly stop the currently owned runtime through the ordinary Stop admission. This does not delete its native history. |
+| Fresh / launch without restore flags | Abandon pending AoE input and attachments, stop the admitted outgoing runtime, and launch without AoE restore flags. Do not replay blocked or possibly accepted input. Keep native and transcript history. |
+
+Repair provider settings or authentication in the Agent before composing new
+input. If the Agent reports its own retry or backoff, that remains Agent work:
+AoE shows its progress rather than starting a concurrent recovery. Missing
+retryability evidence does not authorize Compose retry. An uncertain earlier
+prompt must not be automatically resent.
+
+For an admitted recovery, select Same or Fresh explicitly in F5 or the web
+banner. The F5 dialog starts with neither action selected. CLI equivalents are:
+
+```sh
+aoe session restart <session> --same
+aoe session restart <session> --fresh
+```
+
+These options require a current daemon observation, cannot be combined with
+each other or `--all`, and do not override launch settings. Same refuses an
+unqualified or changed target instead of choosing Fresh. A refusal preserves the
+conversation association; it is not permission to resend the blocked input.
+
+For an undeclared wrapper, restore truthful trusted global/profile
+`session.agent_execution_as` and `session.agent_config_dir` settings matching the
+original agent and store, then use the qualified assertion described in
+[Pinning or resetting a conversation](#pinning-or-resetting-a-conversation).
+Keep the recorded ID while repairing it. Explicit Fresh omits AoE restore flags,
+but an opaque wrapper may independently restore its own history: this does not
+promise a new native conversation.
+
+
 ## Forking a session
 
 A fork starts a new, independent session from an existing session's conversation, so you can take the same history in a different direction. Only the fork is new: the original session and its transcript are untouched.
@@ -165,7 +224,7 @@ Pi terminal forks require the same working directory and an attested host `pi` o
 
 ## Swapping the engine on a restart
 
-The restart dialog can change the tool a session runs. Session IDs live in per-agent namespaces, so swapping to a different agent parks the outgoing agent's conversation under its own tool name and starts a new one; swapping back restores what was parked.
+The ordinary restart dialog can change the tool a session runs. The explicit recovery dialog does not change launch settings. Session IDs live in per-agent namespaces, so swapping to a different agent parks the outgoing agent's conversation under its own tool name and starts a new one; swapping back restores what was parked.
 
 Two tool names can also point at the same agent on different accounts, through `[session.agent_config_dir]`. That swap changes the agent's config root, so the conversation is still on disk but under the account you swapped away from. AoE carries it across: it copies the transcript into the incoming account's config root so the agent resumes where it left off, and the row keeps its conversation id, model, and effort setting, since none of those changed agent.
 

@@ -2281,7 +2281,7 @@ pub async fn restart_session(
     if let Some(response) = crate::server::api::cityhall_block(&state) {
         return response;
     }
-    let body = match body {
+    let mut body = match body {
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
         Err(error) => return error.into_response(),
     };
@@ -2292,6 +2292,50 @@ pub async fn restart_session(
         "extra_args",
     )]) {
         return api_error(StatusCode::BAD_REQUEST, "validation_failed", message);
+    }
+    if let Some(recovery) = body.recovery.clone() {
+        if body.profile.is_some()
+            || body.tool.is_some()
+            || body.command_override.is_some()
+            || body.extra_args.is_some()
+            || body.discard_sandbox_container
+            || body
+                .wake_message
+                .as_ref()
+                .is_some_and(|message| !message.is_empty())
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Recovery cannot also change the selected execution or send a wake message",
+            );
+        }
+        body.wake_message = Some(String::new());
+        let structured = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .is_some_and(Instance::is_structured);
+        if structured {
+            if body.size.is_some()
+                || body.unsnooze
+                || body.skip_on_launch
+                || body.bound_hooks
+                || body.only_if_idle
+            {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_failed",
+                    "Structured recovery does not accept additional launch settings",
+                );
+            }
+            if let Some(response) = crate::server::api::read_only_block(&state) {
+                return response;
+            }
+            return crate::server::api::acp::restart_session_recovery(state, id, recovery).await;
+        }
     }
     prepare_agent_session(
         state,
@@ -2357,17 +2401,26 @@ pub async fn restart_for_update(
         };
         inst.clone()
     };
-    let structured_ready = state
-        .acp_supervisor
-        .worker_states_snapshot()
-        .await
-        .get(&id)
-        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
-        && state
-            .acp_event_store
-            .pending_approval_requests(&id)
-            .is_empty();
-    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
+    let structured_ready = if instance.is_structured() {
+        state
+            .session_service
+            .fold_control_state(&id)
+            .await
+            .is_ok_and(|folded| {
+                folded.connection_ready
+                    && folded.pending_approvals.is_empty()
+                    && folded.pending_elicitations.is_empty()
+                    && folded.original_decision_nonces.is_empty()
+            })
+    } else {
+        false
+    };
+    let resume = if structured_ready {
+        ContextResumeAvailability::Available
+    } else {
+        context_resume_for(&instance)
+    };
+    let resume_available = update_restart_resumable(&instance, &resume);
     if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
     {
         return api_error(
@@ -2423,6 +2476,43 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+fn admit_terminal_recovery(
+    row: &Instance,
+    observed: &Instance,
+    storage: &Storage,
+    body: &crate::daemon::RestartSessionBody,
+) -> anyhow::Result<()> {
+    let Some(request) = &body.recovery else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !row.is_structured()
+            && request.expected == crate::session::projection::recovery_selection(row, storage)?,
+        crate::session::LifecycleReservationError::Superseded
+    );
+    let mut current = row.clone();
+    current.agent_pane = observed.agent_pane.clone();
+    current.last_error.clone_from(&observed.last_error);
+    current.last_error_evidence = observed.last_error_evidence;
+    if matches!(observed.status, Status::Running | Status::Waiting) {
+        current.status = observed.status;
+    }
+    let recovery = crate::session::projection::current_recovery(
+        &current,
+        storage,
+        None,
+        Default::default(),
+        true,
+    )?
+    .ok_or(LifecycleTargetError::Busy)?;
+    let admitted = match request.action {
+        crate::session::SessionRecoveryAction::Same => recovery.actions.restart_same,
+        crate::session::SessionRecoveryAction::Fresh => recovery.actions.fresh,
+    };
+    anyhow::ensure!(admitted, LifecycleTargetError::Busy);
+    Ok(())
+}
+
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
@@ -2437,6 +2527,12 @@ fn admit_restart(
         || row.has_fresh_lifecycle_reservation(now)
     {
         return Err(LifecycleTargetError::Busy.into());
+    }
+    if let Some(recovery) = &body.recovery {
+        match recovery.action {
+            crate::session::SessionRecoveryAction::Same => row.qualify_recovery_same()?,
+            crate::session::SessionRecoveryAction::Fresh => row.select_recovery_fresh(),
+        }
     }
     if !row.is_structured() {
         row.check_resume_attempt(resume_policy)?;
@@ -2965,6 +3061,15 @@ async fn prepare_agent_session_inner(
         };
         instance.clone()
     };
+    if instance.is_structured() && restart.as_ref().is_some_and(|body| body.recovery.is_some()) {
+        // Structured recovery enters its captured worker control path at the public route.
+        // A view change while this terminal request waited must not become an unfenced restart.
+        return api_error(
+            StatusCode::CONFLICT,
+            "recovery_superseded",
+            "The recovery selection changed; read the current session before acting",
+        );
+    }
     if preparation == AgentPreparation::Ensure && instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -3221,6 +3326,7 @@ async fn prepare_agent_session_inner(
             if let Some(target) = target {
                 probe.source_profile = target.into();
             }
+            admit_terminal_recovery(&probe, &instance, native.storage(), body)?;
             admit_restart(&mut probe, body, account_swap, resume_policy)?;
             if let Some(target_native) = &target_native {
                 let rows = target_native.storage().load()?;
@@ -3231,7 +3337,7 @@ async fn prepare_agent_session_inner(
                 }
             }
             // Capture using the outgoing tool/profile, before the atomic edit parks its SID.
-            if !outgoing.is_structured() {
+            if !outgoing.is_structured() && body.recovery.is_none() {
                 outgoing.capture_before_restart_in(&native)?;
             }
         }
@@ -3286,6 +3392,7 @@ async fn prepare_agent_session_inner(
                 }
                 if let Some(body) = &worker_restart {
                     row.source_profile.clone_from(&profile);
+                    admit_terminal_recovery(row, &instance, native.storage(), body)?;
                     admit_restart(row, body, account_swap, resume_policy)?;
                     row.rebase_acp_generation(native.storage())?;
                     return Ok(Some(row.clone()));
@@ -3394,6 +3501,17 @@ async fn prepare_agent_session_inner(
         };
         started.source_profile = native.storage().profile().to_owned();
         started.file_watch = Some(worker_state.file_watch.clone());
+        if worker_restart
+            .as_ref()
+            .and_then(|body| body.recovery.as_ref())
+            .is_some_and(|request| request.action == crate::session::SessionRecoveryAction::Fresh)
+        {
+            for prompt in &outgoing.queued_prompts {
+                worker_state
+                    .acp_event_store
+                    .delete_pending_attachments_for_ref(&outgoing.id, &prompt.id);
+            }
+        }
         crate::server::reload::merge_runtime_fields(outgoing, &mut started);
         let store: &dyn crate::session::SessionStore = &native;
         if worker_restart.as_ref().is_some_and(|body| {
@@ -4883,5 +5001,48 @@ mod restart_wake_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_recovery_admission_tests {
+    use super::*;
+    use crate::session::{PanePresence, SessionRecoveryAction, SessionRecoveryRequest};
+
+    #[test]
+    #[serial_test::serial]
+    fn changed_selection_refuses_before_fresh_can_edit_input_or_intent() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("recovery-fence").unwrap();
+        let mut row = Instance::new("recovery fence", "/tmp/project");
+        row.source_profile = "recovery-fence".into();
+        row.status = Status::Stopped;
+        row.agent_pane.state = PanePresence::Dead;
+        row.agent_session_id = Some("old-conversation".into());
+        let body = crate::daemon::RestartSessionBody {
+            recovery: Some(SessionRecoveryRequest {
+                action: SessionRecoveryAction::Fresh,
+                expected: crate::session::projection::recovery_selection(&row, &storage).unwrap(),
+            }),
+            ..Default::default()
+        };
+        admit_terminal_recovery(&row, &row, &storage, &body).unwrap();
+        let mut changed = row.clone();
+        changed.resume_intent = crate::session::ResumeIntent::Use("old-conversation".into());
+        changed.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: "retained blocked input".into(),
+            attachments: Vec::new(),
+            synthesized: false,
+        });
+        let before = serde_json::to_value(&changed).unwrap();
+        let error = admit_terminal_recovery(&changed, &row, &storage, &body).unwrap_err();
+        assert!(error.is::<crate::session::LifecycleReservationError>());
+        assert_eq!(serde_json::to_value(&changed).unwrap(), before);
+        assert_eq!(
+            changed.pending_initial_turn.as_ref().unwrap().text,
+            "retained blocked input"
+        );
+        assert_eq!(changed.agent_session_id, row.agent_session_id);
+        assert_eq!(changed.lifecycle_generation, row.lifecycle_generation);
     }
 }

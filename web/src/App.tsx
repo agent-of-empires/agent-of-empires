@@ -402,6 +402,7 @@ function AppContent({
     applySession,
     applySessionMutation,
     observedById,
+    recoveryCurrentIds,
     runtimeEpoch,
     refresh: refreshSessions,
     applyPushedStatus,
@@ -2000,6 +2001,7 @@ function AppContent({
                             active={active}
                             selected={selected}
                             sessionId={session.id}
+                            readOnly={serverAbout?.read_only}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
                             settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
@@ -2032,6 +2034,7 @@ function AppContent({
                   ) : (
                     <TerminalSessionStack
                       readOnly={!!serverAbout?.read_only}
+                      recoveryCurrentIds={recoveryCurrentIds}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
@@ -2236,6 +2239,7 @@ function AppContent({
         <MobileMainPane
           onStartSession={(id) => void handleStartSession(id)}
           readOnly={!!serverAbout?.read_only}
+          recoveryCurrentIds={recoveryCurrentIds}
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}

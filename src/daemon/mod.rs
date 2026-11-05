@@ -244,7 +244,24 @@ impl DaemonClient {
         &self,
         state: Option<crate::session::SessionScope>,
     ) -> Result<SessionsEnvelope, DaemonClientError> {
-        let query = ListSessionsQuery { state };
+        let query = ListSessionsQuery {
+            state,
+            profile: None,
+        };
+        self.request_json(self.http.get(self.sessions_url.clone()).query(&query))
+            .await
+    }
+
+    /// Resolve profile aliases on the daemon's physical namespace, never the client's filesystem.
+    pub async fn list_sessions_for_profile(
+        &self,
+        profile: &str,
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<SessionsEnvelope, DaemonClientError> {
+        let query = ListSessionsQuery {
+            state,
+            profile: Some(profile.to_owned()),
+        };
         self.request_json(self.http.get(self.sessions_url.clone()).query(&query))
             .await
     }

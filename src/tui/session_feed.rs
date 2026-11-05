@@ -1965,7 +1965,11 @@ impl SessionFeed {
     }
 
     pub(crate) fn current_snapshot_applied(&self) -> bool {
-        self.mutations_available()
+        self.mutations_available() && self.current_observation_applied()
+    }
+
+    pub(crate) fn current_observation_applied(&self) -> bool {
+        self.receiver.has_changed().is_ok()
             && matches!((self.applied.as_ref(), self.receiver.borrow().as_ref()),
                 (Some(applied), Some(SessionFeedResult::Snapshot(latest)))
                     if applied.cursor == latest.cursor)
