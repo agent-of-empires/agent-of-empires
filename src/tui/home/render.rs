@@ -206,26 +206,28 @@ pub(super) struct SplitRects {
     pub(super) terminal: Rect,
 }
 
-/// Equal halves, so a pane sized for either half fits the other and focus swaps never
-/// resize the fleet. An odd leftover row stays blank at the bottom.
-pub(super) fn split_preview_rects(inner: Rect) -> Option<SplitRects> {
-    let half = inner.height.saturating_sub(1) / 2;
-    if half < SPLIT_MIN_HALF_ROWS {
+/// Divide the preview, keeping both panes usable at extreme percentages.
+pub(super) fn split_preview_rects(inner: Rect, terminal_percent: u16) -> Option<SplitRects> {
+    let rows = inner.height.checked_sub(1)?;
+    if rows < SPLIT_MIN_HALF_ROWS * 2 {
         return None;
     }
+    let terminal = ((u32::from(rows) * u32::from(terminal_percent.min(100))) / 100) as u16;
+    let terminal = terminal.clamp(SPLIT_MIN_HALF_ROWS, rows - SPLIT_MIN_HALF_ROWS);
+    let agent = rows - terminal;
     Some(SplitRects {
         agent: Rect {
-            height: half,
+            height: agent,
             ..inner
         },
         divider: Rect {
-            y: inner.y + half,
+            y: inner.y + agent,
             height: 1,
             ..inner
         },
         terminal: Rect {
-            y: inner.y + half + 1,
-            height: half,
+            y: inner.y + agent + 1,
+            height: terminal,
             ..inner
         },
     })
@@ -3123,10 +3125,12 @@ impl HomeView {
             .border_style(Style::default().fg(border_color))
             .padding(Padding::horizontal(1));
 
-        let split = self
-            .split_terminal_applies()
-            .then(|| split_preview_rects(block.inner(area)))
-            .flatten();
+        let window = frame.area();
+        let split = (window.width >= self.split_terminal_min_width
+            && window.height >= self.split_terminal_min_height
+            && self.split_terminal_applies())
+        .then(|| split_preview_rects(block.inner(area), self.split_terminal_height_percent))
+        .flatten();
         // Split mode hands the whole single-preview path the focused half, so geometry,
         // scroll, selection and mouse hits all describe it; the other half is paint-only.
         let inner = match (&split, &self.view_mode) {
@@ -3341,7 +3345,8 @@ impl HomeView {
         } else {
             None
         };
-        self.reconcile_passive_fleet(inner, compact, show_info, fleet_exclude.as_deref());
+        let fleet_inner = split.as_ref().map_or(inner, |rects| rects.agent);
+        self.reconcile_passive_fleet(fleet_inner, compact, show_info, fleet_exclude.as_deref());
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
@@ -3553,14 +3558,32 @@ impl HomeView {
                             self.terminal_preview_cache.ensure_parsed();
                         }
                     }
-                    let total_lines = match terminal_mode {
+                    let cache = match terminal_mode {
                         TerminalMode::Container => &self.container_terminal_preview_cache,
                         TerminalMode::Host => &self.terminal_preview_cache,
-                    }
-                    .parsed_text
-                    .as_ref()
-                    .map_or(0, |t| t.lines.len());
-                    self.set_preview_text_view(pane_area, total_lines);
+                    };
+                    let total_lines = cache.parsed_text.as_ref().map_or(0, |t| t.lines.len());
+                    let scroll_offset = if self.preview_scroll_offset == 0
+                        && self.preview_selection.is_none()
+                        && self.live_send.is_none()
+                    {
+                        passive_capture_scroll_offset(
+                            total_lines,
+                            pane_area.height as usize,
+                            cache.cursor,
+                        )
+                    } else {
+                        self.preview_scroll_offset
+                    };
+                    self.preview_text_view = crate::tui::home::PreviewTextView {
+                        pane: pane_area,
+                        first_line: preview::compute_scroll(
+                            total_lines,
+                            pane_area.height as usize,
+                            scroll_offset,
+                        ) as usize,
+                        total_lines,
+                    };
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
@@ -3578,7 +3601,7 @@ impl HomeView {
                                 cache.parsed_text.as_ref(),
                                 cache.is_pending_for(&id),
                             ),
-                            self.preview_scroll_offset,
+                            scroll_offset,
                             theme,
                             compact,
                             show_info,
@@ -5288,18 +5311,21 @@ mod tests {
     #[test]
     fn split_preview_rects_cases() {
         let at = |height| Rect::new(0, 3, 50, height);
-        assert_eq!(split_preview_rects(at(12)), None, "two halves need 13 rows");
-        let split = split_preview_rects(at(13)).expect("13 rows split");
-        assert_eq!(
-            (split.agent, split.divider, split.terminal),
-            (
-                Rect::new(0, 3, 50, 6),
-                Rect::new(0, 9, 50, 1),
-                Rect::new(0, 10, 50, 6)
-            )
-        );
-        let even = split_preview_rects(at(14)).expect("14 rows split");
-        assert_eq!(even.agent.height, even.terminal.height, "halves stay equal");
+        assert_eq!(split_preview_rects(at(12), 50), None);
+        for (height, percent, agent, terminal) in [
+            (13, 50, 6, 6),
+            (14, 50, 7, 6),
+            (41, 30, 28, 12),
+            (21, 1, 14, 6),
+            (21, 99, 6, 14),
+        ] {
+            let split = split_preview_rects(at(height), percent).unwrap();
+            assert_eq!(split.agent.height, agent);
+            assert_eq!(split.terminal.height, terminal);
+            assert_eq!(split.divider.y, split.agent.bottom());
+            assert_eq!(split.terminal.y, split.divider.bottom());
+            assert_eq!(split.terminal.bottom(), at(height).bottom());
+        }
     }
 
     #[test]

@@ -38,6 +38,12 @@ Almost every key goes to the agent, so AoE reserves one **leader** chord, tmux-s
 
 While the leader is armed the status bar becomes a which-key menu. Only the leader itself is taken from the agent, and pressing it twice still delivers it downstream, so every other chord, `Ctrl+K` included, passes through untouched. The command palette layers over live mode: `Esc` drops back into the relay, while choosing a command leaves live mode first, so the preview never shows one session while your keystrokes go to another. The sidebar stays as you left it when you exit live mode; click the collapsed strip to bring it back.
 
+The paired terminal split also toggles with `|` outside live mode. In `[session]`,
+`split_terminal_height_percent` sets its share of the preview (1 to 99, default 50).
+`split_terminal_min_width` and `split_terminal_min_height` set the minimum whole
+window size (0 to 1000, defaults 100 columns and 30 rows). Below either threshold
+the split is hidden without changing the toggle; Terminal view remains available.
+
 `Shift+PageUp` and `Shift+PageDown` scroll the preview through the agent's history without leaving live mode; bare `PageUp` and `PageDown` still pass through for agents that page their own UI.
 
 `Shift+Enter` inserts a newline into the agent's input box on kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole 24+, Alacritty 0.13+, recent xterm). Elsewhere it submits like bare `Enter`, so use `Alt+Enter` (`Option+Enter` on macOS), which sends `ESC+CR` natively on many terminals, or configure your terminal to send `ESC+CR` for `Shift+Enter`.

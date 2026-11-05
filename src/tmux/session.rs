@@ -5394,7 +5394,7 @@ mod tests {
     /// Holds `ENV_LOCK` across the `PATH` read it hands to a child.
     #[test]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let _env = crate::session::test_support::EnvGuard::set(&[("SHELL", "/bin/sh")]);
         let temp = tempfile::tempdir().unwrap();
         let host_output = temp.path().join("host-env");
         let payload_output = temp.path().join("container-env");

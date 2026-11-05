@@ -740,7 +740,12 @@ mod tests {
         ] {
             let (_g, base, _tmp) = BaseGuard::fresh();
             std::fs::create_dir(&base).unwrap();
+            std::os::unix::fs::chown(&base, None, Some(nix::unistd::getegid().as_raw())).unwrap();
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
             let err = with_hook_base(|_| Ok(())).unwrap_err();
             let rendered = format!("{err:#}");
             assert!(rendered.contains(expected), "{mode:o}: {rendered}");

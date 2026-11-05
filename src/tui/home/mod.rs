@@ -491,6 +491,9 @@ pub struct HomeView {
 
     /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
     pub(super) split_terminal: bool,
+    pub(super) split_terminal_height_percent: u16,
+    pub(super) split_terminal_min_width: u16,
+    pub(super) split_terminal_min_height: u16,
     /// Captures whichever split half is not focused; the focused half uses
     /// `preview_capture_worker` like a single preview.
     pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,

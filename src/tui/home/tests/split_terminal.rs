@@ -126,6 +126,37 @@ fn split_preview_layout_and_focus() {
     }
 }
 
+#[test]
+#[serial]
+fn split_thresholds_preserve_focus_and_preference() {
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    let (mut env, agent, _) = split_env(false, false);
+    cache.force_present(&[agent.as_str()]);
+    env.view.split_terminal_height_percent = 30;
+    for (width, height, split) in [
+        (100, 30, true),
+        (99, 30, false),
+        (100, 29, false),
+        (120, 40, true),
+    ] {
+        let screen = render_home_to_string(&mut env.view, width, height);
+        assert_eq!(screen.contains(" Terminal ─"), split, "{width}x{height}");
+        assert!(env.view.split_terminal);
+    }
+    let agent_area = env.view.preview_area;
+    let fleet_geometry = env.view.passive_fleet_armed.clone();
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 120, 40);
+    let terminal_area = env.view.preview_area;
+    assert!(agent_area.height > terminal_area.height);
+    assert_eq!(agent_area.bottom() + 1, terminal_area.y);
+    assert_eq!(env.view.passive_fleet_armed, fleet_geometry);
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 99, 30);
+    assert!(matches!(env.view.view_mode, ViewMode::Terminal));
+    assert!(env.view.split_terminal);
+}
+
 /// Swapping focus hands each pane to the other worker without blanking the cache the
 /// newly focused worker inherits.
 #[test]
@@ -298,6 +329,7 @@ fn split_hides_info_headers_so_output_owns_each_half() {
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
     env.view.select_session_by_id(&inst.id);
     env.view.split_terminal = true;
+    env.view.split_terminal_min_height = 0;
     env.view.show_preview_info = true;
     cache.force_present(&[agent.as_str(), term.as_str()]);
 

@@ -1079,6 +1079,45 @@ pub struct SessionConfig {
     )]
     pub sidebar_position: SidebarPosition,
 
+    /// Percentage of split preview rows allocated to the paired terminal.
+    #[serde(default = "default_split_terminal_height_percent")]
+    #[setting(
+        label = "Split Terminal Height (%)",
+        widget = "number",
+        min = 1,
+        max = 99,
+        validate = "range:1:99",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_height_percent: u16,
+
+    /// Minimum whole-window width for the paired terminal split.
+    #[serde(default = "default_split_terminal_min_width")]
+    #[setting(
+        label = "Split Terminal Minimum Width",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_min_width: u16,
+
+    /// Minimum whole-window height for the paired terminal split.
+    #[serde(default = "default_split_terminal_min_height")]
+    #[setting(
+        label = "Split Terminal Minimum Height",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_min_height: u16,
+
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
     /// agent without naming each one in the Host Environment list. AoE's own
@@ -2005,6 +2044,9 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
+            split_terminal_height_percent: default_split_terminal_height_percent(),
+            split_terminal_min_width: default_split_terminal_min_width(),
+            split_terminal_min_height: default_split_terminal_min_height(),
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -2054,6 +2096,18 @@ impl Default for SessionConfig {
             tie_workdir_to_name: true,
         }
     }
+}
+
+fn default_split_terminal_height_percent() -> u16 {
+    50
+}
+
+fn default_split_terminal_min_width() -> u16 {
+    100
+}
+
+fn default_split_terminal_min_height() -> u16 {
+    30
 }
 
 fn default_snooze_duration_minutes() -> u32 {

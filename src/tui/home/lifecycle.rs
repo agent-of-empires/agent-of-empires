@@ -331,6 +331,9 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.home_split_terminal)
                 .unwrap_or(false),
+            split_terminal_height_percent: resolved.session.split_terminal_height_percent,
+            split_terminal_min_width: resolved.session.split_terminal_min_width,
+            split_terminal_min_height: resolved.session.split_terminal_min_height,
             split_capture_worker: None,
             split_capture_target: None,
             archived_section_collapsed: user_config
