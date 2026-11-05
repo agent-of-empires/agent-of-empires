@@ -956,6 +956,42 @@ fn the_structured_row_appears_only_for_an_acp_capable_tool() {
 }
 
 #[test]
+fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
+    // (terminal locked, structured locked), with a Yolo the user turned on beforehand.
+    for (name, expected) in [
+        ("my-pi", (true, true)),
+        ("own-pi", (true, false)),
+        ("my-claude", (false, false)),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_tools(vec![name], TEST_PATH.to_string());
+        let base = name.trim_start_matches("my-").trim_start_matches("own-");
+        dialog
+            .agent_detect_as
+            .insert(name.to_string(), base.to_string());
+        dialog
+            .agent_acp_cmd
+            .insert("own-pi".to_string(), "own-pi-acp".to_string());
+        dialog.set_structured_capable(true);
+        dialog.yolo_mode = true;
+        let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
+        assert_eq!(locked(&dialog), expected.0, "{name} terminal");
+
+        dialog.focused_field = dialog.field_indices().structured;
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(dialog.structured_enabled, "{name}");
+        assert_eq!(locked(&dialog), expected.1, "{name} structured");
+        // Leaving the lock resets Yolo to the default; an unchanged lock keeps the choice.
+        let yolo = expected.1 || expected.0 == expected.1;
+        assert_eq!(dialog.yolo_mode, yolo, "{name}");
+        assert_eq!(
+            submitted(dialog.build_submit_result()).yolo_mode,
+            yolo,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 #[serial_test::serial]
 fn clicks_focus_and_act_on_a_row_while_hover_only_tints_it() {
     assert!(single_tool_dialog().handle_click(5, 5).is_none());
