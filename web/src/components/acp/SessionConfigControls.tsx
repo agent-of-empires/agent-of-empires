@@ -165,8 +165,10 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
 
   const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!searchable) return;
-    // A composing Escape dismisses the IME candidate; keep it from reaching the document listener below.
-    if (e.nativeEvent.isComposing) {
+    // Composition keys belong to the IME, not the menu. Safari ends the composition before the Enter that
+    // commits it, leaving isComposing false, so keyCode 229 is the only marker left on that event. Escape
+    // additionally has to be kept from the document listener below, which would close the picker.
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
       if (e.key === "Escape") e.stopPropagation();
       return;
     }

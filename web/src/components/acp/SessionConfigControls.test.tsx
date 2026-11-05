@@ -177,6 +177,21 @@ describe("SessionConfigControls", () => {
     expect(document.activeElement).toBe(chip);
   });
 
+  // Safari ends the composition first, so the committing key arrives as keyCode 229 with isComposing false.
+  it("ignores a composition-committing key that only reports keyCode 229", () => {
+    const { onSetConfigOption } = mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: "sonnet" } });
+    fireEvent.keyDown(search, { key: "Enter", keyCode: 229 });
+    expect(onSetConfigOption).not.toHaveBeenCalled();
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    // The real Enter that follows still selects.
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
+  });
+
   it("distinguishes an advertised model list with no options from a search with no matches", () => {
     mount([{ ...MODEL, options: [] }]);
     fireEvent.click(byId("model")!);
