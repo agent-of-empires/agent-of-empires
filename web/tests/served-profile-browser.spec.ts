@@ -158,3 +158,118 @@ test("a failed about hides write actions behind a Retry notice, then the wizard 
   expect(reads).toContain("Alpha");
   expect(reads).not.toContain("Main");
 });
+
+for (const origin of ["session", "profiles"] as const) {
+  test(`implicit wizard refreshes served authority after same-tab ${origin} profile rename`, async ({ page }) => {
+    const created = await mockWizardApis(page, {
+      servedProfile: "Alpha",
+      profiles: [{ name: "Alpha", is_default: true }],
+      sessions: [],
+      settings: settings.Alpha,
+      projects: [{ name: "example", path: "/tmp/example", scope: "profile" }],
+    });
+    let served = "Alpha";
+    let holdAbout = true;
+    const held: Route[] = [];
+    const wizardReads: string[] = [];
+    let recordWizardReads = false;
+    await page.route("**/api/about", (route) => {
+      if (served !== "Alpha" && holdAbout) {
+        held.push(route);
+        return;
+      }
+      return route.fulfill({ json: { profile: served } });
+    });
+    await page.route("**/api/profiles", (route) => route.fulfill({ json: [{ name: served, is_default: true }] }));
+    await page.route("**/api/profiles/*/settings", (route) => route.fulfill({ json: {} }));
+    await page.route("**/api/profiles/Alpha/rename", (route) => {
+      expect(route.request().postDataJSON()).toEqual({ new_name: "Renamed" });
+      served = "Renamed";
+      return route.fulfill({ json: { ok: true } });
+    });
+    for (const resource of ["projects", "settings"]) {
+      await page.route(`**/api/${resource}**`, (route) => {
+        const profile = new URL(route.request().url()).searchParams.get("profile");
+        if (recordWizardReads && profile) wizardReads.push(profile);
+        if (served === "Renamed" && profile === "Alpha") return route.fulfill({ status: 404 });
+        return route.fulfill({
+          json:
+            resource === "projects" ? [{ name: "example", path: "/tmp/example", scope: "profile" }] : settings.Alpha,
+        });
+      });
+    }
+    await page.route("**/api/recent-projects", (route) =>
+      route.fulfill({
+        json: {
+          projects: [
+            { path: "/tmp/example", display_name: "example", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" },
+          ],
+        },
+      }),
+    );
+    // Settings derives its profile-scoped tabs from the real schema shape.
+    // The wizard's broad settings fixture is not a schema response.
+    await page.route(
+      (url) => url.pathname === "/api/settings/schema",
+      (route) =>
+        route.fulfill({
+          json: [
+            {
+              section: "session",
+              field: "yolo_mode_default",
+              category: "Session",
+              label: "YOLO Mode Default",
+              description: "",
+              widget: { kind: "toggle" },
+              web_write: { policy: "allow" },
+              profile_overridable: true,
+              validation: { rule: "none" },
+              advanced: false,
+            },
+          ],
+        }),
+    );
+    await page.goto(`/settings/${origin}`);
+    if (origin === "session") {
+      await expect(page.getByTestId("settings-profile-picker").locator("select")).toHaveValue("Alpha");
+    } else {
+      await expect(page.getByRole("heading", { name: "Profiles", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Alpha", exact: true })).toBeVisible();
+    }
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await page.getByPlaceholder("New name", { exact: true }).fill("Renamed");
+    await page.getByPlaceholder("New name", { exact: true }).press("Enter");
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await page.getByRole("button", { name: "Go to dashboard" }).click();
+    recordWizardReads = true;
+    await openWizard(page);
+    const w = wizard(page);
+    await w.getByRole("button", { name: "Scratch", exact: true }).click();
+    await w.getByRole("button", { name: "Use a scratch folder" }).click();
+    await setTitle(page, "rename-dirty-title");
+    await w.getByRole("switch", { name: "Yolo mode" }).click();
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeDisabled();
+    expect(wizardReads).not.toContain("Alpha");
+    holdAbout = false;
+    for (const route of held.splice(0)) await failRead(page, route);
+    await w.getByRole("button", { name: "Retry server profile" }).click();
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
+    await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("rename-dirty-title");
+    await expect(w.getByRole("switch", { name: "Yolo mode" })).toHaveAttribute("aria-checked", "true");
+    await openPanel(page, "Project");
+    await w.getByRole("button", { name: "Recent", exact: true }).click();
+    await selectProject(page, "/tmp/example");
+    await expect(w.getByTestId("wizard-project-row")).toContainText("/tmp/example");
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
+    await w.getByRole("button", { name: /Launch session/ }).click();
+    await expect.poll(() => created.length).toBe(1);
+    expect(created[0]).toMatchObject({
+      path: "/tmp/example",
+      title: "rename-dirty-title",
+      yolo_mode: true,
+    });
+    expect(created[0]!.profile).toBeUndefined();
+    expect(wizardReads).toContain("Renamed");
+    expect(wizardReads).not.toContain("Alpha");
+  });
+}

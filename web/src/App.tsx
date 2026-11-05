@@ -106,7 +106,8 @@ import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { onServerDownChange } from "./lib/connectionState";
-import { ABOUT_RETRY_DELAYS_MS, fetchAboutRetrying } from "./lib/serverAbout";
+import { createAboutRequests } from "./lib/aboutRequests";
+import { ABOUT_RETRY_DELAYS_MS, fetchAboutOnce, fetchAboutRetrying } from "./lib/serverAbout";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
@@ -1171,36 +1172,29 @@ function AppContent({
   // the tour gates auto-launch on an explicit loaded flag instead.
   const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
   const [servedProfileReady, setServedProfileReady] = useState(false);
-  const serverAboutGeneration = useRef(0);
-
-  const refreshServerAbout = useCallback(async () => {
-    const generation = ++serverAboutGeneration.current;
-    setServedProfileReady(false);
-    try {
-      const about = await fetchAbout();
-      if (generation === serverAboutGeneration.current && about) {
+  const [aboutRequests] = useState(() =>
+    createAboutRequests(() => fetchAboutOnce(fetchAbout), {
+      start: () => setServedProfileReady(false),
+      answer: (about) => {
         setServerAbout(about);
         setServedProfileReady(true);
         settleSettingsIntrosReadOnly(about.read_only);
-      }
-    } finally {
-      if (generation === serverAboutGeneration.current) setServerAboutLoaded(true);
-    }
-  }, []);
+      },
+      settled: () => setServerAboutLoaded(true),
+    }),
+  );
+  const refreshServerAbout = aboutRequests.refresh;
+  const recoverServerAbout = aboutRequests.recover;
 
   // Kick off the initial server-about fetch on mount. The effect body only
   // calls fetchAbout and schedules the telemetry consent check; neither runs
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
-    const generation = ++serverAboutGeneration.current;
-    void fetchAboutRetrying(
-      fetchAbout,
-      ABOUT_RETRY_DELAYS_MS,
-      () => !active || generation !== serverAboutGeneration.current,
-    )
+    const generation = aboutRequests.begin();
+    void fetchAboutRetrying(fetchAbout, ABOUT_RETRY_DELAYS_MS, () => !active || !aboutRequests.isCurrent(generation))
       .then((about) => {
-        if (!active || generation !== serverAboutGeneration.current) return;
+        if (!active || !aboutRequests.isCurrent(generation)) return;
         if (about) {
           setServerAbout(about);
           setServedProfileReady(true);
@@ -1214,7 +1208,7 @@ function AppContent({
       // run out too, not only on success. Otherwise the shell would hang on its
       // placeholder; it then renders read-only with a Retry notice.
       .finally(() => {
-        if (active && generation === serverAboutGeneration.current) setServerAboutLoaded(true);
+        if (active && aboutRequests.isCurrent(generation)) setServerAboutLoaded(true);
       });
     void fetchTelemetryStatus()
       .then((status) => {
@@ -1229,15 +1223,15 @@ function AppContent({
     return () => {
       active = false;
     };
-  }, []);
+  }, [aboutRequests]);
 
   // A failed /api/about leaves write actions hidden, so ask again once the server answers.
   useEffect(() => {
     if (!serverAboutLoaded || serverAbout) return;
     return onServerDownChange((down) => {
-      if (!down) void refreshServerAbout();
+      if (!down) void recoverServerAbout();
     });
-  }, [serverAboutLoaded, serverAbout, refreshServerAbout]);
+  }, [serverAboutLoaded, serverAbout, recoverServerAbout]);
 
   // Telemetry: report that the acp web UI was opened, folded into the
   // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
@@ -2594,7 +2588,7 @@ function AppContent({
             />
           </CollapsibleRegion>
 
-          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void refreshServerAbout()} />
+          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
