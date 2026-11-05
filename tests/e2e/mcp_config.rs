@@ -404,6 +404,42 @@ fn configured_read_acquisition_preserves_profiles_and_one_owner() {
 
 #[test]
 #[parallel]
+fn configured_autostart_reports_tcp_bind_failure_without_private_fallback() {
+    crate::harness::require_tmux!();
+    if !crate::serve::isolated_local_network() {
+        return;
+    }
+    let port = if cfg!(debug_assertions) { 8081 } else { 8080 };
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let mut h = TuiTestHarness::new_in_tmp("configured_tcp_bind_failure");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    h.run_cli_err(&["serve", "--daemon"]);
+    h.run_cli_err(&["profile", "list"]);
+    h.run_cli_err(&["--no-autostart", "profile", "list"]);
+    h.spawn_tui();
+    h.wait_for("Not responding");
+    h.run_cli_err(&["--no-autostart", "profile", "list"]);
+
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
+    h.send_keys("r");
+    h.wait_for_runtime_ready();
+    h.run_cli_err(&["mcp", "config"]);
+    h.kill_tui();
+    h.run_cli_ok(&["serve", "--stop"]);
+    drop(occupied);
+
+    h.run_cli_ok(&["profile", "list"]);
+    assert_mcp_connects(&h);
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    assert_mcp_connects(&h);
+}
+
+#[test]
+#[parallel]
 fn configured_autostart_respects_selected_endpoint_and_opt_out() {
     crate::harness::require_tmux!();
     if !crate::serve::isolated_local_network() {

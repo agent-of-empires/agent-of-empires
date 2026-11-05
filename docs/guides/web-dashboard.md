@@ -47,7 +47,11 @@ aoe serve --core-only --daemon
 
 Fresh CLI and TUI acquisitions, including explicit reconnects, resolve global service opt-ins through the same launch preparation as explicit serving. With no inbound service enabled, or with the registered `aoe.web` plugin disabled, they stay private. Enabling the [MCP server](mcp-control.md) otherwise requests the existing loopback TCP API, not a public bind or tunnel. Builds with the `web` Cargo feature also serve the dashboard. Profile overrides cannot change this global policy. Explicit `--core-only` still suppresses TCP.
 
+Configured TCP startup failures are reported without automatically starting core-only. See [configured startup recovery](mcp-control.md#when-configured-tcp-cannot-start).
+
 `aoe plugin enable aoe.web` can acquire a private daemon while the plugin is disabled. Re-enabling the plugin does not promote that daemon; the next fresh acquisition may enable configured TCP serving. Explicit TCP starts remain rejected while the plugin is disabled.
+
+AoE-managed writes to the registered Web plugin's enable state use the daemon's namespace transaction. A save cannot commit during an active start, restart, or rollback; it reports a busy error rather than waiting inside the daemon. Retry rejected saves explicitly after the transition finishes. A save committed first is honored by launch validation. Disabling the plugin does not stop an existing TCP daemon. Hand edits do not participate in this coordination.
 
 An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 

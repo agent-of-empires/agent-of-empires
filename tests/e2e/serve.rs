@@ -91,25 +91,27 @@ pub(super) fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &
     let (port, token) = serve_url_parts(&url).expect("successor endpoint");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let response = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
             .build()
-            .unwrap()
-            .post(format!("http://127.0.0.1:{port}/api/login"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({
-                "passphrase": passphrase,
-                "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
-            }))
-            .send()
-            .await
-            .expect("successor login response");
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::OK,
-            "successor rejected the original passphrase"
-        );
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/api/login");
+        let body = serde_json::json!({
+            "passphrase": passphrase,
+            "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
+        });
+        for (bearer, expected) in [
+            (None, reqwest::StatusCode::UNAUTHORIZED),
+            (Some(token.as_str()), reqwest::StatusCode::OK),
+        ] {
+            let mut request = client.post(&url).json(&body);
+            if let Some(token) = bearer {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.expect("successor login response");
+            assert_eq!(response.status(), expected);
+        }
     });
 }
 
@@ -2901,6 +2903,55 @@ fn cli_serve_disabled_web_replay_preserves_owner_and_credentials() {
     h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
     h.run_cli_ok(&["serve", "--rollback"]);
     assert_original_passphrase_login(&h, passphrase);
+}
+
+#[cfg(feature = "web")]
+#[test]
+#[parallel]
+fn cli_serve_web_toggle_rejects_active_lifecycle_transaction() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("web_toggle_lifecycle");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&[]);
+    let app = app_dir_in(h.home_path());
+    let before = std::fs::read(app.join("config.toml")).unwrap();
+    let transaction = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(app.join("daemon/transaction.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&transaction).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .unix_socket(app.join("daemon/api.sock"))
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = client
+            .post("http://localhost/api/plugins/aoe.web/enabled")
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            agent_of_empires::daemon::ApiErrorCode::from_headers(
+                response.status(),
+                response.headers(),
+                false,
+            ),
+            Some(agent_of_empires::daemon::ApiErrorCode::LifecycleLocked),
+        );
+    });
+    assert_eq!(std::fs::read(app.join("config.toml")).unwrap(), before);
+    drop(transaction);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
 }
 
 #[test]

@@ -738,6 +738,12 @@ pub async fn set_plugin_enabled(
             }
             list_plugins(State(state)).await
         }
+        Ok(Err(e)) if e.is::<crate::daemon::lifecycle::TransactionBusy>() => {
+            super::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::LifecycleLocked,
+                format!("{e:#}"),
+            )
+        }
         Ok(Err(e)) => {
             tracing::warn!(target: "plugin.host", %plugin, enabled, error = %format!("{e:#}"), "plugin toggle failed");
             api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}"))

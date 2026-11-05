@@ -103,6 +103,7 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
             super::reload_registry();
             Ok(LiveToggle::Daemon)
         }
+        Err(e) if plugin_id == "aoe.web" => Err(e.into()),
         Err(e) => {
             set_enabled(plugin_id, enabled)?;
             Ok(LiveToggle::LocalDaemonStale {

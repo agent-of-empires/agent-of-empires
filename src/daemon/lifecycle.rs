@@ -8,6 +8,10 @@ use fs2::FileExt;
 
 pub(crate) struct Transaction(File);
 
+#[derive(Debug, thiserror::Error)]
+#[error("Daemon lifecycle is busy; retry after the current transition finishes")]
+pub(crate) struct TransactionBusy;
+
 pub(crate) struct Lifetime {
     _file: File,
 }
@@ -40,6 +44,17 @@ fn open_lock(name: &str) -> Result<File> {
 }
 
 impl Transaction {
+    pub(crate) fn try_acquire() -> Result<Self> {
+        let file = open_lock("transaction.lock")?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(TransactionBusy.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Acquire the transaction, giving up after `wait`.
     ///
     /// The only blocking acquisition: a daemon transition holds the lock for as

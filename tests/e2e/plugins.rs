@@ -132,6 +132,25 @@ fn open_manager(h: &TuiTestHarness) {
     h.wait_for(" Plugins ");
 }
 
+#[test]
+#[parallel]
+fn test_tui_web_toggle_does_not_replay_daemon_rejection() {
+    require_tmux!();
+    if !crate::serve::isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("web_toggle_no_replay");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&["--read-only"]);
+    h.spawn_tui();
+    open_manager(&h);
+    let config = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let before = std::fs::read(&config).unwrap();
+    h.send_keys("Space");
+    h.wait_for("read-only");
+    assert_eq!(std::fs::read(config).unwrap(), before);
+}
+
 /// The manager lists builtins by manifest name and version with their state.
 /// Enter opens the details popup (`aoe plugin info`'s TUI twin) and Esc closes
 /// it; Space toggles the plugin and reports where the write landed (no daemon

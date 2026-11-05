@@ -3732,23 +3732,14 @@ pub fn load_config() -> Result<Option<Config>> {
     Ok(Some(Config::load()?))
 }
 
-/// Atomically read-modify-write the global `config.toml`.
+/// Atomically read-modify-write global `config.toml`, excluding `app_state`.
 ///
-/// Loads a *fresh* [`Config`] from disk inside a process-wide mutex plus a
-/// cross-process `flock`, applies `f`, then writes `config.toml` back out.
-/// Any field `f` does not touch is preserved from the fresh on-disk copy, so
-/// a concurrent writer's unrelated edits survive: the fresh load itself is
-/// the merge, because `f` only mutates the fields it cares about and
-/// everything else already reflects the current on-disk state.
+/// Loads fresh config under a process mutex and cross-process flock so
+/// unrelated edits survive. Registered Web enable-state changes also require
+/// the namespace lifecycle transaction; a busy transition refuses the save.
 ///
-/// `app_state` is always stripped from the written table; it is persisted
-/// separately in `state.toml` (see [`update_app_state`]). Mutating
-/// `config.app_state` inside `f` has no durable effect here.
-///
-/// Whatever `f` leaves `config` in gets written to disk, even if `f` mutates
-/// `config` and then returns an error (e.g. via `?` partway through). There is
-/// no rollback: a caller that wants "no error, no mutation" must check its
-/// error condition and return before touching `config`, not after.
+/// Closure errors do not undo edits. Validate before mutating when an edit
+/// must be all-or-nothing.
 pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let _mu = config_save_lock()
         .lock()
@@ -3757,7 +3748,22 @@ pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let _flock = super::storage::acquire_storage_flock(&app_dir, CONFIG_LOCK_FILENAME)?;
 
     let mut config = Config::load()?;
+    let web_was_disabled = config
+        .plugins
+        .get("aoe.web")
+        .is_some_and(|plugin| !plugin.enabled);
     let result = f(&mut config);
+    let web_is_disabled = config
+        .plugins
+        .get("aoe.web")
+        .is_some_and(|plugin| !plugin.enabled);
+    let _transaction = if web_was_disabled != web_is_disabled
+        && crate::plugin::registry().get("aoe.web").is_some()
+    {
+        Some(crate::daemon::lifecycle::Transaction::try_acquire()?)
+    } else {
+        None
+    };
 
     let mut table = toml::Table::try_from(&config)?;
     table.remove("app_state");
@@ -4811,6 +4817,54 @@ mod tests {
             Some("1.0.0"),
             "state.toml external edit lost"
         );
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    #[serial_test::serial]
+    fn web_plugin_changes_do_not_cross_lifecycle_transactions() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::plugin::ReloadRegistryOnDrop;
+        crate::plugin::reload_registry();
+        for initial in [None, Some(false)] {
+            update_config(|config| match initial {
+                Some(enabled) => {
+                    config.plugins.entry("aoe.web".into()).or_default().enabled = enabled;
+                }
+                None => {
+                    config.plugins.remove("aoe.web");
+                }
+            })
+            .unwrap();
+            let before = std::fs::read(config_path().unwrap()).unwrap();
+            let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            let enabled = initial.unwrap_or(true);
+            let result = update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = !enabled;
+                config.session.confirm_delete = !config.session.confirm_delete;
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(config_path().unwrap()).unwrap(), before);
+            let minutes = if enabled { 47 } else { 48 };
+            update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = enabled;
+                config.session.snooze_duration_minutes = minutes;
+            })
+            .unwrap();
+            assert_eq!(
+                Config::load().unwrap().session.snooze_duration_minutes,
+                minutes,
+            );
+            drop(transaction);
+            update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = !enabled;
+            })
+            .unwrap();
+            assert_eq!(Config::load().unwrap().plugins["aoe.web"].enabled, !enabled);
+        }
     }
 
     #[test]

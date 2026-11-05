@@ -17,6 +17,14 @@ The private local runtime and `aoe plugin enable aoe.web` remain available while
 
 For an already-running TCP daemon, use `aoe serve --restart` to apply the setting. Restart preserves the recorded launch mode: it does not promote a core-only daemon. To enable TCP on a running core-only daemon, explicitly run `aoe serve --daemon`. This replaces the managed daemon and disconnects its clients; reconnect them afterwards.
 
+### When configured TCP cannot start
+
+A configured TCP startup failure is reported without automatically starting a core-only daemon. For example, an occupied listener port makes CLI reads fail and leaves the TUI disconnected. AoE does not silently drop the configured MCP service to keep local reads working.
+
+Free the port or repair the reported startup failure, then retry the CLI command or press `r` in the TUI to reconnect.
+
+To work intentionally without TCP, run `aoe serve --core-only --daemon`, then retry the command or reconnect the TUI. MCP remains unavailable on that daemon. Restart preserves core-only mode; after freeing the port, run `aoe serve --daemon` to explicitly promote it back to TCP.
+
 ## Connect an agent
 
 On the daemon's host, run:
