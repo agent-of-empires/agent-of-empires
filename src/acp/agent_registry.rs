@@ -188,6 +188,8 @@ pub fn display_name_for(agent: &str) -> Option<&'static str> {
         "kimi" => "Kimi Code",
         "prime-agent" => "Prime Agent",
         "aoe-agent" => "aoe-agent",
+        #[cfg(feature = "e2e-tests")]
+        "fake-agent" => "Fake Agent",
         _ => return None,
     })
 }
