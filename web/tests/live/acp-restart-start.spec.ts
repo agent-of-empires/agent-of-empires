@@ -47,7 +47,16 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   // The line says the composer is open; a prompt the daemon accepts now is stopped by a restart.
   const composer = page.locator('textarea[name="input"]');
   await composer.fill(PROMPT);
+  // Stop and the caption are optimistic; the response proves the daemon took the prompt before Restart.
+  const admitted = page.waitForResponse(
+    (r) => r.url().endsWith("/acp/prompt") && r.request().postDataJSON()?.text === PROMPT,
+  );
   await composer.press("Enter");
+  const admission = await admitted;
+  expect(admission.status(), await admission.text()).toBe(202);
+  const dispatch = (await admission.json()) as { disposition?: string; queued_id?: string };
+  expect(dispatch.disposition).toBe("sent");
+  expect(dispatch.queued_id).toBeUndefined();
   const stopButton = page.getByRole("button", { name: "Stop", exact: true });
   await expect(stopButton).toBeVisible();
 
