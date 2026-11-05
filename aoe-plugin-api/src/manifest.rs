@@ -660,6 +660,9 @@ pub struct UiContribution {
     /// `page` only: the dashboard hands the page the `?link=` value of its URL.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deep_link: bool,
+    /// `pane` only: the worker pushes a stub and renders the content on `ui.pane.render`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lazy: bool,
 }
 
 /// An opaque page deep-link value: 1 to 128 URL-safe characters, so it never needs escaping.
@@ -1306,6 +1309,13 @@ impl PluginManifest {
         self.ui
             .iter()
             .any(|u| u.slot == UiSlot::Page && u.id == id && u.deep_link)
+    }
+
+    /// Whether pane `id` is lazy: the host asks the worker for its content when it is opened.
+    pub fn pane_lazy(&self, id: &str) -> bool {
+        self.ui
+            .iter()
+            .any(|u| u.slot == UiSlot::Pane && u.id == id && u.lazy)
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -1965,6 +1975,12 @@ impl PluginManifest {
                 "the mcp.serve capability requires a runtime worker".into(),
             );
         }
+        if self.api_version < 29 {
+            check(
+                self.ui.iter().all(|u| !u.lazy),
+                "lazy requires api_version >= 29".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1974,6 +1990,10 @@ impl PluginManifest {
         let mut page_ids = std::collections::HashSet::new();
         for (i, u) in self.ui.iter().enumerate() {
             check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
+            check(
+                !u.lazy || u.slot == UiSlot::Pane,
+                format!("ui[{i}]: lazy is only valid on a pane slot"),
+            );
             if u.slot != UiSlot::Page {
                 check(
                     u.title.is_none() && u.icon.is_none() && u.entry.is_none() && !u.deep_link,
@@ -2421,6 +2441,30 @@ mod tests {
         ] {
             assert!(!deep_link_value_ok(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn lazy_is_a_pane_only_opt_in() {
+        let pane = |api: u32, extra: &str| {
+            format!("{HEAD}{api}\n\n[[ui]]\nslot = \"pane\"\nid = \"p\"\n{extra}")
+        };
+        let m = PluginManifest::from_toml_str(&pane(29, "lazy = true\n")).expect("parses");
+        assert!(m.pane_lazy("p"));
+        let m = PluginManifest::from_toml_str(&pane(29, "")).expect("parses");
+        assert!(!m.pane_lazy("p"));
+        assert!(!m.pane_lazy("other"));
+        rejects(&[
+            (
+                "lazy before api_version 29",
+                pane(28, "lazy = true\n"),
+                "lazy requires api_version >= 29",
+            ),
+            (
+                "lazy on another slot",
+                format!("{HEAD}29\n\n[[ui]]\nslot = \"card\"\nid = \"c\"\nlazy = true\n"),
+                "lazy is only valid on a pane slot",
+            ),
+        ]);
     }
 
     #[test]

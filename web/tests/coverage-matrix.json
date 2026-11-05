@@ -2911,6 +2911,14 @@
       "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
     },
     {
+      "id": "plugins.lazy-pane",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/plugin-lazy-pane.spec.ts"],
+      "components": ["web/src/components/plugin/PluginPane.tsx", "web/src/hooks/useLazyPane.ts", "web/src/lib/api.ts"],
+      "notes": "The fetch on open, the rendered content and the failed state are covered here; the refetch on a session UI revision change and an eager pane never fetching are covered by Vitest in src/components/plugin/__tests__/PluginSlots.test.tsx."
+    },
+    {
       "id": "plugins.pages",
       "kind": "mocked-playwright",
       "risk": "high",

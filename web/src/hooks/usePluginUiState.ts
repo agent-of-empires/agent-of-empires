@@ -27,6 +27,7 @@ const REFRESH_INDICATOR_DELAY = 250;
 export function usePluginUiState() {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
   const [revisions, setRevisions] = useState<Record<string, Record<string, number>>>({});
+  const [generation, setGeneration] = useState(0);
   // `null` until the first snapshot, so a deep link waits instead of reporting an unknown page.
   const [pages, setPages] = useState<PluginPage[] | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -39,6 +40,8 @@ export function usePluginUiState() {
     let slowTimer: ReturnType<typeof setTimeout> | null = null;
     let inFlight = false;
     let boostUntil = 0;
+    let pollFailed = false;
+    let lastRevisions: Record<string, Record<string, number>> = {};
 
     const apply = (notifications: PluginUiNotification[]) => {
       const maxSeq = notifications.reduce((m, n) => Math.max(m, n.seq), 0);
@@ -69,9 +72,21 @@ export function usePluginUiState() {
       }, REFRESH_INDICATOR_DELAY);
       try {
         const state = await fetchPluginUiState({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-        if (cancelled || state === null) return;
+        if (cancelled) return;
+        if (state === null) {
+          pollFailed = true;
+          return;
+        }
+        const nextRevisions = state.revisions ?? {};
+        // The daemon restarts its revision counters at zero, so after an outage or a step back equal numbers no longer mean unchanged content.
+        const wentBack = Object.entries(lastRevisions).some(([plugin, scopes]) =>
+          Object.entries(scopes).some(([scope, rev]) => (nextRevisions[plugin]?.[scope] ?? -1) < rev),
+        );
+        if (pollFailed || wentBack) setGeneration((g) => g + 1);
+        pollFailed = false;
+        lastRevisions = nextRevisions;
         setEntries(state.entries);
-        setRevisions(state.revisions ?? {});
+        setRevisions(nextRevisions);
         // Pages rarely change, so keep the identity and spare the TopBar and palette a re-render.
         const nextPages = state.pages ?? [];
         setPages((prev) => (JSON.stringify(prev) === JSON.stringify(nextPages) ? prev : nextPages));
@@ -104,5 +119,5 @@ export function usePluginUiState() {
 
   const poke = useCallback(() => pokeRef.current(), []);
 
-  return { entries, revisions, pages, isRefreshing, poke };
+  return { entries, revisions, generation, pages, isRefreshing, poke };
 }

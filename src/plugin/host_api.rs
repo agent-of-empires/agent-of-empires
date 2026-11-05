@@ -199,6 +199,22 @@ impl HostApiState {
         self.ui.revision(plugin_id, session_id)
     }
 
+    /// Publishes session-scoped UI entries as one live worker generation of the plugin would.
+    #[cfg(test)]
+    pub fn set_ui_entries_for_test(
+        &self,
+        plugin_id: &str,
+        session_id: &str,
+        entries: &[(UiSlot, &str, Value)],
+    ) {
+        let generation = self.ui.begin_generation(plugin_id);
+        for (slot, id, payload) in entries {
+            self.ui
+                .set(plugin_id, generation, *slot, id, Some(session_id), payload)
+                .expect("a valid UI entry");
+        }
+    }
+
     pub fn notify_host(
         &self,
         plugin_id: &str,

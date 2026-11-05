@@ -11,6 +11,7 @@ const PluginUiEntriesContext = createContext<PluginUiEntry[]>([]);
 const PluginUiAttentionContext = createContext<ReadonlySet<string>>(new Set());
 const PluginUiRefreshingContext = createContext(false);
 const PluginUiRevisionsContext = createContext<Record<string, Record<string, number>>>({});
+const PluginUiGenerationContext = createContext(0);
 const PluginUiPokeContext = createContext<() => void>(() => {});
 const PluginUiPagesContext = createContext<PluginPage[] | null>(null);
 
@@ -24,17 +25,19 @@ function useStableAttention(entries: PluginUiEntry[]): ReadonlySet<string> {
 }
 
 export function PluginUiProvider({ children }: { children: ReactNode }) {
-  const { entries, revisions, pages, isRefreshing, poke } = usePluginUiState();
+  const { entries, revisions, generation, pages, isRefreshing, poke } = usePluginUiState();
   const attention = useStableAttention(entries);
   return (
     <PluginUiEntriesContext.Provider value={entries}>
       <PluginUiAttentionContext.Provider value={attention}>
         <PluginUiRevisionsContext.Provider value={revisions}>
-          <PluginUiPokeContext.Provider value={poke}>
-            <PluginUiRefreshingContext.Provider value={isRefreshing}>
-              <PluginUiPagesContext.Provider value={pages}>{children}</PluginUiPagesContext.Provider>
-            </PluginUiRefreshingContext.Provider>
-          </PluginUiPokeContext.Provider>
+          <PluginUiGenerationContext.Provider value={generation}>
+            <PluginUiPokeContext.Provider value={poke}>
+              <PluginUiRefreshingContext.Provider value={isRefreshing}>
+                <PluginUiPagesContext.Provider value={pages}>{children}</PluginUiPagesContext.Provider>
+              </PluginUiRefreshingContext.Provider>
+            </PluginUiPokeContext.Provider>
+          </PluginUiGenerationContext.Provider>
         </PluginUiRevisionsContext.Provider>
       </PluginUiAttentionContext.Provider>
     </PluginUiEntriesContext.Provider>
@@ -59,6 +62,11 @@ export function usePluginUiRefreshing(): boolean {
 /** Per-scope mutation counter; a pane action holds its spinner until it moves off the returned baseline. */
 export function usePluginUiRevision(pluginId: string, sessionId?: string): number {
   return useContext(PluginUiRevisionsContext)[pluginId]?.[sessionId ?? ""] ?? 0;
+}
+
+/** Moves when the daemon may have been replaced (a poll failed and recovered, or a revision went backwards): revisions are not comparable across it. */
+export function usePluginUiGeneration(): number {
+  return useContext(PluginUiGenerationContext);
 }
 
 /** Poll now and briefly boost the cadence so an action's result shows promptly. */
