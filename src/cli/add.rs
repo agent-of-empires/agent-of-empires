@@ -279,6 +279,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
+    // Checked before anything is provisioned: a refused parent must leave no worktree,
+    // branch or workspace behind.
+    let mut group_path = args.group.clone();
+    let parent_id = if let Some(parent_ref) = &args.parent {
+        let parent = super::resolve_session(parent_ref, &instances)?;
+        // The Daemon's create refuses a trashed parent as not found; agree with it.
+        if parent.is_trashed() {
+            bail!(
+                "Session '{}' is in the trash, so it can't be a parent. Restore it first.",
+                parent.title
+            );
+        }
+        parent.ensure_can_parent()?;
+        group_path = Some(parent.group_path.clone());
+        Some(parent.id.clone())
+    } else {
+        None
+    };
+
     let worktree_session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let final_title =
         resolve_session_title(&args, &instances, &path, &config, &worktree_session_id)?;
@@ -511,23 +530,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             }
         }
     }
-
-    let mut group_path = args.group.clone();
-    let parent_id = if let Some(parent_ref) = &args.parent {
-        let parent = super::resolve_session(parent_ref, &instances)?;
-        // The Daemon's create refuses a trashed parent as not found; agree with it.
-        if parent.is_trashed() {
-            bail!(
-                "Session '{}' is in the trash, so it can't be a parent. Restore it first.",
-                parent.title
-            );
-        }
-        parent.ensure_can_parent()?;
-        group_path = Some(parent.group_path.clone());
-        Some(parent.id.clone())
-    } else {
-        None
-    };
 
     if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or(""), None) {
         cleanup_partial_session(
@@ -1964,6 +1966,78 @@ command = "plugin-helper --safe"
                 .trim(),
                 "feat/my-feature"
             );
+        }
+
+        /// A parent is refused before anything is provisioned, so a refusal leaves no
+        /// worktree, branch or session behind.
+        #[tokio::test]
+        #[serial]
+        async fn a_refused_parent_leaves_no_worktree_branch_or_session() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            let seeded = |id: &str| {
+                let mut row = crate::session::Instance::new(id, repo.to_str().unwrap());
+                row.id = id.to_string();
+                row
+            };
+            let mut trashed = seeded("trashed-id");
+            trashed.trashed_at = Some(chrono::Utc::now());
+            let mut child = seeded("child-id");
+            child.parent_session_id = Some("top-id".into());
+            Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![trashed, child];
+                    Ok(())
+                })
+                .unwrap();
+
+            // (parent, branch the add would have created, error contains)
+            let cases = [
+                ("trashed-id", "feat/under-trashed", "in the trash"),
+                (
+                    "child-id",
+                    "feat/under-child",
+                    "sub-session of a sub-session",
+                ),
+                ("missing-id", "feat/under-missing", "missing-id"),
+            ];
+            for (parent, branch, error) in cases {
+                let (profile, args) = dispatch_argv(&[
+                    "aoe",
+                    "add",
+                    repo.to_str().unwrap(),
+                    "-w",
+                    branch,
+                    "-b",
+                    "--parent",
+                    parent,
+                    "-p",
+                    "real",
+                ]);
+                let err = super::super::run(&profile, args)
+                    .await
+                    .expect_err("a refused parent fails the add")
+                    .to_string();
+                assert!(err.contains(error), "{parent}: {err}");
+                assert!(
+                    !root.path().join("repo-worktrees").exists(),
+                    "{parent}: a worktree was created"
+                );
+                assert!(
+                    run_git(&repo, &["branch", "--list", branch])
+                        .trim()
+                        .is_empty(),
+                    "{parent}: branch {branch} was created"
+                );
+                let (rows, _) = Storage::new_unwatched("real")
+                    .unwrap()
+                    .load_with_groups()
+                    .unwrap();
+                assert_eq!(rows.len(), 2, "{parent}: a session was written");
+            }
         }
 
         fn title_for(
