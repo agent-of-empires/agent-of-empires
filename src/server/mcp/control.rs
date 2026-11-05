@@ -433,12 +433,17 @@ fn refusal(status: StatusCode, body: &[u8]) -> CallToolResult {
                 s if s.is_server_error() => "internal",
                 _ => "invalid_request",
             };
-            CallToolResult::structured_error(json!({
+            let mut error = json!({
                 "code": code,
                 "message": message,
                 "http_status": status.as_u16(),
                 "http_error": http_error,
-            }))
+            });
+            // A failed create names itself in the Daemon's log; pass that on so the two can be matched.
+            if let Some(reference) = json.as_ref().and_then(|v| v["reference"].as_str()) {
+                error["reference"] = reference.into();
+            }
+            CallToolResult::structured_error(error)
         }
     }
 }
@@ -607,6 +612,17 @@ mod tests {
             .unwrap();
         assert_eq!(content["on_create"], json!(["make setup"]));
         assert!(content.get("trust_hooks").is_none());
+
+        // A failed create's reference reaches the caller, to match the Daemon's log line.
+        let failed = json!({
+            "error": "create_failed", "message": "Failed to create session",
+            "stage": "provisioning", "reference": "mcp-0f3a",
+        });
+        let content = refusal(StatusCode::BAD_REQUEST, failed.to_string().as_bytes())
+            .structured_content
+            .unwrap();
+        assert_eq!(content["code"], "invalid_request");
+        assert_eq!(content["reference"], "mcp-0f3a");
     }
 
     /// Keys reach a pane as `POST /send` sends them, so a prompt can't close the bracketed
