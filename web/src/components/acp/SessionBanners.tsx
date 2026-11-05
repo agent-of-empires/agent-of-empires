@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
@@ -28,7 +28,7 @@ export function SessionBanners({
   startingAgent: string | null;
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart: boolean;
-  onRestarted?: (epoch: number, stoppedSent: boolean) => void;
+  onRestarted?: (epoch: number) => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -70,11 +70,8 @@ export function SessionBanners({
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
-          sentPending={state.turnActive}
-          queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
           restartEpoch={state.restartEpoch}
-          sentStopped={state.restartStoppedSent}
           onRestarted={onRestarted}
         />
       ) : (
@@ -114,24 +111,15 @@ const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce
 export function StartupWaitLine({
   sessionId,
   agent,
-  sentPending,
-  queuedPending,
   canRestart,
   restartEpoch,
-  sentStopped,
   onRestarted,
 }: {
   sessionId: string;
   agent: string;
-  /** A sent prompt waits on this start; a restart stops it. */
-  sentPending: boolean;
-  /** Queued prompts wait on this start; the Daemon sends them to the replacement. */
-  queuedPending: boolean;
   canRestart: boolean;
   restartEpoch: number;
-  /** A restart stopped the sent message and it hasn't been sent again. */
-  sentStopped: boolean;
-  onRestarted?: (epoch: number, stoppedSent: boolean) => void;
+  onRestarted?: (epoch: number) => void;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
@@ -151,20 +139,11 @@ export function StartupWaitLine({
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
   const restart = async () => {
     const epoch = restartEpoch;
-    const stopsSent = sentPending;
     if (!(await respawn())) return;
-    onRestarted?.(epoch, stopsSent);
+    onRestarted?.(epoch);
     setStartedAt(Date.now());
     setSeconds(0);
   };
-  const costId = useId();
-  const cost = [
-    sentPending && `Restarting stops the message you sent. Send it again once ${agent} is ready.`,
-    !sentPending && sentStopped && `The message you sent was stopped. Send it again once ${agent} is ready.`,
-    queuedPending && `Queued messages are sent once ${agent} is ready.`,
-  ]
-    .filter(Boolean)
-    .join(" ");
   const offerRestart =
     canRestart && (seconds >= RESTART_OFFERED_AFTER_S || restartState === "retrying" || restartState === "failed");
   return (
@@ -188,17 +167,11 @@ export function StartupWaitLine({
           data-testid="startup-wait-restart"
           onClick={() => void restart()}
           disabled={restartState === "retrying"}
-          aria-describedby={cost ? costId : undefined}
           className={`${SECONDARY_BUTTON} shrink-0`}
         >
           {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
         </button>
       )}
-      {offerRestart && cost && (
-        <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
-          {cost}
-        </span>
-      )}{" "}
       {restartState === "failed" && restartError && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
           Restart failed: {restartError}
