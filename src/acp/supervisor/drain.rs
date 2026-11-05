@@ -661,6 +661,9 @@ impl<S: BroadcastSink> Drain<S> {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
                         handle.native_session_id = None;
+                        lock_recover(&self.unassigned_prompts)
+                            .entry(self.session_id.clone())
+                            .or_default();
                         None
                     }
                     None => Some(InstallError::Stale),

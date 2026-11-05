@@ -609,7 +609,9 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         .await
     {
         Ok(()) => {
-            handoff.deliver().await;
+            if !restart.is_cancelled() {
+                handoff.deliver().await;
+            }
             Json(SpawnAcpResponse {
                 session_id: id,
                 agent,
