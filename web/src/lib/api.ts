@@ -1969,8 +1969,22 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 /** Null when the request failed, so callers can tell "no agents" from "unknown". */
 export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const agents = await fetchProfileAgents(profile);
+  return Array.isArray(agents) ? agents : null;
+}
+
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
+export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
   const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
+  try {
+    const res = await fetch(`/api/agents${query}`);
+    if (res.ok) return (await res.json()) as AgentInfo[];
+    if (res.status !== 404) return null;
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+    return body?.error === "profile_not_found" ? "profile_not_found" : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@t
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { initialData } from "../wizardReducer";
 import {
-  fetchAgents,
+  fetchProfileAgents,
   fetchCreateProgress,
   fetchDockerStatus,
   fetchGroups,
@@ -37,6 +37,7 @@ vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
   fetchCreateBootId: vi.fn().mockResolvedValue("boot-1"),
   fetchSettings: vi.fn().mockResolvedValue({}),
+  fetchProfileAgents: vi.fn().mockResolvedValue([]),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
   fetchGroups: vi.fn().mockResolvedValue([]),
@@ -72,7 +73,7 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 beforeEach(() => {
   vi.clearAllMocks();
   // clearAllMocks keeps queued answers, and a test can leave some unread.
-  vi.mocked(fetchAgents).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchProfileAgents).mockReset().mockResolvedValue([]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -140,7 +141,7 @@ describe("SessionWizard native import late defaults", () => {
             resolveSettings = resolve;
           }),
       );
-      vi.mocked(fetchAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
+      vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
       renderWizard({ path: "/tmp/proj", worktreeEnabled: true, sandboxEnabled: true });
       fireEvent.click(screen.getByText("Project"));
       fireEvent.click(await screen.findByRole("button", { name: "Import session" }));
@@ -232,7 +233,7 @@ describe("SessionWizard structured view payload", () => {
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
-    vi.mocked(fetchAgents).mockResolvedValueOnce([
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([
       agent("opencode", { acp_installed: true }),
       agent("claude", { acp_installed: true }),
     ]);
@@ -410,7 +411,7 @@ describe("SessionWizard rows", () => {
     ["sandbox_enabled", "Sandbox unavailable: settl runs on the host only"],
     ["worktree_enabled", "Worktree unavailable: settl runs on the host only"],
   ])("refuses a host-only agent with a seeded %s project override", async (field, message) => {
-    vi.mocked(fetchAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
     vi.mocked(fetchProjects).mockResolvedValueOnce([
       {
         name: "proj",
@@ -433,7 +434,7 @@ describe("SessionWizard rows", () => {
     ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
     ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
   ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
-    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
     renderWizard({ path: "/tmp/proj", tool });
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
     expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
@@ -462,7 +463,7 @@ describe("SessionWizard rows", () => {
     [undefined, "Run in a safe container", "Docker is not running"],
     [[agent("settl", { host_only: true })], "Create a worktree", "settl runs on the host only"],
   ])("a blocked switch left on shows on and turns off: %#", async (agents, name, reason) => {
-    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
     const tool = agents ? "settl" : "claude";
     renderWizard({ path: "/tmp/proj", tool, sandboxEnabled: true, worktreeEnabled: true });
     const toggle = () => screen.getByRole("switch", { name }) as HTMLButtonElement;
@@ -1160,7 +1161,10 @@ describe("SessionWizard Yolo mode", () => {
   });
 
   it("locks on for an agent that always runs in Yolo mode, and gives the value back after", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([
+      agent("claude"),
+      agent("pi", { always_yolo: true, acp_capable: false }),
+    ]);
     vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
     renderWizard({ path: "/tmp/proj", tool: "pi" });
     await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
@@ -1180,7 +1184,10 @@ describe("SessionWizard Yolo mode", () => {
   });
 
   it("keeps a profile's Yolo mode default for an agent that can turn it off", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([
+      agent("claude"),
+      agent("pi", { always_yolo: true, acp_capable: false }),
+    ]);
     vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: true }, sandbox: {} } as never);
     renderWizard({ path: "/tmp/proj", tool: "pi" });
     await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
@@ -1204,7 +1211,7 @@ describe("SessionWizard Yolo mode", () => {
     ];
     let answerBeta: (agents: AgentInfo[]) => void = () => {};
     let betaCalls = 0;
-    vi.mocked(fetchAgents).mockImplementation((profile) => {
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) => {
       if (profile !== "beta") return Promise.resolve(wrapper(true));
       return betaCalls++ === 0 ? new Promise((resolve) => (answerBeta = resolve)) : Promise.resolve(wrapper(false));
     });
@@ -1236,7 +1243,7 @@ describe("SessionWizard Yolo mode", () => {
 
   it("waits for the agent list before promising prompts or launching", async () => {
     let answer: (agents: typeof AGENTS) => void = () => {};
-    vi.mocked(fetchAgents).mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    vi.mocked(fetchProfileAgents).mockReturnValue(new Promise((resolve) => (answer = resolve)));
     vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
     renderWizard({ path: "/tmp/proj", tool: "pi" });
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
@@ -1254,26 +1261,106 @@ describe("SessionWizard Yolo mode", () => {
   });
 
   it("retries a failed agent list, keeping Launch off until it loads", async () => {
-    vi.mocked(fetchAgents).mockResolvedValueOnce(null).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce(null).mockResolvedValue(AGENTS);
     renderWizard({ path: "/tmp/proj", tool: "pi" });
     await screen.findByText(/Couldn't load the agent list/);
     expect(yoloRow()).toContain("checking the agent…");
     expect(launchButton().disabled).toBe(true);
     await waitFor(() => expect(yoloRow()).toContain("always on for pi"), { timeout: 3000 });
-    expect(fetchAgents).toHaveBeenCalledTimes(2);
+    expect(fetchProfileAgents).toHaveBeenCalledTimes(2);
     expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
   });
 
+  it("stops retrying a profile the Daemon doesn't have, and loads the next one chosen", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(fetchProfiles).mockResolvedValueOnce([
+        { name: "gone", is_default: true },
+        { name: "beta", is_default: false },
+      ]);
+      vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+        Promise.resolve(profile === "gone" ? "profile_not_found" : AGENTS),
+      );
+      renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+      await screen.findByText('The profile "gone" no longer exists. Choose another profile to launch.');
+      expect(launchButton().disabled).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(60_000));
+      expect(vi.mocked(fetchProfileAgents).mock.calls.filter(([p]) => p === "gone")).toHaveLength(1);
+
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
+      await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+      expect(screen.queryByText(/no longer exists/)).toBeNull();
+      await waitFor(() => expect(launchButton().disabled).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers the Profile row for a deleted served Profile with one Profile left", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "gone" ? "profile_not_found" : AGENTS),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await screen.findByText(/The profile "gone" no longer exists/);
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /^default/ }));
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    expect(screen.queryByText(/no longer exists/)).toBeNull();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+
+  it("keeps the Profile row hidden for one Profile while its agent list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(screen.queryByText("Profile")).toBeNull();
+  });
+
+  it("names a deleted Profile even when its project lookup failed too", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue("profile_not_found");
+    vi.mocked(fetchProjects).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "gone" }));
+    await act(async () => {});
+    expect(screen.getByText('The profile "gone" no longer exists. Choose another profile to launch.')).toBeTruthy();
+    expect(screen.queryByText(/Could not load this project's settings/)).toBeNull();
+  });
+
+  it("drops the last Profile's agents when the next one's list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([
+      { name: "alpha", is_default: true },
+      { name: "beta", is_default: false },
+    ]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "alpha" ? [agent("claude"), agent("aider")] : null),
+    );
+    const agentButton = () => screen.queryByRole("button", { name: /^aider/ });
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "alpha");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
+    await screen.findByText(/Couldn't load the agent list/);
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).toBeNull();
+  });
+
   it("launches a name-only form without the agent list", async () => {
     // The retry never answers, so the list stays failed.
-    vi.mocked(fetchAgents)
+    vi.mocked(fetchProfileAgents)
       .mockResolvedValueOnce(null)
       .mockReturnValueOnce(new Promise(() => {}));
     render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
-    await waitFor(() => expect(fetchAgents).toHaveBeenCalled());
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
@@ -1523,11 +1610,11 @@ describe("SessionWizard create failures", () => {
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
         release = () => answer({} as never);
       } else {
-        vi.mocked(fetchAgents).mockResolvedValueOnce([helper]);
+        vi.mocked(fetchProfileAgents).mockResolvedValueOnce([helper]);
         const { restore } = await backgroundFailure(failure("create_failed", "preparing", "boom"), "helper");
         expect(payload(0).view).toBe("structured");
         let answer!: (v: AgentInfo[]) => void;
-        vi.mocked(fetchAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        vi.mocked(fetchProfileAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
         render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
         release = () => answer([helper]);
       }
@@ -1568,7 +1655,7 @@ describe("SessionWizard create failures", () => {
   );
 
   it("a restored failure still says why its actions wait while the agent list fails", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue(null);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
     const restore = {
       data: { ...initialData, path: "/tmp/proj", tool: "claude" },
       failure: failure("create_failed", "preparing", "boom").failure,
@@ -1628,7 +1715,7 @@ describe("SessionWizard View row", () => {
     ["Structured view", "structured"],
     ["Terminal view", "terminal"],
   ])("gives %s back after an agent that can't run Structured view", async (choice, expected) => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(radio("Structured view").disabled).toBe(false));
     fireEvent.click(radio(choice));
@@ -1644,7 +1731,7 @@ describe("SessionWizard View row", () => {
     ["clicking Terminal view", () => fireEvent.click(radio("Terminal view"))],
     ["an arrow key", () => fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" })],
   ])("re-picking the forced Terminal view by %s keeps Structured view for later", async (_label, repick) => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(selected()).toBe("structured"));
     pickAgent("aider");
@@ -1656,7 +1743,7 @@ describe("SessionWizard View row", () => {
   });
 
   it("arrow keys move the selection and skip a disabled option", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(selected()).toBe("structured"));
     expect(radio("Structured view").tabIndex).toBe(0);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type {
   CreateFailure,
@@ -10,7 +10,7 @@ import type {
 } from "../../lib/types";
 import { setAgentNames } from "../../lib/agentDisplayName";
 import {
-  fetchAgents,
+  fetchProfileAgents,
   fetchGroups,
   fetchDockerStatus,
   fetchProfiles,
@@ -58,7 +58,7 @@ import { failureView, type FailureAction } from "./createFailureView";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
-import { initialData, reducer, type WizardData } from "./wizardReducer";
+import { agentsView, initialData, reducer, type WizardData } from "./wizardReducer";
 import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
@@ -134,6 +134,8 @@ const MAX_RETRY_DELAY_MS = 30_000;
 const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
 const AGENTS_UNAVAILABLE_ERROR = "Couldn't load the agent list, so Yolo mode can't be shown yet. Retrying…";
+const profileMissingError = (profile: string) =>
+  `The profile "${profile}" no longer exists. Choose another profile to launch.`;
 
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
@@ -213,6 +215,7 @@ export function SessionWizard({
     failure: restore?.failure ?? null,
     agents: [],
     agentsStatus: "loading",
+    agentsFor: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -315,29 +318,32 @@ export function SessionWizard({
     };
   }, [state.data.profile, groupsKey]);
 
-  // A custom agent's base comes from the profile the session is created in.
+  // A custom agent's base comes from the profile the session is created in. Like Groups, a list
+  // is read only for the profile it was fetched for, so a switch never shows the last one as ready.
   const agentsProfile = state.data.profile || servedProfile;
+  const agentsKey = agentsProfile ?? "";
+  const { agents, agentsStatus } = useMemo(() => agentsView(state, agentsKey), [state, agentsKey]);
   useEffect(() => {
     let alive = true;
     let retry: ReturnType<typeof setTimeout> | undefined;
-    dispatch({ type: "AGENTS_LOADING" });
     const load = (attempt: number) =>
-      void fetchAgents(agentsProfile || undefined).then((agents) => {
+      void fetchProfileAgents(agentsProfile || undefined).then((list) => {
         if (!alive) return;
-        if (agents) {
+        if (Array.isArray(list)) {
           // The app-wide names describe the served profile, not the one being created in.
-          if (agentsProfile === servedProfile) setAgentNames(agents);
-          return dispatch({ type: "SET_AGENTS", agents });
+          if (agentsProfile === servedProfile) setAgentNames(list);
+          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey });
         }
-        dispatch({ type: "AGENTS_FAILED" });
-        retry = setTimeout(() => load(attempt + 1), Math.min(1000 * 2 ** attempt, 15000));
+        const missing = list === "profile_not_found";
+        dispatch({ type: "AGENTS_FAILED", agentsFor: agentsKey, missing });
+        if (!missing) retry = setTimeout(() => load(attempt + 1), Math.min(1000 * 2 ** attempt, 15000));
       });
     load(0);
     return () => {
       alive = false;
       clearTimeout(retry);
     };
-  }, [agentsProfile, servedProfile]);
+  }, [agentsProfile, agentsKey, servedProfile]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
@@ -693,7 +699,7 @@ export function SessionWizard({
         d,
         isAcpEligible(
           d.tool,
-          state.agents.find((a) => a.name === d.tool),
+          agents.find((a) => a.name === d.tool),
         ),
       ),
       idempotency_key: newIdempotencyKey(),
@@ -809,8 +815,7 @@ export function SessionWizard({
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
-  const formReady =
-    defaultsReady && (nameOnly || state.agentsStatus === "ready") && !profileSwitching && !projectUnresolved;
+  const formReady = defaultsReady && (nameOnly || agentsStatus === "ready") && !profileSwitching && !projectUnresolved;
   const canResend = launchEligible(d, { ready: formReady, offline, nameOnly });
   const canResendRef = useRef(canResend);
   useEffect(() => {
@@ -821,7 +826,7 @@ export function SessionWizard({
     // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
     return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
   };
-  const selectedAgent = state.agents.find((a) => a.name === d.tool);
+  const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const hostOnlyReason = `${d.tool} runs on the host only`;
@@ -852,7 +857,7 @@ export function SessionWizard({
             profile={effectiveProfile}
             onChange={handleChange}
             initialTab={prefill?.initialTab}
-            agents={state.agents}
+            agents={agents}
             onSelectSavedProject={(overrides, path) => {
               const key = normalizeProjectPathKey(path);
               if (overrides === null) {
@@ -895,7 +900,7 @@ export function SessionWizard({
           />
         );
       case "agent":
-        return <AgentPanel data={d} onChange={handleChange} agents={state.agents} commandMaps={commandMaps} />;
+        return <AgentPanel data={d} onChange={handleChange} agents={agents} commandMaps={commandMaps} />;
       case "worktree":
         return <WorktreePanel data={d} onChange={handleChange} />;
       case "sandbox":
@@ -923,7 +928,8 @@ export function SessionWizard({
   ) : (
     <div className="space-y-4">
       <RowGroup>
-        {state.profiles.length > 1 && (
+        {/* A deleted Profile needs a way out even when only one other is left. */}
+        {(state.profiles.length > 1 || agentsStatus === "missing") && (
           <NavRow
             label="Profile"
             value={`${d.profile || "Server default"}${d.profile && d.profileDirty ? " (custom)" : ""}`}
@@ -998,7 +1004,7 @@ export function SessionWizard({
           onChange={(v) => handleChange("yoloMode", v)}
           disabled={alwaysYolo}
           summary={
-            state.agentsStatus !== "ready"
+            agentsStatus !== "ready"
               ? "checking the agent…"
               : alwaysYolo
                 ? `always on for ${d.tool}`
@@ -1123,8 +1129,10 @@ export function SessionWizard({
               }
               error={
                 state.error ??
+                // A deleted Profile also fails the project lookup, which reselecting can't fix.
+                (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
                 (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
-                (!nameOnly && state.agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
+                (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
                 (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
               }
               onSubmit={() => void handleSubmit()}
