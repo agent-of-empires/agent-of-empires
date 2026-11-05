@@ -1,6 +1,7 @@
 //! `aoe acp lint-stream`: conformance check of a recorded agent-to-client
 //! NDJSON stream, one JSON-RPC frame per line.
 
+use super::ordering::{Arrival, ArrivalOrder};
 use super::{Envelope, EnvelopeError, LeaseVerb, ProxyHello};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +21,15 @@ pub struct LintOptions {
     pub require_hello: bool,
 }
 
+/// A frame in the order the runtime would deliver it.
+struct Seen {
+    line: usize,
+    update_kind: String,
+    envelope: Option<Envelope>,
+}
+
+/// Replays the stream through the runtime's own ordering, so a repeated key,
+/// an anchored frame and the hold bound behave exactly as they do live.
 pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut add = |line: usize, code: &'static str, message: String| {
@@ -30,10 +40,9 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         })
     };
     let mut hello_line: Option<usize> = None;
-    let mut adapter_frames: u64 = 0;
     let mut keys: HashMap<String, Envelope> = HashMap::new();
     let mut leases: HashSet<String> = HashSet::new();
-    let mut anchors: Vec<(usize, u64)> = Vec::new();
+    let mut order: ArrivalOrder<Seen> = ArrivalOrder::default();
 
     for (index, line) in reader.lines().enumerate() {
         let n = index + 1;
@@ -58,6 +67,15 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
             .and_then(|m| m.as_object())
             .filter(|m| m.get("aoe").is_some_and(|a| a.get("proxy").is_some()))
         {
+            // Only the initialize result carries `protocolVersion`.
+            if frame.pointer("/result/protocolVersion").is_none() {
+                add(
+                    n,
+                    "hello_misplaced",
+                    "proxy hello is only valid on the initialize response".into(),
+                );
+                continue;
+            }
             match ProxyHello::from_meta(meta) {
                 Ok(_) if hello_line.is_some() => {
                     add(n, "duplicate_hello", "second proxy hello".into())
@@ -74,8 +92,13 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         let update = frame
             .pointer("/params/update")
             .unwrap_or(&serde_json::Value::Null);
-        let env = match super::from_update_value(update) {
-            Ok(env) => env,
+        let update_kind = update
+            .get("sessionUpdate")
+            .and_then(|k| k.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let envelope = match super::from_update_value(update) {
+            Ok(envelope) => envelope,
             Err(e) => {
                 let code = match e {
                     EnvelopeError::UnsupportedVersion(_) => "unsupported_version",
@@ -84,63 +107,82 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
                     EnvelopeError::Malformed(_) => "bad_envelope",
                 };
                 add(n, code, e.to_string());
-                adapter_frames += 1;
-                continue;
+                None
             }
         };
-        let Some(env) = env else {
-            adapter_frames += 1;
-            continue;
-        };
-
-        match keys.get(&env.key) {
-            Some(first) if first != &env => {
-                add(
+        if let Some(env) = &envelope {
+            match keys.get(&env.key) {
+                Some(first) if first != env => add(
                     n,
                     "key_conflict",
                     format!(
                         "idempotency key {:?} reused with a different payload",
                         env.key
                     ),
+                ),
+                Some(_) => {}
+                None => {
+                    keys.insert(env.key.clone(), env.clone());
+                }
+            }
+        }
+        let arrival = Arrival {
+            key: envelope.as_ref().map(|e| e.key.as_str()),
+            after_adapter_sequence: envelope.as_ref().and_then(|e| e.after_adapter_sequence),
+        };
+        let seen = Seen {
+            line: n,
+            update_kind,
+            envelope: envelope.clone(),
+        };
+        let delivered = match order.arrive(arrival, seen) {
+            Ok(delivered) => delivered,
+            Err(e) => {
+                add(n, "hold_overflow", e.to_string());
+                continue;
+            }
+        };
+        for seen in delivered {
+            let Some(env) = seen.envelope else { continue };
+            if seen.update_kind != "tool_call"
+                && (env.parent_tool_call.is_some()
+                    || env.memory_recall.is_some()
+                    || env.plan_proposal.is_some())
+            {
+                add(
+                    seen.line,
+                    "primitive_on_wrong_update",
+                    "parent_tool_call, memory_recall and plan_proposal are read on tool_call updates only"
+                        .into(),
                 );
             }
-            Some(_) => {}
-            None => {
-                keys.insert(env.key.clone(), env.clone());
-            }
-        }
-        if let Some(lease) = &env.lease {
-            match lease.op {
-                LeaseVerb::Acquire => {
-                    leases.insert(lease.id.clone());
-                }
-                LeaseVerb::Renew | LeaseVerb::Release if !leases.contains(&lease.id) => {
-                    add(
-                        n,
-                        "lease_unknown",
-                        format!("lease {:?} was never acquired", lease.id),
-                    );
-                }
-                LeaseVerb::Renew => {}
-                LeaseVerb::Release => {
-                    leases.remove(&lease.id);
+            if let Some(lease) = &env.lease {
+                match lease.op {
+                    LeaseVerb::Acquire => {
+                        leases.insert(lease.id.clone());
+                    }
+                    LeaseVerb::Renew | LeaseVerb::Release if !leases.contains(&lease.id) => {
+                        add(
+                            seen.line,
+                            "lease_unknown",
+                            format!("lease {:?} was never acquired", lease.id),
+                        );
+                    }
+                    LeaseVerb::Renew => {}
+                    LeaseVerb::Release => {
+                        leases.remove(&lease.id);
+                    }
                 }
             }
-        }
-        match env.after_adapter_sequence {
-            Some(anchor) => anchors.push((n, anchor)),
-            None => adapter_frames += 1,
         }
     }
 
-    for (n, anchor) in anchors {
-        if anchor > adapter_frames {
-            add(
-                n,
-                "sequence_beyond_stream",
-                format!("after_adapter_sequence {anchor} but the stream has {adapter_frames} adapter frames"),
-            );
-        }
+    for (anchor, seen) in order.drain_held() {
+        add(
+            seen.line,
+            "sequence_beyond_stream",
+            format!("after_adapter_sequence {anchor} is never reached by the stream"),
+        );
     }
     if opts.require_hello && hello_line.is_none() {
         add(
@@ -159,10 +201,14 @@ mod tests {
 
     const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}}}"#;
 
-    fn update(meta: &str) -> String {
+    fn update_of(kind: &str, meta: &str) -> String {
         format!(
-            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","_meta":{{"aoe":{meta}}}}}}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"{kind}","_meta":{{"aoe":{meta}}}}}}}}}"#
         )
+    }
+
+    fn update(meta: &str) -> String {
+        update_of("agent_message_chunk", meta)
     }
 
     fn run(lines: &[String], require_hello: bool) -> Vec<&'static str> {
@@ -251,7 +297,7 @@ mod tests {
                 "same key other payload",
                 vec![
                     update(r#"{"v":1,"key":"a","ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"a","parent_tool_call":"t"}"#),
+                    update(r#"{"v":1,"key":"a","ephemeral":false}"#),
                 ],
                 false,
                 vec!["key_conflict"],
@@ -275,6 +321,60 @@ mod tests {
                 vec![],
             ),
         ];
+        let hello_on_session_new = HELLO.replace("\"protocolVersion\":1,", "");
+        let flood: Vec<String> = (0..=super::super::ordering::MAX_HELD)
+            .map(|n| {
+                update(&format!(
+                    r#"{{"v":1,"key":"h{n}","after_adapter_sequence":2,"ephemeral":true}}"#
+                ))
+            })
+            .chain([
+                update(r#"{"v":1,"key":"p1"}"#),
+                update(r#"{"v":1,"key":"p2"}"#),
+            ])
+            .collect();
+        let mut cases = cases;
+        cases.extend([
+            (
+                "hello on a session/new result",
+                vec![hello_on_session_new],
+                true,
+                vec!["hello_missing", "hello_misplaced"],
+            ),
+            (
+                "replayed release is dropped like at runtime",
+                vec![
+                    update(r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
+                    update(r#"{"v":1,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
+                    update(r#"{"v":1,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "anchored renewal that precedes its acquire on the wire",
+                vec![
+                    update(r#"{"v":1,"key":"r","after_adapter_sequence":2,"lease":{"id":"l","kind":"busy","op":"renew","ttl_ms":5}}"#),
+                    update(r#"{"v":1,"key":"x"}"#),
+                    update(r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
+                ],
+                false,
+                vec![],
+            ),
+            ("too many frames wait on an anchor", flood, false, vec!["hold_overflow"]),
+            (
+                "plan proposal off a tool call",
+                vec![update(r#"{"v":1,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
+                false,
+                vec!["primitive_on_wrong_update"],
+            ),
+            (
+                "plan proposal on a tool call",
+                vec![update_of("tool_call", r#"{"v":1,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
+                false,
+                vec![],
+            ),
+        ]);
         for (name, stream, require_hello, expected) in cases {
             assert_eq!(run(&stream, require_hello), expected, "{name}");
         }

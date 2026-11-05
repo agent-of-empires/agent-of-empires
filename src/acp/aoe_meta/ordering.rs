@@ -53,6 +53,15 @@ impl<T> ArrivalOrder<T> {
         self.held_len = 0;
     }
 
+    /// Frames still waiting on an anchor, as `(anchor, frame)`.
+    pub fn drain_held(&mut self) -> Vec<(u64, T)> {
+        self.held_len = 0;
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .flat_map(|(anchor, items)| items.into_iter().map(move |item| (anchor, item)))
+            .collect()
+    }
+
     /// Whether another anchored frame would overflow the hold buffer.
     pub fn held_full(&self) -> bool {
         self.held_len >= MAX_HELD
