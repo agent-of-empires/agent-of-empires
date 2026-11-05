@@ -236,6 +236,13 @@ pub fn from_update_value(update: &serde_json::Value) -> Result<Option<Envelope>,
     }
 }
 
+/// The envelope of an already-ingested update. A malformed one reads as
+/// absent here: `Shared` rejects it before mapping.
+pub fn envelope_of(meta: &Option<Meta>) -> Option<Envelope> {
+    meta.as_ref()
+        .and_then(|m| Envelope::from_meta(m).ok().flatten())
+}
+
 /// The published schema: `proxy` is the hello, `primitive` an update's
 /// `_meta.aoe`.
 #[derive(JsonSchema)]
