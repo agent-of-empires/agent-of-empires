@@ -219,6 +219,12 @@ jobs:
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: python3 scripts/check-no-claude-in-core.py --self-test
+      # Disabled until C25 to C29 remove Claude from core on
+      # integration/claude-removal; enable there by dropping the `if`.
+      - name: Check core has no Claude references
+        if: ${{ false }}
+        run: python3 scripts/check-no-claude-in-core.py
 
   nix:
     name: Nix Eval
