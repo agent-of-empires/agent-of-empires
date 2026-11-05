@@ -56,7 +56,15 @@ without a token. To connect an agent, see
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
-| `whoami` | none | `null`; no session credential is currently available. |
+| `whoami` | none | The calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
+
+A session can authenticate to `/mcp` as itself: a bearer equal to
+`hex(HMAC-SHA256(secret, session_id))` sent with an `X-AoE-Session` header naming
+that `session_id`. The secret is generated once per app directory and never
+rotates. The pair is accepted only on `/mcp`, and only while the session exists
+and is neither archived nor trashed; any other case reports the same `401` as a
+missing token. It never bypasses the passphrase wall for a remote caller. The
+daemon-wide bearer keeps working unchanged.
 
 Both tools declare an `outputSchema` and return `structuredContent`.
 Listing does not persist workspace ordering or rebuild rows from mutable state.

@@ -19,7 +19,7 @@ use serde_json::json;
 use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession};
 use crate::server::principal::{authorize, Capability, Principal};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
@@ -28,7 +28,7 @@ const CAP_SESSION_READ: &str = "session.read";
 /// Apply mutation restrictions before resolving the authenticated principal.
 async fn mutation_gate(
     state: &AppState,
-    session: Option<&AuthenticatedSession>,
+    session: Option<&AuthenticatedBrowserSession>,
     local: Option<&Principal>,
 ) -> Result<(), Response> {
     if state.read_only {
@@ -219,7 +219,7 @@ pub async fn serve_plugin_page(
 pub async fn mint_plugin_page_ticket(
     State(state): State<std::sync::Arc<AppState>>,
     Path((id, page_id)): Path<(String, String)>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
 ) -> Response {
     let declared = plugin::registry()
         .active()
@@ -232,7 +232,7 @@ pub async fn mint_plugin_page_ticket(
         [(axum::http::header::CACHE_CONTROL, "no-store")],
     )
         .into_response();
-    if let Some(axum::Extension(AuthenticatedSession(session_id))) = session {
+    if let Some(axum::Extension(AuthenticatedBrowserSession(session_id))) = session {
         let ticket = state
             .login_manager
             .mint_page_ticket(&session_id, &id, &page_id)
@@ -651,7 +651,7 @@ pub struct ApplyUpdateBody {
 /// re-previewing.
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
@@ -684,7 +684,7 @@ pub struct DismissUpdateBody {
 /// signal, so it is gated like apply (read-write + elevation).
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
@@ -715,7 +715,7 @@ pub struct SetEnabledBody {
 /// `POST /api/plugins/{id}/enabled`
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
@@ -754,7 +754,7 @@ pub async fn set_plugin_enabled(
 /// TUI) runs the new build without a daemon restart.
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Response {
@@ -987,7 +987,7 @@ pub struct StartInstallBody {
 /// apply. Returns a `job_id` to poll; `409` if another lifecycle job is running.
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
@@ -1014,7 +1014,7 @@ pub async fn start_plugin_install(
 /// returns a `job_id` to poll; `409` if another lifecycle job is running.
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Response {
