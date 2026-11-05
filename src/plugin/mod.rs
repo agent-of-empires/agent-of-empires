@@ -47,7 +47,18 @@ pub(crate) fn remote_exposure() -> bool {
 fn resolve_node() -> Option<crate::acp::node::ResolvedNode> {
     let config = crate::session::Config::load_or_warn();
     let app_dir = crate::session::get_app_dir().ok()?;
-    crate::acp::node::resolve(&config.acp.node_path, &app_dir).ok()
+    let node = crate::acp::node::resolve(&config.acp.node_path, &app_dir).ok()?;
+    // Builds and workers run in their own cwd, so a relative or bare path must not reach them.
+    let path = absolute_node_path(&node.path)?;
+    Some(crate::acp::node::ResolvedNode { path, ..node })
+}
+
+fn absolute_node_path(path: &std::path::Path) -> Option<PathBuf> {
+    if path.components().count() == 1 {
+        which::which(path).ok()
+    } else {
+        std::path::absolute(path).ok()
+    }
 }
 
 /// `AOE_NODE` plus a `PATH` led by that node's directory, for build steps and
@@ -143,9 +154,9 @@ impl Drop for ReloadRegistryOnDrop {
 
 /// A `node` script that reports the pinned version, for `AOE_ACP_NODE`.
 #[cfg(all(test, unix))]
-pub(crate) fn write_fake_node(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn write_fake_node(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let node = dir.join("node");
+    let node = dir.join(name);
     std::fs::write(
         &node,
         format!(
@@ -164,12 +175,37 @@ mod node_env_tests {
     use std::ffi::OsString;
     use std::path::Path;
 
+    #[test]
+    fn node_path_is_made_absolute() {
+        let relative = super::absolute_node_path(Path::new("tools/node")).unwrap();
+        assert!(relative.is_absolute() && relative.ends_with("tools/node"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn node_env_resolves_bare_aoe_acp_node_through_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = super::write_fake_node(temp.path(), "aoe-bare-node");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("AOE_ACP_NODE", "aoe-bare-node"),
+            ("PATH", temp.path().to_str().unwrap()),
+        ]);
+
+        let env = super::node_env();
+        let aoe_node = env
+            .iter()
+            .find(|(k, _)| *k == "AOE_NODE")
+            .map(|(_, v)| v.clone());
+        assert_eq!(aoe_node, Some(node.into_os_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn node_env_resolves_aoe_acp_node() {
         let temp = tempfile::tempdir().unwrap();
-        let node = super::write_fake_node(temp.path());
+        let node = super::write_fake_node(temp.path(), "node");
         let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
 
         let env = super::node_env();
