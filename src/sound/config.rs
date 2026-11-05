@@ -23,7 +23,11 @@ pub struct SoundConfig {
     /// sounds folder on the machine running aoe; run "aoe sounds install" there
     /// for a starter pack.
     #[serde(default)]
-    #[setting(label = "Enabled", widget = "toggle")]
+    #[setting(
+        label = "Play sounds",
+        widget = "toggle",
+        summary = "A sound when a Session changes status. Needs sound files on the computer running AoE: run aoe sounds install there for a starter set."
+    )]
     pub enabled: bool,
 
     /// Specify file name with extension.
@@ -60,33 +64,46 @@ pub struct SoundConfig {
 
     /// Play status sounds on the machine running aoe.
     #[serde(default = "default_true")]
-    #[setting(label = "Play on server", widget = "toggle")]
+    #[setting(label = "On the computer running AoE", widget = "toggle")]
     pub server_enabled: bool,
 
     /// Play status sounds in the web dashboard for every session. Needs an
     /// open dashboard tab.
     #[serde(default = "default_true")]
-    #[setting(label = "Play in browser", widget = "toggle")]
+    #[setting(
+        label = "In the Web dashboard",
+        widget = "toggle",
+        summary = "Needs a Web dashboard tab open."
+    )]
     pub browser_enabled: bool,
 
     /// Server playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1.
     /// Ignored when aplay is the Linux backend.
     #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
-    #[setting(label = "Server volume", widget = "custom:sound-volume")]
+    #[setting(
+        label = "Volume",
+        widget = "custom:sound-volume",
+        summary = "From 0.1 to 1.5. Ignored on Linux when sound plays through aplay."
+    )]
     pub server_volume: f64,
 
     /// Browser playback volume, step 0.1. Browsers cap it at 1.0.
     #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
-    #[setting(label = "Browser volume", widget = "custom:sound-volume")]
+    #[setting(
+        label = "Volume",
+        widget = "custom:sound-volume",
+        summary = "From 0.1 to 1.0. Browsers cap it there."
+    )]
     pub browser_volume: f64,
 
     /// Which sessions sound in the browser: all of them, every session except
     /// the one open in that tab, or only while the tab is hidden.
     #[serde(default, skip_serializing_if = "is_default_scope")]
     #[setting(
-        label = "Browser scope",
+        label = "Which Sessions",
         widget = "select",
-        options = "all:All sessions,other_sessions:Other sessions,hidden_tab:Hidden tab only"
+        options = "all:All sessions,other_sessions:Other sessions,hidden_tab:Hidden tab only",
+        summary = "Every Session · Every Session except the one open in this tab · Only while this tab is hidden."
     )]
     pub browser_scope: BrowserScope,
 

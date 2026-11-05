@@ -64,6 +64,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .or_else(|| doc_comment(field))
             .unwrap_or_default();
         let category = attrs.category.unwrap_or_else(|| default_category.clone());
+        let summary = match attrs.summary {
+            Some(text) => quote!(::core::option::Option::Some(#text.to_string())),
+            None => quote!(::core::option::Option::None),
+        };
 
         descriptors.push(quote! {
             FieldDescriptor {
@@ -72,6 +76,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 category: #category.to_string(),
                 label: #label.to_string(),
                 description: #description.to_string(),
+                summary: #summary,
                 widget: #widget,
                 web_write: #web,
                 repo_policy: #repo,
@@ -152,6 +157,7 @@ struct FieldAttrs {
     tui_only: bool,
     label: Option<String>,
     desc: Option<String>,
+    summary: Option<String>,
     category: Option<String>,
     widget: Option<String>,
     web: Option<String>,
@@ -188,6 +194,7 @@ fn parse_field_attrs(field: &syn::Field, field_name: &str) -> syn::Result<FieldA
                 "mono" => out.mono = true,
                 "label" => out.label = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "desc" => out.desc = Some(meta.value()?.parse::<LitStr>()?.value()),
+                "summary" => out.summary = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "category" => out.category = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "widget" => out.widget = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "web" => out.web = Some(meta.value()?.parse::<LitStr>()?.value()),
