@@ -661,7 +661,8 @@ impl PluginHost {
             .map(|u| (u.slot, u.id.clone()))
             .collect();
 
-        let launch = resolve_launch(plugin, &OsLaunchResolver)?;
+        let node_env = tokio::task::spawn_blocking(crate::plugin::node_env).await?;
+        let launch = resolve_launch(plugin, &OsLaunchResolver::new(node_env.clone()))?;
         let prepared = self.sandbox.prepare(&launch)?;
 
         let worker_id = uuid::Uuid::new_v4().to_string();
@@ -680,7 +681,7 @@ impl PluginHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log))
             .kill_on_drop(true);
-        cmd.envs(crate::plugin::node_env());
+        cmd.envs(node_env);
         for (k, v) in &prepared.env {
             cmd.env(k, v);
         }

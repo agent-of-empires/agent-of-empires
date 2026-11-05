@@ -44,18 +44,23 @@ pub(crate) fn remote_exposure() -> bool {
     REMOTE_EXPOSURE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+pub(crate) type NodeEnv = Vec<(&'static str, std::ffi::OsString)>;
+
 fn resolve_node() -> Option<crate::acp::node::ResolvedNode> {
     let config = crate::session::Config::load_or_warn();
     let app_dir = crate::session::get_app_dir().ok()?;
     let node = crate::acp::node::resolve(&config.acp.node_path, &app_dir).ok()?;
     // Builds and workers run in their own cwd, so a relative or bare path must not reach them.
-    let path = absolute_node_path(&node.path)?;
+    let path = absolute_node_path(&node.path, std::env::var_os("PATH"))?;
     Some(crate::acp::node::ResolvedNode { path, ..node })
 }
 
-fn absolute_node_path(path: &std::path::Path) -> Option<PathBuf> {
+fn absolute_node_path(
+    path: &std::path::Path,
+    search: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     if path.components().count() == 1 {
-        which::which(path).ok()
+        which::which_in(path, search, std::env::current_dir().ok()?).ok()
     } else {
         std::path::absolute(path).ok()
     }
@@ -63,13 +68,13 @@ fn absolute_node_path(path: &std::path::Path) -> Option<PathBuf> {
 
 /// `AOE_NODE` plus a `PATH` led by that node's directory, for build steps and
 /// workers. Empty when no Node resolves.
-pub(crate) fn node_env() -> Vec<(&'static str, std::ffi::OsString)> {
+pub(crate) fn node_env() -> NodeEnv {
     resolve_node()
         .map(|node| node_env_for(&node.path))
         .unwrap_or_default()
 }
 
-fn node_env_for(node: &std::path::Path) -> Vec<(&'static str, std::ffi::OsString)> {
+fn node_env_for(node: &std::path::Path) -> NodeEnv {
     let mut env = vec![("AOE_NODE", node.as_os_str().to_owned())];
     if let Some(bin_dir) = node.parent() {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
@@ -177,27 +182,20 @@ mod node_env_tests {
 
     #[test]
     fn node_path_is_made_absolute() {
-        let relative = super::absolute_node_path(Path::new("tools/node")).unwrap();
+        let relative = super::absolute_node_path(Path::new("tools/node"), None).unwrap();
         assert!(relative.is_absolute() && relative.ends_with("tools/node"));
     }
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
-    fn node_env_resolves_bare_aoe_acp_node_through_path() {
+    fn a_bare_node_name_resolves_through_the_given_search_path() {
         let temp = tempfile::tempdir().unwrap();
         let node = super::write_fake_node(temp.path(), "aoe-bare-node");
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("AOE_ACP_NODE", "aoe-bare-node"),
-            ("PATH", temp.path().to_str().unwrap()),
-        ]);
-
-        let env = super::node_env();
-        let aoe_node = env
-            .iter()
-            .find(|(k, _)| *k == "AOE_NODE")
-            .map(|(_, v)| v.clone());
-        assert_eq!(aoe_node, Some(node.into_os_string()));
+        let search = Some(temp.path().as_os_str().to_owned());
+        assert_eq!(
+            super::absolute_node_path(Path::new("aoe-bare-node"), search),
+            Some(node)
+        );
     }
 
     #[cfg(unix)]

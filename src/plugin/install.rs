@@ -1337,8 +1337,8 @@ fn build_in_place(
         ..
     }) = &manifest.runtime
     {
-        super::launch::resolve_command(plugin_id, dir, command, &super::launch::OsLaunchResolver)
-            .with_context(|| {
+        let resolver = super::launch::OsLaunchResolver::new(super::node_env());
+        super::launch::resolve_command(plugin_id, dir, command, &resolver).with_context(|| {
             format!(
                 "plugin {plugin_id}: worker command is not runnable after install \
                      (a build step may have been skipped on this platform, or did not produce it)"
@@ -1350,25 +1350,23 @@ fn build_in_place(
 
 fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLog) -> Result<()> {
     let os = std::env::consts::OS;
+    let node_env = super::node_env();
+    let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
     for (i, step) in steps.iter().enumerate() {
         if !step.platforms.is_empty() && !step.platforms.iter().any(|p| p == os) {
             continue;
         }
         let pretty = step.command.join(" ");
-        let (program, args) = super::launch::resolve_command(
-            plugin_id,
-            dir,
-            &step.command,
-            &super::launch::OsLaunchResolver,
-        )
-        .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
+        let (program, args) =
+            super::launch::resolve_command(plugin_id, dir, &step.command, &resolver)
+                .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
         log.line(&format!("  building {plugin_id}: {pretty}"));
         let (stdout, stderr) = log.child_stdio()?;
         let status = std::process::Command::new(&program)
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
-            .envs(super::node_env())
+            .envs(node_env.clone())
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)

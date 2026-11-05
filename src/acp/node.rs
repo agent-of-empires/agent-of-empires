@@ -1,6 +1,9 @@
 //! Node.js runtime resolution for acp-worker subprocesses.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -85,8 +88,51 @@ pub fn resolve_for(
     Err(NodeError::NoNode(MIN_NODE_MAJOR))
 }
 
+/// How long `node --version` may run before the probe is killed.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn probe_version(path: &Path, timeout: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "node --version timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn verify_path(path: &Path, source: NodeSource) -> Result<ResolvedNode, NodeError> {
-    let output = std::process::Command::new(path).arg("--version").output()?;
+    verify_path_within(path, source, PROBE_TIMEOUT)
+}
+
+fn verify_path_within(
+    path: &Path,
+    source: NodeSource,
+    timeout: Duration,
+) -> Result<ResolvedNode, NodeError> {
+    let output = probe_version(path, timeout)?;
     if !output.status.success() {
         return Err(NodeError::TooOld {
             path: path.to_path_buf(),
@@ -328,6 +374,25 @@ mod tests {
         assert_eq!(parse_major_minor("20"), Some((20, 0)));
         assert_eq!(parse_major_minor("18.17.1"), Some((18, 17)));
         assert_eq!(parse_major_minor("not a version"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_node_probe_is_killed_after_the_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("node");
+        std::fs::write(&node, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let err = verify_path_within(&node, NodeSource::Env, Duration::from_millis(200))
+            .expect_err("a hanging probe must fail");
+        assert!(
+            matches!(&err, NodeError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
