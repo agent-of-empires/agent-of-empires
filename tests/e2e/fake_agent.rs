@@ -1,4 +1,4 @@
-//! The neutral `fake-agent` built-in is detected from a PATH stub and can back a session.
+//! The neutral `fake-agent` built-in is detected from a PATH stub and can back a created session.
 
 use serial_test::parallel;
 
@@ -6,7 +6,7 @@ use crate::harness::{init_git_repo, TuiTestHarness};
 
 #[test]
 #[parallel]
-fn fake_agent_is_detected_and_launchable() {
+fn fake_agent_is_detected_and_creatable() {
     let h = TuiTestHarness::new("fake_agent");
 
     let agents = h.run_cli_ok(&["agents"]);
