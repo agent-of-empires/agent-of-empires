@@ -7,7 +7,8 @@ use tracing::{debug, info, warn};
 
 use super::launch::{apply_mode, set_spawn_model};
 use super::{
-    lock_recover, BroadcastSink, Supervisor, SupervisorError, WorkerKind, WORKER_READY_TIMEOUT,
+    lock_recover, BroadcastSink, UnassignedPrompt, Supervisor, SupervisorError, WorkerKind,
+    WORKER_READY_TIMEOUT,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, ResetSessionOutcome};
 use crate::acp::approvals::{ApprovalDecision, Nonce};
@@ -101,7 +102,37 @@ impl<S: BroadcastSink> Supervisor<S> {
         attachments: &[AttachmentBlob],
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.send_prompt(text, attachments).await?;
+        if let Some(queued) = lock_recover(&self.unassigned_prompts).get_mut(session_id) {
+            queued.push(UnassignedPrompt {
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+            });
+        }
+        if let Err(error) = client.send_prompt(text, attachments).await {
+            if let Some(queued) = lock_recover(&self.unassigned_prompts).get_mut(session_id) {
+                queued.pop();
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn take_unassigned_prompts(&self, session_id: &str) -> Vec<UnassignedPrompt> {
+        lock_recover(&self.unassigned_prompts)
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
+    /// Forward prompts a restart carried over, in order, to the replacement worker.
+    pub(crate) async fn redeliver_prompts(
+        &self,
+        session_id: &str,
+        prompts: Vec<UnassignedPrompt>,
+    ) -> Result<(), SupervisorError> {
+        for prompt in prompts {
+            self.send_prompt(session_id, &prompt.text, &prompt.attachments)
+                .await?;
+        }
         Ok(())
     }
 
