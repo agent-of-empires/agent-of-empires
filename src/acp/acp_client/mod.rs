@@ -22,6 +22,8 @@ mod permission_handlers;
 mod plan;
 mod rate_limit;
 mod raw_input;
+#[cfg(test)]
+mod recovery_tests;
 mod reset;
 mod resolve_command;
 mod runner;
@@ -139,6 +141,26 @@ struct ReattachSpec {
     agent_key: String,
     source_profile: Option<String>,
     claude_home: Option<PathBuf>,
+    state: Arc<SessionState>,
+}
+
+/// Resources and turn ownership survive replacement of the control connection.
+struct SessionState {
+    terminals: TerminalManager,
+    terminal_claim: Arc<TerminalClaim>,
+    cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    rate_limit_rejections: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            terminals: TerminalManager::new(),
+            terminal_claim: Arc::new(TerminalClaim::new()),
+            cancel_deadline: Arc::default(),
+            rate_limit_rejections: Arc::default(),
+        }
+    }
 }
 
 impl Drop for AcpClient {
@@ -214,6 +236,7 @@ struct Launch {
     mcp_servers: Vec<McpServer>,
     claude_home: Option<PathBuf>,
     cancellation: tokio_util::sync::CancellationToken,
+    state: Arc<SessionState>,
 }
 
 impl Launch {
@@ -235,17 +258,15 @@ impl Launch {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
         let label = self.session_id.0.clone();
+        let mut resources =
+            SessionResources::new(self.cwd, self.additional_dirs, label.clone(), self.sandbox);
+        resources.terminals = self.state.terminals.clone();
         let params = ConnectionParams {
             event_tx,
             cmd_rx,
             child: child.clone(),
             pending_responders: pending_responders.clone(),
-            resources: SessionResources::new(
-                self.cwd,
-                self.additional_dirs,
-                label.clone(),
-                self.sandbox,
-            ),
+            resources,
             mode: self.mode,
             ready_tx,
             profile: self.profile,
@@ -538,6 +559,7 @@ impl AcpClient {
                 .and_then(|binding| binding.stores.first())
                 .cloned(),
             cancellation: cancellation.clone(),
+            state: Arc::default(),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -562,6 +584,7 @@ impl AcpClient {
                 agent_key: config.agent_key.clone(),
                 source_profile: launch.source_profile.clone(),
                 claude_home: launch.claude_home.clone(),
+                state: launch.state.clone(),
             };
             let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
             client.runner_pid = Some(runner_pid);
@@ -618,7 +641,7 @@ impl AcpClient {
             ));
         }
         let label = launch.session_id.0.clone();
-        let terminal_claim = Arc::new(TerminalClaim::new());
+        let terminal_claim = launch.state.terminal_claim.clone();
         // The reader may see a cached completion right after Attach, before
         // the handshake marks the adopted turn.
         let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
@@ -635,7 +658,7 @@ impl AcpClient {
                 return Err(AcpError::Spawn("runner construction cancelled".into()));
             }
             connected = connect_runner_control_v3(
-                &control_path, events.0.clone(), label.clone(),
+                &control_path, label.clone(),
                 terminal_claim.clone(), prompt_in_flight.clone(),
             ) => connected,
         };
@@ -653,7 +676,7 @@ impl AcpClient {
         let control_loss = control.loss_handle();
         let runner = RunnerLink {
             control,
-            terminal_claim,
+            state: launch.state.clone(),
             prompt_in_flight,
         };
         let (mut client, ready_rx) = launch.start(events, transport, None, Some(runner));
@@ -696,6 +719,7 @@ impl AcpClient {
             agent_key,
             source_profile,
             claude_home,
+            state: Arc::default(),
         };
         let mode = ConnectMode::Resume {
             acp_session_id: stored_acp_session_id,
@@ -739,6 +763,7 @@ impl AcpClient {
                 .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
                     lease.cancellation().child_token()
                 }),
+            state: spec.state.clone(),
         };
         let mut client =
             Self::connect_via_socket(spec.socket_path.clone(), launch, deadline).await?;

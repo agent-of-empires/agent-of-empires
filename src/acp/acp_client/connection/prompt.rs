@@ -77,7 +77,7 @@ enum Flow {
 #[derive(Default)]
 struct TurnFlags {
     shutdown: bool,
-    rate_limited: bool,
+    rate_limit: Option<RateLimitInfo>,
     force_stopped: bool,
     prompt_orphaned: bool,
     agent_unresponsive: bool,
@@ -110,11 +110,9 @@ impl Turn {
             .apply_signal(signal, Instant::now(), chrono::Utc::now(), self.cfg);
     }
 
-    fn start_cancel_grace(&mut self) {
+    fn start_cancel_grace(&mut self, deadline: Instant) {
         self.flags.cancelling = true;
-        self.cancel_grace
-            .as_mut()
-            .reset(Instant::now() + CANCEL_ESCALATION_GRACE);
+        self.cancel_grace.as_mut().reset(deadline);
     }
 }
 
@@ -167,6 +165,7 @@ impl Session {
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
         clear_captured_rejections(&shared.rate_limit_rejections);
+        *shared.cancel_deadline.lock().unwrap() = None;
         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
         // Bump the epoch before sending so envelopes from a handler parked on
         // the previous prompt are discarded.
@@ -312,38 +311,20 @@ impl Session {
         turn: &mut Turn,
         res: AcpResult<PromptResponse>,
     ) -> AcpResult<Flow> {
-        let e = match res {
-            Ok(resp) => {
-                turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
-                turn.flags.agent_stop_reason = Some(resp.stop_reason);
-                if !turn.flags.prompt_cancelled {
-                    if let Some(info) = self.take_parking_rejection() {
-                        self.shared.emit(Event::RateLimit { info }).await;
-                        turn.flags.rate_limited = true;
-                        turn.flags.shutdown = true;
-                    }
-                }
-                return Ok(Flow::Break);
-            }
-            Err(e) => e,
-        };
-        let label = &self.shared.session_label;
-        // A rate limit parks the session rather than burning restart budget
-        // on a worker that would hit it again (#1281).
-        let resets_at =
-            captured_rate_limit_resets_at(&self.shared.rate_limit_rejections, chrono::Utc::now());
-        if let Some(info) = classify_rate_limit_error(&e, resets_at) {
-            info!(
-                target: "acp.protocol",
-                session = %label,
-                resets_at = ?info.resets_at,
-                "session/prompt returned rate_limit; parking session"
-            );
-            self.shared.emit(Event::RateLimit { info }).await;
-            turn.flags.rate_limited = true;
+        if let Ok(response) = &res {
+            turn.flags.prompt_cancelled = matches!(response.stop_reason, StopReason::Cancelled);
+            turn.flags.agent_stop_reason = Some(response.stop_reason);
+        }
+        if let Some(info) = self.completion_rate_limit(&res) {
+            turn.flags.rate_limit = Some(info);
             turn.flags.shutdown = true;
             return Ok(Flow::Break);
         }
+        let e = match res {
+            Ok(_) => return Ok(Flow::Break),
+            Err(e) => e,
+        };
+        let label = &self.shared.session_label;
         // A resumed id the agent dropped: reset context so the respawn opens
         // a fresh session instead of terminating the runner (#3560).
         if self.session_from_storage && is_unsupported_session_error(&e) {
@@ -367,8 +348,24 @@ impl Session {
 
     /// The adapter can end a limited turn normally, so a still-future rejected
     /// window captured during it is the only evidence; park like the error path.
-    fn take_parking_rejection(&self) -> Option<RateLimitInfo> {
+    pub(super) fn completion_rate_limit(
+        &self,
+        result: &AcpResult<PromptResponse>,
+    ) -> Option<RateLimitInfo> {
         let shared = &self.shared;
+        match result {
+            Err(error) => {
+                return classify_rate_limit_error(
+                    error,
+                    captured_rate_limit_resets_at(
+                        &shared.rate_limit_rejections,
+                        chrono::Utc::now(),
+                    ),
+                )
+            }
+            Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
+            Ok(_) => {}
+        }
         let info = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             chrono::Utc::now(),
@@ -380,6 +377,23 @@ impl Session {
             "prompted turn ended on a rejected rate-limit window; parking session"
         );
         Some(info)
+    }
+
+    pub(super) async fn request_cancel(&self) -> Instant {
+        let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+        {
+            let mut current = self.shared.cancel_deadline.lock().unwrap();
+            if let Some(deadline) = *current {
+                return deadline;
+            }
+            *current = Some(deadline);
+        }
+        let escalates_at =
+            chrono::Utc::now() + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE).unwrap();
+        self.shared
+            .emit(Event::CancelRequested { escalates_at })
+            .await;
+        deadline
     }
 
     async fn reject_busy(&self, text: String) {
@@ -398,13 +412,7 @@ impl Session {
                 self.send_cancel().await?;
                 // Only the first cancel arms escalation and tells the UI.
                 if !turn.flags.cancelling {
-                    turn.start_cancel_grace();
-                    let escalates_at = chrono::Utc::now()
-                        + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(10));
-                    self.shared
-                        .emit(Event::CancelRequested { escalates_at })
-                        .await;
+                    turn.start_cancel_grace(self.request_cancel().await);
                 }
             }
             Some(ClientCmd::ForceStop) => {
@@ -560,7 +568,9 @@ impl Session {
             }
             turn.flags.orphan_cancel_sent = true;
             if !turn.flags.cancelling {
-                turn.start_cancel_grace();
+                let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+                *self.shared.cancel_deadline.lock().unwrap() = Some(deadline);
+                turn.start_cancel_grace(deadline);
             }
         }
         let next = Instant::now() + turn.orphan_check_period;
@@ -621,6 +631,7 @@ impl Session {
 
     async fn finish_turn(&mut self, mut turn: Turn, prompt_started_at_ms: i64) {
         let shared = self.shared.clone();
+        let mut preceding = Vec::new();
         // A cost marker can land in the same tick the prompt resolves (#2370).
         while let Ok(env) = self.lifecycle_rx.try_recv() {
             if env.epoch == turn.epoch {
@@ -633,12 +644,12 @@ impl Session {
             if let Some(message) =
                 recover_opencode_prompt_error(&self.acp_session_id.0, prompt_started_at_ms)
             {
-                shared.emit(Event::PromptRuntimeError { message }).await;
+                preceding.push(Event::PromptRuntimeError { message });
             }
         }
-        let f = &turn.flags;
+        let f = &mut turn.flags;
         let reason = terminal_stop_reason(
-            f.rate_limited,
+            f.rate_limit.is_some(),
             f.force_stopped,
             f.prompt_orphaned,
             f.agent_unresponsive,
@@ -646,15 +657,15 @@ impl Session {
             f.prompt_cancelled,
             f.orphan_cancel_sent && finished,
         );
+        if let Some(info) = f.rate_limit.take() {
+            preceding.push(Event::RateLimit { info });
+        }
         // A completion the runner reports after this is dropped.
         shared.terminal_claim.claim();
-        shared
-            .emit(Event::Stopped {
-                reason: reason.into(),
-            })
-            .await;
+        shared.publish_terminal(reason.into(), preceding).await;
         shared.reset_message_dedup();
         shared.prompt_in_flight.store(false, Ordering::Relaxed);
+        *shared.cancel_deadline.lock().unwrap() = None;
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
             target: "acp.protocol",

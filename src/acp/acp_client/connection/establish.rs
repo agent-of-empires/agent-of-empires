@@ -251,7 +251,13 @@ pub(super) async fn establish(
     session.apply_default_model().await;
     session.apply_default_effort().await;
     if adopted_turn && live_recovery.is_none() {
-        spawn_resume_idle_watchdog(shared);
+        spawn_resume_idle_watchdog(
+            shared,
+            session
+                .control
+                .as_ref()
+                .map(|control| control.disconnected.clone()),
+        );
     }
     Ok(Some(session))
 }
@@ -259,12 +265,24 @@ pub(super) async fn establish(
 /// Fallback when an adopted turn neither completes nor shows activity, so the
 /// UI cannot stay "thinking" forever. Once the turn is observable, completion
 /// belongs to the between-prompt watchdog.
-fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
+fn spawn_resume_idle_watchdog(
+    shared: Arc<Shared>,
+    disconnected: Option<tokio_util::sync::CancellationToken>,
+) {
     let grace_ms = resume_idle_grace().as_millis() as i64;
     let interval = resume_idle_check_interval();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                biased;
+                _ = async {
+                    match &disconnected {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
             if shared.terminal_claim.claimed()
                 || shared.prompt_sent_since_attach.load(Ordering::Relaxed)
             {

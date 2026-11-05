@@ -36,7 +36,6 @@ use super::commands::{ClientCmd, ConnectMode};
 use super::control::DaemonControlClient;
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
-use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::{captured_rate_limit_resets_at, classify_rate_limit_from_message};
@@ -45,7 +44,7 @@ use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
 };
-use super::SessionResources;
+use super::{SessionResources, SessionState};
 use notifications::Shared;
 
 /// After a cancel, declare the adapter unresponsive if no prompt response
@@ -59,9 +58,7 @@ pub(super) type ReadyTx = Mutex<Option<oneshot::Sender<Result<(), AcpError>>>>;
 
 pub(super) struct RunnerLink {
     pub(super) control: Arc<DaemonControlClient>,
-    /// Shared with the control reader, which claims an adopted turn's
-    /// completion so the fallback watchdogs stand down.
-    pub(super) terminal_claim: Arc<TerminalClaim>,
+    pub(super) state: Arc<SessionState>,
     pub(super) prompt_in_flight: Arc<AtomicBool>,
 }
 
@@ -158,13 +155,9 @@ pub(super) async fn run_connection_task<W, R>(
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
-    let (control, terminal_claim, prompt_in_flight) = match runner {
-        Some(r) => (Some(r.control), r.terminal_claim, r.prompt_in_flight),
-        None => (
-            None,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-        ),
+    let (control, state, prompt_in_flight) = match runner {
+        Some(r) => (Some(r.control), r.state, r.prompt_in_flight),
+        None => (None, Arc::default(), Arc::new(AtomicBool::new(false))),
     };
     let _control_shutdown = super::control::ShutdownControlOnDrop(control.clone());
     // A runner owns identity across daemons, so its ingress is the one that
@@ -189,7 +182,7 @@ pub(super) async fn run_connection_task<W, R>(
         label.clone(),
         profile,
         lifecycle_tx,
-        terminal_claim,
+        state,
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
@@ -227,7 +220,10 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             SessionIngressNotification::PromptCompleted(marker) => {
                                 if let Some(control) = control.as_ref() {
-                                    control.deliver_prompt_completion(marker);
+                                    if let Some(outcome) = control.deliver_prompt_completion(marker)
+                                    {
+                                        shared.adopted_completion_tx.send_replace(Some(outcome));
+                                    }
                                 }
                                 return Ok(());
                             }
