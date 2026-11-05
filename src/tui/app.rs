@@ -3853,10 +3853,10 @@ mod tests {
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = crate::acp::client::DaemonEndpoint::new(
+        let endpoint = crate::daemon::DaemonEndpoint::new(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let mut app = App::new(

@@ -713,13 +713,13 @@ mod retained_tests {
             Some(DaemonEndpoint::new(
                 url.clone(),
                 None,
-                crate::acp::client::discovery::Source::Env,
+                crate::daemon::Source::Env,
             )),
             None,
             Some(DaemonEndpoint::new(
                 "not a URL".into(),
                 None,
-                crate::acp::client::discovery::Source::Env,
+                crate::daemon::Source::Env,
             )),
         ] {
             let mut view = RetainedView::new(endpoint, &inst);
@@ -783,7 +783,7 @@ mod retained_tests {
             let endpoint = DaemonEndpoint::new(
                 "http://127.0.0.1:1".into(),
                 None,
-                crate::acp::client::discovery::Source::Env,
+                crate::daemon::Source::Env,
             );
             let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
             let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
@@ -845,7 +845,7 @@ mod retained_tests {
         let endpoint = DaemonEndpoint::new(
             "http://127.0.0.1:1".into(),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
@@ -935,7 +935,7 @@ mod retained_tests {
         let endpoint = DaemonEndpoint::new(
             "http://127.0.0.1:1".into(),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
@@ -976,7 +976,7 @@ mod retained_tests {
                 let endpoint = DaemonEndpoint::new(
                     "http://127.0.0.1:1".into(),
                     None,
-                    crate::acp::client::discovery::Source::Env,
+                    crate::daemon::Source::Env,
                 );
                 let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
@@ -1155,7 +1155,7 @@ mod retained_tests {
                 let endpoint = DaemonEndpoint::new(
                     "http://127.0.0.1:1".into(),
                     None,
-                    crate::acp::client::discovery::Source::Env,
+                    crate::daemon::Source::Env,
                 );
                 let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
@@ -1337,7 +1337,7 @@ mod retained_tests {
             let endpoint = DaemonEndpoint::new(
                 format!("http://{}", listener.local_addr().unwrap()),
                 None,
-                crate::acp::client::discovery::Source::Env,
+                crate::daemon::Source::Env,
             );
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let mut view = RetainedView::new(Some(endpoint), &inst);
@@ -1436,7 +1436,7 @@ mod retained_tests {
             let endpoint = DaemonEndpoint::new(
                 format!("http://{}", listener.local_addr().unwrap()),
                 None,
-                crate::acp::client::discovery::Source::Env,
+                crate::daemon::Source::Env,
             );
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let mut view = RetainedView::new(Some(endpoint), &inst);
@@ -1566,7 +1566,7 @@ mod retained_tests {
         let endpoint = DaemonEndpoint::new(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let _endpoint =
             crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &endpoint.base_url)]);
@@ -1740,7 +1740,7 @@ mod retained_tests {
         let endpoint = DaemonEndpoint::new(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut inst = crate::session::Instance::new("retained", "/tmp");

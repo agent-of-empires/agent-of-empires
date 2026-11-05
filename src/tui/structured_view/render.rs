@@ -2642,11 +2642,12 @@ mod tests {
             thought("options\nsecond line", "t-a"),
             thought(&long, "t-b"),
         ]);
-        let lines: Vec<String> = transcript_lines(&t, &Theme::default(), None)
-            .iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-            .filter(|line: &String| !line.is_empty())
-            .collect();
+        let lines: Vec<String> =
+            transcript_lines(&t, &Theme::default(), None, ToolOutputMode::Compact)
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .filter(|line: &String| !line.is_empty())
+                .collect();
         assert_eq!(
             lines,
             [
