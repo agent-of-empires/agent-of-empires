@@ -48,6 +48,9 @@ export const test = base.extend({
         return response;
       };
     });
+    // A writable Daemon's answer. The dashboard hides write actions while /api/about has no answer, so a spec
+    // that wants that state, or another answer, routes it itself (later routes take precedence).
+    await page.route("**/api/about", (r) => r.fulfill({ json: { read_only: false } }));
     const started = await startCoverage(page);
     await use(page);
     await stopAndWriteCoverage(page, testInfo.titlePath.join(" > "), started);

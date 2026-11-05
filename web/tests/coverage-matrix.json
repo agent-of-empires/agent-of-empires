@@ -3936,6 +3936,25 @@
       "notes": "Live coverage checks authoritative /api/about policy, pre-extraction mutation refusal and dashboard shortcut suppression. Terminal policy transitions and passive consumers are exercised by terminal.live-split-composite; this live spec does not open an existing terminal."
     },
     {
+      "id": "read-only.unknown-about",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/clientCapabilities.test.ts",
+        "src/lib/__tests__/serverAbout.test.ts",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/lib/clientCapabilities.ts",
+        "web/src/lib/serverAbout.ts",
+        "web/src/components/ServerSettingsBanner.tsx",
+        "web/src/components/BannerStack.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "The dashboard asks /api/about three times before rendering its shell. With no answer, every write gate (Restart Agent, Switch to Terminal view, new-terminal buttons, new session, the readOnly props) stays hidden, a notice explains why with Retry, and the answer is asked for again on reconnect; any answer is followed. Shortcuts report ready only once the answer is in."
+    },
+    {
       "id": "ensure-session-restart",
       "kind": "live-playwright",
       "risk": "high",
