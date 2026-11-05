@@ -164,7 +164,12 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
     : option.options;
 
   const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (!searchable || e.nativeEvent.isComposing) return;
+    if (!searchable) return;
+    // A composing Escape dismisses the IME candidate; keep it from reaching the document listener below.
+    if (e.nativeEvent.isComposing) {
+      if (e.key === "Escape") e.stopPropagation();
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -297,7 +302,7 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
           <div ref={menuRef} role="menu" aria-label={option.name} className="min-h-0 overflow-y-auto">
             {searchable && filteredOptions.length === 0 && (
               <div role="status" className="px-3 py-2 text-xs text-text-dim">
-                No models match your search.
+                {query.trim() ? "No models match your search." : "No models available."}
               </div>
             )}
             {filteredOptions.map((opt) => {
@@ -310,7 +315,10 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
                   type="button"
                   role="menuitem"
                   disabled={!!lockedReason || isPending}
-                  onClick={() => {
+                  onClick={(e) => {
+                    // Keyboard activation (detail 0, native or the search field's click()) unmounts the
+                    // focused element, so hand focus back to the trigger before the menu goes away.
+                    if (e.detail === 0) triggerRef.current?.focus({ preventScroll: true });
                     if (lockedReason || isPending || isCurrent) {
                       setOpen(false);
                       return;

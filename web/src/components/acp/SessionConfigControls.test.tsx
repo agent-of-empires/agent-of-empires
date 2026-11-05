@@ -147,6 +147,44 @@ describe("SessionConfigControls", () => {
     expect(screen.getAllByRole("menuitem")).toHaveLength(models.options.length);
   });
 
+  // Selecting unmounts whatever held focus, so keyboard paths hand it back to the chip (#4894).
+  it("returns focus to the chip after keyboard selection and leaves pointer clicks alone", () => {
+    const { onSetConfigOption } = mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: "sonnet" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
+    expect(document.activeElement).toBe(chip);
+    // A pointer click reports its click count; focus keeps following the browser's own rules.
+    fireEvent.click(chip);
+    const sonnet = byId("model-value-claude-sonnet-4-6") as HTMLButtonElement;
+    sonnet.focus();
+    fireEvent.click(sonnet, { detail: 1 });
+    expect(document.activeElement).not.toBe(chip);
+  });
+
+  it("keeps the picker open when Escape cancels an IME composition", () => {
+    mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.keyDown(search, { key: "Escape", isComposing: true });
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(chip);
+  });
+
+  it("distinguishes an advertised model list with no options from a search with no matches", () => {
+    mount([{ ...MODEL, options: [] }]);
+    fireEvent.click(byId("model")!);
+    expect(screen.getByRole("status").textContent).toBe("No models available.");
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), { target: { value: "opus" } });
+    expect(screen.getByRole("status").textContent).toBe("No models match your search.");
+  });
+
   // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible (#3747).
   it.each([
     ["ample room above", 400, 420, 800, undefined, 0, "up", 288],

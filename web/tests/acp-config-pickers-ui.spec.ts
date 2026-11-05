@@ -127,6 +127,8 @@ test("model search focuses on open, handles keyboard selection, and resets after
   await opus.press("ArrowDown");
   await expect(sonnet).toBeFocused();
   await sonnet.press("Enter");
+  // Enter on a result unmounts it; focus lands back on the chip rather than on the body.
+  await expect(modelChip).toBeFocused();
   await expect(modelChip).toContainText("Claude Sonnet 4.6");
   expect(mock.configOptionBodies).toEqual([{ config_id: "model", value: "claude-sonnet-4-6" }]);
   expect(await publishedRequests(page, `/api/sessions/${mock.sessionId}/acp/prompt`, "POST")).toEqual([]);
@@ -135,6 +137,8 @@ test("model search focuses on open, handles keyboard selection, and resets after
   await expect(search).toBeFocused();
   await search.fill("opus");
   await search.press("Enter");
+  // Same for Enter from the search field, which selects through a programmatic click.
+  await expect(modelChip).toBeFocused();
   await expect(modelChip).toContainText("Claude Opus 4.7");
   expect(mock.configOptionBodies).toEqual([
     { config_id: "model", value: "claude-sonnet-4-6" },
