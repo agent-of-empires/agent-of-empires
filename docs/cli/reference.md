@@ -990,6 +990,7 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 ###### **Options:**
 
 * `--yes` — Grant all requested capabilities without prompting
+* `--dev` — Install a local directory as a dev plugin: it may claim a reserved `aoe.*` / `agent-of-empires.*` id, is never featured, and is refused under `aoe serve --remote`
 
 
 
