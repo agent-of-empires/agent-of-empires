@@ -72,14 +72,9 @@ test("command palette switches sessions", async ({ page, spawnServe }) => {
 test("Cmd/Ctrl+` activates the paired terminal panel", async ({ page, spawnServe }) => {
   const serve = await spawnServe({ seedFn: seedSessionViaAoeAdd({ title: "story-terminal-focus" }) });
   const [seeded] = await listSessions(serve.baseUrl);
-  await expect
-    .poll(async () => {
-      const session = (await listSessions(serve.baseUrl)).find((row) => row.id === seeded!.id);
-      return !!session && !["Creating", "Starting"].includes(session.status) && !session.lifecycle_reservation;
-    })
-    .toBe(true);
   await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded!.id)}`);
   await expect(page.locator('[data-testid="content-split-resize-handle"]')).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator('[data-term="agent"]').first()).toBeVisible({ timeout: 15_000 });
 
   // The chord activates the paired terminal tab and focuses it once its PTY is ready.
   await page.locator("body").click({ position: { x: 5, y: 5 } });
