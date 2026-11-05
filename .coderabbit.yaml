@@ -1,48 +1,45 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 #
-# CodeRabbit configuration for agent-of-empires.
-# Reference: https://docs.coderabbit.ai/reference/yaml-template
-# Schema:    https://coderabbit.ai/integrations/schema.v2.json
-#
-# Style note: this repo bans em dashes everywhere (see AGENTS.md), including
-# yaml comments. Use commas, semicolons, or rephrase.
-#
-# Philosophy: start small. AGENTS.md is the source of truth; CodeRabbit reads
-# it via knowledge_base.code_guidelines below, so we do not restate its rules
-# here. Pre-merge gates start at `warning` and only graduate to `error` once
-# real PR traffic shows they catch real problems. Tools that CI already runs
-# (clippy, eslint) are left to CI to avoid duplicate signal.
+# Maintainer review assistance; humans approve scope, implementation, and merge.
+# Reference: https://docs.coderabbit.ai/reference/configuration
+# Keep checks advisory and leave CI-owned lint and title gates to CI.
 
 language: en-US
 
-tone_instructions: "Review code like a calm, friendly senior engineer. Be clear, constructive, and encouraging. Explain the reasoning behind suggestions, assume good intentions, and occasionally use light, friendly humor when appropriate."
+tone_instructions: "Be concise and evidence-first. Prioritize correctness, security, regressions, and missing verification. State the impact and what would satisfy each finding. Avoid speculative improvements and repeated CI lint feedback."
 
-# Beta features can shift under us; stay on stable until we have a reason.
+# Do not opt into early-access features.
 early_access: false
 enable_free_tier: true
 
 reviews:
   profile: chill
 
-  # Comment-only reviews; do not auto-request changes from CodeRabbit.
-  request_changes_workflow: false
+  # CodeRabbit advises; human code owners approve.
+  auto_approvals:
+    enabled: false
+    allow_author_approval: false
 
   high_level_summary: true
-  high_level_summary_instructions: "Provide a concise, high-level summary of the code changes, focusing on the most significant improvements and potential areas for further enhancement. Use clear and concise language, and avoid overly technical jargon. We just want to know what changed, what moved, what was added, what was removed. Not technically. Then you can add technical jargons in another block if needed. Provide the benefits of the PR if you can"
+  high_level_summary_instructions: |
+    Give maintainers a concise review brief: user-visible behavior changed,
+    affected areas, linked-issue coverage and scope deviations, and concrete
+    risks. Separate author-reported verification from checks you observed;
+    identify missing evidence without claiming tests ran. Link related work.
+    Leave scope approval, issue disposition, and merge decisions to humans.
   high_level_summary_placeholder: "@coderabbitai summary"
   high_level_summary_in_walkthrough: false
 
   auto_title_placeholder: "@coderabbitai title"
-  auto_title_instructions: "Generate a short, action-oriented PR title. Start with a verb in the imperative form. Focus only on what changed, not why. Keep it concise and specific"
+  auto_title_instructions: |
+    Follow CONTRIBUTING.md and .github/workflows/pr-title-check.yml:
+    use <type>(<optional scope>): <lowercase subject>, with a concise,
+    imperative subject describing the change.
 
   review_status: true
-  # Off to stop CodeRabbit from posting a separate per-commit status check.
-  # The walkthrough comment on the PR is enough signal; CI already gates
-  # merges via clippy, eslint, tests, and codecov.
+  # Show review progress, not an additional legacy commit status or merge gate.
+  review_progress: true
   commit_status: false
-  # Fails the GitHub commit check when CodeRabbit cannot complete a review
-  # (errors, timeouts, service unavailable). It does NOT fail based on review
-  # findings; those are surfaced as comments.
   fail_commit_status: false
 
   collapse_walkthrough: false
@@ -54,8 +51,8 @@ reviews:
   related_issues: true
   related_prs: true
 
-  suggested_labels: true
-  labeling_instructions: []
+  # The repository's triage labels describe issues, not PR review readiness.
+  suggested_labels: false
   auto_apply_labels: false
 
   # Reviewer routing is handled by CODEOWNERS teams.
@@ -69,10 +66,7 @@ reviews:
 
   path_filters: []
 
-  # Intentionally empty. AGENTS.md and CLAUDE.md are loaded as
-  # knowledge_base.code_guidelines below; restating rules here would create
-  # two sources of truth that drift. Add entries only when CodeRabbit needs
-  # signal that AGENTS.md cannot express.
+  # Canonical policy documents are loaded below, not copied into path rules.
   path_instructions: []
 
   abort_on_close: true
@@ -80,10 +74,7 @@ reviews:
 
   auto_review:
     enabled: true
-    # On. CodeRabbit does proper housekeeping between incremental reviews
-    # (does not keep previous reviews open) and self-caps at roughly 3
-    # follow-up commits per PR before switching to manual review, so the
-    # noise that originally motivated turning this off is bounded.
+    # Incremental reviews pause after five reviewed commits by default.
     auto_incremental_review: true
     ignore_title_keywords:
       - "Dependencies"
@@ -95,8 +86,7 @@ reviews:
     base_branches: ["main"]
     ignore_usernames: []
 
-  # Optional auto-commits CodeRabbit can offer at the end of a review. Each
-  # one is a "click to accept" suggestion; nothing lands without approval.
+  # Manually triggered finishing touches still require human review.
   finishing_touches:
     docstrings:
       enabled: true
@@ -105,21 +95,50 @@ reviews:
     simplify:
       enabled: true
 
-  # Gates that run before merge. Start everything at `warning` so we can
-  # observe real PR traffic before promoting any of these to `error`.
+  # Advisory readiness checks, not evidence of human approval or passing CI.
   pre_merge_checks:
+    # AGENTS.md requires useful documentation, not blanket docstring coverage.
     docstrings:
-      mode: warning
-      threshold: 80
+      mode: "off"
     issue_assessment:
       mode: warning
     title:
-      mode: warning
-      requirements: |
-        PR titles should start with a Conventional Commit prefix: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`, `test:`, `perf:`, or `ci:`.
-        Use imperative mood. Keep the title under ~70 chars and let the body carry the detail.
+      # The PR Title Check workflow owns enforcement.
+      mode: "off"
     description:
       mode: warning
+    # Custom checks require CodeRabbit Team or above.
+    custom_checks:
+      - name: Scope evidence
+        mode: warning
+        instructions: |
+          Use CONTRIBUTING.md and linked issue/PR discussion as the source of
+          truth. Pass for changes that do not introduce significant features or
+          architecture changes, or when the description links the agreed design,
+          acceptance criteria, and non-goals for such a change. Warn when a
+          significant feature or architecture change has no linked scope
+          discussion, or when the diff contradicts explicit agreed non-goals.
+          If linked discussion cannot be read or agreement is ambiguous, return
+          Inconclusive and identify the missing evidence. Cite the specific gap
+          and what would satisfy it. An issue link alone is not approval.
+          Do not inspect reviewer assignments or approval status, infer human
+          approval from this check, or approve, close, assign, or merge anything.
+      - name: Verification evidence
+        mode: warning
+        instructions: |
+          Check the PR description against the actual changed surfaces and the
+          testing requirements in AGENTS.md and any applicable nested AGENTS.md.
+          Pass when it reports applicable commands and outcomes, behavior
+          exercised, and any coverage limitations. For user-facing web or
+          TUI/CLI changes, require the relevant Test Coverage Analysis choice
+          from .github/pull_request_template.md, with a reason if tests are
+          skipped, and a screenshot or recording for UI changes. For config-only
+          or docs-only changes, accept relevant validation without Rust tests.
+          Warn for missing applicable evidence or a coverage choice that
+          contradicts the diff. Return Inconclusive if required context is
+          unavailable. Cite the missing evidence and what would satisfy it.
+          Do not run repository code or claim author-reported tests were
+          independently verified; green CI alone does not prove behavior.
 
   tools:
     # CI already runs `cargo clippy -- -D warnings` and the web `eslint`
@@ -162,16 +181,14 @@ knowledge_base:
     enabled: true
   code_guidelines:
     enabled: true
-    # AGENTS.md is the canonical rule set; CLAUDE.md is a symlink to it but
-    # we list both since the symlink may not be resolved by the scanner.
-    # DESIGN.md carries visual rules referenced by AGENTS.md.
+    # Include contribution and authority policy alongside coding guidelines.
     filePatterns:
       - "**/AGENTS.md"
       - "**/CLAUDE.md"
       - "**/DESIGN.md"
-  # `auto` keeps learnings per-repo unless the same content shows up in a
-  # sibling repo, which matches the current solo-repo reality. Switch to
-  # `global` deliberately if AoE grows into an org with shared conventions.
+      - "CONTRIBUTING.md"
+      - "MAINTAINERS.md"
+  # `auto` uses local context for public repos, global for private repos.
   learnings:
     scope: auto
   issues:
@@ -185,15 +202,26 @@ code_generation:
   docstrings:
     language: en-US
 
-# Trial for duplicate and related-work detection (#4704). Suggestions only:
-# planning runs on a manual `@coderabbitai plan`, labels are never applied.
+# Duplicate/related-work enrichment is advisory; humans decide disposition.
+# Humans opt issues into planning with ready-for-agent; needs-triage vetoes it.
+# Positive labels OR-match; exclusions always win. Planning requires Team+.
 issue_enrichment:
   auto_enrich:
     enabled: true
   planning:
     enabled: true
     auto_planning:
-      enabled: false
-      labels: []
+      enabled: true
+      labels:
+        - ready-for-agent
+        - "!needs-triage"
   labeling:
     auto_apply_labels: false
+    # Suggest only the existing intake label, never promote to ready-for-agent.
+    labeling_instructions:
+      - label: needs-triage
+        instructions: |
+          Suggest when an issue still needs maintainer evaluation, including
+          missing information or a possible duplicate. Follow
+          docs/agents/triage-labels.md and CONTRIBUTING.md. Do not suggest
+          ready-for-agent, decide acceptance, close issues, or change assignees.
