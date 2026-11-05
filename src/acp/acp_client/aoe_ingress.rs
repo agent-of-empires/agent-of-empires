@@ -50,9 +50,11 @@ impl AoeIngress {
         *self.order.lock().expect("aoe ordering mutex poisoned") = ArrivalOrder::default();
     }
 
-    /// A reset commit starts a new native session: its keys are fresh and
-    /// frames held for the old one are dropped.
+    /// A reset commit starts a new native session: its keys are fresh, frames
+    /// held for the old one are dropped, and a lost integration is restored,
+    /// matching the reducer clearing `integration_lost` on the new session.
     pub(super) fn session_reset(&self) {
+        self.lost.store(false, Ordering::Relaxed);
         self.order
             .lock()
             .expect("aoe ordering mutex poisoned")
@@ -255,5 +257,17 @@ mod tests {
             ["b"],
             "key reusable"
         );
+    }
+
+    #[test]
+    fn a_session_reset_restores_a_lost_integration() {
+        let i = ingress(true);
+        assert!(matches!(
+            i.ingest(frame("bad", json!({"v": 1})), true, 0, 0),
+            Ingested::Lost(_)
+        ));
+        assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
+        i.session_reset();
+        assert_eq!(ids(i.ingest(frame("b", json!(null)), true, 0, 0)), ["b"]);
     }
 }
