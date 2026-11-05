@@ -7,11 +7,11 @@ use crate::acp::state::{
     AvailableCommand, ConfigOptionDescriptor, Event, Plan, PlanStep, SessionMode, SessionUsage,
     ToolCall, UsageCost,
 };
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::v1::schema::{
     CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, SessionId,
     SessionUpdate, TextContent,
 };
-use agent_client_protocol::schema::MaybeUndefined;
 use tracing::debug;
 
 use super::config_options::map_acp_config_option;
@@ -19,7 +19,8 @@ use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
     background_agent_launched_from_value, background_command_launched_from_value,
-    background_task_started_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_task_started_from_value, background_task_stopped_from_value, monitor_event_from_raw,
+    wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -332,7 +333,7 @@ pub(super) fn map_update_to_events(
             }
             other => vec![raw_event(&other)],
         },
-        // Only seen on replay (#2276): live prompts record UserPromptSent.
+        // Import replay only (#2276); `Shared` drops live echoes, which duplicate UserPromptSent.
         SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
                 text: text.text,
@@ -343,7 +344,13 @@ pub(super) fn map_update_to_events(
             }],
             other => vec![raw_event(&other)],
         },
-        SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Event::AgentThoughtChunk {
+                text: text.text,
+                message_id: chunk.message_id.map(|id| id.0.to_string()),
+            }],
+            _ => vec![Event::ThinkingStarted],
+        },
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty rather than "null" without raw_input (#1713).
@@ -382,7 +389,7 @@ pub(super) fn map_update_to_events(
             if profile.supports_exit_plan_mode
                 && matches!(
                     tc.kind,
-                    agent_client_protocol::schema::v1::ToolKind::SwitchMode
+                    agent_client_protocol::v1::schema::ToolKind::SwitchMode
                 )
             {
                 if let Some(plan) = extract_plan_from_switch_mode(&raw_args) {
@@ -397,7 +404,7 @@ pub(super) fn map_update_to_events(
             if profile.emits_heartbeat_keepalives && is_heartbeat_tool_call_id(&id) {
                 return Vec::new();
             }
-            use agent_client_protocol::schema::v1::ToolCallStatus;
+            use agent_client_protocol::v1::schema::ToolCallStatus;
             // `InProgress` re-stamps `started_at` so durations measure the
             // tool, not adapter scheduling (#1060).
             let (is_error, completed, in_progress) = match update.fields.status {
@@ -481,6 +488,7 @@ pub(super) fn map_update_to_events(
                         if profile.supports_wakeup_tools {
                             events.extend(background_command_launched_from_value(&payload));
                             events.extend(background_task_started_from_value(&payload));
+                            events.extend(background_task_stopped_from_value(&payload));
                         }
                         events.push(Event::RawAgentUpdate { payload });
                     }
@@ -588,7 +596,7 @@ pub(super) fn map_update_to_events(
             vec![Event::UsageUpdated { usage }]
         }
         SessionUpdate::AvailableCommandsUpdate(u) => {
-            use agent_client_protocol::schema::v1::AvailableCommandInput;
+            use agent_client_protocol::v1::schema::AvailableCommandInput;
             let commands: Vec<AvailableCommand> = u
                 .available_commands
                 .into_iter()
@@ -665,7 +673,7 @@ mod tests {
     use crate::acp::acp_client::test_helpers::{compaction_chunk, compaction_update, text_chunk};
     use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
     use crate::acp::state::ConfigOptionCategory;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         Content, ContentChunk, TextContent, ToolCall as AcpToolCall, ToolCallContent,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };
@@ -695,6 +703,25 @@ mod tests {
                 message_id: None,
                 ..
             }
+        ));
+    }
+
+    /// #5088: a text thought keeps its text and id; other content only
+    /// signals thinking.
+    #[test]
+    fn agent_thought_chunk_keeps_text_and_message_id() {
+        use agent_client_protocol::v1::schema::ImageContent;
+        let thought = |content| SessionUpdate::AgentThoughtChunk(ContentChunk::new(content));
+        let text = ContentChunk::new(ContentBlock::Text(TextContent::new("hmm"))).message_id("m-1");
+        let events = claude(SessionUpdate::AgentThoughtChunk(text));
+        assert!(
+            matches!(events.as_slice(), [Event::AgentThoughtChunk { text, message_id }] if text == "hmm" && message_id.as_deref() == Some("m-1")),
+            "{events:?}"
+        );
+        let image = ContentBlock::Image(ImageContent::new("BASE64IMG", "image/png"));
+        assert!(matches!(
+            claude(thought(image)).as_slice(),
+            [Event::ThinkingStarted]
         ));
     }
 
@@ -774,7 +801,7 @@ mod tests {
             ),
         ] {
             let mut tc = AcpToolCall::new("tc-plan", "EnterPlanMode");
-            tc.kind = agent_client_protocol::schema::v1::ToolKind::SwitchMode;
+            tc.kind = agent_client_protocol::v1::schema::ToolKind::SwitchMode;
             tc.raw_input = Some(raw_input.clone());
             let events = claude(SessionUpdate::ToolCall(tc));
             assert_eq!(kinds(&events), want, "{raw_input}");
@@ -1209,6 +1236,13 @@ mod tests {
                 },
                 true,
             ),
+            (
+                Event::AgentThoughtChunk {
+                    text: "hmm".into(),
+                    message_id: None,
+                },
+                true,
+            ),
             (Event::SessionCleared, false),
             (
                 Event::Stopped {
@@ -1319,7 +1353,7 @@ mod tests {
         }
 
         {
-            use agent_client_protocol::schema::v1::{Diff, ToolKind};
+            use agent_client_protocol::v1::schema::{Diff, ToolKind};
             let diff = || ToolCallContent::Diff(Diff::new("src/foo.rs", "new").old_text("old"));
             let codex = |update| map_update_to_events(update, &agent_profiles::CODEX);
 
@@ -1394,7 +1428,7 @@ mod tests {
 
     #[test]
     fn mode_and_config_option_updates() {
-        use agent_client_protocol::schema::v1::CurrentModeUpdate;
+        use agent_client_protocol::v1::schema::CurrentModeUpdate;
         for (id, want) in [
             ("yolo", SessionMode::BypassPermissions),
             ("auto_edit", SessionMode::AcceptEdits),
@@ -1420,7 +1454,7 @@ mod tests {
         }
 
         {
-            use agent_client_protocol::schema::v1::{
+            use agent_client_protocol::v1::schema::{
                 ConfigOptionUpdate, SessionConfigOption, SessionConfigOptionCategory,
                 SessionConfigSelectOption,
             };

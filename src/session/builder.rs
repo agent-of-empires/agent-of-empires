@@ -622,6 +622,18 @@ impl WorkspacePlan {
     }
 }
 
+/// Why [`build_instance`] refused before doing any work, typed so a remote
+/// caller can name the cause without the text.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildRefusal {
+    #[error("Container runtime is not installed. Please install a supported runtime to use sandbox mode.")]
+    RuntimeNotInstalled,
+    #[error("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.")]
+    RuntimeNotRunning,
+    #[error("Project path does not exist: {0}")]
+    WorkingDirMissing(String),
+}
+
 /// Build an instance with all setup (worktree resolution, sandbox config).
 ///
 /// This does NOT start the instance or create Docker containers - that happens
@@ -689,10 +701,10 @@ pub(crate) fn plan_instance(
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
-            bail!("Container runtime is not installed. Please install a supported runtime to use sandbox mode.");
+            return Err(BuildRefusal::RuntimeNotInstalled.into());
         }
         if !runtime.is_daemon_running() {
-            bail!("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.");
+            return Err(BuildRefusal::RuntimeNotRunning.into());
         }
     }
 
@@ -907,7 +919,7 @@ pub(crate) fn plan_instance(
     if !params.scratch && matches!(provisioning, Provisioning::None) {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
-            bail!("Project path does not exist: {}", final_path);
+            return Err(BuildRefusal::WorkingDirMissing(final_path.to_string()).into());
         }
         if !final_path_buf.is_dir() {
             bail!("Project path is not a directory: {}", final_path);
@@ -1235,9 +1247,6 @@ pub mod structured {
         trust_hooks: Option<bool>,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
-        let prepares = |hooks: &crate::session::HooksConfig| {
-            !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
-        };
         if prepares(profile_hooks) {
             return true;
         }
@@ -1251,6 +1260,10 @@ pub mod structured {
             }
             _ => false,
         }
+    }
+
+    fn prepares(hooks: &crate::session::HooksConfig) -> bool {
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1320,8 +1333,7 @@ pub mod structured {
             "" => config.session.resolve_tool_command(choice.tool),
             command => command.to_string(),
         };
-        if let Some(ovr) =
-            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        if let Some(ovr) = crate::acp::supervisor::command_override_for_spawn(choice.tool, &command)
         {
             crate::acp::supervisor::apply_agent_command_override(
                 agent,
@@ -1353,11 +1365,14 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. There is no project to search from, so relative PATH entries pass.
+    /// list. There is no project to search from, so relative PATH entries pass. With
+    /// `count_profile_hooks`, `config`'s own hooks may install the adapter first; the
+    /// repository's depend on the project.
     pub fn adapter_installed(
         agent: &str,
         config: &crate::session::Config,
         host_environment: &[(String, String)],
+        count_profile_hooks: bool,
     ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
@@ -1365,7 +1380,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            preparation_hooks: &|| false,
+            preparation_hooks: &|| count_profile_hooks && prepares(&config.hooks),
         };
         validate_structured_choice_with(
             &choice,
@@ -2015,6 +2030,54 @@ mod tests {
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
+        }
+    }
+
+    /// Only the create-ready answer counts the profile's own preparation hooks, as the create
+    /// check does; the strict one reports whether the adapter runs now.
+    #[test]
+    #[serial_test::serial]
+    fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
+        use crate::session::HooksConfig;
+        let _home = crate::session::test_support::isolate_app_dir();
+        // Absolute, so no PATH is searched: a relative entry in the caller's PATH would pass.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-adapter");
+        let hook = || vec!["npm install".to_string()];
+        for (label, hooks, create_ready) in [
+            ("no hooks", HooksConfig::default(), false),
+            (
+                "on_create",
+                HooksConfig {
+                    on_create: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "on_launch",
+                HooksConfig {
+                    on_launch: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let mut config = crate::session::Config::default();
+            config
+                .session
+                .agent_acp_cmd
+                .insert("fake".into(), missing.display().to_string());
+            config.hooks = hooks;
+            assert!(
+                !structured::adapter_installed("fake", &config, &[], false),
+                "{label}: strict"
+            );
+            assert_eq!(
+                structured::adapter_installed("fake", &config, &[], true),
+                create_ready,
+                "{label}: create-ready"
+            );
         }
     }
 

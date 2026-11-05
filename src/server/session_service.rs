@@ -906,14 +906,18 @@ impl SessionService {
     /// if needed, publish the prompt into the event stream, then forward it
     /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
     /// non-HTTP caller (the plugin host, #2897) delivers turns through the
-    /// same path; the handler keeps HTTP concerns (read-only gate, wake,
-    /// attachment validation, smart-rename, status mapping).
+    /// same path; wake, attachment validation and queueing stay with the caller
+    /// (`api::acp::prompt::submit_prompt` for the user path).
+    ///
+    /// Returns the seq of the turn's `UserPromptSent` event, or `None` when that
+    /// event was not persisted: the turn is still forwarded, but nothing in the
+    /// event log marks where it began.
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
         id: &str,
         turn: SendTurnRequest<'_>,
-    ) -> Result<(), SendTurnError> {
+    ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
             text,
@@ -990,7 +994,7 @@ impl SessionService {
             return Err(SendTurnError::RevivalRefused);
         }
         // Persist the admitted turn before forwarding it to the agent.
-        let disposition = self
+        let published = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
                 id,
@@ -1001,7 +1005,7 @@ impl SessionService {
                 caller.message_origin().map(str::to_string),
             )
             .await;
-        let outcome = match disposition {
+        let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
                 self.acp_supervisor.send_prompt(id, text, attachments).await
             }
@@ -1012,7 +1016,7 @@ impl SessionService {
             }
         };
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
@@ -2901,7 +2905,7 @@ mod tests {
                     },
                 )
                 .await,
-            Ok(()) | Err(SendTurnError::NotOwner)
+            Ok(_) | Err(SendTurnError::NotOwner)
         ));
         assert!(!matches!(
             service
@@ -2920,7 +2924,7 @@ mod tests {
                     },
                 )
                 .await,
-            Ok(()) | Err(SendTurnError::NotOwner)
+            Ok(_) | Err(SendTurnError::NotOwner)
         ));
     }
 

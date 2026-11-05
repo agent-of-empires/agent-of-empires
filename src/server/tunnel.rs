@@ -533,6 +533,16 @@ impl TailscaleProbe {
     }
 }
 
+/// Whether tunnel selection skips Tailscale: `--no-tailscale`, or a named Cloudflare tunnel
+/// (name and URL both set), makes the probe's answer irrelevant.
+pub fn skips_tailscale(
+    no_tailscale: bool,
+    tunnel_name: Option<&str>,
+    tunnel_url: Option<&str>,
+) -> bool {
+    no_tailscale || (tunnel_name.is_some() && tunnel_url.is_some())
+}
+
 /// Probe whether `tailscale` is on PATH and its daemon is running and signed in.
 pub async fn tailscale_probe() -> TailscaleProbe {
     tailscale_probe_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT).await
@@ -542,8 +552,9 @@ async fn tailscale_probe_with(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
 ) -> TailscaleProbe {
-    // Each probe is bounded so a wedged `tailscale` falls back to Cloudflare at once instead of
-    // holding tunnel selection until the startup deadline; dropping one kills its child.
+    // Each probe is bounded so a wedged `tailscale` reads as `TimedOut` at once, which fails the
+    // start, instead of holding tunnel selection until the startup deadline; dropping one kills
+    // its child.
     let probe = |arg: &'static str| async move {
         let output = Command::new(program).arg(arg).kill_on_drop(true).output();
         match tokio::time::timeout(timeout, output).await {
@@ -663,7 +674,7 @@ async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::F
 }
 
 /// How long turning the Funnel back off may take.
-const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Turns off the :443 Funnel a Tailscale start switched on, unless the start finishes.
 /// Every error return after `--bg` starts awaits [`Self::fail`]; `Drop` covers a start that was
@@ -1338,6 +1349,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn tailscale_is_skipped_only_when_its_answer_cannot_matter() {
+        // (--no-tailscale, tunnel name, tunnel URL, skipped)
+        let cases = [
+            (false, None, None, false),
+            (true, None, None, true),
+            (false, Some("work"), Some("https://aoe.example.com"), true),
+            // A name without a URL is refused earlier; it isn't a named tunnel.
+            (false, Some("work"), None, false),
+        ];
+        for (no_tailscale, name, url, skipped) in cases {
+            assert_eq!(
+                skips_tailscale(no_tailscale, name, url),
+                skipped,
+                "{no_tailscale} {name:?} {url:?}"
+            );
+        }
+    }
 
     #[test]
     fn funnel_preflight_starts_only_where_it_can_put_back_what_it_changes() {

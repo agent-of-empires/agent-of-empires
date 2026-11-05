@@ -289,7 +289,7 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::{DaemonEndpoint, Source};
+    use crate::daemon::{DaemonEndpoint, Source};
     use crate::tui::remote_home::RemoteSession;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

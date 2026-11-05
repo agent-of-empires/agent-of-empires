@@ -1,5 +1,8 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
+mod endpoint;
+pub use endpoint::{DaemonEndpoint, Source};
+
 mod error;
 pub use error::{ApiErrorCode, ERROR_CODE_HEADER, MANAGED_RESUME_CAUSE_HEADER};
 
@@ -675,6 +678,7 @@ impl DaemonClient {
             ProjectMutation::Remove {
                 target,
                 name_or_path,
+                anchored_path,
             } => {
                 let url = self
                     .sessions_url
@@ -683,7 +687,11 @@ impl DaemonClient {
                         transport::path_segment(name_or_path)?
                     ))
                     .map_err(|_| DaemonClientError::Transport)?;
-                self.http.delete(url).query(target)
+                let request = self.http.delete(url).query(target);
+                match anchored_path {
+                    Some(path) => request.query(&[("path", path)]),
+                    None => request,
+                }
             }
         };
         self.request_mutation(request, epoch).await
@@ -1736,7 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn smart_rename_accepts_completed_and_supervised_receipts() {
         for status in [200, 202] {
-            let row = SessionResponse::from_instance(
+            let row = crate::server::api::sessions::session_response_from_instance(
                 &crate::session::Instance::new("named", "/tmp/named"),
                 false,
             );
@@ -1925,16 +1933,32 @@ mod tests {
     #[tokio::test]
     async fn managed_resume_refusal_recovers_without_reflecting_private_bodies() {
         use axum::response::IntoResponse;
+        use clap::CommandFactory;
+
+        let mut recovery_command = crate::cli::Cli::command();
         for (unix, authenticated, cause) in [
             (false, false, "wrapper_contract_required"),
             (false, true, "wrapper_contract_required"),
             (true, false, "wrapper_contract_required"),
+            (false, false, "pi_transcript_binding_required"),
+            (false, true, "pi_transcript_binding_required"),
+            (true, false, "pi_transcript_binding_required"),
+            (false, false, "omp_transcript_binding_required"),
+            (false, true, "omp_transcript_binding_required"),
+            (true, false, "omp_transcript_binding_required"),
             (false, false, "secret-token"),
         ] {
-            let expected = if cause == "wrapper_contract_required" {
-                crate::session::ManagedResumeCause::WrapperContractRequired
-            } else {
-                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            let expected = match cause {
+                "wrapper_contract_required" => {
+                    crate::session::ManagedResumeCause::WrapperContractRequired
+                }
+                "pi_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                }
+                "omp_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                }
+                _ => crate::session::ManagedResumeCause::ExecutionContextUnattested,
             };
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("api.sock");
@@ -1990,17 +2014,56 @@ mod tests {
                 };
                 let message = error.to_string();
                 assert!(!format!("{error:?}").contains("secret"));
-                assert!(message.contains("aoe session set-session-id"), "{message}");
-                assert!(message.contains("--store"), "{message}");
                 assert!(!message.contains("secret"), "{message}");
                 if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
                     assert!(message.contains("session.agent_execution_as"), "{message}");
                     assert!(message.contains("session.agent_config_dir"), "{message}");
                 }
-                assert!(
-                    message.contains("aoe session set-session-id <session> \"\""),
-                    "{message}"
-                );
+                if matches!(
+                    expected,
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                        | crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                ) {
+                    let agent = if expected
+                        == crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                    {
+                        "Pi"
+                    } else {
+                        "OMP"
+                    };
+                    assert!(
+                        message
+                            .split(|ch: char| !ch.is_ascii_alphanumeric())
+                            .any(|token| token == agent),
+                        "{message}"
+                    );
+                    let mut rebind = false;
+                    let mut fresh = false;
+                    for line in message
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| line.starts_with("aoe "))
+                    {
+                        let argv = shell_words::split(line).expect("recovery command quoting");
+                        let parsed = recovery_command
+                            .try_get_matches_from_mut(argv)
+                            .expect("recovery command must parse");
+                        let args = parsed
+                            .subcommand_matches("session")
+                            .and_then(|args| args.subcommand_matches("set-session-id"))
+                            .expect("recovery command must select a native conversation");
+                        let sid = args.get_one::<String>("session_id").unwrap();
+                        let store = args.get_one::<std::path::PathBuf>("store");
+                        if sid.is_empty() {
+                            assert!(store.is_none(), "{message}");
+                            fresh = true;
+                        } else {
+                            assert!(store.is_some_and(|path| path.is_absolute()), "{message}");
+                            rebind = true;
+                        }
+                    }
+                    assert!(rebind && fresh, "{message}");
+                }
                 if committed {
                     assert!(
                         matches!(error, DaemonClientError::Committed { cursor, code }

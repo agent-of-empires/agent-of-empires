@@ -23,7 +23,8 @@ use super::{
     apply_ws_message, drain_plugin_toast, handle_terminal_event, render, set_toast, setup_view,
     PluginPoll, ViewSetup,
 };
-use crate::acp::client::{DaemonEndpoint, WsMessage};
+use crate::acp::client::WsMessage;
+use crate::daemon::DaemonEndpoint;
 use crate::daemon::WsError;
 use crate::tui::styles::Theme;
 
@@ -426,10 +427,10 @@ impl EmbeddedView {
     /// handoff without a live connection.
     #[cfg(test)]
     pub(crate) fn for_test(session_id: &str) -> Self {
-        let endpoint = crate::acp::client::DaemonEndpoint::new(
+        let endpoint = crate::daemon::DaemonEndpoint::new(
             "http://127.0.0.1:8080".into(),
             None,
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         );
         let http =
             crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");

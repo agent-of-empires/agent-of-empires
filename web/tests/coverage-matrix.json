@@ -21,8 +21,13 @@
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/PairedShellPane.test.tsx"],
-      "components": ["web/src/components/PairedTerminal.tsx"]
+      "specs": [
+        "src/components/__tests__/PairedShellPane.test.tsx",
+        "src/components/__tests__/LiveTerminalView.focus.test.tsx",
+        "src/hooks/__tests__/usePairedTerminalReveal.test.ts"
+      ],
+      "components": ["web/src/components/PairedTerminal.tsx", "web/src/hooks/usePairedTerminalReveal.ts"],
+      "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
       "id": "app-shell.docks",
@@ -212,6 +217,14 @@
       "risk": "high",
       "specs": ["src/hooks/useLiveTerminal.test.ts"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/live-terminal/TermRow.tsx"]
+    },
+    {
+      "id": "terminal.live-pipe-contention-notice",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it."
     },
     {
       "id": "terminal.live-alt-screen-scroll",
@@ -898,6 +911,34 @@
       "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
+      "id": "sessions.focus-mode",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/focus-mode.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/components/__tests__/FocusModeNote.test.tsx",
+        "src/components/__tests__/FocusSessionGone.test.tsx",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/hooks/useDashboardPresence.test.ts",
+        "src/hooks/useFocusMode.test.tsx",
+        "src/lib/__tests__/focusMode.test.ts",
+        "src/lib/__tests__/sessionRoute.test.ts",
+        "src/__tests__/sw.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/TopBar.tsx",
+        "web/src/components/FocusModeNote.tsx",
+        "web/src/components/FocusSessionGone.tsx",
+        "web/public/sw.js"
+      ],
+      "notes": "The Session menu's More lists Show only this Session, which reloads the current window as `/session/<id>?focus=1`, and, on desktop, Open in its own window; the palette offers both under the same names. A focus window hides the sidebar, the dashboard link and the switching shortcuts, titles the tab after its session, shows a dismissible first-use note, and reports its focus session with its presence; its All Sessions button, which replaces the sidebar toggle and the logo, reloads the window back to the regular view. Because both transitions load a new document, the service worker reads the current mode from the window's URL: it sends pushes about other sessions to the OS rather than a focus window's toasts, and never navigates a focus window to another session on a notification click. A focus window counts badges and sounds for its own session only; the spec checks that a plugin link to another session, a plugin page button, the settings shortcut and a palette settings entry each open a new window while the focus window keeps its URL, and that a trashed or deleted session shows a screen naming it whose Show all Sessions button reloads to the dashboard. A router navigation that changes the mode, such as an in-app link to a `?focus=1` URL, reloads the document so the service worker sees it (spec and `useFocusMode.test.tsx`). Background session creates started elsewhere add their session without a toast in a focus window. The palette offers neither enter command for a trashed session. Server-side push scoping and presence expiry are covered by `web_watch_follows_foreground_windows_and_their_focus`, `web_presence_writes_prune_abandoned_windows`, `due_events_hold_sessions_a_window_shows_until_it_stops_showing_them` and `presence_is_recorded_per_window_with_its_focus`."
+    },
+    {
       "id": "notifications.service-worker-clear",
       "kind": "vitest",
       "risk": "medium",
@@ -1166,7 +1207,12 @@
         "tests/wizard.spec.ts",
         "tests/wizard-project.spec.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
-        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx"
+        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/lib/api.test.ts",
+        "src/components/session-wizard/__tests__/CreateFailureBox.test.tsx",
+        "src/components/session-wizard/createFailureView.test.ts",
+        "src/components/__tests__/Toasts.test.tsx"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
@@ -1182,8 +1228,12 @@
         "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
         "web/src/components/session-wizard/WizardRows.tsx",
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
-        "web/src/components/session-wizard/steps/LaunchFields.tsx"
-      ]
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
+        "web/src/components/session-wizard/CreateFailureBox.tsx",
+        "web/src/components/session-wizard/createFailureView.ts",
+        "web/src/components/Toasts.tsx"
+      ],
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1260,6 +1310,14 @@
       ]
     },
     {
+      "id": "wizard.agent-switch-model-reset",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/wizardReducer.test.ts"],
+      "components": ["web/src/components/session-wizard/wizardReducer.ts"],
+      "notes": "Switching the wizard agent clears the seeded model and effort so the create request omits them and the server uses the new agent's defaults; re-selecting the same agent keeps them."
+    },
+    {
       "id": "wizard.project-sandbox-override",
       "notes": "Tri-state project container defaults resolve from the acknowledged served or explicitly selected profile; registry retries preserve unknown versus empty, profile switches commit atomically, manual edits and host-only imports outrank late defaults, and saves preserve explicit false while omitting inherited values.",
       "kind": "vitest",
@@ -1283,6 +1341,13 @@
     },
     {
       "id": "wizard.agent-lifecycle",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/AgentPanel.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"]
+    },
+    {
+      "id": "wizard.plugin-agents",
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/session-wizard/__tests__/AgentPanel.test.tsx"],
@@ -2210,7 +2275,7 @@
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs. Session lists carry canonical runtime epoch/revision headers, and rename completion consumes a matching advancing receipt and outcome."
+      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge; a page that declares `deep_link` gets the URL's `?link=` value over the bridge (never in the frame URL), a page without it or an unsafe value gets null, and a notification toast carrying a link keeps its tone and opens the page on that item. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs. Session lists carry canonical runtime epoch/revision headers, and rename completion consumes a matching advancing receipt and outcome."
     },
     {
       "id": "sidebar.plugin-row-slots",
@@ -2443,6 +2508,18 @@
       "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
       "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
       "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
+    },
+    {
+      "id": "acp.thinking-row",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Summarized model thinking renders as a collapsed Thinking block in place among the reply's parts; adjacent chunks join, and a server-marked new thought or any other part splits them. Folding and grouping are covered by Rust transcript tests."
     },
     {
       "id": "acp.copy-message-markdown",
@@ -3805,7 +3882,7 @@
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx", "tests/acp-startup-error-screen.spec.ts"],
       "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"],
-      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container, npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
+      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
     },
     {
       "id": "acp.startup-error-banner",
@@ -3815,9 +3892,10 @@
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
-        "web/src/components/acp/RecoveryActionRow.tsx"
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
+      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -4613,7 +4691,27 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
-      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "A signed-out label is a button opening the Agent's sign-in steps; Open Terminal and Restart Agent follow the server's terminal and mutation gates."
+    },
+    {
+      "id": "acp.sign-in-steps",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-sign-in-steps.spec.ts"],
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/components/acp/signInSteps.ts",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/hooks/usePairedShellModes.ts",
+        "web/src/hooks/usePairedTerminalReveal.ts"
+      ],
+      "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command. A sandboxed Session's open Host shell switches to a focused Container shell, and a collapsed dock whose active tab is the terminal is revealed."
     },
     {
       "id": "story.wizard-open-close",

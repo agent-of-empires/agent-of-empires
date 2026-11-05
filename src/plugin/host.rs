@@ -660,6 +660,13 @@ impl PluginHost {
             .iter()
             .map(|u| (u.slot, u.id.clone()))
             .collect();
+        let deep_link_pages: HashSet<String> = plugin
+            .manifest
+            .ui
+            .iter()
+            .filter(|u| u.slot == UiSlot::Page && u.deep_link)
+            .map(|u| u.id.clone())
+            .collect();
 
         let launch = resolve_launch(plugin, &OsLaunchResolver)?;
         let prepared = self.sandbox.prepare(&launch)?;
@@ -787,6 +794,7 @@ impl PluginHost {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: granted,
             ui_contributions,
+            deep_link_pages,
             ui_generation,
         });
         serve_connection(
@@ -1443,6 +1451,7 @@ mod tests {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: vec!["runtime.worker".to_string()],
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         });
 
@@ -1513,6 +1522,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             plugin_id: "acme.worker".into(),
             granted_capabilities: vec!["runtime.worker".into()],
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         });
 

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, useRef, type ReactNode } from "react";
 import { Toggle } from "./steps/Toggle";
 
 const ROW = "flex items-center gap-3 min-h-[44px] md:min-h-[36px] px-3 border-b border-surface-700/30 last:border-b-0";
@@ -42,17 +42,17 @@ export function NavRow({
   placeholder?: string;
   onOpen: () => void;
   testId?: string;
-  /** Draws attention to a required, still-empty row. */
-  highlight?: boolean;
+  /** Draws attention to a required, still-empty row, or to one a failed create blames. */
+  highlight?: boolean | "error";
 }) {
   return (
     <button
       type="button"
       onClick={onOpen}
       data-testid={testId}
-      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-850 transition-colors first:rounded-t-lg last:rounded-b-lg ${
-        highlight ? "outline outline-1 outline-brand-600 -outline-offset-1" : ""
-      }`}
+      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-850 transition-colors first:rounded-t-lg last:rounded-b-lg ${highlightClass(
+        highlight,
+      )}`}
     >
       <Label>{label}</Label>
       <span className="flex-1 min-w-0 truncate text-sm font-mono text-text-primary">
@@ -73,6 +73,7 @@ export function SwitchRow({
   onConfigure,
   disabled = false,
   testId,
+  highlight,
 }: {
   label: string;
   checked: boolean;
@@ -82,10 +83,12 @@ export function SwitchRow({
   onConfigure?: () => void;
   disabled?: boolean;
   testId?: string;
+  /** Outlines a row a failed create blames; its summary carries the text cue. */
+  highlight?: "error";
 }) {
   const summaryText = <span className="flex-1 min-w-0 truncate text-xs text-text-dim">{summary}</span>;
   return (
-    <div className={ROW} data-testid={testId}>
+    <div className={`${ROW} ${highlightClass(highlight)}`} data-testid={testId}>
       <Label>{label}</Label>
       {onConfigure ? (
         <button
@@ -101,6 +104,104 @@ export function SwitchRow({
         summaryText
       )}
       <Toggle checked={checked} onChange={onChange} disabled={disabled} label={switchLabel} />
+    </div>
+  );
+}
+
+function highlightClass(highlight: boolean | "error" | undefined): string {
+  if (!highlight) return "";
+  return `outline outline-1 -outline-offset-1 ${highlight === "error" ? "outline-status-error" : "outline-brand-600"}`;
+}
+
+export interface SegmentOption<T extends string> {
+  value: T;
+  /** Visible text. */
+  label: string;
+  /** Accessible name, when the visible text is shorter. */
+  name: string;
+  disabled?: boolean;
+}
+
+/** A choice between equal options, as a radio group of segments. Below `md` the
+ *  summary wraps under the label and segments; at `md` the row is one line. */
+export function SegmentedRow<T extends string>({
+  label,
+  options,
+  value,
+  onChange,
+  summary,
+  testId,
+}: {
+  label: string;
+  options: SegmentOption<T>[];
+  value: T;
+  onChange: (value: T) => void;
+  summary: ReactNode;
+  testId?: string;
+}) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const summaryId = useId();
+  const enabled = options.filter((o) => !o.disabled);
+  const move = (step: 1 | -1) => {
+    const at = enabled.findIndex((o) => o.value === value);
+    const next = enabled[(at + step + enabled.length) % enabled.length];
+    if (!next) return;
+    if (next.value !== value) onChange(next.value);
+    refs.current[options.indexOf(next)]?.focus();
+  };
+  return (
+    <div
+      className="flex flex-wrap items-center gap-x-2 gap-y-1 min-h-[44px] md:min-h-[36px] md:flex-nowrap px-3 py-1.5 md:py-0 border-b border-surface-700/30 last:border-b-0"
+      data-testid={testId}
+    >
+      <Label>{label}</Label>
+      <span
+        id={summaryId}
+        title={typeof summary === "string" ? summary : undefined}
+        className="order-last basis-full text-xs text-text-dim md:order-none md:basis-auto md:flex-1 md:min-w-0 md:truncate"
+      >
+        {summary}
+      </span>
+      <div
+        role="radiogroup"
+        aria-label={label}
+        aria-describedby={summaryId}
+        className="ml-auto flex shrink-0 rounded-md border border-surface-700 bg-surface-950 p-0.5"
+        onKeyDown={(e) => {
+          if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+            e.preventDefault();
+            move(1);
+          } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+            e.preventDefault();
+            move(-1);
+          }
+        }}
+      >
+        {options.map((option, i) => {
+          const selected = option.value === value;
+          return (
+            <button
+              key={option.value}
+              ref={(el) => {
+                refs.current[i] = el;
+              }}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              aria-label={option.name}
+              disabled={option.disabled}
+              tabIndex={selected ? 0 : -1}
+              // Re-picking the selected option must not overwrite a choice the row is overriding.
+              onClick={() => option.value !== value && onChange(option.value)}
+              className={`min-h-8 rounded px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                selected ? "bg-brand-600 text-text-on-brand" : "text-text-primary hover:bg-surface-800"
+              }`}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

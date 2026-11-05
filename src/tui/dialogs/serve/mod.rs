@@ -461,11 +461,10 @@ impl RestartProbe {
             ServeMode::Local => RestartProbe {
                 on_funnel: false,
                 persists: persist_sessions(),
-                port: saved_port(),
-                local_hosts: crate::server::discover_tagged_ips()
+                port: crate::acp::client::autostart::saved_port(),
+                local_hosts: crate::server::local_published_hosts()
                     .into_iter()
-                    .map(|(_, ip)| ip.to_string())
-                    .chain(["localhost".to_string()])
+                    .map(|(_, host)| host)
                     .collect(),
                 local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
                     .is_ok_and(|pp| !pp.is_empty()),
@@ -573,10 +572,11 @@ fn persist_sessions() -> bool {
         .is_none_or(|config| config.auth.persist_sessions)
 }
 
-/// Mirrors the server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise
-/// Funnel whenever `tailscale` is installed and logged in.
+/// The server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise Funnel
+/// whenever `tailscale` is installed and logged in.
 fn restart_on_funnel(transport: Option<TunnelTransport>) -> bool {
-    transport != Some(TunnelTransport::Cloudflare)
+    let no_tailscale = transport == Some(TunnelTransport::Cloudflare);
+    !crate::server::tunnel::skips_tailscale(no_tailscale, None, None)
         && crate::server::tunnel::tailscale_available_sync()
 }
 

@@ -105,7 +105,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-8+jRhGq2OHljxFAirB/dZ9IwXqlSpP+Fd+B2OSCm/98=";
+            npmDepsHash = "sha256-2vf6Atu1f4bGdZiX97S/HABDnbmImd6kWdxmkvdr0uI=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
@@ -173,7 +173,6 @@
             aoe-test = craneLib.cargoTest (commonArgs // {
               inherit cargoArtifacts;
               cargoTestExtraArgs = "--package agent-of-empires";
-              # Some git:: unit tests invoke the git binary directly
               nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git pkgs.curl ];
             });
           };

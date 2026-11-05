@@ -17,7 +17,7 @@ use tracing::info;
 use super::access::{host_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
-use super::ip_discovery::{discover_tagged_ips, IpKind};
+use super::ip_discovery::{local_published_hosts, IpKind};
 use super::reload::load_all_instances;
 use super::router::build_router;
 use super::serve_snapshot::{
@@ -307,10 +307,66 @@ async fn within_tunnel_deadline<T>(
         })
 }
 
+/// Drops `start` on a signal so its guards run their cleanup.
+async fn until_terminated<T>(
+    terminated: &CancellationToken,
+    start: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        biased;
+        _ = terminated.cancelled() => anyhow::bail!("Stopped by a signal before startup finished"),
+        result = start => result,
+    }
+}
+
+/// Cancelled by the first SIGINT, SIGTERM or SIGHUP. Registered up front so a signal during
+/// startup stops it, rather than killing the process with no `Drop` run.
+fn watch_termination_signals() -> CancellationToken {
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let register = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .inspect_err(|error| {
+                    tracing::warn!(target: "serve.shutdown", signal = name, %error, "could not register signal handler");
+                })
+                .ok()
+        };
+        let mut sigterm = register(SignalKind::terminate(), "SIGTERM");
+        let mut sighup = register(SignalKind::hangup(), "SIGHUP");
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = async { if tokio::signal::ctrl_c().await.is_err() { std::future::pending().await } } => {
+                    tracing::info!(target: "serve.shutdown", signal = "SIGINT", "received signal, shutting down");
+                }
+                _ = async { match sigterm { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
+                    tracing::info!(target: "serve.shutdown", signal = "SIGTERM", "received signal, shutting down");
+                }
+                _ = async { match sighup { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
+                    tracing::info!(target: "serve.shutdown", signal = "SIGHUP", "received signal, shutting down");
+                }
+            }
+            cancel.cancel();
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
+        cancel.cancel();
+    });
+    token
+}
+
 pub(crate) async fn start_server(
     config: ServerConfig<'_>,
     transaction: crate::daemon::lifecycle::Transaction,
 ) -> anyhow::Result<()> {
+    let terminated = watch_termination_signals();
     let tunnel_deadline = tokio::time::Instant::now() + TUNNEL_STARTUP_DEADLINE;
     let ServerConfig {
         profile,
@@ -615,9 +671,8 @@ pub(crate) async fn start_server(
 
     let tunnel_handle = if remote {
         // Choosing and starting the tunnel is the part that can hang, so it shares one deadline.
-        let handle = within_tunnel_deadline(tunnel_deadline, async {
-            let named = tunnel_name.is_some() && tunnel_url.is_some();
-            let tailscale_ok = if no_tailscale || named {
+        let handle = until_terminated(&terminated, within_tunnel_deadline(tunnel_deadline, async {
+            let tailscale_ok = if tunnel::skips_tailscale(no_tailscale, tunnel_name, tunnel_url) {
                 tracing::debug!(target: "http.middleware", "tunnel: --no-tailscale or a named tunnel, skipping Tailscale auto-detection");
                 false
             } else {
@@ -653,7 +708,7 @@ pub(crate) async fn start_server(
             } else {
                 tunnel::TunnelHandle::spawn_quick(local_port).await?
             })
-        })
+        }))
         .await?;
 
         let tunnel_url_with_token = if let Some(ref token) = auth_token {
@@ -731,12 +786,10 @@ pub(crate) async fn start_server(
         // When bound to 0.0.0.0 we're reachable on all three; on a specific
         // host we just surface that one.
         let labeled_urls: Vec<(IpKind, String)> = if host == "0.0.0.0" {
-            let mut urls: Vec<(IpKind, String)> = discover_tagged_ips()
+            local_published_hosts()
                 .into_iter()
-                .map(|(kind, ip)| (kind, make_url(&ip.to_string())))
-                .collect();
-            urls.push((IpKind::Loopback, make_url("localhost")));
-            urls
+                .map(|(kind, host)| (kind, make_url(&host)))
+                .collect()
         } else {
             vec![(IpKind::Loopback, make_url(host))]
         };
@@ -1217,32 +1270,9 @@ pub(crate) async fn start_server(
     // Both listeners drain on the same cancellation signal and deadline.
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).ok();
-            let mut sighup = signal(SignalKind::hangup()).ok();
-            tokio::select! {
-                _ = shutdown_state.shutdown.cancelled() => {}
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!(target: "serve.shutdown", signal = "SIGINT", "received signal, shutting down");
-                }
-                _ = async { match sigterm { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
-                    tracing::info!(target: "serve.shutdown", signal = "SIGTERM", "received signal, shutting down");
-                }
-                _ = async { match sighup { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
-                    tracing::info!(target: "serve.shutdown", signal = "SIGHUP", "received signal, shutting down");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::select! {
-                _ = shutdown_state.shutdown.cancelled() => {}
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
-                }
-            }
+        tokio::select! {
+            _ = shutdown_state.shutdown.cancelled() => {}
+            _ = terminated.cancelled() => {}
         }
         notify_stopping().await;
         let plugin_host = shutdown_state.plugin_host.clone();
@@ -1449,6 +1479,34 @@ mod tests {
                 .unwrap(),
             7
         );
+    }
+
+    #[tokio::test]
+    async fn a_signal_drops_a_start_in_flight_so_its_guards_run() {
+        struct Guard(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (dropped_tx, dropped) = tokio::sync::oneshot::channel();
+        let terminated = CancellationToken::new();
+        let (running_tx, running) = tokio::sync::oneshot::channel();
+        let start = {
+            let terminated = terminated.clone();
+            tokio::spawn(async move {
+                until_terminated(&terminated, async move {
+                    let _guard = Guard(Some(dropped_tx));
+                    running_tx.send(()).unwrap();
+                    std::future::pending::<anyhow::Result<()>>().await
+                })
+                .await
+            })
+        };
+        running.await.unwrap();
+        terminated.cancel();
+        assert!(start.await.unwrap().is_err());
+        dropped.await.expect("the guard must drop on the signal");
     }
 
     #[tokio::test]

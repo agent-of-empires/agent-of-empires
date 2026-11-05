@@ -1301,6 +1301,7 @@ impl HomeView {
             tool_picker_dialog,
             send_message_dialog,
             permission_response_dialog,
+            agent_question_dialog,
             update_confirm_dialog,
             context_menu,
         );

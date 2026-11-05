@@ -2469,7 +2469,7 @@ impl App {
     /// Mount in preview state; the caller activates it when entering.
     async fn connect_embedded_structured(
         &mut self,
-        endpoint: crate::acp::client::DaemonEndpoint,
+        endpoint: crate::daemon::DaemonEndpoint,
         session_id: &str,
     ) {
         use crate::tui::structured_view::embedded::EmbeddedView;

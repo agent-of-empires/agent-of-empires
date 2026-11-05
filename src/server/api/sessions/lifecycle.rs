@@ -2146,7 +2146,7 @@ pub(super) async fn apply_update_restart(
         // The reconciler terminates the worker once its turn drains and respawns it against the
         // stored conversation.
         state.acp_supervisor.mark_build_respawn_pending(&id);
-        let response = SessionResponse::from_instance(
+        let response = session_response_from_instance(
             &instance,
             crate::claude_settings::read_tui_fullscreen(),
         );
@@ -3311,6 +3311,8 @@ mod durable_stop_tests {
             "TMUX_PANE",
             "OMP_SESSION_ID",
             "PI_SESSION_ID",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
             "AOE_SESSION_ID",
             "AOE_PROFILE",
             "AOE_DAEMON_URL",
@@ -3323,6 +3325,11 @@ mod durable_stop_tests {
         let _omp = crate::session::test_support::install_login_shell_path_command(
             root.path(),
             "omp",
+            "#!/bin/sh\nexit 97\n",
+        );
+        let _pi = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "pi",
             "#!/bin/sh\nexit 97\n",
         );
         let _prime = crate::session::test_support::install_login_shell_path_command(
@@ -3351,7 +3358,28 @@ mod durable_stop_tests {
         let transcript = root.path().join("private-transcript.jsonl");
         std::fs::write(&transcript, "private-conversation-body\n").unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";
-        for tool in ["omp", "prime-agent"] {
+        for (tool, transcript_bound, expected_cause) in [
+            (
+                "pi",
+                false,
+                crate::session::ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                "omp",
+                false,
+                crate::session::ManagedResumeCause::OmpTranscriptBindingRequired,
+            ),
+            (
+                "omp",
+                true,
+                crate::session::ManagedResumeCause::ExecutionContextUnattested,
+            ),
+            (
+                "prime-agent",
+                true,
+                crate::session::ManagedResumeCause::ExecutionContextUnattested,
+            ),
+        ] {
             let mut row = Instance::new("managed refusal", project.to_str().unwrap());
             row.tool = tool.into();
             row.command = tool.into();
@@ -3359,12 +3387,10 @@ mod durable_stop_tests {
             row.status = Status::Stopped;
             row.agent_session_id = Some(sid.into());
             let mut binding = crate::session::ConversationBinding::unknown(sid);
-            binding.transcript_path = Some(transcript.clone());
+            binding.transcript_path = transcript_bound.then(|| transcript.clone());
             row.agent_session_binding = Some(binding);
             row.omp_capture_generation = Some("original-generation".into());
-            if tool == "omp" {
-                assert!(row.supports_native_resume());
-            } else {
+            if tool == "prime-agent" {
                 let agent = crate::agents::get_agent("prime-agent").unwrap();
                 assert!(row.launch_invokes_resolved_agent_directly(agent));
                 assert_eq!(row.command, "prime-agent");
@@ -3373,6 +3399,8 @@ mod durable_stop_tests {
                     std::fs::read_to_string(project.join(".prime/agent/settings.json")).unwrap(),
                     r#"{"sessionDir":7}"#
                 );
+            } else {
+                assert!(row.supports_native_resume());
             }
             assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
             let conversation = row.conversation_state();
@@ -3449,13 +3477,15 @@ mod durable_stop_tests {
                 headers[crate::daemon::ERROR_CODE_HEADER],
                 "managed_resume_refused"
             );
-            let expected_cause = crate::session::ManagedResumeCause::ExecutionContextUnattested;
             assert_eq!(
                 headers[crate::daemon::MANAGED_RESUME_CAUSE_HEADER],
                 expected_cause.as_str(),
             );
             let code = crate::daemon::ApiErrorCode::from_headers(status, &headers, false).unwrap();
-            assert_eq!(code.as_str(), "managed_resume_refused");
+            assert_eq!(
+                code,
+                crate::daemon::ApiErrorCode::ManagedResumeRefused(expected_cause)
+            );
             assert_eq!(
                 headers[crate::daemon::RUNTIME_EPOCH_HEADER],
                 before.value.cursor.epoch.as_str()
@@ -3470,13 +3500,6 @@ mod durable_stop_tests {
             assert_eq!(published.value.cursor.revision, revision);
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"], "managed_resume_refused");
-            let message = body["message"].as_str().unwrap();
-            assert!(message.contains("aoe session set-session-id"), "{message}");
-            assert!(message.contains("--store"), "{message}");
-            assert!(
-                message.contains("aoe session set-session-id <session> \"\""),
-                "{message}"
-            );
             let public_body = body.to_string();
             for private in [
                 sid,

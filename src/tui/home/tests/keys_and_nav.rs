@@ -722,7 +722,7 @@ fn native_unread_respects_visits_and_canonical_feedback() {
         canonical.contents.sessions = [(&a, a_unread), (&b, b_unread)]
             .into_iter()
             .map(|(id, unread)| {
-                let mut row = crate::daemon::SessionResponse::from_instance(
+                let mut row = crate::server::api::sessions::session_response_from_instance(
                     env.view.get_instance(id).unwrap(),
                     false,
                 );
@@ -1106,7 +1106,7 @@ async fn test_b_opens_project_add_flow_when_no_projects() {
         test_support::build_router_for_test(state.clone()),
     )
     .await;
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket.clone(), None);
     let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
         .await
         .unwrap();

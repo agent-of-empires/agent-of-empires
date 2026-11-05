@@ -8,12 +8,12 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
 use super::project_mcp::{
     convert_standard, load_standard_mcp_servers, ProjectMcpServer, ProjectMcpTransport,
-    StandardMcpFile,
+    StandardRawServer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +181,7 @@ pub fn resolve_effective(
         profile,
         session_env,
         native_config_override,
+        Some(cwd),
     )
     .map(NativeRead::into_enabled);
     let global = crate::session::get_app_dir().and_then(|dir| load_global_mcp_servers(&dir));
@@ -246,13 +247,18 @@ pub struct McpSurfaceView {
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let session_env = session_env_for_discovery(profile);
     let effective = resolve_effective(agent, profile, cwd, &session_env, None);
-    let reconcile =
-        load_native_mcp_servers_checked_from_home(agent, profile, &session_env, None)
-            .and_then(|read| super::mcp_state::reconcile_agent(agent, &read))
-            .unwrap_or_else(|e| {
-                warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
-                Default::default()
-            });
+    let reconcile = load_native_mcp_servers_checked_from_home(
+        agent,
+        profile,
+        &session_env,
+        None,
+        None,
+    )
+    .and_then(|read| super::mcp_state::reconcile_agent(agent, &read))
+    .unwrap_or_else(|e| {
+        warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
+        Default::default()
+    });
     let kept_on_removal = reconcile
         .removed
         .into_iter()
@@ -316,18 +322,34 @@ impl NativeRead {
 
 /// Reads an agent's native config. A missing file or unknown agent yields nothing;
 /// an unparseable file is an error; malformed entries are skipped. Only the Claude
-/// and Codex readers honor `config_dir`.
-fn read_native(agent_key: &str, home: &Path, config_dir: Option<&Path>) -> Result<NativeRead> {
+/// and Codex readers honor `config_dir`; only Claude's reads `cwd`, for the
+/// servers `/mcp` disabled in that project.
+fn read_native(
+    agent_key: &str,
+    home: &Path,
+    config_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<NativeRead> {
     match native_config_for(agent_key) {
         None => Ok(NativeRead::default()),
-        Some(NativeMcpConfig::StandardJson(rel)) => read_json::<StandardMcpFile, _>(
+        Some(NativeMcpConfig::StandardJson(rel)) => read_json::<ClaudeConfigFile, _>(
             &config_dir.unwrap_or(home).join(rel),
-            |f| f.mcp_servers,
+            |f| {
+                let disabled = cwd
+                    .and_then(Path::to_str)
+                    .and_then(|cwd| f.projects.get(cwd))
+                    .and_then(Option::as_ref)
+                    .map(|project| project.disabled_mcp_servers.iter().cloned().collect())
+                    .unwrap_or_default();
+                (f.mcp_servers, disabled)
+            },
             convert_standard,
         ),
-        Some(NativeMcpConfig::GeminiJson(rel)) => {
-            read_json::<GeminiConfigFile, _>(&home.join(rel), |f| f.mcp_servers, convert_gemini)
-        }
+        Some(NativeMcpConfig::GeminiJson(rel)) => read_json::<GeminiConfigFile, _>(
+            &home.join(rel),
+            |f| (f.mcp_servers, BTreeSet::new()),
+            convert_gemini,
+        ),
         Some(NativeMcpConfig::CodexToml(rel)) => read_codex_toml(&match config_dir {
             Some(dir) => dir.join("config.toml"),
             None => home.join(rel),
@@ -337,7 +359,7 @@ fn read_native(agent_key: &str, home: &Path, config_dir: Option<&Path>) -> Resul
 
 /// Enabled native servers under an injected `home`.
 pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<ProjectMcpServer>> {
-    read_native(agent_key, home, None).map(NativeRead::into_enabled)
+    read_native(agent_key, home, None, None).map(NativeRead::into_enabled)
 }
 
 pub fn load_native_mcp_servers_checked_from_home(
@@ -345,6 +367,7 @@ pub fn load_native_mcp_servers_checked_from_home(
     profile: Option<&str>,
     session_env: &[(String, String)],
     native_config_override: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
     let explicit = resolved_profile_config(profile)
@@ -354,7 +377,7 @@ pub fn load_native_mcp_servers_checked_from_home(
         native_config_for(agent_key),
         Some(NativeMcpConfig::StandardJson(_))
     );
-    let native_config_override = matches!(agent_key, "claude" | "claude-code")
+    let native_config_override = matches!(agent_key, "claude" | "claude-code" | "codex")
         .then_some(native_config_override)
         .flatten()
         .map(Path::to_path_buf);
@@ -365,7 +388,7 @@ pub fn load_native_mcp_servers_checked_from_home(
         session_env,
         std::env::var_os("CLAUDE_CONFIG_DIR"),
     );
-    read_native(agent_key, &home, config_dir.as_deref())
+    read_native(agent_key, &home, config_dir.as_deref(), cwd)
 }
 
 /// The directory the launched agent reads its native config from: a selected
@@ -421,7 +444,7 @@ fn convert_tolerant<R>(
 /// Streams the file so a large `~/.claude.json` is parsed without materializing history.
 fn read_json<F: serde::de::DeserializeOwned, R>(
     path: &Path,
-    servers: impl FnOnce(F) -> BTreeMap<String, R>,
+    split: impl FnOnce(F) -> (BTreeMap<String, R>, BTreeSet<String>),
     convert: impl Fn(String, R) -> Result<ProjectMcpServer>,
 ) -> Result<NativeRead> {
     let file = match std::fs::File::open(path) {
@@ -434,7 +457,42 @@ fn read_json<F: serde::de::DeserializeOwned, R>(
     };
     let parsed: F = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
-    Ok(convert_tolerant(servers(parsed), path, convert))
+    let (servers, disabled_names) = split(parsed);
+    let mut read = convert_tolerant(servers, path, convert);
+    read.disabled_names = disabled_names;
+    Ok(read)
+}
+
+/// `~/.claude.json`: user-level servers plus the per-project state `/mcp` writes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeConfigFile {
+    #[serde(default)]
+    mcp_servers: BTreeMap<String, StandardRawServer>,
+    #[serde(default)]
+    projects: BTreeMap<String, Option<ClaudeProject>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeProject {
+    #[serde(default, deserialize_with = "lenient_names")]
+    disabled_mcp_servers: Vec<String>,
+}
+
+/// Another project's malformed list must not drop every server definition.
+/// Within a list, non-string entries are skipped so the valid names still apply.
+fn lenient_names<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(name),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -836,7 +894,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR",
             stray.path().to_path_buf(),
         )]);
-        let read = read_native("claude", home.path(), Some(config_dir.path())).unwrap();
+        let read = read_native("claude", home.path(), Some(config_dir.path()), None).unwrap();
         assert_eq!(names(&read.servers), vec!["from-config-dir"]);
         assert_eq!(
             names(&load_native_mcp_servers("claude", home.path()).unwrap()),
@@ -892,12 +950,12 @@ enabled = true
         );
 
         for agent in ["claude", "claude-code"] {
-            let read = read_native(agent, home.path(), None).unwrap();
+            let read = read_native(agent, home.path(), None, None).unwrap();
             assert_eq!(names(&read.servers), vec!["fs", "remote"]);
             assert_eq!(read.skipped, vec!["broken"]);
         }
 
-        let gemini = read_native("gemini", home.path(), None).unwrap();
+        let gemini = read_native("gemini", home.path(), None, None).unwrap();
         assert_eq!(gemini.skipped, vec!["ambiguous"]);
         let kinds: Vec<_> = gemini
             .servers
@@ -909,7 +967,7 @@ enabled = true
             vec![("httpish", "http"), ("local", "stdio"), ("sseish", "sse")]
         );
 
-        let codex = read_native("codex", home.path(), None).unwrap();
+        let codex = read_native("codex", home.path(), None, None).unwrap();
         assert_eq!(names(&codex.servers), vec!["fs", "off", "on", "remote"]);
         assert_eq!(codex.skipped, vec!["bad"]);
         assert_eq!(codex.disabled_names, BTreeSet::from(["off".to_string()]));
@@ -932,9 +990,32 @@ enabled = true
             "config.toml",
             "[mcp_servers.declared]\ncommand = \"d\"\n",
         );
-        let read = |dir: Option<&Path>| read_native("codex", home.path(), dir).unwrap().servers;
+        let read = |dir: Option<&Path>| {
+            read_native("codex", home.path(), dir, None)
+                .unwrap()
+                .servers
+        };
         assert_eq!(names(&read(Some(declared.path()))), vec!["declared"]);
         assert_eq!(names(&read(None)), vec!["home"]);
+    }
+
+    #[test]
+    fn codex_discovery_honors_the_launch_resolved_dir() {
+        let declared = tempfile::tempdir().unwrap();
+        write(
+            declared.path(),
+            "config.toml",
+            "[mcp_servers.declared]\ncommand = \"d\"\n",
+        );
+        let read = load_native_mcp_servers_checked_from_home(
+            "codex",
+            None,
+            &[],
+            Some(declared.path()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(names(&read.servers), vec!["declared"]);
     }
 
     #[test]
@@ -956,5 +1037,70 @@ enabled = true
             assert!(view.conflicts.is_empty(), "re-enabling must not conflict");
             assert!(!view.drift_paused);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_malformed_project_state_keeps_servers_forwarding() {
+        let (home, _env) = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write(
+            home.path(),
+            ".claude.json",
+            &format!(
+                r#"{{ "mcpServers": {{ "fs": {{ "command": "mcp-fs" }}, "pagerduty": {{ "command": "pd" }} }},
+                    "projects": {{
+                        "/a": {{ "disabledMcpServers": null }},
+                        "/b": {{ "disabledMcpServers": "pagerduty" }},
+                        "/c": null,
+                        {cwd:?}: {{ "disabledMcpServers": ["pagerduty", null, 7] }}
+                    }} }}"#
+            ),
+        );
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(resolved_names(&view.effective), ["fs"]);
+        assert!(!view.drift_paused);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_disabled_servers_are_per_project_and_keep_drift_state() {
+        let (home, _env) = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let other = home.path().join("other");
+        let servers = r#""mcpServers": {
+            "fs": { "command": "mcp-fs" },
+            "pagerduty": { "type": "http", "url": "https://e/mcp" }
+        }"#;
+        // (disabled list for `cwd`, disabled list for another project, expected forwarded)
+        let cases: [(&str, &str, &[&str]); 4] = [
+            ("[]", "[]", &["fs", "pagerduty"]),
+            (r#"["pagerduty"]"#, "[]", &["fs"]),
+            ("[]", r#"["pagerduty", "fs"]"#, &["fs", "pagerduty"]),
+            (r#"["gone"]"#, "[]", &["fs", "pagerduty"]),
+        ];
+        for (mine, theirs, expected) in cases {
+            write(
+                home.path(),
+                ".claude.json",
+                &format!(
+                    r#"{{ {servers}, "projects": {{
+                        {cwd:?}: {{ "disabledMcpServers": {mine} }},
+                        {other:?}: {{ "disabledMcpServers": {theirs} }}
+                    }} }}"#
+                ),
+            );
+            let view = resolve_surface("claude", None, &cwd);
+            assert_eq!(resolved_names(&view.effective), expected);
+            assert!(view.kept_on_removal.is_empty(), "disabled is not removed");
+            assert!(view.conflicts.is_empty());
+            assert!(!view.drift_paused);
+        }
+
+        write(home.path(), ".claude.json", &format!("{{ {servers} }}"));
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(resolved_names(&view.effective), ["fs", "pagerduty"]);
     }
 }

@@ -2,7 +2,8 @@
 import { act, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("./api", () => ({ fetchAgents: vi.fn(() => Promise.resolve([])) }));
+// A failed fetch resolves null.
+vi.mock("./api", () => ({ fetchAgents: vi.fn(() => Promise.resolve(null)) }));
 import { fetchAgents } from "./api";
 
 import { resolveAgentDisplayName, setAgentNames, useAgentDisplayNames } from "./agentDisplayName";
