@@ -382,16 +382,25 @@ describe("a restart of a start in progress", () => {
   });
 
   const stoppedSent: Action = { kind: "restart_started", epoch: 0, stoppedSent: true };
+  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500.", stoppedSent: true };
   it.each<[string, Action[], boolean]>([
     ["a restart that stopped the sent prompt remembers it", [stop(1), stoppedSent], true],
     ["a later restart that stopped nothing keeps it", [stoppedSent, restarted], true],
     ["sending again clears it", [stoppedSent, frame(1, { UserPromptSent: { text: "hi" } })], false],
-    ["a late acknowledgement doesn't set it", [stop(1), assigned(2), stoppedSent], false],
+    [
+      "an acknowledgement after a startup error still records it",
+      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), stoppedSent],
+      true,
+    ],
+    [
+      "a failure after a startup error still records it",
+      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), failed],
+      true,
+    ],
   ])("%s", (_label, actions, expected) => {
     expect(run(empty(), ...actions).restartStoppedSent).toBe(expected);
   });
 
-  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500.", stoppedSent: true };
   it.each<[string, Action[], string | null, boolean]>([
     ["a failure after its stop keeps the stop and names the reason", [stop(1), failed], "Server returned 500.", true],
     ["a failure after the restart already ended is ignored", [stop(1), assigned(2), failed], null, false],

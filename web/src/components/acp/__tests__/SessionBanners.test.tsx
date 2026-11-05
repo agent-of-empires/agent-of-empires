@@ -253,9 +253,15 @@ describe("StartupWaitLine", () => {
     vi.useFakeTimers();
     reducedMotion(true);
     let respond!: (res: unknown) => void;
+    // Only the restart answers; the startup error banner's own fetches stay pending.
     vi.stubGlobal(
       "fetch",
-      vi.fn(() => new Promise((resolve) => (respond = resolve))),
+      vi.fn(
+        (url: string) =>
+          new Promise((resolve) => {
+            if (url.endsWith("/acp/restart")) respond = resolve;
+          }),
+      ),
     );
     let dispatch!: (action: Action) => void;
     function Owner() {
@@ -312,15 +318,32 @@ describe("StartupWaitLine", () => {
     expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
   });
 
-  it("names a restart that failed after its stop on the stopped banner", async () => {
+  it.each([
+    [500, "restart spawn failed: boom"],
+    // A 4xx can follow the stop too; the unmounted line is what says so.
+    [409, "session changed during restart preflight; retry the restart"],
+  ])("names a restart that failed with %i after its stop on the stopped banner", async (status, body) => {
     const owner = renderOwner();
     owner.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
-    await owner.respond(500, "restart spawn failed: boom");
+    await owner.respond(status, body);
     expect(screen.queryByTestId("startup-wait-line")).toBeNull();
     expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
     expect(restartFailure()).toBe(
-      "Restart failed: Server returned 500. restart spawn failed: boom The message you sent was stopped. Send it again once you reconnect.",
+      `Restart failed: Server returned ${status}. ${body} The message you sent was stopped. Send it again once you reconnect.`,
     );
+  });
+
+  it("tells the startup error banner the sent message was stopped when the replacement fails before the restart answers", async () => {
+    const owner = renderOwner();
+    owner.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
+    owner.dispatch(
+      frame(3, { AgentStartupError: { message: 'Failed to start structured view agent "claude": boom' } }),
+    );
+    await owner.respond(500, "restart spawn failed: boom");
+    expect(screen.getByTestId("startup-error-banner-sent-stopped").textContent).toContain(
+      "The message you sent was stopped.",
+    );
+    expect(restartFailure()).toBeNull();
   });
 
   it("leaves a refusal before the stop on the line, not on a later stop's banner", async () => {

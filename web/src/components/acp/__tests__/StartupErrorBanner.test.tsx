@@ -64,17 +64,20 @@ function renderBanner({
   onSwitchToTerminal = vi.fn(),
   switchable = true,
   acpWorkerState = "absent",
+  sentStopped = false,
 }: {
   message?: string;
   onSwitchToTerminal?: () => void;
   switchable?: boolean;
   acpWorkerState?: AcpWorkerState;
+  sentStopped?: boolean;
 } = {}) {
   return render(
     <StartupErrorBanner
       sessionId="s-1"
       message={message}
       acpWorkerState={acpWorkerState}
+      sentStopped={sentStopped}
       onSwitchToTerminal={switchable ? onSwitchToTerminal : undefined}
     />,
   );
@@ -247,6 +250,16 @@ describe("StartupErrorBanner layout", () => {
     const { findByTestId } = renderBanner({ onSwitchToTerminal: onSwitch });
     fireEvent.click(await findByTestId("startup-error-banner-terminal"));
     expect(onSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [true, "The message you sent was stopped. Send it again once Claude is ready."],
+    [false, null],
+  ])("with a restart's stopped message %s, says to send it again", async (sentStopped, caption) => {
+    stubApi({ info: json(claude()) });
+    const { findByText, queryByTestId } = renderBanner({ sentStopped });
+    await findByText("Claude couldn't start in Structured view");
+    expect(queryByTestId("startup-error-banner-sent-stopped")?.textContent ?? null).toBe(caption);
   });
 });
 

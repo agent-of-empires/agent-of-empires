@@ -282,8 +282,9 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "dismiss_primer":
       return { ...state, contextPrimerAvailable: null };
     case "restart_started":
-      // The restart already ended when `epoch` moved on; its replacement's stops are real.
-      if (action.epoch !== state.restartEpoch) return state;
+      // The restart already ended when `epoch` moved on; its replacement's stops are real, but its stop still stopped the sent prompt.
+      if (action.epoch !== state.restartEpoch)
+        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
       // The stop this restart caused may already be applied; it isn't the Worker stopping.
       return {
         ...state,
@@ -294,7 +295,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
         restartFailure: null,
       };
     case "restart_failed":
-      if (action.epoch !== state.restartEpoch) return state;
+      if (action.epoch !== state.restartEpoch)
+        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
       return {
         ...state,
         restartFailure: action.message,

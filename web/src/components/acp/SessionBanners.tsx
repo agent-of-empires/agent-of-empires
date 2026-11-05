@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
@@ -56,6 +56,7 @@ export function SessionBanners({
           sessionId={sessionId}
           message={state.startupError}
           acpWorkerState={acpWorkerState}
+          sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
@@ -148,15 +149,23 @@ export function StartupWaitLine({
   const [seconds, setSeconds] = useState(0);
   const [frame, setFrame] = useState(0);
   const [still] = useState(reducedMotion);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const {
     state: restartState,
     error: restartError,
     respawn,
   } = useRespawnSession(sessionId, null, {
     restart: true,
-    // Refusals (4xx) come before the stop and this line shows them; a server error comes after it, which unmounts the line.
+    // A mounted line shows the failure itself; once the restart's stop has unmounted it, or for a server
+    // error, which only follows the stop, the stopped banner names it.
     onFailed: (status, error) => {
-      if (status !== null && status >= 500) onRestartFailed?.(restartEpoch, error, sentPending);
+      if ((status !== null && status >= 500) || !mounted.current) onRestartFailed?.(restartEpoch, error, sentPending);
     },
   });
   useEffect(() => {
