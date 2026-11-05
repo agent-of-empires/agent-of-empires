@@ -55,7 +55,7 @@ export type Action =
   | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
-  | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
+  | { kind: "restart_started"; epoch: number }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -288,7 +288,6 @@ export function reducer(state: AcpState, action: Action): AcpState {
         workerStopped: false,
         workerRestarting: false,
         restartInFlight: true,
-        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
       };
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };

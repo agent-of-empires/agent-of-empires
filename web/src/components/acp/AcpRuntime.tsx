@@ -65,7 +65,7 @@ export interface AcpContext {
   dismissError: () => void;
   dismissPrimer: () => void;
   /** After this dashboard's restart of a start in progress succeeds. */
-  markRestartStarted: (epoch: number, stoppedSent: boolean) => void;
+  markRestartStarted: (epoch: number) => void;
   dismissCompactionReminder: () => void;
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;

@@ -2,11 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { useReducer } from "react";
-
-import { emptyAcpState, type AcpEvent } from "../../../lib/acpTypes";
-import { reducer, type Action } from "../../../hooks/acpSession/reducer";
-import { isNewSessionStarting } from "../startupWait";
+import { emptyAcpState } from "../../../lib/acpTypes";
 import {
   ScheduledWakeupBanner,
   SessionBanners,
@@ -47,7 +43,9 @@ describe("TrashedWorkerStoppedBanner", () => {
     const onRestore = vi.fn(() => new Promise<boolean>(() => {}));
     render(<TrashedWorkerStoppedBanner sessionId="sess-9" onRestore={onRestore} />);
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
-    const pending = screen.getByRole("button", { name: "Restoring…" }) as HTMLButtonElement;
+    const pending = screen.getByRole("button", {
+      name: "Restoring…",
+    }) as HTMLButtonElement;
     expect(pending.disabled).toBe(true);
     fireEvent.click(pending);
     expect(onRestore).toHaveBeenCalledTimes(1);
@@ -117,14 +115,17 @@ describe("StartupWaitLine", () => {
   const reducedMotion = (reduce: boolean) =>
     vi.stubGlobal(
       "matchMedia",
-      vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
+      vi.fn((query: string) => ({
+        matches: reduce && query.includes("reduce"),
+        media: query,
+      })),
     );
   afterEach(() => vi.unstubAllGlobals());
 
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
     reducedMotion(false);
-    render(<StartupWaitLine sessionId="s1" agent="Claude Code" sentPending={false} queuedPending={false} canRestart />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" canRestart />);
     expect(line().textContent).toContain("Starting Claude Code… You can type now.");
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
     act(() => vi.advanceTimersByTime(6_000));
@@ -149,9 +150,7 @@ describe("StartupWaitLine", () => {
   ])("%s", (_label, reduce) => {
     vi.useFakeTimers();
     reducedMotion(reduce);
-    const { unmount } = render(
-      <StartupWaitLine sessionId="s1" agent="Codex" sentPending={false} queuedPending={false} canRestart />,
-    );
+    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" canRestart />);
     const glyph = () => line().firstElementChild!.textContent;
     const first = glyph();
     act(() => vi.advanceTimersByTime(180 * 4));
@@ -187,16 +186,7 @@ describe("StartupWaitLine", () => {
     vi.stubGlobal("fetch", spawn);
     const onRestarted = vi.fn();
     render(
-      <StartupWaitLine
-        sessionId="s1"
-        agent="Claude Code"
-        sentPending={false}
-        queuedPending={false}
-        canRestart
-        restartEpoch={3}
-        sentStopped={false}
-        onRestarted={onRestarted}
-      />,
+      <StartupWaitLine sessionId="s1" agent="Claude Code" canRestart restartEpoch={3} onRestarted={onRestarted} />,
     );
     const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
@@ -211,7 +201,7 @@ describe("StartupWaitLine", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
     expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
-    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3, false]] : []);
+    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3]] : []);
   });
 
   it("acknowledges a restart with the epoch it was requested in", async () => {
@@ -227,11 +217,8 @@ describe("StartupWaitLine", () => {
       <StartupWaitLine
         sessionId="s1"
         agent="Claude Code"
-        sentPending={false}
-        queuedPending={false}
         canRestart
         restartEpoch={restartEpoch}
-        sentStopped={false}
         onRestarted={onRestarted}
       />
     );
@@ -241,103 +228,7 @@ describe("StartupWaitLine", () => {
     // The replacement is assigned before the restart request answers.
     rerender(line(1));
     await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
-    expect(onRestarted.mock.calls).toEqual([[0, false]]);
-  });
-
-  it("keeps saying the sent message was stopped when the restart's stop lands first and the replacement stalls", async () => {
-    vi.useFakeTimers();
-    reducedMotion(true);
-    let respond!: (res: unknown) => void;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() => new Promise((resolve) => (respond = resolve))),
-    );
-    const frame = (seq: number, event: AcpEvent): Action => ({
-      kind: "frame",
-      frame: { session_id: "s1", seq, event },
-    });
-    let dispatch!: (action: Action) => void;
-    // The owner StructuredView gives SessionBanners: the line shows while the new Session is starting.
-    function Owner() {
-      const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
-      dispatch = send;
-      const connection = {
-        status: "open",
-        hasEverOpened: true,
-        reconnecting: false,
-        retryCount: 0,
-        maxRetries: 7,
-      } as const;
-      return (
-        <SessionBanners
-          sessionId="s1"
-          state={state}
-          startingAgent={isNewSessionStarting(state, connection, "resuming", false) ? "Claude Code" : null}
-          canRestart
-          onRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
-          acpWorkerState="resuming"
-          trashedAt={null}
-          archivedAt={null}
-          snoozedUntil={null}
-          dismissError={vi.fn()}
-        />
-      );
-    }
-    const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
-    render(<Owner />);
-    act(() => vi.advanceTimersByTime(30_000));
-    expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
-    // The Daemon answers the restart only after the old Worker stopped, so its stop arrives first.
-    act(() => dispatch(frame(2, { Stopped: { reason: "user_stopped" } })));
-    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
-    await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
-    expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
-    // The replacement stalls too.
-    act(() => vi.advanceTimersByTime(30_000));
-    expect(cost()).toBe("The message you sent was stopped. Send it again once Claude Code is ready.");
-    act(() => dispatch(frame(3, { UserPromptSent: { text: "hi" } })));
-    expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
-  });
-
-  it.each([
-    [
-      "warns that a sent prompt will be stopped",
-      true,
-      false,
-      "Restarting stops the message you sent. Send it again once Claude Code is ready.",
-    ],
-    [
-      "says queued messages still go to the replacement",
-      false,
-      true,
-      "Queued messages are sent once Claude Code is ready.",
-    ],
-    [
-      "says both when a sent and a queued prompt wait",
-      true,
-      true,
-      "Restarting stops the message you sent. Send it again once Claude Code is ready. Queued messages are sent once Claude Code is ready.",
-    ],
-    ["has no caption with nothing pending", false, false, ""],
-  ])("Restart %s", (_label, sentPending, queuedPending, description) => {
-    vi.useFakeTimers();
-    reducedMotion(true);
-    render(
-      <StartupWaitLine
-        sessionId="s1"
-        agent="Claude Code"
-        sentPending={sentPending}
-        queuedPending={queuedPending}
-        canRestart
-        restartEpoch={0}
-        sentStopped={false}
-      />,
-    );
-    act(() => vi.advanceTimersByTime(30_000));
-    const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
-    expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
-    expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
+    expect(onRestarted.mock.calls).toEqual([[0]]);
   });
 });
 
@@ -350,7 +241,7 @@ describe("SessionBanners startup line", () => {
     render(
       <SessionBanners
         sessionId="s1"
-        state={{ ...emptyAcpState(), turnActive: true }}
+        state={emptyAcpState()}
         startingAgent="Claude Code"
         canRestart={canRestart}
         acpWorkerState="running"
@@ -363,6 +254,5 @@ describe("SessionBanners startup line", () => {
     act(() => vi.advanceTimersByTime(31_000));
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
     expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
-    expect(screen.queryByTestId("startup-wait-restart-cost") !== null).toBe(canRestart);
   });
 });
