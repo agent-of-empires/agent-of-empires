@@ -615,6 +615,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
+        lock_recover(&self.unassigned_prompts).remove(session_id);
         Ok(())
     }
 

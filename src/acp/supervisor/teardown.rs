@@ -734,6 +734,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         observed: Option<(&Lease, u64)>,
         cancel_pending: bool,
     ) -> Result<(), SupervisorError> {
+        if stop_reason != RESTART_HANDOFF_STOP_REASON {
+            lock_recover(&self.unassigned_prompts).remove(session_id);
+        }
         // Close the request lane before inspecting lifecycle state. Pending
         // spawns must observe the stop while they still wait on submission or
         // instance guards; admitted launches are cancelled by their Lease.
