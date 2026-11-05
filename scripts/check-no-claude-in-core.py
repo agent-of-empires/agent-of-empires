@@ -93,8 +93,8 @@ def main():
         if not is_scanned(path):
             continue
         try:
-            text = (REPO_ROOT / path).read_text(encoding="utf-8")
-        except (UnicodeDecodeError, FileNotFoundError):
+            text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
             continue
         hits.extend(find_hits(path, text))
 
