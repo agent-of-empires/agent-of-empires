@@ -123,6 +123,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
+* [`aoe acp lint-stream`↴](#aoe-acp-lint-stream)
 * [`aoe acp stop`↴](#aoe-acp-stop)
 * [`aoe acp recover`↴](#aoe-acp-recover)
 * [`aoe acp kill`↴](#aoe-acp-kill)
@@ -1869,6 +1870,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
+* `lint-stream` — Check a recorded agent-to-client NDJSON stream (one JSON-RPC frame per line) against the `_meta.aoe` primitive contract. Exits 1 on any finding, so a plugin can run it in CI
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
 * `kill` — SIGKILL the runner, then settle its native workers
@@ -1910,6 +1912,23 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 List configured agents (claude-code, aoe-agent, etc.)
 
 **Usage:** `aoe acp agents`
+
+
+
+## `aoe acp lint-stream`
+
+Check a recorded agent-to-client NDJSON stream (one JSON-RPC frame per line) against the `_meta.aoe` primitive contract. Exits 1 on any finding, so a plugin can run it in CI
+
+**Usage:** `aoe acp lint-stream [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — NDJSON file, or `-` for stdin
+
+###### **Options:**
+
+* `--json` — Emit findings as JSON instead of a human report
+* `--require-hello` — Fail a stream with no `_meta.aoe.proxy` hello
 
 
 
