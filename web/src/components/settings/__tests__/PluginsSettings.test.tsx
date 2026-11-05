@@ -159,6 +159,13 @@ describe("installed plugins", () => {
     expect(screen.getByText(/not granted/)).toBeTruthy();
   });
 
+  it("styles the dev validation badge as a warning", async () => {
+    renderWith([{ ...EXAMPLE, id: "agent-of-empires.claude", validation: "dev", source: "/src/claude" }]);
+    const badge = await screen.findByTestId("plugin-validation-agent-of-empires.claude");
+    expect(badge.textContent).toBe("dev");
+    expect(badge.className).toContain("text-status-warning");
+  });
+
   it("renders load errors", async () => {
     renderWith([STATUS], ["plugins/bad: manifest is invalid"]);
     expect(await screen.findByText(/manifest is invalid/)).toBeTruthy();

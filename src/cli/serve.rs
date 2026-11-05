@@ -1260,6 +1260,18 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
         if args.passphrase.is_none() {
             bail!("Remote exposure requires --passphrase or AOE_SERVE_PASSPHRASE");
         }
+        let dev_plugins: Vec<String> = crate::plugin::registry()
+            .active()
+            .filter(|p| p.validation == crate::plugin::registry::ValidationState::Dev)
+            .map(|p| p.id().to_string())
+            .collect();
+        if !dev_plugins.is_empty() {
+            bail!(
+                "Remote exposure is refused while dev plugins are active: {}. Disable or uninstall them first.",
+                dev_plugins.join(", ")
+            );
+        }
+        crate::plugin::set_remote_exposure();
         // The same decision `start_server` makes, so a wedged Tailscale fails here with the
         // probe's `--no-tailscale` advice rather than the cloudflared install error below.
         use crate::server::tunnel::{skips_tailscale, tailscale_probe};

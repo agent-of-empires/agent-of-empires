@@ -276,6 +276,9 @@ async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
+    if !build_steps(&fetched.manifest).is_empty() {
+        super::ensure_node().await;
+    }
 
     if super::plugins_dir()?.join(&id).exists() {
         bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
@@ -576,13 +579,12 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
             fetched.manifest.id.as_str()
         );
     }
-    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    if dev && featured_verified {
-        eprintln!("{id} matches a featured release but stays a dev install; reinstall without --dev to use the featured build.");
-    }
-    let featured_verified = featured_verified && !dev;
+    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
+    if !build_steps(&fetched.manifest).is_empty() {
+        super::ensure_node().await;
+    }
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
@@ -1366,6 +1368,7 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLo
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
+            .envs(super::node_env())
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)

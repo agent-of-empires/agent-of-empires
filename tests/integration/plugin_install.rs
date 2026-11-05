@@ -663,6 +663,41 @@ fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBu
     write_featured_versions(dir, id, source, &[("1.0.0", tree_hash)])
 }
 
+/// `--dev` lets a local reserved id load, records dev provenance, outranks a
+/// matching featured pin, and stays dev across update. `--dev` on a gh: source
+/// is refused.
+#[tokio::test]
+#[serial]
+async fn dev_install_claims_reserved_id_and_stays_dev() {
+    let _home = isolate();
+    let id = "agent-of-empires.claude";
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        &format!("id = \"{id}\"\nname = \"Dev\"\nversion = \"1.0.0\"\napi_version = 2\n"),
+    );
+    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+    write_featured(src.path(), id, dir.to_str().unwrap(), &tree_hash);
+
+    let err = install::install("gh:acme/widget", true, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--dev requires a local"), "{err}");
+
+    let report = install::install(dir.to_str().unwrap(), true, true)
+        .await
+        .unwrap();
+    assert_eq!(report.validation.as_str(), "dev");
+    assert_eq!(Lockfile::load().unwrap().get(id).unwrap().trust, "dev");
+    assert!(Config::load().unwrap().plugins[id].dev);
+    assert_eq!(load_registry().get(id).unwrap().validation.as_str(), "dev");
+
+    let report = install::update(id, true).await.unwrap();
+    assert_eq!(report.validation.as_str(), "dev");
+    assert_eq!(Lockfile::load().unwrap().get(id).unwrap().trust, "dev");
+    assert_eq!(load_registry().get(id).unwrap().validation.as_str(), "dev");
+}
+
 /// Only a vetted featured release lifts the reserved-namespace gate. The same
 /// unvetted pin on a non-reserved id still installs, labelled by its source.
 #[tokio::test]
