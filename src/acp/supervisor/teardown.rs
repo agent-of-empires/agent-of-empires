@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::{
-    lock_recover, BroadcastSink, RestartRequestGuard, Supervisor, SupervisorError, UnassignedPrompt,
-    WorkerHandle, WorkerKind, RESTART_HANDOFF_STOP_REASON,
+    lock_recover, BroadcastSink, RestartRequestGuard, Supervisor, SupervisorError,
+    UnassignedPrompt, WorkerHandle, WorkerKind, RESTART_HANDOFF_STOP_REASON,
 };
 use crate::acp::acp_client::{AcpClient, DeleteSessionOutcome};
 use crate::acp::runner_lifecycle::{
@@ -503,14 +503,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
         self.cancel_restart_request(session_id).await;
-        self.shutdown_and_wait_with_policy(
-            session_id,
-            "user_stopped",
-            deadline,
-            true,
-            Some(target),
-        )
-        .await
+        self.shutdown_and_wait_with_policy(session_id, "user_stopped", deadline, true, Some(target))
+            .await
     }
     /// Stop a worker, keeping its agent-side transcript resumable.
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
