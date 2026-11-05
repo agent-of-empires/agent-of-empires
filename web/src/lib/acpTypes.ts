@@ -289,7 +289,17 @@ export type IncompatibleAgentDetail =
       kind: "unsupported_protocol_version";
       expected: string;
       received: string;
+    }
+  | {
+      kind: "invalid_proxy_hello";
+      reason: string;
     };
+
+/** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
+export type IntegrationLostReason =
+  | { kind: "contract_violation"; detail: string }
+  | { kind: "hold_overflow" }
+  | { kind: "lease_overflow" };
 
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =
@@ -409,6 +419,7 @@ export type AcpEvent =
   | { AgentStartupError: { message: string } }
   | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
+  | { IntegrationLost: { reason: IntegrationLostReason } }
   | {
       UserPromptSent: {
         text: string;
@@ -1153,6 +1164,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("IncompatibleAgent" in event) {
     next.incompatibleAgent = event.IncompatibleAgent.detail;
     next.agentUnresponsive = false;
+    return next;
+  }
+  if ("IntegrationLost" in event) {
+    const { reason } = event.IntegrationLost;
+    next.startupError = `Agent integration lost: ${
+      reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
+    }`;
+    next.agentUnresponsive = false;
+    closeTurn(next);
     return next;
   }
   if ("AgentStartupError" in event) {
