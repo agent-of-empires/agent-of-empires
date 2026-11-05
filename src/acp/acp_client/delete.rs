@@ -1,8 +1,9 @@
 //! `session/delete`: its wire form, the outcomes aoe distinguishes, and
 //! the dispatch that sends it.
 
-use agent_client_protocol::schema::v1::ErrorCode;
-use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest, JsonRpcResponse};
+use agent_client_protocol::v1::schema::ErrorCode;
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, JsonRpcRequest, JsonRpcResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -14,7 +15,7 @@ use super::spawn::scrub_stderr_secrets;
 #[request(method = "session/delete", response = DeleteSessionResponse)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DeleteSessionRequest {
-    session_id: agent_client_protocol::schema::v1::SessionId,
+    session_id: agent_client_protocol::v1::schema::SessionId,
     /// Optional in the TS schema, but sent so a strict
     /// `unstable_session_delete` validator cannot answer `-32602`.
     #[serde(rename = "_meta")]
@@ -57,7 +58,7 @@ pub(super) fn handle_delete_session_cmd(
     acp_session_id: String,
     respond_to: oneshot::Sender<DeleteSessionOutcome>,
 ) {
-    let target = agent_client_protocol::schema::v1::SessionId::from(acp_session_id);
+    let target = agent_client_protocol::v1::schema::SessionId::from(acp_session_id);
     // `block_task()` is safe to await from a spawned task: it waits on the
     // per-request oneshot the main connection task feeds, so the dispatch loop
     // keeps running while this future is parked.

@@ -4,7 +4,7 @@
 
 use crate::acp::control_protocol::PromptOutcome;
 use crate::acp::state::{Event, RateLimitInfo};
-use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;

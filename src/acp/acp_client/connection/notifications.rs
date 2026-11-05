@@ -5,7 +5,7 @@ use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
-use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate};
+use agent_client_protocol::v1::schema::{SessionId, SessionNotification, SessionUpdate};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -393,7 +393,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+    use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
 
     async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
         let (event_tx, mut event_rx) = mpsc::channel(8);
