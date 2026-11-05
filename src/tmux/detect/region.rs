@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 
 /// Capture rows before surface preprocessing and recent-window truncation.
 pub(super) struct Rows<'a> {
-    pub source: &'a str,
     pub non_empty: Vec<&'a str>,
     pub blank_before: Vec<bool>,
 }
@@ -24,7 +23,6 @@ impl<'a> Rows<'a> {
             blank_before.push(std::mem::take(&mut after_blank));
         }
         Self {
-            source,
             non_empty,
             blank_before,
         }

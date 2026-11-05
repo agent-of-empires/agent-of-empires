@@ -1600,8 +1600,7 @@ mod tests {
         #[test]
         #[serial]
         fn omp_launch_without_capture_plan_publishes_tombstone_generation() {
-            let temp = tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _omp = crate::session::instance::test_helpers::install_omp_test_plugin();
             let profile = "omp-plan-failure-tombstone";
             let old_generation = "omp-old-generation";
             let mut inst = omp_inst(profile, "omp-plan-failure");
@@ -1712,7 +1711,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp.path());
+            let _omp = crate::session::instance::test_helpers::install_omp_test_plugin();
 
             let profile = "publish-applied";
             let mut inst = omp_inst(profile, "fpaw");
@@ -1783,8 +1782,7 @@ mod tests {
             if no_tmux() {
                 return;
             }
-            let temp = tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp.path());
+            let _omp = crate::session::instance::test_helpers::install_omp_test_plugin();
 
             let mut inst = omp_inst("omp-legacy-metadata", "legacy-omp");
             inst.agent_session_id = Some(VALID_SID.to_string());

@@ -2860,16 +2860,23 @@ mod tests {
     #[serial_test::serial]
     fn managed_resume_refuses_unattestable_execution_without_changing_identity() {
         let root = tempfile::tempdir().unwrap();
+        let _omp = crate::session::install_omp_test_plugin();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
         let _omp_env = crate::session::test_support::EnvGuard::unset(
             &crate::session::capture::OMP_STORE_ENV_KEYS,
         );
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("HOME", root.path().to_path_buf()),
-            ("CODEX_HOME", codex_home),
-        ]);
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "PI_CODING_AGENT_DIR",
+            "OMP_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "XDG_STATE_HOME",
+            "OMP_PROFILE",
+            "PI_PROFILE",
+        ])
+        .and_set("HOME", root.path())
+        .and_set("CODEX_HOME", codex_home);
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";

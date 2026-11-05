@@ -26,7 +26,7 @@ Running several agents in parallel across tasks or branches means juggling termi
 
 ## Supported agents
 
-Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent. AoE auto-detects which are installed.
+Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent. Oh My Pi (OMP) is provided by the featured OMP integration plugin. AoE auto-detects which agents are installed.
 
 Each agent carries a lifecycle state in AoE's registry, so when a vendor deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears (`aoe agents`, `aoe acp doctor`, session creation, the restart and switch-agent pickers, the web wizard) before you launch one.
 

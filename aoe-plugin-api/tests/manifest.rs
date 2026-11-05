@@ -536,3 +536,187 @@ fn path_icon_and_hash_helpers() {
     assert!(a.starts_with("sha256:"));
     assert_ne!(a, PluginManifest::hash_bytes(b"different"));
 }
+
+#[test]
+fn agent_launch_declarations_parse_at_v20() {
+    let body = r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper --serve"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+model_flag = "--model"
+host_only = true
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+[agent_integrations.detection]
+mode = "native_only"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+"#;
+    let manifest = parse(20, body);
+    let integration = &manifest.agent_integrations[0];
+    let launch = integration.launch.as_ref().expect("launch parsed");
+    assert_eq!(launch.oneshot_flag.as_deref(), Some("-p"));
+    assert_eq!(launch.model_flag.as_deref(), Some("--model"));
+    assert!(launch
+        .instruction_flag
+        .as_deref()
+        .is_some_and(|flag| flag.contains("{}")));
+    assert_eq!(
+        launch
+            .container_env
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some("/root/.omp/agent")
+    );
+    assert_eq!(
+        launch.capture.as_ref().map(|capture| capture.backend),
+        Some(aoe_plugin_api::agent_integration::AgentCaptureBackend::Omp)
+    );
+    assert_eq!(
+        integration
+            .detection
+            .as_ref()
+            .map(|detection| detection.mode),
+        Some(aoe_plugin_api::agent_integration::AgentDetectionMode::NativeOnly)
+    );
+    assert!(integration.reply_fallback.is_some());
+}
+
+#[test]
+fn agent_launch_declarations_reject_unknown_keys() {
+    let body = r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch]
+frobnicate = true
+"#;
+    assert!(matches!(
+        PluginManifest::from_toml_str(&manifest(20, body)),
+        Err(ManifestError::Parse(_))
+    ));
+}
+
+#[test]
+fn agent_launch_declarations_reject_unsafe_or_ambiguous_values() {
+    let cases = [
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch.container_env]
+HOME = "/root"
+"#,
+            "non-reserved environment name",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch]
+instruction_flag = "--append-system-prompt"
+"#,
+            "exactly one `{}` placeholder",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#,
+            "capture requires launch.resume",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+replies = true
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+"#,
+            "reply-enabled integrations own replies",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Ctrl+C" }]
+deny = [{ kind = "literal", value = "n" }]
+"#,
+            "named key",
+        ),
+        (
+            r#"
+capabilities = []
+[[agent_integrations]]
+tool = "acme-helper"
+command = "acme-helper"
+[agent_integrations.detection]
+mode = "native_only"
+"#,
+            "requires the session.integration capability",
+        ),
+    ];
+    for (body, expected) in cases {
+        let errors = invalid(20, body);
+        assert!(
+            errors.iter().any(|error| error.contains(expected)),
+            "expected {expected:?}, got {errors:?}"
+        );
+    }
+
+    let v20_body = r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.detection]
+mode = "native_only"
+"#;
+    let errors = invalid(19, v20_body);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("require api_version >= 20")),
+        "{errors:?}"
+    );
+}

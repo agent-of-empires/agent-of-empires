@@ -588,13 +588,10 @@ fn agent_integrations_changed(
         return !current.is_empty();
     };
     current.iter().any(|current| {
-        let Some(previous) = previous
+        previous
             .iter()
             .find(|previous| previous.tool == current.tool)
-        else {
-            return true;
-        };
-        current.command.is_some() && previous.command != current.command
+            .is_none_or(|previous| previous != current)
     })
 }
 
@@ -1342,15 +1339,9 @@ fn confirm_capabilities(
     if !integrations.is_empty() {
         println!("Plugin {id} declares these agent commands (run as your user, unsandboxed):");
         for integration in integrations {
-            println!(
-                "  {}: {}",
-                integration.tool,
-                integration
-                    .command
-                    .as_deref()
-                    .map(super::agent_integration::display_command)
-                    .unwrap_or_else(|| "No launch command declared".to_string())
-            );
+            for line in super::agent_integration::declaration_summary(integration) {
+                println!("  {line}");
+            }
         }
     }
     println!(
@@ -1785,6 +1776,7 @@ mod tests {
                 provider_versions: Vec::new(),
                 command: Some("agent --flag".into()),
                 replies: false,
+                ..Default::default()
             }],
         ));
     }
@@ -1796,12 +1788,52 @@ mod tests {
             provider_versions: Vec::new(),
             command: Some("x\u{202e}tail".into()),
             replies: false,
+            ..Default::default()
         };
         let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
         // The consent that the CLI/TUI/web serialize carries the escaped form.
         assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
         // The manifest / launch command stays raw.
         assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
+    }
+
+    #[test]
+    fn any_agent_declaration_change_requires_consent_but_removal_does_not() {
+        let base = AgentIntegrationContribution {
+            tool: "acme-helper".into(),
+            command: Some("acme-helper".into()),
+            launch: Some(aoe_plugin_api::agent_integration::AgentLaunchDeclaration {
+                container_env: [(
+                    "PI_CODING_AGENT_DIR".to_string(),
+                    "/root/.omp/agent".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!agent_integrations_changed(
+            Some(std::slice::from_ref(&base)),
+            std::slice::from_ref(&base)
+        ));
+
+        let mut changed = base.clone();
+        changed
+            .launch
+            .as_mut()
+            .unwrap()
+            .container_env
+            .insert("PI_CODING_AGENT_DIR".into(), "/root/.omp/other".into());
+        assert!(agent_integrations_changed(
+            Some(std::slice::from_ref(&base)),
+            std::slice::from_ref(&changed)
+        ));
+
+        assert!(!agent_integrations_changed(
+            Some(std::slice::from_ref(&base)),
+            &[]
+        ));
     }
 
     #[tokio::test]
