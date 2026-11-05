@@ -878,6 +878,17 @@ describe("ensureTerminal", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
 
+    it("reports an abort that lands during the final wait", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(29_950);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
     it("stops retrying once its signal aborts", async () => {
       fetchSpy.mockImplementation(async () => busy());
       const controller = new AbortController();
