@@ -21,17 +21,20 @@
       "type": "object",
       "properties": {
         "plugin_id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "\\S"
         },
         "protocol_version": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 1
         },
         "primitive_schema_version": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 1
         }
       },
       "additionalProperties": false,
@@ -48,10 +51,12 @@
         "v": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 1
         },
         "key": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "after_adapter_sequence": {
           "type": [
@@ -150,7 +155,8 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 3600000
         }
       },
       "additionalProperties": false,
