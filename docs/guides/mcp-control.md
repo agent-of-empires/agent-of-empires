@@ -4,7 +4,7 @@ The daemon can serve a [Model Context Protocol](https://modelcontextprotocol.io)
 
 ## Turn it on
 
-The server is off by default. Turn on the **MCP server** toggle in Settings, or add this to `config.toml`:
+The server is off by default. Turn on **Let other apps control AoE** in Settings, or add this to `config.toml`:
 
 ```toml
 [web]
