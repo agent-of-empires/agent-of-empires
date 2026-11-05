@@ -388,6 +388,7 @@ impl NativeRuntime {
             authorize(local, Capability::NativeInteraction);
         RuntimeInfo {
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            cli_creation: true,
             epoch: self.epoch.clone(),
             namespace: self.namespace.clone(),
             tmux_socket: self.tmux_socket.clone(),

@@ -2381,7 +2381,7 @@ async fn commit_profile_owned(
     mutation: crate::daemon::ProfileMutation,
 ) -> axum::response::Response {
     use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
-    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+    use crate::server::reload::{load_configuration_profiles, merge_loaded_rows};
 
     let transaction = tokio::select! {
         _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2406,9 +2406,6 @@ async fn commit_profile_owned(
             "The profile served by this daemon cannot be deleted",
         );
     }
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     let creation_active = match &mutation {
         ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } => {
             state.session_service.has_profile_creation(name)
@@ -2432,7 +2429,7 @@ async fn commit_profile_owned(
             transaction,
             identity,
         )?;
-        let loaded = load_all_profiles(&file_watch).map(|_| ());
+        let loaded = load_configuration_profiles(&file_watch).map(|loaded| loaded.native_health());
         Ok::<_, anyhow::Error>((catalogue, loaded, reload))
     })
     .await
@@ -2445,12 +2442,17 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    if let Err(error) = preflight {
-        state.mark_reload_failure(error.health).await;
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    let preflight_health = match preflight {
+        Ok(health) => health,
+        Err(error) => {
+            state.mark_reload_failure(error.health).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let publication = state.publication.write().await;
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy
+        && preflight_health == RuntimeHealth::Healthy
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let file_watch = state.file_watch.clone();
@@ -2468,7 +2470,7 @@ async fn commit_profile_owned(
                 .map(|_| ()),
             ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
         };
-        let loaded = load_all_profiles(&file_watch);
+        let loaded = load_configuration_profiles(&file_watch);
         #[cfg(test)]
         {
             let pause = {
@@ -2512,6 +2514,7 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let health = loaded.native_health();
     let suppressed =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
     merge_loaded_rows(
@@ -2521,7 +2524,12 @@ async fn commit_profile_owned(
         &suppressed,
     );
     *state.canonical_metadata.write().await = loaded.metadata;
-    *state.canonical_health.write().await = RuntimeHealth::Healthy;
+    state
+        .runtime_read_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inventory = loaded.inventory;
+    *state.canonical_health.write().await = health;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

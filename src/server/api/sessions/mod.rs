@@ -34,6 +34,7 @@ use super::AppState;
 use super::{api_error, bare_not_found, session_not_found, validate_display_label};
 
 mod artifacts;
+mod cli_create;
 mod create;
 mod delete;
 mod diff;
@@ -47,6 +48,7 @@ mod send;
 mod update;
 
 pub use artifacts::*;
+pub(crate) use cli_create::resolve_cli_session;
 pub use create::*;
 pub use delete::*;
 pub use diff::*;
