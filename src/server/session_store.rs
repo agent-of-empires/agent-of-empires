@@ -1030,6 +1030,7 @@ mod tests {
             let mut row = Instance::new("live structured", "/tmp");
             row.source_profile = "default".into();
             row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
             let prior_access = chrono::Utc::now() - chrono::Duration::days(2);
             row.last_accessed_at = Some(prior_access);
             row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));

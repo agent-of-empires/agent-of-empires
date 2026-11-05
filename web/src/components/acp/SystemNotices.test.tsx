@@ -3,11 +3,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { SystemNotices } from "./SystemNotices";
-import { emptyAcpState } from "../../lib/acpTypes";
+import {
+  applyEvent,
+  applyReducedState,
+  canSubmitPromptIntent,
+  emptyAcpState,
+  mergeServerRows,
+  revokeNativeAuthority,
+  type AcpEvent,
+  type AcpState,
+} from "../../lib/acpTypes";
+import { loadPersistedState, persistState } from "../../hooks/acpSession/stateCache";
+import { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
+import { queuedReason } from "./queuedReason";
 import { isNewSessionStarting } from "./startupWait";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 type NoticeProps = React.ComponentProps<typeof SystemNotices>;
@@ -30,6 +43,99 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
 const mount = (overrides?: Partial<NoticeProps>) => render(<SystemNotices {...noticeProps(overrides)} />);
 
 describe("SystemNotices", () => {
+  it("keeps quota advice canonical across foreign history, hydration, and later current snapshots", () => {
+    const id = "canonical-quota-notices";
+    const snapshot = (state: AcpState, seq: number, rateLimitPark: "none" | "armed" | "exhausted" | null) => {
+      const receipt = currentControlSnapshot(state, { ready: true, rateLimitPark }, seq);
+      return applyReducedState(state, receipt.state, receipt.unchanged, receipt.seq);
+    };
+    let state = snapshot(emptyAcpState(), 20, "none");
+    const view = render(<SystemNotices {...noticeProps()} />);
+    const advice = () => {
+      view.rerender(
+        <SystemNotices
+          {...noticeProps({ rateLimitRetriesExhausted: state.rateLimitRetriesExhausted === true && !state.rateLimit })}
+        />,
+      );
+      return queuedReason({
+        agent: "Claude",
+        online: true,
+        anyPending: false,
+        waitingFor: null,
+        rateLimitParked: state.rateLimitParked === true,
+        rateLimit: state.rateLimit,
+        rateLimitAutoResume: true,
+        workerDown: false,
+        workerStarting: false,
+        cancelling: false,
+        compacting: false,
+        turnActive: false,
+        steerable: false,
+        firstText: "next task",
+        soloAliases: [],
+      });
+    };
+    const raw = (seq: number, event: AcpEvent) => {
+      state = applyEvent(state, { session_id: id, seq, event });
+    };
+    const expectNoQuotaAdvice = () => {
+      expect(advice()).toMatchObject({ reason: null, action: "send" });
+      expect(view.queryByText(/Auto-resume stopped/)).toBeNull();
+    };
+    raw(5, { Stopped: { reason: "rate_limit_exhausted_retries" } });
+    raw(6, { Stopped: { reason: "rate_limited" } });
+    raw(21, { Stopped: { reason: "rate_limit_exhausted_retries" } });
+    raw(22, { Stopped: { reason: "rate_limited" } });
+    expectNoQuotaAdvice();
+    expect(canSubmitPromptIntent(state)).toBe(true);
+    state = {
+      ...state,
+      activity: mergeServerRows(state.activity, [
+        { id: "historical-reply", kind: "message", text: "Retained historical answer", at: "2026-01-01T00:00:00Z" },
+      ]),
+    };
+
+    state = snapshot(state, 23, "armed");
+    expect(advice()).toMatchObject({ reason: "sends after the rate limit lifts", action: "send" });
+    expect(view.queryByText(/Auto-resume stopped/)).toBeNull();
+    state = snapshot(state, 24, "exhausted");
+    expect(advice().reason).toBe("sends after the rate limit lifts");
+    expect(view.queryByText(/Auto-resume stopped/)).not.toBeNull();
+    raw(25, { UserPromptSent: { text: "foreign prompt" } });
+    raw(26, { RateLimitAutoResumed: { resets_at: "2026-01-01T00:00:00Z" } });
+    raw(27, { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" } });
+    expect(advice().reason).toBe("sends after the rate limit lifts");
+    expect(view.queryByText(/Auto-resume stopped/)).not.toBeNull();
+
+    persistState(id, state);
+    state = loadPersistedState(id)!;
+    expect(state.rateLimitParked).toBeNull();
+    expect(state.rateLimitRetriesExhausted).toBeNull();
+    expectNoQuotaAdvice();
+    expect(canSubmitPromptIntent(state)).toBe(false);
+    expect(state.activity.map((row) => row.text)).toContain("Retained historical answer");
+    state = snapshot(state, 28, "exhausted");
+    expect(advice().reason).toBe("sends after the rate limit lifts");
+    expect(view.queryByText(/Auto-resume stopped/)).not.toBeNull();
+    state = revokeNativeAuthority(state);
+    expectNoQuotaAdvice();
+    expect(state.rateLimitParked).toBeNull();
+    state = snapshot(state, 29, null);
+    expectNoQuotaAdvice();
+    expect(state.rateLimitRetriesExhausted).toBeNull();
+    expect(canSubmitPromptIntent(state)).toBe(true);
+    raw(30, { Stopped: { reason: "rate_limit_exhausted_retries" } });
+    raw(31, { Stopped: { reason: "rate_limited" } });
+    expectNoQuotaAdvice();
+    expect(state.rateLimitParked).toBeNull();
+    expect(state.rateLimitRetriesExhausted).toBeNull();
+    state = snapshot(state, 32, "none");
+    expectNoQuotaAdvice();
+    expect(state.rateLimitParked).toBe(false);
+    state = snapshot(state, 31, "exhausted");
+    expectNoQuotaAdvice();
+  });
+
   // The startup wait line covers a new Session's first connection; reconnect lines stay.
   it.each<[string, Partial<NoticeProps>, RegExp | null]>([
     ["first connect while starting", { status: "connecting", hasEverOpened: false, newSessionStarting: true }, null],

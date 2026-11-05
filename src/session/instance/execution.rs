@@ -2895,6 +2895,62 @@ impl ConversationState {
                     &row.active_execution,
                 )
     }
+
+    pub(crate) fn establish_acp_identity(
+        &mut self,
+        sid: &str,
+        observed: Option<&ExecutionBinding>,
+        sandboxed: bool,
+        retained_load: bool,
+    ) {
+        if !retained_load {
+            self.intent = ResumeIntent::Default;
+            if self.session_id.as_deref() != Some(sid) {
+                self.session_id = None;
+            }
+            if self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.session_id != sid)
+            {
+                self.binding = None;
+            }
+        }
+        if self.resume_binding.as_ref().is_some_and(|binding| {
+            binding.provenance == ConversationProvenance::Asserted && binding.session_id != sid
+        }) {
+            self.resume_binding = None;
+        }
+        if sandboxed {
+            return;
+        }
+        for binding in [self.binding.as_mut(), self.resume_binding.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            attest_observed_default_store(binding, observed);
+        }
+        let Some(observed) =
+            observed.filter(|store| store.agent == "claude" && store.filesystem == "host")
+        else {
+            return;
+        };
+        self.session_id = Some(sid.to_owned());
+        if !self.binding.as_ref().is_some_and(|binding| {
+            binding.session_id == sid
+                && (binding.provenance != ConversationProvenance::Observed
+                    || binding.execution.as_ref().is_some_and(|known| {
+                        known.stores == observed.stores && known.cwd == observed.cwd
+                    }))
+        }) {
+            self.binding = Some(ConversationBinding {
+                session_id: sid.to_owned(),
+                execution: Some(observed.clone()),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            });
+        }
+    }
 }
 
 impl Instance {

@@ -2,10 +2,15 @@
 
 use std::collections::HashMap;
 
+use crate::acp::establishment::{NativeResourceSelector, NativeResourceWitness};
+use crate::acp::event_sender::EventMetadata;
+use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
+use std::sync::Arc;
 
 use super::{
-    decode_logged, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+    decode_logged, logged, query_strings, ControlKnowledge, EventStore,
+    NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
 };
 use crate::acp::approvals::{Approval, Nonce};
 use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, WorkflowAgents};
@@ -30,31 +35,40 @@ pub struct TerminalRepairProbe {
 pub struct UnresolvedBackgroundAgentLaunch {
     pub agent_id: String,
     pub output_file: String,
+    pub(crate) witness: Option<std::sync::Arc<crate::acp::establishment::NativeResourceWitness>>,
 }
 
-/// Launches with no matching completion, shared by both unresolved-launch
-/// queries. Both `agent_id` extractions are `IS NOT NULL`-guarded: SQLite's
-/// `NOT IN` evaluates to `NULL` (never true) for every row once the subquery
-/// yields one `NULL`, so a single unextractable id would otherwise blank the
-/// whole result instead of just miscounting that row.
+/// Only a matching allocation's later completion can retire its launch.
 const UNRESOLVED_BACKGROUND_AGENT_WHERE: &str = "
-     FROM acp_events
-     WHERE session_id = ?1
-       AND discriminant = 'BackgroundAgentLaunched'
-       AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
-       AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
-           SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
-           FROM acp_events
-           WHERE session_id = ?1
-             AND discriminant = 'BackgroundAgentCompleted'
-             AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+     FROM acp_events AS started
+     WHERE started.session_id = ?1
+       AND started.discriminant = 'BackgroundAgentLaunched'
+       AND json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events later
+           WHERE later.session_id = started.session_id
+             AND later.discriminant = started.discriminant AND later.seq > started.seq
+             AND json_extract(later.event_json, '$.BackgroundAgentLaunched.agent_id') =
+                 json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+             AND (json_extract(later.qualification_json, '$.resource_ref') IS NOT NULL
+                 OR json_extract(started.qualification_json, '$.resource_ref') IS NULL)
        )
-     ORDER BY seq ASC";
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events finished
+           WHERE finished.session_id = started.session_id
+             AND finished.discriminant = 'BackgroundAgentCompleted' AND finished.seq > started.seq
+             AND json_extract(finished.event_json, '$.BackgroundAgentCompleted.agent_id') =
+                 json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+             AND json_extract(finished.qualification_json, '$.resource_ref')
+                 IS json_extract(started.qualification_json, '$.resource_ref')
+       )
+     ORDER BY started.seq ASC";
 
 const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
     "SELECT json_extract(started.event_json, '$.BackgroundTaskStarted.task_id') AS task_id,
             json_extract(started.event_json, '$.BackgroundTaskStarted.tool_call_id'),
-            json_extract(started.event_json, '$.BackgroundTaskStarted.workflow')
+            json_extract(started.event_json, '$.BackgroundTaskStarted.workflow'),
+            started.scope, started.qualification_json
      FROM acp_events AS started
      WHERE started.session_id = ?1
        AND started.discriminant = 'BackgroundTaskStarted'
@@ -66,6 +80,8 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
              AND later.seq > started.seq
              AND json_extract(later.event_json, '$.BackgroundTaskStarted.task_id') =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
+             AND (json_extract(later.qualification_json, '$.resource_ref') IS NOT NULL
+                 OR json_extract(started.qualification_json, '$.resource_ref') IS NULL)
        )
        AND NOT EXISTS (
            SELECT 1 FROM acp_events AS finished
@@ -74,37 +90,137 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
              AND finished.seq > started.seq
              AND json_extract(finished.event_json, '$.BackgroundTaskFinished.task_id') =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
+             AND json_extract(finished.qualification_json, '$.resource_ref')
+                 IS json_extract(started.qualification_json, '$.resource_ref')
        )
      ORDER BY started.seq ASC";
 
-/// The agents of workflow run `run_id` the log has launched, and those of
-/// them it has completed.
-fn workflow_agents(conn: &rusqlite::Connection, session_id: &str, run_id: &str) -> WorkflowAgents {
-    let what = "workflow_agents";
-    let ids = |sql: &str| -> std::collections::HashSet<String> {
-        let Some(mut stmt) = logged(conn.prepare_cached(sql), what, session_id) else {
-            return Default::default();
+/// Group child allocations once for all retained workflow parents.
+fn workflow_agents(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<HashMap<String, HashMap<Option<uuid::Uuid>, WorkflowAgents>>> {
+    const SQL: &str = "
+        SELECT json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id'),
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.output_file'),
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.tool_call_id'),
+               started.scope, started.qualification_json,
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id'),
+               EXISTS (
+                   SELECT 1 FROM acp_events finished
+                   WHERE finished.session_id = started.session_id
+                     AND finished.discriminant = 'BackgroundAgentCompleted'
+                     AND finished.seq > started.seq
+                     AND json_extract(finished.event_json, '$.BackgroundAgentCompleted.agent_id') =
+                         json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+                     AND json_extract(finished.qualification_json, '$.resource_ref')
+                         IS json_extract(started.qualification_json, '$.resource_ref')
+               )
+        FROM acp_events started
+        WHERE started.session_id = ?1 AND started.discriminant = 'BackgroundAgentLaunched'
+          AND json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id') IS NOT NULL
+        ORDER BY started.seq ASC";
+    let mut statement = conn.prepare_cached(SQL)?;
+    let mut rows = statement.query([session_id])?;
+    let mut groups: HashMap<String, HashMap<Option<uuid::Uuid>, WorkflowAgents>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let agent: String = row.get(0)?;
+        let run = optional_text(row, 5)?.ok_or_else(|| invalid_launch("workflow run is absent"))?;
+        let witness = launch_witness(row, 3, 4, session_id)?;
+        let parent = match witness.as_deref() {
+            Some(witness) => {
+                if !witness.matches_agent_launch(
+                    &agent,
+                    optional_text(row, 2)?.unwrap_or_default(),
+                    optional_text(row, 1)?.unwrap_or_default(),
+                    Some(run),
+                ) {
+                    return Err(invalid_launch(
+                        "workflow resource selector differs from its launch",
+                    )
+                    .into());
+                }
+                match witness.selector.as_ref() {
+                    NativeResourceSelector::WorkflowChild {
+                        parent_allocation, ..
+                    } => Some(*parent_allocation),
+                    _ => {
+                        return Err(
+                            invalid_launch("workflow launch has no parent allocation").into()
+                        )
+                    }
+                }
+            }
+            None => None,
         };
-        let rows = stmt.query_map(params![session_id, run_id], |row| row.get::<_, String>(0));
-        logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    };
-    const LAUNCHED: &str = "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id')
-         FROM acp_events
-         WHERE session_id = ?1
-           AND discriminant = 'BackgroundAgentLaunched'
-           AND json_extract(event_json, '$.BackgroundAgentLaunched.workflow.run_id') = ?2";
-    WorkflowAgents {
-        launched: ids(LAUNCHED),
-        completed: ids(&format!(
-            "SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
-             FROM acp_events
-             WHERE session_id = ?1
-               AND discriminant = 'BackgroundAgentCompleted'
-               AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IN ({LAUNCHED})"
-        )),
+        if !groups.contains_key(run) {
+            groups.insert(run.to_owned(), HashMap::new());
+        }
+        let known = groups
+            .get_mut(run)
+            .expect("run inserted")
+            .entry(parent)
+            .or_default();
+        known.launched.insert(agent.clone());
+        if row.get::<_, bool>(6)? {
+            known.completed.insert(agent.clone());
+        } else {
+            known.completed.remove(&agent);
+        }
+        if let Some(witness) = witness {
+            known.resources.insert(agent, witness);
+        }
     }
+    Ok(groups)
+}
+
+fn invalid_launch(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        4,
+        rusqlite::types::Type::Text,
+        anyhow::anyhow!(message).into(),
+    )
+}
+
+fn optional_text<'a>(
+    row: &'a rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<&'a str>> {
+    row.get_ref(column)?.as_str_or_null().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn launch_witness(
+    row: &rusqlite::Row<'_>,
+    scope: usize,
+    qualification: usize,
+    session_id: &str,
+) -> rusqlite::Result<Option<Arc<NativeResourceWitness>>> {
+    let metadata =
+        EventMetadata::decode_private(row.get(scope)?, optional_text(row, qualification)?)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    qualification,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
+    if let Some(witness) = metadata.resource_witness.as_deref() {
+        if witness.session_id != session_id || metadata.host_action || metadata.availability_denial
+        {
+            return Err(invalid_launch(
+                "resource qualification has a different owner or role",
+            ));
+        }
+    } else if metadata.resource_ref.is_some() {
+        return Err(invalid_launch("resource launch has no first-I/O witness"));
+    }
+    Ok(metadata.resource_witness)
 }
 
 impl EventStore {
@@ -300,72 +416,124 @@ impl EventStore {
     pub fn unresolved_background_task_launches(
         &self,
         session_id: &str,
-    ) -> Vec<BackgroundTaskLaunch> {
+    ) -> Result<Vec<BackgroundTaskLaunch>> {
         let conn = self.conn();
-        let what = "unresolved_background_task_launches";
-        let Some(mut statement) = logged(
-            conn.prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL),
-            what,
-            session_id,
-        ) else {
-            return Vec::new();
+        let tx = conn.unchecked_transaction()?;
+        let mut launches = {
+            let mut statement = tx.prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?;
+            let rows = statement.query_map([session_id], |row| {
+                let workflow = optional_text(row, 2)?
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let launch = BackgroundTaskLaunch {
+                    task_id: row.get(0)?,
+                    tool_call_id: row.get(1)?,
+                    workflow,
+                    workflow_agents: WorkflowAgents::default(),
+                    witness: launch_witness(row, 3, 4, session_id)?,
+                };
+                if launch.witness.as_ref().is_some_and(|witness| {
+                    !witness.matches_task_launch(
+                        &launch.task_id,
+                        launch.tool_call_id.as_deref(),
+                        launch.workflow.as_ref(),
+                    )
+                }) {
+                    return Err(invalid_launch(
+                        "task resource selector differs from its launch",
+                    ));
+                }
+                Ok(launch)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let rows = statement.query_map(params![session_id], |row| {
-            Ok(BackgroundTaskLaunch {
-                task_id: row.get(0)?,
-                tool_call_id: row.get(1)?,
-                workflow: row
-                    .get::<_, Option<String>>(2)?
-                    .and_then(|json| serde_json::from_str(&json).ok()),
-                workflow_agents: WorkflowAgents::default(),
-            })
-        });
-        let mut launches: Vec<BackgroundTaskLaunch> = logged(rows, what, session_id)
-            .map(|rows| {
-                rows.filter_map(|row| logged(row, what, session_id))
-                    .collect()
-            })
-            .unwrap_or_default();
-        drop(statement);
-        for launch in &mut launches {
-            if let Some(workflow) = &launch.workflow {
-                launch.workflow_agents = workflow_agents(&conn, session_id, &workflow.run_id);
+        if launches.iter().any(|launch| launch.workflow.is_some()) {
+            let mut groups = workflow_agents(&tx, session_id)?;
+            for launch in &mut launches {
+                if let Some(workflow) = &launch.workflow {
+                    let allocation = launch.witness.as_ref().map(|witness| witness.allocation);
+                    launch.workflow_agents = groups
+                        .get_mut(&workflow.run_id)
+                        .and_then(|parents| parents.remove(&allocation))
+                        .unwrap_or_default();
+                }
             }
         }
-        launches
+        tx.commit()?;
+        Ok(launches)
     }
 
-    /// The same rows as [`Self::unresolved_background_agent_ids`], carrying
-    /// the transcript path a resumed tailer needs. `Supervisor::attach` uses
-    /// it to resume tracking a sub-agent that survived the restart instead of
-    /// detaching it.
+    /// Standalone launch payload and qualification are read from the same SQLite row.
     pub fn unresolved_background_agent_launches(
         &self,
         session_id: &str,
-    ) -> Vec<UnresolvedBackgroundAgentLaunch> {
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
+        self.unresolved_background_agent_launches_inner(session_id, false)
+    }
+
+    /// Tracking retirement includes workflow children even after their parent task ended.
+    pub(crate) fn unresolved_background_agent_tracking_launches(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
+        self.unresolved_background_agent_launches_inner(session_id, true)
+    }
+
+    fn unresolved_background_agent_launches_inner(
+        &self,
+        session_id: &str,
+        include_workflows: bool,
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
         let conn = self.conn();
-        let what = "unresolved_background_agent_launches";
         let sql = format!(
-            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.workflow') IS NOT NULL\
+            "SELECT json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id'),
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.output_file'),
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow') IS NOT NULL,
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.tool_call_id'),
+                    started.scope, started.qualification_json,
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id')
              {UNRESOLVED_BACKGROUND_AGENT_WHERE}"
         );
-        let Some(mut stmt) = logged(conn.prepare(&sql), what, session_id) else {
-            return Vec::new();
-        };
-        // A workflow's agents resume with their run's journal, which owns
-        // their completion (see `acp::workflow_journal`).
-        let rows = stmt.query_map(params![session_id], |row| {
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([session_id], |row| {
+            let workflow = row.get::<_, bool>(2)?;
+            if workflow && !include_workflows {
+                return Ok(None);
+            }
+            let workflow_run: Option<String> = row.get(6)?;
+            if workflow && workflow_run.is_none() {
+                return Err(invalid_launch("workflow agent launch has no run identity"));
+            }
             let launch = UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
                 output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                witness: launch_witness(row, 4, 5, session_id)?,
             };
-            Ok((!row.get::<_, bool>(2)?).then_some(launch))
-        });
-        logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok().flatten()).collect())
-            .unwrap_or_default()
+            let tool = optional_text(row, 3)?.unwrap_or_default();
+            if launch.witness.as_ref().is_some_and(|witness| {
+                !witness.matches_agent_launch(
+                    &launch.agent_id,
+                    tool,
+                    &launch.output_file,
+                    workflow_run.as_deref(),
+                )
+            }) {
+                return Err(invalid_launch(
+                    "agent resource selector differs from its launch",
+                ));
+            }
+            Ok(Some(launch))
+        })?;
+        Ok(rows
+            .filter_map(|row| row.transpose())
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Full payloads of unresolved approval requests, in request order.
@@ -436,83 +604,31 @@ impl EventStore {
         .collect()
     }
 
-    fn latest_prompt_state(&self, session_id: &str) -> Option<bool> {
-        let conn = self.conn();
-        let prompt_seq = logged(
-            conn.query_row(
-                "SELECT MAX(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
-                     OR json_extract(event_json, '$.UserDiffCommentsPrompt') IS NOT NULL)",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            ),
-            "main_turn_state prompt query",
-            session_id,
-        )
-        .flatten()?;
-        let terminator = logged(
-            conn.query_row(
-                concat!(
-                    "SELECT MIN(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq > ?2
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
-                     OR ",
-                    native_channel_loss_sql!("event_json"),
-                    ")"
-                ),
-                params![session_id, prompt_seq],
-                |row| row.get::<_, Option<i64>>(0),
-            ),
-            "main_turn_state terminator query",
-            session_id,
-        )?;
-        Some(terminator.is_none())
+    pub fn has_in_flight_main_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| Ok(cursor.projection.main_open))
     }
 
-    /// A native prompt completion may be adopted only for an open main turn.
-    /// Background work is restored independently and does not reopen its parent.
-    pub fn has_in_flight_main_turn(&self, session_id: &str) -> bool {
-        self.latest_prompt_state(session_id) == Some(true)
-    }
-
-    /// Restore the unsuccessful-main fence, not display activity or replay
-    /// permission. Ambient/administrative stops and diagnostics cannot erase a
-    /// real failure; a new input, conversation boundary or genuine outcome can.
-    pub fn has_unsuccessful_main_outcome(&self, session_id: &str) -> bool {
-        logged(
-            self.conn().query_row(
-                "SELECT COALESCE(json_extract(event_json, '$.Stopped.reason')
-                    IN ('prompt_failed', 'rate_limited', ?2), 0)
-                 FROM acp_events WHERE session_id = ?1 AND (
-                    discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt', 'SessionCleared', 'AgentSwitched')
-                    OR (discriminant = 'Stopped' AND json_extract(event_json, '$.Stopped.reason')
-                        IN ('prompt_failed', 'rate_limited', ?2, 'prompt_complete',
-                            'cancelled', 'max_tokens', 'refusal', 'max_turn_requests')))
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id, crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON],
-                |row| row.get::<_, bool>(0),
-            ).optional(),
-            "unsuccessful main outcome", session_id,
-        ).flatten().unwrap_or(false)
+    pub fn has_unsuccessful_main_outcome(
+        &self,
+        session_id: &str,
+    ) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            Ok(cursor.projection.unsuccessful_main)
+        })
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
-    pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
+    pub fn has_in_flight_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
         if self.has_unresolved_background_tasks(session_id) {
-            return true;
+            return Ok(ControlKnowledge::Known(true));
         }
-        match self.latest_prompt_state(session_id) {
-            None => return false,
-            Some(true) => return true,
-            Some(false) => {}
+        let main = self.has_in_flight_main_turn(session_id)?;
+        if main == ControlKnowledge::Known(true) {
+            return Ok(main);
         }
         let conn = self.conn();
         let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
-        let bg_in_flight: i64 = logged(
-            conn.query_row(
+        let bg_in_flight: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM (
                      SELECT aid, MAX(created_at) AS last_at FROM (
                          SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
@@ -536,12 +652,12 @@ impl EventStore {
                    )",
                 params![session_id, stale_cutoff],
                 |row| row.get(0),
-            ),
-            "has_in_flight_turn bg-agent query",
-            session_id,
-        )
-        .unwrap_or(0);
-        bg_in_flight > 0
+            )?;
+        Ok(if bg_in_flight > 0 {
+            ControlKnowledge::Known(true)
+        } else {
+            main
+        })
     }
 
     /// Read the inputs the terminal-repair pass decides on.
@@ -652,12 +768,21 @@ mod tests {
         let (_tmp, store) = open_store(1000);
         assert!(store.first_user_prompt("s-1").is_none());
         assert!(store.first_turn_context("s-1", 4096).is_none());
-        // Recorded out of order: the earliest seq wins.
         store
-            .record("s-1", 2, &user_prompt("second prompt"))
+            .record(
+                "s-1",
+                1,
+                &user_prompt("first prompt"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
-            .record("s-1", 1, &user_prompt("first prompt"))
+            .record(
+                "s-1",
+                2,
+                &user_prompt("second prompt"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         assert_eq!(
             store.first_user_prompt("s-1").as_deref(),
@@ -717,124 +842,120 @@ mod tests {
     }
 
     #[test]
-    fn has_in_flight_turn_follows_the_latest_prompt_and_background_agents() {
-        let (_tmp, store) = open_store(1000);
+    fn admitted_main_and_background_work_have_independent_knowledge() {
+        use ControlKnowledge::{Indeterminate, Known};
         let progress = || Event::BackgroundAgentProgress {
             agent_id: "bg-1".into(),
             status: BackgroundAgentStatus::Running,
             tool_count: 1,
-            tools: Vec::new(),
+            tools: vec![],
             last_tool: None,
             last_text: None,
             at: chrono::Utc::now(),
         };
-        let startup_error = Event::AgentStartupError {
-            message: "boom".into(),
-            native_subject: None,
-        };
-        // (events, any native work, adoptable main prompt)
-        let cases = [
-            (vec![], false, false),
-            (vec![user_prompt("go"), agent_chunk("thinking")], true, true),
+        for (events, main, any) in [
+            (
+                vec![user_prompt("explicit but not admitted")],
+                Known(false),
+                Known(false),
+            ),
             (
                 vec![
                     user_prompt("go"),
-                    agent_chunk("done"),
+                    Event::ThinkingStarted,
+                    agent_chunk("work"),
+                ],
+                Known(true),
+                Known(true),
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    Event::ThinkingStarted,
                     stopped("prompt_complete"),
                 ],
-                false,
-                false,
+                Known(false),
+                Known(false),
             ),
-            (vec![user_prompt("go"), startup_error], false, false),
+            (
+                vec![
+                    user_prompt("go"),
+                    Event::AgentStartupError {
+                        message: "boom".into(),
+                        native_subject: None,
+                    },
+                ],
+                Known(false),
+                Known(false),
+            ),
             (
                 vec![
                     user_prompt("first"),
+                    Event::ThinkingStarted,
                     stopped("prompt_complete"),
                     user_prompt("second"),
-                    agent_chunk("mid"),
+                    Event::ThinkingStarted,
                 ],
-                true,
-                true,
+                Known(true),
+                Known(true),
             ),
             (
-                vec![user_prompt("go"), stopped("prompt_complete"), progress()],
-                true,
-                false,
+                vec![stopped("prompt_complete"), progress()],
+                Known(false),
+                Known(true),
             ),
             (
-                vec![user_prompt("go"), stopped("rate_limited"), progress()],
-                true,
-                false,
+                vec![stopped("rate_limited"), progress()],
+                Known(false),
+                Known(true),
             ),
-            (
-                vec![
-                    user_prompt("completed main"),
-                    stopped("prompt_complete"),
-                    progress(),
-                    Event::UserDiffCommentsPrompt {
-                        intro: "review changes".into(),
-                        outro: String::new(),
-                        is_multi_repo: false,
-                        comments: Vec::new(),
-                        assembled_markdown: "review these changes".into(),
-                    },
-                ],
-                true,
-                true,
-            ),
-        ];
-        for (i, (events, in_flight, main_active)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            assert_eq!(store.has_in_flight_turn(&id), in_flight, "case {i}");
-            assert_eq!(store.has_in_flight_main_turn(&id), main_active, "case {i}");
+        ] {
+            let (_tmp, store) = open_store(0);
+            record_projection(&store, "s", 1, events);
+            assert_eq!(store.has_in_flight_main_turn("s").unwrap(), main);
+            assert_eq!(store.has_in_flight_turn("s").unwrap(), any);
         }
-
+        let (_tmp, store) = open_store(0);
+        store
+            .record("s", 2, &progress(), &EventMetadata::history())
+            .unwrap();
+        assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Indeterminate);
+        assert_eq!(store.has_in_flight_turn("s").unwrap(), Known(true));
         let completed = Event::BackgroundAgentCompleted {
             agent_id: "bg-1".into(),
             status: BackgroundAgentStatus::Completed,
-            tools: Vec::new(),
+            tools: vec![],
             result: None,
             warning: None,
             ended_at: chrono::Utc::now(),
         };
-        store.record("s-5", 4, &completed).unwrap();
-        assert!(
-            !store.has_in_flight_turn("s-5"),
-            "completion drains the turn"
-        );
-
-        record_from(
-            &store,
-            "stale",
-            1,
-            [user_prompt("go"), stopped("prompt_complete")],
-        );
-        let stale_at =
-            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
-        store.record_at("stale", 3, &progress(), stale_at).unwrap();
-        assert!(
-            !store.has_in_flight_turn("stale"),
-            "a silent background agent is gone"
-        );
+        store
+            .record("s", 3, &completed, &EventMetadata::history())
+            .unwrap();
+        assert_eq!(store.has_in_flight_turn("s").unwrap(), Indeterminate);
+        // A stale progress record does not turn unknown main state into known idle.
+        let stale =
+            chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS - 60_000;
+        store.record_at("stale", 2, &progress(), stale).unwrap();
+        assert_eq!(store.has_in_flight_turn("stale").unwrap(), Indeterminate);
     }
 
     #[test]
-    fn unsuccessful_main_outcome_survives_ambient_progress_until_a_genuine_boundary() {
-        let (_tmp, store) = open_store(1000);
+    fn unsuccessful_main_outcome_survives_historical_ambient_rows_until_host_boundary() {
+        use ControlKnowledge::Known;
         for reason in [
             "prompt_failed",
             "rate_limited",
             crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
         ] {
-            let boundaries = [
+            for boundary in [
                 user_prompt("next explicit prompt"),
                 Event::UserDiffCommentsPrompt {
-                    intro: "review".into(),
+                    intro: String::new(),
                     outro: String::new(),
                     is_multi_repo: false,
-                    comments: Vec::new(),
-                    assembled_markdown: "review changes".into(),
+                    comments: vec![],
+                    assembled_markdown: "review".into(),
                 },
                 stopped("prompt_complete"),
                 Event::SessionCleared,
@@ -843,66 +964,84 @@ mod tests {
                     to: "codex".into(),
                     reason: "explicit".into(),
                 },
-            ];
-            for (index, boundary) in boundaries.into_iter().enumerate() {
-                let id = format!("failed-{reason}-{index}");
-                let prefix = [
-                    user_prompt("original"),
-                    stopped(reason),
-                    Event::BackgroundAgentProgress {
-                        agent_id: "survivor".into(),
-                        status: BackgroundAgentStatus::Running,
-                        tool_count: 1,
-                        tools: Vec::new(),
-                        last_tool: None,
-                        last_text: None,
-                        at: chrono::Utc::now(),
-                    },
-                    agent_chunk("ambient progress after the failed turn"),
-                    stopped("agent_idle"),
-                    Event::PromptRuntimeError {
-                        message: "a later diagnostic is not a main outcome".into(),
-                        evidence: None,
-                        native_subject: None,
-                    },
-                    Event::AcpSessionAssigned {
-                        acp_session_id: "same-native".into(),
-                        connection_ready: false,
-                        native_subject: None,
-                    },
-                ];
-                record_from(&store, &id, 1, prefix);
-                assert!(store.has_unsuccessful_main_outcome(&id));
-                assert!(!store.has_in_flight_main_turn(&id));
-                assert!(
-                    store.has_in_flight_turn(&id),
-                    "surviving background work is independent"
+            ] {
+                let (_tmp, store) = open_store(0);
+                record_projection(
+                    &store,
+                    "s",
+                    1,
+                    [
+                        user_prompt("original"),
+                        Event::ThinkingStarted,
+                        stopped(reason),
+                    ],
                 );
-                store.record(&id, 8, &boundary).unwrap();
-                assert!(
-                    !store.has_unsuccessful_main_outcome(&id),
-                    "genuine boundary {index} supersedes {reason}"
+                record_from(
+                    &store,
+                    "s",
+                    4,
+                    [
+                        agent_chunk("ambient"),
+                        stopped("agent_idle"),
+                        Event::PromptRuntimeError {
+                            message: "later diagnostic".into(),
+                            evidence: None,
+                            native_subject: None,
+                        },
+                        Event::AcpSessionAssigned {
+                            acp_session_id: "read-only".into(),
+                            connection_ready: false,
+                            native_subject: None,
+                        },
+                    ],
+                );
+                assert_eq!(
+                    store.has_unsuccessful_main_outcome("s").unwrap(),
+                    Known(true)
+                );
+                assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Known(false));
+                store
+                    .record("s", 8, &boundary, &EventMetadata::host(&boundary))
+                    .unwrap();
+                assert_eq!(
+                    store.has_unsuccessful_main_outcome("s").unwrap(),
+                    Known(false)
                 );
             }
         }
-        record_from(
+        // An owned diagnostic is terminal; historical ambient diagnostics are not.
+        let (_tmp, store) = open_store(0);
+        record_projection(
             &store,
-            "diagnostic-only",
+            "s",
             1,
             [
-                user_prompt("unfinished main"),
+                user_prompt("work"),
+                Event::ThinkingStarted,
                 Event::PromptRuntimeError {
-                    message: "diagnostic before terminal".into(),
+                    message: "failed".into(),
                     evidence: None,
                     native_subject: None,
                 },
             ],
         );
-        assert!(store.has_in_flight_main_turn("diagnostic-only"));
-        assert!(
-            !store.has_unsuccessful_main_outcome("diagnostic-only"),
-            "a diagnostic is not a completed main outcome"
+        assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Known(false));
+        assert_eq!(
+            store.has_unsuccessful_main_outcome("s").unwrap(),
+            Known(true)
         );
+    }
+
+    #[test]
+    fn continuation_projection_read_errors_remain_errors() {
+        let (_tmp, store) = open_store(0);
+        store
+            .conn()
+            .execute_batch("DROP TABLE acp_rate_limit_budgets")
+            .unwrap();
+        assert!(store.has_in_flight_main_turn("s").is_err());
+        assert!(store.has_unsuccessful_main_outcome("s").is_err());
+        assert!(store.has_in_flight_turn("s").is_err());
     }
 
     #[test]
@@ -1109,12 +1248,13 @@ mod tests {
         // A refused management attachment does not end the retained native
         // turn or resolve its callbacks. Only observed channel loss does.
         let management_elicitation = Nonce::new();
-        record_from(
+        record_projection(
             &store,
             "management",
             1,
             [
                 user_prompt("retained work"),
+                Event::ThinkingStarted,
                 approval("retained-approval"),
                 elicitation(&management_elicitation),
                 Event::MonitorArmed {
@@ -1131,7 +1271,10 @@ mod tests {
                 },
             ],
         );
-        assert!(store.has_in_flight_turn("management"));
+        assert_eq!(
+            store.has_in_flight_turn("management").unwrap(),
+            ControlKnowledge::Known(true)
+        );
         assert!(store.has_open_tool_call_in_epoch("management"));
         assert_eq!(store.pending_approval_requests("management").len(), 1);
         assert_eq!(
@@ -1139,19 +1282,36 @@ mod tests {
             [management_elicitation]
         );
         assert!(store.latest_active_monitor("management").is_some());
+        let mut loss = Event::AcpConnectionUnavailable {
+            source: crate::acp::state::AcpConnectionSource::Native,
+            cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+            phase: crate::acp::state::AcpConnectionPhase::Established,
+            native_subject: None,
+        };
+        let subject = crate::acp::state::NativeEventSubject::channel(
+            serde_json::from_value(serde_json::to_value([31u8; 32]).unwrap()).unwrap(),
+            None,
+            &loss,
+        );
+        if let Event::AcpConnectionUnavailable { native_subject, .. } = &mut loss {
+            *native_subject = Some(subject);
+        }
         store
             .record(
                 "management",
-                7,
-                &Event::AcpConnectionUnavailable {
-                    source: crate::acp::state::AcpConnectionSource::Native,
-                    cause: crate::acp::state::AcpConnectionCause::StdoutEof,
-                    phase: crate::acp::state::AcpConnectionPhase::Established,
-                    native_subject: None,
+                8,
+                &loss,
+                &crate::acp::event_sender::EventMetadata {
+                    scope: crate::acp::event_sender::EventScope::SessionCurrent,
+                    availability_denial: true,
+                    ..crate::acp::event_sender::EventMetadata::history()
                 },
             )
             .unwrap();
-        assert!(!store.has_in_flight_turn("management"));
+        assert_eq!(
+            store.has_in_flight_turn("management").unwrap(),
+            ControlKnowledge::Known(false)
+        );
         assert!(!store.has_open_tool_call_in_epoch("management"));
         assert!(store.pending_approval_requests("management").is_empty());
         assert!(store.unresolved_elicitation_nonces("management").is_empty());
@@ -1184,6 +1344,7 @@ mod tests {
         );
         let launches: Vec<(String, String)> = store
             .unresolved_background_agent_launches("s-1")
+            .unwrap()
             .into_iter()
             .map(|l| (l.agent_id, l.output_file))
             .collect();
@@ -1195,13 +1356,21 @@ mod tests {
             ]
         );
         assert!(store.unresolved_background_agent_ids("s-2").is_empty());
-        assert!(store.unresolved_background_agent_launches("s-2").is_empty());
+        assert!(store
+            .unresolved_background_agent_launches("s-2")
+            .unwrap()
+            .is_empty());
 
         // A completion row whose `agent_id` is not extractable must not blank
         // the whole scan: SQLite's `NOT IN` goes `NULL` once the subquery
         // yields one `NULL`. The store never writes such a row.
         store
-            .record("s-3", 1, &bg_launched("bg-real-orphan", ""))
+            .record(
+                "s-3",
+                1,
+                &bg_launched("bg-real-orphan", ""),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
             .conn()
@@ -1246,7 +1415,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         record(task("open"));
         record(task("done"));
@@ -1300,12 +1476,18 @@ mod tests {
             "completed pairs age out; only the open starts stay"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        for (seq, event) in store.replay_from("s-1", 0) {
-            state.apply_event(seq, event).unwrap();
+        for stored in store.replay_from("s-1", 0).unwrap() {
+            state
+                .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                .unwrap();
         }
         assert_eq!(
-            state.background_tasks,
-            ["open".to_string(), "reused".to_string()]
+            state
+                .background_tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "reused"]
         );
     }
 
@@ -1324,24 +1506,69 @@ mod tests {
             task_id: "t".into(),
             ended_at: None,
         };
-        store.record("s-1", 1, &started("toolu_old")).unwrap();
-        assert!(store.has_in_flight_turn("s-1"));
-        store.record("s-1", 2, &finished()).unwrap();
-        assert!(store.unresolved_background_task_ids("s-1").is_empty());
-        assert!(!store.has_in_flight_turn("s-1"));
-        store.record("s-1", 3, &started("toolu_reused")).unwrap();
-        store.record("s-1", 4, &started("toolu_latest")).unwrap();
-        store.record("s-2", 1, &finished()).unwrap();
+        store
+            .record(
+                "s-1",
+                1,
+                &started("toolu_old"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert_eq!(
-            store.unresolved_background_task_launches("s-1"),
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        store
+            .record(
+                "s-1",
+                2,
+                &finished(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        assert!(store.unresolved_background_task_ids("s-1").is_empty());
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        store
+            .record(
+                "s-1",
+                3,
+                &started("toolu_reused"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                4,
+                &started("toolu_latest"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-2",
+                1,
+                &finished(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.unresolved_background_task_launches("s-1").unwrap(),
             [BackgroundTaskLaunch {
                 task_id: "t".into(),
                 tool_call_id: Some("toolu_latest".into()),
                 workflow: None,
                 workflow_agents: WorkflowAgents::default(),
+                witness: None,
             }]
         );
-        assert!(store.has_in_flight_turn("s-1"));
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
         assert_eq!(
             store.unresolved_background_task_ids("s-1"),
             ["t".to_string()]
@@ -1357,8 +1584,22 @@ mod tests {
             description: "sleep".into(),
             workflow: None,
         };
-        store.record("s-1", 1, &started("t-1")).unwrap();
-        store.record("s-1", 2, &started("t-2")).unwrap();
+        store
+            .record(
+                "s-1",
+                1,
+                &started("t-1"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &started("t-2"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         store
             .record(
                 "s-1",
@@ -1367,6 +1608,7 @@ mod tests {
                     task_id: "t-1".into(),
                     ended_at: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         assert_eq!(
@@ -1427,7 +1669,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            store.unresolved_background_task_launches("s-1"),
+            store.unresolved_background_task_launches("s-1").unwrap(),
             [BackgroundTaskLaunch {
                 task_id: "wfx".into(),
                 tool_call_id: Some("toolu_wf".into()),
@@ -1435,11 +1677,14 @@ mod tests {
                 workflow_agents: WorkflowAgents {
                     launched: ["a1".to_string(), "a2".to_string()].into(),
                     completed: ["a1".to_string()].into(),
+                    resources: Default::default(),
                 },
+                witness: None,
             }]
         );
         let generic: Vec<String> = store
             .unresolved_background_agent_launches("s-1")
+            .unwrap()
             .into_iter()
             .map(|l| l.agent_id)
             .collect();
@@ -1449,6 +1694,26 @@ mod tests {
             store.unresolved_background_agent_ids("s-1"),
             ["a2", "other-run", "plain"].map(String::from)
         );
+        record_from(
+            &store,
+            "s-1",
+            7,
+            [Event::BackgroundTaskFinished {
+                task_id: "wfx".into(),
+                ended_at: Some(chrono::Utc::now()),
+            }],
+        );
+        assert!(store
+            .unresolved_background_task_launches("s-1")
+            .unwrap()
+            .is_empty());
+        let tracking: Vec<_> = store
+            .unresolved_background_agent_tracking_launches("s-1")
+            .unwrap()
+            .into_iter()
+            .map(|launch| launch.agent_id)
+            .collect();
+        assert_eq!(tracking, ["a2", "other-run", "plain"]);
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {

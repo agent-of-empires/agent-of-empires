@@ -582,18 +582,9 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
     )
 }
 
-/// Quiesce a structured-view worker before its worktree directory or profile
-/// moves. A live ACP worker is pinned to its launch cwd and profile: moving the
-/// directory crash-loops it at the stale cwd (#2260), and a profile move leaves
-/// it running under the old profile (#4919). `blocks_worktree_edit` misses both
-/// because a "stopped" structured session sits at Idle yet still owns a worker.
-///
-/// The stop is reversible: it keeps the transcript and `acp_session_id`, so the
-/// reconciler fresh-spawns under the new path and profile and resumes via
-/// session/load. Callers hold `instance_lock` across shutdown, move and persist.
-/// Waits for retirement to settle, since `shutdown` also succeeds for a worker
-/// that is already stopping. Refuses the move (409) if a live worker is not
-/// proven stopped within the deadline.
+/// Retire a structured worker before moving its cwd or profile, preserving its
+/// Native selection for Load. Callers hold instance exclusion through retirement,
+/// move and persistence; unproven retirement refuses the move.
 async fn quiesce_structured_worker(
     state: &Arc<AppState>,
     id: &str,
@@ -602,13 +593,18 @@ async fn quiesce_structured_worker(
     if !is_structured {
         return Ok(());
     }
-    match crate::server::acp_events::retire_native_worker(
-        state,
-        id,
-        std::time::Duration::from_secs(5),
-    )
-    .await
-    {
+    let retired = async {
+        let target = state.acp_supervisor.capture_retirement(id)?;
+        crate::server::acp_events::retire_native_worker(
+            state,
+            id,
+            target,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+    .await;
+    match retired {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(

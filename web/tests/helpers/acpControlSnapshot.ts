@@ -3,7 +3,12 @@ import type { AcpConnectionUnavailability, AcpState, ReducedState } from "../../
 /** A fixture's declared current receipt, deliberately independent of replay/SIDs/socket-open. */
 export function currentControlSnapshot(
   state: AcpState,
-  receipt: { ready: boolean; unavailable?: AcpConnectionUnavailability | null; wakeEligible?: boolean },
+  receipt: {
+    ready: boolean;
+    unavailable?: AcpConnectionUnavailability | null;
+    wakeEligible?: boolean;
+    rateLimitPark?: ReducedState["rate_limit_park"];
+  },
   seq = state.lastSeq,
 ): { kind: "reduced_state"; seq: number; state: ReducedState; unchanged: string[] } {
   const unavailable = receipt.unavailable ?? null;
@@ -21,6 +26,7 @@ export function currentControlSnapshot(
       pending_elicitations: unavailable ? [] : state.pendingElicitations,
       thinking: !unavailable && state.thinking ? { started_at: "2026-01-01T00:00:00Z" } : null,
       rate_limit: state.rateLimit,
+      rate_limit_park: receipt.rateLimitPark ?? null,
       available_commands: state.availableCommands,
       available_modes: state.availableModes,
       current_mode_id: state.currentModeId,

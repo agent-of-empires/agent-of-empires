@@ -1,13 +1,14 @@
 //! `session/delete`: its wire form, the outcomes aoe distinguishes, and
 //! the dispatch that sends it.
 
+use crate::acp::establishment::NativeRequestContext;
 use agent_client_protocol::schema::v1::ErrorCode;
 use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest, JsonRpcResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::connection::ConnectionState;
-use super::session_identity::{spawn_native_request, OrderedRequestResult};
+use super::session_identity::{ordered_native_request, OrderedRequestResult};
 use super::spawn::scrub_stderr_secrets;
 use std::sync::Arc;
 
@@ -59,13 +60,33 @@ pub(super) fn handle_delete_session_cmd(
     state: &Arc<ConnectionState>,
     acp_session_id: String,
     respond_to: oneshot::Sender<DeleteSessionOutcome>,
+    context: Option<NativeRequestContext>,
 ) {
+    if state.control.get().is_some()
+        && context
+            .as_ref()
+            .and_then(|context| context.receipt.as_deref())
+            .and_then(|receipt| receipt.session_id())
+            != Some(acp_session_id.as_str())
+    {
+        let _ = respond_to.send(DeleteSessionOutcome::Failed(
+            "NotIssued: delete target differs from frozen native scope".into(),
+        ));
+        return;
+    }
     let target = agent_client_protocol::schema::v1::SessionId::from(acp_session_id);
     let request = DeleteSessionRequest {
         session_id: target,
         meta: serde_json::Value::Object(serde_json::Map::new()),
     };
-    let _ = spawn_native_request(connection, state, request, move |request| async move {
+    let request = match ordered_native_request(connection, state, context, request) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = respond_to.send(DeleteSessionOutcome::Failed(format!("NotIssued: {error}")));
+            return;
+        }
+    };
+    tokio::spawn(async move {
         let outcome = match tokio::time::timeout(ACP_SESSION_DELETE_TIMEOUT, request.wait()).await {
             Ok(OrderedRequestResult::Correlated(Ok(_))) => DeleteSessionOutcome::Deleted,
             Ok(OrderedRequestResult::Correlated(Err(error)))

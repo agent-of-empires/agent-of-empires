@@ -570,7 +570,7 @@ pub async fn session_diff_file_raw(
             .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
         crate::server::api::file_provenance::confine_path(
             std::slice::from_ref(&root),
-            std::collections::HashSet::new,
+            || Ok(std::collections::HashSet::new()),
             requested,
         )
     })
@@ -702,18 +702,25 @@ impl SessionFileScope {
         // ponytail: per-request scan on the miss path; cache per session keyed
         // on highest_seq if it shows up hot.
         let touched = || {
-            let mut events = Vec::new();
+            let mut paths = std::collections::HashSet::new();
             let mut since = 0u64;
             loop {
-                let page = self.store.replay_page(&self.session_id, since, Some(1000));
+                let page = self.store.replay_page(&self.session_id, since, Some(1000)).map_err(|error| {
+                    tracing::warn!(target: "acp.file_provenance", session = %self.session_id, %error, "cannot read file provenance");
+                    (StatusCode::SERVICE_UNAVAILABLE, "file provenance unavailable")
+                })?;
                 let advance = page.last_scanned_seq;
-                events.extend(page.events);
+                paths.extend(crate::server::api::file_provenance::collect_touched_paths(
+                    page.events
+                        .iter()
+                        .map(|stored| (stored.seq, stored.event.as_ref())),
+                ));
                 match (page.has_more, advance) {
                     (true, Some(seq)) => since = seq,
                     _ => break,
                 }
             }
-            crate::server::api::file_provenance::collect_touched_paths(&events)
+            Ok(paths)
         };
 
         crate::server::api::file_provenance::confine_path(&roots, touched, requested)

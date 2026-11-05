@@ -4,13 +4,12 @@
 use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
-use crate::acp::transcript::LOAD_FAILED_PREFIX;
 use agent_client_protocol::schema::v1::{
     ForkSessionRequest, ForkSessionResponse, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, SessionConfigId,
     SessionId,
 };
-use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest};
+use agent_client_protocol::{Agent, ConnectionTo};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -22,51 +21,21 @@ use tracing::{debug, info, warn};
 use super::command_loop::Session;
 use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
-use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
+use crate::acp::acp_client::commands::{ConnectMode, QueuedClientCmd};
 use crate::acp::acp_client::config_options::{
-    apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
-    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    apply_config_default, config_option_failure_event, config_options_event, modes_available_event,
+    thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
-use crate::acp::acp_client::control::{establish_session_v5, DaemonControlClient};
-use crate::acp::acp_client::errors::{
-    acp_internal_error, public_error_message, AcpError, IncompatibleAgentError,
+use crate::acp::acp_client::control::{
+    establish_session, DaemonControlClient, EstablishmentApplication,
 };
-use crate::acp::acp_client::handshake::{build_initialize_request, should_fork};
+use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
+use crate::acp::acp_client::handshake::build_initialize_request;
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
-use crate::acp::acp_client::session_identity::{ordered_native_request, ordered_session_request};
+use crate::acp::acp_client::session_identity::ordered_native_request;
 
 /// Fully silent grace after reattaching to an in-flight turn.
 const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
-
-/// Announced when `session/new` replaces a conversation the user expects to
-/// continue. `stored` is absent after a view switch that lost the id.
-fn initial_reset_reason(
-    stored: bool,
-    load_session_capable: bool,
-    fork_requested: bool,
-    prior_conversation: bool,
-) -> Option<String> {
-    if fork_requested {
-        return None;
-    }
-    if stored && !load_session_capable {
-        return Some("session/load unavailable; started a new session with empty context".into());
-    }
-    (!stored && prior_conversation).then(|| {
-        "Conversation context reset; the previous conversation could not be resumed.".into()
-    })
-}
-
-/// A prior conversation drops the prefix the transcript suppresses, since the
-/// view switch cleared the history that suppression looks for.
-fn load_failed_reason(prior_conversation: bool, error: &agent_client_protocol::Error) -> String {
-    let message = public_error_message(error);
-    if prior_conversation {
-        format!("Conversation context reset; {LOAD_FAILED_PREFIX}: {message}")
-    } else {
-        format!("{LOAD_FAILED_PREFIX}: {message}")
-    }
-}
 
 /// Debug builds honor `AOE_RESUME_IDLE_GRACE_MS`, clamped to at least 100ms.
 fn resume_idle_grace() -> Duration {
@@ -104,7 +73,7 @@ pub(super) struct EstablishCtx {
     pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
     pub(super) agent_cwd: PathBuf,
-    pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
+    pub(super) cmd_rx: mpsc::Receiver<QueuedClientCmd>,
     pub(super) lifecycle_rx: mpsc::Receiver<LifecycleEnvelope>,
 }
 
@@ -116,29 +85,54 @@ pub(super) async fn establish(
 ) -> Result<Option<Session>, agent_client_protocol::Error> {
     let shared = ctx.shared.clone();
     let label = shared.session_label.clone();
+    let _application = ctx
+        .control
+        .as_ref()
+        .map(|control| EstablishmentApplication::new(Arc::clone(control)))
+        .transpose()?;
     info!(target: "acp.protocol", session = %label, "initializing ACP agent");
     // A new adapter process may never report, so an earlier process's
     // identity must not carry over. Cleared before `initialize`, so nothing
     // the new process sends can precede it; a reattach keeps its report.
-    if matches!(ctx.mode, ConnectMode::Fresh { .. }) {
+    if matches!(ctx.mode, ConnectMode::Fresh) {
         shared.emit(Event::AuthStatusUpdated { status: None }).await;
     }
-    let init: InitializeResponse = match ctx.control.as_ref() {
-        Some(control) => {
-            let params = serde_json::to_value(build_initialize_request())
-                .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
-            serde_json::from_value(control.initialize(params).await?)
-                .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
+    let initialized = async {
+        let init: InitializeResponse = match ctx.control.as_ref() {
+            Some(control) => {
+                let params = serde_json::to_value(build_initialize_request())
+                    .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
+                serde_json::from_value(control.initialize(params).await?).map_err(|e| {
+                    acp_internal_error(format!("deserialize initialize result: {e}"))
+                })?
+            }
+            None => ordered_native_request(
+                &connection,
+                &shared.connection_state,
+                None,
+                build_initialize_request(),
+            )
+            .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
+            .wait()
+            .await
+            .into_result()?,
+        };
+        Ok::<_, agent_client_protocol::Error>(init)
+    }
+    .await;
+    let init = match initialized {
+        Ok(init) => init,
+        Err(error) => {
+            if matches!(ctx.mode, ConnectMode::Fresh) {
+                shared
+                    .event_tx
+                    .close_establishment(Some(
+                        crate::acp::establishment::EstablishmentBlockReason::NotIssued,
+                    ))
+                    .await;
+            }
+            return Err(error);
         }
-        None => ordered_native_request(
-            &connection,
-            &shared.connection_state,
-            build_initialize_request(),
-        )
-        .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
-        .wait()
-        .await
-        .into_result()?,
     };
     shared.connection_state.initialized();
 
@@ -154,12 +148,36 @@ pub(super) async fn establish(
             "agent compatibility check failed; refusing to enter session"
         );
         let detail = StartupErrorDetail::from(&err);
+        if matches!(ctx.mode, ConnectMode::Fresh) {
+            shared
+                .event_tx
+                .close_establishment(Some(
+                    crate::acp::establishment::EstablishmentBlockReason::NotIssued,
+                ))
+                .await;
+        }
         if let Some(tx) = ctx.ready_tx.lock().await.take() {
             let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
                 IncompatibleAgentError { detail, message },
             ))));
         }
         return Ok(None);
+    }
+
+    #[cfg(test)]
+    {
+        let gate = shared
+            .connection_state
+            .test_initialize_response_application
+            .lock()
+            .unwrap()
+            .take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            if release.await.is_err() {
+                return Ok(None);
+            }
+        }
     }
 
     // Return initialized ownership before any bootstrap replay can fill the
@@ -176,7 +194,7 @@ pub(super) async fn establish(
         };
         let _ = tx.send(readiness);
     }
-    if matches!(&ctx.mode, ConnectMode::Fresh { .. }) {
+    if matches!(&ctx.mode, ConnectMode::Fresh) {
         let _guard = shared.ingress.fence.write().await;
         let replay = shared.ingress.finish(None)?;
         shared.apply_replay(replay).await;
@@ -187,15 +205,6 @@ pub(super) async fn establish(
     // build) and emitted even when false so replay cannot keep a stale true.
     let steering_capable = agent_compat::supports_steering(ctx.expected_agent, &init);
     let prompt_caps = &init.agent_capabilities.prompt_capabilities;
-    shared
-        .emit(Event::PromptCapabilities {
-            image: prompt_caps.image,
-            audio: prompt_caps.audio,
-            embedded_context: prompt_caps.embedded_context,
-            load_session: Some(load_session_capable),
-            steering: steering_capable,
-        })
-        .await;
     if steering_capable {
         info!(
             target: "acp.protocol",
@@ -244,32 +253,35 @@ pub(super) async fn establish(
         cmd_rx: ctx.cmd_rx,
         lifecycle_rx: ctx.lifecycle_rx,
         pending_prompts: VecDeque::new(),
+        pending_reset: None,
     };
     session.acp_session_id = match ctx.mode {
         ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,
-        ConnectMode::Fresh {
-            stored_acp_session_id,
-            seed_history_replay,
-            fork_from,
-            prior_conversation,
-        } => {
-            let fork_capable = init.agent_capabilities.session_capabilities.fork.is_some();
+        ConnectMode::Fresh => {
             session
                 .fresh(
-                    stored_acp_session_id,
-                    seed_history_replay,
-                    fork_from,
-                    fork_capable,
+                    init.agent_capabilities.session_capabilities.fork.is_some(),
                     load_session_capable,
                     mcp_servers,
-                    prior_conversation,
                 )
                 .await?
         }
     };
+    // Initialize describes this physical peer, but only a completed
+    // establishment supplies custody for publishing its Current capabilities.
+    shared
+        .emit(Event::PromptCapabilities {
+            image: prompt_caps.image,
+            audio: prompt_caps.audio,
+            embedded_context: prompt_caps.embedded_context,
+            load_session: Some(load_session_capable),
+            steering: steering_capable,
+        })
+        .await;
     session.apply_default_model().await;
     session.apply_default_effort().await;
-    if arm_resume_watchdog && shared.connection_state.loss().is_none() {
+    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none()
+    {
         spawn_resume_idle_watchdog(shared, &session.connection);
     }
     Ok(Some(session))
@@ -320,359 +332,297 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>, connection: &ConnectionTo<Age
 }
 
 impl Session {
-    /// A request that mints a new native session: sent by the runner when one
-    /// is attached, else over the crate connection. Updates the agent sends
-    /// before its reply stay buffered until [`Shared::commit_session`] decides
-    /// which id owns them (#3937).
-    async fn minting_request<Req>(
-        &self,
-        method: &str,
-        req: Req,
-        native_id: fn(&Req::Response) -> SessionId,
-    ) -> Result<Req::Response, super::super::control::EstablishmentFailure>
-    where
-        Req: JsonRpcRequest + serde::Serialize,
-        Req::Response: serde::de::DeserializeOwned + Send + 'static,
-    {
-        let ingress = &self.shared.ingress;
-        let generation = {
-            let _guard = ingress.fence.write().await;
-            ingress.begin()
-        };
-        match self.control.as_ref() {
-            Some(control) => establish_session_v5(control, method, &req).await,
-            None => ordered_session_request(
-                &self.connection,
-                ingress,
-                &self.shared.connection_state,
-                generation,
-                req,
-                native_id,
-            )
-            .await
-            .map_err(Into::into),
+    async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
+        let control = self.control.as_ref().ok_or_else(|| {
+            acp_internal_error("native adoption requires the owned control protocol".into())
+        })?;
+        let result = control.resume_session().await.map(SessionId::from);
+        if let Ok(id) = &result {
+            if !stored.is_empty() && stored != id.0.as_ref() {
+                control.projection.lost();
+                return Err(acp_internal_error(
+                    "retained native identity differs from the selected conversation".into(),
+                ));
+            }
         }
+        self.finish_establishment(result, None).await
     }
 
-    /// The agent still owns the live session, so no load/new is sent. A prior
-    /// daemon's reset may commit after our registry snapshot, so a runner's
-    /// cached identity wins.
-    async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
-        let runner = match self.control.as_ref() {
-            Some(control) => control.resume_session().await?,
-            None => stored.clone(),
+    async fn fresh(
+        &mut self,
+        fork_capable: bool,
+        load_capable: bool,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<SessionId, agent_client_protocol::Error> {
+        use crate::acp::establishment::{EstablishmentBlockReason, EstablishmentTarget};
+        let control = self.control.as_ref().ok_or_else(|| {
+            acp_internal_error("native establishment requires the owned control protocol".into())
+        })?;
+        let attempt = control
+            .projection
+            .attempt()
+            .ok_or_else(|| acp_internal_error("no durable native establishment attempt".into()))?;
+        let mut failure = None;
+        let constructor = self.shared.ingress.constructor_scope();
+        let response = match &attempt.target {
+            EstablishmentTarget::Fork { .. } if !fork_capable => {
+                failure = Some(EstablishmentBlockReason::NotIssued);
+                Err(acp_internal_error(
+                    "the selected agent does not support session/fork".into(),
+                ))
+            }
+            EstablishmentTarget::Load { .. } if !load_capable => {
+                failure = Some(EstablishmentBlockReason::NotIssued);
+                Err(acp_internal_error(
+                    "the selected agent does not support session/load".into(),
+                ))
+            }
+            EstablishmentTarget::Fork { session_id } => {
+                let req = ForkSessionRequest::new(session_id.clone(), self.agent_cwd.clone())
+                    .mcp_servers(mcp_servers);
+                establish_session::<ForkSessionResponse>(control, "session/fork", &req)
+                    .await
+                    .map(|response: ForkSessionResponse| {
+                        (response.session_id, response.modes, response.config_options)
+                    })
+            }
+            EstablishmentTarget::Load { session_id, import } => {
+                self.shared
+                    .suppress_history_replay
+                    .store(!import, Ordering::Relaxed);
+                // The original load's known identity admits reverse callbacks
+                // without waiting for the result those callbacks may complete.
+                self.shared
+                    .activate_session(SessionId::from(session_id.clone()))
+                    .await?;
+                let req = LoadSessionRequest::new(session_id.clone(), self.agent_cwd.clone())
+                    .mcp_servers(mcp_servers);
+                establish_session::<LoadSessionResponse>(control, "session/load", &req)
+                    .await
+                    .map(|response| {
+                        (
+                            SessionId::from(session_id.clone()),
+                            response.modes,
+                            response.config_options,
+                        )
+                    })
+            }
+            EstablishmentTarget::New => {
+                let req = NewSessionRequest::new(self.agent_cwd.clone()).mcp_servers(mcp_servers);
+                establish_session::<NewSessionResponse>(control, "session/new", &req)
+                    .await
+                    .map(|response: NewSessionResponse| {
+                        (response.session_id, response.modes, response.config_options)
+                    })
+            }
         };
-        info!(
-            target: "acp.protocol",
-            session = %self.shared.session_label,
-            stored_id = %stored,
-            runner_id = %runner,
-            "resume mode: reusing runner session without agent load/new"
-        );
-        if !stored.is_empty() && runner != stored {
-            // Ahead of the assignment, so the reset's id clear is overwritten by the new id.
-            self.shared
-                .emit(Event::SessionContextReset {
-                    reason:
-                        "Conversation context reset; the agent resumed a different conversation."
-                            .to_string(),
-                    fork_rejection: None,
-                })
-                .await;
+        #[cfg(test)]
+        if response.is_ok() && matches!(attempt.target, EstablishmentTarget::New) {
+            let gate = self
+                .shared
+                .connection_state
+                .test_fresh_response_application
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((entered, release)) = gate {
+                let writer = self.shared.ingress.fence.write().await;
+                let _ = entered.send(());
+                let _ = release.await;
+                // Activation takes this same writer; only the test application pause owns it here.
+                drop(writer);
+            }
         }
-        let id = SessionId::from(runner);
-        let ready = self
-            .control
-            .as_ref()
-            .is_some_and(|control| control.native_session_ready());
-        self.shared.commit_session(id.clone(), ready).await?;
+        let result = match response {
+            Ok((id, modes, options)) => match self.shared.activate_session(id.clone()).await {
+                Ok(()) => {
+                    self.channels = SessionChannels::new(modes.as_ref(), options.as_deref());
+                    if let Some(modes) = modes.as_ref() {
+                        self.shared
+                            .emit_with_constructor(
+                                modes_available_event(modes),
+                                constructor.clone(),
+                            )
+                            .await;
+                    }
+                    if let Some(event) = config_options_event(options) {
+                        self.shared
+                            .emit_with_constructor(event, constructor.clone())
+                            .await;
+                    }
+                    Ok(id)
+                }
+                Err(error) => {
+                    self.control
+                        .as_ref()
+                        .expect("owned establishment")
+                        .projection
+                        .lost();
+                    Err(error)
+                }
+            },
+            Err(error) => Err(error),
+        };
+        let id = self.finish_establishment(result, failure).await?;
+        if matches!(attempt.target, EstablishmentTarget::New) {
+            if let (Some(mode), Some(option)) = (
+                self.default_mode.as_deref(),
+                self.channels.mode_config_option_id.as_ref(),
+            ) {
+                let _ = apply_config_default(
+                    &self.connection,
+                    &self.shared.connection_state,
+                    &self.shared.event_tx,
+                    agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+                        id.clone(),
+                        SessionConfigId::new(option.clone()),
+                        agent_client_protocol::schema::v1::SessionConfigValueId::new(mode),
+                    ),
+                    &self.shared.session_label,
+                    self.control
+                        .as_ref()
+                        .and_then(|control| control.original_request_context()),
+                )
+                .await;
+            }
+        }
         Ok(id)
     }
 
-    /// A runner sends SessionReady ahead of the replay it is still flushing,
-    /// so the load only completes once the barrier behind that replay has
-    /// been dispatched (#4016).
-    async fn load_request(
+    async fn finish_establishment(
         &self,
-        req: LoadSessionRequest,
-    ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
-        let Some(control) = self.control.as_ref() else {
-            return ordered_native_request(&self.connection, &self.shared.connection_state, req)
-                .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
-                .wait()
-                .await
-                .into_result();
-        };
-        let result = establish_session_v5(control, "session/load", &req).await;
-        if result.is_ok() {
-            control.session_replayed().await;
-        }
-        result.map_err(Into::into)
+        result: Result<SessionId, agent_client_protocol::Error>,
+        failure: Option<crate::acp::establishment::EstablishmentBlockReason>,
+    ) -> Result<SessionId, agent_client_protocol::Error> {
+        let control = self.control.as_ref().ok_or_else(|| {
+            acp_internal_error("native establishment has no original control receipt".into())
+        })?;
+        Self::settle_establishment(&self.shared, control, result, failure, true).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn fresh(
-        &mut self,
-        stored: Option<String>,
-        seed_history_replay: bool,
-        fork_from: Option<String>,
-        fork_capable: bool,
-        load_session_capable: bool,
-        mcp_servers: Vec<McpServer>,
-        prior_conversation: bool,
+    pub(super) async fn settle_establishment(
+        shared: &Arc<Shared>,
+        control: &Arc<crate::acp::acp_client::control::DaemonControlClient>,
+        mut result: Result<SessionId, agent_client_protocol::Error>,
+        failure: Option<crate::acp::establishment::EstablishmentBlockReason>,
+        publish_assignment: bool,
     ) -> Result<SessionId, agent_client_protocol::Error> {
-        let label = self.shared.session_label.clone();
-        let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
-        // Lost resume context is announced only once a replacement succeeds.
-        let mut context_reset_reason = initial_reset_reason(
-            stored.is_some(),
-            load_session_capable,
-            fork_requested,
-            prior_conversation,
-        );
-
-        if should_fork(fork_from.as_deref(), fork_capable) {
-            // Never falls through to session/new, which would hand the user
-            // an empty session they believe is a fork.
-            let parent = fork_from.unwrap_or_default();
-            info!(target: "acp.protocol", session = %label, parent_acp_id = %parent, "structured fork via session/fork");
-            let req = ForkSessionRequest::new(parent.clone(), self.agent_cwd.clone())
-                .mcp_servers(mcp_servers);
-            return match self
-                .minting_request("session/fork", req, |resp: &ForkSessionResponse| {
-                    resp.session_id.clone()
-                })
-                .await
-            {
-                Ok(resp) => {
-                    let new_id = resp.session_id.clone();
-                    self.shared.commit_session(new_id.clone(), true).await?;
-                    info!(
-                        target: "acp.protocol",
-                        session = %label,
-                        parent_acp_id = %parent,
-                        new_id = %new_id.0,
-                        "session/fork succeeded, captured forked acp_session_id"
-                    );
-                    self.channels =
-                        SessionChannels::new(resp.modes.as_ref(), resp.config_options.as_deref());
-                    if let Some(modes) = resp.modes.as_ref() {
-                        self.shared.emit(modes_available_event(modes)).await;
-                    }
-                    if let Some(event) = config_options_event(resp.config_options) {
-                        self.shared.emit(event).await;
-                    }
-                    Ok(new_id)
+        use crate::acp::establishment::EstablishmentBlockReason;
+        use crate::acp::event_sender::EstablishmentResolution;
+        let (expected_id, expected_context) = control.applying_attempt().ok_or_else(|| {
+            acp_internal_error("original application custody is unavailable".into())
+        })?;
+        let receipt = control
+            .projection
+            .receipt_snapshot()
+            .filter(|receipt| receipt.attempt.id == expected_id);
+        let native_id = receipt.as_ref().and_then(|receipt| receipt.session_id());
+        if let Some(id) = result
+            .as_ref()
+            .ok()
+            .cloned()
+            .or_else(|| native_id.map(|id| SessionId::from(id.to_owned())))
+        {
+            if let Err(error) = shared.activate_session(id).await {
+                control.projection.lost();
+                if result.is_ok() {
+                    result = Err(error);
                 }
-                Err(mut e) => {
-                    let rejection = if e.origin
-                        == crate::acp::control_protocol::HandshakeFailureOrigin::NativeResponse
-                    {
-                        e.fork_rejection.take()
-                    } else {
-                        None
-                    };
-                    warn!(
-                        target: "acp.protocol",
-                        session = %label,
-                        parent_acp_id = %parent,
-                        "session/fork failed; failing spawn (no session/new fallback): {e}"
-                    );
-                    if let Some(rejection) = rejection {
-                        #[cfg(test)]
-                        {
-                            let gate = self
-                                .shared
-                                .connection_state
-                                .fork_emit_gate
-                                .lock()
-                                .unwrap()
-                                .take();
-                            if let Some((entered, release)) = gate {
-                                let _ = entered.send(());
-                                let _ = release.await;
-                            }
-                        }
-                        self.shared
-                            .emit(Event::SessionContextReset {
-                                reason: format!(
-                                    "fork_failed: {}",
-                                    super::super::errors::public_error_message(&e.error)
-                                ),
-                                fork_rejection: Some(rejection),
-                            })
-                            .await;
-                        #[cfg(test)]
-                        if let Some(emitted) = self
-                            .shared
-                            .connection_state
-                            .fork_emitted
-                            .lock()
-                            .unwrap()
-                            .take()
-                        {
-                            let _ = emitted.send(());
-                        }
+            }
+        } else if !shared
+            .ingress
+            .current()
+            .as_ref()
+            .is_some_and(|id| shared.ingress.is_current_stable(id))
+        {
+            let _guard = shared.ingress.fence.write().await;
+            match shared.ingress.finish(shared.ingress.current()) {
+                Ok(replay) => shared.apply_replay(replay).await,
+                Err(error) => {
+                    control.projection.lost();
+                    if result.is_ok() {
+                        result = Err(error);
                     }
-                    Err(e.into())
                 }
-            };
+            }
         }
-        if fork_requested {
-            warn!(
-                target: "acp.protocol",
-                session = %label,
-                "fork requested but agent does not advertise fork; falling back to session/new"
-            );
-            self.shared
-                .emit(Event::SessionContextReset {
-                    reason: "fork_unsupported_by_agent".to_string(),
-                    fork_rejection: None,
+        control.session_replayed().await;
+        let failure = if native_id.is_some() {
+            None
+        } else {
+            failure.or_else(|| {
+                result.as_ref().err().map(|_| {
+                    control
+                        .projection
+                        .failure_reason()
+                        .unwrap_or(EstablishmentBlockReason::OutcomeUnknown)
                 })
-                .await;
-        }
-
-        if let (true, Some(stored)) = (load_session_capable, stored) {
-            info!(target: "acp.protocol", session = %label, stored_id = %stored, "resuming session via session/load");
-            // Set before sending: the adapter replays history during the load.
-            // An import (#2276) has an empty store and wants the replay.
-            if !seed_history_replay {
-                self.shared
-                    .suppress_history_replay
-                    .store(true, Ordering::Relaxed);
+            })
+        };
+        let delivery = shared
+            .event_tx
+            .close_establishment(failure)
+            .await
+            .ok_or_else(|| {
+                acp_internal_error("original establishment delivery is unavailable".into())
+            })?;
+        let resolution = delivery.settled().await;
+        let id = match result {
+            Ok(id) => id,
+            Err(error) => {
+                shared.ingress.revoke_requests();
+                shared.connection_state.decline_establishment();
+                return Err(error);
             }
-            // The replay arrives under the stored id, so identity commits
-            // before the request rather than on its reply.
+        };
+        match resolution {
+            EstablishmentResolution::Applied(postimage)
+                if delivery.attempt.id == expected_id
+                    && postimage.attempt_id == expected_id
+                    && postimage.context == expected_context
+                    && postimage.choice.acp_session_id.as_deref() == Some(id.0.as_ref()) =>
             {
-                let ingress = &self.shared.ingress;
-                let _guard = ingress.fence.write().await;
-                ingress.finish(Some(SessionId::from(stored.clone())))?;
-            }
-            let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
-                .mcp_servers(mcp_servers.clone());
-            match self.load_request(req).await {
-                Ok(resp) => {
-                    info!(
-                        target: "acp.protocol",
-                        session = %label,
-                        stored_id = %stored,
-                        "session/load succeeded; suppressing post-load history replay"
-                    );
-                    self.channels =
-                        SessionChannels::new(resp.modes.as_ref(), resp.config_options.as_deref());
-                    self.shared
+                #[cfg(test)]
+                let gate = shared
+                    .connection_state
+                    .test_establishment_usable
+                    .lock()
+                    .unwrap()
+                    .take();
+                #[cfg(test)]
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+                let ready = control.native_session_ready()
+                    && control.projection.applied().is_some()
+                    && !shared.connection_state.is_stopping();
+                if publish_assignment {
+                    if ready {
+                        shared.connection_state.record_usable();
+                    }
+                    shared
                         .emit(Event::AcpSessionAssigned {
-                            acp_session_id: stored.clone(),
-                            connection_ready: true,
+                            acp_session_id: id.0.to_string(),
+                            connection_ready: ready,
                             native_subject: None,
                         })
                         .await;
-                    if let Some(event) = config_options_event(resp.config_options) {
-                        self.shared.emit(event).await;
-                    }
-                    return Ok(SessionId::from(stored));
+                } else if !ready {
+                    return Err(acp_internal_error(
+                        "new native binding is applied but its channel is unavailable".into(),
+                    ));
                 }
-                Err(error) if self.shared.connection_state.loss().is_some() => return Err(error),
-                // A partial replay may already be in the empty store, so a
-                // failed import must not continue on a fresh session.
-                Err(e) if seed_history_replay => {
-                    warn!(
-                        target: "acp.protocol",
-                        session = %label,
-                        stored_id = %stored,
-                        "session/load failed for imported session; failing import (no session/new fallback): {e}"
-                    );
-                    return Err(e);
-                }
-                Err(e) => {
-                    warn!(
-                        target: "acp.protocol",
-                        session = %label,
-                        stored_id = %stored,
-                        "session/load failed, falling back to session/new: {e}"
-                    );
-                    {
-                        let ingress = &self.shared.ingress;
-                        let _guard = ingress.fence.write().await;
-                        ingress.finish(None)?;
-                    }
-                    self.shared
-                        .suppress_history_replay
-                        .store(false, Ordering::Relaxed);
-                    if !fork_requested {
-                        context_reset_reason = Some(load_failed_reason(prior_conversation, &e));
-                    }
-                }
+                Ok(id)
+            }
+            _ => {
+                shared.ingress.revoke_requests();
+                shared.connection_state.decline_establishment();
+                Err(acp_internal_error(
+                    "native establishment or original replay remains unconfirmed".into(),
+                ))
             }
         }
-        self.new_session(mcp_servers, context_reset_reason).await
-    }
-
-    async fn new_session(
-        &mut self,
-        mcp_servers: Vec<McpServer>,
-        context_reset_reason: Option<String>,
-    ) -> Result<SessionId, agent_client_protocol::Error> {
-        let label = self.shared.session_label.clone();
-        info!(target: "acp.protocol", session = %label, "creating fresh session via session/new");
-        let req = NewSessionRequest::new(self.agent_cwd.clone()).mcp_servers(mcp_servers);
-        let new_session = self
-            .minting_request("session/new", req, |resp: &NewSessionResponse| {
-                resp.session_id.clone()
-            })
-            .await?;
-        let id = new_session.session_id.clone();
-        if let Some(reason) = context_reset_reason {
-            self.shared
-                .emit(Event::SessionContextReset {
-                    reason,
-                    fork_rejection: None,
-                })
-                .await;
-        }
-        self.shared.commit_session(id.clone(), true).await?;
-        info!(
-            target: "acp.protocol",
-            session = %label,
-            new_id = %id.0,
-            "session/new succeeded, captured acp_session_id"
-        );
-        self.channels = SessionChannels::new(
-            new_session.modes.as_ref(),
-            new_session.config_options.as_deref(),
-        );
-        if let Some(modes) = &new_session.modes {
-            self.shared.emit(modes_available_event(modes)).await;
-        }
-        if let Some(event) = config_options_event(new_session.config_options.clone()) {
-            self.shared.emit(event).await;
-        }
-        // Only a live `mode` config option is driven from defaults (#2631).
-        if let (Some(mode), Some(options)) = (
-            self.default_mode.as_deref(),
-            new_session.config_options.as_deref(),
-        ) {
-            match mode_config_id(options) {
-                Some(config_id) => {
-                    let _ = apply_config_default(
-                        &self.connection,
-                        &self.shared.connection_state,
-                        &self.shared.event_tx,
-                        id.clone(),
-                        config_id,
-                        mode,
-                        &label,
-                    )
-                    .await;
-                }
-                None => debug!(
-                    target: "acp.protocol",
-                    session = %label,
-                    "default structured view mode skipped; no mode option"
-                ),
-            }
-        }
-        Ok(id)
     }
 
     /// The persisted model pick, re-asserted after any establish path because
@@ -701,14 +651,21 @@ impl Session {
             );
             return;
         }
+        let scope = self
+            .control
+            .as_ref()
+            .and_then(|control| control.original_request_context());
         let result = apply_config_default(
             &self.connection,
             &self.shared.connection_state,
             &self.shared.event_tx,
-            self.acp_session_id.clone(),
-            SessionConfigId::new(option.id.clone()),
-            model,
+            agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+                self.acp_session_id.clone(),
+                SessionConfigId::new(option.id.clone()),
+                agent_client_protocol::schema::v1::SessionConfigValueId::new(model),
+            ),
             label,
+            scope.clone(),
         )
         .await;
         match result {
@@ -723,7 +680,12 @@ impl Session {
                     reason,
                     ConfigOptionDispatchPurpose::Generic,
                 );
-                self.shared.emit(event).await;
+                let sender = if self.control.is_some() {
+                    self.shared.event_tx.with_context(scope.map(Arc::new))
+                } else {
+                    self.shared.event_tx.clone()
+                };
+                let _ = sender.send(event).await;
             }
             Err(_) => {}
         }
@@ -741,10 +703,15 @@ impl Session {
                     &self.connection,
                     &self.shared.connection_state,
                     &self.shared.event_tx,
-                    self.acp_session_id.clone(),
-                    SessionConfigId::new(config_id.to_string()),
-                    effort,
+                    agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+                        self.acp_session_id.clone(),
+                        SessionConfigId::new(config_id.to_string()),
+                        agent_client_protocol::schema::v1::SessionConfigValueId::new(effort),
+                    ),
                     &self.shared.session_label,
+                    self.control
+                        .as_ref()
+                        .and_then(|control| control.original_request_context()),
                 )
                 .await;
             }
@@ -753,29 +720,6 @@ impl Session {
                 session = %self.shared.session_label,
                 "structured view effort skipped; no thought_level option"
             ),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reset_reasons_follow_prior_conversation() {
-        // (stored, load_capable, fork, prior) -> announced
-        for (stored, load, fork, prior, announced) in [
-            (false, true, false, true, true),
-            (false, true, false, false, false),
-            (false, true, true, true, false),
-            (true, false, false, false, true),
-            (true, true, false, true, false),
-        ] {
-            assert_eq!(
-                initial_reset_reason(stored, load, fork, prior).is_some(),
-                announced,
-                "stored={stored} load={load} fork={fork} prior={prior}"
-            );
         }
     }
 }

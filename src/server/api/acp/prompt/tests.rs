@@ -8,6 +8,7 @@ fn structured_instance(id: &str, idle: bool) -> crate::session::Instance {
     inst.id = id.to_string();
     inst.source_profile = "default".into();
     inst.view = crate::session::View::Structured;
+    crate::server::test_support::select_retained_for_test(&mut inst);
     if idle {
         inst.status = crate::session::Status::Idle;
     }
@@ -82,57 +83,10 @@ fn published(state: &AppState, id: &str, pred: impl Fn(&Event) -> bool) -> bool 
     state
         .acp_event_store
         .replay_from(id, 0)
+        .unwrap()
         .iter()
-        .any(|(_, e)| pred(e))
+        .any(|stored| pred(stored.event.as_ref()))
 }
-
-fn park_on_exhausted_rate_limit(state: &AppState, id: &str) {
-    assert!(state.acp_supervisor.publish_stopped_if_seq(
-        id,
-        crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
-        0,
-    ));
-}
-
-/// An ARMED park: the limit reported a reset time and the cap is nowhere near,
-/// so auto-resume (when enabled at all) still owns the recovery. This is the
-/// state a user hits the moment a weekly limit lands.
-fn park_on_armed_rate_limit(state: &AppState, id: &str) {
-    let store = &state.acp_event_store;
-    store
-        .record(
-            id,
-            1,
-            &Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
-                    status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
-                    kind: "usage".into(),
-                },
-            },
-        )
-        .expect("seed the limit");
-    store
-        .record(
-            id,
-            2,
-            &Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        )
-        .expect("seed the park");
-    state.acp_supervisor.hydrate_seqs([(id.to_string(), 2)]);
-    assert!(
-        store.rate_limit_park(id).is_some_and(|p| !p.cap_reached),
-        "the fixture must be an armed park, or these tests assert nothing"
-    );
-}
-
-/// Both park shapes, for tests that must hold on either.
-const PARKS: [(&str, fn(&AppState, &str)); 2] = [
-    ("exhausted", park_on_exhausted_rate_limit),
-    ("armed", park_on_armed_rate_limit),
-];
 
 /// A structured session whose worker starts fail: on the provider limit when
 /// `rate_limited`, otherwise as a generic launch failure. The count proves a
@@ -170,7 +124,7 @@ async fn failing_start_state(
 #[tokio::test]
 async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
-    use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+    use crate::acp::supervisor::ResumeKind;
 
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false).await;
@@ -184,8 +138,8 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
         .await
         .expect("begin_resume must not error under capacity")
     {
-        ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        Some(r) => r,
+        None => panic!("expected a fresh reservation"),
     };
 
     let mut waits = state.acp_supervisor.watch_worker_waits();
@@ -311,36 +265,6 @@ async fn prompt_handlers_claim_the_submission_guard_before_they_wake() {
     }
 }
 
-/// #3688 and the armed park: either is sendable at the shared decision point.
-#[tokio::test]
-async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
-    for (park, seed) in PARKS {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let id = format!("sess-{park}-park-shared");
-        let state = structured_state(&id, false).await;
-        let service = &state.session_service;
-        let id_ref = id.as_str();
-        let decide = move || async move {
-            let _guard = service
-                .admit_prompt_submission(&SessionCaller::User, id_ref)
-                .await
-                .expect("session exists");
-            service
-                .prompt_dispatch_under_submission(id_ref, "", false, false)
-                .await
-        };
-        assert_eq!(
-            decide().await,
-            PromptDispatch::Queued {
-                reason: QueueReason::WorkerDown,
-            },
-            "{park}"
-        );
-        seed(&state, &id);
-        assert_eq!(decide().await, PromptDispatch::Sent, "{park}");
-    }
-}
-
 /// #4081 review: `no_revive` must refuse a prompt to a fully stopped worker
 /// (`WorkerDown`) rather than queue it, since queuing still hands the prompt
 /// off once something else revives the worker. An idle-dormant session is
@@ -412,81 +336,101 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
 /// a turn lands. No reservation is held: one would make `is_running` true and
 /// skip the park probe.
 #[tokio::test]
-async fn turn_on_a_park_resumes_instead_of_queueing() {
-    for (park, seed) in PARKS {
-        for rate_limited in [false, true] {
+#[serial_test::serial]
+async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_explicit_input() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
             for diff_comments in [false, true] {
-                let case = format!(
-                    "{park} park, rate_limited={rate_limited}, diff_comments={diff_comments}"
-                );
-                let _app_dir = crate::session::test_support::isolate_app_dir();
-                let id = format!("sess-{park}-park-{rate_limited}-{diff_comments}");
-                let (state, launches) = failing_start_state(&id, rate_limited).await;
-                seed(&state, &id);
-                // The detached start holds a `SessionService` clone until it ends.
-                let refs_at_rest = Arc::strong_count(&state.session_service);
-
-                let response = if diff_comments {
-                    acp_prompt_diff_comments(
-                        State(Arc::clone(&state)),
-                        Path(id.clone()),
-                        diff_req("please address these"),
-                    )
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    if diff_comments {
+                        "quota-explicit-review"
+                    } else {
+                        "quota-explicit-text"
+                    },
+                )
+                .await;
+                live.park("old interrupted input must not replay").await;
+                let id = live.id().to_owned();
+                let original = live
+                    .state
+                    .acp_supervisor
+                    .current_native_availability(&id)
                     .await
-                    .into_response()
+                    .unwrap()
+                    .owner;
+                let frontier = live.state.acp_event_store.highest_seq(&id);
+                live.client = scope
+                    .reconcile_after(live.client, |state, id| async move {
+                        let response = if diff_comments {
+                            acp_prompt_diff_comments(
+                                State(state),
+                                Path(id),
+                                diff_req("please address these"),
+                            )
+                            .await
+                            .into_response()
+                        } else {
+                            acp_prompt(State(state), Path(id), prompt_req("a distinct new input"))
+                                .await
+                                .into_response()
+                        };
+                        assert_eq!(response.status(), StatusCode::ACCEPTED);
+                    })
+                    .await;
+                live.client.ready().await;
+                live.state = live.client.app_state();
+                let request = live.next_prompt().await;
+                assert_eq!(request["params"]["sessionId"], live.sid);
+                let expected = if diff_comments {
+                    "please address these"
                 } else {
-                    acp_prompt(
-                        State(Arc::clone(&state)),
-                        Path(id.clone()),
-                        prompt_req("switch me to a model that still has quota"),
-                    )
-                    .await
-                    .into_response()
+                    "a distinct new input"
                 };
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while Arc::strong_count(&state.session_service) > refs_at_rest {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| panic!("{case}: the detached start never finished"));
-
+                assert_eq!(request["params"]["prompt"][0]["text"], expected);
+                let events = live
+                    .state
+                    .acp_event_store
+                    .replay_from(&id, frontier)
+                    .unwrap();
+                assert!(!events.iter().any(|stored| matches!(
+                    stored.event.as_ref(),
+                    Event::RateLimitAutoResumed { .. }
+                )));
+                assert!(live
+                    .state
+                    .session_service
+                    .queued_prompts_snapshot(&id)
+                    .await
+                    .is_empty());
                 assert_eq!(
-                    launches.load(std::sync::atomic::Ordering::SeqCst),
-                    1,
-                    "{case}: the forced start was never reached"
-                );
-                assert!(
-                    state
-                        .session_service
-                        .queued_prompts_snapshot(&id)
+                    live.state
+                        .acp_supervisor
+                        .current_native_availability(&id)
                         .await
-                        .is_empty(),
-                    "{case}"
+                        .unwrap()
+                        .owner,
+                    original
                 );
                 assert_eq!(
-                    published(&state, &id, |e| matches!(
-                        e,
-                        Event::AgentStartupError { .. }
-                    )),
-                    !rate_limited,
-                    "{case}"
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
                 );
-                assert!(
-                    !published(&state, &id, |e| matches!(
-                        e,
-                        Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
-                    )),
-                    "{case}"
-                );
-                assert!(
-                    state.acp_event_store.rate_limit_park(&id).is_some(),
-                    "{case}: the park must stand until a turn lands"
-                );
+                assert!(!live
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/load"));
+                live.finish_prompt(&request, None).await;
             }
-        }
-    }
+        })
+    })
+    .await;
 }
 
 /// #4081 review: a prompt into either park dispatches `Sent` (see
@@ -494,473 +438,500 @@ async fn turn_on_a_park_resumes_instead_of_queueing() {
 /// by `send_turn`'s resume decision. The refusal must start no worker and
 /// leave the park, the queue, and a pending initial turn as they were.
 #[tokio::test]
-async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
-    for (park, seed) in PARKS {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let id = format!("sess-no-revive-{park}-park");
-        let (state, launches) = failing_start_state(&id, true).await;
-        seed(&state, &id);
-        state.instances.write().await[0].pending_initial_turn =
-            Some(crate::session::PendingInitialTurn {
-                text: "queued before the park".to_string(),
-                attachments: Vec::new(),
-                synthesized: true,
-            });
-        seed_native_row(&state).await;
-
-        let response = acp_prompt(
-            State(Arc::clone(&state)),
-            Path(id.clone()),
-            no_revive_prompt_req("hello"),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT, "{park}");
-        assert_eq!(
-            launches.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "{park}: no_revive must not start a worker"
-        );
-        assert!(
-            state
-                .session_service
-                .queued_prompts_snapshot(&id)
-                .await
-                .is_empty(),
-            "{park}"
-        );
-        assert!(
-            !published(&state, &id, |e| matches!(
-                e,
-                Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
-            )),
-            "{park}"
-        );
-        assert!(
-            state.acp_event_store.rate_limit_park(&id).is_some(),
-            "{park}: the park must stand"
-        );
-        assert!(
-            state.instances.read().await[0]
-                .pending_initial_turn
-                .is_some(),
-            "{park}: no_revive refusal must not clear the pending initial turn"
-        );
-    }
-}
-
-/// #4109: a rate-limit park can retain a stale active-turn latch until the
-/// worker's `Stopped` event is persisted. `no_revive` still refuses while the
-/// worker is absent, regardless of the dispatch queue reason.
-#[tokio::test]
-async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-no-revive-stale-rate-limit".to_string();
-    let (state, launches) = failing_start_state(&id, true).await;
-    seed_elapsed_rate_limit_park(&state, &id, true);
-    state.instances.write().await[0].pending_initial_turn =
-        Some(crate::session::PendingInitialTurn {
-            text: "queued before the park".to_string(),
-            attachments: Vec::new(),
-            synthesized: true,
-        });
-    seed_native_row(&state).await;
-
-    assert!(!state.acp_supervisor.is_running(&id).await);
-    assert!(
-        state
-            .session_service
-            .fold_control_state(&id)
-            .await
-            .turn_active,
-        "the fixture must retain a stale active-turn latch"
-    );
-
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.clone()),
-        no_revive_prompt_req("hello"),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        launches.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "no_revive must not start a worker"
-    );
-    assert!(
-        state
-            .session_service
-            .queued_prompts_snapshot(&id)
-            .await
-            .is_empty(),
-        "a refusal must not enqueue the prompt"
-    );
-    assert!(
-        state.acp_event_store.rate_limit_park(&id).is_some(),
-        "the rate-limit park must remain intact"
-    );
-    assert!(
-        state.instances.read().await[0]
-            .pending_initial_turn
-            .is_some(),
-        "the refusal must preserve the pending initial turn"
-    );
+#[serial_test::serial]
+async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effects() {
+    use crate::acp::event_store::ControlKnowledge::Known;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            for parked in [false, true] {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    if parked {
+                        "no-revive-park"
+                    } else {
+                        "no-revive-active"
+                    },
+                )
+                .await;
+                let active = live.start_prompt("original governed work").await;
+                if parked {
+                    live.finish_prompt(&active, Some("rate_limit")).await;
+                }
+                let id = live.id().to_owned();
+                live.state
+                    .session_service
+                    .set_pending_initial_turn(&id, "existing continuation".into(), Vec::new())
+                    .await;
+                let native_methods = live.native.requests();
+                live.client = scope
+                    .reconcile_after(live.client, |state, id| async move {
+                        let before = state.acp_event_store.highest_seq(&id);
+                        let budget = state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap();
+                        assert_eq!(
+                            state.acp_event_store.has_in_flight_main_turn(&id).unwrap(),
+                            Known(!parked)
+                        );
+                        let response = acp_prompt(
+                            State(state.clone()),
+                            Path(id.clone()),
+                            no_revive_prompt_req("must refuse"),
+                        )
+                        .await
+                        .into_response();
+                        assert_eq!(response.status(), StatusCode::CONFLICT);
+                        assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                        assert_eq!(
+                            state
+                                .acp_event_store
+                                .rate_limit_redelivery_streak(&id)
+                                .unwrap(),
+                            budget
+                        );
+                        assert!(state
+                            .session_service
+                            .queued_prompts_snapshot(&id)
+                            .await
+                            .is_empty());
+                        assert_eq!(
+                            persisted_pending_turn(&state, &id).await.unwrap().text,
+                            "existing continuation"
+                        );
+                        crate::server::acp_reconciler::ensure_rate_limit_worker(
+                            &state,
+                            &id,
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    })
+                    .await;
+                live.client.ready().await;
+                live.state = live.client.app_state();
+                assert_eq!(live.native.requests(), native_methods);
+                if !parked {
+                    live.finish_prompt(&active, None).await;
+                }
+            }
+        })
+    })
+    .await;
 }
 
 /// #3621: a direct prompt parks while a drain owns the session, and the drain
 /// that follows leaves its row queued behind the turn the prompt started.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-3621-race".to_string();
-    let state = structured_state(&id, true).await;
-    let cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(&id)
-        .await;
-    state
-        .session_service
-        .enqueue_prompt(
-            &id,
-            "q1".into(),
-            "queued follow-up".into(),
-            vec![],
-            None,
-            None,
-        )
-        .await
-        .expect("session exists");
-
-    let drain_owns_it = state.session_service.prompt_submission(&id).await;
-    let mut claims = state.session_service.watch_submission_claims();
-    let handler = {
-        let state = Arc::clone(&state);
-        let id = id.clone();
-        async move {
-            acp_prompt(State(state), Path(id), prompt_req("typed mid-delivery"))
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "queue-direct-race")
+                    .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    &id,
+                    "q1".into(),
+                    "queued follow-up".into(),
+                    vec![],
+                    None,
+                    None,
+                )
                 .await
-                .into_response()
-        }
-    };
-    tokio::pin!(handler);
-    assert!(futures_util::poll!(&mut handler).is_pending());
-    assert_eq!(claims.try_recv().expect("contender reached claim"), id);
+                .expect("session exists");
 
-    drop(drain_owns_it);
-    let response = tokio::time::timeout(Duration::from_secs(30), handler)
-        .await
-        .expect("the handler must finish once the drain releases the session");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let drain_owns_it = state.session_service.prompt_submission(&id).await;
+            let mut claims = state.session_service.watch_submission_claims();
+            let handler = {
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move {
+                    acp_prompt(State(state), Path(id), prompt_req("typed mid-delivery"))
+                        .await
+                        .into_response()
+                }
+            };
+            tokio::pin!(handler);
+            assert!(futures_util::poll!(&mut handler).is_pending());
+            assert_eq!(claims.try_recv().expect("contender reached claim"), id);
 
-    state.session_service.drain_queued_prompts_once(&id).await;
-    assert_eq!(
-        state
-            .session_service
-            .queued_prompts_snapshot(&id)
+            drop(drain_owns_it);
+            let response = tokio::time::timeout(Duration::from_secs(30), handler)
+                .await
+                .expect("the handler must finish once the drain releases the session");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let request = live.next_prompt().await;
+            assert_eq!(request["params"]["prompt"][0]["text"], "typed mid-delivery");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !state
+                    .session_service
+                    .fold_control_state(&id)
+                    .await
+                    .unwrap()
+                    .turn_active
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .len(),
-        1
-    );
-    state.acp_supervisor.test_flush_worker_commands(&id).await;
-    assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
+            .expect("the actual Native admission owns the canonical turn before draining");
+
+            state.session_service.drain_queued_prompts_once(&id).await;
+            assert_eq!(
+                state
+                    .session_service
+                    .queued_prompts_snapshot(&id)
+                    .await
+                    .len(),
+                1
+            );
+            assert_eq!(
+                live.native
+                    .requests()
+                    .iter()
+                    .filter(|method| *method == "session/prompt")
+                    .count(),
+                1
+            );
+            live.finish_prompt(&request, None).await;
+        })
+    })
+    .await;
+}
+
+async fn request_queue_interaction(
+    live: &mut crate::server::test_support::ManagedControlSession,
+    kind: &str,
+) -> crate::acp::approvals::Nonce {
+    let (method, params) = if kind == "approval" {
+        (
+            "session/request_permission",
+            serde_json::json!({
+                "sessionId": live.sid,
+                "toolCall": {"toolCallId": "pending-tool", "title": "Wait for user"},
+                "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+            }),
+        )
+    } else {
+        (
+            "elicitation/create",
+            serde_json::json!({
+                "mode": "form", "sessionId": live.sid, "message": "Choose",
+                "requestedSchema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+            }),
+        )
+    };
+    live.native
+        .send(serde_json::json!({
+            "jsonrpc": "2.0", "id": "queue-interaction", "method": method, "params": params,
+        }))
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match live
+                .client
+                .next_event()
+                .await
+                .expect("actual callback reaches the daemon")
+            {
+                Event::ApprovalRequested { approval } if kind == "approval" => {
+                    return approval.nonce
+                }
+                Event::ElicitationRequested { elicitation } if kind == "elicitation" => {
+                    return elicitation.nonce
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("actual Original nonce is published")
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    for (reason, interaction, late) in [
-        ("prompt_failed", None, false),
-        ("prompt_failed", Some("approval"), false),
-        ("prompt_failed", Some("elicitation"), false),
-        ("prompt_failed", Some("approval"), true),
-        ("prompt_failed", Some("elicitation"), true),
-        ("session_reset_failed", None, false),
-        ("startup_error", None, false),
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    for (runtime_loss, interaction, late) in [
+        (false, None, false),
+        (false, Some("approval"), false),
+        (false, Some("elicitation"), false),
+        (false, Some("approval"), true),
+        (false, Some("elicitation"), true),
+        (true, None, false),
     ] {
-        let id = format!(
-            "queued-after-{reason}-{}-{late}",
-            interaction.unwrap_or("none")
-        );
-        let state = structured_state(&id, true).await;
-        let commands = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
-        let row = state.instances.read().await[0].clone();
-        let storage =
-            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
-        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
-        state
-            .acp_supervisor
-            .current_lease(&id)
-            .unwrap()
-            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-                store: storage,
-                generation: row.lifecycle_generation,
-                namespace: Some(state.profile_namespace.clone()),
-                native_scope: Some(scope),
-            }));
-        state.acp_supervisor.test_observe_native_ready(&id).await;
-        let first = acp_prompt(
-            State(state.clone()),
-            Path(id.clone()),
-            prompt_req("first explicit request"),
-        )
-        .await
-        .into_response();
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let second = acp_prompt(
-            State(state.clone()),
-            Path(id.clone()),
-            prompt_req("second explicit request"),
-        )
-        .await
-        .into_response();
-        assert_eq!(second.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            state
-                .session_service
-                .queued_prompts_snapshot(&id)
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "queue-after-failure",
+                )
+                .await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let first = live.start_prompt("first explicit request").await;
+                let second = acp_prompt(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    prompt_req("second explicit request"),
+                )
                 .await
-                .len(),
-            1
-        );
-        let inject = |event: Event| {
-            let seq = state.acp_event_store.highest_seq_checked(&id).unwrap() + 1;
-            state.acp_event_store.record(&id, seq, &event).unwrap();
-            state.acp_control_cache.apply_if_cached(&id, seq, &event);
-            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
-        };
-        let (mut requested, resolved) = match interaction {
-            Some("approval") => {
-                let approval = crate::acp::permissions::build_approval(
-                    crate::acp::state::ToolCall {
-                        id: "pending-tool".into(),
-                        name: "shell".into(),
-                        kind: "execute".into(),
-                        args_preview: "{}".into(),
-                        started_at: chrono::Utc::now(),
-                        parent_tool_call_id: None,
-                        memory_recall: None,
-                        diffs: Vec::new(),
-                    },
-                    Vec::new(),
+                .into_response();
+                assert_eq!(second.status(), StatusCode::ACCEPTED);
+                assert_eq!(
+                    state
+                        .session_service
+                        .queued_prompts_snapshot(&id)
+                        .await
+                        .len(),
+                    1
                 );
-                let nonce = approval.nonce.clone();
-                (
-                    Some(Event::ApprovalRequested { approval }),
-                    Some(Event::ApprovalResolved {
-                        nonce,
-                        decision: crate::acp::approvals::ApprovalDecision::Allow,
-                    }),
-                )
-            }
-            Some("elicitation") => {
-                let nonce = crate::acp::approvals::Nonce("pending-question".into());
-                (
-                    Some(Event::ElicitationRequested {
-                        elicitation: crate::acp::elicitations::Elicitation {
-                            nonce: nonce.clone(),
-                            message: "Choose".into(),
-                            title: None,
-                            description: None,
-                            tool_call_id: None,
-                            questions: Vec::new(),
-                            requested_at: chrono::Utc::now(),
-                            resolved: None,
-                        },
-                    }),
-                    Some(Event::ElicitationResolved {
-                        nonce,
-                        outcome: crate::acp::elicitations::ElicitationOutcome::Declined,
-                        answers: Vec::new(),
-                    }),
-                )
-            }
-            _ => (None, None),
-        };
-        if !late {
-            if let Some(event) = requested.take() {
-                inject(event);
-            }
-        }
-        if reason == "prompt_failed" {
-            inject(Event::PromptRuntimeError {
-                message: "first request failed".into(),
-                evidence: None,
-                native_subject: None,
-            });
-        }
-        if reason == "startup_error" {
-            state
-                .acp_supervisor
-                .publish_startup_error(&id, "transport closed".into());
-        } else {
-            state
-                .acp_supervisor
-                .synthesize_stopped_for_orphan(&id, reason);
-        }
-        if let Some(event) = requested.take() {
-            inject(event);
-        }
-        if let Some(event) = resolved {
-            inject(event);
-        }
-        let control = state.session_service.fold_control_state(&id).await;
-        assert!(!control.turn_active);
-        assert_eq!(control.sidebar_status(), crate::session::Status::Error);
-        if reason == "prompt_failed" {
-            assert_eq!(
-                control.sidebar_phase,
-                crate::acp::state::SidebarPhase::PromptFailed
-            );
-            assert!(
-                control.pending_approvals.is_empty() && control.pending_elicitations.is_empty()
-            );
-        }
-        state.instances.write().await[0].status = crate::session::Status::Error;
-        state.session_service.drain_queued_prompts_once(&id).await;
-        state.acp_supervisor.test_flush_worker_commands(&id).await;
-        let follows = reason == "prompt_failed";
-        assert_eq!(
-            commands.lock().unwrap().len(),
-            if follows { 2 } else { 1 },
-            "{reason}"
-        );
-        assert_eq!(
-            state
-                .session_service
-                .queued_prompts_snapshot(&id)
-                .await
-                .len(),
-            usize::from(!follows),
-            "{reason}"
-        );
-        let prompts: Vec<_> = state
-            .acp_event_store
-            .replay_from(&id, 0)
-            .into_iter()
-            .filter_map(|(_, event)| match event {
-                Event::UserPromptSent {
-                    text, synthesized, ..
-                } => {
-                    assert!(!synthesized, "failed work is not redelivered");
-                    Some(text)
+                let interaction_nonce = if !late {
+                    if let Some(kind) = interaction {
+                        Some(request_queue_interaction(&mut live, kind).await)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let _runtime_pause = if runtime_loss {
+                    Some(live.client.pause_drain().await)
+                } else {
+                    None
+                };
+                if runtime_loss {
+                    live.native.close_stdout().await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if state
+                                .session_service
+                                .prompt_native_unavailability(&id)
+                                .await
+                                .unwrap()
+                                .is_some()
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("physical Native EOF refuses queued delivery");
+                } else {
+                    live.finish_prompt(&first, Some("prompt_failed")).await;
+                    if let Some(kind) = interaction {
+                        let nonce = if late {
+                            request_queue_interaction(&mut live, kind).await
+                        } else {
+                            interaction_nonce.unwrap()
+                        };
+                        if kind == "approval" {
+                            state
+                                .acp_supervisor
+                                .resolve_permission(
+                                    &id,
+                                    nonce,
+                                    crate::acp::approvals::ApprovalDecision::Allow,
+                                    Some("allow".into()),
+                                )
+                                .await
+                                .unwrap();
+                        } else {
+                            state
+                                .acp_supervisor
+                                .resolve_elicitation(
+                                    &id,
+                                    nonce,
+                                    crate::acp::elicitations::ElicitationResolution::Decline,
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        let reply =
+                            tokio::time::timeout(Duration::from_secs(10), live.native.reply())
+                                .await
+                                .expect("actual pending callback settles");
+                        assert_eq!(reply["id"], "queue-interaction");
+                    }
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let control =
+                                state.session_service.fold_control_state(&id).await.unwrap();
+                            assert!(!control.turn_active);
+                            assert!(control.connection_ready);
+                            assert!(control.connection_unavailable.is_none());
+                            if control.pending_approvals.is_empty()
+                                && control.pending_elicitations.is_empty()
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("settled Original callbacks cannot strand explicit queued work");
                 }
-                _ => None,
+                state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .status = crate::session::Status::Error;
+                state.session_service.drain_queued_prompts_once(&id).await;
+                if !runtime_loss {
+                    let next = live.next_prompt().await;
+                    assert_eq!(
+                        next["params"]["prompt"][0]["text"],
+                        "second explicit request"
+                    );
+                    live.finish_prompt(&next, None).await;
+                }
+                assert_eq!(
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    if runtime_loss { 1 } else { 2 },
+                );
+                assert_eq!(
+                    state
+                        .session_service
+                        .queued_prompts_snapshot(&id)
+                        .await
+                        .len(),
+                    usize::from(runtime_loss),
+                );
+                let prompts: Vec<_> = state
+                    .acp_event_store
+                    .replay_from(&id, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|stored| match Arc::unwrap_or_clone(stored.event) {
+                        Event::UserPromptSent {
+                            text, synthesized, ..
+                        } => {
+                            assert!(!synthesized, "failed work is not redelivered");
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    prompts,
+                    if runtime_loss {
+                        vec!["first explicit request"]
+                    } else {
+                        vec!["first explicit request", "second explicit request"]
+                    }
+                );
             })
-            .collect();
-        assert_eq!(
-            prompts,
-            if follows {
-                vec!["first explicit request", "second explicit request"]
-            } else {
-                vec!["first explicit request"]
-            }
-        );
+        })
+        .await;
     }
 }
 
 /// #3649: a review that loses the guard to a turn-starting submission is
 /// refused, with nothing sent or published.
 #[tokio::test]
+#[serial_test::serial]
 async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-3649-diff".to_string();
-    let state = structured_state(&id, true).await;
-    let cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(&id)
-        .await;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "queue-diff-race")
+                    .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
 
-    let winner = state.session_service.prompt_submission(&id).await;
-    let mut claims = state.session_service.watch_submission_claims();
-    let handler = {
-        let state = Arc::clone(&state);
-        let id = id.clone();
-        async move {
-            acp_prompt_diff_comments(State(state), Path(id), diff_req("review this"))
+            let winner = state.session_service.prompt_submission(&id).await;
+            let mut claims = state.session_service.watch_submission_claims();
+            let handler = {
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move {
+                    acp_prompt_diff_comments(State(state), Path(id), diff_req("review this"))
+                        .await
+                        .into_response()
+                }
+            };
+            tokio::pin!(handler);
+            assert!(futures_util::poll!(&mut handler).is_pending());
+            assert_eq!(claims.try_recv().expect("contender reached claim"), id);
+
+            state
+                .session_service
+                .send_turn(
+                    &SessionCaller::User,
+                    &id,
+                    SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        resume_reservation: None,
+                        text: "the winning turn",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
                 .await
-                .into_response()
-        }
-    };
-    tokio::pin!(handler);
-    assert!(futures_util::poll!(&mut handler).is_pending());
-    assert_eq!(claims.try_recv().expect("contender reached claim"), id);
+                .unwrap_or_else(|error| panic!("winning Native input refused: {error}"));
+            let winning_prompt = live.next_prompt().await;
+            assert_eq!(
+                winning_prompt["params"]["prompt"][0]["text"],
+                "the winning turn"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap()
+                        .turn_active
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual Native admission durably opens the winning turn");
+            let methods_before = live.native.requests();
+            drop(winner);
 
-    state
-        .acp_supervisor
-        .publish_user_prompt_with_attachments(
-            &id,
-            "the winning turn".into(),
-            &[],
-            None,
-            false,
-            None,
-        )
-        .await;
-    drop(winner);
-
-    let response = tokio::time::timeout(Duration::from_secs(10), handler)
-        .await
-        .expect("the handler must finish once the winner releases the session");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    state.acp_supervisor.test_flush_worker_commands(&id).await;
-    assert!(cmds.lock().expect("cmd log mutex poisoned").is_empty());
-    assert!(!published(&state, &id, |e| matches!(
-        e,
-        Event::UserDiffCommentsPrompt { .. }
-    )));
-}
-
-/// Seed the rate-limit state a resume acts on: prompt A interrupted by a limit
-/// whose park window has already elapsed, the state the install reads.
-/// Backdated an hour, under the redelivery cap. `busy` adds a running turn,
-/// which is what makes B queue rather than dispatch.
-fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
-    let store = &state.acp_event_store;
-    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-    let at = long_ago.timestamp_millis();
-    let mut events = vec![
-        Event::UserPromptSent {
-            text: "interrupted prompt A".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-        },
-        Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "limited".into(),
-                resets_at: Some(long_ago),
-                kind: "usage".into(),
-            },
-        },
-        Event::Stopped {
-            reason: "rate_limited".into(),
-        },
-    ];
-    if busy {
-        events.push(Event::ThinkingStarted);
-    }
-    for (seq, event) in events.iter().enumerate() {
-        store
-            .record_at(id, seq as u64 + 1, event, at)
-            .expect("seed the rate-limit park");
-    }
-    state
-        .acp_supervisor
-        .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
-    let park = store.rate_limit_park(id).expect("an armed park");
-    assert!(!park.cap_reached, "the fixture must stay under the cap");
-    assert!(
-        store.rate_limited_turn_prompt(id).is_some(),
-        "the fixture must leave a continuation to install"
-    );
+            let response = tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .expect("the handler must finish once the winner releases the session");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(live.native.requests(), methods_before);
+            assert!(!published(&state, &id, |e| matches!(
+                e,
+                Event::UserDiffCommentsPrompt { .. }
+            )));
+            assert!(state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .is_empty());
+            live.finish_prompt(&winning_prompt, None).await;
+        })
+    })
+    .await;
 }
 
 /// The pending continuation as it stands on disk, which the in-memory slot can
@@ -993,120 +964,81 @@ async fn persisted_pending_turn(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
-    // `queued` is the #4079 shape: a live worker with a turn in flight parks B
-    // on the server queue. `direct` has no turn, so B starts one.
-    for queued in [false, true] {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let label = if queued { "queued" } else { "direct" };
-        let id = format!("sess-4092-{label}");
-        let inst = structured_instance(&id, false);
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        seed_native_row(&state).await;
-        state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "continuation-install-race",
+            )
             .await;
-        seed_elapsed_rate_limit_park(&state, &id, queued);
-        // Causal precondition: the durable read this test ends on is live.
-        state
-            .session_service
-            .set_pending_initial_turn(&id, "probe".into(), Vec::new())
-            .await;
-        assert_eq!(
-            persisted_pending_turn(&state, &id).await.map(|t| t.text),
-            Some("probe".to_string()),
-            "{label}: a probe turn must reach disk before absence means anything"
-        );
-        state.session_service.clear_pending_initial_turn(&id).await;
-        assert!(persisted_pending_turn(&state, &id).await.is_none());
-
-        let mut barrier = state.session_service.arm_install_barrier();
-        let mut claims = state.session_service.watch_submission_claims();
-        let producer = tokio::spawn({
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            async move {
-                let Some(submission) = state.session_service.try_prompt_submission(&id).await
-                else {
-                    return;
-                };
-                // B is blocked on the guard, so the queue is still empty here
-                // and the producer must decide the continuation stands.
+            live.park("interrupted prompt A").await;
+            let state = live.state.clone();
+            let id = live.id().to_owned();
+            state
+                .session_service
+                .set_pending_initial_turn(&id, "probe".into(), Vec::new())
+                .await;
+            assert_eq!(
+                persisted_pending_turn(&state, &id).await.unwrap().text,
+                "probe"
+            );
+            state.session_service.clear_pending_initial_turn(&id).await;
+            assert!(persisted_pending_turn(&state, &id).await.is_none());
+            let mut barrier = state.session_service.arm_install_barrier();
+            let mut claims = state.session_service.watch_submission_claims();
+            let producer_state = state.clone();
+            let producer_id = id.clone();
+            let producer = scope.spawn_helper(async move {
+                let submission = producer_state
+                    .session_service
+                    .try_prompt_submission(&producer_id)
+                    .await
+                    .expect("continuation producer owns the real session exclusion");
                 let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
-                    &state,
-                    &id,
+                    &producer_state,
+                    &producer_id,
                     &submission,
                 )
-                .await;
+                .await
+                .expect("known interrupted input remains available");
                 assert!(matches!(
                     outcome,
                     crate::server::acp_reconciler::ContinuationOutcome::Stands
                 ));
-            }
-        });
-        // Causal barrier: A has been read from the store and is not installed.
-        let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
-            .await
-            .expect("the producer must reach the barrier")
-            .expect("the barrier tap outlives the producer");
-        assert_eq!(read_id, id, "{label}");
-        assert!(
-            state.instances.read().await[0]
-                .pending_initial_turn
-                .is_none(),
-            "{label}: the barrier must sit before the installation"
-        );
-
-        let prompt = {
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            async move {
-                acp_prompt(State(state), Path(id), prompt_req("manual prompt B"))
-                    .await
-                    .into_response()
-            }
-        };
-        tokio::pin!(prompt);
-        // B reached its submission claim, so it is contending for the session
-        // the producer is holding. Its accepted decision must not land while
-        // that install is in progress; the deadline bounds the wait, the claim
-        // above is what establishes the contention.
-        assert!(futures_util::poll!(&mut prompt).is_pending());
-        assert_eq!(
-            claims.try_recv().expect("the prompt must reach its claim"),
-            id,
-            "{label}"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), &mut prompt)
+            });
+            let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
                 .await
-                .is_err(),
-            "{label}: a submission must not land while the continuation install holds the session"
-        );
-
-        let _ = release.send(());
-        tokio::time::timeout(Duration::from_secs(10), producer)
-            .await
-            .expect("the producer must finish once released")
-            .expect("the producer must not panic");
-        let response = tokio::time::timeout(Duration::from_secs(30), prompt)
-            .await
-            .expect("the prompt must finish once the producer releases the session");
-        assert_eq!(response.status(), StatusCode::ACCEPTED, "{label}");
-
-        assert_eq!(
-            state.instances.read().await[0]
-                .pending_initial_turn
-                .as_ref()
-                .map(|t| t.text.as_str()),
-            None,
-            "{label}: B superseded A, so no continuation may survive it"
-        );
-        assert!(
-            persisted_pending_turn(&state, &id).await.is_none(),
-            "{label}: the superseded continuation must not reach disk"
-        );
-    }
+                .unwrap()
+                .unwrap();
+            let release = scope.hold_release(release);
+            assert_eq!(read_id, id);
+            assert!(persisted_pending_turn(&state, &id).await.is_none());
+            let prompt = acp_prompt(
+                State(state.clone()),
+                Path(id.clone()),
+                prompt_req("manual prompt B"),
+            );
+            tokio::pin!(prompt);
+            assert!(futures_util::poll!(&mut prompt).is_pending());
+            assert_eq!(claims.try_recv().unwrap(), id);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut prompt)
+                .await
+                .is_err());
+            assert!(release.release());
+            producer.await.unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(10), prompt)
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let request = live.next_prompt().await;
+            assert_eq!(request["params"]["prompt"][0]["text"], "manual prompt B");
+            assert!(persisted_pending_turn(&state, &id).await.is_none());
+            live.finish_prompt(&request, None).await;
+        })
+    })
+    .await;
 }
 
 #[test]
@@ -1132,53 +1064,62 @@ fn prompt_persist_tiers() {
 /// Send now on a queued plugin message keeps the sender the server stored, and the
 /// row is consumed exactly once.
 #[tokio::test]
+#[serial_test::serial]
 async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now";
-    let state = structured_state(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    state
-        .session_service
-        .enqueue_prompt(
-            id,
-            "q1".into(),
-            "PR #7 was merged".into(),
-            vec![],
-            None,
-            Some("cron".into()),
-        )
-        .await
-        .expect("session exists");
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "queue-plugin-sender")
+                    .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    id,
+                    "q1".into(),
+                    "PR #7 was merged".into(),
+                    vec![],
+                    None,
+                    Some("cron".into()),
+                )
+                .await
+                .expect("session exists");
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("PR #7 was merged", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert!(published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { origin_plugin: Some(p), .. } if p == "cron"
-    )));
-    assert!(state
-        .session_service
-        .queued_prompts_snapshot(id)
-        .await
-        .is_empty());
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("PR #7 was merged", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert!(published(&state, id, |e| matches!(
+                e,
+                Event::UserPromptSent { origin_plugin: Some(p), .. } if p == "cron"
+            )));
+            assert!(state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .is_empty());
 
-    let again = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("PR #7 was merged", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(again.status(), StatusCode::CONFLICT);
+            let again = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("PR #7 was merged", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(again.status(), StatusCode::CONFLICT);
+            let request = live.next_prompt().await;
+            assert_eq!(request["params"]["prompt"][0]["text"], "PR #7 was merged");
+            live.finish_prompt(&request, None).await;
+        })
+    })
+    .await;
 }
 
 async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
@@ -1200,69 +1141,93 @@ async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
 
 /// Different text must not be published under the plugin's name.
 #[tokio::test]
+#[serial_test::serial]
 async fn send_now_refuses_text_that_differs_from_the_stored_plugin_row() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-spoof";
-    let state = state_with_queued_plugin_row(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let live =
+                crate::server::test_support::managed_control_session(scope, "queue-plugin-spoof")
+                    .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    id,
+                    "q1".into(),
+                    "PR #7 was merged".into(),
+                    vec![],
+                    None,
+                    Some("cron".into()),
+                )
+                .await
+                .unwrap();
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("something the plugin never said", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { .. }
-    )));
-    assert_eq!(
-        state
-            .session_service
-            .queued_prompts_snapshot(id)
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("something the plugin never said", "q1"),
+            )
             .await
-            .len(),
-        1
-    );
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!published(&state, id, |e| matches!(
+                e,
+                Event::UserPromptSent { .. }
+            )));
+            assert_eq!(
+                state
+                    .session_service
+                    .queued_prompts_snapshot(id)
+                    .await
+                    .len(),
+                1
+            );
+        })
+    })
+    .await;
 }
 
 /// A send naming a row must carry that row's text, so a 202 never covers text the daemon
 /// does not hold (a queue edit racing Send now).
 #[tokio::test]
+#[serial_test::serial]
 async fn send_now_refuses_text_that_differs_from_a_user_row_too() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-stale";
-    let state = structured_state(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    state
-        .session_service
-        .enqueue_prompt(id, "q1".into(), "stored".into(), vec![], None, None)
-        .await
-        .expect("session exists");
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let live =
+                crate::server::test_support::managed_control_session(scope, "queue-user-stale")
+                    .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(id, "q1".into(), "stored".into(), vec![], None, None)
+                .await
+                .expect("session exists");
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("edited elsewhere", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { .. }
-    )));
-    let queue = state.session_service.queued_prompts_snapshot(id).await;
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].text, "stored");
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("edited elsewhere", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!published(&state, id, |e| matches!(
+                e,
+                Event::UserPromptSent { .. }
+            )));
+            let queue = state.session_service.queued_prompts_snapshot(id).await;
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text, "stored");
+        })
+    })
+    .await;
 }
 
 fn shot_ref() -> crate::daemon::PromptAttachmentRef {
@@ -1275,116 +1240,142 @@ fn shot_ref() -> crate::daemon::PromptAttachmentRef {
     }
 }
 
-async fn state_with_attachment_row(id: &str, store_bytes: bool) -> Arc<AppState> {
-    let state = structured_state(id, true).await;
-    state
-        .session_service
-        .enqueue_prompt(
-            id,
-            "q1".into(),
-            "caption".into(),
-            vec![shot_ref()],
-            None,
-            None,
-        )
-        .await
-        .expect("session exists");
-    if store_bytes {
-        assert!(state.acp_event_store.record_pending_attachment(
-            id,
-            "q1",
-            &crate::acp::event_store::AttachmentBlob {
-                id: "att-1".into(),
-                kind: crate::daemon::PromptAttachmentKind::Image,
-                mime_type: "image/png".into(),
-                name: Some("shot.png".into()),
-                data: b"stored".to_vec(),
-            },
-        ));
-    }
-    state
-}
-
 /// Send now delivers the bytes the daemon stored for the row. Request attachments, even a
 /// valid different one of the same count, never replace them.
 #[tokio::test]
+#[serial_test::serial]
 async fn send_now_delivers_the_rows_stored_attachments_not_the_requests() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
     use base64::Engine;
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-attachments";
-    let state = state_with_attachment_row(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "queue-attachments")
+                    .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    id,
+                    "q1".into(),
+                    "caption".into(),
+                    vec![shot_ref()],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(state.acp_event_store.record_pending_attachment(
+                id,
+                "q1",
+                &crate::acp::event_store::AttachmentBlob {
+                    id: "att-1".into(),
+                    kind: crate::daemon::PromptAttachmentKind::Image,
+                    mime_type: "image/png".into(),
+                    name: Some("shot.png".into()),
+                    data: b"stored".to_vec(),
+                },
+            ));
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        Ok(Json(PromptRequest {
-            text: "caption".into(),
-            attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
-                kind: crate::daemon::PromptAttachmentKind::Image,
-                mime_type: "image/png".into(),
-                data: base64::engine::general_purpose::STANDARD.encode(b"swapped-bytes"),
-                name: Some("other.png".into()),
-            }],
-            prompt_id: None,
-            no_revive: false,
-            queued_prompt_id: Some("q1".into()),
-        })),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let sent = state
-        .acp_event_store
-        .replay_from(id, 0)
-        .into_iter()
-        .find_map(|(_, e)| match e {
-            Event::UserPromptSent { attachments, .. } => Some(attachments),
-            _ => None,
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                Ok(Json(PromptRequest {
+                    text: "caption".into(),
+                    attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
+                        kind: crate::daemon::PromptAttachmentKind::Image,
+                        mime_type: "image/png".into(),
+                        data: base64::engine::general_purpose::STANDARD.encode(b"swapped-bytes"),
+                        name: Some("other.png".into()),
+                    }],
+                    prompt_id: None,
+                    no_revive: false,
+                    queued_prompt_id: Some("q1".into()),
+                })),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let sent = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .unwrap()
+                .into_iter()
+                .find_map(|stored| match Arc::unwrap_or_clone(stored.event) {
+                    Event::UserPromptSent { attachments, .. } => Some(attachments),
+                    _ => None,
+                })
+                .expect("prompt published");
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].name.as_deref(), Some("shot.png"));
+            assert_eq!(sent[0].size, 6);
+            assert!(state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .is_empty());
+            let request = live.next_prompt().await;
+            assert_eq!(
+                request["params"]["prompt"][1]["data"],
+                base64::engine::general_purpose::STANDARD.encode(b"stored"),
+            );
+            live.finish_prompt(&request, None).await;
         })
-        .expect("prompt published");
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].name.as_deref(), Some("shot.png"));
-    assert_eq!(sent[0].size, 6);
-    assert!(state
-        .session_service
-        .queued_prompts_snapshot(id)
-        .await
-        .is_empty());
+    })
+    .await;
 }
 
 /// A row whose bytes are gone cannot be sent as if it never had attachments.
 #[tokio::test]
+#[serial_test::serial]
 async fn send_now_keeps_a_row_whose_attachment_bytes_are_gone() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-expired";
-    let state = state_with_attachment_row(id, false).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-attachment-expired",
+            )
+            .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    id,
+                    "q1".into(),
+                    "caption".into(),
+                    vec![shot_ref()],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("caption", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { .. }
-    )));
-    assert_eq!(
-        state.session_service.queued_prompts_snapshot(id).await[0]
-            .attachments
-            .len(),
-        1
-    );
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("caption", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!published(&state, id, |e| matches!(
+                e,
+                Event::UserPromptSent { .. }
+            )));
+            assert_eq!(
+                state.session_service.queued_prompts_snapshot(id).await[0]
+                    .attachments
+                    .len(),
+                1
+            );
+        })
+    })
+    .await;
 }
 
 /// A refused send leaves the row for a retry instead of losing it.
@@ -1414,48 +1405,64 @@ async fn a_refused_send_now_keeps_the_queued_row() {
 
 /// A busy agent parks the send again: the same row stays, with its sender, and no copy is made.
 #[tokio::test]
+#[serial_test::serial]
 async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-busy";
-    let state = state_with_queued_plugin_row(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    state
-        .acp_supervisor
-        .publish_user_prompt_with_attachments(id, "the user's turn".into(), &[], None, false, None)
-        .await;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "queue-send-now-busy")
+                    .await;
+            let owned_id = live.id().to_owned();
+            let id = owned_id.as_str();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    id,
+                    "q1".into(),
+                    "PR #7 was merged".into(),
+                    vec![],
+                    None,
+                    Some("cron".into()),
+                )
+                .await
+                .unwrap();
+            let active = live.start_prompt("the user's turn").await;
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        send_now_req("PR #7 was merged", "q1"),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let queue = state.session_service.queued_prompts_snapshot(id).await;
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].id, "q1");
-    assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.to_string()),
+                send_now_req("PR #7 was merged", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let queue = state.session_service.queued_prompts_snapshot(id).await;
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].id, "q1");
+            assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+            assert_eq!(
+                live.native
+                    .requests()
+                    .iter()
+                    .filter(|method| *method == "session/prompt")
+                    .count(),
+                1
+            );
+            live.finish_prompt(&active, None).await;
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
-    use crate::acp::state::{
-        AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, NativeEventContext,
-        NativeEventSubject,
-    };
     use crate::process::worker_registry::{self, WorkerRecord};
-    for native_loss in [false, true] {
+    {
         let _home = crate::session::test_support::isolate_app_dir();
-        let id = if native_loss {
-            "sess-native-loss"
-        } else {
-            "sess-legacy-owner"
-        };
+        let id = "sess-legacy-owner";
         let (state, launches) = failing_start_state(id, false).await;
         {
             let mut rows = state.instances.write().await;
@@ -1481,7 +1488,6 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             .await
             .unwrap();
         state.instances.write().await[0].last_error = Some("retained operation diagnostic".into());
-        let row = state.instances.read().await[0].clone();
         let socket = worker_registry::socket_path_for(id).unwrap();
         let mut record = WorkerRecord::new(
             id.into(),
@@ -1497,33 +1503,13 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             Some("default".into()),
         )
         .with_generation(41);
-        record.control_protocol_version =
-            native_loss.then_some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
+        record.control_protocol_version = None;
         worker_registry::save(&record).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(
             crate::process::worker::control_socket_sibling(&socket),
         )
         .unwrap();
         listener.set_nonblocking(true).unwrap();
-        if native_loss {
-            let storage = crate::session::Storage::open_reference(&row.source_profile).unwrap();
-            let context = NativeEventContext::capture(&row, &storage).unwrap();
-            let mut event = Event::AcpConnectionUnavailable {
-                source: AcpConnectionSource::Native,
-                cause: AcpConnectionCause::StdoutEof,
-                phase: AcpConnectionPhase::Established,
-                native_subject: None,
-            };
-            event.set_native_subject(NativeEventSubject::channel(
-                context,
-                Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
-                    &record,
-                )),
-                &event,
-            ));
-            state.acp_event_store.record(id, 1, &event).unwrap();
-            state.acp_supervisor.hydrate_seqs([(id.into(), 1)]);
-        }
         let before = serde_json::to_value(&state.instances.read().await[0]).unwrap();
         let bytes = std::fs::read(worker_registry::record_path(id).unwrap()).unwrap();
         let queue_before =
@@ -1594,121 +1580,325 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             Event::UserPromptSent { .. }
         )));
     }
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let live =
+                crate::server::test_support::managed_control_session(scope, "refused-native-loss")
+                    .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            state
+                .session_service
+                .set_pending_initial_turn(&id, "existing continuation".into(), vec![])
+                .await;
+            state
+                .session_service
+                .enqueue_prompt(
+                    &id,
+                    "retained".into(),
+                    "existing queued intent".into(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .status
+                        == crate::session::Status::Idle
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual assignment reaches the status mirror before the refusal window");
+            let _pause = live.client.pause_drain().await;
+            let row = {
+                let mut rows = state.instances.write().await;
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.mark_idle_dormant();
+                row.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::days(3));
+                row.last_error = Some("retained operation diagnostic".into());
+                row.clone()
+            };
+            crate::session::Storage::open_unwatched(&row.source_profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows.iter_mut().find(|saved| saved.id == id).unwrap() = row.clone();
+                    Ok(())
+                })
+                .unwrap();
+            live.native.close_stdout().await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if state
+                        .session_service
+                        .prompt_native_unavailability(&id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual Native EOF is qualified before any gesture");
+            let before = serde_json::to_value(&row).unwrap();
+            let storage = crate::session::Storage::open_unwatched(&row.source_profile).unwrap();
+            let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+            let registry = crate::process::worker_registry::record_path(&id).unwrap();
+            let record_before = std::fs::read(&registry).ok();
+            let methods_before = live.native.requests();
+            let frontier = state.acp_event_store.highest_seq(&id);
+            for diff_comments in [false, true] {
+                let response = if diff_comments {
+                    acp_prompt_diff_comments(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        diff_req("must not wake"),
+                    )
+                    .await
+                    .into_response()
+                } else {
+                    acp_prompt(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        prompt_req("must not wake"),
+                    )
+                    .await
+                    .into_response()
+                };
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    serde_json::to_value(
+                        state
+                            .instances
+                            .read()
+                            .await
+                            .iter()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    before,
+                );
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
+                assert_eq!(std::fs::read(&registry).ok(), record_before);
+                assert_eq!(live.native.requests(), methods_before);
+            }
+            state
+                .session_service
+                .wake_dormant_for_queue_drain(&id)
+                .await;
+            state.session_service.drain_pending_initial_turn(&id).await;
+            assert_eq!(
+                serde_json::to_value(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                )
+                .unwrap(),
+                before,
+            );
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
+            assert_eq!(std::fs::read(&registry).ok(), record_before);
+            assert_eq!(live.native.requests(), methods_before);
+            assert!(!state
+                .acp_event_store
+                .replay_from(&id, frontier)
+                .unwrap()
+                .iter()
+                .any(|stored| matches!(
+                    stored.event.as_ref(),
+                    Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
+                )));
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_before_fold() {
-    let _home = crate::session::test_support::isolate_app_dir();
-    let id = "sess-current-native";
-    let state = structured_state(id, true).await;
-    let _commands = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    let row = state.instances.read().await[0].clone();
-    let storage = Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
-    let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
-    state
-        .acp_supervisor
-        .current_lease(id)
-        .unwrap()
-        .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-            store: storage,
-            generation: row.lifecycle_generation,
-            namespace: Some(state.profile_namespace.clone()),
-            native_scope: Some(scope),
-        }));
-    state.acp_supervisor.test_observe_native_ready(id).await;
-    assert!(state.acp_event_store.replay_from(id, 0).is_empty());
-    for _ in 0..2 {
-        let folded = state.session_service.fold_control_state(id).await;
-        assert!(folded.connection_ready && folded.connection_unavailable.is_none());
-        assert!(
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "current-native").await;
+            let session_id = live.id().to_owned();
+            let id = session_id.as_str();
+            let state = live.state.clone();
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .clone();
+            // Remove retained readiness history, not the physically established Current source.
+            state
+                .acp_event_store
+                .test_conn()
+                .execute("DELETE FROM acp_events WHERE session_id = ?1", [id])
+                .unwrap();
+            state.acp_control_cache.forget(id);
+            assert!(state.acp_event_store.replay_from(id, 0).unwrap().is_empty());
+            for _ in 0..2 {
+                let folded = state.session_service.fold_control_state(id).await.unwrap();
+                assert!(folded.connection_ready && folded.connection_unavailable.is_none());
+                assert!(
+                    state
+                        .session_service
+                        .native_control_projection(
+                            id,
+                            folded.native_availability,
+                            folded.native_control_seq
+                        )
+                        .await
+                        .ready
+                );
+            }
+            let current = state
+                .acp_supervisor
+                .current_native_availability(id)
+                .await
+                .unwrap();
+            let failure = Event::PromptRuntimeError {
+                message: "unpersisted diagnostic".into(),
+                evidence: None,
+                native_subject: None,
+            };
             state
                 .session_service
-                .native_control_projection(
+                .acp_control_cache
+                .record_failed_observation(
                     id,
-                    folded.native_availability,
-                    folded.native_control_seq
-                )
-                .await
-                .ready
-        );
-    }
-    let current = state
-        .acp_supervisor
-        .current_native_availability(id)
-        .await
-        .unwrap();
-    let failure = Event::PromptRuntimeError {
-        message: "unpersisted diagnostic".into(),
-        evidence: None,
-        native_subject: None,
-    };
-    state
-        .session_service
-        .acp_control_cache
-        .record_failed_observation(
-            id,
-            1,
-            Some(crate::acp::state::NativeEventSubject::channel(
-                current.context,
-                current.owner,
-                &failure,
-            )),
-        );
-    let failed = state.session_service.fold_control_state(id).await;
-    assert!(failed.connection_ready && !failed.turn_active);
-    assert_eq!(failed.sidebar_status(), crate::session::Status::Error);
-    assert!(
-        state.acp_event_store.replay_from(id, 0).is_empty(),
-        "failed-append semantics need no fabricated durable event or duplicate message"
-    );
-    let accepted = crate::acp::state::test_support::prompt("next explicit accepted intent");
-    state.acp_event_store.record(id, 2, &accepted).unwrap();
-    state
-        .session_service
-        .acp_control_cache
-        .apply_if_cached(id, 2, &accepted);
-    assert!(
-        state
-            .session_service
-            .fold_control_state(id)
+                    1,
+                    Some(crate::acp::state::NativeEventSubject::channel(
+                        current.scope.context,
+                        current.owner,
+                        &failure,
+                    )),
+                );
+            let failed = state.session_service.fold_control_state(id).await.unwrap();
+            assert!(failed.connection_ready && !failed.turn_active);
+            assert_eq!(failed.sidebar_status(), crate::session::Status::Error);
+            assert!(
+                state.acp_event_store.replay_from(id, 0).unwrap().is_empty(),
+                "failed-append semantics need no fabricated durable event or duplicate message"
+            );
+            let accepted = live.start_prompt("next explicit accepted intent").await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if state
+                        .session_service
+                        .fold_control_state(id)
+                        .await
+                        .unwrap()
+                        .turn_active
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .turn_active,
-        "the old append-error hint cannot override a newer accepted main turn"
-    );
-    let carried = state
-        .acp_supervisor
-        .current_native_availability(id)
-        .await
-        .unwrap();
-    carried.client.test_observe_native_loss();
-    let projection = state
-        .session_service
-        .acp_control_cache
-        .native_projection(
-            id,
-            None,
-            0,
-            Some((
-                row.source_profile.clone(),
-                row.created_at,
-                row.lifecycle_generation,
-            )),
-            Some(carried),
-        )
-        .unwrap();
-    assert!(!projection.ready);
-    assert_eq!(
-        projection.unavailable.unwrap().cause,
-        crate::acp::state::AcpConnectionCause::StdoutEof
-    );
-    let folded = state.session_service.fold_control_state(id).await;
-    assert!(
-        !folded.connection_ready && folded.connection_unavailable.is_some(),
-        "a warm fold cannot heal loss that is latched before its public event"
-    );
+            .expect("the old append-error hint cannot override a newer accepted main turn");
+            live.finish_prompt(&accepted, None).await;
+            let carried = state
+                .acp_supervisor
+                .current_native_availability(id)
+                .await
+                .unwrap();
+            let _pause = live.client.pause_drain().await;
+            live.native.close_stdout().await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if state
+                        .session_service
+                        .prompt_native_unavailability(id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical EOF is latched before the public drain event");
+            let projection = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match state.session_service.acp_control_cache.native_projection(
+                        id,
+                        None,
+                        0,
+                        Some((
+                            row.source_profile.clone(),
+                            row.created_at,
+                            row.lifecycle_generation,
+                        )),
+                        Some(carried.clone()),
+                    ) {
+                        Ok(projection) => {
+                            assert!(!projection.ready, "latched loss cannot become Ready");
+                            if projection.unavailable.is_some() {
+                                break projection;
+                            }
+                        }
+                        Err(wait) => assert!(wait.settle().await),
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the captured source qualifies its actual EOF after contention");
+            assert!(!projection.ready);
+            assert_eq!(
+                projection.unavailable.unwrap().cause,
+                crate::acp::state::AcpConnectionCause::StdoutEof
+            );
+            let folded = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let folded = state.session_service.fold_control_state(id).await.unwrap();
+                    assert!(
+                        !folded.connection_ready,
+                        "a warm fold cannot heal loss before its public event"
+                    );
+                    if folded.connection_unavailable.is_some() {
+                        break folded;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the warm fold qualifies the same actual EOF");
+            assert_eq!(
+                folded.connection_unavailable.unwrap().cause,
+                crate::acp::state::AcpConnectionCause::StdoutEof
+            );
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1792,100 +1982,120 @@ async fn readable_known_worker_down_keeps_explicit_queue_admission_without_nativ
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn native_loss_after_final_precheck_preserves_pending_and_named_queue_intent() {
-    for text in ["explicit next request", "/clear"] {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let id = "sess-late-native-loss";
-        let state = structured_state(id, true).await;
-        {
-            let mut rows = state.instances.write().await;
-            rows[0].acp_session_id = Some("retained-native-sid".into());
-            rows[0].pending_initial_turn = Some(crate::session::PendingInitialTurn {
-                text: "existing governed continuation".into(),
-                attachments: vec![],
-                synthesized: true,
-            });
-        }
-        seed_native_row(&state).await;
-        let commands = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
-            .await;
-        let row = state.instances.read().await[0].clone();
-        let storage =
-            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
-        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
-        state
-            .acp_supervisor
-            .current_lease(id)
-            .unwrap()
-            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-                store: storage,
-                generation: row.lifecycle_generation,
-                namespace: Some(state.profile_namespace.clone()),
-                native_scope: Some(scope),
-            }));
-        state.acp_supervisor.test_observe_native_ready(id).await;
-        state
-            .session_service
-            .enqueue_prompt(id, "retained".into(), text.into(), vec![], None, None)
-            .await
-            .unwrap();
-        let current = state
-            .acp_supervisor
-            .current_native_availability(id)
-            .await
-            .unwrap();
-        assert!(current.ready);
-        let (arrived, release) = state.session_service.arm_native_prompt_send_gate();
-        let request = tokio::spawn({
-            let state = state.clone();
-            async move {
-                acp_prompt(
-                    State(state),
-                    Path(id.into()),
-                    send_now_req(text, "retained"),
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            for text in ["explicit next request", "/clear"] {
+                let live = crate::server::test_support::managed_control_session(
+                    scope,
+                    if text == "/clear" {
+                        "late-loss-reset"
+                    } else {
+                        "late-loss-prompt"
+                    },
                 )
+                .await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                state
+                    .session_service
+                    .set_pending_initial_turn(&id, "existing governed continuation".into(), vec![])
+                    .await;
+                let methods_before = live.native.requests();
+                state
+                    .session_service
+                    .enqueue_prompt(&id, "retained".into(), text.into(), vec![], None, None)
+                    .await
+                    .unwrap();
+                let _current = state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .expect("the captured Native actor remains installed");
+                assert!(
+                    state
+                        .session_service
+                        .native_control_projection(&id, None, 0)
+                        .await
+                        .ready
+                );
+                let (arrived, release) = state.session_service.arm_native_prompt_send_gate();
+                let request = tokio::spawn({
+                    let state = state.clone();
+                    let id = id.clone();
+                    async move {
+                        acp_prompt(State(state), Path(id), send_now_req(text, "retained"))
+                            .await
+                            .into_response()
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), arrived)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let _pause = live.client.pause_drain().await;
+                live.native.close_stdout().await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if state
+                            .session_service
+                            .prompt_native_unavailability(&id)
+                            .await
+                            .unwrap()
+                            .is_some()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
                 .await
-                .into_response()
+                .expect("physical EOF crosses the final precheck before forwarding");
+                release.send(()).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(5), request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{text}");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["disposition"], "unavailable");
+                assert_eq!(body["unavailability"]["cause"], "stdout_eof");
+                assert_eq!(
+                    persisted_pending_turn(&state, &id).await.unwrap().text,
+                    "existing governed continuation"
+                );
+                assert_eq!(
+                    state
+                        .session_service
+                        .queued_prompts_snapshot(&id)
+                        .await
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    live.native.requests(),
+                    methods_before,
+                    "no native prompt/reset after loss"
+                );
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .acp_session_id
+                        .as_deref(),
+                    Some(live.sid.as_str())
+                );
             }
-        });
-        tokio::time::timeout(Duration::from_secs(5), arrived)
-            .await
-            .unwrap()
-            .unwrap();
-        current.client.test_observe_native_loss();
-        release.send(()).unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(5), request)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT, "{text}");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["disposition"], "unavailable");
-        assert_eq!(body["unavailability"]["cause"], "stdout_eof");
-        assert_eq!(
-            persisted_pending_turn(&state, id).await.unwrap().text,
-            "existing governed continuation"
-        );
-        assert_eq!(
-            state
-                .session_service
-                .queued_prompts_snapshot(id)
-                .await
-                .len(),
-            1
-        );
-        assert!(
-            commands.lock().unwrap().is_empty(),
-            "no native prompt/reset after loss"
-        );
-        assert_eq!(
-            state.instances.read().await[0].acp_session_id.as_deref(),
-            Some("retained-native-sid")
-        );
-    }
+        })
+    })
+    .await;
 }

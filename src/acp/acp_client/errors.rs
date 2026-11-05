@@ -37,6 +37,8 @@ pub enum AcpError {
     NotRunning,
     #[error("ACP connection is unavailable ({:?}, {:?}, {:?})", .0.source, .0.cause, .0.phase)]
     ConnectionUnavailable(crate::acp::state::AcpConnectionUnavailability),
+    #[error(transparent)]
+    Establishment(#[from] crate::acp::establishment::EstablishmentRefusal),
     #[error("{0}; the existing owner has been preserved")]
     RetainedRuntimeUnavailable(Box<crate::process::worker_registry::ControlAdmissionRefusal>),
     #[error("no pending approval with that nonce")]
@@ -47,8 +49,7 @@ pub enum AcpError {
     /// resubmit rather than the question aborting (#2100).
     #[error("submitted answer is invalid: {0}")]
     InvalidAnswer(String),
-    /// A driven `session/new` reset failed (#2979); the conversation keeps
-    /// its prior context.
+    /// The reset did not establish a durably confirmed replacement.
     #[error("conversation reset failed: {0}")]
     ResetFailed(String),
 }

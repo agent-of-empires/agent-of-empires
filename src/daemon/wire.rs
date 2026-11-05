@@ -1140,6 +1140,9 @@ pub struct SessionResponse {
     /// sidebar badge clears when a resume lands with no tab open (#3514).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    /// Whether the durable quota history is attestable; false is not an absent park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_known: Option<bool>,
     /// Whether `[acp] rate_limit_auto_resume` is on for this session's
     /// profile, so the rate-limit banner can say whether the park ends by
     /// itself. Set by the list handler; omitted by single-session responses,

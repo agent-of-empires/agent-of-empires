@@ -11,6 +11,8 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     let mut row = Instance::new("purge pending handshake", "/tmp");
     row.view = crate::session::View::Structured;
     row.source_profile = "default".into();
+    row.acp_session_id = Some("native-purge-id".into());
+    row.resume_intent = crate::session::ResumeIntent::Use("native-purge-id".into());
     crate::server::test_support::seed_instances_on_disk_for_test(
         &row.source_profile,
         vec![row.clone()],
@@ -111,10 +113,43 @@ async fn permanent_delete_reaps_a_refused_owned_constructor_before_removing_its_
         let (reservation, mut runner) =
             refused_owned_constructor(&state.acp_supervisor, &row).await;
         let lease = reservation.lease().clone();
+        let retirement = state.acp_supervisor.capture_retirement(&row.id).unwrap();
+        assert_eq!(retirement.identity, Some(runner.identity));
+        assert_eq!(retirement.lease.as_ref(), Some(&lease));
+        let original_wait = lease.test_child_wait_completed();
+        let journal_path = crate::session::get_app_dir()
+            .unwrap()
+            .join(crate::session::purge_owners::FILE_NAME);
+        let pending_owner = || {
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+            journal["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|owner| owner["session_id"] == row.id)
+                .cloned()
+        };
         let mut reservation = Some(reservation);
         let mut deleting = None;
         let checked = std::panic::AssertUnwindSafe(async {
             assert!(!lease.constructor_finished());
+            assert!(!lease.original_constructor_completed());
+            assert_eq!(*original_wait.borrow(), None);
+            assert_eq!(
+                crate::process::process_birth_identity(runner.identity.pid)
+                    .unwrap()
+                    .map(|birth| birth.fingerprint()),
+                runner.identity.birth_fingerprint,
+                "the held refusal still belongs to the exact born original"
+            );
+            assert!(
+                lease
+                    .retirement()
+                    .establishment_projection()
+                    .is_some_and(|projection| projection.receipt_snapshot().is_none()),
+                "incompatible Hello must never manufacture a Native receipt"
+            );
             assert!(control.is_alive(runner.identity));
             assert!(
                 control.signals().is_empty(),
@@ -152,6 +187,38 @@ async fn permanent_delete_reaps_a_refused_owned_constructor_before_removing_its_
                 .await
                 .expect("permanent deletion requests Stop from the original constructor");
                 assert!(!lease.constructor_finished());
+                assert!(!lease.original_constructor_completed());
+                assert_eq!(*original_wait.borrow(), None);
+                assert!(control.is_alive(runner.identity));
+                assert!(control.signals().is_empty());
+                let record = crate::process::worker_registry::load_strict(&row.id)
+                    .unwrap()
+                    .expect("pending producer retains its original registry route");
+                assert!(runner.identity.owns_record(&record));
+                assert!(scratch.join("retained-until-stop").exists());
+                let owner = pending_owner().expect("committed purge retains durable owner debt");
+                assert!(matches!(
+                    serde_json::from_value::<crate::session::purge_owners::RunnerCapture>(
+                        owner["runner"].clone()
+                    )
+                    .unwrap(),
+                    crate::session::purge_owners::RunnerCapture::Captured {
+                        pid,
+                        generation,
+                        birth_fingerprint,
+                        ..
+                    } if pid == runner.identity.pid
+                        && generation == runner.identity.generation
+                        && birth_fingerprint == runner.identity.birth_fingerprint
+                ));
+                assert!(matches!(
+                    state.acp_supervisor.acknowledge_retirement(&retirement),
+                    Err(crate::acp::supervisor::SupervisorError::TeardownPending(_))
+                ));
+                assert!(matches!(
+                    state.acp_supervisor.forget_session(&row.id),
+                    Err(crate::acp::supervisor::SupervisorError::TeardownPending(_))
+                ));
                 assert!(
                     !deleting.as_ref().unwrap().is_finished(),
                     "Stop cannot acknowledge before the producer's Drop"
@@ -175,6 +242,19 @@ async fn permanent_delete_reaps_a_refused_owned_constructor_before_removing_its_
             assert_eq!(body["status"], "deleted", "{body}");
             assert_eq!(body["cleanup_errors"], serde_json::json!([]), "{body}");
             assert!(!control.is_alive(runner.identity));
+            assert_eq!(*original_wait.borrow(), Some(true));
+            assert!(lease.original_constructor_completed());
+            assert_ne!(
+                crate::process::process_birth_identity(runner.identity.pid)
+                    .unwrap()
+                    .map(|birth| birth.fingerprint()),
+                runner.identity.birth_fingerprint,
+                "the original child was reaped, not replaced by an absent registry route"
+            );
+            assert!(
+                pending_owner().is_none(),
+                "successful purge settles durable owner debt"
+            );
             assert!(!control.signals().is_empty());
             assert!(control
                 .signals()
@@ -292,7 +372,12 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
         let sentinel = crate::acp::Event::Stopped {
             reason: "replacement transcript sentinel".into(),
         };
-        state.acp_event_store.record(&row.id, 17, &sentinel)?;
+        state.acp_event_store.record(
+            &row.id,
+            17,
+            &sentinel,
+            &crate::acp::event_sender::EventMetadata::history(),
+        )?;
         let replacement_commands = if recovered_with_replacement_worker {
             Some(
                 state
@@ -349,8 +434,8 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
             17,
             "original purge erased replacement event counter"
         );
-        assert!(state.acp_event_store.replay_from(&row.id, 0).iter().any(|(_, event)| {
-        matches!(event, crate::acp::Event::Stopped { reason } if reason == "replacement transcript sentinel")
+        assert!(state.acp_event_store.replay_from(&row.id, 0).expect("read retained events").iter().any(|stored| {
+                    matches!(stored.event.as_ref(), crate::acp::Event::Stopped { reason } if reason == "replacement transcript sentinel")
     }));
         assert_eq!(storage.load()?[0].title, replacement.title);
         assert!(scratch.exists());
@@ -482,6 +567,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             .await?;
         let producer_lease = producer.lease().clone();
         producer_lease.set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+            establishment: None,
             store: Arc::new(Storage::open_unwatched(&row.source_profile)?),
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
@@ -548,6 +634,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             newer
                 .lease()
                 .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                    establishment: None,
                     store: storage.clone(),
                     generation: newer_row.lifecycle_generation,
                     namespace: Some(state.profile_namespace.clone()),
@@ -567,7 +654,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 !newer.lease().cancellation().is_cancelled(),
                 "a frozen old request cannot cancel an unborn replacement"
             );
-            committed.complete_retirement(&retirement)?;
+            committed = committed.complete_retirement(retirement.clone()).await?;
             assert!(
                 state
                     .acp_supervisor
@@ -630,7 +717,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 let settled =
                     tokio::time::timeout(std::time::Duration::from_secs(10), finishing).await?;
                 settled??;
-                committed.complete_retirement(&retirement)?;
+                committed = committed.complete_retirement(retirement.clone()).await?;
                 if window == 2 {
                     use crate::acp::runner_lifecycle::{
                         LifecycleTable, PrimeOwnership, ResumeKind,
@@ -724,7 +811,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 "completed construction remains admission-fenced before durable acknowledgement"
             );
         }
-        committed.complete_retirement(&retirement)?;
+        committed = committed.complete_retirement(retirement.clone()).await?;
         state.acp_supervisor.acknowledge_retirement(&retirement)?;
         let result = tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
         assert!(result.success, "{result:?}");
@@ -783,6 +870,8 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         row.scratch = true;
         row.view = crate::session::View::Structured;
         row.source_profile = "default".into();
+        row.acp_session_id = Some("native-purge-admission".into());
+        row.resume_intent = crate::session::ResumeIntent::Use("native-purge-admission".into());
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         let control = Arc::new(FakeProcessControl::default());
         control.alive(pid);
@@ -912,7 +1001,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
             ),
             "physical retirement must retain the journal fence until durable acknowledgement (running={running}, recovered={recovered})"
         );
-        committed.complete_retirement(&retirement)?;
+        committed = committed.complete_retirement(retirement.clone()).await?;
         state.acp_supervisor.acknowledge_retirement(&retirement)?;
         let result = tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
         assert!(result.success, "{result:?}");
@@ -1662,6 +1751,8 @@ async fn structured_stop_start_receipts_include_the_committed_peer_bundle() -> a
     row.source_profile = "receipt".into();
     row.view = crate::session::View::Structured;
     row.status = Status::Idle;
+    row.acp_session_id = Some("retained-lifecycle-receipt".into());
+    row.resume_intent = crate::session::ResumeIntent::Use("retained-lifecycle-receipt".into());
     let id = row.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
 
@@ -5704,6 +5795,8 @@ async fn start_session_notifies_plugins() {
     inst.view = crate::session::View::Structured;
     inst.source_profile = "default".to_string();
     inst.status = Status::Stopped;
+    inst.acp_session_id = Some("retained-start-notify".into());
+    inst.resume_intent = crate::session::ResumeIntent::Use("retained-start-notify".into());
     let id = inst.id.clone();
     Storage::new_unwatched("default")
         .unwrap()
@@ -6326,6 +6419,7 @@ mod open_file {
                 "raw",
                 1,
                 &crate::acp::state::Event::ToolCallStarted { tool_call },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
 
@@ -8919,20 +9013,28 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     let nonce = approval.nonce.0.clone();
     state
         .acp_event_store
-        .record(&id, 1, &Event::ApprovalRequested { approval })
+        .record(
+            &id,
+            1,
+            &Event::ApprovalRequested { approval },
+            &crate::server::test_support::sql_projection_metadata(),
+        )
         .expect("record pending approval");
 
-    // A durable nonce without a live worker cannot be resolved.
-    let workers = state.acp_supervisor.worker_states_snapshot().await;
-    let response = project_sessions(&state, &workers).await;
+    // Pure snapshot DATA only. Neither map installs a worker nor grants approval I/O.
+    let mut workers = std::collections::HashMap::new();
+    let response = project_sessions(&state, &workers)
+        .await
+        .expect("project canonical sessions");
     assert!(
         response[0].pending_approvals.is_empty(),
         "a pending approval on a non-running worker must not be projected"
     );
 
-    state.acp_supervisor.test_insert_worker(&id).await;
-    let workers = state.acp_supervisor.worker_states_snapshot().await;
-    let response = project_sessions(&state, &workers).await;
+    workers.insert(id.clone(), (crate::daemon::AcpWorkerState::Running, None));
+    let response = project_sessions(&state, &workers)
+        .await
+        .expect("project canonical sessions");
     assert_eq!(
         response[0].pending_approvals,
         vec![PendingApproval {
@@ -9465,8 +9567,14 @@ async fn scratch_create_resolves_profile_before_publication_and_purge() {
             state
                 .acp_event_store
                 .replay_from(id, 0)
+                .expect("read retained events")
                 .iter()
-                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+                .any(|stored| {
+                    matches!(
+                        stored.event.as_ref(),
+                        crate::acp::Event::AgentStartupError { .. }
+                    )
+                })
         })
         .await;
 
@@ -9741,6 +9849,10 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     let (status, failed) = post_create(&state, body("oldest")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
     assert_eq!(hook_runs(), 1);
+    assert!(
+        support::load_instances_from_disk_for_test("test").is_empty(),
+        "failed creation rollback must leave readable metadata without its reserved row"
+    );
 
     // More live failures than the map holds.
     for n in 0..5000 {
@@ -10012,6 +10124,10 @@ async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
     let (status, code, body_json) = create.await.unwrap();
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body_json}");
     assert_eq!(code.as_deref(), Some("creation_cancelled"), "{body_json}");
+    assert!(
+        support::load_instances_from_disk_for_test("test").is_empty(),
+        "cancelled creation rollback must remove its row before the key can be retried"
+    );
 
     let (again, session) = post_create(&state, body).await;
     assert_eq!(again, axum::http::StatusCode::CREATED, "{again} {session}");
@@ -10844,6 +10960,9 @@ async fn recreate_container_removes_the_container_before_the_agent_restarts() ->
             row.view = crate::session::View::Structured;
             row.agent_name = Some("claude".into());
             row.mark_idle_dormant();
+            row.acp_session_id = Some("retained-recreate-container".into());
+            row.resume_intent =
+                crate::session::ResumeIntent::Use("retained-recreate-container".into());
         }
         if sandboxed {
             row.sandbox_info = Some(crate::session::SandboxInfo {

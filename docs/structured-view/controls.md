@@ -31,6 +31,8 @@ destructive_require_double_confirm = true
 
 The card clears as soon as your decision is accepted, and resolving one that already settled (a concurrent decision, or the watchdog) clears it quietly instead of erroring. An expired approval sends the agent a structured cancellation, so it usually asks again.
 
+An approval or question needed to finish agent initialization can be answerable before the main input is ready. Only that live request is enabled; answering it does not enable prompts, model changes or other controls. It remains answerable if initialization finishes first, but disconnecting, replacing or stopping its agent revokes the old request.
+
 Some agents put a **question** in the permission options rather than an allow/deny vocabulary (pi's `ask_user_question` sends one `allow_once` option per answer). The daemon spots that (every option carries the same kind, so there is no allow/deny meaning to read) and renders the labels as one button each. **Dismiss** cancels the request rather than answering it, so the agent is never handed an answer you did not pick, and a destructive tool keeps its hold-to-confirm on every answer that would run it. Lists mixing kinds stay on the Allow / Always / Deny buttons.
 
 ### Approving from the TUI home list
@@ -65,3 +67,11 @@ The chip keeps the previous value until the adapter confirms, so it never snaps 
 ## Session persistence
 
 Workers and transcripts outlive an `aoe serve` restart, a closed laptop, and a reconnect: in-flight turns continue and the next daemon reattaches. To actually terminate a worker, use `aoe acp stop <session>` (graceful) or `aoe acp kill` (force). For agents that support session restoration (Claude today) the model keeps its context across restarts too, so a follow-up like "what did we just decide?" still works. The mechanics are in [Structured View Internals](../development/internals/structured-view.md#worker-lifecycle).
+
+`/clear` is an explicit request for a new conversation, not an automatic repair for a provider error. Active work, in-flight model/mode/config changes, and pending approval or question decisions must settle before cutover. Transcript history is retained.
+
+The dashboard folds earlier history at the confirmed boundary. Messages and a plan already produced by the new conversation before confirmation remain visible after that boundary, once; expanding earlier history does not duplicate them. The TUI and CLI retain the transcript history.
+
+A caller timeout does not cancel an already-issued native reset or stop publication of a default-option result still in flight. The reset may still complete or already be applied. Inspect the current session state before another explicit action; do not blindly resend the reset or replay a prompt.
+
+If retained history cannot establish control of an interrupted turn, automatic continuation and quota retries stay held. A verified read-only reconnect preserves the selected Native conversation and permits a distinct new input after readiness; it does not authorize redelivery of an old prompt or an implicit fresh conversation.

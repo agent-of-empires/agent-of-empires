@@ -47,7 +47,9 @@ fn extract_path_from_args_preview(args_preview: &str) -> Option<String> {
 /// the initial call with an empty `raw_input` and fills the path in on a later
 /// update. Paths are collected exactly as the agent emitted them, so entries are
 /// directly usable as absolute allow-set keys.
-pub fn collect_touched_paths(events: &[(u64, Event)]) -> HashSet<PathBuf> {
+pub fn collect_touched_paths<'a>(
+    events: impl IntoIterator<Item = (u64, &'a Event)>,
+) -> HashSet<PathBuf> {
     let mut out = HashSet::new();
     let mut add = |s: &str| {
         if !s.is_empty() {
@@ -122,7 +124,7 @@ pub struct Confined {
 /// beneath the returned `root`, which they treat as a capability boundary.
 pub fn confine_path(
     project_roots: &[PathBuf],
-    touched: impl FnOnce() -> HashSet<PathBuf>,
+    touched: impl FnOnce() -> Result<HashSet<PathBuf>, (StatusCode, &'static str)>,
     requested: &Path,
 ) -> Result<Confined, (StatusCode, &'static str)> {
     if requested.as_os_str().is_empty() {
@@ -158,7 +160,7 @@ pub fn confine_path(
     // Outside every project root, so fall back to provenance. Compare canonical
     // forms so a symlinked-but-touched path still matches, and open it beneath
     // its own parent.
-    let touched_hit = touched()
+    let touched_hit = touched()?
         .iter()
         .any(|t| t.canonicalize().map(|ct| ct == canonical).unwrap_or(false));
     if touched_hit {
@@ -294,7 +296,7 @@ mod tests {
 
     #[test]
     fn collects_paths_from_all_channels() {
-        let events = vec![
+        let events = [
             (
                 1u64,
                 Event::ToolCallStarted {
@@ -326,8 +328,7 @@ mod tests {
                     }]),
                 },
             ),
-            // A 16 KB-truncated args_preview may be invalid JSON; that must not
-            // panic or fabricate a path, and the diffs fallback still lands.
+            // Truncated JSON still falls back to recorded diffs.
             (
                 4,
                 Event::ToolCallStarted {
@@ -335,7 +336,7 @@ mod tests {
                 },
             ),
         ];
-        let set = collect_touched_paths(&events);
+        let set = collect_touched_paths(events.iter().map(|(seq, event)| (*seq, event)));
         let expected: HashSet<PathBuf> = [
             "/tmp/plan.md",
             "/tmp/patched.rs",
@@ -366,7 +367,7 @@ mod tests {
         touched: &HashSet<PathBuf>,
         requested: &Path,
     ) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
-        let confined = confine_path(roots, || touched.clone(), requested)?;
+        let confined = confine_path(roots, || Ok(touched.clone()), requested)?;
         read_confined(&confined, 5_000_000)
     }
 
@@ -465,7 +466,7 @@ mod tests {
         assert!(is_binary && content.is_empty());
 
         fs::write(root.join("big.md"), "abcdef").unwrap();
-        let confined = confine_path(&roots, || touched.clone(), Path::new("big.md")).unwrap();
+        let confined = confine_path(&roots, || Ok(touched.clone()), Path::new("big.md")).unwrap();
         let (content, _, truncated) = read_confined(&confined, 3).unwrap();
         assert!(truncated && content.len() == 3);
 
@@ -485,7 +486,7 @@ mod tests {
         fs::write(root.join("b.bin"), bytes).unwrap();
         let confined = confine_path(
             std::slice::from_ref(&root),
-            HashSet::new,
+            || Ok(HashSet::new()),
             Path::new("b.bin"),
         )
         .unwrap();
@@ -505,8 +506,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         nix::unistd::mkfifo(&root.join("pipe"), nix::sys::stat::Mode::S_IRWXU).unwrap();
-        let confined =
-            confine_path(std::slice::from_ref(&root), HashSet::new, Path::new("pipe")).unwrap();
+        let confined = confine_path(
+            std::slice::from_ref(&root),
+            || Ok(HashSet::new()),
+            Path::new("pipe"),
+        )
+        .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -571,7 +576,7 @@ mod tests {
             std::slice::from_ref(&root),
             || {
                 called = true;
-                HashSet::new()
+                Ok(HashSet::new())
             },
             Path::new("a.md"),
         )

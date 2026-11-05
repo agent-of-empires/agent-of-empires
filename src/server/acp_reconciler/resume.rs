@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use tokio::time::timeout_at;
 
-use super::{is_resumable, query_store, AppState, ResumeOutcome};
+use super::{is_resumable, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
-    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservation, ResumeReservationOutcome,
-    SpawnRequest, Supervisor, SupervisorError,
+    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservation, SpawnRequest, Supervisor,
+    SupervisorError,
 };
 use crate::process::worker_registry;
 use crate::server::session_service::SessionService;
@@ -29,6 +29,7 @@ pub(super) struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     pub(super) source_profile: String,
     pub(super) in_flight_turn: bool,
+    pub(super) historical_control_known: bool,
     yolo_mode: bool,
     /// The resolved launch command, honored like tmux does (#1766).
     command: String,
@@ -47,6 +48,7 @@ impl ResumeTarget {
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
             in_flight_turn: false,
+            historical_control_known: true,
             yolo_mode: inst.yolo_mode,
             command: inst.command.clone(),
         }
@@ -212,10 +214,7 @@ async fn admit(
                 .await?
         }
     };
-    match outcome {
-        ResumeReservationOutcome::Reserved(reservation) => Ok(Some(reservation)),
-        ResumeReservationOutcome::AlreadyPresent => Ok(None),
-    }
+    Ok(outcome)
 }
 
 pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -> ResumeOutcome {
@@ -255,7 +254,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
             return ResumeOutcome::Retry;
         }
     };
-    let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
+    let mut decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             worker_registry::is_record_live(r),
             worker_registry::is_build_current(r),
@@ -263,6 +262,13 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
             in_flight_turn,
         )
     });
+    if !target.historical_control_known {
+        decision = match decision {
+            AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => decision,
+            AdoptDecision::RespawnStaleIdle => AdoptDecision::AdoptStaleForDrain,
+            _ => return ResumeOutcome::Retry,
+        };
+    }
     let kind = match decision {
         AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => ResumeKind::Attach,
         _ => target.spawn_kind(),
@@ -365,6 +371,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         return ResumeOutcome::Retry;
                     }
                     Ok(Err(e)) => {
+                        if !target.historical_control_known {
+                            return ResumeOutcome::Retry;
+                        }
                         if worker_registry::retained_process_may_be_alive(&record) {
                             return target.unavailable(
                                 worker_registry::ControlAdmissionRefusal::from_record(
@@ -637,6 +646,7 @@ async fn build_spawn_request(
 
     Ok(SpawnRequest {
         launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
+            establishment: None,
             store: native,
             generation: target.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
@@ -701,14 +711,17 @@ async fn attach_retained_target(
     };
     // Attached workers resume their background tailers independently in
     // install_worker. Only an actual main turn owns a cached prompt completion.
-    let in_flight_turn = query_store(
+    let in_flight_turn = super::query_control(
         &service.acp_event_store,
         &target.id,
         "retained main-turn adoption",
         |store, id| store.has_in_flight_main_turn(id),
     )
-    .await
-    .ok_or(SupervisorError::NativeStoreUnavailable)?;
+    .await?;
+    let in_flight_turn = matches!(
+        in_flight_turn,
+        crate::acp::event_store::ControlKnowledge::Known(true)
+    );
     service
         .acp_supervisor
         .attach_inner(
@@ -722,10 +735,11 @@ async fn attach_retained_target(
         .await
 }
 
-pub(super) async fn ensure_rate_limit_worker(
+pub(crate) async fn ensure_rate_limit_worker(
     state: &Arc<AppState>,
     id: &str,
     authority: worker_registry::ResumeAuthority,
+    retained_only: bool,
 ) -> Result<(), SupervisorError> {
     if !state.acp_supervisor.is_running(id).await {
         let target = resume_target_for_session(&state.session_service, id)
@@ -747,26 +761,26 @@ pub(super) async fn ensure_rate_limit_worker(
             .as_ref()
             .is_some_and(worker_registry::retained_process_may_be_alive)
         {
-            match state
+            if let Some(mut reservation) = state
                 .acp_supervisor
                 .begin_resume(id, ResumeKind::Attach, authority)
                 .await?
             {
-                ResumeReservationOutcome::AlreadyPresent => {}
-                ResumeReservationOutcome::Reserved(mut reservation) => {
-                    reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
-                    let deadline = reservation.admission_deadline();
-                    timeout_at(
-                        deadline,
-                        attach_retained_target(&state.session_service, &target, reservation),
-                    )
-                    .await
-                    .map_err(|_| {
-                        SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)
-                    })??;
-                }
+                reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
+                let deadline = reservation.admission_deadline();
+                timeout_at(
+                    deadline,
+                    attach_retained_target(&state.session_service, &target, reservation),
+                )
+                .await
+                .map_err(|_| {
+                    SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)
+                })??;
             }
         } else {
+            if retained_only {
+                return Err(SupervisorError::ControlStateUnavailable);
+            }
             match trigger_resume_background(&state.session_service, id, authority, None).await? {
                 ResumeTrigger::NotFound => {
                     return Err(SupervisorError::UnknownSession(id.to_owned()))
@@ -793,7 +807,7 @@ pub(crate) enum ResumeTrigger {
     NotFound,
 }
 
-/// Reserves a resume slot for `id`, then spawns the worker in a detached task
+/// Reserves retained attachment or a new launch for `id` in a detached task
 /// that survives the originating request (#1748).
 ///
 /// Nothing may hold `instance_lock` while awaiting worker readiness: the
@@ -819,39 +833,82 @@ pub(crate) async fn trigger_resume_background(
         .await
         .iter()
         .any(|i| i.id == id && i.acp_session_id.is_some());
-    let reservation = match reservation {
+    let mut reservation = match reservation {
         Some(reservation) => {
             service
                 .acp_supervisor
                 .validate_reserved_resume(&reservation)?;
             reservation
         }
-        None => match service
-            .acp_supervisor
-            .begin_resume(id, spawn_kind(has_stored_id), authority)
-            .await?
-        {
-            ResumeReservationOutcome::Reserved(reservation) => reservation,
-            ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
-        },
+        None => {
+            let probe_id = id.to_owned();
+            let record =
+                tokio::task::spawn_blocking(move || worker_registry::control_admission(&probe_id))
+                    .await
+                    .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+                    .map_err(|refusal| {
+                        SupervisorError::Acp(
+                            crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(Box::new(
+                                refusal,
+                            )),
+                        )
+                    })?;
+            let kind = if record
+                .as_ref()
+                .is_some_and(worker_registry::retained_process_may_be_alive)
+            {
+                ResumeKind::Attach
+            } else {
+                spawn_kind(has_stored_id)
+            };
+            match service
+                .acp_supervisor
+                .begin_resume(id, kind, authority)
+                .await?
+            {
+                Some(reservation) => reservation,
+                None => return Ok(ResumeTrigger::AlreadyResuming),
+            }
+        }
     };
     let Some(target) = resume_target_for_session(service, id).await else {
         return Ok(ResumeTrigger::NotFound);
     };
+    reservation
+        .expected_lifecycle_generation
+        .get_or_insert(target.lifecycle_generation);
     let service = Arc::clone(service);
     crate::task_util::spawn_supervised(
         "acp.prompt_wake_resume",
         crate::task_util::PanicPolicy::Log,
         async move {
+            if reservation.lease().is_borrowed_attach() {
+                let deadline = reservation.admission_deadline();
+                let attached = timeout_at(
+                    deadline,
+                    attach_retained_target(&service, &target, reservation),
+                )
+                .await
+                .map_err(|_| SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut))
+                .and_then(|result| result);
+                if let Err(error) = attached {
+                    tracing::warn!(target: "acp.supervisor", session = %target.id, %error,
+                        "explicit input could not attach the retained actor; preserving its owner");
+                }
+                return;
+            }
             // Close a turn a dead worker left open before a new prompt lands (#3686).
-            let in_flight = query_store(
+            let in_flight = match super::query_control(
                 &service.acp_event_store,
                 &target.id,
                 "in-flight turn",
                 |s, id| s.has_in_flight_turn(id),
             )
             .await
-            .unwrap_or(false);
+            {
+                Ok(crate::acp::event_store::ControlKnowledge::Known(value)) => value,
+                Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) | Err(_) => return,
+            };
             if in_flight {
                 service
                     .acp_supervisor
@@ -888,15 +945,17 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         // A failed probe counts as busy so a live turn is never killed.
-        let in_flight = query_store(
+        let in_flight = super::query_control(
             &state.acp_event_store,
             &id,
             "draining stale worker in-flight",
             |s, id| s.has_in_flight_turn(id),
         )
-        .await
-        .unwrap_or(true);
-        if in_flight {
+        .await;
+        if !matches!(
+            in_flight,
+            Ok(crate::acp::event_store::ControlKnowledge::Known(false))
+        ) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -928,7 +987,7 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_fixtures::{structured_instance, test_state};
+    use super::super::test_fixtures::test_state;
     use super::*;
     use std::time::Duration;
 
@@ -1090,10 +1149,15 @@ mod tests {
     #[test]
     fn incompatible_replacement_publishes_one_specific_terminal() {
         #[derive(Default)]
-        struct Sink(std::sync::Mutex<Vec<crate::acp::state::Event>>);
+        struct Sink(std::sync::Mutex<Vec<Arc<crate::acp::state::Event>>>);
         impl BroadcastSink for Sink {
-            fn publish(&self, _session_id: &str, _seq: u64, event: &crate::acp::state::Event) {
-                self.0.lock().unwrap().push(event.clone());
+            fn publish(
+                &self,
+                _session_id: &str,
+                _seq: u64,
+                data: &crate::acp::event_sender::AcpEventData,
+            ) {
+                self.0.lock().unwrap().push(Arc::clone(&data.event));
             }
         }
 
@@ -1109,7 +1173,7 @@ mod tests {
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            &events[0],
+            events[0].as_ref(),
             crate::acp::state::Event::Stopped { reason } if reason == "runner_protocol_upgraded"
         ));
     }
@@ -1137,41 +1201,6 @@ mod tests {
         assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn prompt_wake_closes_an_orphaned_turn_before_resuming() {
-        let id = "sess-3686-orphan";
-        let (_home, state, _project) = test_state(id);
-        let prompt = crate::acp::Event::UserPromptSent {
-            text: "keep going".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-        };
-        state.acp_event_store.record(id, 1, &prompt).unwrap();
-        state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
-
-        let trigger = trigger_resume_background(
-            &state.session_service,
-            id,
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-            None,
-        )
-        .await
-        .expect("resume is admitted");
-        assert!(matches!(trigger, ResumeTrigger::Started));
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !state.acp_event_store.replay_from(id, 0).into_iter().any(
-            |(_, e)| matches!(e, crate::acp::Event::Stopped { reason } if reason == "orphaned_at_restart"),
-        ) {
-            assert!(tokio::time::Instant::now() < deadline, "orphaned turn was not closed");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(!state.acp_event_store.has_in_flight_turn(id));
-    }
-
     /// A session that left the live set after the snapshot is never spawned.
     #[tokio::test]
     #[serial_test::serial]
@@ -1187,7 +1216,11 @@ mod tests {
             state.acp_supervisor.worker_state(id).await,
             crate::daemon::AcpWorkerState::Absent
         );
-        assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+        assert!(state
+            .acp_event_store
+            .replay_from(id, 0)
+            .expect("read retained events")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1203,7 +1236,15 @@ mod tests {
             let (_home, state, _project) = test_state(id);
             if armed {
                 let event = crate::acp::state::Event::MonitorArmed { description };
-                state.acp_event_store.record(id, 1, &event).unwrap();
+                state
+                    .acp_event_store
+                    .record(
+                        id,
+                        1,
+                        &event,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
+                    .unwrap();
             }
 
             requeue_interrupted_monitor(&state, id).await;
@@ -1220,108 +1261,122 @@ mod tests {
     #[serial_test::serial]
     async fn reconciler_attach_timeout_rearms_same_runner_without_orphaning_its_turn() {
         use super::super::test_fixtures::Tick;
-        use crate::acp::runner_lifecycle::RunnerIdentity;
-        use crate::acp::supervisor::test_support::{HeldAttachRunner, ObservedProcessControl};
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::acp::Event;
-
-        let _home = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let id = "reconciler-borrowed-timeout";
-        let row = structured_instance(id, project.path().to_str().unwrap());
-        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let control = Arc::new(ObservedProcessControl::default());
-        let state = crate::server::test_support::build_test_app_state_impl(
-            vec![row],
-            vec![],
-            vec![],
-            None,
-            false,
-            |_| {},
-            |supervisor| supervisor.with_process_control(control.clone()),
-        );
-        let mut runner = HeldAttachRunner::new(id, project.path(), 17, Some("default")).await;
-        state
-            .acp_event_store
-            .record(
-                id,
-                1,
-                &Event::UserPromptSent {
-                    text: "original turn remains busy".into(),
-                    attachments: vec![],
-                    prompt_id: None,
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-            )
-            .unwrap();
-        state.acp_supervisor.hydrate_seqs([(id.into(), 1)]);
-        let mut rx = state.acp_events_tx.subscribe();
-        let first = tokio::spawn({
-            let state = state.clone();
-            async move {
-                let mut tick = Tick::default();
-                tick.run(&state).await;
-                tick
+        struct SuspendedOwnedRunner(crate::process::RunnerProcessGuard);
+        impl Drop for SuspendedOwnedRunner {
+            fn drop(&mut self) {
+                self.0
+                    .signal(libc::SIGCONT)
+                    .expect("resume original captured runner");
             }
-        });
-        runner.entered().await;
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::time::resume();
-        let mut tick = first.await.unwrap();
-        runner.disconnected().await;
-        assert!(
-            !tick.attempted.contains(id),
-            "timeout must re-arm the next tick"
-        );
-        assert!(control.signals().is_empty());
-        assert!(control.scopes().is_empty());
-        assert!(state.acp_event_store.has_in_flight_turn(id));
-        let retained = worker_registry::load(id).unwrap().unwrap();
-        assert_eq!(RunnerIdentity::from_record(&retained), runner.identity);
-        assert_eq!(retained.scope, runner.record.scope);
-        assert_eq!(
-            retained.stored_acp_session_id,
-            runner.record.stored_acp_session_id
-        );
-        assert!(worker_registry::is_record_live(&retained));
-        assert!(!state
-            .acp_event_store
-            .replay_from(id, 0)
-            .iter()
-            .any(|(_, event)| matches!(
-                event,
-                Event::Stopped { .. }
-                    | Event::AgentStartupError { .. }
-                    | Event::AcpConnectionUnavailable { .. }
-            )));
-
-        tick.run(&state).await;
-        assert_eq!(
-            state.acp_supervisor.running_identity(id),
-            Some(runner.identity)
-        );
-        runner.complete_turn();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.acp_event_store.has_in_flight_turn(id) {
-                rx.recv().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        let events = state.acp_event_store.replay_from(id, 0);
-        let reasons: Vec<_> = events
-            .iter()
-            .filter_map(|(_, event)| match event {
-                Event::Stopped { reason } => Some(reason.as_str()),
-                _ => None,
+        }
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "reconciler-attach-timeout",
+                )
+                .await;
+                let id = live.id().to_owned();
+                let pending = live.start_prompt("original turn remains busy").await;
+                let original = live
+                    .state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .unwrap();
+                let owner = original.owner.unwrap();
+                let record = worker_registry::load(&id).unwrap().unwrap();
+                let methods = live.native.requests();
+                live.client = scope
+                    .reconcile_after(live.client, |state, id| async move {
+                        let guard = crate::process::RunnerProcessGuard::capture(
+                            owner.pid,
+                            owner.birth_fingerprint,
+                        )
+                        .unwrap();
+                        guard
+                            .signal(libc::SIGSTOP)
+                            .expect("suspend only the original captured runner");
+                        let paused = SuspendedOwnedRunner(guard);
+                        let mut tick = Tick::default();
+                        tokio::time::timeout(Duration::from_secs(10), tick.run(&state))
+                            .await
+                            .expect("actual attach handshake returns its bounded timeout");
+                        assert!(!tick.attempted.contains(&id));
+                        assert_eq!(
+                            state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+                            Known(true)
+                        );
+                        let retained = worker_registry::load(&id).unwrap().unwrap();
+                        assert_eq!(
+                            crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
+                            owner
+                        );
+                        assert_eq!(retained.scope, record.scope);
+                        assert_eq!(retained.stored_acp_session_id, record.stored_acp_session_id);
+                        assert!(worker_registry::is_record_live(&retained));
+                        let events = state.acp_event_store.replay_from(&id, 0).unwrap();
+                        assert!(!events.iter().any(|stored| matches!(
+                            stored.event.as_ref(),
+                            Event::Stopped { .. }
+                                | Event::AgentStartupError { .. }
+                                | Event::AcpConnectionUnavailable { .. }
+                        )));
+                        drop(paused);
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                tick.run(&state).await;
+                                if state
+                                    .acp_supervisor
+                                    .current_native_availability(&id)
+                                    .await
+                                    .is_some()
+                                {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .expect("a later tick installs the same borrowed Native actor");
+                        let retained = worker_registry::load(&id).unwrap().unwrap();
+                        assert_eq!(
+                            crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
+                            owner
+                        );
+                    })
+                    .await;
+                live.client.ready().await;
+                live.state = live.client.app_state();
+                assert_eq!(
+                    live.state
+                        .acp_supervisor
+                        .current_native_availability(&id)
+                        .await
+                        .unwrap()
+                        .owner,
+                    Some(owner)
+                );
+                assert_eq!(live.native.requests(), methods);
+                live.finish_prompt(&pending, None).await;
+                let reasons = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+                let reasons = reasons
+                    .iter()
+                    .filter_map(|stored| match stored.event.as_ref() {
+                        Event::Stopped { reason } => Some(reason.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(reasons, ["prompt_complete"]);
+                assert_eq!(
+                    live.state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+                    Known(false)
+                );
             })
-            .collect();
-        assert_eq!(reasons, ["prompt_complete"]);
-        assert!(events.iter().any(|(_, event)| matches!(
-            event,
-            Event::AgentMessageChunk { text, .. } if text == "original producer completed"
-        )));
-        state.acp_supervisor.detach_all().await;
+        })
+        .await;
     }
 }

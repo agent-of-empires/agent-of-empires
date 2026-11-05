@@ -148,11 +148,12 @@ impl TerminalClaim {
         }
     }
 
-    pub(super) fn begin_turn(&self) {
+    pub(super) fn begin_turn(&self) -> u64 {
         let mut state = self.state.lock().expect("terminal claim mutex poisoned");
         state.epoch += 1;
         state.claimed = false;
         state.failed = false;
+        state.epoch
     }
 
     /// Ambiguous output cannot mint another main terminal for a failed operation.
@@ -197,6 +198,27 @@ impl TerminalClaim {
         state.claimed = true;
         state.failed = failed;
         true
+    }
+
+    /// Settle only the original local SDK slot, regardless of later row generation changes.
+    pub(super) fn claim_epoch(&self, epoch: u64, failed: bool) -> bool {
+        let mut state = self.state.lock().expect("terminal claim mutex poisoned");
+        if state.epoch != epoch || state.claimed {
+            return false;
+        }
+        state.claimed = true;
+        state.failed = failed;
+        true
+    }
+
+    /// The closure must neither await nor reenter this claim.
+    pub(super) fn with_current_epoch<T>(
+        &self,
+        epoch: u64,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.lock().expect("terminal claim mutex poisoned");
+        (state.epoch == epoch).then(effect)
     }
 
     pub(super) fn claimed(&self) -> bool {

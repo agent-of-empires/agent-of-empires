@@ -62,6 +62,10 @@ mod v050_sound_volume_split;
 mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
+mod v054_acp_establishment;
+mod v055_acp_event_scope;
+mod v056_native_prompt_publication;
+mod v057_acp_budget_knowledge;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -102,7 +106,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 53;
+const CURRENT_VERSION: u32 = 57;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -278,6 +282,14 @@ const MIGRATIONS: &[Migration] = &[
         v052_runtime_filter_acp_target::run,
     ),
     (53, "runtime_filter_reset", v053_runtime_filter_reset::run),
+    (54, "acp_establishment", v054_acp_establishment::run),
+    (55, "acp_event_scope", v055_acp_event_scope::run),
+    (
+        56,
+        "native_prompt_publication",
+        v056_native_prompt_publication::run,
+    ),
+    (57, "acp_budget_knowledge", v057_acp_budget_knowledge::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

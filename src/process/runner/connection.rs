@@ -110,6 +110,8 @@ pub(super) enum HandshakeCommand {
     EstablishSession {
         method: String,
         request: serde_json::Value,
+        attempt: Arc<crate::acp::establishment::EstablishmentAttempt>,
+        store: Option<crate::session::ExecutionBinding>,
     },
 }
 
@@ -136,7 +138,11 @@ pub(super) async fn handle_control_connection(
 ) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
-    if !shared.install_control(&mut write_half, &session_id).await {
+    let (prompt_head, cached_completion) = shared.prompt_attachment_snapshot().await;
+    if !shared
+        .install_control(&mut write_half, &session_id, prompt_head)
+        .await
+    {
         return false;
     }
 
@@ -161,8 +167,8 @@ pub(super) async fn handle_control_connection(
             );
             return false;
         }
-        Ok(Ok(Some(frame))) => {
-            warn!(target: "acp.runner", session = %session_id, ?frame, "first daemon frame was not Attach");
+        Ok(Ok(Some(_))) => {
+            warn!(target: "acp.runner", session = %session_id, "first daemon frame was not Attach");
             return false;
         }
         Ok(Ok(None)) => return false,
@@ -176,7 +182,7 @@ pub(super) async fn handle_control_connection(
         }
     }
 
-    if let Some(wire) = shared.cached_prompt_completion().await {
+    if let Some(wire) = cached_completion {
         let replayed = matches!(
             tokio::time::timeout(
                 CONTROL_WRITE_TIMEOUT,
@@ -194,6 +200,16 @@ pub(super) async fn handle_control_connection(
     }
 
     let attachment_id = shared.begin_attachment().await;
+    #[cfg(test)]
+    let _ = super::test_support::managed_runner::OBSERVE_CONTROL.try_with(|observer| {
+        use std::os::fd::AsFd;
+        let socket = read_half
+            .as_ref()
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("private actual socket observation");
+        let _ = observer.send((attachment_id, socket));
+    });
     let (writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
     let mut writer = tokio::spawn(run_control_writer(
         write_half
@@ -218,8 +234,31 @@ pub(super) async fn handle_control_connection(
     let handshake_worker = tokio::spawn(async move {
         let mut control_closed = control_closed_rx;
         while let Some(command) = handshake_rx.recv().await {
+            let command = match command {
+                HandshakeCommand::EstablishSession {
+                    method,
+                    request,
+                    attempt,
+                    store,
+                } => {
+                    // Once accepted, collection belongs to the runner even if
+                    // this attachment disappears before the native reply.
+                    handshake_done.store(true, Ordering::Release);
+                    handshake_shared
+                        .start_or_replay_session(
+                            Arc::clone(&handshake_stdin),
+                            attachment_id,
+                            method,
+                            request,
+                            attempt,
+                            store,
+                        )
+                        .await;
+                    continue;
+                }
+                command => command,
+            };
             let mut dispatch_release = None;
-            let mut established = false;
             let handshake = async {
                 match command {
                     HandshakeCommand::Initialize(request) => match handshake_shared
@@ -233,39 +272,20 @@ pub(super) async fn handle_control_connection(
                         }
                     },
                     HandshakeCommand::ResumeSession => {
-                        match handshake_shared.resume_session().await {
-                            Ok((acp_session_id, result)) => ControlBody::SessionReady {
-                                acp_session_id,
-                                result,
-                                native_channel: handshake_shared.native_availability(),
-                            },
-                            Err(error) => error.into_frame("resume_session"),
+                        match handshake_shared.resume_session(attachment_id).await {
+                            Some((cached, original_delivery)) => cached
+                                .frame(handshake_shared.native_availability(), original_delivery),
+                            None => control_protocol::HandshakeFailure::new(
+                                control_protocol::HandshakeFailureOrigin::LocalState,
+                                super::shared::transport_error(
+                                    "runner has no original establishment result",
+                                ),
+                            )
+                            .into_frame("resume_session"),
                         }
                     }
-                    HandshakeCommand::EstablishSession { method, request } => {
-                        match handshake_shared
-                            .run_or_replay_session(
-                                &handshake_stdin,
-                                &method,
-                                request,
-                                &mut dispatch_release,
-                            )
-                            .await
-                        {
-                            Ok((acp_session_id, result)) => {
-                                handshake_done.store(true, Ordering::Release);
-                                established = true;
-                                ControlBody::SessionReady {
-                                    acp_session_id,
-                                    result,
-                                    native_channel: handshake_shared.native_availability(),
-                                }
-                            }
-                            Err(error) => {
-                                warn!(target: "acp.runner", session = %handshake_session, ?error, method, "native establishment failed");
-                                error.into_frame(&method)
-                            }
-                        }
+                    HandshakeCommand::EstablishSession { .. } => {
+                        unreachable!("runner-owned establishment handled before attachment wait")
                     }
                 }
             };
@@ -273,6 +293,7 @@ pub(super) async fn handle_control_connection(
             else {
                 return;
             };
+            let established = matches!(&frame, ControlBody::SessionReady { .. });
             handshake_shared
                 .enqueue_handshake(
                     attachment_id,
@@ -306,11 +327,22 @@ pub(super) async fn handle_control_connection(
         let command = match body {
             ControlBody::Initialize { request } => HandshakeCommand::Initialize(request),
             ControlBody::ResumeSession => HandshakeCommand::ResumeSession,
-            ControlBody::EstablishSession { method, request } => {
-                HandshakeCommand::EstablishSession { method, request }
+            ControlBody::EstablishSession {
+                method,
+                request,
+                attempt,
+                store,
+            } => {
+                handshake_complete.store(true, Ordering::Release);
+                HandshakeCommand::EstablishSession {
+                    method,
+                    request,
+                    attempt,
+                    store,
+                }
             }
-            ControlBody::Prompt { request } => {
-                let prompt = shared.agent_prompt(&agent_stdin, attachment_id, request);
+            ControlBody::Prompt { request, scope } => {
+                let prompt = shared.agent_prompt(&agent_stdin, attachment_id, request, scope);
                 tokio::pin!(prompt);
                 let prompt_id = tokio::select! {
                     result = &mut writer => {
@@ -324,48 +356,65 @@ pub(super) async fn handle_control_connection(
                     }
                     result = &mut prompt => result,
                 };
+                #[cfg(test)]
+                shared.test_record_producer(|| {
+                    serde_json::json!({
+                        "stage": "prompt-returned",
+                        "id": prompt_id,
+                    })
+                });
                 if prompt_id.is_none() {
                     warn!(target: "acp.runner", session = %session_id, "prompt write to agent failed");
                 }
                 continue;
             }
-            ControlBody::Cancel => {
+            ControlBody::Cancel { scope } => {
                 if let Some(acp_session_id) = shared.acp_session_id().await {
-                    shared.agent_cancel(&agent_stdin, &acp_session_id).await;
+                    shared
+                        .agent_cancel(&agent_stdin, attachment_id, &acp_session_id, scope)
+                        .await;
                 }
                 continue;
             }
-            ControlBody::ServerResult { call_id, result } => {
-                shared
-                    .resolve_server_call(
-                        &agent_stdin,
-                        attachment_id,
-                        call_id,
-                        Ok(result),
-                        &session_id,
-                    )
-                    .await;
-                continue;
-            }
-            ControlBody::ServerError { call_id, error } => {
-                shared
-                    .resolve_server_call(
-                        &agent_stdin,
-                        attachment_id,
-                        call_id,
-                        Err(error),
-                        &session_id,
-                    )
-                    .await;
+            reply @ (ControlBody::ServerResult { .. } | ControlBody::ServerError { .. }) => {
+                let (call_id, outcome) = match reply {
+                    ControlBody::ServerResult { call_id, result } => (call_id, Ok(result)),
+                    ControlBody::ServerError { call_id, error } => (call_id, Err(error)),
+                    _ => unreachable!("matched reverse reply"),
+                };
+                let resolve = shared.resolve_server_call(
+                    &agent_stdin,
+                    attachment_id,
+                    call_id,
+                    outcome,
+                    &session_id,
+                );
+                tokio::pin!(resolve);
+                let settled = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        log_writer_exit(result, &session_id);
+                        shared.control.lock().await.purge_attachment(attachment_id);
+                        shared.control_space.notify_waiters();
+                        // Finish the accepted Native write without rerouting its settlement.
+                        let _ = resolve.await;
+                        break 'connection false;
+                    }
+                    settled = &mut resolve => settled,
+                };
+                if !settled {
+                    break 'connection false;
+                }
                 continue;
             }
             ControlBody::AgentCall {
                 call_id,
                 method,
                 params,
+                scope,
             } => {
                 shared
-                    .issue_agent_call(&agent_stdin, attachment_id, call_id, &method, params)
+                    .issue_agent_call(&agent_stdin, attachment_id, call_id, &method, params, scope)
                     .await;
                 continue;
             }

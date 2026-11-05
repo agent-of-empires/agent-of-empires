@@ -1,10 +1,11 @@
 // Session and server lifecycle against a real server: open and delete, restart on attach, reconnects, peer edits, mode switch.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
 import { listSessions, resolveAoeBinary, seedSessionViaAoeAdd, waitForView } from "../helpers/aoeServe";
+import { startAcpSession } from "../helpers/acp";
 
 /** Seed a session whose fake claude prints `marker` so the live terminal is observable. */
 const seedPrinting =
@@ -162,10 +163,26 @@ test("peer rename surfaces within the watcher budget", async ({ page, spawnServe
 test("enabling structured view reaps owned panes and preserves an unverified tool", async ({ spawnServe }) => {
   // #1869: owned panes must not leave unreachable shells after the view switch.
   const title = "modeswitch";
-  const serve = await spawnServe({ acp: true, seedFn: seedSessionViaAoeAdd({ title, tool: "claude" }) });
-  const [session] = await listSessions(serve.baseUrl);
-  const sessionId = session!.id;
-  expect(session!.view === "structured").toBeFalsy();
+  const { serve, sessionId } = await startAcpSession(spawnServe, { title, tool: "claude" });
+  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)!;
+  const acpSessionId = session.acp_session_id as string;
+  expect(acpSessionId).toEqual(expect.any(String));
+  expect(acpSessionId).not.toBe("");
+  const cwd = realpathSync(session.project_path as string);
+  const transcriptDir = join(serve.home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9-]/g, "-"));
+  mkdirSync(transcriptDir, { recursive: true });
+  // The actual Native identity needs its transcript in the captured store for terminal handoff.
+  writeFileSync(
+    join(transcriptDir, `${acpSessionId}.jsonl`),
+    `${JSON.stringify({
+      type: "user",
+      cwd,
+      message: { role: "user", content: [{ type: "text", text: "owned-pane handoff" }] },
+    })}\n`,
+  );
+  const disableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`, { method: "POST" });
+  expect(disableRes.ok).toBe(true);
+  await waitForView(serve.baseUrl, sessionId, "terminal");
 
   const id8 = sessionId.slice(0, 8);
   const names = [
@@ -176,6 +193,8 @@ test("enabling structured view reaps owned panes and preserves an unverified too
   const unverifiedTool = `${serve.tmuxPrefix}tool_unverified_${title}_${id8}`;
   const allNames = [...names, unverifiedTool];
   try {
+    const removed = tmux(serve.tmuxSocket, "kill-session", "-t", names[0]!);
+    expect(removed.status, removed.stderr.toString()).toBe(0);
     for (const [index, name] of allNames.entries()) {
       // Production stamps kind at creation; tool cleanup also requires the full owner identity.
       const args = [

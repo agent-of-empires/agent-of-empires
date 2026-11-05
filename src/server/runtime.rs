@@ -221,7 +221,7 @@ impl NativeRuntime {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
-        let sessions = super::api::sessions::project_sessions(state, &worker_states).await;
+        let sessions = super::api::sessions::project_sessions(state, &worker_states).await?;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);

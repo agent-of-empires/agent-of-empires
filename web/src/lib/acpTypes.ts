@@ -521,6 +521,7 @@ export interface AcpFrame {
   session_id: string;
   seq: number;
   event: AcpEvent;
+  clear_after_seq?: number;
 }
 
 /** Which auth identity the agent process resolved for itself. An interim
@@ -546,6 +547,8 @@ export interface ReducedState {
   pending_elicitations: Elicitation[];
   thinking: { started_at: string } | null;
   rate_limit: RateLimitInfo | null;
+  /** Canonical quota park projection; null/omitted means unknown, never confirmed absence. */
+  rate_limit_park?: "none" | "armed" | "exhausted" | null;
   available_commands: AvailableCommand[];
   available_modes: Array<{ id: string; name: string; description?: string | null }>;
   current_mode_id: string | null;
@@ -560,6 +563,7 @@ export interface ReducedState {
   operation_error?: OperationErrorEvidence | null;
   connection_unavailable?: AcpConnectionUnavailability | null;
   connection_ready?: boolean | null;
+  original_decision_nonces?: string[];
   /** Existing current WorkerDown queue/wake eligibility, not native health. */
   prompt_wake_eligible?: boolean | null;
   last_seq?: number;
@@ -616,6 +620,8 @@ export interface AcpState {
   connectionReady: boolean;
   /** Only a live daemon snapshot supplies current control authority, even at seq 0. */
   nativeSnapshotSeq: number | null;
+  /** Live canonical per-request authority; never restored from history or cache. */
+  originalDecisionNonces: string[];
   promptWakeEligible: boolean;
   interactionError: InteractionError | null;
   /** Derived from `serverTurnActive || inflightPromptIds.length > 0`; never written directly. */
@@ -645,12 +651,10 @@ export interface AcpState {
   workerRestarting: boolean;
   /** The worker was reaped for inactivity; the next prompt POST wakes it without a reconnect. */
   workerIdleStopped: boolean;
-  /** Auto-resume gave up re-delivering the interrupted prompt and parked the session. */
-  rateLimitRetriesExhausted: boolean;
-  /** Parked on a rate limit, cap not yet reached. The daemon sends a prompt into this park
-   *  rather than queueing it (the reconciler holds the respawn, so a queue row would wait on a
-   *  worker nothing starts), so the composer must treat a worker-down 503 here as re-queueable. */
-  rateLimitParked: boolean;
+  /** Canonical retry cap knowledge; null until a current quota projection confirms it. */
+  rateLimitRetriesExhausted: boolean | null;
+  /** Canonical park knowledge, including cap parks; null means unknown. */
+  rateLimitParked: boolean | null;
   /** Prompts submitted while a turn was running; the head is dispatched on `Stopped`. */
   queuedPrompts: QueuedPrompt[];
   nextWakeupAt: string | null;
@@ -789,6 +793,8 @@ export interface ActivityRow {
     | "compaction_summary"
     | "summary";
   text: string;
+  seq?: number;
+  clearAfterSeq?: number;
   toolCallId?: string;
   tool?: ToolCall;
   /** Rendered as `DiffCommentsUserCard`; `text` holds the markdown fallback. */
@@ -812,6 +818,8 @@ export interface ActivityRow {
 /** Wire mirror of the Rust `TranscriptRow` (src/acp/transcript.rs). */
 export interface TranscriptRow {
   id: string;
+  seq?: number;
+  clear_after_seq?: number;
   group_id: string;
   kind: Exclude<ActivityRow["kind"], "thinking">;
   at: string;
@@ -864,6 +872,8 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
       : undefined;
   return {
     id: row.id,
+    seq: row.seq,
+    clearAfterSeq: row.clear_after_seq,
     kind: row.kind,
     text: row.text,
     at: row.at,
@@ -948,8 +958,8 @@ export function emptyAcpState(): AcpState {
     locallyResolved: [],
     thinking: false,
     rateLimit: null,
-    rateLimitRetriesExhausted: false,
-    rateLimitParked: false,
+    rateLimitRetriesExhausted: null,
+    rateLimitParked: null,
     sessionUsage: null,
     usageBaseline: null,
     compactionReminderDismissed: null,
@@ -966,6 +976,7 @@ export function emptyAcpState(): AcpState {
     connectionUnavailableNotice: null,
     connectionReady: false,
     nativeSnapshotSeq: null,
+    originalDecisionNonces: [],
     promptWakeEligible: false,
     interactionError: null,
     turnActive: false,
@@ -1018,6 +1029,14 @@ export function nativeInputAvailable(
   );
 }
 
+/** Original handshake decisions grant only their exact nonce, never native input. */
+export function canDecideRequest(state: AcpState, nonce: string): boolean {
+  return (
+    state.connectionUnavailable === null &&
+    (nativeInputAvailable(state) || state.originalDecisionNonces.includes(nonce))
+  );
+}
+
 /** Managed wake/queue intents retain the existing governor. Generic Unknown
  *  grants neither a native write nor implicit wake permission. */
 export function canSubmitPromptIntent(
@@ -1036,16 +1055,21 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     !state.connectionReady &&
     !state.promptWakeEligible &&
     state.nativeSnapshotSeq == null &&
-    state.connectionUnavailable === null
+    state.connectionUnavailable === null &&
+    state.rateLimitRetriesExhausted === null &&
+    state.rateLimitParked === null
   )
     return state;
   return {
     ...state,
     connectionReady: false,
     nativeSnapshotSeq: null,
+    originalDecisionNonces: [],
     promptWakeEligible: false,
     connectionUnavailableNotice: state.connectionUnavailable ?? state.connectionUnavailableNotice,
     connectionUnavailable: null,
+    rateLimitRetriesExhausted: null,
+    rateLimitParked: null,
   };
 }
 
@@ -1064,8 +1088,6 @@ function applyNewTurnResets(next: AcpState): void {
   next.workerStopped = false;
   next.workerRestarting = false;
   next.workerIdleStopped = false;
-  next.rateLimitRetriesExhausted = false;
-  next.rateLimitParked = false;
   next.rejectedPrompts = [];
   next.agentUnresponsive = false;
   next.agentOrphaned = false;
@@ -1123,7 +1145,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
 
   // A header can arrive before its raw catch-up. Replay still owns fields absent
   // from ReducedState: config/results, usage/cost, capabilities, diagnostics,
-  // cap/park bookkeeping, wake/monitor/primer state and background-agent history.
+  // wake/monitor/primer state and background-agent history.
   // Only the daemon-folded control projection wins over covered raw effects.
   next.agent = state.agent;
   next.model = state.model;
@@ -1135,6 +1157,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   next.locallyResolved = state.locallyResolved;
   next.thinking = state.thinking;
   next.rateLimit = state.rateLimit;
+  next.rateLimitRetriesExhausted = state.rateLimitRetriesExhausted;
+  next.rateLimitParked = state.rateLimitParked;
   next.availableCommands = state.availableCommands;
   next.availableModes = state.availableModes;
   next.currentModeId = state.currentModeId;
@@ -1144,6 +1168,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   next.connectionUnavailable = state.connectionUnavailable;
   next.connectionUnavailableNotice = state.connectionUnavailable ?? next.connectionUnavailableNotice;
   next.nativeSnapshotSeq = state.nativeSnapshotSeq;
+  next.originalDecisionNonces = state.originalDecisionNonces;
   next.promptWakeEligible = state.promptWakeEligible;
   next.serverTurnActive = state.serverTurnActive;
   next.cancelling = state.cancelling;
@@ -1340,10 +1365,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       next.workerIdleStopped = true;
       next.workerStopped = false;
       next.workerRestarting = false;
-    } else if (event.Stopped.reason === "rate_limit_exhausted_retries") {
-      next.rateLimitRetriesExhausted = true;
-    } else if (event.Stopped.reason === "rate_limited") {
-      next.rateLimitParked = true;
     }
     return next;
   }
@@ -1418,13 +1439,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     // projection may restore native controls or physical-worker chrome.
     return next;
   }
-  if ("RateLimitAutoResumed" in event) {
-    // Only the cap park ends here. The armed park outlives an auto-resume attempt: the daemon's
-    // `rate_limit_park` does not treat this event as superseding it, so a failed respawn leaves
-    // the session parked and a prompt still has to wake it.
-    next.rateLimitRetriesExhausted = false;
-    return next;
-  }
   if ("SessionContextReset" in event) {
     next.sessionUsage = null;
     next.usageBaseline = null;
@@ -1469,8 +1483,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.workerStopped = false;
     next.workerRestarting = false;
     next.agentUnresponsive = false;
-    next.rateLimitRetriesExhausted = false;
-    next.rateLimitParked = false;
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;
@@ -1621,11 +1633,16 @@ export function applyReducedState(
     pendingElicitations: reduced.pending_elicitations.filter((e) => !resolved.has(e.nonce)),
     thinking: reduced.thinking != null,
     rateLimit: reduced.rate_limit,
+    rateLimitParked: authoritative && reduced.rate_limit_park != null ? reduced.rate_limit_park !== "none" : null,
+    rateLimitRetriesExhausted:
+      authoritative && reduced.rate_limit_park != null ? reduced.rate_limit_park === "exhausted" : null,
     lastErrorEvidence: reduced.operation_error ?? null,
     connectionUnavailable,
     connectionUnavailableNotice: connectionUnavailable ?? state.connectionUnavailableNotice,
     connectionReady,
     nativeSnapshotSeq: authoritative ? snapshotSeq : null,
+    originalDecisionNonces:
+      authoritative && connectionUnavailable === null ? [...(reduced.original_decision_nonces ?? [])] : [],
     promptWakeEligible: authoritative && reduced.prompt_wake_eligible === true && connectionUnavailable === null,
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
@@ -1876,6 +1893,7 @@ export function normaliseTurnState(
     connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
     connectionReady: state.connectionReady === true,
     nativeSnapshotSeq: typeof state.nativeSnapshotSeq === "number" ? state.nativeSnapshotSeq : null,
+    originalDecisionNonces: [],
     promptWakeEligible: state.promptWakeEligible === true,
     rejectedPrompts,
     agentUnresponsive,

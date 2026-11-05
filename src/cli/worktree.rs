@@ -409,8 +409,7 @@ mod tests {
         }
     }
 
-    /// An abandoned purge listed by cleanup cannot host a new session, and if recovery keeps and
-    /// unhides it before cleanup is confirmed, cleanup spares it for whoever adopts it.
+    /// Cleanup cannot remove an abandoned purge that recovery has already unmarked.
     #[test]
     fn cleanup_removes_an_abandoned_purge_only_while_still_marked() {
         for kept in [false, true] {
@@ -419,7 +418,14 @@ mod tests {
             std::fs::create_dir(&repo).unwrap();
             let git = |args: &[&str]| {
                 let status = std::process::Command::new("git")
-                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
                     .args(args)
                     .current_dir(&repo)
                     .status()

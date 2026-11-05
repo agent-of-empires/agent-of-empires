@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::event_store::ControlKnowledge::{self, Indeterminate, Known};
 use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
@@ -16,6 +17,8 @@ pub struct SpawnAcpRequest {
     /// Falls back to `Supervisor::pick_agent_for_tool`.
     pub agent: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub recovery: Option<crate::acp::establishment::EstablishmentRecovery>,
     /// Extra dirs the agent may use through fs/*; the worktree is always allowed.
     #[serde(default)]
     pub additional_dirs: Vec<PathBuf>,
@@ -63,17 +66,22 @@ fn rate_limit_resume_marker_resets_at(
     )
 }
 
-async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<Utc>> {
+async fn rate_limit_resume_probe(
+    state: &AppState,
+    id: &str,
+) -> Result<ControlKnowledge<Option<DateTime<Utc>>>, SupervisorError> {
     let store = Arc::clone(&state.acp_event_store);
     let id_for_probe = id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let park = store.rate_limit_park(&id_for_probe);
-        rate_limit_resume_marker_resets_at(park.as_ref(), Utc::now())
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(target: "http.api.acp", session = %id, "rate-limit resume probe failed: {e}");
-        None
+    let park = tokio::task::spawn_blocking(move || store.rate_limit_park(&id_for_probe))
+        .await
+        .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+        .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
+    Ok(match park {
+        Known(park) => Known(rate_limit_resume_marker_resets_at(
+            park.as_ref(),
+            Utc::now(),
+        )),
+        Indeterminate => Indeterminate,
     })
 }
 
@@ -112,6 +120,11 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    if req.recovery.is_some() {
+        return restart_acp(State(state), Path(id), Ok(Json(req)))
+            .await
+            .into_response();
+    }
     let spawn_request = match state.acp_supervisor.begin_spawn_request(&id) {
         Ok(request) => request,
         Err(error) => return supervisor_error_response("spawn cancelled", &error),
@@ -155,7 +168,51 @@ pub async fn spawn_acp(
             "error": "creation_not_finalized", "message": "The structured session launch is not finalized",
         }))).into_response();
     }
-    if rate_limit_resume_probe(&state, &id).await.is_some() {
+    if let Some(response) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return response;
+    }
+    if let Err(refusal) = instance.require_resolved_acp_selection() {
+        return supervisor_error_response("spawn refused", &refusal.into());
+    }
+    let quota = match rate_limit_resume_probe(&state, &id).await {
+        Ok(quota) => quota,
+        Err(error) => return supervisor_error_response("quota history probe failed", &error),
+    };
+    if matches!(quota, Indeterminate) {
+        let agent = pick_agent(&state, &instance, None).await;
+        if req
+            .agent
+            .as_ref()
+            .is_some_and(|requested| requested != &agent)
+            || req.model.is_some()
+            || req.recovery.is_some()
+            || !req.additional_dirs.is_empty()
+            || !req.provider_env.is_empty()
+        {
+            return supervisor_error_response(
+                "only read-only reattachment is available with unconfirmed quota history",
+                &SupervisorError::ControlStateUnavailable,
+            );
+        }
+        drop(exclusion);
+        if let Err(error) = crate::server::acp_reconciler::ensure_rate_limit_worker(
+            &state,
+            &id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+            true,
+        )
+        .await
+        {
+            return supervisor_error_response("retained attachment failed", &error);
+        }
+        return Json(SpawnAcpResponse {
+            session_id: id,
+            agent,
+            status: "running",
+        })
+        .into_response();
+    }
+    if matches!(quota, Known(Some(_))) {
         let explicit = req.agent.as_deref().or(instance.agent_name.as_deref());
         let agent = pick_agent(&state, &instance, explicit).await;
         let submission = exclusion
@@ -173,6 +230,25 @@ pub async fn spawn_acp(
         })
         .into_response();
     }
+    if req.agent.is_none()
+        && req.model.is_none()
+        && req.additional_dirs.is_empty()
+        && req.provider_env.is_empty()
+        && state.acp_supervisor.is_running(&id).await
+    {
+        match current_is_noop(&state, &instance, None).await {
+            Ok(true) => {
+                return Json(SpawnAcpResponse {
+                    session_id: id,
+                    agent: pick_agent(&state, &instance, instance.agent_name.as_deref()).await,
+                    status: "running",
+                })
+                .into_response();
+            }
+            Ok(false) => {}
+            Err(response) => return response,
+        }
+    }
 
     let (instance, resume_reservation) =
         match crate::server::api::sessions::resume_structured_stop(&state, instance, None).await {
@@ -184,6 +260,40 @@ pub async fn spawn_acp(
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
+    };
+    let mut reservation = if let Some(reservation) = resume_reservation {
+        reservation
+    } else {
+        match state
+            .acp_supervisor
+            .reserve_spawn(
+                &id,
+                if instance.acp_session_id.is_some() {
+                    crate::acp::supervisor::ResumeKind::Spawn
+                } else {
+                    crate::acp::supervisor::ResumeKind::SpawnFirst
+                },
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => return supervisor_error_response("spawn failed", &error),
+        }
+    };
+    let mut admission = crate::acp::supervisor::LaunchAdmission {
+        establishment: reservation.establishment.clone(),
+        store: native.clone(),
+        generation: instance.lifecycle_generation,
+        namespace: Some(state.profile_namespace.clone()),
+        native_scope: None,
+    };
+    let instance = match exclusion
+        .prepare_native_establishment(&state.acp_supervisor, &mut admission, &mut reservation)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return supervisor_error_response("spawn admission failed", &error),
     };
     let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
@@ -205,12 +315,7 @@ pub async fn spawn_acp(
     // Explicit resume has settled and consumed only the observed native stop.
 
     let request = SpawnRequest {
-        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
-            store: native,
-            generation: instance.lifecycle_generation,
-            namespace: Some(state.profile_namespace.clone()),
-            native_scope: None,
-        }),
+        launch_admission: Some(admission),
         additional_dirs: req.additional_dirs,
         provider_env: req
             .provider_env
@@ -223,35 +328,6 @@ pub async fn spawn_acp(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
-    if spawn_request.cancellation().is_cancelled() {
-        return supervisor_error_response(
-            "spawn cancelled",
-            &SupervisorError::SpawnCancelled(id.clone()),
-        );
-    }
-    // Reserve the lifecycle generation while the preparation exclusion is
-    // still held, then release all request locks before spawn configuration
-    // and before_session hooks. Hooks may re-enter the API for this session.
-    let reservation = if let Some(reservation) = resume_reservation {
-        reservation
-    } else {
-        match state
-            .acp_supervisor
-            .reserve_spawn(
-                &id,
-                if request.stored_acp_session_id.is_some() {
-                    crate::acp::supervisor::ResumeKind::Spawn
-                } else {
-                    crate::acp::supervisor::ResumeKind::SpawnFirst
-                },
-                crate::process::worker_registry::ResumeAuthority::Explicit,
-            )
-            .await
-        {
-            Ok(reservation) => reservation,
-            Err(e) => return supervisor_error_response("spawn failed", &e),
-        }
-    };
     if spawn_request.cancellation().is_cancelled() {
         drop(reservation);
         return supervisor_error_response(
@@ -360,12 +436,30 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     {
         return response;
     }
+    if let Some(recovery) = req.recovery.as_ref() {
+        match current_is_noop(&state, &preflight_instance, Some(recovery)).await {
+            Ok(true) => {
+                return Json(SpawnAcpResponse {
+                    session_id: id,
+                    agent: preflight_agent,
+                    status: "running",
+                })
+                .into_response()
+            }
+            Ok(false) => {}
+            Err(response) => return response,
+        }
+    } else if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
+        return supervisor_error_response("restart refused", &refusal.into());
+    }
 
     let stop_request = state
         .acp_supervisor
-        .begin_stop_request(&id, "user_stopped", None, false)
+        .begin_stop_request(&id, "user_stopped", None, true)
         .await;
-    let was_resuming = stop_request.cancelled_launch();
+    let was_resuming =
+        state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming;
+    let mut establishment = None;
     // A running worker must finish its current submission before restart
     // tears it down. Hold only this barrier here; the full launch exclusion
     // also owns the instance lock and would block an external stop.
@@ -384,8 +478,11 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
     if was_resuming {
-        if let Err(response) = retire_restart_worker(&state, &preflight_instance, &restart).await {
-            return response;
+        match retire_restart_worker(&state, &preflight_instance, &restart, req.recovery.clone())
+            .await
+        {
+            Ok(attempt) => establishment = Some(attempt),
+            Err(response) => return response,
         }
     }
 
@@ -441,8 +538,9 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
     // Running workers are stopped only after the submission barrier is held.
     if !was_resuming {
-        if let Err(response) = retire_restart_worker(&state, &instance, &restart).await {
-            return response;
+        match retire_restart_worker(&state, &instance, &restart, req.recovery.clone()).await {
+            Ok(attempt) => establishment = Some(attempt),
+            Err(response) => return response,
         }
     }
     if restart.is_cancelled() {
@@ -519,12 +617,17 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             instance,
             None,
             Some(&restart),
+            establishment.clone(),
         )
         .await
         {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
+    let establishment = resume_reservation
+        .as_ref()
+        .and_then(|reservation| reservation.establishment.clone())
+        .or(establishment);
     if restart.is_cancelled() {
         return supervisor_error_response(
             "restart cancelled by a stop request",
@@ -534,6 +637,40 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
+    };
+    let mut reservation = match resume_reservation {
+        Some(reservation) => reservation,
+        None => match state
+            .acp_supervisor
+            .reserve_spawn_with_restart(
+                &id,
+                if instance.acp_session_id.is_some() {
+                    crate::acp::supervisor::ResumeKind::Spawn
+                } else {
+                    crate::acp::supervisor::ResumeKind::SpawnFirst
+                },
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                Some(&restart),
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => return supervisor_error_response("restart admission failed", &error),
+        },
+    };
+    let mut admission = crate::acp::supervisor::LaunchAdmission {
+        establishment,
+        store: native.clone(),
+        generation: instance.lifecycle_generation,
+        namespace: Some(state.profile_namespace.clone()),
+        native_scope: None,
+    };
+    let instance = match exclusion
+        .prepare_native_establishment(&state.acp_supervisor, &mut admission, &mut reservation)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return supervisor_error_response("restart admission failed", &error),
     };
     let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
@@ -552,12 +689,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     let request = SpawnRequest {
-        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
-            store: native,
-            generation: instance.lifecycle_generation,
-            namespace: Some(state.profile_namespace.clone()),
-            native_scope: None,
-        }),
+        launch_admission: Some(admission),
         additional_dirs: req.additional_dirs,
         provider_env: req
             .provider_env
@@ -577,19 +709,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     drop(exclusion);
-    let launched = match resume_reservation {
-        Some(reservation) => state.acp_supervisor.spawn_inner(request, reservation).await,
-        None => {
-            state
-                .acp_supervisor
-                .spawn_for_restart(
-                    request,
-                    crate::process::worker_registry::ResumeAuthority::Explicit,
-                    &restart,
-                )
-                .await
-        }
-    };
+    let launched = state.acp_supervisor.spawn_inner(request, reservation).await;
     match launched {
         Ok(()) => Json(SpawnAcpResponse {
             session_id: id,
@@ -601,11 +721,99 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
 }
 
+async fn current_is_noop(
+    state: &Arc<AppState>,
+    expected: &crate::session::Instance,
+    recovery: Option<&crate::acp::establishment::EstablishmentRecovery>,
+) -> Result<bool, Response> {
+    use crate::acp::establishment::{
+        AcpEstablishment, EstablishmentRecoveryAction, EstablishmentRefusal,
+    };
+    let mut current = state
+        .acp_supervisor
+        .current_native_availability(&expected.id)
+        .await;
+    let worker = state.acp_supervisor.worker_state(&expected.id).await;
+    let owner = state.clone();
+    let profile = expected.source_profile.clone();
+    let id = expected.id.clone();
+    let expected = expected.clone();
+    let recovery = recovery.cloned();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        use crate::session::SessionStore as _;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            owner,
+            &profile,
+            Some(id.clone()),
+        )?;
+        let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        anyhow::ensure!(
+            crate::acp::state::NativeEventContext::capture(&expected, native.storage())?
+                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
+                && crate::acp::state::NativeBindingState::capture(&expected).matches(&row)
+                && expected.acp_establishment == row.acp_establishment,
+            EstablishmentRefusal::Superseded
+        );
+        if let Some(recovery) = &recovery {
+            anyhow::ensure!(
+                recovery.expected.matches(&row, native.storage())?,
+                EstablishmentRefusal::Superseded
+            );
+        }
+        if recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.action != EstablishmentRecoveryAction::Same)
+            || !matches!(
+                row.acp_establishment,
+                Some(AcpEstablishment::Applied { .. })
+            )
+            || worker == crate::daemon::AcpWorkerState::Absent
+        {
+            return Ok(false);
+        }
+        let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
+        let selected = current
+            .scope
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.matches(&row));
+        anyhow::ensure!(
+            current.scope.context
+                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
+                && current.refresh(&id, selected).unwrap_or(false),
+            EstablishmentRefusal::Unconfirmed
+        );
+        if current.unavailable.is_some() {
+            return Ok(false);
+        }
+        let applied = current
+            .client
+            .establishment_projection()
+            .and_then(|projection| projection.applied())
+            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+        anyhow::ensure!(
+            current.ready && applied.matches(&row, native.storage())?,
+            EstablishmentRefusal::Unconfirmed
+        );
+        Ok(true)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|error| restart_retirement_error("conversation recovery refused", &error))
+}
+
 async fn retire_restart_worker(
     state: &Arc<AppState>,
     expected: &crate::session::Instance,
     restart: &crate::acp::supervisor::RestartRequestGuard,
-) -> Result<(), Response> {
+    recovery: Option<crate::acp::establishment::EstablishmentRecovery>,
+) -> Result<Arc<crate::acp::establishment::EstablishmentAttempt>, Response> {
     if restart.is_cancelled() {
         return Err(supervisor_error_response(
             "restart cancelled",
@@ -622,6 +830,8 @@ async fn retire_restart_worker(
     let tool = expected.tool.clone();
     let agent_name = expected.agent_name.clone();
     let agent_provider = expected.agent_provider.clone();
+    let expected_choice = crate::acp::state::NativeBindingState::capture(expected);
+    let expected_authority = expected.acp_establishment.clone();
     let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore as _;
         let native = crate::server::session_store::NativeSessionStore::open(
@@ -647,7 +857,9 @@ async fn retire_restart_worker(
                 && row.project_path == project_path
                 && row.tool == tool
                 && row.agent_name == agent_name
-                && row.agent_provider == agent_provider,
+                && row.agent_provider == agent_provider
+                && expected_choice.matches(&row)
+                && row.acp_establishment == expected_authority,
             crate::session::LifecycleReservationError::Superseded
         );
         let target = owner.acp_supervisor.capture_retirement(&row.id)?;
@@ -668,21 +880,39 @@ async fn retire_restart_worker(
                 );
             }
         }
-        let binding = crate::server::acp_events::BindingRetirement::prepare_captured(
+        let mut binding = crate::server::acp_events::BindingRetirement::prepare_captured(
             &owner,
             target,
             &row,
             native.storage(),
         )?;
+        let mut attempt = None;
+        let store: &dyn crate::session::SessionStore = &native;
+        store.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == prepare_id)
+                .ok_or(crate::session::SessionGone)?;
+            attempt = Some(row.arm_acp_establishment(native.storage(), recovery.as_ref())?);
+            Ok(())
+        })?;
+        let attempt = attempt
+            .ok_or_else(|| anyhow::anyhow!("native establishment mutation was not applied"))?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == prepare_id)
+            .ok_or(crate::session::SessionGone)?;
+        binding.promote(&row, native.storage())?;
         owner
             .acp_supervisor
             .register_delegated_binding_retirement(&binding.target, binding.checkpoint.clone())?;
-        Ok((native, binding))
+        Ok((native, binding, Arc::new(attempt)))
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let (native, binding) = prepared.map_err(|error| {
+    let (native, binding, attempt) = prepared.map_err(|error| {
         restart_retirement_error("restart native retirement preparation", &error)
     })?;
     state
@@ -716,7 +946,7 @@ async fn retire_restart_worker(
             row.terminal_handoff.is_none(),
             crate::session::LifecycleReservationError::Superseded
         );
-        binding.commit_under_native_lock(&native, &id)?;
+        binding.commit_under_native_lock(&native)?;
         native
             .load()?
             .into_iter()
@@ -731,12 +961,16 @@ async fn retire_restart_worker(
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result)
-    .map_err(|error| restart_retirement_error("restart native retirement checkpoint", &error))
+    .map_err(|error| restart_retirement_error("restart native retirement checkpoint", &error))?;
+    Ok(attempt)
 }
 
 fn restart_retirement_error(context: &str, error: &anyhow::Error) -> Response {
     if let Some(error) = error.downcast_ref::<SupervisorError>() {
         return supervisor_error_response(context, error);
+    }
+    if let Some(refusal) = error.downcast_ref::<crate::acp::establishment::EstablishmentRefusal>() {
+        return supervisor_error_response(context, &(*refusal).into());
     }
     if error.is::<crate::session::SessionCommitApplied>() {
         return (
@@ -991,15 +1225,71 @@ async fn persist_agent_switch(
                 .iter_mut()
                 .find(|row| row.id == id)
                 .ok_or(crate::session::SessionGone)?;
+            if instance.agent_name.as_deref() != Some(target.as_str()) {
+                instance.acp_session_id = None;
+                instance.import_pending = None;
+            }
             instance.agent_name = Some(target.clone());
-            instance.acp_session_id = None;
-            instance.import_pending = None;
             instance.acp_effort = None;
             instance.agent_model = model.clone();
             instance.terminal_rebind_pending = true;
             Ok(())
         })?;
         Ok(exclusion)
+    })
+    .await?
+}
+
+/// An explicit backend handoff consents to a new destination conversation,
+/// never to resuming the previous backend's native session under another agent.
+async fn prepare_agent_switch(
+    store: Arc<crate::server::session_store::NativeSessionStore>,
+    expected: crate::session::Instance,
+    target: String,
+    model: Option<String>,
+) -> anyhow::Result<Arc<crate::acp::establishment::EstablishmentAttempt>> {
+    use crate::acp::establishment::{
+        EstablishmentExpected, EstablishmentRecovery, EstablishmentRecoveryAction,
+    };
+    use crate::session::SessionStore;
+    tokio::task::spawn_blocking(move || {
+        let _lifecycle = store
+            .storage()
+            .acquire_instance_lifecycle_lock(&expected.id)?;
+        let source = crate::acp::state::NativeBindingState::capture(&expected);
+        let context = crate::acp::state::NativeEventContext::capture(&expected, store.storage())?;
+        let mut prepared = None;
+        store.commit(&mut |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == expected.id)
+                .ok_or(crate::session::SessionGone)?;
+            row.ensure_startable()?;
+            anyhow::ensure!(
+                row.is_structured()
+                    && row.launch_is_finalized()
+                    && row.terminal_handoff.is_none()
+                    && source.matches(row)
+                    && row.acp_establishment == expected.acp_establishment
+                    && context
+                        == crate::acp::state::NativeEventContext::capture(row, store.storage())?,
+                crate::session::LifecycleReservationError::Superseded
+            );
+            row.agent_name = Some(target.clone());
+            row.agent_model = model.clone();
+            row.acp_effort = None;
+            row.acp_load_session_capable = None;
+            row.terminal_rebind_pending = true;
+            let recovery = EstablishmentRecovery {
+                expected: EstablishmentExpected::capture(row, store.storage())?,
+                action: EstablishmentRecoveryAction::Fresh,
+            };
+            prepared = Some(row.arm_acp_establishment(store.storage(), Some(&recovery))?);
+            Ok(())
+        })?;
+        prepared
+            .map(Arc::new)
+            .ok_or_else(|| anyhow::anyhow!("backend switch establishment was not committed"))
     })
     .await?
 }
@@ -1044,20 +1334,24 @@ pub async fn switch_acp_agent(
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
+    if let Err(refusal) = instance.require_resolved_acp_selection() {
+        return supervisor_error_response("agent switch refused", &refusal.into());
+    }
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
-    let (instance, resume_reservation) = match crate::server::api::sessions::resume_structured_stop(
-        &state,
-        instance,
-        Some(crate::acp::supervisor::ResumeKind::SpawnFirst),
-    )
-    .await
-    {
-        Ok(instance) => instance,
-        Err(response) => return response,
-    };
+    let (instance, resume_reservation) =
+        match crate::server::api::sessions::resume_structured_stop_deferred(
+            &state,
+            instance,
+            Some(crate::acp::supervisor::ResumeKind::SpawnFirst),
+        )
+        .await
+        {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
@@ -1065,11 +1359,16 @@ pub async fn switch_acp_agent(
     let before_seq = state.acp_event_store.highest_seq(&id);
 
     if resume_reservation.is_none() {
-        if let Err(e) = crate::server::acp_events::retire_native_worker(
-            &state,
-            &id,
-            std::time::Duration::from_secs(5),
-        )
+        if let Err(e) = async {
+            let target = state.acp_supervisor.capture_retirement(&id)?;
+            crate::server::acp_events::retire_native_worker(
+                &state,
+                &id,
+                target,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        }
         .await
         {
             return (
@@ -1079,50 +1378,7 @@ pub async fn switch_acp_agent(
                 .into_response();
         }
     }
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.acp_load_session_capable = None;
-        }
-    }
-
-    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
-        native.clone(),
-        instance.clone(),
-        exclusion,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => return launch_error_response("sandbox container ensure", &e),
-    };
-
-    let model = req.model.clone();
-
-    // A new backend starts a fresh session. Effort vocabularies are
-    // adapter-specific, so the old pick is dropped too.
-    let request = SpawnRequest {
-        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
-            store: native.clone(),
-            generation: instance.lifecycle_generation,
-            namespace: Some(state.profile_namespace.clone()),
-            native_scope: None,
-        }),
-        model: model.clone(),
-        effort: None,
-        effort_explicit: false,
-        stored_acp_session_id: None,
-        fork_from: None,
-        seed_history_replay: false,
-        prior_conversation: false,
-        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
-        claude_store_pin: None,
-        ..spawn_request_for(&instance, target.clone(), sandbox_info)
-    };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    let reservation = if let Some(reservation) = resume_reservation {
+    let mut reservation = if let Some(reservation) = resume_reservation {
         reservation
     } else {
         match state
@@ -1138,7 +1394,67 @@ pub async fn switch_acp_agent(
             Err(e) => return supervisor_error_response("spawn failed", &e),
         }
     };
-    let launch_epoch = reservation.lease().epoch();
+    let Some(instance) = find_instance(&state, &id).await.filter(|row| {
+        row.created_at == instance.created_at
+            && row.lifecycle_generation == instance.lifecycle_generation
+            && row.source_profile == instance.source_profile
+            && row.agent_name == instance.agent_name
+            && row.agent_provider == instance.agent_provider
+            && row.project_path == instance.project_path
+            && crate::acp::state::NativeBindingState::capture(&instance).matches(row)
+            && row.acp_establishment == instance.acp_establishment
+    }) else {
+        return supervisor_error_response(
+            "agent switch source changed",
+            &SupervisorError::Superseded(id),
+        );
+    };
+    let model = req.model.clone();
+    let attempt = match prepare_agent_switch(
+        native.clone(),
+        instance.clone(),
+        target.clone(),
+        model.clone(),
+    )
+    .await
+    {
+        Ok(attempt) => attempt,
+        Err(error) => return restart_retirement_error("agent switch destination", &error),
+    };
+    let mut admission = crate::acp::supervisor::LaunchAdmission {
+        establishment: Some(attempt),
+        store: native.clone(),
+        generation: instance.lifecycle_generation,
+        namespace: Some(state.profile_namespace.clone()),
+        native_scope: None,
+    };
+    let instance = match exclusion
+        .prepare_native_establishment(&state.acp_supervisor, &mut admission, &mut reservation)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return supervisor_error_response("agent switch admission failed", &error),
+    };
+    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+        native.clone(),
+        instance.clone(),
+        exclusion,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(error) => return launch_error_response("sandbox container ensure", &error),
+    };
+    let request = SpawnRequest {
+        launch_admission: Some(admission),
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
+        ..spawn_request_for(&instance, target.clone(), sandbox_info)
+    };
+    if let Some(response) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return response;
+    }
+    let launch_lease = reservation.lease().clone();
+    let launch_epoch = launch_lease.epoch();
     drop(exclusion);
     if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
         return supervisor_error_response("spawn failed", &e);
@@ -1149,7 +1465,14 @@ pub async fn switch_acp_agent(
         {
             Ok(exclusion) => exclusion,
             Err(error) if is_store_write_failure(&error) => {
-                return persist_failure_response(&state, &id, "agent switch", &error).await;
+                return persist_failure_response(
+                    &state,
+                    &id,
+                    &launch_lease,
+                    "agent switch",
+                    &error,
+                )
+                .await;
             }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
@@ -1199,7 +1522,10 @@ async fn persist_provider_switch(
     expected: &crate::session::Instance,
     provider: &str,
     exclusion: crate::acp::sandbox::LaunchExclusion,
-) -> anyhow::Result<crate::acp::sandbox::LaunchExclusion> {
+) -> anyhow::Result<(
+    crate::acp::sandbox::LaunchExclusion,
+    Arc<crate::acp::establishment::EstablishmentAttempt>,
+)> {
     use crate::session::SessionStore;
     let expected = expected.clone();
     let provider = provider.to_owned();
@@ -1207,6 +1533,8 @@ async fn persist_provider_switch(
         let _lifecycle = store
             .storage()
             .acquire_instance_lifecycle_lock(&expected.id)?;
+        let source = crate::acp::state::NativeBindingState::capture(&expected);
+        let mut prepared = None;
         store.commit(&mut |rows, _| {
             let row = rows
                 .iter_mut()
@@ -1216,6 +1544,8 @@ async fn persist_provider_switch(
                 row.lifecycle_generation == expected.lifecycle_generation
                     && row.title == expected.title
                     && row.agent_provider == expected.agent_provider
+                    && source.matches(row)
+                    && row.acp_establishment == expected.acp_establishment
                     && row.is_structured()
                     && row.launch_is_finalized()
                     && row.terminal_handoff.is_none(),
@@ -1224,9 +1554,12 @@ async fn persist_provider_switch(
             row.ensure_startable()?;
             row.agent_provider = Some(provider.clone());
             row.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_owned());
+            prepared = Some(row.arm_acp_establishment(store.storage(), None)?);
             Ok(())
         })?;
-        Ok(exclusion)
+        let attempt = prepared
+            .ok_or_else(|| anyhow::anyhow!("provider switch establishment was not committed"))?;
+        Ok((exclusion, Arc::new(attempt)))
     })
     .await?
 }
@@ -1314,9 +1647,15 @@ pub async fn switch_acp_provider(
             format!("session is already pinned to {provider}"),
         );
     }
+    if let Err(error) = instance.require_resolved_acp_selection() {
+        return supervisor_error_response("provider switch refused", &error.into());
+    }
     // The submission guard keeps new prompts out but does not wait for the
     // running one, and the shutdown below aborts it.
-    let control = state.session_service.fold_control_state(&id).await;
+    let control = match state.session_service.fold_control_state(&id).await {
+        Ok(control) => control,
+        Err(_) => return super::prompt::control_state_unavailable(),
+    };
     if control.turn_active || control.has_active_background_agent() {
         return super::super::api_error(
             StatusCode::CONFLICT,
@@ -1325,7 +1664,9 @@ pub async fn switch_acp_provider(
         );
     }
     let (instance, resume_reservation) =
-        match crate::server::api::sessions::resume_structured_stop(&state, instance, None).await {
+        match crate::server::api::sessions::resume_structured_stop_deferred(&state, instance, None)
+            .await
+        {
             Ok(instance) => instance,
             Err(response) => return response,
         };
@@ -1335,11 +1676,16 @@ pub async fn switch_acp_provider(
     };
 
     if resume_reservation.is_none() {
-        if let Err(e) = crate::server::acp_events::retire_native_worker(
-            &state,
-            &id,
-            std::time::Duration::from_secs(5),
-        )
+        if let Err(e) = async {
+            let target = state.acp_supervisor.capture_retirement(&id)?;
+            crate::server::acp_events::retire_native_worker(
+                &state,
+                &id,
+                target,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        }
         .await
         {
             if matches!(
@@ -1374,9 +1720,9 @@ pub async fn switch_acp_provider(
         .agent_model
         .as_deref()
         .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
-    let exclusion =
+    let (exclusion, attempt) =
         match persist_provider_switch(native.clone(), &instance, &provider, exclusion).await {
-            Ok(exclusion) => exclusion,
+            Ok(prepared) => prepared,
             Err(error) => {
                 if is_store_write_failure(&error) {
                     state.acp_supervisor.request_respawn(&id);
@@ -1396,37 +1742,14 @@ pub async fn switch_acp_provider(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
-        native.clone(),
-        updated.clone(),
-        exclusion,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => return launch_error_response("sandbox container ensure", &e),
-    };
-
-    let request = SpawnRequest {
-        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
-            store: native,
-            generation: instance.lifecycle_generation,
-            namespace: Some(state.profile_namespace.clone()),
-            native_scope: None,
-        }),
-        ..spawn_request_for(&updated, agent, sandbox_info)
-    };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &updated).await {
-        return resp;
-    }
-    let reservation = if let Some(reservation) = resume_reservation {
+    let mut reservation = if let Some(reservation) = resume_reservation {
         reservation
     } else {
         match state
             .acp_supervisor
             .reserve_spawn(
                 &id,
-                if request.stored_acp_session_id.is_some() {
+                if updated.acp_session_id.is_some() {
                     crate::acp::supervisor::ResumeKind::Spawn
                 } else {
                     crate::acp::supervisor::ResumeKind::SpawnFirst
@@ -1439,6 +1762,34 @@ pub async fn switch_acp_provider(
             Err(e) => return supervisor_error_response("spawn failed after provider switch", &e),
         }
     };
+    let mut admission = crate::acp::supervisor::LaunchAdmission {
+        establishment: Some(attempt),
+        store: native.clone(),
+        generation: updated.lifecycle_generation,
+        namespace: Some(state.profile_namespace.clone()),
+        native_scope: None,
+    };
+    let updated = match exclusion
+        .prepare_native_establishment(&state.acp_supervisor, &mut admission, &mut reservation)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return supervisor_error_response("provider switch admission failed", &error),
+    };
+    let (sandbox_info, exclusion) =
+        match crate::acp::sandbox::ensure_container_for_session(native, updated.clone(), exclusion)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => return launch_error_response("sandbox container ensure", &e),
+        };
+    let request = SpawnRequest {
+        launch_admission: Some(admission),
+        ..spawn_request_for(&updated, agent, sandbox_info)
+    };
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &updated).await {
+        return resp;
+    }
     drop(exclusion);
     if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
         return supervisor_error_response("spawn failed after provider switch", &e);
@@ -1486,6 +1837,7 @@ mod tests {
         let mut row = crate::session::Instance::new("Before", project.path().to_str().unwrap());
         row.source_profile = "default".into();
         row.view = crate::session::View::Structured;
+        row.resume_intent = crate::session::ResumeIntent::Use("retained-reentrant-hook".into());
         let id = row.id.clone();
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1553,6 +1905,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -1665,6 +2018,7 @@ mod tests {
             row.source_profile = "default".into();
             row.view = View::Structured;
             row.status = status;
+            row.resume_intent = crate::session::ResumeIntent::Use("retained-durable-stop".into());
             let state = durable_stop_state(row.clone()).await;
             let mut runner = live_stop_runner(&row).await;
             let record = crate::process::worker_registry::load_strict(&row.id)
@@ -1700,13 +2054,16 @@ mod tests {
             assert!(stopped.lifecycle_reservation.is_none());
             assert_reconstructed_stop_does_not_resume(stopped.clone()).await;
 
-            let (resumed, _reservation) =
+            let (resumed, reservation) =
                 crate::server::api::sessions::resume_structured_stop(&state, stopped, None)
                     .await
                     .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
             assert_eq!(resumed.status, Status::Idle);
             assert!(!resumed.is_idle_dormant());
             let admission = crate::acp::supervisor::LaunchAdmission {
+                establishment: reservation
+                    .as_ref()
+                    .and_then(|reservation| reservation.establishment.clone()),
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: resumed.lifecycle_generation,
                 namespace: None,
@@ -1731,273 +2088,103 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn late_assigned_frame_preserves_acknowledged_stop_and_selected_store() {
-        use crate::acp::protocol::AcpBroadcastFrame;
-        use crate::session::{
-            ConversationBinding, ConversationProvenance, ExecutionBinding, Instance, Status,
-            Storage, View,
-        };
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::server::test_support as support;
+        use crate::session::{Status, Storage};
         use std::time::Duration;
-
-        for (first_assignment, retire) in
-            [(true, true), (false, true), (true, false), (false, false)]
-        {
-            let _home = crate::session::test_support::isolate_app_dir();
-            let project = tempfile::tempdir().unwrap();
-            let selected_store = project.path().join("selected-claude-store");
-            std::fs::create_dir(&selected_store).unwrap();
-            let sid = "11111111-1111-4111-8111-111111111111";
-            let binding = ConversationBinding {
-                session_id: sid.into(),
-                execution: Some(ExecutionBinding {
-                    agent: "claude".into(),
-                    stores: vec![selected_store.clone()],
-                    configuration: Vec::new(),
-                    cwd: project.path().to_path_buf(),
-                    cwd_filesystem: "host".into(),
-                    filesystem: "host".into(),
-                    exported_default_store: Some(false),
-                }),
-                provenance: ConversationProvenance::Observed,
-                transcript_path: None,
-            };
-            let mut row = Instance::new("late assignment", project.path().to_str().unwrap());
-            row.source_profile = "default".into();
-            row.view = View::Structured;
-            row.status = Status::Running;
-            row.lifecycle_generation = 37;
-            row.agent_session_id = Some(sid.into());
-            row.agent_session_binding = Some(binding.clone());
-            row.acp_session_id = (!first_assignment).then(|| sid.to_owned());
-            let state = durable_stop_state(row.clone()).await;
-            let mut runner = live_stop_runner(&row).await;
-            let record = crate::process::worker_registry::load_strict(&row.id)
-                .unwrap()
-                .unwrap();
-            state
-                .acp_supervisor
-                .test_install_attached(
-                    &row.id,
-                    crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
-                )
-                .await;
-            let old_epoch = state.acp_supervisor.running_lease(&row.id).unwrap().epoch();
-            let (native, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
-                state.clone(),
-                &row,
-                (),
-            )
-            .await
-            .unwrap();
-            let native_scope = Some(
-                crate::acp::state::NativeObservationScope::capture(&row, native.storage()).unwrap(),
-            );
-            state
-                .acp_supervisor
-                .running_lease(&row.id)
-                .unwrap()
-                .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-                    store: native,
-                    generation: row.lifecycle_generation,
-                    namespace: Some(state.profile_namespace.clone()),
-                    native_scope,
-                }));
-            let gate = crate::server::acp_events::pause_assignment_listener_for_test(&row.id, 1);
-            let listener =
-                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while state.acp_events_tx.receiver_count() == 0 {
-                    tokio::task::yield_now().await;
+        for retire in [true, false] {
+            with_managed(|scope| Box::pin(async move {
+                let mut publications = scope.state.acp_events_tx.subscribe();
+                let session = support::managed_control_session(scope, "late-assignment-stop").await;
+                let state = session.state.clone();
+                let id = session.id().to_owned();
+                let original = session.client.lease.spawned_runner().unwrap();
+                let frame = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let frame = publications.recv().await.unwrap();
+                        if frame.session_id == id && matches!(frame.event.as_ref(),
+                            crate::acp::Event::AcpSessionAssigned { connection_ready: true, native_subject: Some(_), .. })
+                        {
+                            break frame;
+                        }
+                    }
+                }).await.expect("retain the actual original's certified assignment frame");
+                let before = find_instance(&state, &id).await.unwrap();
+                let binding = before.agent_session_binding.clone().expect("actual observed store binding");
+                let gate = crate::server::acp_events::pause_assignment_listener_for_test(&id, frame.seq);
+                let baseline = state.acp_events_tx.receiver_count();
+                let listener_state = state.clone();
+                let listener = scope.spawn_helper(async move {
+                    crate::server::acp_events::acp_event_listener(listener_state).await;
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state.acp_events_tx.receiver_count() <= baseline {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("the real listener subscribes before original frame delivery");
+                state.acp_events_tx.send(frame).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), gate.arrived).await.unwrap().unwrap();
+                let storage = Storage::open_unwatched("test").unwrap();
+                let expected_status = if retire {
+                    let response = shutdown_acp(State(state.clone()), Path(id.clone())).await.into_response();
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    assert!(!crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(original));
+                    Status::Stopped
+                } else {
+                    let _lifecycle = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                    storage.update(|rows, _| {
+                        rows.iter_mut().find(|row| row.id == id).unwrap().mark_idle_dormant();
+                        Ok(())
+                    }).unwrap();
+                    state.instances.write().await.iter_mut().find(|row| row.id == id).unwrap().mark_idle_dormant();
+                    support::refresh_canonical_metadata_for_test(&state).await;
+                    assert!(crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(original));
+                    before.status
+                };
+                let stopped = storage.load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                assert_eq!(stopped.status, expected_status);
+                assert!(stopped.is_idle_dormant());
+                gate.release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), gate.applied).await.unwrap().unwrap();
+                listener.abort();
+                for row in [
+                    find_instance(&state, &id).await.unwrap(),
+                    storage.load().unwrap().into_iter().find(|row| row.id == id).unwrap(),
+                ] {
+                    assert_eq!(row.status, expected_status, "Original assignment is not wake authority");
+                    assert!(row.is_idle_dormant(), "late Native assignment must not consume the durable park");
+                    assert_eq!(row.lifecycle_generation, stopped.lifecycle_generation);
+                    assert_eq!(row.acp_session_id.as_deref(), Some(session.sid.as_str()));
+                    assert_eq!(row.agent_session_binding.as_ref(), Some(&binding));
+                    assert_eq!(row.agent_session_binding.as_ref().unwrap().execution.as_ref().unwrap().exported_default_store,
+                        binding.execution.as_ref().unwrap().exported_default_store);
                 }
-            })
-            .await
-            .expect("listener subscribed");
-            let mut event = crate::acp::Event::AcpSessionAssigned {
-                acp_session_id: sid.into(),
-                connection_ready: false,
-                native_subject: None,
-            };
-            let subject = crate::acp::state::NativeEventSubject::channel(
-                state
-                    .acp_supervisor
-                    .running_lease(&row.id)
-                    .unwrap()
-                    .native_scope()
-                    .unwrap()
-                    .unwrap()
-                    .context,
-                Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
-                    &record,
-                )),
-                &event,
-            );
-            event.set_native_subject(subject);
-            state.acp_event_store.record(&row.id, 1, &event).unwrap();
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    native_subject: Some(subject),
-                    session_id: row.id.clone(),
-                    seq: 1,
-                    event: Arc::new(event),
-                    worker_generation: Some(old_epoch),
-                    sidebar_status: Some(Status::Idle),
-                })
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), gate.arrived)
-                .await
-                .expect("original tagged assignment reached listener")
-                .unwrap();
-            assert!(state
-                .acp_supervisor
-                .running_lease(&row.id)
-                .is_some_and(|lease| lease.epoch() == old_epoch));
-
-            let storage = Storage::open_unwatched("default").unwrap();
-            let expected_status = if retire {
-                let stopped = shutdown_acp(State(state.clone()), Path(row.id.clone()))
-                    .await
-                    .into_response();
-                assert_eq!(stopped.status(), StatusCode::NO_CONTENT);
-                let exit = tokio::time::timeout(Duration::from_secs(5), runner.wait())
-                    .await
-                    .expect("original runner retired")
-                    .unwrap();
-                assert!(!exit.success());
-                assert!(!state.acp_supervisor.is_owned(&row.id).await);
-                assert!(crate::process::worker_registry::load(&row.id)
-                    .unwrap()
-                    .is_none());
-                Status::Stopped
-            } else {
-                // Idle retirement persists its marker before claiming the still-current lease.
-                {
-                    let _lifecycle = storage.acquire_instance_lifecycle_lock(&row.id).unwrap();
-                    storage
-                        .update(|rows, _| {
-                            rows.iter_mut()
-                                .find(|instance| instance.id == row.id)
-                                .unwrap()
-                                .mark_idle_dormant();
-                            Ok(())
-                        })
-                        .unwrap();
-                }
-                state
-                    .instances
-                    .write()
-                    .await
-                    .iter_mut()
-                    .find(|instance| instance.id == row.id)
-                    .unwrap()
-                    .mark_idle_dormant();
-                assert!(state
-                    .acp_supervisor
-                    .running_lease(&row.id)
-                    .is_some_and(|lease| lease.epoch() == old_epoch));
-                assert!(runner.try_wait().unwrap().is_none());
-                Status::Running
-            };
-            let committed = storage.load().unwrap().remove(0);
-            assert_eq!(committed.status, expected_status);
-            assert!(committed.is_idle_dormant());
-            assert!(committed.lifecycle_reservation.is_none());
-            let stop_generation = committed.lifecycle_generation;
-            assert_eq!(committed.agent_session_id.as_deref(), Some(sid));
-            assert_eq!(committed.agent_session_binding.as_ref(), Some(&binding));
-            {
-                let rows = state.instances.read().await;
-                let cached_stop = rows.iter().find(|instance| instance.id == row.id).unwrap();
-                assert_eq!(cached_stop.status, expected_status);
-                assert!(cached_stop.is_idle_dormant());
-                assert_eq!(cached_stop.lifecycle_generation, stop_generation);
-            }
-
-            gate.release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), gate.applied)
-                .await
-                .expect("assignment application and persistence finished")
-                .unwrap();
-            listener.abort();
-            let _ = listener.await;
-            let cached = state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|instance| instance.id == row.id)
-                .unwrap()
-                .clone();
-            let durable = storage.load().unwrap().remove(0);
-            for (source, retained) in [("cache", &cached), ("disk", &durable)] {
-                assert_eq!(retained.status, expected_status,
-                    "{source}, first_assignment={first_assignment}, retired={retire}: observed SID is not wake authority");
-                assert!(retained.is_idle_dormant(),
-                    "{source}, first_assignment={first_assignment}, retired={retire}: assignment consumed Stop/dormancy");
-                assert_eq!(retained.lifecycle_generation, stop_generation);
-                assert_eq!(retained.acp_session_id.as_deref(), Some(sid));
-                assert_eq!(retained.agent_session_id.as_deref(), Some(sid));
-                assert_eq!(retained.agent_session_binding.as_ref(), Some(&binding));
-                assert_eq!(
-                    retained
-                        .agent_session_binding
-                        .as_ref()
-                        .unwrap()
-                        .execution
-                        .as_ref()
-                        .unwrap()
-                        .exported_default_store,
-                    Some(false)
+                let sid = session.sid.clone();
+                let (config, native) = scope.native_peer(
+                    PathBuf::from(&before.project_path), "claude", "claude",
+                    move |request| Some(match request["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                            "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+                        "session/load" => {
+                            assert_eq!(request["params"]["sessionId"], sid);
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}})
+                        },
+                        other => panic!("manual resume must retain the actual selected Native: {other}"),
+                    }),
                 );
-            }
-
-            let (resumed, reservation) =
-                crate::server::api::sessions::resume_structured_stop(&state, cached, None)
-                    .await
-                    .unwrap_or_else(|response| {
-                        panic!("manual resume failed: {}", response.status())
-                    });
-            assert_eq!(resumed.status, Status::Idle);
-            assert!(!resumed.is_idle_dormant());
-            if !retire {
-                let exit = tokio::time::timeout(Duration::from_secs(5), runner.wait())
-                    .await
-                    .expect("explicit resume retired the dormant original")
-                    .unwrap();
-                assert!(!exit.success());
-            }
-            assert!(resumed.lifecycle_generation > stop_generation);
-            let reservation =
-                reservation.expect("retiring the dormant original reserves its explicit successor");
-            assert_ne!(reservation.lease().epoch(), old_epoch);
-            assert!(!state
-                .acp_supervisor
-                .test_cancel_requested(reservation.lease()));
-            let mut child = crate::acp::supervisor::with_durable_launch(
-                Some(crate::acp::supervisor::LaunchAdmission {
-                    store: Arc::new(Storage::open_unwatched("default").unwrap()),
-                    generation: resumed.lifecycle_generation,
-                    namespace: None,
-                    native_scope: None,
-                }),
-                row.id.clone(),
-                || {
-                    std::process::Command::new("true")
-                        .spawn()
-                        .map_err(|error| crate::acp::acp_client::AcpError::Spawn(error.to_string()))
-                },
-            )
-            .await
-            .expect("explicit resume passes the actual native birth gate");
-            assert!(child.wait().unwrap().success());
-            let after_resume = storage.load().unwrap().remove(0);
-            assert_eq!(after_resume.agent_session_id.as_deref(), Some(sid));
-            assert_eq!(after_resume.agent_session_binding.as_ref(), Some(&binding));
-            drop(reservation);
-            assert_eq!(
-                state.acp_supervisor.worker_state(&row.id).await,
-                crate::daemon::AcpWorkerState::Absent,
-                "dropping an unpublished construction abandons its lease; no worker needs shutdown"
-            );
+                let replacement = scope.resume_stopped(&id, config).await;
+                replacement.ready().await;
+                assert_ne!(replacement.lease.epoch(), session.client.lease.epoch());
+                assert_ne!(replacement.lease.spawned_runner(), Some(original));
+                assert_eq!(native.requests().iter().filter(|method| *method == "session/load").count(), 1);
+                assert!(!native.requests().iter().any(|method| method == "session/new"));
+                let resumed = find_instance(&state, &id).await.unwrap();
+                assert!(!resumed.is_idle_dormant());
+                assert!(resumed.lifecycle_generation > stopped.lifecycle_generation);
+                assert_eq!(resumed.acp_session_id.as_deref(), Some(session.sid.as_str()));
+                assert_eq!(resumed.agent_session_binding.as_ref(), Some(&binding));
+            })).await;
         }
     }
 
@@ -2012,6 +2199,7 @@ mod tests {
             row.source_profile = "default".into();
             row.view = View::Structured;
             row.status = Status::Running;
+            row.resume_intent = crate::session::ResumeIntent::Use("retained-prebirth-stop".into());
             let old_generation = row
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
@@ -2062,6 +2250,7 @@ mod tests {
             };
 
             let admission = crate::acp::supervisor::LaunchAdmission {
+                establishment: None,
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: old_generation,
                 namespace: None,
@@ -2103,129 +2292,79 @@ mod tests {
     #[serial_test::serial]
     async fn restart_commits_original_binding_before_releasing_its_admission() {
         use crate::acp::runner_lifecycle::ProcessControl as _;
-        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::acp::Event;
-        use crate::session::{Instance, Status, Storage, View};
-
-        let _home = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let mut row = Instance::new("restart original binding", project.path().to_str().unwrap());
-        row.source_profile = "default".into();
-        row.view = View::Structured;
-        row.status = Status::Running;
-        row.tool = "claude".into();
-        row.agent_name = Some("claude".into());
-        let id = row.id.clone();
-        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
-        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        let mut runner = HeldAttachRunner::recording_prompt(
-            &id,
-            project.path(),
-            17,
-            Some("default"),
-            "original-native-restart",
-        )
-        .await;
-        runner.record.scope = crate::process::worker_registry::ScopeOwnership::Unscoped;
-        crate::process::worker_registry::save(&runner.record).unwrap();
-        let mut events = state.acp_events_tx.subscribe();
-        state
-            .acp_supervisor
-            .attach(id.clone(), project.path().into(), Vec::new(), false, None)
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let frame = events.recv().await.unwrap();
-                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned {
-                    acp_session_id, connection_ready: true, native_subject: Some(_),
-                } if acp_session_id == "original-native-restart")
-                {
-                    break;
+        use crate::session::Storage;
+        with_managed(|scope| Box::pin(async move {
+                let project = scope.tempdir();
+                let native_store = project.path().join("claude-native-store");
+                std::fs::create_dir(&native_store).unwrap();
+                scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+                std::env::set_var("CLAUDE_CONFIG_DIR", &native_store);
+                let (config, native) = scope.native_peer(project.path().into(), "claude", "claude", |request| {
+                    let id = request.get("id")?;
+                    Some(match request["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                        "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"original-native-restart"}}),
+                        other => panic!("retirement cannot issue another native session operation: {other}"),
+                    })
+                });
+                let mut client = scope.spawn(config, "restart-original-binding").await.unwrap();
+                client.ready().await;
+                let id = client.id.clone();
+                let state = scope.state.clone();
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let event = client.next_event().await.unwrap();
+                        if matches!(&event, Event::AcpSessionAssigned {
+                            acp_session_id, connection_ready: true, native_subject: Some(_),
+                        } if acp_session_id == "original-native-restart") { break; }
+                        assert!(!matches!(event, Event::AgentStartupError { .. }));
+                    }
+                }).await.unwrap();
+                let original = state.acp_supervisor.current_native_availability(&id).await.unwrap();
+                let owner = original.owner.expect("the real original owner");
+                assert_eq!(Some(owner), client.lease.spawned_runner());
+                assert_ne!(owner.pid, std::process::id());
+                assert_eq!(state.instances.read().await.iter().find(|row| row.id == id).unwrap().acp_session_id.as_deref(),
+                    Some("original-native-restart"),
+                    "the certified original binding is published by its establishment CAS");
+                let storage = Storage::open_unwatched("test").unwrap();
+                let row = storage.load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                assert!(matches!(row.acp_establishment, Some(crate::acp::establishment::AcpEstablishment::Applied { .. })),
+                    "retirement starts from a real certified original, not a mock Ready");
+                let snapshot = || state.acp_event_store.replay_from(&id, 0).expect("read retained events").into_iter()
+                    .map(|stored| (stored.seq, stored.metadata.scope as i64,
+                        serde_json::to_value(&stored.metadata).unwrap(), stored.event.native_subject(),
+                        serde_json::to_value(stored.event.as_ref()).unwrap()))
+                    .collect::<Vec<_>>();
+                let history = snapshot();
+                let restart = state.acp_supervisor.try_begin_restart_with_reason(&id).await.unwrap();
+                // This is an ordinary retained Applied restart, not a Fresh or
+                // unresolved-attempt recovery request.
+                if let Err(response) = retire_restart_worker(&state, &row, &restart, None).await {
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    panic!("restart retirement failed: {status}: {}", String::from_utf8_lossy(&body));
                 }
-                assert!(!matches!(
-                    frame.event.as_ref(),
-                    Event::AgentStartupError { .. }
-                ));
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(runner.resumed_session().await, "original-native-restart");
-        let original = state
-            .acp_supervisor
-            .current_native_availability(&id)
-            .await
-            .unwrap();
-        assert_eq!(original.owner, Some(runner.identity));
-        assert!(
-            state.instances.read().await[0].acp_session_id.is_none(),
-            "the original received binding has not been consumed by an event listener"
-        );
-        let snapshot = || {
-            state
-                .acp_event_store
-                .replay_from(&id, 0)
-                .into_iter()
-                .map(|(seq, event)| {
-                    (
-                        seq,
-                        event.native_subject(),
-                        serde_json::to_value(event).unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let history = snapshot();
-        let restart = state
-            .acp_supervisor
-            .try_begin_restart_with_reason(&id)
-            .await
-            .unwrap();
-        if let Err(response) = retire_restart_worker(&state, &row, &restart).await {
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_else(|error| format!("reading bounded response body failed: {error}"));
-            panic!("restart retirement failed: {status}: {body}");
-        }
-        assert!(
-            !crate::acp::runner_lifecycle::SystemProcessControl::default()
-                .is_alive(runner.identity)
-        );
-        let memory = state.instances.read().await;
-        assert_eq!(
-            memory[0].acp_session_id.as_deref(),
-            Some("original-native-restart")
-        );
-        drop(memory);
-        let stored = Storage::open_reference("default")
-            .unwrap()
-            .load()
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            stored.acp_session_id.as_deref(),
-            Some("original-native-restart")
-        );
-        assert!(snapshot().starts_with(&history));
-        let reservation = state
-            .acp_supervisor
-            .reserve_spawn_with_restart(
-                &id,
-                crate::acp::supervisor::ResumeKind::Spawn,
-                crate::process::worker_registry::ResumeAuthority::Explicit,
-                Some(&restart),
-            )
-            .await
-            .expect("the foreground checkpoint ACK releases actual replacement admission");
-        assert!(state.acp_supervisor.current_lease(&id) == Some(reservation.lease().clone()));
-        assert!(reservation.lease() != &original.lease);
-        assert!(!restart.is_cancelled());
-        drop(reservation);
-        state.shutdown.cancel();
+                assert!(!crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(owner));
+                let memory = state.instances.read().await;
+                assert_eq!(memory.iter().find(|row| row.id == id).unwrap().acp_session_id.as_deref(),
+                    Some("original-native-restart"));
+                drop(memory);
+                let stored = storage.load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                assert_eq!(stored.acp_session_id.as_deref(), Some("original-native-restart"));
+                assert!(snapshot().starts_with(&history));
+                let reservation = state.acp_supervisor.reserve_spawn_with_restart(
+                    &id, crate::acp::supervisor::ResumeKind::Spawn,
+                    crate::process::worker_registry::ResumeAuthority::Explicit, Some(&restart),
+                ).await.expect("the foreground checkpoint ACK releases actual replacement admission");
+                assert!(state.acp_supervisor.current_lease(&id) == Some(reservation.lease().clone()));
+                assert!(reservation.lease() != &original.lease);
+                assert!(!restart.is_cancelled());
+                assert_eq!(native.requests().iter().filter(|method| *method == "session/new").count(), 1);
+                drop(reservation);
+            })).await;
     }
 
     #[tokio::test]
@@ -2239,6 +2378,7 @@ mod tests {
         let mut row = Instance::new("stop then resume", project.path().to_str().unwrap());
         row.source_profile = "default".into();
         row.view = View::Structured;
+        row.resume_intent = crate::session::ResumeIntent::Use("retained-explicit-resume".into());
         let state = durable_stop_state(row.clone()).await;
         assert_eq!(
             shutdown_acp(State(state.clone()), Path(row.id.clone()))
@@ -2271,6 +2411,7 @@ mod tests {
                 stopped,
                 None,
                 Some(&restart),
+                None,
             )
             .await
             .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
@@ -2613,6 +2754,8 @@ mod tests {
             row.lifecycle_generation = 9;
             row.tool = "claude".into();
             row.agent_name = Some("claude".into());
+            row.resume_intent =
+                crate::session::ResumeIntent::Use("retained-reconstructed-stop".into());
             if native_status == Status::Stopped {
                 row.mark_idle_dormant();
             }
@@ -2648,6 +2791,7 @@ mod tests {
                     &crate::acp::Event::Stopped {
                         reason: "user_stopped".into(),
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             crate::server::acp_events::seed_acp_statuses(state.clone()).await;
@@ -2671,6 +2815,7 @@ mod tests {
             );
             if native_status == Status::Stopped {
                 let admission = crate::acp::supervisor::LaunchAdmission {
+                    establishment: None,
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: row.lifecycle_generation,
                     namespace: None,
@@ -2704,7 +2849,14 @@ mod tests {
     async fn explicit_backend_and_provider_switches_resume_native_stop_before_birth() {
         use crate::session::{Instance, LifecycleOperation, Status, Storage, View};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for case in ["backend", "provider", "invalid_backend", "invalid_provider"] {
+        for case in [
+            "backend",
+            "provider",
+            "invalid_backend",
+            "invalid_provider",
+            "unselected_backend",
+            "unselected_provider",
+        ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let project = tempfile::tempdir().unwrap();
             let mut row = Instance::new(case, project.path().to_str().unwrap());
@@ -2714,6 +2866,9 @@ mod tests {
             row.tool = "claude".into();
             row.agent_name = Some("claude".into());
             row.agent_provider = Some("anthropic".into());
+            if !case.starts_with("unselected") {
+                crate::server::test_support::select_retained_for_test(&mut row);
+            }
             row.mark_idle_dormant();
             let observed = row
                 .try_acquire_lifecycle_reservation(
@@ -2748,7 +2903,7 @@ mod tests {
                     State(state.clone()),
                     Path(row.id.clone()),
                     Ok(Json(SwitchAgentRequest {
-                        target: if case == "backend" {
+                        target: if !case.starts_with("invalid") {
                             "codex".into()
                         } else {
                             "not-a-registered-agent".into()
@@ -2760,7 +2915,7 @@ mod tests {
                 .await
                 .into_response()
             } else {
-                let provider = if case == "provider" {
+                let provider = if !case.starts_with("invalid") {
                     crate::session::environment::AGENT_PROVIDERS
                         .iter()
                         .find(|provider| **provider != "anthropic")
@@ -2783,11 +2938,16 @@ mod tests {
                 .load()
                 .unwrap()
                 .remove(0);
-            if case.starts_with("invalid") {
+            if case.starts_with("invalid") || case.starts_with("unselected") {
                 assert_eq!(births.load(Ordering::SeqCst), 0);
                 assert_eq!(stored.lifecycle_generation, observed);
                 assert_eq!(stored.status, Status::Stopped);
                 assert!(stored.is_idle_dormant());
+                assert_eq!(
+                    serde_json::to_value(&stored).unwrap(),
+                    serde_json::to_value(&row).unwrap(),
+                    "{case}: refusal preserves the exact stopped source and selection"
+                );
             } else {
                 assert_eq!(
                     births.load(Ordering::SeqCst),
@@ -2816,6 +2976,7 @@ mod tests {
             State(Arc::clone(&state)),
             Path(id.clone()),
             Ok(Json(SpawnAcpRequest {
+                recovery: None,
                 agent: None,
                 model: None,
                 additional_dirs: Vec::new(),
@@ -2869,6 +3030,7 @@ mod tests {
             State(state.clone()),
             Path(id.clone()),
             Ok(Json(SpawnAcpRequest {
+                recovery: None,
                 agent: None,
                 model: None,
                 additional_dirs: Vec::new(),
@@ -2921,6 +3083,8 @@ mod tests {
         let mut instance = crate::session::Instance::new("restart", "/tmp/aoe-restart-api");
         instance.view = crate::session::View::Structured;
         instance.source_profile = "default".into();
+        instance.resume_intent =
+            crate::session::ResumeIntent::Use("retained-restart-cancel".into());
         let id = instance.id.clone();
         crate::server::test_support::seed_instances_on_disk_for_test(
             "default",
@@ -2959,6 +3123,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -2975,6 +3140,15 @@ mod tests {
                 .expect("initial spawn reaches its blocked launcher"),
             Some(0)
         );
+        let pending = find_instance(&state, &id).await.unwrap();
+        let recovery = crate::acp::establishment::EstablishmentRecovery {
+            expected: crate::acp::establishment::EstablishmentExpected::capture(
+                &pending,
+                &crate::session::Storage::open_reference("default").unwrap(),
+            )
+            .unwrap(),
+            action: crate::acp::establishment::EstablishmentRecoveryAction::Same,
+        };
 
         let restarting = {
             let state = Arc::clone(&state);
@@ -2984,6 +3158,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: Some(recovery),
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -3009,6 +3184,7 @@ mod tests {
             State(Arc::clone(&state)),
             Path(id.clone()),
             Ok(Json(SpawnAcpRequest {
+                recovery: None,
                 agent: None,
                 model: None,
                 additional_dirs: Vec::new(),
@@ -3051,6 +3227,7 @@ mod tests {
         let mut instance = crate::session::Instance::new("stop-start", "/tmp/aoe-stop-start-api");
         instance.view = crate::session::View::Structured;
         instance.source_profile = "default".into();
+        crate::server::test_support::select_retained_for_test(&mut instance);
         let id = instance.id.clone();
         crate::server::test_support::seed_instances_on_disk_for_test(
             "default",
@@ -3089,6 +3266,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -3188,6 +3366,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -3296,6 +3475,7 @@ mod tests {
                 State(Arc::clone(&state)),
                 Path(id.clone()),
                 Ok(Json(SpawnAcpRequest {
+                    recovery: None,
                     agent: Some(agent.into()),
                     model: None,
                     additional_dirs: Vec::new(),
@@ -3327,6 +3507,8 @@ mod tests {
         instance.view = crate::session::View::Structured;
         instance.agent_name = Some("claude".into());
         instance.source_profile = "default".into();
+        instance.resume_intent =
+            crate::session::ResumeIntent::Use("retained-restart-barrier".into());
         let id = instance.id.clone();
         crate::server::test_support::seed_instances_on_disk_for_test(
             "default",
@@ -3366,6 +3548,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -3414,71 +3597,101 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn restart_survives_request_cancellation_after_worker_retirement() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let mut instance =
-            crate::session::Instance::new("restart-disconnect", "/tmp/aoe-restart-disconnect");
-        instance.view = crate::session::View::Structured;
-        instance.agent_name = Some("claude".into());
-        instance.source_profile = "default".into();
-        let id = instance.id.clone();
-        crate::server::test_support::seed_instances_on_disk_for_test(
-            "default",
-            vec![instance.clone()],
-        );
-        let state = crate::server::test_support::build_test_app_state_with_launcher(
-            vec![instance],
-            crate::server::test_support::succeeding_launcher(),
-        );
-        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        state.acp_supervisor.test_insert_worker(&id).await;
-        let lock = state.instance_lock(&id).await;
-        let guard = lock.lock().await;
-        let request = {
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            tokio::spawn(async move {
-                restart_acp(
-                    State(state),
-                    Path(id),
-                    Ok(Json(SpawnAcpRequest {
-                        agent: None,
-                        model: None,
-                        additional_dirs: Vec::new(),
-                        provider_env: Vec::new(),
-                    })),
-                )
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::server::test_support::managed_control_session;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let session = managed_control_session(scope, "restart-disconnect").await;
+                let state = session.state.clone();
+                let id = session.id().to_owned();
+                let original = session.client.lease.spawned_runner().unwrap();
+                let row = find_instance(&state, &id).await.unwrap();
+                let sid = session.sid.clone();
+                let expected_sid = sid.clone();
+                let (config, native) = scope.native_peer(
+                    PathBuf::from(&row.project_path),
+                    "claude",
+                    "claude",
+                    move |request| {
+                        Some(match request["method"].as_str().unwrap() {
+                            "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                        "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+                            "session/load" => {
+                                assert_eq!(request["params"]["sessionId"], expected_sid);
+                                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}})
+                            }
+                            other => panic!(
+                                "restart cannot create or prompt another conversation: {other}"
+                            ),
+                        })
+                    },
+                );
+                let events = scope.bind_external_launch(&id, config);
+                let lock = state.instance_lock(&id).await;
+                let guard = lock.lock().await;
+                let request = tokio::spawn({
+                    let state = state.clone();
+                    let id = id.clone();
+                    async move {
+                        restart_acp(
+                            State(state),
+                            Path(id),
+                            Ok(Json(SpawnAcpRequest {
+                                recovery: None,
+                                agent: None,
+                                model: None,
+                                additional_dirs: Vec::new(),
+                                provider_env: Vec::new(),
+                            })),
+                        )
+                        .await
+                        .into_response()
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while state.acp_supervisor.worker_state(&id).await
+                        != crate::daemon::AcpWorkerState::Absent
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
                 .await
-                .into_response()
+                .expect("the actual original retires before replacement exclusion");
+                assert!(
+                    !crate::acp::runner_lifecycle::SystemProcessControl::default()
+                        .is_alive(original)
+                );
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+                drop(guard);
+                let replacement = scope.observe_external_resume(id.clone(), events).await;
+                replacement.ready().await;
+                let replacement_owner = replacement.lease.spawned_runner().unwrap();
+                assert_ne!(replacement_owner, original);
+                assert_eq!(
+                    find_instance(&state, &id)
+                        .await
+                        .unwrap()
+                        .acp_session_id
+                        .as_deref(),
+                    Some(sid.as_str())
+                );
+                assert_eq!(
+                    native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/load")
+                        .count(),
+                    1
+                );
+                assert!(!native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/new"));
             })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while state.acp_supervisor.worker_state(&id).await
-                != crate::daemon::AcpWorkerState::Absent
-            {
-                tokio::task::yield_now().await;
-            }
         })
-        .await
-        .expect("old worker retires");
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        drop(guard);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while state.acp_supervisor.worker_state(&id).await
-                != crate::daemon::AcpWorkerState::Running
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("replacement runs after request cancellation");
-        assert_eq!(
-            shutdown_acp(State(Arc::clone(&state)), Path(id))
-                .await
-                .into_response()
-                .status(),
-            StatusCode::NO_CONTENT
-        );
+        .await;
     }
 
     #[tokio::test]
@@ -3489,79 +3702,74 @@ mod tests {
             (true, false, false),
             (false, false, true),
         ] {
-            let _home = crate::session::test_support::isolate_app_dir();
-            let mut instance =
-                crate::session::Instance::new("restart-exclusion", "/tmp/aoe-restart-exclusion");
-            instance.view = crate::session::View::Structured;
-            instance.agent_name = Some("claude".into());
-            instance.source_profile = "default".into();
-            let id = instance.id.clone();
-            crate::server::test_support::seed_instances_on_disk_for_test(
-                "default",
-                vec![instance.clone()],
-            );
-            let state = crate::server::test_support::build_test_app_state_with_launcher(
-                vec![instance],
-                crate::server::test_support::succeeding_launcher(),
-            );
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            state.acp_supervisor.test_insert_worker(&id).await;
-            let lock = state.instance_lock(&id).await;
-            let guard = lock.lock().await;
-            let mut claims = state.session_service.watch_submission_claims();
-            let request = {
-                let state = Arc::clone(&state);
-                let id = id.clone();
-                tokio::spawn(async move {
-                    restart_acp(
-                        State(state),
-                        Path(id),
-                        Ok(Json(SpawnAcpRequest {
-                            agent: None,
-                            model: None,
-                            additional_dirs: Vec::new(),
-                            provider_env: Vec::new(),
-                        })),
-                    )
-                    .await
-                    .into_response()
-                })
-            };
-            for _ in 0..2 {
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(3), claims.recv())
+            use crate::acp::supervisor::test_support::managed::with_managed;
+            use crate::server::test_support::managed_control_session;
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let session = managed_control_session(scope, "restart-exclusion").await;
+                    let state = session.state.clone();
+                    let id = session.id().to_owned();
+                    let lock = state.instance_lock(&id).await;
+                    let mut guard = Some(lock.lock().await);
+                    let mut claims = state.session_service.watch_submission_claims();
+                    let request = {
+                        let state = Arc::clone(&state);
+                        let id = id.clone();
+                        tokio::spawn(async move {
+                            restart_acp(
+                                State(state),
+                                Path(id),
+                                Ok(Json(SpawnAcpRequest {
+                                    recovery: None,
+                                    agent: None,
+                                    model: None,
+                                    additional_dirs: Vec::new(),
+                                    provider_env: Vec::new(),
+                                })),
+                            )
+                            .await
+                            .into_response()
+                        })
+                    };
+                    for _ in 0..2 {
+                        assert_eq!(
+                            tokio::time::timeout(std::time::Duration::from_secs(3), claims.recv())
+                                .await
+                                .expect("restart reaches each submission barrier"),
+                            Some(id.clone())
+                        );
+                    }
+                    assert_eq!(
+                        state.acp_supervisor.worker_state(&id).await,
+                        crate::daemon::AcpWorkerState::Absent
+                    );
+                    if cancel {
+                        state.acp_supervisor.cancel_restart_request(&id).await;
+                    } else {
+                        let mut instances = state.instances.write().await;
+                        let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                        if change_agent {
+                            row.agent_name = Some("codex".into());
+                        }
+                        if change_view {
+                            row.view = crate::session::View::Terminal;
+                        }
+                        drop(instances);
+                        drop(guard.take());
+                    }
+                    let response = tokio::time::timeout(std::time::Duration::from_secs(3), request)
                         .await
-                        .expect("restart reaches each submission barrier"),
-                    Some(id.clone())
-                );
-            }
-            assert_eq!(
-                state.acp_supervisor.worker_state(&id).await,
-                crate::daemon::AcpWorkerState::Absent
-            );
-            if cancel {
-                state.acp_supervisor.cancel_restart_request(&id).await;
-            } else {
-                let mut instances = state.instances.write().await;
-                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
-                if change_agent {
-                    row.agent_name = Some("codex".into());
-                }
-                if change_view {
-                    row.view = crate::session::View::Terminal;
-                }
-                drop(instances);
-                drop(guard);
-            }
-            let response = tokio::time::timeout(std::time::Duration::from_secs(3), request)
-                .await
-                .expect("restart finishes")
-                .expect("restart task");
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            assert_eq!(
-                state.acp_supervisor.worker_state(&id).await,
-                crate::daemon::AcpWorkerState::Absent
-            );
+                        .expect("restart finishes")
+                        .expect("restart task");
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    assert_eq!(
+                        state.acp_supervisor.worker_state(&id).await,
+                        crate::daemon::AcpWorkerState::Absent
+                    );
+                    drop(guard.take());
+                })
+            })
+            .await;
         }
     }
 
@@ -3575,30 +3783,64 @@ mod tests {
         use std::task::Poll;
 
         for legacy_mode in [false, true] {
-            let _home = crate::session::test_support::isolate_app_dir();
-            let mut row = crate::session::Instance::new("provider ordering", "/repo");
-            row.source_profile = "default".into();
-            row.view = crate::session::View::Structured;
-            row.agent_name = Some("claude".into());
-            row.agent_provider = Some("anthropic".into());
-            row.agent_model = Some("old-provider-model".into());
-            let id = row.id.clone();
-            crate::server::test_support::seed_instances_on_disk_for_test(
-                "default",
-                vec![row.clone()],
+            use crate::acp::supervisor::test_support::managed::with_managed;
+            use crate::server::test_support::managed_control_session;
+            with_managed(|scope| Box::pin(async move {
+            let session = managed_control_session(scope, "selector-provider-order").await;
+            let state = session.state.clone();
+            let id = session.id().to_owned();
+            let current = find_instance(&state, &id).await.unwrap();
+            let (initialize_seen, initialize_observed) = tokio::sync::oneshot::channel();
+            let mut initialize_seen = Some(initialize_seen);
+            let selected = session.sid.clone();
+            let (config, native) = scope.native_peer(
+                PathBuf::from(&current.project_path), "claude", "claude",
+                move |request| {
+                    if request["method"] == "initialize" {
+                        initialize_seen.take().unwrap().send(request.clone()).unwrap();
+                        return None;
+                    }
+                    Some(match request["method"].as_str().unwrap() {
+                    "session/load" => {
+                        assert_eq!(request["params"]["sessionId"], selected);
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                            "modes":{"currentModeId":"old-mode","availableModes":[
+                                {"id":"old-mode","name":"Old"},{"id":"plan","name":"Plan"}]},
+                            "configOptions":[{"id":"model","name":"Model","type":"select",
+                                "category":"model","currentValue":"default","options":[
+                                    {"value":"default","name":"Default"},
+                                    {"value":"new-provider-model","name":"New provider model"}]}]
+                        }})
+                    },
+                    "session/set_mode" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+                    "session/set_config_option" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                        "result":{"configOptions":[]}}),
+                    other => panic!("selector replacement must retain the selected conversation: {other}"),
+                    })
+                },
             );
-            let state = crate::server::test_support::build_test_app_state(vec![row]);
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            let old_commands = state
-                .acp_supervisor
-                .test_insert_worker_cmd_recording(&id)
-                .await;
-            let switching = state
-                .session_service
-                .prompt_submission_for_session(&id)
-                .await
-                .unwrap();
-            let mut claims = state.session_service.watch_submission_claims();
+            let events = scope.bind_external_launch(&id, config);
+            let lock = state.instance_lock(&id).await;
+            let guard = lock.lock().await;
+            let mut switch_claims = state.session_service.watch_submission_claims();
+            let mut switching = Box::pin(async {
+                switch_acp_provider(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SwitchProviderRequest { provider: "vertex".into() })),
+                ).await.into_response()
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    claimed = switch_claims.recv() => {
+                        assert_eq!(claimed.unwrap().as_str(), id.as_str());
+                    }
+                    response = &mut switching => panic!(
+                        "provider switch bypassed its instance exclusion: {}", response.status(),
+                    ),
+                }
+            }).await.expect("the actual switch claims submission before instance exclusion");
+            let mut claims = switch_claims;
             let mut selecting = Box::pin(async {
                 if legacy_mode {
                     acp_set_mode(
@@ -3606,6 +3848,7 @@ mod tests {
                         Path(id.clone()),
                         Ok(Json(SetModeRequest {
                             mode_id: "plan".into(),
+                            request_nonce: None,
                         })),
                     )
                     .await
@@ -3617,6 +3860,7 @@ mod tests {
                         Ok(Json(SetConfigOptionRequest {
                             config_id: "model".into(),
                             value: "new-provider-model".into(),
+                            request_nonce: None,
                         })),
                     )
                     .await
@@ -3638,46 +3882,48 @@ mod tests {
                     .as_deref(),
                 Some(id.as_str())
             );
-            state.acp_supervisor.test_flush_worker_commands(&id).await;
-            assert!(
-                old_commands.lock().unwrap().is_empty(),
-                "no selection may reach the old provider"
-            );
-            state
-                .acp_supervisor
-                .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
-            let expected = find_instance(&state, &id).await.unwrap();
-            let exclusion =
-                crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, false)
-                    .await
-                    .unwrap();
-            let (native, exclusion) = launch_store_for(&state, &expected, exclusion)
-                .await
-                .unwrap();
-            persist_provider_switch(native, &expected, "vertex", exclusion)
-                .await
-                .unwrap();
-            let new_commands = state
-                .acp_supervisor
-                .test_insert_worker_cmd_recording(&id)
-                .await;
-            drop(switching);
+            let command = if legacy_mode { "session/set_mode" } else { "session/set_config_option" };
+            assert!(!session.native.requests().iter().any(|method| method == command),
+                "no selection may reach the old provider while submission is held");
+            drop(guard);
+            let mut switched = None;
+            let mut initialize_observed = initialize_observed;
+            let initialize = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        request = &mut initialize_observed => break request.unwrap(),
+                        response = &mut switching, if switched.is_none() => {
+                            assert_eq!(response.status(), StatusCode::OK);
+                            switched = Some(response);
+                        },
+                    }
+                }
+            }).await.expect("the actual provider switch reaches its replacement Native");
+            native.send(serde_json::json!({"jsonrpc":"2.0","id":initialize["id"],
+                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}})).await;
+            let switched = match switched {
+                Some(response) => response,
+                None => tokio::time::timeout(std::time::Duration::from_secs(10), switching)
+                    .await.unwrap(),
+            };
+            assert_eq!(switched.status(), StatusCode::OK);
+            let replacement = scope.observe_external_resume(id.clone(), events).await;
+            replacement.ready().await;
             let response = tokio::time::timeout(std::time::Duration::from_secs(5), selecting)
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             state.acp_supervisor.test_flush_worker_commands(&id).await;
-            let command = if legacy_mode {
-                "set_mode"
-            } else {
-                "set_config_option"
-            };
-            assert!(!old_commands.lock().unwrap().contains(&command));
-            assert_eq!(*new_commands.lock().unwrap(), [command]);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !native.requests().iter().any(|method| method == command) {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("the new provider receives the queued selector");
+            assert!(!session.native.requests().iter().any(|method| method == command));
+            assert_eq!(native.requests().iter().filter(|method| *method == command).count(), 1);
+            assert!(!native.requests().iter().any(|method| method == "session/new"));
             let live = find_instance(&state, &id).await.unwrap();
-            let disk = crate::server::test_support::load_instances_from_disk_for_test("default");
+            let disk = crate::server::test_support::load_instances_from_disk_for_test("test");
             let stored = disk.iter().find(|row| row.id == id).unwrap();
             for row in [&live, stored] {
                 assert_eq!(row.agent_provider.as_deref(), Some("vertex"));
@@ -3690,11 +3936,90 @@ mod tests {
                     })
                 );
             }
-            state
-                .acp_supervisor
-                .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+            })).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn backend_handoff_freezes_source_before_arming_its_explicit_new_destination() {
+        use crate::acp::establishment::{AcpEstablishment, EstablishmentTarget};
+        use crate::server::test_support as support;
+        for superseded in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut source =
+                crate::session::Instance::new("backend-source", project.path().to_str().unwrap());
+            source.source_profile = "default".into();
+            source.view = crate::session::View::Structured;
+            source.agent_name = Some("claude".into());
+            source.acp_session_id = Some("selected-original".into());
+            source.acp_effort = Some("high".into());
+            support::select_retained_for_test(&mut source);
+            let id = source.id.clone();
+            support::seed_instances_on_disk_for_test("default", vec![source.clone()]);
+            let state = support::build_test_app_state(vec![source.clone()]);
+            support::refresh_canonical_metadata_for_test(&state).await;
+            let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true)
                 .await
                 .unwrap();
+            let (native, exclusion) = launch_store_for(&state, &source, exclusion).await.unwrap();
+            if superseded {
+                let store = native.clone();
+                let source_id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.commit(&mut |rows, _| {
+                        rows.iter_mut()
+                            .find(|row| row.id == source_id)
+                            .unwrap()
+                            .resume_intent =
+                            crate::session::ResumeIntent::Use("newer-user-selection".into());
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let before = find_instance(&state, &id).await.unwrap();
+            let result = prepare_agent_switch(
+                native,
+                source,
+                "codex".into(),
+                Some("selected-model".into()),
+            )
+            .await;
+            let retained = find_instance(&state, &id).await.unwrap();
+            if superseded {
+                assert!(result
+                    .unwrap_err()
+                    .is::<crate::session::LifecycleReservationError>());
+                assert_eq!(
+                    serde_json::to_value(&retained).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+            } else {
+                let attempt = result.unwrap();
+                assert_eq!(attempt.target, EstablishmentTarget::New);
+                assert_eq!(attempt.preimage.agent_name.as_deref(), Some("codex"));
+                assert_eq!(retained.agent_name.as_deref(), Some("codex"));
+                assert_eq!(retained.agent_model.as_deref(), Some("selected-model"));
+                assert_eq!(retained.acp_effort, None);
+                assert_eq!(retained.acp_session_id, None);
+                assert!(
+                    matches!(&retained.acp_establishment, Some(AcpEstablishment::Pending { attempt: recorded })
+                    if recorded.as_ref() == attempt.as_ref())
+                );
+                assert!(
+                    attempt.producer.is_none(),
+                    "a durable proposal is not an issued Native operation"
+                );
+            }
+            assert_eq!(
+                state.acp_supervisor.worker_state(&id).await,
+                crate::daemon::AcpWorkerState::Absent
+            );
+            drop(exclusion);
         }
     }
 
@@ -3821,101 +4146,77 @@ mod tests {
         }
     }
 
-    /// The target spawns, then the stored write fails on a valid row: the
-    /// caller gets the 500, the new worker is stopped, nothing announces a
-    /// switch, and neither store moves. Once storage recovers the retry lands.
+    /// A failed destination write never grants the new backend native authority.
+    /// The old actor is retired; storage recovery permits one deliberate retry.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failed_agent_switch_write_stops_the_target_and_a_retry_recovers() {
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::server::test_support as support;
-        let profile = "default";
-        let _tmp = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let mut inst = crate::session::Instance::new("claude", project.path().to_str().unwrap());
-        inst.view = crate::session::View::Structured;
-        inst.status = crate::session::Status::Idle;
-        inst.source_profile = profile.to_string();
-        inst.agent_name = Some("claude".to_string());
-        inst.acp_effort = Some("high".to_string());
-        let id = inst.id.clone();
-        support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
-        let state =
-            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
-        support::refresh_canonical_metadata_for_test(&state).await;
-        state.acp_supervisor.test_insert_worker(&id).await;
-        let switch = || async {
-            switch_acp_agent(
-                State(state.clone()),
-                Path(id.clone()),
-                Ok(Json(crate::acp::protocol::SwitchAgentRequest {
-                    target: "codex".to_string(),
-                    model: None,
-                    reason: None,
-                })),
-            )
-            .await
-            .into_response()
-        };
-        let switched = || {
-            state
-                .acp_event_store
-                .replay_from(&id, 0)
-                .iter()
-                .filter(|(_, event)| {
-                    matches!(event, crate::acp::state::Event::AgentSwitched { .. })
-                })
-                .count()
-        };
-
-        let failure = support::fail_session_writes_for_test(profile);
-        let resp = switch().await;
-        let status = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        assert_eq!(
-            state.acp_supervisor.worker_state(&id).await,
-            crate::daemon::AcpWorkerState::Absent,
-            "the target worker is stopped"
-        );
-        assert_eq!(switched(), 0);
-        assert_eq!(
-            state
-                .telemetry_structured
-                .agent_switches
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        let memory = state.instances.read().await;
-        assert_eq!(memory[0].agent_name.as_deref(), Some("claude"));
-        assert_eq!(memory[0].acp_effort.as_deref(), Some("high"));
-        drop(memory);
-        let stored = support::load_instances_from_disk_for_test(profile);
-        assert_eq!(stored[0].agent_name.as_deref(), Some("claude"));
-        assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
-
-        drop(failure);
-        // The failed commit left the store degraded until the next reload.
-        support::accept_runtime_read_cache_for_test(&state).await;
-        let resp = switch().await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(switched(), 1);
-        assert_eq!(
-            state
-                .telemetry_structured
-                .agent_switches
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        let stored = support::load_instances_from_disk_for_test(profile);
-        assert_eq!(stored[0].agent_name.as_deref(), Some("codex"));
-        assert_eq!(stored[0].acp_effort, None);
-        assert_eq!(
-            state.instances.read().await[0].agent_name.as_deref(),
-            Some("codex")
-        );
+        with_managed(|scope| Box::pin(async move {
+            let session = support::managed_control_session(scope, "failed-backend-write").await;
+            let state = session.state.clone();
+            let id = session.id().to_owned();
+            let original = session.client.lease.spawned_runner().unwrap();
+            let switch = || async {
+                switch_acp_agent(State(state.clone()), Path(id.clone()),
+                    Ok(Json(SwitchAgentRequest { target: "codex".into(), model: None, reason: None })),
+                ).await.into_response()
+            };
+            let switched = || state.acp_event_store.replay_from(&id, 0).unwrap().iter()
+                .filter(|stored| matches!(stored.event.as_ref(), crate::acp::Event::AgentSwitched { .. })).count();
+            let failure = support::fail_session_writes_for_test("test");
+            let response = switch().await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(!status.is_success(), "{}", String::from_utf8_lossy(&body));
+            assert!(!crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(original));
+            assert!(!state.acp_supervisor.is_running(&id).await);
+            assert_eq!(switched(), 0);
+            assert_eq!(state.telemetry_structured.agent_switches.load(std::sync::atomic::Ordering::Relaxed), 0);
+            for row in [
+                find_instance(&state, &id).await.unwrap(),
+                support::load_instances_from_disk_for_test("test").into_iter().find(|row| row.id == id).unwrap(),
+            ] {
+                assert_eq!(row.agent_name.as_deref(), Some("claude"));
+                assert_eq!(row.acp_session_id.as_deref(), Some(session.sid.as_str()));
+            }
+            drop(failure);
+            support::accept_runtime_read_cache_for_test(&state).await;
+            session.client.shutdown().await.expect("settle only the exact original retirement");
+            let row = find_instance(&state, &id).await.unwrap();
+            let (config, native) = scope.native_peer(
+                PathBuf::from(&row.project_path), "codex", &row.tool,
+                |request| Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                        "result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                    "session/new" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                        "result":{"sessionId":"new-explicit-backend-conversation"}}),
+                    other => panic!("backend switch cannot reuse the previous backend's Native SID: {other}"),
+                }),
+            );
+            let events = scope.bind_external_launch(&id, config);
+            let response = switch().await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let replacement = scope.observe_external_resume(id.clone(), events).await;
+            replacement.ready().await;
+            assert_ne!(replacement.lease.spawned_runner(), Some(original));
+            assert_eq!(switched(), 1);
+            assert_eq!(state.telemetry_structured.agent_switches.load(std::sync::atomic::Ordering::Relaxed), 1);
+            for row in [
+                find_instance(&state, &id).await.unwrap(),
+                support::load_instances_from_disk_for_test("test").into_iter().find(|row| row.id == id).unwrap(),
+            ] {
+                assert_eq!(row.agent_name.as_deref(), Some("codex"));
+                assert_eq!(row.acp_effort, None);
+                assert_eq!(row.acp_session_id.as_deref(), Some("new-explicit-backend-conversation"));
+            }
+            assert_eq!(native.requests().iter().filter(|method| *method == "session/new").count(), 1);
+            assert!(!native.requests().iter().any(|method| method == "session/load"));
+        })).await;
     }
 
     /// The pick reaches both stores, and the model resets to the provider's
@@ -3989,6 +4290,7 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.agent_name = Some("claude".to_string());
         inst.agent_model = Some("claude-fable-5-1".to_string());
+        crate::server::test_support::select_retained_for_test(&mut inst);
         let id = inst.id.clone();
         crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
@@ -4031,41 +4333,74 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_provider_switch_refuses_a_busy_or_unsettled_worker() {
-        use crate::session::test_support::isolate_app_dir;
-        let profile = "default";
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::server::test_support as support;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut session = support::managed_control_session(scope, "provider-busy").await;
+                let prompt = session.start_prompt("still working").await;
+                let state = session.state.clone();
+                let id = session.id().to_owned();
+                let before = find_instance(&state, &id).await.unwrap();
+                let original = session
+                    .client
+                    .lease
+                    .spawned_runner()
+                    .expect("actual Native actor");
+                let response = switch_acp_provider(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SwitchProviderRequest {
+                        provider: "vertex".into(),
+                    })),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"], "turn_active");
+                assert!(state.acp_supervisor.is_running(&id).await);
+                assert_eq!(session.client.lease.spawned_runner(), Some(original));
+                let after = find_instance(&state, &id).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                let stored = support::load_instances_from_disk_for_test("test")
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert_eq!(stored.agent_provider, before.agent_provider);
+                assert_eq!(stored.agent_model, before.agent_model);
+                assert!(!session
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/cancel"));
+                session.finish_prompt(&prompt, None).await;
+            })
+        })
+        .await;
 
-        for (case, code) in [
-            ("mid-turn", "turn_active"),
-            ("unproven stop", "worker_not_stopped"),
-        ] {
-            let _tmp = isolate_app_dir();
+        let profile = "default";
+        {
+            let case = "unproven stop";
+            let code = "worker_not_stopped";
+            let _tmp = crate::session::test_support::isolate_app_dir();
             let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider-gate");
             inst.source_profile = profile.into();
             inst.view = crate::session::View::Structured;
             inst.agent_name = Some("claude".to_string());
             inst.agent_model = Some("claude-fable-5-1".to_string());
+            support::select_retained_for_test(&mut inst);
             let id = inst.id.clone();
-            crate::server::test_support::seed_instances_on_disk_for_test(
-                profile,
-                vec![inst.clone()],
-            );
-            let state = crate::server::test_support::build_test_app_state(vec![inst]);
-            if code == "turn_active" {
-                state.acp_supervisor.test_insert_worker(&id).await;
-                let prompt = crate::acp::state::Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "still working".to_string(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                };
-                state
-                    .acp_event_store
-                    .record_at(&id, 1, &prompt, Utc::now().timestamp_millis())
-                    .unwrap();
-            } else {
-                state.acp_supervisor.test_hold_stopping(&id);
-            }
+            support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+            let state = support::build_test_app_state(vec![inst]);
+            support::refresh_canonical_metadata_for_test(&state).await;
+            let lease = state.acp_supervisor.test_hold_stopping(&id).unwrap();
 
             let response = switch_acp_provider(
                 State(Arc::clone(&state)),
@@ -4083,12 +4418,6 @@ mod tests {
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"], code, "{case}");
-            if code == "turn_active" {
-                assert!(
-                    state.acp_supervisor.is_running(&id).await,
-                    "{case}: the worker must keep its turn"
-                );
-            }
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let memory = state.instances.read().await;
             for row in [
@@ -4103,6 +4432,7 @@ mod tests {
                     "{case}"
                 );
             }
+            state.acp_supervisor.test_settle_stopping(&lease);
         }
     }
 
@@ -4222,6 +4552,7 @@ mod tests {
                     State(state),
                     Path(id),
                     Ok(Json(SpawnAcpRequest {
+                        recovery: None,
                         agent: None,
                         model: None,
                         additional_dirs: Vec::new(),
@@ -4249,262 +4580,148 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rate_limit_manual_resume_tolerates_an_already_running_worker() {
-        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::acp::Event;
-        use crate::session::{Instance, Status, Storage, View};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let _home = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let mut row = Instance::new("manual rate-limit resume", project.path().to_str().unwrap());
-        row.id = "sess-3514-manual-resume-already-running".into();
-        row.source_profile = "default".into();
-        row.status = Status::Running;
-        row.view = View::Structured;
-        row.tool = "claude".into();
-        row.agent_name = Some("claude".into());
-        row.acp_session_id = Some("same-native-manual-quota".into());
-        let id = row.id.clone();
-        let mut ordinary_row =
-            Instance::new("ordinary running worker", project.path().to_str().unwrap());
-        ordinary_row.id = "sess-ordinary-manual-resume-already-running".into();
-        ordinary_row.source_profile = "default".into();
-        ordinary_row.status = Status::Running;
-        ordinary_row.view = View::Structured;
-        ordinary_row.tool = "claude".into();
-        ordinary_row.agent_name = Some("claude".into());
-        let ordinary_id = ordinary_row.id.clone();
-        crate::server::test_support::seed_instances_on_disk_for_test(
-            "default",
-            vec![row.clone(), ordinary_row.clone()],
-        );
-
-        let launches = Arc::new(AtomicUsize::new(0));
-        let launcher: crate::acp::supervisor::Launcher = {
-            let launches = Arc::clone(&launches);
-            Arc::new(move |_, _| {
-                launches.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async {
-                    Err(crate::acp::acp_client::AcpError::Spawn(
-                        "an already-running worker must not be started again".into(),
-                    ))
-                })
-            })
-        };
-        let state = crate::server::test_support::build_test_app_state_with_launcher(
-            vec![row, ordinary_row],
-            launcher,
-        );
-        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        let ordinary_commands = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&ordinary_id)
-            .await;
-
-        let resets_at = Utc::now() - chrono::Duration::minutes(30);
-        let prompt = || crate::acp::Event::UserPromptSent {
-            text: "continue the interrupted work".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-        };
-        let rate_limit = || crate::acp::Event::RateLimit {
-            info: RateLimitInfo {
-                status: "limited".into(),
-                resets_at: Some(resets_at),
-                kind: "usage".into(),
-            },
-        };
-        let stopped = || crate::acp::Event::Stopped {
-            reason: "rate_limited".into(),
-        };
-        let events = [
-            prompt(),
-            rate_limit(),
-            stopped(),
-            crate::acp::Event::RateLimitAutoResumed {
-                resets_at,
-                manual: false,
-            },
-            prompt(),
-            rate_limit(),
-            stopped(),
-        ];
-        let recorded_at_ms =
-            Utc::now().timestamp_millis() - chrono::Duration::hours(1).num_milliseconds();
-        for (index, event) in events.iter().enumerate() {
-            state
-                .acp_event_store
-                .record_at(
-                    &id,
-                    u64::try_from(index).unwrap() + 1,
-                    event,
-                    recorded_at_ms,
-                )
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.clone(), state.acp_event_store.highest_seq(&id))]);
-        assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
-        let park = state.acp_event_store.rate_limit_park(&id).unwrap();
-        let mut runner = HeldAttachRunner::recording_prompt(
-            &id,
-            project.path(),
-            17,
-            Some("default"),
-            "same-native-manual-quota",
-        )
-        .await;
-        let mut observed = state.acp_events_tx.subscribe();
-        state
-            .acp_supervisor
-            .attach(id.clone(), project.path().into(), Vec::new(), false, None)
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let frame = observed.recv().await.unwrap();
-                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned {
-                    acp_session_id,
-                    connection_ready: true,
-                    ..
-                } if acp_session_id == "same-native-manual-quota")
-                {
-                    break;
-                }
-                assert!(!matches!(
-                    frame.event.as_ref(),
-                    Event::AgentStartupError { .. }
+        use crate::server::test_support::managed_control_session;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_control_session(scope, "manual-quota-running").await;
+                let ordinary = managed_control_session(scope, "ordinary-running").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let original = state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .unwrap();
+                live.park("continue the interrupted work").await;
+                let frontier = state.acp_event_store.highest_seq(&id);
+                let request = || {
+                    Ok(Json(SpawnAcpRequest {
+                        recovery: None,
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    }))
+                };
+                let response = spawn_acp(State(state.clone()), Path(id.clone()), request())
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let prompt = live.next_prompt().await;
+                assert_eq!(prompt["params"]["sessionId"], live.sid);
+                assert_eq!(
+                    prompt["params"]["prompt"][0]["text"],
+                    "continue the interrupted work"
+                );
+                assert_eq!(
+                    state
+                        .acp_supervisor
+                        .current_native_availability(&id)
+                        .await
+                        .unwrap()
+                        .owner,
+                    original.owner
+                );
+                assert_eq!(
+                    state.acp_supervisor.current_lease(&id),
+                    Some(original.lease.clone())
+                );
+                let delivered = state.acp_event_store.replay_from(&id, frontier).unwrap();
+                let breadcrumbs = delivered
+                    .iter()
+                    .filter(|stored| {
+                        matches!(
+                            stored.event.as_ref(),
+                            Event::RateLimitAutoResumed { manual: true, .. }
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let prompts = delivered
+                    .iter()
+                    .filter(|stored| matches!(stored.event.as_ref(), Event::UserPromptSent { .. }))
+                    .collect::<Vec<_>>();
+                assert_eq!(breadcrumbs.len(), 1);
+                assert_eq!(prompts.len(), 1);
+                assert!(breadcrumbs[0].seq < prompts[0].seq);
+                assert!(matches!(
+                    state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Known(None)
                 ));
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(runner.resumed_session().await, "same-native-manual-quota");
-        let original = state
-            .acp_supervisor
-            .current_native_availability(&id)
-            .await
-            .unwrap();
-        assert_eq!(original.owner, Some(runner.identity));
-        assert_eq!(
-            state.acp_event_store.rate_limit_park(&id).unwrap().seq,
-            park.seq
-        );
-        let frontier = state.acp_event_store.highest_seq(&id);
-
-        let request =
-            || -> Result<Json<SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
-                Ok(Json(SpawnAcpRequest {
-                    agent: None,
-                    model: None,
-                    additional_dirs: Vec::new(),
-                    provider_env: Vec::new(),
-                }))
-            };
-        let response = spawn_acp(State(state.clone()), Path(id.clone()), request())
-            .await
-            .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.acp_supervisor.is_running(&id).await);
-        assert_eq!(launches.load(Ordering::SeqCst), 0);
-        let native_prompt =
-            tokio::time::timeout(std::time::Duration::from_secs(10), runner.next_prompt())
-                .await
-                .unwrap();
-        assert_eq!(native_prompt["sessionId"], "same-native-manual-quota");
-        let native_text = native_prompt["prompt"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|block| block["type"] == "text")
-            .map(|block| block["text"].as_str().unwrap())
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(native_text, "continue the interrupted work");
-        assert!(state.acp_supervisor.current_lease(&id) == Some(original.lease.clone()));
-        assert_eq!(
-            state
-                .acp_supervisor
-                .current_native_availability(&id)
-                .await
-                .unwrap()
-                .owner,
-            Some(runner.identity)
-        );
-        assert!(crate::process::worker_registry::is_record_live(
-            &runner.record
-        ));
-        let memory = state.instances.read().await;
-        let current = memory.iter().find(|row| row.id == id).unwrap();
-        assert!(current.pending_initial_turn.is_none());
-        assert_eq!(
-            current.acp_session_id.as_deref(),
-            Some("same-native-manual-quota")
-        );
-        drop(memory);
-        let stored = Storage::open_unwatched("default")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|instance| instance.id == id)
-            .expect("session remains stored");
-        assert!(stored.pending_initial_turn.is_none());
-        assert_eq!(
-            stored.acp_session_id.as_deref(),
-            Some("same-native-manual-quota")
-        );
-        assert!(state.acp_event_store.rate_limit_park(&id).is_none());
-        assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
-        let delivered = state.acp_event_store.replay_from(&id, frontier);
-        let breadcrumbs = delivered
-            .iter()
-            .filter_map(|(seq, event)| {
-                matches!(event, Event::RateLimitAutoResumed { manual: true, .. }).then_some(*seq)
-            })
-            .collect::<Vec<_>>();
-        let prompts = delivered
-            .iter()
-            .filter_map(|(seq, event)| match event {
-                Event::UserPromptSent { text, .. } => Some((*seq, text.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(breadcrumbs.len(), 1);
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].1, "continue the interrupted work");
-        assert!(breadcrumbs[0] < prompts[0].0);
-
-        let ordinary_response =
-            spawn_acp(State(state.clone()), Path(ordinary_id.clone()), request())
+                assert_eq!(
+                    state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    Known(0)
+                );
+                let ordinary_before = ordinary.state.acp_event_store.highest_seq(ordinary.id());
+                let ordinary_requests = ordinary.native.requests();
+                let ordinary_response = spawn_acp(
+                    State(ordinary.state.clone()),
+                    Path(ordinary.id().into()),
+                    request(),
+                )
                 .await
                 .into_response();
-        assert_eq!(ordinary_response.status(), StatusCode::CONFLICT);
-        assert!(state.acp_supervisor.is_running(&ordinary_id).await);
-        assert!(state
-            .acp_event_store
-            .replay_from(&ordinary_id, 1)
-            .is_empty());
-        assert_eq!(launches.load(Ordering::SeqCst), 0);
-        assert!(ordinary_commands.lock().unwrap().is_empty());
-        runner.complete_turn();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let frame = observed.recv().await.unwrap();
-                if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete") {
-                    break;
-                }
-            }
+                assert_eq!(ordinary_response.status(), StatusCode::OK);
+                assert_eq!(
+                    ordinary.state.acp_event_store.highest_seq(ordinary.id()),
+                    ordinary_before
+                );
+                assert_eq!(ordinary.native.requests(), ordinary_requests);
+                live.finish_prompt(&prompt, Some("rate_limit")).await;
+                let park = match state.acp_event_store.rate_limit_park(&id).unwrap() {
+                    Known(Some(park)) => park,
+                    other => panic!("expected known park: {other:?}"),
+                };
+                state
+                    .acp_event_store
+                    .test_conn()
+                    .execute(
+                        "DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
+                        rusqlite::params![id, i64::try_from(park.seq).unwrap()],
+                    )
+                    .unwrap();
+                state.acp_event_store.control_cache().forget(&id);
+                assert!(matches!(
+                    state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Indeterminate
+                ));
+                let before = state.acp_event_store.highest_seq(&id);
+                let methods = live.native.requests();
+                let reattached = spawn_acp(State(state.clone()), Path(id.clone()), request())
+                    .await
+                    .into_response();
+                assert_eq!(reattached.status(), StatusCode::OK);
+                assert!(matches!(
+                    state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Indeterminate
+                ));
+                let refused = spawn_acp(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SpawnAcpRequest {
+                        recovery: None,
+                        agent: None,
+                        model: Some("new-model".into()),
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response();
+                assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.native.requests(), methods);
+                assert_eq!(
+                    state.acp_supervisor.current_lease(&id),
+                    Some(original.lease)
+                );
+            })
         })
-        .await
-        .unwrap();
-        state.acp_supervisor.test_remove_worker(&id).await;
-        original.client.shutdown().await.unwrap();
-        state.acp_supervisor.test_remove_worker(&ordinary_id).await;
-        state.shutdown.cancel();
+        .await;
     }
 }

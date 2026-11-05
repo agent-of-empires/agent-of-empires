@@ -461,7 +461,7 @@ fn render_approval_shelf(
         theme,
         active,
         row.choice && !row.options.is_empty(),
-        state.native_input_available(),
+        state.can_decide(&row.nonce),
     );
     frame.render_widget(Paragraph::new(actions), inner);
     // An open choice picker owns the keyboard, so the decision buttons go
@@ -1161,7 +1161,14 @@ fn render_status(
             state.focus,
             selected_approval_is_choice(state),
             state.visible_notices().next().is_some(),
-            state.native_input_available(),
+            if state.focus == Focus::Approval {
+                state
+                    .selected_approval
+                    .as_deref()
+                    .is_some_and(|nonce| state.can_decide(nonce))
+            } else {
+                state.native_input_available()
+            },
             state.can_submit_prompt_intent(),
         )
     } else if state.can_submit_prompt_intent() {
@@ -2092,13 +2099,13 @@ mod tests {
         render_rows(state, w, h, true).concat()
     }
 
-    /// Server transcript rows folded from events, as the daemon ships them.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
-        let mut m = crate::acp::transcript::TranscriptModel::new();
-        for (i, e) in events.iter().enumerate() {
-            m.apply_event(i as u64 + 1, e);
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        let metadata = crate::acp::event_sender::EventMetadata::history();
+        for (index, event) in events.iter().enumerate() {
+            model.apply_scoped_event(index as u64 + 1, event, &metadata);
         }
-        m.rows().to_vec()
+        model.rows().to_vec()
     }
 
     fn cmd(name: &str, desc: &str) -> AvailableCommand {
@@ -2422,6 +2429,46 @@ mod tests {
             "{out:?}"
         );
         assert!(out.contains("Building now"), "{out:?}");
+    }
+
+    #[test]
+    fn certified_clear_keeps_new_prefix_after_marker_without_hiding_history() {
+        let message = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(text.into()),
+        };
+        let mut rows = server_rows(&[
+            message("old history"),
+            message("new handshake prefix"),
+            Event::SessionCleared,
+            message("new followup"),
+        ]);
+        rows[2].clear_after_seq = Some(1);
+        let prefix_id = rows[1].id.clone();
+        let mut transcript = AcpTranscript::new("s-1");
+        transcript.merge_server_rows(rows.clone());
+        // An overlapping snapshot must neither duplicate nor move the prefix back.
+        transcript.merge_server_rows(rows);
+        let out = joined(&transcript_lines(&transcript, &Theme::default(), None));
+        let clear = out.find("Conversation cleared").unwrap();
+        assert!(out.find("old history").unwrap() < clear, "{out}");
+        assert!(clear < out.find("new handshake prefix").unwrap(), "{out}");
+        assert!(out.find("new handshake prefix").unwrap() < out.find("new followup").unwrap());
+        assert_eq!(out.matches("new handshake prefix").count(), 1);
+        assert_eq!(transcript.server_rows[2].id, prefix_id);
+
+        // Legacy clears have no certified cut and keep physical history order.
+        let mut legacy = AcpTranscript::new("s-1");
+        let mut rows = server_rows(&[
+            message("legacy prefix"),
+            Event::SessionCleared,
+            message("legacy followup"),
+        ]);
+        rows[0].seq = 0;
+        legacy.merge_server_rows(rows);
+        let out = joined(&transcript_lines(&legacy, &Theme::default(), None));
+        assert!(out.find("legacy prefix").unwrap() < out.find("Conversation cleared").unwrap());
+        assert!(out.find("Conversation cleared").unwrap() < out.find("legacy followup").unwrap());
     }
 
     #[test]

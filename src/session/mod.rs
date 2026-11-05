@@ -201,6 +201,7 @@ pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
+pub(crate) use storage::publish_migration_snapshot;
 pub(crate) use storage::{
     acquire_migration_lifecycle_lock, acquire_open_storage_flock, acquire_recovery_identity_lock,
     acquire_recovery_storage_flock, acquire_session_title_lock, acquire_storage_flock,

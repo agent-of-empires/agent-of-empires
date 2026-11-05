@@ -30,7 +30,7 @@ export async function replayFrames(baseUrl: string, sessionId: string): Promise<
   return Array.isArray(replay) ? replay : ((replay?.frames as unknown[]) ?? []);
 }
 
-/** The `AgentStartupError` message published when the background spawn fails after enable returned 200. */
+/** The startup failure recorded by the ACP worker. */
 function findStartupError(frames: unknown[]): string | null {
   for (const f of frames) {
     const event = (f as { event?: { AgentStartupError?: { message?: string } } } | null)?.event;
@@ -41,63 +41,92 @@ function findStartupError(frames: unknown[]): string | null {
   return null;
 }
 
-async function throwOnStartupError(baseUrl: string, sessionId: string): Promise<number> {
-  const frames = await replayFrames(baseUrl, sessionId);
-  const startupErr = findStartupError(frames);
-  if (startupErr) throw new Error(`acp_enable spawn failed: ${startupErr} (frames=${frames.length})`);
-  return frames.length;
-}
-
-/**
- * Enable is fire-and-forget, so wait until a replay frame exists (worker up) and the session
- * reports `acp_worker_state === "running"` (handshake done); a prompt sent earlier can be parked.
- */
+/** Wait for the live projection's current owned Available receipt, not worker presence or replayed readiness. */
 export async function waitForAcpReady(
   baseUrl: string,
   sessionId: string,
   timeoutMs = 30_000,
   home?: string,
 ): Promise<void> {
+  let lastReducedState: unknown = null;
   try {
-    await expect
-      .poll(() => throwOnStartupError(baseUrl, sessionId), { timeout: timeoutMs, intervals: [100, 200, 200, 200] })
-      .toBeGreaterThan(0);
-  } catch (err) {
-    throw new Error(
-      `waitForAcpReady phase 1 (replay frames) failed after ${timeoutMs}ms; the supervisor spawn task is wedged.\n` +
-        `Original: ${err instanceof Error ? err.message : String(err)}\n` +
-        `--- debug.log tail ---\n${debugLogTail(home)}\n--- end debug.log ---`,
-      { cause: err },
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const url = new URL(`/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=0`, baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(url, ["aoe-auth"]);
+    let lastSeq = -1;
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`No current owned ACP ready receipt within ${timeoutMs}ms`)),
+      timeoutMs,
     );
-  }
-  try {
-    await expect
-      .poll(
-        async () => {
-          const res = await fetch(`${baseUrl}/api/sessions`);
-          if (!res.ok) return "fetch-failed";
-          const body = await res.json();
-          const sessions: Array<{ id: string; acp_worker_state?: string }> = Array.isArray(body)
-            ? body
-            : (body.sessions ?? []);
-          const state = sessions.find((s) => s.id === sessionId)?.acp_worker_state ?? "absent";
-          if (state === "absent") await throwOnStartupError(baseUrl, sessionId);
-          return state;
-        },
-        { timeout: timeoutMs, intervals: [100, 200, 200, 500, 1000] },
-      )
-      .toBe("running");
+    socket.onerror = () => finish(new Error("ACP readiness WebSocket failed"));
+    socket.onclose = (event) =>
+      finish(new Error(`ACP readiness WebSocket closed before ready: ${event.code} ${event.reason}`));
+    socket.onmessage = (message) => {
+      try {
+        const frame = JSON.parse(String(message.data)) as {
+          kind?: string;
+          session_id?: string;
+          seq?: number;
+          state?: { connection_ready?: boolean; connection_unavailable?: unknown };
+        };
+        if (frame.session_id !== sessionId) return;
+        const startupError = findStartupError([frame]);
+        if (startupError) {
+          finish(new Error(`ACP startup failed: ${startupError}`));
+          return;
+        }
+        if (
+          frame.kind !== "reduced_state" ||
+          typeof frame.seq !== "number" ||
+          !Number.isSafeInteger(frame.seq) ||
+          frame.seq < 0 ||
+          frame.seq < lastSeq
+        ) {
+          return;
+        }
+        lastSeq = frame.seq;
+        lastReducedState = frame;
+        if (frame.state?.connection_ready === true && frame.state.connection_unavailable === null) finish();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    await promise;
   } catch (err) {
-    const frames = await replayFrames(baseUrl, sessionId).catch(() => []);
-    const sessionsRes = await fetch(`${baseUrl}/api/sessions`).catch(() => null);
-    const sessionsBody = sessionsRes ? await sessionsRes.json().catch(() => null) : null;
+    const signal = AbortSignal.timeout(5_000);
+    const [replay, sessionsBody] = await Promise.all([
+      fetch(`${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`, { signal })
+        .then((res) => res.json())
+        .catch(() => null),
+      fetch(`${baseUrl}/api/sessions`, { signal })
+        .then((res) => res.json())
+        .catch(() => null),
+    ]);
+    const frames: unknown[] = Array.isArray(replay) ? replay : (replay?.frames ?? []);
     const summary = JSON.stringify(
-      { sessionId, sessions: sessionsBody, framesCount: frames.length, firstFrames: frames.slice(0, 5) },
+      {
+        sessionId,
+        lastReducedState,
+        sessions: sessionsBody,
+        startupError: findStartupError(frames),
+        framesCount: frames.length,
+        firstFrames: frames.slice(0, 5),
+      },
       null,
       2,
     );
     throw new Error(
-      `waitForAcpReady phase 2 failed: ${err instanceof Error ? err.message : String(err)}\n` +
+      `waitForAcpReady failed: ${err instanceof Error ? err.message : String(err)}\n` +
         `Diagnostic snapshot:\n${summary}\n` +
         `--- debug.log tail ---\n${debugLogTail(home)}\n--- end debug.log ---`,
       { cause: err },
@@ -124,21 +153,18 @@ export async function waitForReplayContains(
     .toBe(true);
 }
 
-export async function enableStructuredViewAndWait(
+export async function spawnAcpAgentAndWait(
   baseUrl: string,
   sessionId: string,
   timeoutMs = 30_000,
   home?: string,
 ): Promise<void> {
-  const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
-  if (!res.ok) {
-    throw new Error(`structured view enable failed: status=${res.status} body=${await res.text()}`);
-  }
+  await spawnAcpAgent(baseUrl, sessionId);
   await waitForAcpReady(baseUrl, sessionId, timeoutMs, home);
 }
 
 /** Explicitly spawn the agent so its ACP session is attached before a test drives it. */
-export async function spawnAcpAgent(baseUrl: string, sessionId: string, agent = "claude"): Promise<void> {
+export async function spawnAcpAgent(baseUrl: string, sessionId: string, agent?: string): Promise<void> {
   const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/spawn`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -160,19 +186,23 @@ export async function sessionIdByTitle(baseUrl: string, title: string): Promise<
 type SpawnServe = (opts?: ServeOptions) => Promise<ServeHandle>;
 type AcpSessionOptions = ServeOptions & { title: string; tool?: string };
 
-/** Spawn a structured view server with one seeded session, without enabling structured view on it. */
+/** Seed an unstarted structured session with a genuine first-creation selection. */
 export async function seedAcpSession(
   spawnServe: SpawnServe,
   { title, tool, ...opts }: AcpSessionOptions,
 ): Promise<{ serve: ServeHandle; sessionId: string }> {
-  const serve = await spawnServe({ acp: true, seedFn: seedSessionViaAoeAdd({ title, tool }), ...opts });
+  const serve = await spawnServe({
+    acp: true,
+    seedFn: seedSessionViaAoeAdd({ title, tool, structuredView: true }),
+    ...opts,
+  });
   return { serve, sessionId: await sessionIdByTitle(serve.baseUrl, title) };
 }
 
-/** `seedAcpSession`, then enable structured view and wait until the agent is ready. */
+/** Seed the first conversation, then spawn its Native and wait for readiness. */
 export async function startAcpSession(spawnServe: SpawnServe, opts: AcpSessionOptions) {
   const started = await seedAcpSession(spawnServe, opts);
-  await enableStructuredViewAndWait(started.serve.baseUrl, started.sessionId, 30_000, started.serve.home);
+  await spawnAcpAgentAndWait(started.serve.baseUrl, started.sessionId, 30_000, started.serve.home);
   return started;
 }
 
@@ -231,7 +261,7 @@ export async function openStructuredView(
   const box = composer(page);
   if (prompt !== undefined) {
     await box.fill(prompt);
-    await box.press("Enter");
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
   }
   return box;
 }

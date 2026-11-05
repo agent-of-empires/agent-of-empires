@@ -1,398 +1,186 @@
-//! Mid-turn `aoe serve` reattach: integration coverage for the daemon
-//! side of the fix. Stands up the production runner around a Node ACP shim
-//! so the real `AcpClient::attach`, control connection, and ACP
-//! `initialize` path are exercised. It asserts:
-//!
-//! 1. `attach` with `in_flight_turn = true` synthesizes
-//!    `Event::Stopped { reason: "reattach_idle" }` after the configured
-//!    grace when the runner has no activity or completion to replay.
-//!
-//! 2. `attach` with `in_flight_turn = false` does not synthesize one.
-//!
-//! 3. A completion cached while detached preserves its native reason only
-//!    when durable state still marks the turn in flight. A clean client
-//!    shutdown also releases the runner for the next attachment.
-//!
-//! Skipped automatically if `node` is not on PATH.
-//!
-//! Note: the parent `main.rs` only compiles this module under
-//! `cfg(debug_assertions)`, the only builds where `AOE_RESUME_IDLE_GRACE_MS`
-//! and `AOE_RESUME_IDLE_CHECK_INTERVAL_MS` tune the watchdog.
+//! Retained native outcomes keep their request identity and native stop reason.
 
-use std::time::{Duration, Instant};
+use std::future::Future;
+use std::time::Duration;
 
-use agent_of_empires::acp::acp_client::AcpClient;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
-use crate::common::{shim_ready, spawn_runner_with_shim};
+use crate::acp::protocol::{AcpOriginalRequestResult, AcpPromptObservation};
+use crate::acp::state::Event;
 
-async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
-            Ok(Some(Event::Stopped { reason })) => return Some(reason),
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("ACP stream closed during reattach observation"),
-            Err(_) => continue,
-        }
-    }
-    None
+use super::managed::{with_managed, ManagedClient};
+
+async fn bounded<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(15), future)
+        .await
+        .expect("managed cached-outcome operation completes before deadline")
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Shorten the watchdog grace and tick from the production defaults.
-    let _env = crate::common::EnvGuard::from_pairs(&[
-        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
-        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    // The runner must announce the same session id the daemon attaches
-    // with; the control handshake verifies it.
-    const SESSION: &str = "midturn-true";
-    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
-
-    let mut client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        "test-acp-session-id".into(),
-        true, // in_flight_turn
-        false,
-        AcpSessionId("midturn-true".into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("attach in_flight=true");
-
-    let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(3)).await;
-    let _ = client.shutdown().await;
-
-    assert_eq!(
-        stopped.as_deref(),
-        Some("reattach_idle"),
-        "resume-idle watchdog must synthesize a Stopped event"
-    );
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn attach_idle_session_does_not_synthesize_stopped() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    let _env = crate::common::EnvGuard::from_pairs(&[
-        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
-        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    // The runner must announce the same session id the daemon attaches
-    // with; the control handshake verifies it.
-    const SESSION: &str = "midturn-false";
-    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
-
-    let mut client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        "test-acp-session-id".into(),
-        false, // NOT in flight
-        false,
-        AcpSessionId("midturn-false".into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("attach in_flight=false");
-
-    let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(1)).await;
-    let _ = client.shutdown().await;
-
+fn assert_healthy(event: &Event) {
     assert!(
-        stopped.is_none(),
-        "watchdog must stay disarmed when in_flight_turn=false; got Stopped reason={stopped:?}"
+        !matches!(
+            event,
+            Event::AcpConnectionUnavailable { .. }
+                | Event::AgentStartupError { .. }
+                | Event::PromptRuntimeError { .. }
+                | Event::SessionContextReset { .. }
+        ),
+        "retained native conversation unexpectedly failed: {event:?}"
     );
 }
 
-/// #1216: once the runner forwards any notification after reattach, the
-/// in-flight turn is observable, so normal mid-turn silence (Task
-/// subagents, slow Bash, reasoning gaps) must NOT trip the watchdog. The
-/// shim emits one unsolicited chunk early, then goes silent well past
-/// the grace; the watchdog must disarm on that first notification rather
-/// than synthesize a spurious `reattach_idle` Stopped.
+async fn stopped(client: &mut ManagedClient, expected: &str) {
+    bounded(async {
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .expect("managed observer remains open");
+            if let Event::Stopped { reason } = &event {
+                assert_eq!(reason, expected);
+                break;
+            }
+            assert_healthy(&event);
+        }
+    })
+    .await;
+}
+
+fn assert_native_stop(client: &ManagedClient, after: u64, request: &Value, expected: &str) {
+    let state = client.app_state();
+    let stored = state
+        .acp_event_store
+        .replay_from(&client.id, after)
+        .unwrap();
+    let stops: Vec<_> = stored
+        .iter()
+        .filter(|entry| matches!(entry.event.as_ref(), Event::Stopped { .. }))
+        .collect();
+    assert_eq!(
+        stops.len(),
+        1,
+        "one terminal for the actual native response"
+    );
+    assert!(matches!(stops[0].event.as_ref(), Event::Stopped { reason } if reason == expected));
+    let metadata = &stops[0].metadata;
+    assert_eq!(metadata.native_prompt_id, request["id"].as_i64());
+    assert!(metadata.native_origin.is_some());
+    assert_eq!(
+        metadata.operation.unwrap().outcome,
+        Some(AcpOriginalRequestResult::Succeeded)
+    );
+    assert!(matches!(
+        metadata.prompt_observation,
+        Some(AcpPromptObservation::Written { .. })
+    ));
+}
+
 #[tokio::test]
 #[serial_test::serial]
-async fn attach_in_flight_disarms_after_first_inbound_notification() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
+async fn cached_native_stop_reason_survives_retained_attachment_and_next_input() {
+    with_managed(|scope| Box::pin(async move {
+        for in_flight in [false, true] {
+            for reason in ["max_tokens", "cancelled"] {
+                let name = std::thread::current().name().unwrap().to_owned();
+                let inspection = scope.inspect_next_runner(&name);
+                let directory = scope.tempdir();
+                let session_id = format!("midturn-{}", uuid::Uuid::new_v4());
+                let (seen, mut prompts) = mpsc::unbounded_channel();
+                let (config, native) = scope.native_peer(
+                    directory.path().into(), "codex", "codex", move |request| {
+                        let id = request.get("id")?;
+                        match request["method"].as_str().unwrap() {
+                            "initialize" => Some(json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {"protocolVersion": 1, "agentCapabilities": {}}
+                            })),
+                            "session/new" => Some(json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {"sessionId": session_id}
+                            })),
+                            "session/prompt" => {
+                                assert_eq!(request["params"]["sessionId"], session_id);
+                                seen.send(request.clone()).unwrap();
+                                None
+                            }
+                            method => panic!("unexpected native operation: {method}"),
+                        }
+                    },
+                );
+                let original = bounded(scope.spawn(config, "midturn-cached-native")).await.unwrap();
+                bounded(original.ready()).await;
+                let owner = original.connected_runner().expect("actual original runner owner");
+                bounded(original.send_prompt("original pending native request", &[])).await.unwrap();
+                let first = bounded(prompts.recv()).await.expect("actual first prompt reached native stdin");
+                let store = original.app_state().acp_event_store.clone();
+                let before = store.highest_seq(&original.id);
+                let mut client = bounded(scope.adopt_with(original, in_flight, || async {
+                    // Joining the old SDK does not mean the runner has consumed its socket EOF.
+                    bounded(async {
+                        loop {
+                            let snapshot = inspection.query("snapshot").await;
+                            if snapshot["attached"] == false {
+                                assert_eq!(snapshot["queued_frames"], 0);
+                                assert_eq!(snapshot["retained_bytes"], 0);
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }).await;
+                    bounded(native.send(json!({
+                        "jsonrpc": "2.0", "id": first["id"], "result": {"stopReason": reason}
+                    }))).await;
+                    bounded(async {
+                        loop {
+                            let snapshot = inspection.query("snapshot").await;
+                            assert_eq!(snapshot["attached"], false);
+                            let completions = snapshot["queued_prompt_completions"].as_array().unwrap();
+                            if completions.iter().any(|completion| completion[0] == first["id"]) {
+                                assert_eq!(completions.len(), 1);
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }).await;
+                })).await;
+                bounded(client.ready()).await;
+                assert_eq!(client.connected_runner(), Some(owner));
+                stopped(&mut client, reason).await;
+                assert_native_stop(&client, before, &first, reason);
 
-    // Release the notification only after the intended client attaches.
-    let _env = crate::common::EnvGuard::from_pairs(&[
-        ("AOE_RESUME_IDLE_GRACE_MS", "800"),
-        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let release_dir = tempfile::tempdir().expect("notification release directory");
-    let release = release_dir.path().join("release");
-    let session_id = "test-acp-session-id";
-    // The runner must announce the same session id the daemon attaches
-    // with; the control handshake verifies it.
-    const SESSION: &str = "midturn-disarm";
-    let (socket_path, _runner) = spawn_runner_with_shim(
-        SESSION,
-        &[
-            ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
-            ("SHIM_EMIT_UNSOLICITED_NOTIF", "0".to_string()),
-            (
-                "SHIM_UNSOLICITED_RELEASE_FILE",
-                release.display().to_string(),
-            ),
-        ],
-    )
-    .await;
-
-    let mut client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        session_id.into(),
-        true, // in_flight_turn
-        false,
-        AcpSessionId("midturn-disarm".into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("attach in_flight=true");
-
-    std::fs::write(&release, b"release").expect("release notification after attachment");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            match client.next_event().await.expect("reattached stream open") {
-                Event::AgentMessageChunk { text, .. }
-                    if text == "mid-turn chunk after reattach" =>
-                {
-                    break
+                let before_next = store.highest_seq(&client.id);
+                bounded(client.send_prompt("distinct next explicit native request", &[])).await.unwrap();
+                let next = bounded(prompts.recv()).await.expect("actual next prompt reached native stdin");
+                assert_ne!(next["id"], first["id"]);
+                assert_eq!(next["params"]["sessionId"], first["params"]["sessionId"]);
+                // The peer has received the new request and has not answered it.
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+                loop {
+                    match tokio::time::timeout_at(deadline, client.next_event()).await {
+                        Err(_) => break,
+                        Ok(None) => panic!("managed observer closed before the native response"),
+                        Ok(Some(event)) => {
+                            assert!(!matches!(event, Event::Stopped { .. }),
+                                "cached outcome cannot settle a different pending request: {event:?}");
+                            assert_healthy(&event);
+                        }
+                    }
                 }
-                Event::Stopped { reason } => panic!("stopped before notification: {reason}"),
-                _ => {}
+                bounded(native.send(json!({
+                    "jsonrpc": "2.0", "id": next["id"], "result": {"stopReason": "end_turn"}
+                }))).await;
+                stopped(&mut client, "prompt_complete").await;
+                assert_native_stop(&client, before_next, &next, "prompt_complete");
+                assert_eq!(client.connected_runner(), Some(owner));
+                let methods = native.requests();
+                for (method, expected) in [("initialize", 1), ("session/new", 1), ("session/prompt", 2)] {
+                    assert_eq!(methods.iter().filter(|seen| seen.as_str() == method).count(), expected, "{method}");
+                }
+                assert!(!methods.iter().any(|method| matches!(method.as_str(),
+                    "session/load" | "session/fork" | "session/cancel")));
+                bounded(client.shutdown()).await.unwrap();
             }
         }
-    })
-    .await
-    .expect("final attachment received the intended notification");
-    let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(1600)).await;
-    let _ = client.shutdown().await;
-
-    assert!(
-        stopped.is_none(),
-        "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
-    );
-}
-
-async fn read_typed_control(
-    stream: &mut tokio::net::UnixStream,
-) -> agent_of_empires::acp::control_protocol::ControlBody {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
-
-    loop {
-        let frame = control_protocol::read_frame(stream)
-            .await
-            .expect("read control frame")
-            .expect("runner kept control socket open");
-        if !matches!(frame, ControlBody::Notify { .. }) {
-            return frame;
-        }
-    }
-}
-
-async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool) -> Option<String> {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
-
-    let completion_dir = tempfile::tempdir().expect("completion observation directory");
-    let completed = completion_dir.path().join("completed");
-    let completion_release = completion_dir.path().join("release-completion");
-    let (socket_path, _runner) = spawn_runner_with_shim(
-        session,
-        &[
-            (
-                "AOE_E2E_PROMPT_COMPLETED_FILE",
-                completed.display().to_string(),
-            ),
-            (
-                "SHIM_PROMPT_COMPLETION_RELEASE_FILE",
-                completion_release.display().to_string(),
-            ),
-        ],
-    )
-    .await;
-    let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
-    let mut first = tokio::net::UnixStream::connect(&control_path)
-        .await
-        .expect("connect first daemon");
-    assert!(matches!(
-        control_protocol::read_frame(&mut first).await.unwrap(),
-        Some(ControlBody::Hello { .. })
-    ));
-    control_protocol::write_frame(
-        &mut first,
-        &ControlBody::Attach {
-            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await
-    .unwrap();
-    control_protocol::write_frame(
-        &mut first,
-        &ControlBody::Initialize {
-            request: serde_json::json!({"protocolVersion": 1}),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        read_typed_control(&mut first).await,
-        ControlBody::Initialized { .. }
-    ));
-    control_protocol::write_frame(
-        &mut first,
-        &ControlBody::EstablishSession {
-            method: "session/new".into(),
-            request: serde_json::json!({
-                "cwd": std::env::temp_dir(),
-                "mcpServers": [],
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    let acp_session_id = match read_typed_control(&mut first).await {
-        ControlBody::SessionReady { acp_session_id, .. } => acp_session_id,
-        frame => panic!("expected SessionReady, got {frame:?}"),
-    };
-    assert!(matches!(
-        control_protocol::read_frame(&mut first).await.unwrap(),
-        Some(ControlBody::Notify { method, .. }) if method == "_aoe/session_replayed"
-    ));
-    control_protocol::write_frame(
-        &mut first,
-        &ControlBody::Prompt {
-            request: serde_json::json!({
-                "sessionId": acp_session_id,
-                "prompt": [{"type": "text", "text": "MAX_TOKENS detached completion"}],
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        control_protocol::read_frame(&mut first).await.unwrap(),
-        Some(ControlBody::PromptStarted { .. })
-    ));
-    assert!(matches!(
-        control_protocol::read_frame(&mut first).await.unwrap(),
-        Some(ControlBody::Notify { .. })
-    ));
-    drop(first);
-    std::fs::write(&completion_release, b"release").expect("release completion after detach");
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while std::fs::read(&completed).ok().as_deref() != Some(b"queued") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("runner queued detached completion before reattachment");
-    let mut resumed = AcpClient::attach(
-        socket_path.clone(),
-        std::env::temp_dir(),
-        vec![],
-        acp_session_id.clone(),
-        in_flight_turn,
-        false,
-        AcpSessionId(session.into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("resume after detached completion");
-    let reason =
-        drain_for_stopped_reason(&mut resumed, Instant::now() + Duration::from_millis(1200)).await;
-    resumed.shutdown().await.expect("shutdown resumed client");
-    let closed = tokio::time::timeout(Duration::from_secs(3), async {
-        while resumed.next_event().await.is_some() {}
-    })
-    .await;
-    assert!(closed.is_ok(), "resumed client detached cleanly");
-
-    let reopened = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        acp_session_id,
-        false,
-        false,
-        AcpSessionId(session.into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("runner accepts a new daemon after clean shutdown");
-    reopened.shutdown().await.expect("shutdown reopened client");
-    reason
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    let adopted = replay_completion_after_disconnect("cached-completion-live", true).await;
-    assert_eq!(
-        adopted.as_deref(),
-        Some("max_tokens"),
-        "an adopted turn must surface the runner's cached native completion"
-    );
-
-    let durable = replay_completion_after_disconnect("cached-completion-durable", false).await;
-    assert!(
-        durable.is_none(),
-        "an already-durable terminal must suppress the stale cached completion, got {durable:?}"
-    );
+    })).await;
 }

@@ -70,15 +70,11 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             acp-worker/test-shim/package-lock.json
-      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
-      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
-      # so its deps must be installed before the integration crate runs. Only
-      # the core-rest leg runs the integration binary; the web-e2e leg uses
-      # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
-      # not exercise the shim. Node here is a test-runtime dependency, not a
-      # build one: core-rest's `cargo build` never invokes npm.
+      # Managed ACP suites run in libtests on core-rest and bare-core.
+      # Their canonical Node shim needs its actual SDK dependencies installed.
+      # Node remains a test-runtime dependency, not a default build dependency.
       - name: Install ACP shim deps
-        if: matrix.leg == 'core-rest'
+        if: matrix.leg == 'core-rest' || matrix.leg == 'bare-core'
         working-directory: acp-worker/test-shim
         run: npm ci
       # web-e2e: just the e2e binary, and the only leg that builds the
@@ -332,6 +328,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Install ACP shim deps
+        working-directory: acp-worker/test-shim
+        run: npm ci
       - name: Cargo test (macOS, lib + bins)
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)

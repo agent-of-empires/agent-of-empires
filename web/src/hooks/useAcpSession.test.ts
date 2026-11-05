@@ -63,6 +63,40 @@ async function openSession(...args: HookArgs) {
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
 
+describe("Original decision authority", () => {
+  it.each(["approval", "elicitation"] as const)(
+    "rechecks %s authority when an edited or held request submits",
+    async (kind) => {
+      calls = installAcpFakes(({ method }) => (method === "POST" ? new Response(null, { status: 204 }) : undefined));
+      const { result } = await openSessionWithReceipt({ ready: false }, "original-decision");
+      const snapshot = currentControlSnapshot(result.current.state, { ready: false });
+      snapshot.state.original_decision_nonces = ["original"];
+      lastSocket().message(snapshot);
+      await flushAsync();
+      const submit = (nonce: string) =>
+        kind === "approval"
+          ? result.current.resolveApproval(nonce, "Allow")
+          : result.current.resolveElicitation(nonce, { action: "cancel" });
+      expect(nativeInputAvailable(result.current.state)).toBe(false);
+      await act(async () => {
+        await expect(submit("historical")).rejects.toThrow();
+      });
+      expect(posts("/acp/approvals/")).toHaveLength(0);
+      expect(posts("/acp/elicitations/")).toHaveLength(0);
+      await act(async () => {
+        await submit("original");
+      });
+      expect(posts(kind === "approval" ? "/acp/approvals/" : "/acp/elicitations/")).toHaveLength(1);
+      lastSocket().message(currentControlSnapshot(result.current.state, { ready: false }));
+      await flushAsync();
+      await act(async () => {
+        await expect(submit("original")).rejects.toThrow();
+      });
+      expect(posts(kind === "approval" ? "/acp/approvals/" : "/acp/elicitations/")).toHaveLength(1);
+    },
+  );
+});
+
 describe("reconnect (#1130)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -544,12 +578,15 @@ describe("sendPrompt outcomes", () => {
         return undefined;
       };
 
-    // Replay flags are not admission. The explicit current server governor can
-    // report a park the client has not learned about yet.
-    it.each([[true], [false]])("parked=%s re-enqueues a 503'd prompt", async (isParked) => {
+    // Replay is display history. Only a current canonical projection declares a park.
+    it.each([[true], [false]])("canonical parked=%s re-enqueues a 503'd prompt", async (isParked) => {
       calls = installAcpFakes(parked(isParked));
       const { result } = await openSessionWithReceipt(
-        { ready: false, wakeEligible: true },
+        {
+          ready: false,
+          wakeEligible: true,
+          rateLimitPark: isParked ? (tag === "cap" ? "exhausted" : "armed") : "none",
+        },
         `sess-${tag}`,
         "running",
         null,
@@ -566,7 +603,7 @@ describe("sendPrompt outcomes", () => {
     it("offers Send now on a row stranded behind the park", async () => {
       installAcpFakes(parked(true));
       const { result } = await openSessionWithReceipt(
-        { ready: false, wakeEligible: true },
+        { ready: false, wakeEligible: true, rateLimitPark: tag === "cap" ? "exhausted" : "armed" },
         `sess-${tag}-send`,
         "absent",
         null,

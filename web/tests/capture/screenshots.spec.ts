@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { test as base, type Page } from "@playwright/test";
 import { spawnAoeServe, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../helpers/acp";
+import { waitForStructuredView, spawnAcpAgentAndWait } from "../helpers/acp";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -189,7 +189,7 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "wire-auth" }),
+    seedFn: seedSessionViaAoeAdd({ title: "wire-auth", structuredView: true }),
   });
 
   try {
@@ -199,7 +199,7 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "wire-auth");
     if (!seeded) throw new Error("seeded session 'wire-auth' missing");
-    await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
+    await spawnAcpAgentAndWait(serve.baseUrl, seeded.id);
 
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
@@ -208,7 +208,7 @@ base("structured view surfaces", async ({ page }, testInfo) => {
       name: /Send a message|Queue a follow-up/i,
     });
     await composer.fill("Wire auth into login() and add a health route.");
-    await composer.press("Enter");
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
 
     await page
       .getByText(/tests pass/i)
@@ -220,12 +220,18 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     await page.setViewportSize(MOBILE);
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
-    // Tap the backdrop to close the drawer.
-    const sidebarHeading = page.getByTestId("sidebar-axis-heading");
-    if (await sidebarHeading.isVisible()) {
-      await page.mouse.click(340, 450);
-      await sidebarHeading.waitFor({ state: "hidden", timeout: 5_000 });
+    const sidebarBox = await page.getByTestId("sidebar-axis-heading").boundingBox();
+    if (sidebarBox && sidebarBox.x >= 0) {
+      await page.getByRole("button", { name: "Toggle sidebar", exact: true }).click();
     }
+    await page.waitForFunction(
+      () => {
+        const box = document.querySelector('[data-testid="sidebar-axis-heading"]')?.getBoundingClientRect();
+        return !box || box.x < 0;
+      },
+      null,
+      { timeout: 5_000 },
+    );
     await page.waitForTimeout(600);
     await shot(page, "structured view/interface.png");
   } finally {
@@ -275,7 +281,7 @@ base("structured view approval card", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "approve-push" }),
+    seedFn: seedSessionViaAoeAdd({ title: "approve-push", structuredView: true }),
   });
 
   try {
@@ -285,7 +291,7 @@ base("structured view approval card", async ({ page }, testInfo) => {
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "approve-push");
     if (!seeded) throw new Error("seeded session 'approve-push' missing");
-    await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
+    await spawnAcpAgentAndWait(serve.baseUrl, seeded.id);
 
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
@@ -294,7 +300,7 @@ base("structured view approval card", async ({ page }, testInfo) => {
       name: /Send a message|Queue a follow-up/i,
     });
     await composer.fill("push my changes");
-    await composer.press("Enter");
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
 
     await page
       .getByText(/git push --force/i)

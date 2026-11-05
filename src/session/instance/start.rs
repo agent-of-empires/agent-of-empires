@@ -916,7 +916,7 @@ impl Instance {
         );
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
             crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
-                profile,
+                storage.storage(),
                 &self.id,
                 crate::migrations::v033_isolate_sandbox_content::NativeContextView::Terminal,
                 self.lifecycle_generation,

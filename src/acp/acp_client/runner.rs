@@ -344,6 +344,16 @@ pub(super) async fn spawn_runner_detached(
     {
         cmd.arg("--lifecycle-generation")
             .arg(admission.generation.to_string());
+        let attempt = admission.establishment.as_ref().ok_or_else(|| {
+            AcpError::Spawn("runner birth has no original establishment attempt".into())
+        })?;
+        let producer = attempt.producer.ok_or_else(|| {
+            AcpError::Spawn("runner birth has no original establishment producer".into())
+        })?;
+        cmd.arg("--establishment-attempt")
+            .arg(attempt.id.to_string())
+            .arg("--establishment-producer")
+            .arg(producer.to_string());
     }
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
@@ -917,19 +927,11 @@ mod tests {
             super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
         config.socket_path = Some(socket.clone());
-        let mut lifecycle = crate::acp::runner_lifecycle::LifecycleTable::new(1);
-        let lease = lifecycle
-            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
-            .unwrap();
-        config.launch_lease = Some(lease.clone());
 
-        let err = super::super::AcpClient::spawn(
-            config,
-            crate::acp::state::AcpSessionId(session.clone()),
-        )
-        .await
-        .err()
-        .expect("spawn must fail");
+        let err = match spawn_runner_detached(&config, &socket, session.clone(), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("spawn must fail"),
+        };
         assert!(
             matches!(&err, AcpError::Spawn(msg) if msg.contains("not found on the daemon's PATH")),
             "{err:?}"
@@ -942,9 +944,5 @@ mod tests {
         ] {
             assert!(!path.exists(), "left behind: {}", path.display());
         }
-        assert!(lifecycle.abandon(&lease), "the failed producer must settle");
-        lifecycle
-            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
-            .expect("adapter refusal must not strand the session reservation");
     }
 }

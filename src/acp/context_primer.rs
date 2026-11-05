@@ -111,14 +111,17 @@ struct Folded {
     ended_non_success: bool,
 }
 
-fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
+fn fold_turns<'a>(
+    events: impl IntoIterator<Item = (u64, &'a Event)>,
+    before_seq: Option<u64>,
+) -> Folded {
     let mut turns = Vec::new();
     let mut current: Option<Turn> = None;
     let mut included_event_count = 0;
     let mut ended_non_success = false;
 
     for (seq, event) in events {
-        if before_seq.is_some_and(|before| *seq >= before) {
+        if before_seq.is_some_and(|before| seq >= before) {
             break;
         }
         match event {
@@ -219,7 +222,10 @@ fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
 }
 
 /// Build a markdown primer from the given events.
-pub fn build_context_primer(events: &[(u64, Event)], opts: PrimerOptions) -> ContextPrimer {
+pub fn build_context_primer<'a>(
+    events: impl IntoIterator<Item = (u64, &'a Event)>,
+    opts: PrimerOptions,
+) -> ContextPrimer {
     let Folded {
         mut turns,
         included_event_count,
@@ -493,7 +499,7 @@ mod tests {
 
     fn with_options(events: Vec<Event>, opts: PrimerOptions) -> ContextPrimer {
         let events: Vec<(u64, Event)> = (1..).zip(events).collect();
-        build_context_primer(&events, opts)
+        build_context_primer(events.iter().map(|(seq, event)| (*seq, event)), opts)
     }
 
     fn primer(events: Vec<Event>) -> ContextPrimer {
@@ -560,7 +566,6 @@ mod tests {
 
         let reset = Event::SessionContextReset {
             reason: "load failed".into(),
-            fork_rejection: None,
         };
         let p = with_options(
             vec![

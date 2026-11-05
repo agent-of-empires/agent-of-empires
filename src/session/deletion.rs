@@ -437,6 +437,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .iter_mut()
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
+            stored.rebase_acp_generation(store.storage())?;
             lifecycle_changed = was_trashed && !stored.same_trash_lifecycle(&request.instance);
             stored.failed_purge = None;
             stored.status = crate::session::Status::Deleting;
@@ -458,6 +459,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             request.instance.status = snapshot.status;
             request.instance.lifecycle_reservation = snapshot.lifecycle_reservation.clone();
             request.instance.source_profile = snapshot.source_profile;
+            request.instance.acp_establishment = snapshot.acp_establishment;
         } else {
             request.instance = snapshot;
         }
@@ -1036,11 +1038,65 @@ impl<S: SessionStore> CommittedPurge<S> {
         self.owner.ensure_retirement_target(target)
     }
 
-    pub(crate) fn complete_retirement(
+    /// Keep committed ownership inside the blocking worker through journal and
+    /// Native-store checkpointing. Cancellation leaves its durable owner intact.
+    pub(crate) async fn complete_retirement(
+        mut self,
+        target: crate::acp::supervisor::RetirementTarget,
+    ) -> Result<Self>
+    where
+        S: 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            // The supplied target is frozen; do not recursively reacquire a
+            // recovered owner's preparation locks during its final checkpoint.
+            self.release_retirement_exclusion();
+            self.checkpoint_retirement(&target)?;
+            Ok(self)
+        })
+        .await?
+    }
+
+    fn checkpoint_retirement(
         &mut self,
         target: &crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
-        self.owner.complete_retirement(target)
+        self.owner.complete_retirement(target)?;
+        let Some(projection) = target
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.retirement().establishment_projection())
+        else {
+            return Ok(());
+        };
+        if !projection.retirement_checkpoint_pending() {
+            return Ok(());
+        }
+        // This is the committed remover's permanent-forget checkpoint, not
+        // establishment completion against a Native row that no longer exists.
+        let _identity = super::acquire_session_identity_lock()?;
+        let _lifecycle = self
+            .store
+            .storage()
+            .acquire_instance_lifecycle_lock(&self.request.session_id)?;
+        self.store.check_available()?;
+        anyhow::ensure!(
+            !self
+                .store
+                .load()?
+                .iter()
+                .any(|row| row.id == self.request.session_id),
+            "session identity was reused before permanent establishment retirement"
+        );
+        let delivery = projection
+            .seal_retirement()
+            .context("Permanent purge establishment retirement is unsealed")?;
+        let proof = self.owner.permanent_establishment_retirement(
+            self.store.storage(),
+            &delivery.attempt,
+            target,
+        )?;
+        projection.finish_permanent_forget(&delivery, &proof)
     }
 
     /// Durable journal token of the owner backing this purge, so a caller can

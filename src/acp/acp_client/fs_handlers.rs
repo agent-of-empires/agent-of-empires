@@ -8,8 +8,10 @@ use agent_client_protocol::schema::v1::{
 use std::sync::Arc;
 use tracing::{trace, warn};
 
+use crate::acp::establishment::NativeRequestContext;
 use crate::acp::fs_handler;
 
+use super::connection::ConnectionState;
 use super::SessionResources;
 
 /// Issue #1147: monotonic ns-since-process-start, used as a thin
@@ -60,6 +62,8 @@ where
 pub(super) async fn handle_read_text_file(
     request: ReadTextFileRequest,
     res: SessionResources,
+    context: Option<Arc<NativeRequestContext>>,
+    state: Arc<ConnectionState>,
 ) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
     // Issue #1147: parallel-tool-call diagnostics. The `enter_ns` value is a
     // monotonic ns-since-process-start counter; if the model dispatches N
@@ -84,7 +88,32 @@ pub(super) async fn handle_read_text_file(
         path, line, limit, ..
     } = request;
     let read_outcome = spawn_blocking_fs("read", move || {
-        fs_handler::handle_read(&policy, &label, &path)
+        // Blocking work can start after its caller was superseded. Check the
+        // same ingress permission here, not before scheduling the closure.
+        if context.is_none() && state.control.get().is_some() {
+            return Err(fs_handler::FsError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "native FS callback scope missing",
+            )));
+        }
+        let _effect = context
+            .as_deref()
+            .map(NativeRequestContext::original_io_guard)
+            .transpose()
+            .map_err(|error| {
+                fs_handler::FsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    error,
+                ))
+            })?;
+        state
+            .admit(|| fs_handler::handle_read(&policy, &label, &path))
+            .map_err(|error| {
+                fs_handler::FsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    error,
+                ))
+            })?
     })
     .await;
     let result = match read_outcome {
@@ -120,6 +149,8 @@ pub(super) async fn handle_read_text_file(
 pub(super) async fn handle_write_text_file(
     request: WriteTextFileRequest,
     res: SessionResources,
+    context: Option<Arc<NativeRequestContext>>,
+    state: Arc<ConnectionState>,
 ) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
@@ -137,7 +168,30 @@ pub(super) async fn handle_write_text_file(
     let label = res.label.clone();
     let WriteTextFileRequest { path, content, .. } = request;
     let write_outcome = spawn_blocking_fs("write", move || {
-        fs_handler::handle_write(&policy, &label, &path, &content)
+        if context.is_none() && state.control.get().is_some() {
+            return Err(fs_handler::FsError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "native FS callback scope missing",
+            )));
+        }
+        let _effect = context
+            .as_deref()
+            .map(NativeRequestContext::original_io_guard)
+            .transpose()
+            .map_err(|error| {
+                fs_handler::FsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    error,
+                ))
+            })?;
+        state
+            .admit(|| fs_handler::handle_write(&policy, &label, &path, &content))
+            .map_err(|error| {
+                fs_handler::FsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    error,
+                ))
+            })?
     })
     .await;
     let result = match write_outcome {

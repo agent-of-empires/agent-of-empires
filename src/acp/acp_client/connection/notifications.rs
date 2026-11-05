@@ -3,9 +3,16 @@
 
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
+use crate::acp::establishment::{
+    NativeEstablishmentReceipt, NativeResourceAuthority, NativeResourceLocation,
+    NativeResourceSelector, NativeWorkflowSelector,
+};
+use crate::acp::event_sender::{EventMetadata, EventScope, EventSender};
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
-use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate};
+use agent_client_protocol::schema::v1::{
+    SessionId, SessionNotification, SessionUpdate, ToolCallStatus,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,15 +20,19 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
-use crate::acp::acp_client::control::{publish_adopted_completion, DaemonControlClient};
-use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+use crate::acp::acp_client::control::{
+    publish_adopted_completion, AdoptedCompletionPublication, DaemonControlClient,
 };
-use crate::acp::acp_client::rate_limit::record_rate_limit_report;
-use crate::acp::acp_client::session_identity::{PendingIngress, SessionIngress};
+use crate::acp::acp_client::lifecycle::{
+    classify_lifecycle_signal, forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal,
+    TerminalClaim,
+};
+use crate::acp::acp_client::rate_limit::{captured_rate_limit_resets_at, record_rate_limit_report};
+use crate::acp::acp_client::session_identity::{IngressUpdate, PendingIngress, SessionIngress};
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    capture_tool_context_input, restore_wake_tool_title, update_tool_context_cache,
+    ToolCallContextCache, ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -35,7 +46,7 @@ pub(super) fn now_ms() -> i64 {
 }
 
 pub(super) struct Shared {
-    pub(super) event_tx: mpsc::Sender<Event>,
+    pub(super) event_tx: EventSender,
     pub(super) connection_state: Arc<super::ConnectionState>,
     control: Option<Arc<DaemonControlClient>>,
     pending_responders: crate::acp::acp_client::pending::PendingResponders,
@@ -72,6 +83,7 @@ pub(super) struct Shared {
     pub(super) rate_limit_rejections: std::sync::Mutex<HashMap<String, i64>>,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
+    /// Native runtime uses only current-qualified updates; original history folds separately.
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
@@ -79,10 +91,18 @@ pub(super) struct Shared {
     claude_home: Option<std::path::PathBuf>,
 }
 
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Readers must release strong senders before the SDK drain can join.
+        self.bg_tasks.clear();
+        self.between_prompt.bg_agents.clear();
+    }
+}
+
 impl Shared {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        event_tx: mpsc::Sender<Event>,
+        event_tx: EventSender,
         session_label: String,
         profile: &'static AgentProfile,
         lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
@@ -132,10 +152,52 @@ impl Shared {
         }
     }
 
-    pub(super) async fn emit(&self, mut event: Event) {
-        let Ok(permit) = self.event_tx.reserve().await else {
+    pub(super) fn native_compacting(&self) -> bool {
+        self.compaction
+            .lock()
+            .expect("compaction tracker mutex poisoned")
+            .is_active()
+    }
+
+    pub(super) fn begin_native_compaction_original(
+        &self,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+        attempt: crate::acp::establishment::AttemptId,
+    ) {
+        self.compaction
+            .lock()
+            .expect("compaction tracker mutex poisoned")
+            .begin_original(owner, attempt);
+    }
+
+    pub(super) async fn emit(&self, event: Event) {
+        let constructor = self
+            .control
+            .as_ref()
+            .and_then(|_| self.ingress.constructor_scope());
+        self.emit_with_constructor(event, constructor).await;
+    }
+
+    pub(super) async fn emit_with_constructor(
+        &self,
+        mut event: Event,
+        constructor: Option<Arc<crate::acp::establishment::NativeConstructorObservation>>,
+    ) {
+        let sender = match &constructor {
+            Some(constructor) => self.event_tx.with_constructor(Arc::clone(constructor)),
+            None => self.event_tx.historical(),
+        };
+        let Ok(permit) = sender.reserve().await else {
             return;
         };
+        let current = constructor
+            .as_deref()
+            .map(|constructor| constructor.try_publication_guard())
+            .transpose();
+        let stale = current
+            .as_ref()
+            .is_err_and(|error| !error.is::<crate::process::worker_registry::RegistryBusy>());
+        let permit = if stale { permit.historical() } else { permit };
         if let Event::AcpSessionAssigned {
             connection_ready, ..
         } = &mut event
@@ -148,7 +210,7 @@ impl Shared {
             self.connection_state.established();
             *connection_ready &= self.connection_state.loss().is_none();
             if *connection_ready {
-                self.connection_state.usable.store(true, Ordering::Release);
+                self.connection_state.record_usable();
             }
             permit.send(event);
         } else {
@@ -195,31 +257,22 @@ impl Shared {
             self.terminal_claim.claim();
             self.adopted_turn_active.store(false, Ordering::Release);
             self.between_prompt.deactivate();
-            self.emit(Event::AcpConnectionUnavailable {
-                source: observation.source,
-                cause: observation.cause,
-                phase: observation.phase,
-                native_subject: None,
-            })
-            .await;
+            let _ = self
+                .event_tx
+                .send_control_plane_loss(Arc::clone(&self.connection_state), observation)
+                .await;
         }
     }
 
-    /// Publish the native session the lifecycle selected and apply the
-    /// updates buffered while it was still pending.
-    pub(super) async fn commit_session(
+    pub(super) async fn activate_session(
         &self,
         id: SessionId,
-        connection_ready: bool,
     ) -> Result<(), agent_client_protocol::Error> {
+        if self.ingress.is_current_stable(&id) {
+            return Ok(());
+        }
         let _guard = self.ingress.fence.write().await;
-        let replay = self.ingress.finish(Some(id.clone()))?;
-        self.emit(Event::AcpSessionAssigned {
-            acp_session_id: id.0.to_string(),
-            connection_ready,
-            native_subject: None,
-        })
-        .await;
+        let replay = self.ingress.finish(Some(id))?;
         self.apply_replay(replay).await;
         Ok(())
     }
@@ -242,6 +295,15 @@ impl Shared {
                 control.deliver_native_lost();
             }
         }
+        if matches!(&marker, PendingIngress::Replayed(_)) {
+            if let Some(marker) = self.ingress.marker(marker)? {
+                let _guard = self.ingress.fence.write().await;
+                if let Some(marker) = self.ingress.marker(marker)? {
+                    self.apply_ingress(marker).await;
+                }
+            }
+            return Ok(());
+        }
         if let Some(marker) = self.ingress.marker(marker)? {
             if matches!(&marker, PendingIngress::NativeLost) {
                 self.connection_state.wait_completed_outcomes().await;
@@ -259,21 +321,36 @@ impl Shared {
             PendingIngress::Update(notification) => {
                 self.handle_notification(*notification, false).await
             }
-            PendingIngress::Auth(status) => {
-                self.emit(Event::AuthStatusUpdated {
-                    status: Some(status),
-                })
-                .await;
+            PendingIngress::Auth(auth) => {
+                let mut metadata = EventMetadata::history();
+                metadata.native_origin = auth.evidence.physical_source.map(|source| source.witness);
+                if let Some(context) = &auth.current_scope {
+                    metadata.scope = EventScope::SessionCurrent;
+                    metadata.native_origin = context.origin();
+                }
+                let sender = self
+                    .event_tx
+                    .with_scoped_metadata(metadata, auth.current_scope);
+                let _ = sender
+                    .send(Event::AuthStatusUpdated {
+                        status: Some(auth.status),
+                    })
+                    .await;
             }
             PendingIngress::PromptCompleted(adopted) => {
                 if let Some(control) = self.control.as_ref() {
-                    let turn = adopted.turn;
-                    if publish_adopted_completion(
+                    if let AdoptedCompletionPublication::Settled(turn) = publish_adopted_completion(
                         *adopted,
                         &self.event_tx,
-                        &control.completion,
+                        control,
                         &self.prompt_in_flight,
                         &self.terminal_claim,
+                        || {
+                            captured_rate_limit_resets_at(
+                                &self.rate_limit_rejections,
+                                chrono::Utc::now(),
+                            )
+                        },
                     )
                     .await
                     {
@@ -284,6 +361,11 @@ impl Shared {
                 }
             }
             PendingIngress::NativeLost => self.publish_connection_unavailable().await,
+            PendingIngress::Replayed(marker) => {
+                if let Some(control) = &self.control {
+                    control.mark_session_replayed(marker);
+                }
+            }
         }
     }
 
@@ -295,30 +377,340 @@ impl Shared {
     }
 
     /// Re-tail sub-agents a previous daemon launched and left unresolved.
-    pub(super) fn resume_background_tailing(&self, launches: Vec<(String, String)>) {
-        for (agent_id, output_file) in launches {
+    pub(super) async fn resume_background_tailing(
+        &self,
+        launches: Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>,
+        receipt: Option<Arc<NativeEstablishmentReceipt>>,
+    ) {
+        let Some(receipt) = receipt.as_deref() else {
+            return;
+        };
+        for launch in launches {
+            let Some(witness) = launch.witness else {
+                continue;
+            };
+            let authority = match NativeResourceAuthority::adopt(witness, receipt) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    tracing::warn!(target: "acp.resource", agent = %launch.agent_id, %error,
+                        "retained tracking allocation was not adopted");
+                    continue;
+                }
+            };
+            let NativeResourceSelector::Agent { source, .. } = authority.selector() else {
+                continue;
+            };
+            let Some(source) = TranscriptSource::from_location(source) else {
+                tracing::warn!(target: "acp.resource", agent = %launch.agent_id,
+                    "retained transcript runtime is unsupported");
+                continue;
+            };
             spawn_tailer(
-                agent_id,
-                output_file,
-                self.bg_transcript_source.clone(),
+                (launch.agent_id, launch.output_file),
+                source,
                 self.event_tx.clone(),
-                self.between_prompt.bg_agents.clone(),
+                Arc::clone(&self.between_prompt.bg_agents),
                 TailerStart::Resumed,
-            );
+                authority,
+                None,
+            )
+            .await;
         }
     }
 
     pub(super) fn reset_message_dedup(&self) {
+        if self.control.is_some() {
+            return;
+        }
         self.agent_msg_dedup
             .lock()
             .expect("agent message dedup mutex poisoned")
             .reset();
     }
 
+    pub(super) async fn handle_notification(
+        &self,
+        update: IngressUpdate,
+        local_prompt_signals: bool,
+    ) {
+        if self.control.is_none() {
+            self.handle_sdk_notification(update.notification, local_prompt_signals)
+                .await;
+            return;
+        }
+        let IngressUpdate {
+            mut notification,
+            evidence,
+            current_scope,
+            metadata_scope,
+            resource_start,
+            history,
+            suppress_replay,
+        } = update;
+        let mut metadata = EventMetadata::history();
+        metadata.native_origin = evidence.physical_source.map(|source| source.witness);
+        metadata.reported_session_id = Some(notification.session_id.clone());
+        metadata.prompt_observation = evidence.prompt_observation;
+        let historical = self.event_tx.with_metadata(metadata.clone());
+        if let Some(history) = &history {
+            if !suppress_replay
+                && history
+                    .dedup
+                    .lock()
+                    .expect("original message dedup")
+                    .observe(&notification.update)
+            {
+                return;
+            }
+        }
+        if !suppress_replay {
+            qualify_compaction_id(&notification.session_id, &mut notification.update);
+            let compaction_lifecycle = matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(_) | SessionUpdate::CompactionUpdate(_)
+            ) && matches!(
+                classify_lifecycle_signal(&notification.update),
+                Some(
+                    LifecycleSignal::CompactionStarted
+                        | LifecycleSignal::CompactionCompleted
+                        | LifecycleSignal::CompactionFailed
+                )
+            );
+            if let Some(context) = current_scope.as_ref().filter(|_| compaction_lifecycle) {
+                let pending = self
+                    .compaction
+                    .lock()
+                    .expect("compaction tracker mutex poisoned")
+                    .observe_current(&mut notification.update, Arc::clone(context));
+                #[cfg(test)]
+                if pending {
+                    if let Some(entered) = self
+                        .connection_state
+                        .test_prompt_admission_busy
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {
+                        let _ = entered.send(());
+                    }
+                }
+                #[cfg(not(test))]
+                let _ = pending;
+                #[cfg(test)]
+                if let Some(folded) = crate::acp::acp_client::steer::COMPACTION_FOLD_OBSERVED
+                    .lock()
+                    .unwrap()
+                    .remove(&(Arc::as_ptr(&self.connection_state) as usize))
+                {
+                    let _ = folded.send(());
+                }
+            }
+            let fold = history.as_ref().map(|history| {
+                history
+                    .compaction
+                    .lock()
+                    .expect("original compaction")
+                    .observe(&mut notification.update)
+            });
+            match fold {
+                Some(CompactionFold::Skip) => return,
+                Some(CompactionFold::Patch(event)) => {
+                    let _ = historical.send(*event).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !suppress_replay && history.is_some() && current_scope.is_some() {
+            self.capture_rate_limit(&notification.update);
+        }
+        if !suppress_replay && history.is_some() {
+            let tool_activity = match &notification.update {
+                SessionUpdate::ToolCall(tool) => Some((
+                    tool.tool_call_id.0.as_ref(),
+                    !matches!(
+                        tool.status,
+                        ToolCallStatus::Completed | ToolCallStatus::Failed
+                    ),
+                )),
+                SessionUpdate::ToolCallUpdate(tool) => tool.fields.status.map(|status| {
+                    (
+                        tool.tool_call_id.0.as_ref(),
+                        !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed),
+                    )
+                }),
+                _ => None,
+            };
+            if let Some((id, in_flight)) = tool_activity {
+                let _ = super::command_loop::current_effect_wait(
+                    current_scope.as_deref(),
+                    true,
+                    &self.connection_state,
+                    || self.between_prompt.record_native_tool(id, in_flight),
+                )
+                .await;
+            }
+        }
+        let session_metadata = matches!(
+            &notification.update,
+            SessionUpdate::CurrentModeUpdate(_)
+                | SessionUpdate::UsageUpdate(_)
+                | SessionUpdate::AvailableCommandsUpdate(_)
+                | SessionUpdate::ConfigOptionUpdate(_)
+        );
+        let compaction_sender =
+            current_scope
+                .as_ref()
+                .filter(|_| !suppress_replay)
+                .map(|context| {
+                    let mut metadata = metadata.clone();
+                    metadata.scope = EventScope::SessionCurrent;
+                    metadata.native_origin = context.origin();
+                    self.event_tx
+                        .with_scoped_metadata(metadata, Some(Arc::clone(context)))
+                });
+        let sender = if let (true, Some(context)) = (session_metadata, current_scope) {
+            metadata.scope = EventScope::SessionCurrent;
+            metadata.native_origin = context.origin();
+            self.event_tx.with_scoped_metadata(metadata, Some(context))
+        } else if let Some(context) = metadata_scope {
+            self.event_tx.with_constructor(context)
+        } else {
+            historical
+        };
+        let restored = history
+            .as_ref()
+            .and_then(|history| {
+                restore_wake_tool_title(&history.tool_context, &notification.update)
+            })
+            .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, &title));
+        let native_session = notification.session_id;
+        let mut tool_input = history
+            .as_ref()
+            .and_then(|_| capture_tool_context_input(&notification.update));
+        let events = map_update_to_events(notification.update, self.profile)
+            .into_iter()
+            .chain(restored);
+        // Late callback bookkeeping remains history, not a new main turn.
+        let failed_main_turn =
+            !self.prompt_in_flight.load(Ordering::Acquire) && self.terminal_claim.failed();
+        for event in events {
+            if failed_main_turn && matches!(event, Event::ThinkingStarted) {
+                continue;
+            }
+            if suppress_replay && is_transcript_event(&event) {
+                continue;
+            }
+            let sender = if matches!(
+                event,
+                Event::ConversationCompactionStarted
+                    | Event::ConversationCompacted
+                    | Event::ConversationCompactionFailed
+            ) {
+                compaction_sender.as_ref().unwrap_or(&sender)
+            } else {
+                &sender
+            };
+            if let Some(start) = &resource_start {
+                if let Event::BackgroundAgentLaunched {
+                    agent_id,
+                    tool_call_id,
+                    output_file,
+                    ..
+                } = &event
+                {
+                    if !output_file.is_empty() {
+                        let source = match &self.bg_transcript_source {
+                            TranscriptSource::Host => NativeResourceLocation::Host,
+                            TranscriptSource::Container { runtime, container } => {
+                                NativeResourceLocation::Container {
+                                    runtime: runtime.to_string(),
+                                    container: container.clone(),
+                                }
+                            }
+                        };
+                        if let Ok(authority) = NativeResourceAuthority::start(
+                            Arc::clone(start),
+                            NativeResourceSelector::Agent {
+                                agent_id: agent_id.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                                output_file: output_file.clone(),
+                                source,
+                            },
+                        ) {
+                            spawn_tailer(
+                                (agent_id.clone(), output_file.clone()),
+                                self.bg_transcript_source.clone(),
+                                sender.clone(),
+                                Arc::clone(&self.between_prompt.bg_agents),
+                                TailerStart::Live,
+                                authority,
+                                Some(event),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+                if let (
+                    Event::BackgroundTaskStarted {
+                        task_id,
+                        tool_call_id,
+                        workflow,
+                        ..
+                    },
+                    TranscriptSource::Host,
+                    Some(home),
+                ) = (&event, &self.bg_transcript_source, &self.claude_home)
+                {
+                    let selector = NativeResourceSelector::Task {
+                        task_id: task_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        session_id: native_session.0.to_string(),
+                        claude_home: home.clone(),
+                        workflow: workflow.as_ref().map(|workflow| NativeWorkflowSelector {
+                            run_id: workflow.run_id.clone(),
+                            transcript_dir: workflow.transcript_dir.clone(),
+                        }),
+                    };
+                    if let Ok(authority) =
+                        NativeResourceAuthority::start(Arc::clone(start), selector)
+                    {
+                        spawn_task_tailer(
+                            BackgroundTaskLaunch {
+                                task_id: task_id.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                                workflow: workflow.clone(),
+                                workflow_agents: Default::default(),
+                                witness: None,
+                            },
+                            native_session.0.to_string(),
+                            Some(home.clone()),
+                            Arc::clone(&self.bg_tasks),
+                            Arc::clone(&self.between_prompt.bg_agents),
+                            sender.downgrade(),
+                            TailerStart::Live,
+                            Some(event),
+                            authority,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+            if let Some(history) = &history {
+                update_tool_context_cache(&history.tool_context, &event, &mut tool_input);
+            }
+            if sender.send(event).await.is_err() {
+                break;
+            }
+        }
+    }
+
     /// `local_prompt_signals` is false for a replayed update committed with
     /// the session: it belongs to no local prompt, so it must not reach the
     /// per-prompt watchdog.
-    pub(super) async fn handle_notification(
+    async fn handle_sdk_notification(
         &self,
         mut notification: SessionNotification,
         local_prompt_signals: bool,
@@ -393,8 +785,7 @@ impl Shared {
             );
         }
         self.capture_rate_limit(&notification.update);
-        let session_id = notification.session_id.0.to_string();
-        let update_for_tool_context = notification.update.clone();
+        let mut tool_input = capture_tool_context_input(&notification.update);
         let mut events = map_update_to_events(notification.update, self.profile);
         events.extend(restored_wake_event);
         // Signals go first: if the event send backpressures, the watchdog must
@@ -415,23 +806,6 @@ impl Shared {
             if failed_main_turn && matches!(event, Event::ThinkingStarted) {
                 continue;
             }
-            if let Event::BackgroundAgentLaunched {
-                agent_id,
-                output_file,
-                ..
-            } = &event
-            {
-                if !suppressing && !output_file.is_empty() {
-                    spawn_tailer(
-                        agent_id.clone(),
-                        output_file.clone(),
-                        self.bg_transcript_source.clone(),
-                        self.event_tx.clone(),
-                        self.between_prompt.bg_agents.clone(),
-                        TailerStart::Live,
-                    );
-                }
-            }
             // During replay only transcript events are dropped; ambient state
             // and lifecycle events still pass so pickers stay current.
             if suppressing && is_transcript_event(&event) {
@@ -443,64 +817,54 @@ impl Shared {
                 );
                 continue;
             }
-            if let Event::BackgroundTaskStarted {
-                task_id,
-                tool_call_id,
-                workflow,
-                ..
-            } = &event
-            {
-                if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
-                    continue;
-                }
-                spawn_task_tailer(
-                    BackgroundTaskLaunch {
-                        task_id: task_id.clone(),
-                        tool_call_id: tool_call_id.clone(),
-                        workflow: workflow.clone(),
-                        workflow_agents: Default::default(),
-                    },
-                    session_id.clone(),
-                    self.claude_home.clone(),
-                    self.bg_tasks.clone(),
-                    self.between_prompt.bg_agents.clone(),
-                    self.event_tx.downgrade(),
-                    TailerStart::Live,
-                    Some(event),
-                )
-                .await;
-                if self.event_tx.is_closed() {
-                    break;
-                }
-                continue;
-            }
-            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
+            update_tool_context_cache(&self.tool_context_cache, &event, &mut tool_input);
             if self.event_tx.send(event).await.is_err() {
                 break;
             }
         }
     }
 
-    /// Re-tail tasks a previous daemon left open: their end may already be in
-    /// the transcript, so each tailer reads it from the start.
+    /// Retained selectors, not current configuration, choose the resumed source.
     pub(super) async fn resume_task_tailing(
         &self,
-        session_id: &str,
         tasks: Vec<BackgroundTaskLaunch>,
+        receipt: Option<Arc<NativeEstablishmentReceipt>>,
     ) {
-        if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
+        let Some(receipt) = receipt.as_deref() else {
             return;
-        }
+        };
         for task in tasks {
+            let Some(witness) = task.witness.as_ref() else {
+                continue;
+            };
+            let authority = match NativeResourceAuthority::adopt(Arc::clone(witness), receipt) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    tracing::warn!(target: "acp.resource", task = %task.task_id, %error,
+                        "retained tracking allocation was not adopted");
+                    continue;
+                }
+            };
+            let NativeResourceSelector::Task {
+                session_id,
+                claude_home,
+                ..
+            } = authority.selector()
+            else {
+                continue;
+            };
+            let native_session = session_id.clone();
+            let home = Some(claude_home.clone());
             spawn_task_tailer(
                 task,
-                session_id.to_string(),
-                self.claude_home.clone(),
-                self.bg_tasks.clone(),
-                self.between_prompt.bg_agents.clone(),
+                native_session,
+                home,
+                Arc::clone(&self.bg_tasks),
+                Arc::clone(&self.between_prompt.bg_agents),
                 self.event_tx.downgrade(),
                 TailerStart::Resumed,
                 None,
+                authority,
             )
             .await;
         }

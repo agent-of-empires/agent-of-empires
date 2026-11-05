@@ -323,8 +323,9 @@ pub(crate) async fn spawn_structured_session(
             )?;
             instance.status = Status::Creating;
             store.update(|rows, groups| {
-                anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
-                rows.push(instance.clone());
+                crate::acp::establishment::insert_created_instance(
+                    rows, instance, native.storage(), crate::acp::establishment::CreationAdmission::Now,
+                )?;
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
                 Ok(())
             })?;
@@ -345,6 +346,7 @@ pub(crate) async fn spawn_structured_session(
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let mut adapter_refusal = None;
         let agent_effort = if provision_error.is_none() {
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
@@ -407,11 +409,15 @@ pub(crate) async fn spawn_structured_session(
                 let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
                 if capable {
                     instance.view = crate::session::View::Structured;
+                } else if instance.acp_establishment.as_ref()
+                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    .is_some_and(|attempt| attempt.target != crate::acp::establishment::EstablishmentTarget::New)
+                {
+                    adapter_refusal = Some(anyhow::anyhow!(
+                        "the selected agent cannot establish the requested structured conversation"
+                    ));
                 } else {
                     instance.view = crate::session::View::Terminal;
-                    // A non-ACP tool cannot run the structured session/fork handshake.
-                    instance.fork_pending = None;
-                    instance.import_pending = None;
                 }
             }
 
@@ -509,6 +515,18 @@ pub(crate) async fn spawn_structured_session(
                     (None, None) => {}
                     _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
                 }
+                if !instance.is_structured() {
+                    if let Some(original) = instance.acp_establishment.as_ref()
+                        .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    {
+                        let expected = row.acp_establishment.as_ref()
+                            .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                            .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+                        anyhow::ensure!(expected.same_source(original),
+                            crate::acp::establishment::EstablishmentRefusal::Superseded);
+                        row.discard_acp_creation(native.storage(), &expected)?;
+                    }
+                }
                 row.view = instance.view;
                 row.agent_model = instance.agent_model.clone();
                 row.acp_effort = instance.acp_effort.clone();
@@ -522,7 +540,7 @@ pub(crate) async fn spawn_structured_session(
             rollback(native, instance, provisioning_failed);
             return Err(error);
         }
-        let creation = match provision_error {
+        let creation = match provision_error.or(adapter_refusal) {
             Some(error) => Err(error),
             None => creation_guard
                 .check()
@@ -628,10 +646,29 @@ pub(crate) async fn spawn_structured_session(
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
                 let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))?;
+                let original = instance.acp_establishment.as_ref()
+                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+                let mut authority = None;
+                store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == instance.id)
+                        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        crate::session::LifecycleReservationError::Superseded);
+                    let expected = row.acp_establishment.as_ref()
+                        .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                        .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+                    anyhow::ensure!(expected.same_source(&original),
+                        crate::acp::establishment::EstablishmentRefusal::Superseded);
+                    row.finish_acp_creation(native.storage(), &expected)?;
+                    authority = row.acp_establishment.clone();
+                    Ok(())
+                })?;
+                instance.acp_establishment = authority;
                 acp_reservation = match runtime.block_on(worker_state.acp_supervisor.begin_resume(&instance.id, crate::acp::supervisor::ResumeKind::Spawn, crate::process::worker_registry::ResumeAuthority::Explicit)) {
-                    Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease)) => Some(lease),
+                    Ok(Some(lease)) => Some(lease),
                     Err(crate::acp::supervisor::SupervisorError::CapacityFull { .. }) => None,
-                    Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+                    Ok(None) => {
                         anyhow::bail!("creation worker already claimed before finalization")
                     }
                     Err(error) => return Err(error.into()),
@@ -775,6 +812,12 @@ pub(crate) async fn spawn_structured_session(
                 let launch_native = native.clone();
                 let sandbox_info = response_instance.sandbox_info.clone();
                 let generation = response_instance.lifecycle_generation;
+                let establishment = response_instance
+                    .acp_establishment
+                    .as_ref()
+                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    .cloned()
+                    .map(Arc::new);
                 let spawn_state = state.clone();
                 let claude_store_pin = response_instance.selected_claude_store_pin();
                 service.work.spawn("acp.create_spawn", async move {
@@ -841,6 +884,7 @@ pub(crate) async fn spawn_structured_session(
                                 crate::acp::supervisor::SpawnRequest {
                                     launch_admission: Some(
                                         crate::acp::supervisor::LaunchAdmission {
+                                            establishment,
                                             store: launch_native,
                                             generation,
                                             namespace: Some(spawn_state.profile_namespace.clone()),
@@ -1265,8 +1309,14 @@ mod tests {
             while !state
                 .acp_event_store
                 .replay_from(&id, 0)
+                .expect("read retained events")
                 .iter()
-                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+                .any(|stored| {
+                    matches!(
+                        stored.event.as_ref(),
+                        crate::acp::Event::AgentStartupError { .. }
+                    )
+                })
             {
                 tokio::task::yield_now().await;
             }

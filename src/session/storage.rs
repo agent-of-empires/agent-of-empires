@@ -1285,6 +1285,10 @@ pub struct Storage {
     file_watch: Arc<FileWatchService>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("profile storage binding changed")]
+pub(crate) struct NativeInputBindingChanged;
+
 /// A channel-local binding to the profile and the current sessions-file name.
 pub(crate) struct NativeInputStore {
     storage: Storage,
@@ -1306,6 +1310,10 @@ pub(crate) struct NativeInputRevision {
 impl NativeInputStore {
     pub(crate) fn profile(&self) -> &str {
         self.storage.profile()
+    }
+
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     pub(crate) fn acquire_lifecycle_lock(&self) -> Result<StorageFlock> {
@@ -1741,7 +1749,7 @@ impl ProfileFiles {
             || !self.sessions.same_target(&current.sessions)?
             || !self.groups.same_target(&current.groups)?
         {
-            anyhow::bail!("profile storage binding changed");
+            anyhow::bail!(NativeInputBindingChanged);
         }
         Ok(())
     }
@@ -1934,7 +1942,10 @@ impl Storage {
 
         Ok(Self {
             profile: profile_name,
-            files: None,
+            files: Some(Box::new(ProfileFiles::open(
+                &sessions_path,
+                ProfileRootPolicy::Reference,
+            )?)),
             sessions_path,
             save_lock,
             file_watch,
@@ -2258,6 +2269,11 @@ impl Storage {
                 .is_some_and(|intent| !intent.is_null()),
             "row retains terminal handoff authority and cannot be decoded"
         );
+        anyhow::ensure!(
+            !row.get("acp_establishment")
+                .is_some_and(|authority| !authority.is_null()),
+            "row retains ACP establishment authority and cannot be decoded"
+        );
         Ok(())
     }
 
@@ -2273,6 +2289,9 @@ impl Storage {
                         format!("invalid terminal handoff for session {}", instance.id)
                     })?;
                 }
+                instance.validate_acp_establishment(self).with_context(|| {
+                    format!("invalid ACP establishment for session {}", instance.id)
+                })?;
                 Ok(())
             },
             Self::on_corrupt_session,
@@ -4080,17 +4099,36 @@ pub(crate) fn backup_before_migration(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write one copy beside `path` under `marker`, then prune the set that was
-/// there before, never the copy just made. `None` means `path` held nothing to
-/// copy.
-fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).context(format!("failed reading {} for backup", path.display()))
-        }
-    };
+pub(crate) fn publish_migration_snapshot(
+    path: &Path,
+    snapshot: tempfile::NamedTempFile,
+) -> Result<()> {
+    anyhow::ensure!(
+        snapshot.path().parent() == path.parent(),
+        "migration snapshot must be beside its source"
+    );
+    let BackupTarget {
+        path: backup,
+        previous,
+    } = backup_target(path, MIGRATION_BACKUP_MARKER)?;
+    snapshot.as_file().sync_all()?;
+    snapshot
+        .persist_noclobber(&backup)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish migration snapshot {}", backup.display()))?;
+    sync_parent_directory(&backup)?;
+    if let Err(error) = prune_backups_beside(path, &previous, sync_resolved_parent_directory) {
+        tracing::warn!(target: "session.store", %error, path = %path.display(), "migration snapshots not pruned");
+    }
+    Ok(())
+}
+
+struct BackupTarget {
+    path: PathBuf,
+    previous: Vec<(u128, PathBuf)>,
+}
+
+fn backup_target(path: &Path, marker: &str) -> Result<BackupTarget> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("a file to back up needs a name: {}", path.display()))?;
@@ -4126,6 +4164,28 @@ fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
     let mut name = file_name.to_os_string();
     name.push(format!("{marker}{stamp}"));
     let backup = path.with_file_name(&name);
+    Ok(BackupTarget {
+        path: backup,
+        previous: backups,
+    })
+}
+
+/// Write one copy beside `path` under `marker`, then prune the set that was
+/// there before, never the copy just made. `None` means `path` held nothing to
+/// copy.
+fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context(format!("failed reading {} for backup", path.display()))
+        }
+    };
+    let BackupTarget {
+        path: backup,
+        previous: backups,
+    } = backup_target(path, marker)?;
+    let name = backup.file_name().expect("backup target has a file name");
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("a file to back up needs a parent: {}", path.display()))?;

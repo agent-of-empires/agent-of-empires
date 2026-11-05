@@ -203,9 +203,14 @@ pub async fn acp_context_primer(
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    let events = state.acp_event_store.replay_before(&id, q.before_seq);
+    let events = match state.acp_event_store.replay_before(&id, q.before_seq) {
+        Ok(events) => events,
+        Err(error) => return blocking_failed("retained transcript read failed", error),
+    };
     let primer = crate::acp::context_primer::build_context_primer(
-        &events,
+        events
+            .iter()
+            .map(|stored| (stored.seq, stored.event.as_ref())),
         crate::acp::context_primer::PrimerOptions {
             before_seq: Some(q.before_seq),
             ..Default::default()
@@ -227,21 +232,21 @@ const ROWS_PRIOR_BATCH: usize = 256;
 
 /// Only an identified chunk before the page's first user turn can use an older marker.
 fn prior_message_marker_for_page(
-    events: &[(u64, crate::acp::state::Event)],
-    lookup: impl FnOnce(u64) -> Option<crate::acp::state::Event>,
-) -> Option<crate::acp::state::Event> {
+    events: &[crate::acp::event_store::StoredEvent],
+    lookup: impl FnOnce(u64) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>>,
+) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>> {
     use crate::acp::state::Event;
-    for (_, event) in events {
-        match event {
+    for stored in events {
+        match stored.event.as_ref() {
             Event::AgentMessageChunk {
                 message_id: Some(_),
                 ..
-            } => return lookup(events[0].0),
-            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => return None,
+            } => return lookup(events[0].seq),
+            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => return Ok(None),
             _ => {}
         }
     }
-    None
+    Ok(None)
 }
 
 /// The latest event below `before` that says which agent message a page
@@ -252,13 +257,13 @@ fn prior_message_marker(
     session_id: &str,
     before: u64,
     batch: usize,
-) -> Option<crate::acp::state::Event> {
+) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>> {
     let mut cursor = before;
     loop {
-        let page = store.replay_page_before(session_id, cursor, Some(batch));
-        let marker = page.events.iter().rev().find(|(_, event)| {
+        let page = store.replay_page_before(session_id, cursor, Some(batch))?;
+        let marker = page.events.iter().rev().find(|stored| {
             matches!(
-                event,
+                stored.event.as_ref(),
                 crate::acp::state::Event::AgentMessageChunk {
                     message_id: Some(_),
                     ..
@@ -266,12 +271,12 @@ fn prior_message_marker(
                     | crate::acp::state::Event::UserDiffCommentsPrompt { .. }
             )
         });
-        if let Some((_, event)) = marker {
-            return Some(event.clone());
+        if let Some(stored) = marker {
+            return Ok(Some(Arc::clone(&stored.event)));
         }
         match page.last_scanned_seq {
             Some(next) if page.has_more && next < cursor => cursor = next,
-            _ => return None,
+            _ => return Ok(None),
         }
     }
 }
@@ -300,6 +305,10 @@ pub async fn acp_replay(
             .replay_page_before(&id, before, Some(limit)),
         None => state.acp_event_store.replay_page(&id, q.since, Some(limit)),
     };
+    let page = match page {
+        Ok(page) => page,
+        Err(error) => return blocking_failed("retained transcript read failed", error),
+    };
     let (highest_seq, lowest_seq, next_cursor, has_more) = (
         page.highest_seq,
         page.lowest_seq,
@@ -308,26 +317,33 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        if let Some(prior) = prior_message_marker_for_page(&page.events, |lowest| {
+        let prior = match prior_message_marker_for_page(&page.events, |lowest| {
             prior_message_marker(&state.acp_event_store, &id, lowest, ROWS_PRIOR_BATCH)
         }) {
+            Ok(prior) => prior,
+            Err(error) => return blocking_failed("retained transcript marker read failed", error),
+        };
+        if let Some(prior) = prior {
             model.observe_prior(&prior);
         }
-        for (seq, event) in &page.events {
-            model.apply_event(*seq, event);
+        for stored in &page.events {
+            model.apply_scoped_event(stored.seq, &stored.event, &stored.metadata);
         }
         (Vec::new(), Some(model.rows().to_vec()))
     } else {
         let frames = page
             .events
             .into_iter()
-            .map(|(seq, event)| crate::server::AcpBroadcastFrame {
-                native_subject: None,
-                session_id: id.clone(),
-                seq,
-                event: Arc::new(event),
-                worker_generation: None,
-                sidebar_status: None,
+            .map(|stored| {
+                crate::server::AcpBroadcastFrame::from_qualified(
+                    id.clone(),
+                    stored.seq,
+                    stored.event,
+                    &stored.metadata,
+                    None,
+                    None,
+                    None,
+                )
             })
             .collect();
         (frames, None)
@@ -752,7 +768,12 @@ done
             for (i, ev) in before.iter().chain(&page).enumerate() {
                 state
                     .acp_event_store
-                    .record(&id, i as u64 + 1, ev)
+                    .record(
+                        &id,
+                        i as u64 + 1,
+                        ev,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
                     .expect("record");
             }
             let q = ReplayQuery {
@@ -825,17 +846,22 @@ done
             let page: Vec<_> = events
                 .into_iter()
                 .enumerate()
-                .map(|(i, e)| (i as u64 + 20, e))
+                .map(|(i, event)| crate::acp::event_store::StoredEvent {
+                    seq: i as u64 + 20,
+                    event: std::sync::Arc::new(event),
+                    metadata: crate::acp::event_sender::EventMetadata::history(),
+                })
                 .collect();
             let mut calls = 0;
             let prior = prior_message_marker_for_page(&page, |before| {
                 calls += 1;
                 assert_eq!(before, 20, "{label}");
-                Some(Event::AgentMessageChunk {
+                Ok(Some(std::sync::Arc::new(Event::AgentMessageChunk {
                     text: "earlier".into(),
                     message_id: Some("m-a".into()),
-                })
-            });
+                })))
+            })
+            .expect("read prior marker");
             assert_eq!(calls, reads, "{label}");
             assert_eq!(prior.is_some(), reads == 1, "{label}");
         }
@@ -863,18 +889,38 @@ done
             let events =
                 std::iter::once(head).chain(std::iter::repeat_n(&Event::ThinkingStarted, 70));
             for (i, event) in events.enumerate() {
-                store.record(session, i as u64 + 1, event).expect("record");
+                store
+                    .record(
+                        session,
+                        i as u64 + 1,
+                        event,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
+                    .expect("record");
             }
         }
         assert!(matches!(
-            prior_message_marker(&store, "s-chunk", 72, 8),
+            prior_message_marker(&store, "s-chunk", 72, 8).expect("read prior chunk").as_deref(),
             Some(Event::AgentMessageChunk { message_id: Some(id), .. }) if id == "m-a"
         ));
         assert!(matches!(
-            prior_message_marker(&store, "s-prompt", 72, 8),
+            prior_message_marker(&store, "s-prompt", 72, 8)
+                .expect("read prior turn")
+                .as_deref(),
             Some(Event::UserPromptSent { .. })
         ));
-        assert!(prior_message_marker(&store, "s-none", 72, 8).is_none());
+        assert!(prior_message_marker(&store, "s-none", 72, 8)
+            .expect("read absent marker")
+            .is_none());
+        store
+            .test_conn()
+            .execute_batch("ALTER TABLE acp_events RENAME TO hidden_history_events")
+            .unwrap();
+        assert!(prior_message_marker(&store, "s-chunk", 72, 8).is_err());
+        store
+            .test_conn()
+            .execute_batch("ALTER TABLE hidden_history_events RENAME TO acp_events")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -907,7 +953,12 @@ done
         for (i, ev) in events.iter().enumerate() {
             state
                 .acp_event_store
-                .record(&id, i as u64 + 1, ev)
+                .record(
+                    &id,
+                    i as u64 + 1,
+                    ev,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .expect("record");
         }
 

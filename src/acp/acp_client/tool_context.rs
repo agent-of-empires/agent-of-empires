@@ -94,35 +94,34 @@ pub(super) fn raw_input_has_no_user_context(raw_input: &serde_json::Value) -> bo
     }
 }
 
+pub(super) struct ToolContextInput {
+    id: String,
+    raw_input: serde_json::Value,
+}
+
 pub(super) fn update_tool_context_cache(
     cache: &ToolContextCache,
     event: &Event,
-    source_update: &SessionUpdate,
+    source_input: &mut Option<ToolContextInput>,
 ) {
-    match event {
-        Event::ToolCallStarted { tool_call } => {
-            if let Some(raw_input) = raw_input_for_tool_event(source_update, &tool_call.id) {
-                cache
-                    .lock()
-                    .expect("tool context cache mutex poisoned")
-                    .record(tool_call.id.clone(), raw_input);
-            }
-        }
-        Event::ToolCallUpdated { tool_call_id, .. } => {
-            if let Some(raw_input) = raw_input_for_tool_event(source_update, tool_call_id) {
-                cache
-                    .lock()
-                    .expect("tool context cache mutex poisoned")
-                    .record(tool_call_id.clone(), raw_input);
-            }
-        }
+    let id = match event {
+        Event::ToolCallStarted { tool_call } => &tool_call.id,
+        Event::ToolCallUpdated { tool_call_id, .. } => tool_call_id,
         Event::ToolCallCompleted { tool_call_id, .. } => {
             cache
                 .lock()
                 .expect("tool context cache mutex poisoned")
                 .remove(tool_call_id);
+            return;
         }
-        _ => {}
+        _ => return,
+    };
+    if source_input.as_ref().is_some_and(|input| input.id == *id) {
+        let input = source_input.take().expect("matching tool input");
+        cache
+            .lock()
+            .expect("tool context cache mutex poisoned")
+            .record(input.id, input.raw_input);
     }
 }
 
@@ -161,23 +160,18 @@ pub(super) fn restore_wake_tool_title(
     }
 }
 
-pub(super) fn raw_input_for_tool_event(
-    source_update: &SessionUpdate,
-    tool_call_id: &str,
-) -> Option<serde_json::Value> {
-    match source_update {
-        SessionUpdate::ToolCall(tool_call)
-            if tool_call.tool_call_id.0.to_string() == tool_call_id =>
-        {
-            tool_call.raw_input.clone()
+pub(super) fn capture_tool_context_input(update: &SessionUpdate) -> Option<ToolContextInput> {
+    let (id, raw_input) = match update {
+        SessionUpdate::ToolCall(tool) => (&tool.tool_call_id.0, tool.raw_input.as_ref()?),
+        SessionUpdate::ToolCallUpdate(tool) => {
+            (&tool.tool_call_id.0, tool.fields.raw_input.as_ref()?)
         }
-        SessionUpdate::ToolCallUpdate(update)
-            if update.tool_call_id.0.to_string() == tool_call_id =>
-        {
-            update.fields.raw_input.clone()
-        }
-        _ => None,
-    }
+        _ => return None,
+    };
+    (!raw_input_has_no_user_context(raw_input)).then(|| ToolContextInput {
+        id: id.to_string(),
+        raw_input: raw_input.clone(),
+    })
 }
 
 #[cfg(test)]

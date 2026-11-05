@@ -27,6 +27,26 @@ const row = (id: string, kind: ActivityRow["kind"], text: string, extra: Partial
   at: AT,
   ...extra,
 });
+
+describe("certified late clear display", () => {
+  it.each([0, 10])("keeps the New prefix visible with cut %s, without duplicating stored rows", (cut) => {
+    const wire: TranscriptRow[] = [
+      ...(cut ? [{ id: "old", group_id: "old", seq: cut, kind: "message" as const, text: "old history", at: AT }] : []),
+      { id: "prefix", group_id: "new", seq: 11, kind: "message", text: "New prefix", at: AT },
+      { id: "clear", group_id: "clear", seq: 13, clear_after_seq: cut, kind: "session_cleared", text: "reset", at: AT },
+      { id: "next", group_id: "new", seq: 14, kind: "message", text: "next answer", at: AT },
+    ];
+    const rows = wire.map((entry) => transcriptRowToActivity(entry, "s"));
+    const visible = JSON.stringify(activityToThreadMessages(rows, false));
+    expect(visible).toContain("New prefix");
+    expect(visible).toContain("next answer");
+    expect(visible).not.toContain("old history");
+    expect(visible.match(/New prefix/g)).toHaveLength(1);
+    if (cut) expect(JSON.stringify(activityToThreadMessages(rows, false, true))).toContain("old history");
+    expect(clearFoldGeneration(rows, false)).toBe("clear");
+    expect(rows.map((entry) => entry.id)).toEqual(wire.map((entry) => entry.id));
+  });
+});
 const user = (text = "go", id = "u1") => row(id, "user_prompt", text);
 const message = (text: string, id = "m1") => row(id, "message", text);
 

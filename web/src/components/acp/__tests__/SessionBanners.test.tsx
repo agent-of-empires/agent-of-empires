@@ -131,6 +131,7 @@ describe("interaction card retries through the session hook", () => {
                   <AskUserQuestionCard
                     key={elicitation.nonce}
                     elicitation={elicitation}
+                    canDecide={acp.status === "open" && nativeInputAvailable(acp.state)}
                     onResolve={(resolution) => acp.resolveElicitation(elicitation.nonce, resolution)}
                   />
                 ))}

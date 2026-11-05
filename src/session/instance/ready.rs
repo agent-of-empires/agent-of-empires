@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::session::storage::{NativeInputRevision, NativeInputStore, StorageFlock};
+use crate::session::Storage;
 
 /// Outcome of `Instance::ensure_pane_ready`. Callers surface this so the user
 /// knows what (if anything) happened on their behalf before a send.
@@ -97,11 +98,19 @@ pub(crate) struct NativeInputFence {
 struct NativeInputCache {
     witness: Option<NativeInputWitness>,
     invalidated: bool,
+    physical_invalidated: bool,
 }
 
 struct NativeInputWitness {
     revision: NativeInputRevision,
     row: Instance,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeFenceUse {
+    Input,
+    Observation,
+    OriginalHistory,
 }
 
 impl std::fmt::Debug for NativeInputFence {
@@ -169,12 +178,12 @@ impl NativeInputFence {
 
     /// Retain the guard through the native effect acknowledgement, not user hooks or waits.
     pub(crate) fn lock(&self) -> Result<StorageFlock> {
-        self.lock_scoped(true)
+        self.lock_scoped(NativeFenceUse::Input)
     }
 
     /// Runtime observations compare incarnation, not input or recovery permission.
     pub(crate) fn lock_observation(&self) -> Result<StorageFlock> {
-        self.lock_scoped(false)
+        self.lock_scoped(NativeFenceUse::Observation)
     }
 
     /// Additional controller custody may only restrict an observation fence,
@@ -183,7 +192,7 @@ impl NativeInputFence {
         &self,
         matches: impl FnOnce(&Instance) -> bool,
     ) -> Result<StorageFlock> {
-        self.lock_scoped_matching(false, matches, false)?
+        self.lock_scoped_matching(NativeFenceUse::Observation, matches, false)?
             .context(NativeInputError::Ownership)
     }
 
@@ -191,20 +200,66 @@ impl NativeInputFence {
         &self,
         matches: impl FnOnce(&Instance) -> bool,
     ) -> Result<Option<StorageFlock>> {
-        self.lock_scoped_matching(false, matches, true)
+        self.lock_scoped_matching(NativeFenceUse::Observation, matches, true)
     }
 
-    fn lock_scoped(&self, input: bool) -> Result<StorageFlock> {
-        self.lock_scoped_matching(input, |_| true, false)?
+    /// Original history or an already-owned resource continuation only. This
+    /// does not permit input, current-state folds, model changes, or ACKs.
+    pub(crate) fn lock_original_history(&self) -> Result<StorageFlock> {
+        self.lock_scoped(NativeFenceUse::OriginalHistory)
+    }
+
+    pub(crate) fn try_lock_original_history(&self) -> Result<Option<StorageFlock>> {
+        self.lock_scoped_matching(NativeFenceUse::OriginalHistory, |_| true, true)
+    }
+
+    pub(crate) fn lock_original_history_project<T>(
+        &self,
+        project: impl FnOnce(&Instance, &Storage) -> Result<T>,
+    ) -> Result<Option<(StorageFlock, T)>> {
+        self.lock_scoped_project(NativeFenceUse::OriginalHistory, |_| true, project, false)
+    }
+
+    /// Copy source evidence from the existing witness before any queue wait.
+    /// The returned guard retains the physical lifecycle exclusion.
+    pub(crate) fn try_lock_original_history_project<T>(
+        &self,
+        project: impl FnOnce(&Instance, &Storage) -> Result<T>,
+    ) -> Result<Option<(StorageFlock, T)>> {
+        self.lock_scoped_project(NativeFenceUse::OriginalHistory, |_| true, project, true)
+    }
+
+    pub(crate) fn lock_observation_project<T>(
+        &self,
+        project: impl FnOnce(&Instance, &Storage) -> Result<T>,
+        nonblocking: bool,
+    ) -> Result<Option<(StorageFlock, T)>> {
+        self.lock_scoped_project(NativeFenceUse::Observation, |_| true, project, nonblocking)
+    }
+
+    fn lock_scoped(&self, purpose: NativeFenceUse) -> Result<StorageFlock> {
+        self.lock_scoped_matching(purpose, |_| true, false)?
             .context(NativeInputError::Ownership)
     }
 
     fn lock_scoped_matching(
         &self,
-        input: bool,
+        purpose: NativeFenceUse,
         matches: impl FnOnce(&Instance) -> bool,
         nonblocking: bool,
     ) -> Result<Option<StorageFlock>> {
+        self.lock_scoped_project(purpose, matches, |_, _| Ok(()), nonblocking)
+            .map(|result| result.map(|(lock, ())| lock))
+    }
+
+    fn lock_scoped_project<T>(
+        &self,
+        purpose: NativeFenceUse,
+        matches: impl FnOnce(&Instance) -> bool,
+        project: impl FnOnce(&Instance, &Storage) -> Result<T>,
+        nonblocking: bool,
+    ) -> Result<Option<(StorageFlock, T)>> {
+        let input = purpose == NativeFenceUse::Input;
         let mut cache = if nonblocking {
             match self.cache.try_lock() {
                 Ok(cache) => cache,
@@ -216,7 +271,11 @@ impl NativeInputFence {
         } else {
             self.cache.lock().map_err(|_| NativeInputError::Ownership)?
         };
-        anyhow::ensure!(!cache.invalidated, NativeInputError::Ownership);
+        anyhow::ensure!(
+            !cache.physical_invalidated
+                && (purpose == NativeFenceUse::OriginalHistory || !cache.invalidated),
+            NativeInputError::Ownership
+        );
         let result = (|| {
             let lock = if nonblocking {
                 let Some(lock) = self
@@ -253,7 +312,10 @@ impl NativeInputFence {
                         .context(NativeInputError::Ownership)?
                 };
                 let mut matching = rows.into_iter().filter(|row| row.id == self.instance_id);
-                let row = matching.next().ok_or(NativeInputError::Ownership)?;
+                let Some(row) = matching.next() else {
+                    cache.physical_invalidated = true;
+                    return Err(NativeInputError::Ownership.into());
+                };
                 anyhow::ensure!(matching.next().is_none(), NativeInputError::Ownership);
                 cache.witness = Some(NativeInputWitness { revision, row });
             }
@@ -262,17 +324,21 @@ impl NativeInputFence {
                 .as_ref()
                 .ok_or(NativeInputError::Ownership)?
                 .row;
-            let same_context = row.created_at == self.created_at
-                && row.lifecycle_generation == self.lifecycle_generation
-                && row.source_profile == self.store.profile();
-            if !same_context {
+            if row.created_at != self.created_at || row.source_profile != self.store.profile() {
+                cache.physical_invalidated = true;
+                cache.invalidated = true;
+                return Err(LifecycleReservationError::Superseded.into());
+            }
+            if purpose != NativeFenceUse::OriginalHistory
+                && row.lifecycle_generation != self.lifecycle_generation
+            {
                 cache.invalidated = true;
                 return Err(LifecycleReservationError::Superseded.into());
             }
             anyhow::ensure!(matches(row), LifecycleReservationError::Superseded);
-            if !input {
+            if purpose == NativeFenceUse::Observation {
                 anyhow::ensure!(row.is_structured(), LifecycleReservationError::Superseded);
-            } else {
+            } else if input {
                 anyhow::ensure!(
                     !row.has_fresh_lifecycle_reservation(Utc::now()),
                     LifecycleReservationError::Superseded
@@ -282,8 +348,17 @@ impl NativeInputFence {
                 row.ensure_startable()?;
                 anyhow::ensure!(!row.is_structured(), NativeInputError::AgentNotReady);
             }
-            Ok(Some(lock))
+            let value = project(row, self.store.storage())?;
+            Ok(Some((lock, value)))
         })();
+        if result.as_ref().err().is_some_and(|error| {
+            error.is::<crate::session::storage::NativeInputBindingChanged>()
+                || error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        }) {
+            cache.physical_invalidated = true;
+        }
         if input && result.is_err() {
             cache.invalidated = true;
         }
@@ -589,6 +664,14 @@ mod tests {
             error.downcast_ref::<LifecycleReservationError>(),
             Some(&LifecycleReservationError::Superseded)
         );
+        assert!(stale.lock_observation().is_err());
+        drop(stale.lock_original_history()?);
+        drop(
+            stale
+                .try_lock_original_history()?
+                .expect("same physical row remains available for original history"),
+        );
+        assert!(stale.lock().is_err(), "history cannot rearm input");
         drop(row.native_input_fence(true)?.lock()?);
         assert_eq!(storage.load_instances_complete()?[0].status, Status::Error);
         Ok(())
@@ -679,6 +762,11 @@ mod tests {
                 error.downcast_ref::<LifecycleReservationError>(),
                 Some(&LifecycleReservationError::Superseded)
             );
+            if reservation {
+                drop(fence.lock_original_history()?);
+            } else {
+                assert!(fence.lock_original_history().is_err());
+            }
             storage.update(|rows, _| {
                 rows[0] = row.clone();
                 Ok(())
@@ -687,6 +775,58 @@ mod tests {
                 fence.lock().is_err(),
                 "restored data must not rearm old scope"
             );
+            if reservation {
+                drop(fence.lock_original_history()?);
+            } else {
+                assert!(
+                    fence.lock_original_history().is_err(),
+                    "restoring a replaced row cannot rearm original history"
+                );
+            }
+            drop(row.native_input_fence(false)?.lock()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn original_history_refuses_removed_rows_and_replaced_physical_profiles() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        for replace_profile in [false, true] {
+            let profile = if replace_profile {
+                "history-profile-replaced"
+            } else {
+                "history-row-removed"
+            };
+            let (storage, row) = input_fixture(profile)?;
+            let original = std::fs::read(storage.sessions_path())?;
+            let fence = row.native_input_fence(false)?;
+            drop(fence.lock_original_history()?);
+            let profile_path = storage.sessions_path().parent().unwrap();
+            let retained = profile_path.with_file_name(format!("{profile}-original"));
+            if replace_profile {
+                std::fs::rename(profile_path, &retained)?;
+                std::fs::create_dir(profile_path)?;
+                std::fs::write(storage.sessions_path(), &original)?;
+            } else {
+                storage.update(|rows, _| {
+                    rows.clear();
+                    Ok(())
+                })?;
+            }
+            assert!(fence.lock().is_err());
+            assert!(fence.lock_original_history().is_err());
+            if replace_profile {
+                std::fs::remove_dir_all(profile_path)?;
+                std::fs::rename(&retained, profile_path)?;
+            } else {
+                crate::session::storage::atomic_write(storage.sessions_path(), &original)?;
+            }
+            assert!(
+                fence.try_lock_original_history().is_err(),
+                "restored bytes cannot erase observed physical loss"
+            );
+            assert!(fence.lock().is_err());
             drop(row.native_input_fence(false)?.lock()?);
         }
         Ok(())

@@ -371,7 +371,7 @@ impl Instance {
     ) -> Result<u64> {
         storage.check_available()?;
         let now = Utc::now();
-        let generation = storage.update(|instances, _groups| {
+        let (generation, establishment) = storage.update(|instances, _groups| {
             let stored = instances
                 .iter_mut()
                 .find(|instance| instance.id == self.id)
@@ -391,12 +391,14 @@ impl Instance {
             let generation =
                 stored.next_available_lifecycle_generation(Self::LIFECYCLE_RESERVATION_TTL, now)?;
             stored.lifecycle_generation = generation;
+            stored.rebase_acp_generation(storage.storage())?;
             // Availability above rejects every fresh current-generation owner.
             // Only an expired or already-inert marker can be discarded here.
             stored.lifecycle_reservation = None;
-            Ok(generation)
+            Ok((generation, stored.acp_establishment.clone()))
         })?;
         self.lifecycle_generation = generation;
+        self.acp_establishment = establishment;
         self.lifecycle_reservation = None;
         Ok(generation)
     }
@@ -422,21 +424,27 @@ impl Instance {
                         .context(format!("session {} lifecycle generation overflow", self.id)),
                     LifecycleReservationError::Superseded => anyhow::Error::new(error),
                 })?;
+            stored.rebase_acp_generation(storage.storage())?;
             if let Some(status) = status {
                 stored.status = status;
                 if status != Status::Idle {
                     stored.idle_entered_at = None;
                 }
             }
-            acquired = Some((generation, stored.lifecycle_reservation.clone()));
+            acquired = Some((
+                generation,
+                stored.lifecycle_reservation.clone(),
+                stored.acp_establishment.clone(),
+            ));
             Ok(())
         })?;
-        let Some((generation, reservation)) = acquired else {
+        let Some((generation, reservation, establishment)) = acquired else {
             anyhow::bail!("session {} no longer exists", self.id);
         };
         self.lifecycle_generation = generation;
         self.failed_purge = None;
         self.lifecycle_reservation = reservation;
+        self.acp_establishment = establishment;
         if let Some(status) = status {
             self.status = status;
             if status != Status::Idle {

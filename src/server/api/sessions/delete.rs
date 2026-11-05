@@ -190,31 +190,38 @@ async fn purge_session_artifacts_inner(
         .await?
         {
             Err(result) => *result,
-            Ok(mut committed) => {
+            Ok(committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
                 let shutdown = match committed.ensure_retirement_target(&mut retirement) {
-                    Ok(()) => match finish_structured_purge(state, id, &retirement).await {
-                        Ok(()) => committed.complete_retirement(&retirement).and_then(|()| {
-                            state
-                                .acp_supervisor
-                                .acknowledge_retirement(&retirement)
-                                .map_err(Into::into)
-                        }),
-                        Err(error) => Err(error),
-                    },
+                    Ok(()) => finish_structured_purge(state, id, &retirement).await,
                     Err(error) => Err(error),
+                };
+                let retired = match shutdown {
+                    Ok(()) => committed
+                        .complete_retirement(retirement.clone())
+                        .await
+                        .and_then(|committed| {
+                            state.acp_supervisor.acknowledge_retirement(&retirement)?;
+                            Ok(committed)
+                        }),
+                    Err(error) => {
+                        drop(committed);
+                        Err(error)
+                    }
                 };
                 // Both paths removed the row; neither may retain its prompt lock.
                 release_removed_session_locks(state, id, &profile).await?;
-                if let Err(error) = shutdown {
-                    // Dropping CommittedPurge releases exclusion, never its durable journal owner.
-                    // Recovery will prove structured exit before retrying resource teardown.
-                    drop(committed);
-                    return Ok(PurgeOutcome::Deleted {
-                        messages: Vec::new(),
-                        cleanup_errors: vec![format!("Session removed, but resources retained because structured shutdown is unproven: {error}")],
-                    });
-                }
+                let committed = match retired {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        // A failed worker, checkpoint or ACK drops only the handle.
+                        // The durable owner retains resource cleanup debt for recovery.
+                        return Ok(PurgeOutcome::Deleted {
+                            messages: Vec::new(),
+                            cleanup_errors: vec![format!("Session removed, but resources retained because structured shutdown is unproven: {error}")],
+                        });
+                    }
+                };
                 finish_committed_purge(state.clone(), committed).await?
             }
         }
@@ -337,7 +344,6 @@ pub(super) async fn finish_committed_purge<S: crate::session::SessionStore + 'st
             store.check_available()?;
             if structured {
                 state.acp_supervisor.forget_session(id)?;
-                state.acp_event_store.delete_session(id);
             }
             prune_unused_session_locks(&state, id);
             Ok(())
@@ -364,7 +370,6 @@ fn cleanup_abandoned_native(state: Arc<AppState>, instance: Instance) -> anyhow:
     );
     if instance.is_structured() {
         state.acp_supervisor.forget_session(&instance.id)?;
-        state.acp_event_store.delete_session(&instance.id);
     }
     prune_unused_session_locks(&state, &instance.id);
     crate::session::deletion::cleanup_abandoned_session(instance);
@@ -433,11 +438,14 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
                 continue;
             }
-            if let Err(error) = committed.complete_retirement(&retirement) {
-                attempted.insert(token);
-                tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "producer settlement capture failed; purge retained");
-                continue;
-            }
+            committed = match committed.complete_retirement(retirement.clone()).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    attempted.insert(token);
+                    tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "producer settlement capture failed; purge retained");
+                    continue;
+                }
+            };
             if let Err(error) = state.acp_supervisor.acknowledge_retirement(&retirement) {
                 attempted.insert(token);
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "producer acknowledgement refused; purge retained");

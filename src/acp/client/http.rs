@@ -1067,6 +1067,7 @@ mod tests {
                         text: text.clone(),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1078,6 +1079,7 @@ mod tests {
                 &Event::Stopped {
                     reason: "prompt_complete".into(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         let content = format!("{}tool-tail-🦀", "y".repeat(17 * 1024 * 1024));
@@ -1098,6 +1100,7 @@ mod tests {
                     completed_at,
                     async_subagent: false,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
 

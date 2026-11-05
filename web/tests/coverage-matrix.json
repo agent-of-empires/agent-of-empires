@@ -49,7 +49,11 @@
       "id": "acp.native-input-commit",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts", "src/components/acp/__tests__/CommittedStop.test.tsx"],
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/__tests__/CommittedStop.test.tsx"
+      ],
       "components": [
         "web/src/hooks/useAcpSession.ts",
         "web/src/components/acp/AcpRuntime.tsx",
@@ -57,7 +61,7 @@
         "web/src/components/acp/ComposerControls.tsx",
         "web/src/components/acp/useCancelEscalation.ts"
       ],
-      "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow the committed authority. A separate real Runtime/Composer/StopButton/installed-SDK consumer clicks once from an outer Profiler after layouts but before SDK passive publication, then verifies that the previous turn callback issues neither cancel nor force against the new turn. Only transport and browser APIs are faked; SDK, admission, reducer and cancellation identities remain real."
+      "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow committed authority. Original handshake decisions use only fresh canonical exact-nonce capabilities; both approval and form submissions recheck revocation without granting main input or historical request authority. Cache normalization and disconnect revoke capabilities. Existing installed-SDK stop coverage remains."
     },
     {
       "id": "settings.dialog-escape",
@@ -2767,8 +2771,17 @@
       "id": "acp.clear-fold-remount",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/AcpRuntime.test.tsx"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx"]
+      "specs": [
+        "src/components/acp/__tests__/AcpRuntime.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/lib/acpHistoryWindow.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/lib/acpHistoryWindow.ts"
+      ],
+      "notes": "Certified journal cuts preserve New output published before a late clear marker in the actual default message consumer, including empty Original history. Shared projection drives fold identity, hidden count and history pagination without mutating stored chronology."
     },
     {
       "id": "diff-comments.storage-cleanup",
@@ -2999,6 +3012,7 @@
       "id": "acp.spawn-prompt",
       "kind": "live-playwright",
       "risk": "high",
+      "notes": "Live fixtures explicitly create a first structured conversation and spawn its selected Native. Enabling an unselected terminal row cannot silently substitute a Fresh conversation.",
       "specs": ["tests/live/acp-prompt-lifecycle.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
@@ -3365,6 +3379,8 @@
       "risk": "high",
       "specs": [
         "src/lib/acpTypes.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
         "src/hooks/useRespawnSession.test.tsx",
         "src/components/acp/UsageLimitBanner.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx",
@@ -3381,7 +3397,8 @@
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/UsageLimitBanner.tsx",
         "web/src/lib/autoResumeSettingsHref.ts"
-      ]
+      ],
+      "notes": "Canonical rate_limit_park snapshots alone drive park and exhaustion notices and queued reasons. Foreign or unqualified raw history, hydration and disconnect cannot recreate control. Null or omission is unknown; stale snapshots do not replace current knowledge. Current native readiness still permits distinct input."
     },
     {
       "id": "acp.switch-agent-manual",
@@ -3423,6 +3440,7 @@
       "id": "acp.keep-context-round-trip",
       "kind": "live-playwright",
       "risk": "high",
+      "notes": "View round trips first establish an actual Native identity and captured store, then disable and re-enable that retained conversation. Fresh reset checks the new persisted SID and subsequent explicit input rather than internal frame ordering.",
       "specs": ["tests/live/acp-session-history.spec.ts"],
       "components": ["src/server/api/acp.rs"]
     },
@@ -3755,10 +3773,11 @@
       ]
     },
     {
-      "id": "acp.story.stop-tool-card-terminal",
+      "id": "acp.story.cancel-unattributed-tool-output",
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
+      "notes": "A genuine Native cancel result closes only its original prompt. The live story retains partial Native output across reload, verifies its written-window uncertainty and refuses a fabricated per-tool completion, error or stopped projection. A temporal observation window does not establish tool authorship or outcome.",
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {

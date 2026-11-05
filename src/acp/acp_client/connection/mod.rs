@@ -12,10 +12,12 @@ mod notifications;
 mod prompt;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) use prompt::{SelectProbe as TestSelectProbe, SELECT_PROBE as TEST_SELECT_PROBE};
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
-use crate::acp::control_protocol::PromptCompletedMarker;
+use crate::acp::event_sender::EventSender;
 use crate::acp::state::{
     AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, AcpConnectionUnavailability, Event,
 };
@@ -35,7 +37,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info, warn};
 
-use super::commands::{ClientCmd, ConnectMode};
+use super::commands::{ConnectMode, QueuedClientCmd};
 use super::control::DaemonControlClient;
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
@@ -63,7 +65,7 @@ pub(crate) const CANCEL_ESCALATION_GRACE: Duration = Duration::from_secs(10);
 pub(super) type ReadyTx = Mutex<Option<oneshot::Sender<Result<(), AcpError>>>>;
 
 #[derive(Default)]
-pub(super) struct ConnectionState {
+pub(crate) struct ConnectionState {
     phase: AtomicU8,
     unavailable: OnceLock<AcpConnectionUnavailability>,
     reported: AtomicBool,
@@ -71,25 +73,130 @@ pub(super) struct ConnectionState {
     ordered_loss: AtomicBool,
     intentional_stop: AtomicBool,
     foreground_finished: AtomicBool,
+    establishment_declined: AtomicBool,
     pub(super) admission: std::sync::Mutex<()>,
     sdk_closing: AtomicBool,
     unavailable_wake: tokio::sync::Notify,
     ordered_loss_wake: tokio::sync::Notify,
     completed_outcomes: std::sync::atomic::AtomicUsize,
+    pub(super) callback_duration: Arc<tokio::sync::RwLock<()>>,
+    native_durations: std::sync::Mutex<NativeDurations>,
     completed_outcomes_wake: tokio::sync::Notify,
-    pub(super) fork_response: std::sync::Mutex<super::control::OriginalForkResponse>,
+    pub(super) projection: OnceLock<Arc<crate::acp::event_sender::ProjectionState>>,
+    pub(super) control: OnceLock<std::sync::Weak<DaemonControlClient>>,
     #[cfg(test)]
-    pub(super) fork_emit_gate: std::sync::Mutex<
+    pub(super) test_callback: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_reverse_send: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_default_publish: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_initialize_response_application: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_fresh_response_application: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_establishment_usable: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_fresh_write_pending: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    pub(super) test_prompt_admission: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_prompt_admission_busy: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    pub(super) test_queue: OnceLock<crate::acp::event_sender::WeakEventSender>,
+    #[cfg(test)]
+    pub(super) test_shim: OnceLock<Arc<Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>>,
+    #[cfg(test)]
+    pub(super) test_relay_observer:
+        std::sync::Mutex<Option<mpsc::UnboundedSender<super::control::TestRelayObservation>>>,
+    #[cfg(test)]
+    pub(super) test_sdk_output: std::sync::Mutex<Option<mpsc::UnboundedSender<serde_json::Value>>>,
+    #[cfg(test)]
+    pub(super) test_prompt_completed: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_control_output:
+        std::sync::Mutex<Option<mpsc::UnboundedSender<crate::acp::control_protocol::ControlBody>>>,
+    #[cfg(test)]
+    pub(super) test_native_session_seen: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    pub(super) test_update: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(super) test_session_update: std::sync::Mutex<
         Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
+            agent_client_protocol::schema::v1::SessionId,
+            super::SdkTestGate,
         )>,
     >,
     #[cfg(test)]
-    pub(super) fork_emitted: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub(super) test_terminal: OnceLock<Arc<super::lifecycle::TerminalClaim>>,
+    #[cfg(test)]
+    pub(super) test_in_flight: OnceLock<Arc<AtomicBool>>,
+}
+
+#[derive(Default)]
+struct NativeDurations {
+    guard: std::sync::Weak<tokio::sync::OwnedRwLockReadGuard<()>>,
+    operations: usize,
+}
+
+pub(super) struct NativeOperationDuration {
+    state: Arc<ConnectionState>,
+    _duration: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl Drop for NativeOperationDuration {
+    fn drop(&mut self) {
+        self.state.native_durations.lock().unwrap().operations -= 1;
+    }
+}
+
+pub(super) enum CallbackDuration {
+    Direct {
+        _duration: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
+    Inherited {
+        _duration: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    },
 }
 
 impl ConnectionState {
+    pub(super) fn reserve_native_duration(
+        self: &Arc<Self>,
+    ) -> Result<NativeOperationDuration, AcpError> {
+        let guard = Arc::clone(&self.callback_duration)
+            .try_read_owned()
+            .map_err(|_| AcpError::ResetFailed("conversation reset is in progress".into()))?;
+        let mut durations = self.native_durations.lock().unwrap();
+        let guard = durations.guard.upgrade().unwrap_or_else(|| Arc::new(guard));
+        durations.guard = Arc::downgrade(&guard);
+        durations.operations += 1;
+        Ok(NativeOperationDuration {
+            state: Arc::clone(self),
+            _duration: guard,
+        })
+    }
+
+    pub(super) fn callback_publication(&self) -> Option<CallbackDuration> {
+        if let Ok(guard) = Arc::clone(&self.callback_duration).try_read_owned() {
+            return Some(CallbackDuration::Direct { _duration: guard });
+        }
+        let durations = self.native_durations.lock().unwrap();
+        // Fresh cannot arm while this operation's guard survives. Its callbacks
+        // must finish without acquiring another fair read behind Fresh.
+        (durations.operations != 0)
+            .then(|| durations.guard.upgrade())
+            .flatten()
+            .map(|guard| CallbackDuration::Inherited { _duration: guard })
+    }
+
+    pub(crate) fn observed_native_origin(&self) -> Option<crate::acp::state::NativeEventOrigin> {
+        self.control
+            .get()?
+            .upgrade()?
+            .ingress
+            .observed_native_origin()
+    }
+
     pub(super) fn begin_completed_outcome(&self) {
         self.completed_outcomes.fetch_add(1, Ordering::AcqRel);
     }
@@ -105,7 +212,13 @@ impl ConnectionState {
             let wake = self.completed_outcomes_wake.notified();
             tokio::pin!(wake);
             wake.as_mut().enable();
-            if self.is_stopping() || self.completed_outcomes.load(Ordering::Acquire) == 0 {
+            if self.is_stopping() {
+                if let Some(projection) = self.projection.get() {
+                    projection.original_delivered().await;
+                }
+                return;
+            }
+            if self.completed_outcomes.load(Ordering::Acquire) == 0 {
                 return;
             }
             wake.await;
@@ -135,20 +248,55 @@ impl ConnectionState {
         self.foreground_finished.load(Ordering::Acquire)
     }
 
-    pub(super) fn record_usable(&self) {
-        self.usable.store(true, Ordering::Release);
+    fn finish_foreground(&self) {
+        self.foreground_finished.store(true, Ordering::Release);
+        self.unavailable_wake.notify_waiters();
     }
 
+    pub(super) fn decline_establishment(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .expect("connection admission poisoned");
+        self.establishment_declined.store(true, Ordering::Release);
+        self.unavailable_wake.notify_waiters();
+    }
+
+    pub(super) fn record_usable(&self) {
+        self.usable.store(true, Ordering::Release);
+        self.unavailable_wake.notify_waiters();
+    }
+
+    pub(super) async fn wait_until_usable(&self) -> Result<(), AcpError> {
+        loop {
+            let changed = self.unavailable_wake.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.admit(|| self.ready())? {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
+    /// Intentional shutdown wins; otherwise a known loss survives foreground completion.
+    /// Refusal never executes the operation or downgrades a retained transport cause.
     pub(super) fn admit<T>(&self, operation: impl FnOnce() -> T) -> Result<T, AcpError> {
         let _admission = self
             .admission
             .lock()
             .expect("connection admission poisoned");
-        if self.intentional_stop.load(Ordering::Acquire) || self.driver_finished() {
+        if self.intentional_stop.load(Ordering::Acquire) {
             return Err(AcpError::NotRunning);
         }
         if let Some(observation) = self.loss() {
             return Err(AcpError::ConnectionUnavailable(observation));
+        }
+        if self.driver_finished() {
+            return Err(AcpError::NotRunning);
+        }
+        if self.establishment_declined.load(Ordering::Acquire) {
+            return Err(crate::acp::establishment::EstablishmentRefusal::Unresolved.into());
         }
         Ok(operation())
     }
@@ -166,6 +314,21 @@ impl ConnectionState {
                 return observation;
             }
             unavailable.await;
+        }
+    }
+    pub(super) async fn wait_callback_end(&self) {
+        loop {
+            let changed = self.unavailable_wake.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.establishment_declined.load(Ordering::Acquire)
+                || self.is_stopping()
+                || self.driver_finished()
+                || self.loss().is_some()
+            {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -191,6 +354,7 @@ impl ConnectionState {
     pub(super) fn mark_stopping(&self) {
         self.intentional_stop.store(true, Ordering::Release);
         self.completed_outcomes_wake.notify_waiters();
+        self.unavailable_wake.notify_waiters();
     }
 
     pub(super) fn is_stopping(&self) -> bool {
@@ -207,6 +371,12 @@ impl ConnectionState {
 
     /// Caller holds `admission`, including synchronous I/O-failure observation.
     pub(super) fn record_loss(&self, source: AcpConnectionSource, cause: AcpConnectionCause) {
+        if source == AcpConnectionSource::Sdk
+            && self.driver_finished()
+            && self.establishment_declined.load(Ordering::Acquire)
+        {
+            return;
+        }
         // A bridge ending because foreground already returned is teardown,
         // not an independent observation that a peer transport failed.
         if cause == AcpConnectionCause::ForwardPumpEnded && self.driver_finished() {
@@ -248,9 +418,9 @@ pub(super) struct RunnerLink {
 }
 
 pub(super) struct ConnectionParams {
-    pub(super) event_tx: mpsc::Sender<Event>,
+    pub(super) event_tx: EventSender,
     pub(super) connection_state: Arc<ConnectionState>,
-    pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
+    pub(super) cmd_rx: mpsc::Receiver<QueuedClientCmd>,
     /// Killed when the task ends. `None` for a runner, which owns its agent
     /// and outlives this connection.
     pub(super) child: Option<Arc<Mutex<tokio::process::Child>>>,
@@ -269,6 +439,8 @@ pub(super) struct ConnectionParams {
     pub(super) runner: Option<RunnerLink>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    pub(super) tracking_observer: Option<oneshot::Sender<super::test_helpers::TrackingObservation>>,
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -286,23 +458,43 @@ fn reply<T: agent_client_protocol::JsonRpcResponse>(
 /// Register request handlers that each answer from a `SessionResources` clone.
 /// The builder is typestate, so each registration shadows the last.
 macro_rules! resource_requests {
-    ($builder:expr, $resources:expr, $ingress:expr, $state:expr, $(($req:ty, $resp:ty, $handler:path)),+ $(,)?) => {{
+    ($builder:expr, $resources:expr, $ingress:expr, $state:expr, $control:expr, $(($req:ty, $resp:ty, $handler:path)),+ $(,)?) => {{
         let builder = $builder;
         $(
             let builder = {
                 let res = $resources.clone();
                 let ingress = $ingress.clone();
                 let state = $state.clone();
+                let control = $control.clone();
                 builder.on_receive_request(
                     move |request: $req, responder: Responder<$resp>, connection: ConnectionTo<Agent>| {
                         let (res, ingress, state) = (res.clone(), ingress.clone(), state.clone());
+                        let control = control.clone();
+                        let request_id = responder.id().clone();
+                        let callback = control.as_ref().and_then(|control| {
+                            match control.admit_reverse_callback(&request_id) {
+                                super::control::ReverseCallbackAdmission::Admitted(callback) => Some(callback),
+                                _ => None,
+                            }
+                        });
+                        let scope = match control.as_ref() {
+                            Some(_) => callback.as_ref().map(|callback| callback.ingress.clone()),
+                            None => Some(ingress.capture_request()),
+                        };
+                        let context = callback.and_then(|callback| callback.context.clone());
+                        let id = request.session_id.clone();
+                        // Owned-resource handlers capture their entry synchronously here.
+                        let work = $handler(request, res, context, Arc::clone(&state));
                         async move {
-                            spawn_native_callback(&connection, &state, async move {
-                                let _guard = match ingress.request(&request.session_id).await {
-                                    Ok(guard) => guard,
-                                    Err(error) => return reply(responder, Err(error)),
+                            spawn_native_callback(&connection, &state, control.as_ref(), &request_id, move |admission| async move {
+                                if let Err(error) = admission {
+                                    return reply(responder, Err(error));
+                                }
+                                let Some(scope) = scope else {
+                                    return reply(responder, Err(super::session_identity::SessionIngress::request_refused()));
                                 };
-                                reply(responder, $handler(request, res).await)
+                                let outcome = ingress.run_request(scope, &id, work).await;
+                                reply(responder, outcome)
                             })
                         }
                     },
@@ -341,6 +533,8 @@ pub(super) async fn run_connection_task<W, R>(
         runner,
         cancellation,
         shutdown,
+        #[cfg(test)]
+        tracking_observer,
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
@@ -363,11 +557,18 @@ pub(super) async fn run_connection_task<W, R>(
                 ConnectMode::Resume { acp_session_id, .. } => {
                     Some(SessionId::from(acp_session_id.clone()))
                 }
-                ConnectMode::Fresh { .. } => None,
+                ConnectMode::Fresh => None,
             };
             Arc::new(SessionIngress::new(initial))
         });
+    if let Some(projection) = event_tx.projection() {
+        ingress.observe_projection(projection);
+    }
     ingress.begin();
+    let original_ingress = match (control.as_ref(), &mode) {
+        (Some(control), ConnectMode::Fresh) => control.install_original_ingress(),
+        _ => Ok(()),
+    };
     let shared = Arc::new(Shared::new(
         event_tx.clone(),
         label.clone(),
@@ -382,6 +583,13 @@ pub(super) async fn run_connection_task<W, R>(
         control.clone(),
         pending_responders.clone(),
     ));
+    #[cfg(test)]
+    if let Some(observer) = tracking_observer {
+        let _ = observer.send(super::test_helpers::TrackingObservation {
+            tasks: Arc::clone(&shared.bg_tasks),
+            agents: Arc::clone(&shared.between_prompt.bg_agents),
+        });
+    }
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
     let builder = Client
@@ -424,9 +632,9 @@ pub(super) async fn run_connection_task<W, R>(
                     async move {
                         let params = match notification {
                             SessionIngressNotification::Replayed(marker) => {
-                                if let Some(control) = control.as_ref() {
-                                    control.mark_session_replayed(marker);
-                                }
+                                shared
+                                    .handle_ingress_marker(PendingIngress::Replayed(marker))
+                                    .await?;
                                 return Ok(());
                             }
                             SessionIngressNotification::PromptCompleted(marker) => {
@@ -438,9 +646,7 @@ pub(super) async fn run_connection_task<W, R>(
                                             ))
                                             .await?;
                                     } else {
-                                        control.deliver_prompt_completion(
-                                            PromptCompletedMarker::default(),
-                                        );
+                                        control.deliver_prompt_completion(marker);
                                     }
                                 }
                                 return Ok(());
@@ -456,8 +662,12 @@ pub(super) async fn run_connection_task<W, R>(
                             // No session id to fence on, and a refused session
                             // still reports the account it was refused for.
                             SessionIngressNotification::AuthStatus(status) => {
+                                let (mut auth, _) = SessionIngressNotification::decode_auth(
+                                    status, control_notifications,
+                                )?;
+                                auth.current_scope = shared.ingress.notification_scope(auth.evidence);
                                 shared
-                                    .handle_ingress_marker(PendingIngress::Auth(status))
+                                    .handle_ingress_marker(PendingIngress::Auth(Box::new(auth)))
                                     .await?;
                                 return Ok(());
                             }
@@ -467,6 +677,30 @@ pub(super) async fn run_connection_task<W, R>(
                             params,
                             control_notifications,
                         )?;
+                        let notification = shared.ingress.capture_notification(
+                            notification, shared.suppress_history_replay.load(Ordering::Relaxed),
+                        );
+                        #[cfg(test)]
+                        {
+                            let gate = {
+                                let mut scoped = shared.connection_state.test_session_update.lock().unwrap();
+                                if scoped.as_ref().is_some_and(|(id, _)| {
+                                    id == &notification.notification.session_id
+                                }) {
+                                    scoped.take().map(|(_, gate)| gate)
+                                } else {
+                                    None
+                                }
+                            }.or_else(|| shared.connection_state.test_update.lock().unwrap().take());
+                            if let Some((entered, release)) = gate {
+                                let _ = entered.send(());
+                                tokio::select! {
+                                    biased;
+                                    _ = shared.connection_state.wait_callback_end() => return Ok(()),
+                                    released = release => if released.is_err() { return Ok(()); },
+                                }
+                            }
+                        }
                         let admitted = shared
                             .ingress
                             .notification(notification, wire_bytes)
@@ -484,27 +718,48 @@ pub(super) async fn run_connection_task<W, R>(
             {
                 let shared = shared.clone();
                 let pending = pending_responders.clone();
+                let control = control.clone();
                 move |request: RequestPermissionRequest,
                       responder: Responder<RequestPermissionResponse>,
                       connection: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
+                    let control = control.clone();
+                    let request_id = responder.id().clone();
+                    let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
-                        spawn_native_callback(&connection, &state, async move {
-                            let _guard = match shared.ingress.request(&request.session_id).await {
-                                Ok(guard) => guard,
-                                Err(error) => return reply(responder, Err(error)),
-                            };
-                            let outcome = handle_permission_request(
-                                request,
-                                shared.event_tx.clone(),
-                                pending,
-                                profile,
-                                shared.tool_context_cache.clone(),
-                            )
-                            .await;
-                            reply(responder, outcome)
-                        })
+                        spawn_native_callback(
+                            &connection,
+                            &state,
+                            control.as_ref(),
+                            &request_id,
+                            move |admission| async move {
+                                let captured = match admission {
+                                    Ok(captured) => captured,
+                                    Err(error) => return reply(responder, Err(error)),
+                                };
+                                let cache = match &captured {
+                                    Some(callback) => callback.history.as_ref()
+                                        .map(|history| Arc::clone(&history.tool_context)),
+                                    None => Some(Arc::clone(&shared.tool_context_cache)),
+                                };
+                                let sender = match &captured {
+                                    Some(callback) => shared.event_tx.with_context(callback.context.clone()),
+                                    None => shared.event_tx.clone(),
+                                };
+                                let id = request.session_id.clone();
+                                let native = captured.is_some();
+                                let handled = handle_permission_request(
+                                    request, sender, pending, profile, cache, captured,
+                                );
+                                let outcome = if native {
+                                    handled.await
+                                } else {
+                                    shared.ingress.run_request(scope, &id, handled).await
+                                };
+                                reply(responder, outcome)
+                            },
+                        )
                     }
                 }
             },
@@ -514,31 +769,50 @@ pub(super) async fn run_connection_task<W, R>(
             {
                 let shared = shared.clone();
                 let pending = pending_responders.clone();
+                let control = control.clone();
                 move |request: CreateElicitationRequest,
                       responder: Responder<CreateElicitationResponse>,
                       connection: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
+                    let control = control.clone();
+                    let request_id = responder.id().clone();
+                    let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
-                        spawn_native_callback(&connection, &state, async move {
-                            // Only a session-scoped elicitation carries an identity
-                            // to fence on.
-                            let _guard = if let ElicitationScope::Session(scope) = request.scope() {
-                                match shared.ingress.request(&scope.session_id).await {
-                                    Ok(guard) => Some(guard),
+                        spawn_native_callback(
+                            &connection,
+                            &state,
+                            control.as_ref(),
+                            &request_id,
+                            move |admission| async move {
+                                let captured = match admission {
+                                    Ok(captured) => captured,
                                     Err(error) => return reply(responder, Err(error)),
-                                }
-                            } else {
-                                None
-                            };
-                            let outcome = handle_elicitation_request(
-                                request,
-                                shared.event_tx.clone(),
-                                pending,
-                            )
-                            .await;
-                            reply(responder, outcome)
-                        })
+                                };
+                                let sender = match &captured {
+                                    Some(callback) => shared.event_tx.with_context(callback.context.clone()),
+                                    None => shared.event_tx.clone(),
+                                };
+                                let id = match request.scope() {
+                                    ElicitationScope::Session(scope) => {
+                                        Some(scope.session_id.clone())
+                                    }
+                                    _ => None,
+                                };
+                                let native = captured.is_some();
+                                let work = handle_elicitation_request(
+                                    request, sender, pending, captured,
+                                );
+                                let outcome = if native {
+                                    work.await
+                                } else if let Some(id) = id {
+                                    shared.ingress.run_request(scope, &id, work).await
+                                } else {
+                                    work.await
+                                };
+                                reply(responder, outcome)
+                            },
+                        )
                     }
                 }
             },
@@ -549,6 +823,7 @@ pub(super) async fn run_connection_task<W, R>(
         resources,
         ingress,
         connection_state,
+        control,
         (
             ReadTextFileRequest,
             ReadTextFileResponse,
@@ -610,6 +885,7 @@ pub(super) async fn run_connection_task<W, R>(
         transport,
         move |connection: ConnectionTo<Agent>| async move {
             let foreground = async move {
+                original_ingress?;
                 let session = establish::establish(connection, establish_ctx).await?;
                 match session {
                     Some(session) => session.run().await,
@@ -619,8 +895,30 @@ pub(super) async fn run_connection_task<W, R>(
             tokio::pin!(foreground);
             let mut result = tokio::select! {
                 biased;
-                _ = foreground_shutdown.cancelled() => Ok(()),
-                _ = foreground_cancellation.cancelled() => Ok(()),
+                _ = foreground_shutdown.cancelled() => {
+                    if let Some(projection) = foreground_state.projection.get()
+                        .filter(|projection| projection.has_completed_original())
+                    {
+                        tokio::select! {
+                            result = &mut foreground => result,
+                            _ = projection.original_delivered() => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                },
+                _ = foreground_cancellation.cancelled() => {
+                    if let Some(projection) = foreground_state.projection.get()
+                        .filter(|projection| projection.has_completed_original())
+                    {
+                        tokio::select! {
+                            result = &mut foreground => result,
+                            _ = projection.original_delivered() => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                },
                 error = ingress.failed() => {
                     foreground_state.observe(
                         AcpConnectionSource::Sdk,
@@ -629,7 +927,14 @@ pub(super) async fn run_connection_task<W, R>(
                     // Preserve already received correlated outcomes before
                     // protocol loss drops their foreground application. This
                     // never waits for an unresolved native request.
-                    if foreground_state.completed_outcomes.load(Ordering::Acquire) != 0 {
+                    if let Some(projection) = foreground_state.projection.get()
+                        .filter(|projection| projection.has_completed_original())
+                    {
+                        tokio::select! {
+                            _ = projection.original_delivered() => {},
+                            _ = &mut foreground => {},
+                        }
+                    } else if foreground_state.completed_outcomes.load(Ordering::Acquire) != 0 {
                         tokio::select! {
                             biased;
                             _ = foreground_shutdown.cancelled() => {},
@@ -643,10 +948,32 @@ pub(super) async fn run_connection_task<W, R>(
                 },
                 result = &mut foreground => result,
             };
+            // The foreground can observe the same overflow after the failure
+            // future was polled, then win this select before its wake is polled.
+            // Preserve that positive SDK failure regardless of which branch won.
+            if result.is_err() && ingress.has_failed() {
+                foreground_state
+                    .observe(AcpConnectionSource::Sdk, AcpConnectionCause::ProtocolEnded);
+                foreground_state.mark_ordered_loss();
+            }
             if result.is_err()
                 && !foreground_shutdown.is_cancelled()
                 && !foreground_cancellation.is_cancelled()
             {
+                if foreground_state
+                    .establishment_declined
+                    .load(Ordering::Acquire)
+                    && foreground_state.loss().is_none()
+                {
+                    if let Err(error) = &result {
+                        report_connection_error(error, &foreground_shared, &foreground_ready).await;
+                    }
+                    tokio::select! {
+                        _ = foreground_shutdown.cancelled() => { result = Ok(()); }
+                        _ = foreground_cancellation.cancelled() => { result = Ok(()); }
+                        _ = foreground_state.wait_unavailable() => {}
+                    }
+                }
                 if let Some(observation) = foreground_state.loss() {
                     if let Some(tx) = foreground_ready.lock().await.take() {
                         let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
@@ -672,9 +999,7 @@ pub(super) async fn run_connection_task<W, R>(
             if result.is_ok() {
                 foreground_state.mark_stopping();
             }
-            foreground_state
-                .foreground_finished
-                .store(true, Ordering::Release);
+            foreground_state.finish_foreground();
             result
         },
     );
@@ -700,7 +1025,13 @@ pub(super) async fn run_connection_task<W, R>(
     } else {
         info!(target: "acp.protocol", session = %label, "ACP connection task ended cleanly");
     }
-    if connection_state.loss().is_some()
+    // SDK return also covers its background error dropping the foreground future.
+    // Classify/report the SDK result first; retained Native ownership is a separate lifetime.
+    connection_state.finish_foreground();
+    if (connection_state.loss().is_some()
+        || connection_state
+            .establishment_declined
+            .load(Ordering::Acquire))
         && !connection_state.is_stopping()
         && !shutdown.is_cancelled()
         && !cancellation.is_cancelled()
@@ -755,6 +1086,10 @@ async fn report_connection_error(
         "ACP connection task ended with error: {:?}", e
     );
     if shared.connection_state.loss().is_none()
+        && !shared
+            .connection_state
+            .establishment_declined
+            .load(Ordering::Acquire)
         && (!shared
             .connection_state
             .foreground_finished

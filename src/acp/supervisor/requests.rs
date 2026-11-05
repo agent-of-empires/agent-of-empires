@@ -65,6 +65,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
     ) -> Result<Arc<AcpClient>, SupervisorError> {
+        self.client_for_effect(session_id, false).await
+    }
+
+    async fn client_for_effect(
+        &self,
+        session_id: &str,
+        user_input: bool,
+    ) -> Result<Arc<AcpClient>, SupervisorError> {
         loop {
             let wait = {
                 let workers = self.workers.lock().await;
@@ -83,20 +91,52 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .map_err(|()| SupervisorError::NativeStoreUnavailable)?;
                 match scope {
                     Some(scope) => {
+                        let unresolved = std::cell::Cell::new(false);
                         match scope
                             .fence
-                            .try_lock_observation_matching(|_| true)
-                            .map_err(|_| SupervisorError::SpawnCancelled(session_id.into()))?
-                        {
+                            .try_lock_observation_matching(|row| {
+                                let established = matches!(
+                                    row.acp_establishment,
+                                    Some(
+                                        crate::acp::establishment::AcpEstablishment::Applied { .. }
+                                    )
+                                );
+                                unresolved.set(user_input && !established);
+                                (!user_input || established)
+                                    && scope
+                                        .choice
+                                        .as_ref()
+                                        .is_some_and(|choice| choice.matches(row))
+                            })
+                            .map_err(|_| {
+                                if unresolved.get() {
+                                    SupervisorError::Establishment(
+                                        crate::acp::establishment::EstablishmentRefusal::Unresolved,
+                                    )
+                                } else {
+                                    SupervisorError::SpawnCancelled(session_id.into())
+                                }
+                            })? {
                             Some(_native) => {
-                                handle.client.ensure_available()?;
+                                if user_input {
+                                    handle.client.ensure_established()?;
+                                } else {
+                                    handle.client.ensure_available()?;
+                                }
                                 return Ok(Arc::clone(&handle.client));
                             }
                             None => Arc::clone(&scope.fence),
                         }
                     }
                     None => {
-                        handle.client.ensure_available()?;
+                        if self.native_admission_required {
+                            return Err(SupervisorError::NativeStoreUnavailable);
+                        }
+                        if user_input {
+                            handle.client.ensure_established()?;
+                        } else {
+                            handle.client.ensure_available()?;
+                        }
                         return Ok(Arc::clone(&handle.client));
                     }
                 }
@@ -109,7 +149,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
-    /// A current owned receipt, independent of historical assignment events.
+    /// Capture the actual actor without physical admission or historical events.
+    /// Availability is qualified later under the frozen scope's native fence.
     pub(crate) async fn current_native_availability(
         &self,
         session_id: &str,
@@ -117,13 +158,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         let workers = self.workers.lock().await;
         let handle = workers.get(session_id)?;
         let scope = handle.lease.native_scope().ok()??;
-        let unavailable = handle.client.connection_unavailable();
-        let ready = handle.client.connection_ready();
         Some(crate::acp::state::CurrentNativeAvailability {
-            context: scope.context,
+            scope,
             owner: handle.client.connected_runner(),
-            unavailable,
-            ready,
+            unavailable: None,
+            ready: false,
             client: Arc::clone(&handle.client),
             lifecycle: Arc::clone(&self.lifecycle),
             lease: handle.lease.clone(),
@@ -139,16 +178,93 @@ impl<S: BroadcastSink> Supervisor<S> {
             )
             .into());
         }
-        let client = self.client_for_session(session_id).await?;
+        let client = self.client_for_effect(session_id, true).await?;
         if crate::process::worker_registry::stop_requested(session_id) {
             return Err(SupervisorError::SpawnCancelled(session_id.into()));
         }
         Ok(client)
     }
 
-    /// Await worker readiness so a caller can gate a durable side effect on it.
+    /// Observe establishment and SDK usability before final physical admission.
     pub async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.ready_client(session_id).await.map(|_| ())
+        let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
+        self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
+        let client = {
+            let workers = tokio::time::timeout_at(deadline, self.workers.lock())
+                .await
+                .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+            let handle = workers
+                .get(session_id)
+                .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))?;
+            let lifecycle = lock_recover(&self.lifecycle);
+            if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease)
+                || lifecycle.phase(session_id) != WorkerPhase::Running
+            {
+                return Err(SupervisorError::SpawnCancelled(session_id.into()));
+            }
+            Arc::clone(&handle.client)
+        };
+        let expected = if let Some(projection) = client.establishment_projection() {
+            use crate::acp::event_sender::EstablishmentResolution;
+            let attempt_id = if let Some(attempt) = projection.attempt() {
+                attempt.id
+            } else {
+                let workers = tokio::time::timeout_at(deadline, self.workers.lock())
+                    .await
+                    .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+                let handle = workers
+                    .get(session_id)
+                    .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))?;
+                if !Arc::ptr_eq(&client, &handle.client) {
+                    return Err(SupervisorError::Superseded(session_id.into()));
+                }
+                handle
+                    .lease
+                    .native_scope()
+                    .map_err(|()| SupervisorError::NativeStoreUnavailable)?
+                    .and_then(|scope| scope.choice.as_ref().and_then(|choice| choice.authority))
+                    .map(|authority| authority.id)
+                    .ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
+            };
+            let settled = tokio::time::timeout_at(deadline, projection.settled())
+                .await
+                .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+            let applied = match settled {
+                EstablishmentResolution::Applied(postimage) => postimage,
+                EstablishmentResolution::Blocked => {
+                    return Err(crate::acp::establishment::EstablishmentRefusal::Unresolved.into());
+                }
+                _ => {
+                    return Err(crate::acp::establishment::EstablishmentRefusal::Unconfirmed.into())
+                }
+            };
+            if applied.attempt_id != attempt_id {
+                return Err(SupervisorError::Superseded(session_id.into()));
+            }
+            tokio::time::timeout_at(deadline, client.wait_until_usable())
+                .await
+                .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)??;
+            Some(applied)
+        } else {
+            None
+        };
+        let current = tokio::time::timeout_at(deadline, self.ready_client(session_id))
+            .await
+            .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)??;
+        if !Arc::ptr_eq(&client, &current) {
+            return Err(SupervisorError::Superseded(session_id.into()));
+        }
+        if let Some(expected) = expected {
+            if current
+                .establishment_projection()
+                .and_then(|projection| projection.applied())
+                .as_deref()
+                != Some(expected.as_ref())
+            {
+                return Err(SupervisorError::Superseded(session_id.into()));
+            }
+        }
+        Ok(())
     }
 
     pub async fn send_prompt(
@@ -171,8 +287,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         acp_mode_id: Option<&str>,
         yolo_mode: bool,
     ) -> Result<(), SupervisorError> {
-        let client = self.ready_client(session_id).await?;
-        match client.reset_session(text).await? {
+        let started = tokio::time::Instant::now();
+        let deadline = started + crate::acp::acp_client::SESSION_RESET_IN_TASK_TIMEOUT;
+        let outer_deadline = started + crate::acp::acp_client::SESSION_RESET_TIMEOUT;
+        let client = tokio::time::timeout_at(deadline, self.ready_client(session_id))
+            .await
+            .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)??;
+        let proposal = tokio::time::timeout_at(
+            deadline,
+            self.prepare_live_fresh(session_id, &client, deadline),
+        )
+        .await
+        .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
+        .map_err(|error| {
+            warn!(target: "acp.establishment", %error, "live Fresh proposal refused");
+            error
+                .downcast_ref::<crate::acp::establishment::EstablishmentRefusal>()
+                .copied()
+                .unwrap_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)
+        })?;
+        match client
+            .reset_session(text, proposal, deadline, outer_deadline)
+            .await?
+        {
             ResetSessionOutcome::Reset { new_acp_session_id } => {
                 info!(
                     target: "acp.supervisor",
@@ -196,11 +333,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             (None, false) => None,
         };
-        apply_mode(
-            &client,
-            session_id,
-            mode_id.as_deref(),
-            "conversation reset",
+        let _ = tokio::time::timeout_at(
+            outer_deadline,
+            apply_mode(
+                &client,
+                session_id,
+                mode_id.as_deref(),
+                "conversation reset",
+            ),
         )
         .await;
         Ok(())
@@ -234,27 +374,50 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         self.publish_next(
             session_id,
-            &Event::Stopped {
+            Event::Stopped {
                 reason: "user_forced".into(),
             },
         );
     }
 
-    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
+    pub async fn set_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+        request_nonce: Option<uuid::Uuid>,
+    ) -> Result<crate::acp::establishment::NativeOperationCorrelation, SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.set_mode(mode_id).await?;
-        Ok(())
+        Ok(client.set_mode(mode_id, request_nonce).await?)
     }
 
-    pub async fn set_config_option(
+    pub(crate) async fn set_config_option(
         &self,
         session_id: &str,
         config_id: &str,
         value: &str,
-    ) -> Result<(), SupervisorError> {
+        request_nonce: Option<uuid::Uuid>,
+    ) -> Result<
+        (
+            crate::acp::establishment::NativeOperationCorrelation,
+            crate::acp::runner_lifecycle::Lease,
+        ),
+        SupervisorError,
+    > {
         let client = self.ready_client(session_id).await?;
-        client.set_config_option(config_id, value).await?;
-        Ok(())
+        let lease = {
+            let workers = self.workers.lock().await;
+            let handle = workers
+                .get(session_id)
+                .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))?;
+            if !Arc::ptr_eq(&client, &handle.client) {
+                return Err(SupervisorError::Superseded(session_id.into()));
+            }
+            handle.lease.clone()
+        };
+        let operation = client
+            .set_config_option(config_id, value, request_nonce)
+            .await?;
+        Ok((operation, lease))
     }
 
     /// A watchdog respawn clones the cached spawn config, which the daemon's
@@ -311,7 +474,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{ResumeKind, ResumeReservationOutcome, WorkerKind};
+    use super::super::{ResumeKind, WorkerKind};
     use super::*;
     use crate::acp::state::AcpSessionId;
     use crate::daemon::AcpWorkerState;
@@ -337,16 +500,15 @@ mod tests {
             "a reservation counts as running so the reconciler skips it"
         );
         assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
-        assert!(matches!(
-            sup.begin_resume(
+        assert!(sup
+            .begin_resume(
                 "s-1748",
                 ResumeKind::Spawn,
                 crate::process::worker_registry::ResumeAuthority::Automatic
             )
             .await
-            .unwrap(),
-            ResumeReservationOutcome::AlreadyPresent
-        ));
+            .unwrap()
+            .is_none());
 
         let mut entered = sup.watch_worker_waits();
         let waiter = {
@@ -428,60 +590,125 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn reset_session_context_resets_then_reasserts_mode_without_clearing_on_failure() {
-        let sink = VecSink::new();
-        let sup = Supervisor::new(sink.clone());
-        let cmds = sup.test_insert_worker_cmd_recording("s-reset").await;
-
-        sup.reset_session_context("s-reset", "/new", None, false)
-            .await
-            .expect("reset ok");
-        assert_eq!(
-            cmds.lock().unwrap().clone(),
-            vec!["reset_session"],
-            "the clear alias drives a reset, not a prompt forward"
-        );
-        cmds.lock().unwrap().clear();
-        sup.reset_session_context("s-reset", "/new", Some("plan"), false)
-            .await
-            .expect("reset ok");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while cmds.lock().unwrap().len() < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            cmds.lock().unwrap().clone(),
-            vec!["reset_session", "set_mode"],
-            "an explicit persisted mode is re-asserted after the reset"
-        );
-
-        let (client, _tx) = AcpClient::fake_for_test_reset_failure(
-            AcpSessionId("s-reset-busy".into()),
-            "a turn is in flight; stop it before clearing the conversation",
-        );
-        sup.test_install_handle("s-reset-busy", client, WorkerKind::Stdio, None)
-            .await;
-        let error = sup
-            .reset_session_context("s-reset-busy", "/new", None, false)
-            .await
-            .expect_err("busy reset must be rejected");
-        assert!(
-            matches!(
-                &error,
-                SupervisorError::Acp(AcpError::ResetFailed(message))
-                    if message.contains("turn is in flight")
-            ),
-            "the busy classification must remain visible, got {error:?}"
-        );
-        assert!(
-            !sink
-                .frames
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, _, event)| matches!(event, Event::SessionCleared)),
-            "a rejected reset must not publish SessionCleared"
-        );
+        managed::with_managed(|scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let (prompt_seen, prompt_received) = tokio::sync::oneshot::channel();
+                let mut prompt_seen = Some(prompt_seen);
+                let mut generation = 0;
+                let (config, native) =
+                    scope.native_peer(directory.path().into(), "codex", "codex", move |request| {
+                        let id = request.get("id")?;
+                        let result = match request["method"].as_str().unwrap() {
+                            "initialize" => serde_json::json!({
+                                "protocolVersion":1,"agentCapabilities":{}
+                            }),
+                            "session/new" => {
+                                generation += 1;
+                                serde_json::json!({
+                                    "sessionId":format!("reset-native-{generation}"),
+                                    "modes":{
+                                        "currentModeId":"code",
+                                        "availableModes":[
+                                            {"id":"code","name":"Code"},
+                                            {"id":"plan","name":"Plan"}
+                                        ]
+                                    }
+                                })
+                            }
+                            "session/set_mode" => {
+                                assert_eq!(request["params"]["modeId"], "plan");
+                                serde_json::json!({})
+                            }
+                            "session/prompt" => {
+                                prompt_seen.take().unwrap().send(()).unwrap();
+                                return None;
+                            }
+                            "session/cancel" => return None,
+                            other => panic!("unexpected reset operation: {other}"),
+                        };
+                        Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
+                    });
+                let client = scope.spawn(config, "reset-mode").await.unwrap();
+                client.ready().await;
+                let state = client.app_state();
+                let supervisor = &state.acp_supervisor;
+                supervisor
+                    .reset_session_context(&client.id, "/new", None, false)
+                    .await
+                    .expect("genuine reset");
+                assert_eq!(
+                    native.requests(),
+                    ["initialize", "session/new", "session/new"],
+                    "the clear alias issues New, never Prompt"
+                );
+                supervisor
+                    .reset_session_context(&client.id, "/new", Some("plan"), false)
+                    .await
+                    .expect("genuine reset with mode");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !native
+                        .requests()
+                        .iter()
+                        .any(|method| method == "session/set_mode")
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("explicit persisted mode reaches the actual Native after New");
+                assert_eq!(
+                    native.requests(),
+                    [
+                        "initialize",
+                        "session/new",
+                        "session/new",
+                        "session/new",
+                        "session/set_mode"
+                    ]
+                );
+                client
+                    .send_prompt("keep this turn pending", &[])
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), prompt_received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = state.acp_event_store.highest_seq(&client.id);
+                let error = supervisor
+                    .reset_session_context(&client.id, "/new", None, false)
+                    .await
+                    .expect_err("busy reset must be rejected");
+                assert!(
+                    matches!(
+                        &error,
+                        SupervisorError::Acp(AcpError::ResetFailed(message))
+                            if message.contains("turn is in flight")
+                    ),
+                    "busy classification must remain visible: {error:?}"
+                );
+                assert!(!state
+                    .acp_event_store
+                    .replay_from(&client.id, before)
+                    .unwrap()
+                    .iter()
+                    .any(|stored| matches!(stored.event.as_ref(), Event::SessionCleared)));
+                assert_eq!(
+                    native
+                        .requests()
+                        .iter()
+                        .filter(|method| method.as_str() == "session/new")
+                        .count(),
+                    3,
+                    "busy reset cannot issue another New"
+                );
+                client.shutdown().await.unwrap();
+            })
+        })
+        .await;
     }
 }

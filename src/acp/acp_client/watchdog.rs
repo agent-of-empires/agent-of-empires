@@ -157,10 +157,6 @@ impl SilentOrphanWatchdog {
                 .is_some_and(|t| now.duration_since(t) >= self.effective_grace(cfg))
     }
 
-    pub(super) fn tool_calls_in_flight_len(&self) -> usize {
-        self.tool_calls_in_flight.len()
-    }
-
     pub(super) fn off_protocol_work_seen(&self) -> Option<OffProtocolWorkKind> {
         self.off_protocol_work_seen
     }

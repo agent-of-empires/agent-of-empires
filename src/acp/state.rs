@@ -4,6 +4,8 @@ use crate::daemon::PromptAttachmentRef;
 use crate::session::Status;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 
 use super::approvals::{Approval, ApprovalDecision, Nonce};
@@ -436,8 +438,6 @@ impl NativeEventContext {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum AcpSessionChange {
     Assigned(String),
-    Reset(String),
-    Cleared,
 }
 
 impl AcpSessionChange {
@@ -446,26 +446,85 @@ impl AcpSessionChange {
             Event::AcpSessionAssigned { acp_session_id, .. } => {
                 Some(Self::Assigned(acp_session_id.clone()))
             }
-            Event::SessionContextReset {
-                fork_rejection: Some(_),
-                ..
-            } => None,
-            Event::SessionContextReset { reason, .. } if reason.starts_with("fork_") => None,
-            Event::SessionContextReset { reason, .. } => Some(Self::Reset(reason.clone())),
-            Event::SessionCleared => Some(Self::Cleared),
             _ => None,
         }
     }
 }
 
+/// Frozen host establishment identity, not permission or message authorship.
+/// Actual RPC correlation remains separate from transport-row provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeEventOrigin {
+    pub(crate) context: NativeEventContext,
+    pub(crate) generation: u64,
+    pub(crate) attempt_id: crate::acp::establishment::AttemptId,
+    pub(crate) producer: uuid::Uuid,
+    pub(crate) owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+}
+
+impl NativeEventOrigin {
+    pub(crate) fn owned_attempt(
+        attempt: &crate::acp::establishment::EstablishmentAttempt,
+        owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    ) -> Option<Self> {
+        Some(Self {
+            context: attempt.context,
+            generation: attempt.generation,
+            attempt_id: attempt.id,
+            producer: attempt.producer?,
+            owner,
+        })
+    }
+
+    pub(crate) fn same_physical_row(
+        &self,
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<bool> {
+        Ok(self.context
+            == NativeEventContext::capture_identity(
+                &row.id,
+                row.created_at,
+                self.generation,
+                storage,
+            )?)
+    }
+}
+
+/// Authenticated Native transport and physical row witness only.
+/// The witnessed attempt does not identify who authored a content message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePhysicalSource {
+    pub(crate) witness: NativeEventOrigin,
+}
+
+impl NativePhysicalSource {
+    pub(crate) fn from_receipt(
+        receipt: &crate::acp::establishment::NativeEstablishmentReceipt,
+    ) -> Option<Self> {
+        receipt.owner.birth_fingerprint?;
+        Some(Self {
+            witness: NativeEventOrigin::owned_attempt(&receipt.attempt, Some(receipt.owner))?,
+        })
+    }
+}
+
 /// Exact metadata selection at a controller checkpoint. The general
 /// conversation equality intentionally omits ACP identity and route provenance.
-#[derive(Debug, Clone)]
-pub(crate) struct NativeBindingState {
-    pub choice: crate::session::ConversationState,
-    pub acp_session_id: Option<String>,
-    pub fork_pending: Option<String>,
-    pub import_pending: Option<bool>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeBindingState {
+    pub(crate) choice: crate::session::ConversationState,
+    pub(crate) acp_session_id: Option<String>,
+    pub(crate) fork_pending: Option<String>,
+    pub(crate) import_pending: Option<bool>,
+    pub(crate) project_path: String,
+    pub(crate) agent_name: Option<String>,
+    pub(crate) agent_provider: Option<String>,
+    pub(crate) authority: Option<crate::acp::establishment::AuthorityKey>,
+    pub(crate) sandboxed: bool,
 }
 
 impl NativeBindingState {
@@ -475,16 +534,49 @@ impl NativeBindingState {
             acp_session_id: row.acp_session_id.clone(),
             fork_pending: row.fork_pending.clone(),
             import_pending: row.import_pending,
+            project_path: row.project_path.clone(),
+            agent_name: row.agent_name.clone(),
+            agent_provider: row.agent_provider.clone(),
+            authority: row.acp_establishment.as_ref().map(|state| state.key()),
+            sandboxed: row.is_sandboxed(),
         }
     }
 
     pub(crate) fn matches(&self, row: &crate::session::Instance) -> bool {
+        self.selection_matches(row)
+            && self.authority == row.acp_establishment.as_ref().map(|state| state.key())
+    }
+
+    pub(crate) fn selection_matches(&self, row: &crate::session::Instance) -> bool {
         self.choice.matches_checkpoint(row)
             && self.acp_session_id == row.acp_session_id
             && self.fork_pending == row.fork_pending
             && self.import_pending == row.import_pending
+            && self.project_path == row.project_path
+            && self.agent_name == row.agent_name
+            && self.agent_provider == row.agent_provider
+            && self.sandboxed == row.is_sandboxed()
+    }
+
+    pub(crate) fn same_selection(&self, other: &Self) -> bool {
+        self.choice.same_checkpoint(&other.choice)
+            && self.acp_session_id == other.acp_session_id
+            && self.fork_pending == other.fork_pending
+            && self.import_pending == other.import_pending
+            && self.project_path == other.project_path
+            && self.agent_name == other.agent_name
+            && self.agent_provider == other.agent_provider
+            && self.sandboxed == other.sandboxed
     }
 }
+
+impl PartialEq for NativeBindingState {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_selection(other) && self.authority == other.authority
+    }
+}
+
+impl Eq for NativeBindingState {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeObservationScope {
@@ -537,12 +629,6 @@ impl NativeObservationScope {
             )?,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct NativeForkRejection {
-    pub(crate) owner: crate::acp::runner_lifecycle::RunnerIdentity,
-    pub(crate) parent: String,
 }
 
 /// Kept only in the private journal and runtime fold, never public JSON.
@@ -618,11 +704,32 @@ impl NativeEventSubject {
                     .is_some_and(|birth| Some(birth.fingerprint()) == owner.birth_fingerprint)
         })
     }
+
+    pub(crate) fn owner_not_replaced(&self, session_id: &str) -> bool {
+        let Some(owner) = self.owner.filter(|owner| owner.birth_fingerprint.is_some()) else {
+            return false;
+        };
+        match crate::process::worker_registry::load_strict(session_id) {
+            Ok(Some(record)) => owner.owns_record(&record),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn unavailability_still_applies(&self, session_id: &str) -> bool {
+        match self.kind {
+            NativeSubjectEvent::AdmissionRefusal(refusal) => {
+                crate::process::worker_registry::refusal_still_applies(session_id, &refusal)
+            }
+            NativeSubjectEvent::ChannelUnavailable(_) => self.owner_not_replaced(session_id),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct CurrentNativeAvailability {
-    pub context: NativeEventContext,
+    pub scope: NativeObservationScope,
     pub owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     pub unavailable: Option<AcpConnectionUnavailability>,
     pub ready: bool,
@@ -633,20 +740,25 @@ pub(crate) struct CurrentNativeAvailability {
 
 impl CurrentNativeAvailability {
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
-        self.context == other.context
+        self.scope.context == other.scope.context
+            && self.scope.choice == other.scope.choice
             && self.owner == other.owner
             && self.lease == other.lease
             && std::sync::Arc::ptr_eq(&self.client, &other.client)
     }
 
-    /// Called with the native fence held; lifecycle contention must not invert
-    /// the producer's lifecycle-to-native lock order.
-    pub(crate) fn refresh(&mut self, session_id: &str) -> Result<bool, NativeObservationWait> {
+    /// Refresh lifecycle/client facts under the Native fence; owner proof is separate.
+    /// `selected` compares this frozen choice with the fenced row.
+    pub(crate) fn refresh(
+        &mut self,
+        session_id: &str,
+        selected: bool,
+    ) -> Result<bool, NativeObservationWait> {
         let lifecycle = match self.lifecycle.try_lock() {
             Ok(lifecycle) => lifecycle,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(NativeObservationWait {
-                    context: self.context,
+                    context: self.scope.context,
                     lock: NativeObservationLock::Lifecycle(self.lifecycle.clone()),
                 });
             }
@@ -658,10 +770,35 @@ impl CurrentNativeAvailability {
         {
             return Ok(false);
         }
-        self.ready = self.client.connection_ready();
+        self.ready = selected && self.client.connection_ready();
         self.unavailable = self.client.connection_unavailable();
         self.ready &= self.unavailable.is_none();
         Ok(self.ready || self.unavailable.is_some())
+    }
+
+    /// After refresh, qualify ownership under the Native fence without a registry guard.
+    pub(crate) fn qualify_owner(&self, session_id: &str) -> Result<bool, NativeObservationWait> {
+        let Some(owner) = self.owner.filter(|owner| owner.birth_fingerprint.is_some()) else {
+            return Ok(false);
+        };
+        let record = match crate::process::worker_registry::load_strict(session_id) {
+            Ok(record) => record,
+            Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => {
+                return Err(NativeObservationWait {
+                    context: self.scope.context,
+                    lock: NativeObservationLock::Registry(session_id.to_owned()),
+                });
+            }
+            Err(_) => return Ok(false),
+        };
+        if self.unavailable.is_some() {
+            return Ok(record.is_none_or(|record| owner.owns_record(&record)));
+        }
+        Ok(record.is_some_and(|record| owner.owns_record(&record))
+            && crate::process::process_birth_identity(owner.pid)
+                .ok()
+                .flatten()
+                .is_some_and(|birth| Some(birth.fingerprint()) == owner.birth_fingerprint))
     }
 }
 
@@ -681,6 +818,7 @@ impl std::fmt::Debug for NativeObservationWait {
 enum NativeObservationLock {
     Native(std::sync::Arc<crate::session::NativeInputFence>),
     Lifecycle(std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>),
+    Registry(String),
 }
 
 impl NativeObservationWait {
@@ -691,21 +829,14 @@ impl NativeObservationWait {
         }
     }
 
-    pub(crate) fn lifecycle(
-        context: NativeEventContext,
-        lifecycle: std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
-    ) -> Self {
-        Self {
-            context,
-            lock: NativeObservationLock::Lifecycle(lifecycle),
-        }
-    }
-
     /// Only the contended lock survives into this wait, never a publication guard.
     pub(crate) async fn settle(self) -> bool {
         tokio::task::spawn_blocking(move || match self.lock {
             NativeObservationLock::Native(fence) => fence.lock_observation().is_ok(),
             NativeObservationLock::Lifecycle(lifecycle) => lifecycle.lock().is_ok(),
+            NativeObservationLock::Registry(session_id) => {
+                crate::process::worker_registry::acquire_registry_lock(&session_id).is_ok()
+            }
         })
         .await
         .unwrap_or(false)
@@ -739,7 +870,7 @@ impl NativeAvailabilityProjection {
         let Some(context) = context else {
             return Self::default();
         };
-        if let Some(current) = current.filter(|current| current.context == context) {
+        if let Some(current) = current.filter(|current| current.scope.context == context) {
             return Self {
                 ready: current.ready && current.unavailable.is_none(),
                 unavailable: current.unavailable,
@@ -844,12 +975,14 @@ pub struct BackgroundTaskLaunch {
     /// What the log already recorded for the workflow's agents, so a resumed
     /// journal read neither repeats nor misses an event.
     pub workflow_agents: WorkflowAgents,
+    pub(crate) witness: Option<Arc<crate::acp::establishment::NativeResourceWitness>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowAgents {
     pub launched: std::collections::HashSet<String>,
     pub completed: std::collections::HashSet<String>,
+    pub(crate) resources: HashMap<String, Arc<crate::acp::establishment::NativeResourceWitness>>,
 }
 
 /// A Claude `Workflow` run, from its launch result.
@@ -907,6 +1040,8 @@ pub struct BackgroundAgentTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentRecord {
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_ref: Option<uuid::Uuid>,
     /// The parent `Task` tool call that launched this agent.
     pub tool_call_id: String,
     pub description: String,
@@ -947,6 +1082,13 @@ pub enum SidebarPhase {
     PromptFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskRecord {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_ref: Option<uuid::Uuid>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AcpState {
     pub session_id: AcpSessionId,
@@ -955,17 +1097,25 @@ pub struct AcpState {
     pub mode: SessionMode,
 
     pub current_plan: Option<Plan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_plan_seq: Option<u64>,
     pub todos: Vec<Todo>,
     pub in_flight_tool: Option<ToolCall>,
     pub pending_approvals: Vec<Approval>,
     #[serde(default)]
     pub pending_elicitations: Vec<Elicitation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub original_decision_nonces: Vec<Nonce>,
     #[serde(default)]
     pub recent_diffs: Vec<DiffPreview>,
     pub thinking: Option<ThinkingSignal>,
     pub rate_limit: Option<RateLimitInfo>,
     #[serde(default)]
     pub usage: Option<SessionUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_usage: Option<SessionUsage>,
+    #[serde(skip)]
+    operation_effects: crate::acp::operation_effect::OperationEffects,
     #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
     /// Modes the adapter advertised; adapter-scoped, so they survive `/clear`.
@@ -1012,7 +1162,7 @@ pub struct AcpState {
     pub background_agents: Vec<BackgroundAgentRecord>,
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub background_tasks: Vec<String>,
+    pub background_tasks: Vec<BackgroundTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
 
@@ -1025,6 +1175,11 @@ pub struct AcpState {
     /// Sidebar projection input; rebuilt from the log, so never serialized.
     #[serde(skip)]
     pub sidebar_phase: SidebarPhase,
+    /// Derived lifecycle/resource observation; zero means the default phase is not evidence.
+    #[serde(skip)]
+    pub(crate) sidebar_observation_seq: u64,
+    #[serde(skip)]
+    pub(crate) sidebar_observation_origin: Option<NativeEventOrigin>,
     /// A mid-turn prompt is injected into the running turn rather than queued.
     #[serde(default)]
     pub steering: bool,
@@ -1360,11 +1515,9 @@ pub enum Event {
         #[serde(default, skip_serializing)]
         native_subject: Option<NativeEventSubject>,
     },
-    /// Native context continuity was lost or a fork could not be established.
+    /// A new native context boundary, without erasing transcript history.
     SessionContextReset {
         reason: String,
-        #[serde(skip)]
-        fork_rejection: Option<std::sync::Arc<NativeForkRejection>>,
     },
     /// The agent called the Claude SDK's `ScheduleWakeup` tool.
     WakeupScheduled {
@@ -1441,6 +1594,24 @@ impl AcpState {
 
     /// Historical notices never grant current channel health or recovery authority.
     pub(crate) fn apply_native_availability(&mut self, projection: NativeAvailabilityProjection) {
+        if projection.ready
+            && projection.unavailable.is_none()
+            && projection.owner.is_some()
+            && self.sidebar_phase == SidebarPhase::Error
+            && self.operation_error.is_none()
+            && self.native_availability.is_some_and(|(_, subject)| {
+                Some(subject.context) == projection.context
+                    && subject.owner == projection.owner
+                    && matches!(
+                        subject.kind,
+                        NativeSubjectEvent::ChannelUnavailable(unavailable)
+                            if unavailable.source.is_channel_loss()
+                    )
+            })
+        {
+            // Only qualified current readiness can heal this same owner's loss.
+            self.heal_sidebar_phase();
+        }
         self.connection_ready = projection.ready;
         self.connection_unavailable = projection.unavailable;
         if let Some((seq, failure)) = projection
@@ -1448,6 +1619,8 @@ impl AcpState {
             .filter(|(seq, _)| *seq > self.native_control_seq)
         {
             self.native_control_seq = seq;
+            self.sidebar_observation_seq = seq;
+            self.sidebar_observation_origin = None;
             self.end_turn("aborted");
             if failure == NativeControlFailure::Startup {
                 self.sidebar_phase = SidebarPhase::Error;
@@ -1461,8 +1634,7 @@ impl AcpState {
         }
     }
 
-    /// The sidebar status this state implies. A live background agent keeps
-    /// the row `Running` between main turns.
+    /// Qualified main-turn status plus genuinely allocated background work, never raw resource history.
     pub fn sidebar_status(&self) -> Status {
         if self.connection_unavailable.is_some() {
             return Status::Error;
@@ -1471,12 +1643,171 @@ impl AcpState {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
             SidebarPhase::Active => Status::Running,
-            SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
+            SidebarPhase::Idle if self.has_qualified_background_work() => Status::Running,
             SidebarPhase::Idle => Status::Idle,
         }
     }
 
-    pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
+    fn has_qualified_background_work(&self) -> bool {
+        self.background_tasks
+            .iter()
+            .any(|task| task.resource_ref.is_some())
+            || self
+                .background_agents
+                .iter()
+                .any(|agent| agent.resource_ref.is_some() && agent.ended_at.is_none())
+    }
+
+    pub(crate) fn apply_scoped_event(
+        &mut self,
+        seq: u64,
+        event: &Event,
+        metadata: &crate::acp::event_sender::EventMetadata,
+    ) -> Result<u64, StateError> {
+        use crate::acp::operation_effect::ControlKind;
+        let previous = self.operation_effects.active();
+        let kind = ControlKind::from_event(event);
+        let effect = self.operation_effects.apply(kind, metadata);
+        if effect.applies_state() {
+            if matches!(kind, ControlKind::Admission)
+                && self.operation_effects.active().is_some()
+                && self.operation_effects.active() != previous
+            {
+                self.open_turn();
+                self.native_control_seq = self.native_control_seq.max(seq);
+            }
+            return self.apply_current_event(
+                seq,
+                event,
+                kind,
+                metadata.native_origin,
+                metadata.clear_after_seq,
+            );
+        } else {
+            match event {
+                Event::PlanUpdated { .. }
+                | Event::TodoListUpdated { .. }
+                | Event::DiffEmitted { .. }
+                | Event::SessionNotice { .. } => {
+                    return self.apply_current_event(
+                        seq,
+                        event,
+                        kind,
+                        metadata.native_origin,
+                        metadata.clear_after_seq,
+                    );
+                }
+                Event::UsageUpdated { usage } => self.historical_usage = Some(usage.clone()),
+                Event::ApprovalResolved { nonce, .. } => self
+                    .pending_approvals
+                    .retain(|approval| approval.nonce != *nonce),
+                Event::ElicitationResolved { nonce, .. } => self
+                    .pending_elicitations
+                    .retain(|elicitation| elicitation.nonce != *nonce),
+                Event::BackgroundAgentLaunched { agent_id, .. } => {
+                    let existing = self
+                        .background_agents
+                        .iter()
+                        .find(|agent| agent.agent_id == *agent_id);
+                    if metadata.resource_ref.is_some()
+                        || existing.is_none_or(|agent| agent.resource_ref.is_none())
+                    {
+                        self.apply_current_event(
+                            seq,
+                            event,
+                            kind,
+                            metadata.native_origin,
+                            metadata.clear_after_seq,
+                        )?;
+                        if let Some(agent) = self.background_agent(agent_id) {
+                            agent.resource_ref = metadata.resource_ref;
+                        }
+                        if metadata.resource_ref.is_some() {
+                            self.sidebar_observation_seq = seq;
+                            self.sidebar_observation_origin = metadata.native_origin;
+                        }
+                    }
+                }
+                Event::BackgroundAgentProgress { agent_id, .. }
+                | Event::BackgroundAgentCompleted { agent_id, .. } => {
+                    if self.background_agents.iter().any(|agent| {
+                        agent.agent_id == *agent_id && agent.resource_ref == metadata.resource_ref
+                    }) {
+                        self.apply_current_event(
+                            seq,
+                            event,
+                            kind,
+                            metadata.native_origin,
+                            metadata.clear_after_seq,
+                        )?;
+                        if metadata.resource_ref.is_some() {
+                            self.sidebar_observation_seq = seq;
+                            self.sidebar_observation_origin = metadata.native_origin;
+                        }
+                    }
+                }
+                Event::BackgroundTaskStarted { task_id, .. } => {
+                    let existing = self
+                        .background_tasks
+                        .iter()
+                        .find(|task| task.task_id == *task_id);
+                    if metadata.resource_ref.is_some()
+                        || existing.is_none_or(|task| task.resource_ref.is_none())
+                    {
+                        self.apply_current_event(
+                            seq,
+                            event,
+                            kind,
+                            metadata.native_origin,
+                            metadata.clear_after_seq,
+                        )?;
+                        if let Some(task) = self
+                            .background_tasks
+                            .iter_mut()
+                            .find(|task| task.task_id == *task_id)
+                        {
+                            task.resource_ref = metadata.resource_ref;
+                        }
+                        if metadata.resource_ref.is_some() {
+                            self.sidebar_observation_seq = seq;
+                            self.sidebar_observation_origin = metadata.native_origin;
+                        }
+                    }
+                }
+                Event::BackgroundTaskFinished { task_id, .. }
+                    if self.background_tasks.iter().any(|task| {
+                        task.task_id == *task_id && task.resource_ref == metadata.resource_ref
+                    }) =>
+                {
+                    self.apply_current_event(
+                        seq,
+                        event,
+                        kind,
+                        metadata.native_origin,
+                        metadata.clear_after_seq,
+                    )?;
+                    if metadata.resource_ref.is_some() {
+                        self.sidebar_observation_seq = seq;
+                        self.sidebar_observation_origin = metadata.native_origin;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.last_seq = seq;
+        self.updated_at = Utc::now();
+        Ok(seq)
+    }
+
+    fn apply_current_event(
+        &mut self,
+        seq: u64,
+        event: &Event,
+        kind: crate::acp::operation_effect::ControlKind<'_>,
+        origin: Option<NativeEventOrigin>,
+        clear_after_seq: Option<u64>,
+    ) -> Result<u64, StateError> {
+        let previous_sidebar_phase = self.sidebar_phase;
         let closes_native = match &event {
             Event::AcpConnectionUnavailable { .. } => event.is_channel_loss(),
             Event::AgentStartupError {
@@ -1498,8 +1829,11 @@ impl AcpState {
             self.native_control_seq = seq;
         }
         match event {
-            Event::PlanUpdated { plan } => self.current_plan = Some(plan),
-            Event::TodoListUpdated { todos } => self.todos = todos,
+            Event::PlanUpdated { plan } => {
+                self.current_plan = Some(plan.clone());
+                self.current_plan_seq = Some(seq);
+            }
+            Event::TodoListUpdated { todos } => self.todos = todos.clone(),
             Event::ToolCallStarted { tool_call } => {
                 if !matches!(
                     self.sidebar_phase,
@@ -1507,17 +1841,17 @@ impl AcpState {
                 ) {
                     self.sidebar_phase = SidebarPhase::Active;
                 }
-                self.start_tool_call(tool_call)
+                self.start_tool_call(tool_call.clone())
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
                     .in_flight_tool
                     .as_ref()
-                    .is_some_and(|t| t.id == tool_call_id)
+                    .is_some_and(|t| t.id == *tool_call_id)
                 {
                     self.in_flight_tool = None;
                 }
-                if self.compaction_tool_id.as_ref() == Some(&tool_call_id) {
+                if self.compaction_tool_id.as_ref() == Some(tool_call_id) {
                     self.compaction_tool_id = None;
                     self.compacting = false;
                 }
@@ -1532,19 +1866,19 @@ impl AcpState {
                 if let Some(tool) = self
                     .in_flight_tool
                     .as_mut()
-                    .filter(|t| t.id == tool_call_id)
+                    .filter(|t| t.id == *tool_call_id)
                 {
                     if let Some(title) = title {
-                        tool.name = title;
+                        tool.name = title.clone();
                     }
                     if let Some(args_preview) = args_preview {
-                        tool.args_preview = args_preview;
+                        tool.args_preview = args_preview.clone();
                     }
                     if let Some(started_at) = started_at {
-                        tool.started_at = started_at;
+                        tool.started_at = *started_at;
                     }
                     if let Some(diffs) = diffs {
-                        tool.diffs = diffs;
+                        tool.diffs = diffs.clone();
                     }
                 }
             }
@@ -1555,16 +1889,16 @@ impl AcpState {
                 ) {
                     self.sidebar_phase = SidebarPhase::Waiting;
                 }
-                self.pending_approvals.push(approval)
+                self.pending_approvals.push(approval.clone())
             }
             Event::ApprovalResolved { nonce, .. } => {
                 let pos = self
                     .pending_approvals
                     .iter()
-                    .position(|a| a.nonce == nonce)
+                    .position(|a| a.nonce == *nonce)
                     .ok_or_else(|| StateError::UnknownApprovalNonce(nonce.clone()))?;
                 if self.pending_approvals.remove(pos).resolved.is_some() {
-                    return Err(StateError::ApprovalAlreadyResolved(nonce));
+                    return Err(StateError::ApprovalAlreadyResolved(nonce.clone()));
                 }
                 if !matches!(
                     self.sidebar_phase,
@@ -1587,10 +1921,10 @@ impl AcpState {
                 ) {
                     self.sidebar_phase = SidebarPhase::Waiting;
                 }
-                self.pending_elicitations.push(elicitation)
+                self.pending_elicitations.push(elicitation.clone())
             }
             Event::ElicitationResolved { nonce, .. } => {
-                self.pending_elicitations.retain(|e| e.nonce != nonce);
+                self.pending_elicitations.retain(|e| e.nonce != *nonce);
                 if !matches!(
                     self.sidebar_phase,
                     SidebarPhase::Error | SidebarPhase::PromptFailed
@@ -1599,7 +1933,7 @@ impl AcpState {
                 }
             }
             Event::DiffEmitted { diff } => {
-                self.recent_diffs.push(diff);
+                self.recent_diffs.push(diff.clone());
                 let excess = self
                     .recent_diffs
                     .len()
@@ -1616,7 +1950,7 @@ impl AcpState {
                 }
             }
             Event::ThinkingEnded => self.thinking = None,
-            Event::RateLimit { info } => self.rate_limit = Some(info),
+            Event::RateLimit { info } => self.rate_limit = Some(info.clone()),
             Event::SessionNotice {
                 severity,
                 title,
@@ -1625,9 +1959,9 @@ impl AcpState {
             } => {
                 let notice = SessionNotice {
                     id: notice_id(key.as_deref(), seq),
-                    severity,
-                    title,
-                    description,
+                    severity: severity.clone(),
+                    title: title.clone(),
+                    description: description.clone(),
                 };
                 match self.session_notices.iter_mut().find(|n| n.id == notice.id) {
                     Some(existing) => *existing = notice,
@@ -1639,20 +1973,22 @@ impl AcpState {
                     .saturating_sub(Self::MAX_SESSION_NOTICES);
                 self.session_notices.drain(..excess);
             }
-            Event::UsageUpdated { usage } => self.usage = Some(usage),
-            Event::ModeChanged { mode } => self.mode = mode,
+            Event::UsageUpdated { usage } => self.usage = Some(usage.clone()),
+            Event::ModeChanged { mode } => self.mode = *mode,
             Event::ModesAvailable {
                 current_mode_id,
                 modes,
             } => {
-                self.available_modes = modes;
-                self.current_mode_id = Some(current_mode_id);
+                self.available_modes = modes.clone();
+                self.current_mode_id = Some(current_mode_id.clone());
             }
             Event::CurrentModeChanged { current_mode_id } => {
-                self.current_mode_id = Some(current_mode_id)
+                self.current_mode_id = Some(current_mode_id.clone())
             }
-            Event::AuthStatusUpdated { status } => self.auth_status = status,
-            Event::AvailableCommandsUpdated { commands } => self.available_commands = commands,
+            Event::AuthStatusUpdated { status } => self.auth_status = status.clone(),
+            Event::AvailableCommandsUpdated { commands } => {
+                self.available_commands = commands.clone()
+            }
             Event::ConfigOptionsUpdated { options } => {
                 // The failed value is now current, so the notice is moot.
                 let confirmed = self.config_option_switch_failed.as_ref().is_some_and(|f| {
@@ -1664,7 +2000,7 @@ impl AcpState {
                 if confirmed {
                     self.config_option_switch_failed = None;
                 }
-                self.config_options = options;
+                self.config_options = options.clone();
             }
             Event::ConfigOptionSwitchFailed {
                 config_id,
@@ -1672,15 +2008,14 @@ impl AcpState {
                 reason,
             } => {
                 self.config_option_switch_failed = Some(ConfigOptionSwitchFailure {
-                    config_id,
-                    value,
-                    reason,
+                    config_id: config_id.clone(),
+                    value: value.clone(),
+                    reason: reason.clone(),
                 });
             }
             Event::PromptRuntimeError { evidence, .. } => {
-                self.operation_error = evidence;
-                self.turn_active = false;
-                self.cancelling = false;
+                self.operation_error = *evidence;
+                self.end_turn("prompt_failed");
                 self.sidebar_phase = SidebarPhase::Error;
             }
             Event::AcpConnectionUnavailable {
@@ -1690,9 +2025,9 @@ impl AcpState {
                 native_subject,
             } => {
                 let unavailable = AcpConnectionUnavailability {
-                    source,
-                    cause,
-                    phase,
+                    source: *source,
+                    cause: *cause,
+                    phase: *phase,
                 };
                 self.native_availability = native_subject.map(|subject| (seq, subject));
                 self.connection_unavailable = Some(unavailable);
@@ -1705,15 +2040,15 @@ impl AcpState {
                 match subject.kind {
                     NativeSubjectEvent::ChannelUnavailable(unavailable) => {
                         self.connection_unavailable = Some(unavailable);
-                        self.native_availability = Some((seq, subject));
+                        self.native_availability = Some((seq, *subject));
                     }
                     NativeSubjectEvent::AdmissionRefusal(refusal) => {
                         let unavailable = refusal.observation();
                         self.connection_unavailable = Some(unavailable);
-                        self.native_availability = Some((seq, subject));
+                        self.native_availability = Some((seq, *subject));
                     }
                     NativeSubjectEvent::ChannelReady => {
-                        self.native_availability = Some((seq, subject));
+                        self.native_availability = Some((seq, *subject));
                     }
                     NativeSubjectEvent::PromptDiagnostic => {
                         self.turn_active = false;
@@ -1740,19 +2075,19 @@ impl AcpState {
                 self.sidebar_phase = SidebarPhase::Error;
             }
             Event::CancelRequested { .. } => self.cancelling = true,
-            Event::Stopped { reason } => self.end_turn(&reason),
+            Event::Stopped { reason } => self.end_turn(reason),
             Event::IncompatibleAgent { detail } => {
-                self.startup_error = Some(detail);
+                self.startup_error = Some(detail.clone());
                 self.sidebar_phase = SidebarPhase::Error;
             }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
-            Event::PromptCapabilities { steering, .. } => self.steering = steering,
+            Event::PromptCapabilities { steering, .. } => self.steering = *steering,
             Event::AcpSessionAssigned {
                 connection_ready,
                 native_subject,
                 ..
             } => {
-                if connection_ready
+                if *connection_ready
                     && native_subject
                         .is_some_and(|subject| subject.kind == NativeSubjectEvent::ChannelReady)
                 {
@@ -1773,7 +2108,12 @@ impl AcpState {
                 if self.sidebar_phase == SidebarPhase::PromptFailed {
                     self.sidebar_phase = SidebarPhase::Idle;
                 }
-                self.current_plan = None;
+                if clear_after_seq
+                    .is_none_or(|cut| self.current_plan_seq.is_none_or(|seq| seq <= cut))
+                {
+                    self.current_plan = None;
+                    self.current_plan_seq = None;
+                }
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
@@ -1788,7 +2128,9 @@ impl AcpState {
                 self.compaction_tool_id = None;
             }
             Event::PromptRejected { .. } => self.turn_active = false,
-            Event::AgentSwitched { from, to, reason } => self.switch_agent(from, to, reason),
+            Event::AgentSwitched { from, to, reason } => {
+                self.switch_agent(from.clone(), to.clone(), reason.clone())
+            }
             Event::BackgroundAgentLaunched {
                 agent_id,
                 tool_call_id,
@@ -1799,14 +2141,15 @@ impl AcpState {
                 workflow,
                 started_at,
             } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id,
-                tool_call_id,
-                description,
-                prompt,
-                model,
-                workflow,
+                agent_id: agent_id.clone(),
+                resource_ref: None,
+                tool_call_id: tool_call_id.clone(),
+                description: description.clone(),
+                prompt: prompt.clone(),
+                model: model.clone(),
+                workflow: workflow.clone(),
                 status: BackgroundAgentStatus::Running,
-                started_at,
+                started_at: *started_at,
                 ended_at: None,
                 tool_count: 0,
                 tools: Vec::new(),
@@ -1824,19 +2167,17 @@ impl AcpState {
                 last_text,
                 ..
             } => {
-                // A terminal record never reopens. `ended_at` is part of the
-                // guard because the tailer's abort timeout closes a record
-                // with the non-terminal `Stalled` status.
+                // Stalled is non-terminal, but ended records must never reopen.
                 if let Some(a) = self
-                    .background_agent(&agent_id)
+                    .background_agent(agent_id)
                     .filter(|a| a.ended_at.is_none() && !a.status.is_terminal())
                 {
-                    a.status = status;
-                    a.tool_count = tool_count;
-                    replace_if_some(&mut a.last_tool, last_tool);
-                    replace_if_some(&mut a.last_text, last_text);
+                    a.status = *status;
+                    a.tool_count = *tool_count;
+                    replace_if_some(&mut a.last_tool, last_tool.clone());
+                    replace_if_some(&mut a.last_text, last_text.clone());
                     if !tools.is_empty() {
-                        a.tools = tools;
+                        a.tools = tools.clone();
                     }
                 }
             }
@@ -1848,13 +2189,13 @@ impl AcpState {
                 warning,
                 ended_at,
             } => {
-                if let Some(a) = self.background_agent(&agent_id) {
-                    a.status = status;
-                    a.ended_at = Some(ended_at);
-                    replace_if_some(&mut a.result, result);
-                    replace_if_some(&mut a.warning, warning);
+                if let Some(a) = self.background_agent(agent_id) {
+                    a.status = *status;
+                    a.ended_at = Some(*ended_at);
+                    replace_if_some(&mut a.result, result.clone());
+                    replace_if_some(&mut a.warning, warning.clone());
                     if !tools.is_empty() {
-                        a.tools = tools;
+                        a.tools = tools.clone();
                     }
                 }
             }
@@ -1865,24 +2206,32 @@ impl AcpState {
                 ..
             } => {
                 // A reused task id replaces whatever run held it.
-                self.close_workflow_run(&task_id, None);
+                self.close_workflow_run(task_id, None);
                 if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
                     self.workflow_runs.push(WorkflowRunRecord {
                         task_id: task_id.clone(),
-                        tool_call_id,
-                        name: workflow.name,
-                        summary: workflow.summary,
+                        tool_call_id: tool_call_id.clone(),
+                        name: workflow.name.clone(),
+                        summary: workflow.summary.clone(),
                         finished: false,
                         ended_at: None,
                     });
                 }
-                if !self.background_tasks.contains(&task_id) {
-                    self.background_tasks.push(task_id);
+                if !self
+                    .background_tasks
+                    .iter()
+                    .any(|task| task.task_id == *task_id)
+                {
+                    self.background_tasks.push(BackgroundTaskRecord {
+                        task_id: task_id.clone(),
+                        resource_ref: None,
+                    });
                 }
             }
             Event::BackgroundTaskFinished { task_id, ended_at } => {
-                self.close_workflow_run(&task_id, ended_at);
-                self.background_tasks.retain(|id| *id != task_id);
+                self.close_workflow_run(task_id, *ended_at);
+                self.background_tasks
+                    .retain(|task| task.task_id != *task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::AgentMessageChunk { .. } => {
@@ -1903,6 +2252,32 @@ impl AcpState {
             self.retire_unavailable_controls();
             self.sidebar_phase = SidebarPhase::Error;
         }
+        use crate::acp::operation_effect::ControlKind;
+        let passive_heal = matches!(
+            event,
+            Event::AcpSessionAssigned { .. } | Event::RateLimitAutoResumed { .. }
+        );
+        if matches!(
+            kind,
+            ControlKind::Cleared | ControlKind::ContextReset | ControlKind::Switched
+        ) || (passive_heal && self.sidebar_phase != previous_sidebar_phase)
+        {
+            if self.sidebar_phase == SidebarPhase::Idle && !self.has_qualified_background_work() {
+                self.sidebar_observation_seq = 0;
+                self.sidebar_observation_origin = None;
+            }
+        } else if matches!(
+            kind,
+            ControlKind::Admission
+                | ControlKind::Diagnostic
+                | ControlKind::Stopped(_)
+                | ControlKind::AgentWork
+                | ControlKind::Unavailable { .. }
+        ) || (self.sidebar_phase != previous_sidebar_phase && !passive_heal)
+        {
+            self.sidebar_observation_seq = seq;
+            self.sidebar_observation_origin = origin;
+        }
         self.last_seq = seq;
         self.updated_at = Utc::now();
         Ok(self.last_seq)
@@ -1919,6 +2294,7 @@ impl AcpState {
         self.thinking = None;
         self.pending_approvals.clear();
         self.pending_elicitations.clear();
+        self.original_decision_nonces.clear();
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
@@ -2001,6 +2377,8 @@ impl AcpState {
         self.available_modes = Vec::new();
         self.current_mode_id = None;
         self.current_plan = None;
+        self.current_plan_seq = None;
+        self.original_decision_nonces.clear();
         self.mode = SessionMode::Default;
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
@@ -2078,9 +2456,67 @@ mod tests {
     fn applied(events: impl IntoIterator<Item = Event>) -> AcpState {
         let mut s = fresh_state();
         for event in events {
-            s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
+            s.apply_scoped_event(
+                s.last_seq.saturating_add(1),
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         }
         s
+    }
+
+    fn current_session_metadata() -> crate::acp::event_sender::EventMetadata {
+        crate::acp::event_sender::EventMetadata {
+            scope: crate::acp::event_sender::EventScope::SessionCurrent,
+            ..crate::acp::event_sender::EventMetadata::history()
+        }
+    }
+
+    // Model qualified current session events; background resources remain historical.
+    fn applied_current_session(events: impl IntoIterator<Item = Event>) -> AcpState {
+        let mut state = fresh_state();
+        for event in events {
+            let metadata = match &event {
+                Event::BackgroundAgentLaunched { .. }
+                | Event::BackgroundAgentProgress { .. }
+                | Event::BackgroundAgentCompleted { .. }
+                | Event::BackgroundTaskStarted { .. }
+                | Event::BackgroundTaskFinished { .. } => {
+                    crate::acp::event_sender::EventMetadata::history()
+                }
+                _ => current_session_metadata(),
+            };
+            state
+                .apply_scoped_event(state.last_seq + 1, &event, &metadata)
+                .unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn historical_session_reports_do_not_grant_current_control_state() {
+        let state = applied([
+            Event::AuthStatusUpdated {
+                status: Some(auth(AuthStatusKind::Account, "historical account")),
+            },
+            config_options("claude-sonnet-4-6"),
+            caps(true),
+            prompt("historical request"),
+            Event::ThinkingStarted,
+            Event::ToolCallStarted {
+                tool_call: tool_call("historical-tool"),
+            },
+            rate_limit(),
+            observed_channel_ready("historical-channel"),
+        ]);
+        assert!(state.auth_status.is_none());
+        assert!(state.config_options.is_empty());
+        assert!(!state.steering && !state.turn_active);
+        assert!(state.thinking.is_none() && state.in_flight_tool.is_none());
+        assert!(state.rate_limit.is_none());
+        assert!(!state.connection_ready && state.native_availability.is_none());
+        assert_eq!(state.sidebar_status(), Status::Idle);
     }
 
     fn observed_channel_ready(acp_session_id: &str) -> Event {
@@ -2105,6 +2541,37 @@ mod tests {
             ErrorOperation::Prompt,
         );
         let mut state = applied([prompt("work"), super::test_support::chunk("partial output")]);
+        let correlation = crate::acp::establishment::NativeOperationCorrelation::new(None);
+        let mut qualification = crate::acp::event_sender::EventMetadata::history();
+        qualification.operation = Some(crate::acp::protocol::AcpOperationMetadata {
+            correlation,
+            outcome: None,
+        });
+        let mut admission = qualification.clone();
+        admission.scope = crate::acp::event_sender::EventScope::OperationCurrent;
+        state
+            .apply_scoped_event(state.last_seq + 1, &Event::ThinkingStarted, &admission)
+            .unwrap();
+        state.cancelling = true;
+        state.compacting = true;
+        state.compaction_tool_id = Some("partial-tool".into());
+        state.in_flight_tool = Some(tool_call("partial-tool"));
+        let mut unrelated = qualification.clone();
+        unrelated.operation.as_mut().unwrap().correlation =
+            crate::acp::establishment::NativeOperationCorrelation::new(None);
+        state
+            .apply_scoped_event(
+                state.last_seq + 1,
+                &Event::PromptRuntimeError {
+                    message: "older request failed".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+                &unrelated,
+            )
+            .unwrap();
+        assert!(state.turn_active && state.thinking.is_some() && state.compacting);
+        assert_eq!(state.operation_effects.active(), Some(correlation));
         state.usage = Some(SessionUsage {
             used: 12,
             size: 100,
@@ -2143,28 +2610,45 @@ mod tests {
             };
             let decoded: Event =
                 serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
-            replay.apply_event(replay.last_seq + 1, decoded).unwrap();
             replay
-                .apply_event(replay.last_seq + 1, stopped("prompt_failed"))
+                .apply_scoped_event(replay.last_seq + 1, &decoded, &qualification)
                 .unwrap();
+            assert!(replay.thinking.is_none() && replay.in_flight_tool.is_none());
+            assert!(!replay.cancelling && !replay.compacting);
+            assert!(
+                replay.compaction_tool_id.is_none() && replay.operation_effects.active().is_none()
+            );
             replay
-                .apply_event(replay.last_seq + 1, Event::ThinkingStarted)
-                .unwrap();
-            replay
-                .apply_event(
+                .apply_scoped_event(
                     replay.last_seq + 1,
-                    super::test_support::chunk("late native output"),
+                    &stopped("prompt_failed"),
+                    &qualification,
                 )
                 .unwrap();
             replay
-                .apply_event(
+                .apply_scoped_event(
                     replay.last_seq + 1,
-                    Event::BackgroundTaskStarted {
+                    &Event::ThinkingStarted,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            replay
+                .apply_scoped_event(
+                    replay.last_seq + 1,
+                    &super::test_support::chunk("late native output"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            replay
+                .apply_scoped_event(
+                    replay.last_seq + 1,
+                    &Event::BackgroundTaskStarted {
                         task_id: "owned-background-work".into(),
                         tool_call_id: Some("background-tool".into()),
                         description: "background activity remains observed".into(),
                         workflow: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             assert!(
@@ -2186,13 +2670,14 @@ mod tests {
                 assert_eq!(evidence.retryable, None);
             }
             replay
-                .apply_event(
+                .apply_scoped_event(
                     replay.last_seq + 1,
-                    Event::AcpSessionAssigned {
+                    &Event::AcpSessionAssigned {
                         acp_session_id: "same-native-history".into(),
                         connection_ready: false,
                         native_subject: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             assert_eq!(
@@ -2202,9 +2687,54 @@ mod tests {
             );
             assert_eq!(replay.operation_error, metadata);
             replay
-                .apply_event(replay.last_seq + 1, prompt("next explicit request"))
+                .apply_scoped_event(
+                    replay.last_seq + 1,
+                    &prompt("next explicit request"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
-            assert!(replay.turn_active && replay.operation_error.is_none());
+            assert!(
+                !replay.turn_active,
+                "host history is not another admitted operation"
+            );
+            let stale_failure_seq = replay.last_seq;
+            let mut history_only = replay.clone();
+            history_only.apply_native_availability(NativeAvailabilityProjection {
+                control_failure: Some((stale_failure_seq, NativeControlFailure::Prompt)),
+                ..NativeAvailabilityProjection::default()
+            });
+            assert!(
+                !history_only.turn_active && !history_only.connection_ready,
+                "host history cannot retire the failure or establish channel readiness"
+            );
+            let mut next = admission.clone();
+            let next_correlation = crate::acp::establishment::NativeOperationCorrelation::new(None);
+            next.operation.as_mut().unwrap().correlation = next_correlation;
+            replay
+                .apply_scoped_event(replay.last_seq + 1, &Event::ThinkingStarted, &next)
+                .unwrap();
+            replay.apply_native_availability(NativeAvailabilityProjection {
+                control_failure: Some((stale_failure_seq, NativeControlFailure::Prompt)),
+                ..NativeAvailabilityProjection::default()
+            });
+            assert!(
+                replay.turn_active && replay.thinking.is_some(),
+                "a newer admitted operation supersedes an older failed-append hint"
+            );
+            replay
+                .apply_scoped_event(replay.last_seq + 1, &decoded, &qualification)
+                .unwrap();
+            replay
+                .apply_scoped_event(
+                    replay.last_seq + 1,
+                    &stopped("prompt_failed"),
+                    &qualification,
+                )
+                .unwrap();
+            assert!(
+                replay.turn_active && replay.thinking.is_some() && replay.operation_error.is_none()
+            );
+            assert_eq!(replay.operation_effects.active(), Some(next_correlation));
         }
         let mut refused = state.clone();
         let management = AcpConnectionUnavailability {
@@ -2213,14 +2743,15 @@ mod tests {
             phase: AcpConnectionPhase::Establishing,
         };
         refused
-            .apply_event(
+            .apply_scoped_event(
                 refused.last_seq + 1,
-                Event::AcpConnectionUnavailable {
+                &Event::AcpConnectionUnavailable {
                     source: management.source,
                     cause: management.cause,
                     phase: management.phase,
                     native_subject: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         refused.apply_native_availability(NativeAvailabilityProjection {
@@ -2235,15 +2766,19 @@ mod tests {
         assert_eq!(refused.sidebar_status(), Status::Error);
         assert_eq!(refused.pending_approvals.len(), 1);
         assert_eq!(refused.pending_elicitations.len(), 1);
+        let mut unavailable = crate::acp::event_sender::EventMetadata::history();
+        unavailable.scope = crate::acp::event_sender::EventScope::SessionCurrent;
+        unavailable.availability_denial = true;
         refused
-            .apply_event(
+            .apply_scoped_event(
                 refused.last_seq + 1,
-                Event::AcpConnectionUnavailable {
+                &Event::AcpConnectionUnavailable {
                     source: AcpConnectionSource::Native,
                     cause: AcpConnectionCause::StdoutEof,
                     phase: AcpConnectionPhase::Established,
                     native_subject: None,
                 },
+                &unavailable,
             )
             .unwrap();
         assert!(!refused.turn_active);
@@ -2298,15 +2833,22 @@ mod tests {
             native_subject: Some(subject),
         };
         let mut folded = fresh_state();
-        folded.apply_event(7, event.clone()).unwrap();
-        let frame = crate::acp::protocol::AcpBroadcastFrame {
-            session_id: "s-1".into(),
-            seq: 7,
-            event: std::sync::Arc::new(event.clone()),
-            worker_generation: Some(99),
-            native_subject: Some(subject),
-            sidebar_status: Some(Status::Idle),
-        };
+        folded
+            .apply_scoped_event(
+                7,
+                &event.clone(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        let frame = crate::acp::protocol::AcpBroadcastFrame::from_qualified(
+            "s-1".into(),
+            7,
+            std::sync::Arc::new(event.clone()),
+            &crate::acp::event_sender::EventMetadata::history(),
+            Some(99),
+            Some(subject),
+            Some(Status::Idle),
+        );
         let public = serde_json::to_string(&serde_json::json!({
             "frames": [frame], "state": folded, "event": event,
         }))
@@ -2315,6 +2857,8 @@ mod tests {
             "native_subject",
             "native_availability",
             "native_control_seq",
+            "sidebar_observation_seq",
+            "sidebar_observation_origin",
             "birth_fingerprint",
             "worker_generation",
         ] {
@@ -2411,6 +2955,17 @@ mod tests {
     fn carried_native_receipts_recheck_loss_and_the_original_lifecycle_after_await() {
         use crate::acp::runner_lifecycle::{LifecycleTable, ResumeKind};
         use std::sync::{Arc, Mutex};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut row = crate::session::Instance::new("receipt", "/tmp");
+        row.id = "receipt".into();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let scope = NativeObservationScope::capture(&row, &storage).unwrap();
         let (client, _events) =
             crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId("receipt".into()));
         client.test_observe_native_ready();
@@ -2420,7 +2975,7 @@ mod tests {
         table.install(&lease, None).unwrap();
         let lifecycle = Arc::new(Mutex::new(table));
         let mut carried = CurrentNativeAvailability {
-            context: NativeEventContext([3; 32]),
+            scope,
             owner: None,
             ready: true,
             unavailable: None,
@@ -2428,15 +2983,16 @@ mod tests {
             lifecycle: Arc::clone(&lifecycle),
             lease: lease.clone(),
         };
-        assert!(carried.refresh("receipt").unwrap() && carried.ready);
+        assert!(!carried.refresh("receipt", false).unwrap() && !carried.ready);
+        assert!(carried.refresh("receipt", true).unwrap() && carried.ready);
         let held = lifecycle.lock().unwrap();
         assert!(
-            carried.refresh("receipt").is_err(),
+            carried.refresh("receipt", true).is_err(),
             "identified lifecycle contention is distinguishable from stable Unknown"
         );
         drop(held);
         client.test_observe_native_loss();
-        assert!(carried.refresh("receipt").unwrap());
+        assert!(carried.refresh("receipt", true).unwrap());
         assert!(!carried.ready);
         assert_eq!(
             carried.unavailable.unwrap().cause,
@@ -2448,7 +3004,7 @@ mod tests {
         table.install(&replacement, None).unwrap();
         drop(table);
         assert!(
-            !carried.refresh("receipt").unwrap(),
+            !carried.refresh("receipt", true).unwrap(),
             "a replacement cannot reuse the captured client's receipt"
         );
     }
@@ -2457,6 +3013,7 @@ mod tests {
     /// per-event table got right only by reading outside activity flags.
     #[test]
     fn sidebar_status_projects_the_folded_events() {
+        use self::applied_current_session as applied;
         use super::test_support::chunk;
         use crate::acp::permissions::build_approval;
         let tool = || ToolCall {
@@ -2582,11 +3139,6 @@ mod tests {
                 ],
                 Status::Idle,
             ),
-            (
-                "background agent outlives the turn",
-                vec![prompt("go"), launched(), stopped("end_turn")],
-                Status::Running,
-            ),
             // #4001: a detach closes the record like any terminal status.
             (
                 "detached agent then stopped",
@@ -2608,9 +3160,10 @@ mod tests {
                 Status::Running,
             ),
             (
-                "background task outlives the turn",
+                "historical backgrounds cannot reopen a completed main turn",
                 vec![
                     prompt("go"),
+                    launched(),
                     Event::BackgroundTaskStarted {
                         task_id: "task-1".into(),
                         tool_call_id: None,
@@ -2618,8 +3171,9 @@ mod tests {
                         workflow: None,
                     },
                     stopped("end_turn"),
+                    launched(),
                 ],
-                Status::Running,
+                Status::Idle,
             ),
             (
                 "startup error",
@@ -2678,7 +3232,15 @@ mod tests {
             ),
         ];
         for (name, events, want) in cases {
-            assert_eq!(applied(events).sidebar_status(), want, "{name}");
+            let state = applied(events);
+            assert_eq!(state.sidebar_status(), want, "{name}");
+            if name == "historical backgrounds cannot reopen a completed main turn" {
+                assert!(!state.turn_active);
+                assert!(state.has_active_background_agent());
+                assert_eq!(state.background_agents.len(), 1);
+                assert_eq!(state.background_tasks.len(), 1);
+                assert!(state.operation_effects.active().is_none());
+            }
         }
     }
 
@@ -2718,6 +3280,7 @@ mod tests {
     /// the next turn rather than accumulating for the life of the session.
     #[test]
     fn session_notices_are_capped_and_retired_by_the_next_turn() {
+        use self::applied_current_session as applied;
         let titles = |s: &AcpState| -> Vec<String> {
             s.session_notices.iter().map(|n| n.title.clone()).collect()
         };
@@ -2763,6 +3326,7 @@ mod tests {
 
     #[test]
     fn auth_status_tracks_the_latest_report_and_clears() {
+        use self::applied_current_session as applied;
         let max = auth(AuthStatusKind::Account, "Claude Max");
         let key = auth(AuthStatusKind::ApiKey, "Anthropic API key");
 
@@ -2914,15 +3478,28 @@ mod tests {
 
     #[test]
     fn turn_flags_and_rate_limit_park_follow_their_edges() {
+        use self::applied_current_session as applied;
         let mut s = fresh_state();
         assert!(!s.turn_active);
-        s.apply_event(s.last_seq.saturating_add(1), prompt("hi"))
-            .unwrap();
-        s.apply_event(s.last_seq.saturating_add(1), Event::ThinkingStarted)
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &prompt("hi"),
+            &current_session_metadata(),
+        )
+        .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &Event::ThinkingStarted,
+            &current_session_metadata(),
+        )
+        .unwrap();
         assert!(s.turn_active && s.thinking.is_some());
-        s.apply_event(s.last_seq.saturating_add(1), stopped("end_turn"))
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &stopped("end_turn"),
+            &current_session_metadata(),
+        )
+        .unwrap();
         assert!(!s.turn_active && s.thinking.is_none());
 
         for terminal in [
@@ -3021,12 +3598,13 @@ mod tests {
         let mut s = fresh_state();
         let before = s.updated_at;
         let seq = s
-            .apply_event(
+            .apply_scoped_event(
                 s.last_seq.saturating_add(1),
-                Event::ModeSwitchFailed {
+                &Event::ModeSwitchFailed {
                     mode_id: "bypassPermissions".into(),
                     reason: "Mode bypassPermissions is not available.".into(),
                 },
+                &current_session_metadata(),
             )
             .unwrap();
         assert_eq!(seq, 1);
@@ -3036,12 +3614,13 @@ mod tests {
             "a failed switch changes nothing"
         );
         assert!(s.updated_at >= before);
-        let result = s.apply_event(
+        let result = s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            Event::ApprovalResolved {
+            &Event::ApprovalResolved {
                 nonce: Nonce::new(),
                 decision: ApprovalDecision::Allow,
             },
+            &current_session_metadata(),
         );
         assert!(matches!(result, Err(StateError::UnknownApprovalNonce(_))));
 
@@ -3100,6 +3679,7 @@ mod tests {
 
     #[test]
     fn tool_calls_keep_their_diffs_across_updates_and_repeated_starts() {
+        use self::applied_current_session as applied;
         let s = applied(
             (0..AcpState::MAX_RECENT_DIFFS + 5).map(|i| Event::DiffEmitted {
                 diff: diff(&format!("/tmp/file{i}.txt")),
@@ -3146,9 +3726,10 @@ mod tests {
 
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            Event::ToolCallStarted { tool_call: richer },
+            &Event::ToolCallStarted { tool_call: richer },
+            &current_session_metadata(),
         )
         .unwrap();
         let tool = s.in_flight_tool.as_ref().unwrap();
@@ -3227,9 +3808,9 @@ mod tests {
         assert_eq!(agent.tools[0].name, "Read");
         assert_eq!(agent.last_tool.as_deref(), Some("Read"));
 
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            Event::BackgroundAgentCompleted {
+            &Event::BackgroundAgentCompleted {
                 agent_id: "a1".into(),
                 status: BackgroundAgentStatus::Completed,
                 tools: vec![],
@@ -3237,10 +3818,15 @@ mod tests {
                 warning: None,
                 ended_at: Utc::now(),
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         )
         .unwrap();
-        s.apply_event(s.last_seq.saturating_add(1), progress(9, vec![]))
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &progress(9, vec![]),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
         let agent = &s.background_agents[0];
         assert_eq!(
             agent.status,
@@ -3321,11 +3907,16 @@ mod tests {
             let mut s = applied([launched()]);
             assert!(s.has_active_background_agent(), "{status:?}");
 
-            s.apply_event(s.last_seq.saturating_add(1), bg_completed(status))
-                .unwrap();
-            s.apply_event(
+            s.apply_scoped_event(
                 s.last_seq.saturating_add(1),
-                bg_progress(BackgroundAgentStatus::Running, 9),
+                &bg_completed(status),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+            s.apply_scoped_event(
+                s.last_seq.saturating_add(1),
+                &bg_progress(BackgroundAgentStatus::Running, 9),
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
             let agent = &s.background_agents[0];
@@ -3353,11 +3944,19 @@ mod tests {
         assert!(!s.turn_active);
         assert!(s.has_active_background_agent());
 
-        s.apply_event(s.last_seq.saturating_add(1), finished("t-1"))
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &finished("t-1"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
         assert!(s.has_active_background_agent(), "t-2 still runs");
-        s.apply_event(s.last_seq.saturating_add(1), finished("t-2"))
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &finished("t-2"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
         assert!(!s.has_active_background_agent());
     }
 
@@ -3412,7 +4011,12 @@ mod tests {
                 ended_at,
             },
         ] {
-            s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
+            s.apply_scoped_event(
+                s.last_seq.saturating_add(1),
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         }
         assert_eq!(
             runs(&s),
@@ -3432,12 +4036,14 @@ mod tests {
     /// spawned runs on. The busy display signal is the pair of flags.
     #[test]
     fn turn_active_tracks_only_the_main_turn() {
+        use self::applied_current_session as applied;
         let mut s = applied([prompt("go"), launched()]);
         assert!(s.turn_active && s.has_active_background_agent());
 
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            bg_completed(BackgroundAgentStatus::Completed),
+            &bg_completed(BackgroundAgentStatus::Completed),
+            &crate::acp::event_sender::EventMetadata::history(),
         )
         .unwrap();
         assert!(
@@ -3456,9 +4062,10 @@ mod tests {
             "the display signal stays busy"
         );
 
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            bg_completed(BackgroundAgentStatus::Completed),
+            &bg_completed(BackgroundAgentStatus::Completed),
+            &crate::acp::event_sender::EventMetadata::history(),
         )
         .unwrap();
         assert!(!s.turn_active && !s.has_active_background_agent());
@@ -3494,6 +4101,7 @@ mod tests {
 
     #[test]
     fn config_option_failure_notice_clears_only_when_the_value_lands() {
+        use self::applied_current_session as applied;
         let failed = || Event::ConfigOptionSwitchFailed {
             config_id: "model".into(),
             value: "claude-sonnet-4-6".into(),
@@ -3530,6 +4138,7 @@ mod tests {
 
     #[test]
     fn clear_keeps_adapter_capabilities_and_a_switch_drops_them() {
+        use self::applied_current_session as applied;
         let adapter_events = || {
             [
                 config_options("claude-opus-4-7"),
@@ -3573,28 +4182,117 @@ mod tests {
         );
 
         let mut s = applied(adapter_events());
-        s.apply_event(s.last_seq.saturating_add(1), Event::SessionCleared)
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &Event::SessionCleared,
+            &current_session_metadata(),
+        )
+        .unwrap();
         assert_eq!(s.config_options.len(), 2);
         assert!(s.available_commands[0].accepts_input);
         assert_eq!(s.available_modes.len(), 1);
         assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
         assert!(s.usage.is_none() && s.current_plan.is_none());
 
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            Event::ConfigOptionSwitchFailed {
+            &Event::ConfigOptionSwitchFailed {
                 config_id: "effort".into(),
                 value: "high".into(),
                 reason: "unsupported".into(),
             },
+            &current_session_metadata(),
         )
         .unwrap();
-        s.apply_event(s.last_seq.saturating_add(1), switch_agent())
-            .unwrap();
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
+            &switch_agent(),
+            &current_session_metadata(),
+        )
+        .unwrap();
         assert!(s.config_options.is_empty() && s.config_option_switch_failed.is_none());
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+    }
+
+    #[test]
+    fn certified_clear_retains_only_new_plan_across_cold_state() {
+        let plan = |title: &str| Event::PlanUpdated {
+            plan: Plan {
+                plan_id: title.into(),
+                version: 1,
+                steps: vec![PlanStep {
+                    id: title.into(),
+                    title: title.into(),
+                    detail: None,
+                    status: PlanStepStatus::Pending,
+                }],
+            },
+        };
+        for (case, cut, new_seq, retained) in [
+            ("old plan", Some(5), None, false),
+            ("new prefix plan", Some(5), Some(7), true),
+            ("plan on old boundary", Some(7), Some(7), false),
+            ("legacy clear", None, Some(7), false),
+        ] {
+            let mut state = fresh_state();
+            state
+                .apply_current_event(
+                    1,
+                    &plan("old"),
+                    crate::acp::operation_effect::ControlKind::Other,
+                    None,
+                    None,
+                )
+                .unwrap();
+            if let Some(seq) = new_seq {
+                state
+                    .apply_current_event(
+                        seq,
+                        &plan("new"),
+                        crate::acp::operation_effect::ControlKind::Other,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let mut state: AcpState =
+                serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+            state
+                .apply_current_event(
+                    9,
+                    &Event::SessionCleared,
+                    crate::acp::operation_effect::ControlKind::Cleared,
+                    None,
+                    cut,
+                )
+                .unwrap();
+            assert_eq!(
+                state.sidebar_observation_seq, 0,
+                "a display clear is not a terminal observation"
+            );
+            assert_eq!(
+                state
+                    .current_plan
+                    .as_ref()
+                    .map(|plan| plan.steps[0].title.as_str()),
+                retained.then_some("new"),
+                "{case}"
+            );
+            state
+                .apply_current_event(
+                    10,
+                    &Event::SessionCleared,
+                    crate::acp::operation_effect::ControlKind::Cleared,
+                    None,
+                    Some(9),
+                )
+                .unwrap();
+            assert!(
+                state.current_plan.is_none(),
+                "{case}: later clear removes prior plan"
+            );
+        }
     }
 }

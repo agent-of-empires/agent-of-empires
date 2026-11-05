@@ -51,6 +51,17 @@ impl LaunchExclusion {
         self.submission.take()
     }
 
+    pub(crate) async fn prepare_native_establishment(
+        &self,
+        supervisor: &crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+        admission: &mut crate::acp::supervisor::LaunchAdmission,
+        reservation: &mut crate::acp::supervisor::ResumeReservation,
+    ) -> std::result::Result<Instance, crate::acp::supervisor::SupervisorError> {
+        supervisor
+            .prepare_launch_admission(admission, reservation, self.namespace.as_ref())
+            .await
+    }
+
     fn mint_before_start(
         &mut self,
         instance: &mut Instance,
@@ -108,6 +119,8 @@ fn validate_launch(store: &dyn SessionStore, expected: &Instance) -> Result<()> 
             && row.title == expected.title
             && row.agent_provider == expected.agent_provider
             && row.is_structured()
+            && crate::acp::state::NativeBindingState::capture(expected).matches(&row)
+            && row.acp_establishment == expected.acp_establishment
             && row.launch_is_finalized(),
         crate::session::LifecycleReservationError::Superseded
     );

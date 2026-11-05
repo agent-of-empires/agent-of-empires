@@ -2006,22 +2006,20 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn prime_quiescence_never_declares_an_uninspectable_owned_process_absent() {
-        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::io::{Read as _, Write as _};
         use std::os::unix::fs::PermissionsExt as _;
         if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
             assert_eq!(
                 unsafe { libc::prctl(libc::PR_SET_NAME, c"\xffowned".as_ptr(), 0, 0, 0) },
                 0
             );
-            let signal = |message: &[u8]| {
-                let mut stdout = std::io::stdout().lock();
-                stdout.write_all(message).unwrap();
-                stdout.flush().unwrap();
+            let signal = |message: &str| {
+                fs::write(std::env::var_os("AOE_PRIME_CENSUS_READY").unwrap(), message).unwrap();
             };
-            signal(b"warm-ready\n");
+            signal("warm-ready");
             std::io::stdin().read_exact(&mut [0]).unwrap();
             assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
-            signal(b"census-ready\n");
+            signal("census-ready");
             std::io::stdin().read_exact(&mut [0]).unwrap();
             return;
         }
@@ -2071,31 +2069,38 @@ mod tests {
             "{}::prime_quiescence_never_declares_an_uninspectable_owned_process_absent",
             module_path!().split_once("::").unwrap().1
         );
+        let readiness = root.path().join("census-ready");
         let mut child = OwnedChild(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &name, "--nocapture"])
                 .env("AOE_PRIME_CENSUS_CHILD", "1")
+                .env("AOE_PRIME_CENSUS_READY", &readiness)
                 .env("TMPDIR", &runtime.0.directory)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
+                .stdout(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
-        let mut reader = std::io::BufReader::new(child.0.stdout.take().unwrap());
-        let mut ready = |expected: &str| {
-            let mut line = String::new();
+        // Libtest writes its test-name prefix to stdout without a newline.
+        // Keep the probe handshake separate and bound both readiness waits.
+        let ready = |child: &mut std::process::Child, expected: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                assert!(
-                    reader.read_line(&mut line).unwrap() != 0,
-                    "owned probe exited before readiness"
-                );
-                if line.trim() == expected {
+                if fs::read(&readiness).is_ok_and(|bytes| bytes == expected.as_bytes()) {
                     break;
                 }
-                line.clear();
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "owned probe exited before {expected}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned probe did not reach {expected}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
-        ready("warm-ready");
+        ready(&mut child.0, "warm-ready");
         let stat = fs::read(format!("/proc/{}/stat", child.0.id())).unwrap();
         let offset = stat.windows(2).rposition(|pair| pair == b") ").unwrap();
         let start = std::str::from_utf8(&stat[offset + 2..])
@@ -2109,7 +2114,7 @@ mod tests {
         };
         assert!(runtime.0.cleanup().is_err());
         child.0.stdin.as_mut().unwrap().write_all(&[0]).unwrap();
-        ready("census-ready");
+        ready(&mut child.0, "census-ready");
         assert!(child.0.try_wait().unwrap().is_none());
         let marker = format!("TMPDIR={}", runtime.0.directory.display());
         let unbound = prime_processes(&marker, &runtime.0.socket(), &[]).unwrap();

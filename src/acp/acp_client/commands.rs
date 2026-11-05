@@ -7,6 +7,20 @@ use tokio::sync::oneshot;
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
 
+/// The actual command lane retains admission across every queue wait.
+pub(super) struct QueuedClientCmd {
+    pub(super) command: ClientCmd,
+    pub(super) scope: Option<crate::acp::establishment::NativeRequestContext>,
+    pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+}
+
+/// Steering fallback retains the same operation, not a freshly admitted turn.
+pub(super) struct QueuedPrompt {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) scope: Option<crate::acp::establishment::NativeRequestContext>,
+    pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
     /// The fully-built prompt content blocks (text first, then any
@@ -47,17 +61,15 @@ pub(super) enum ClientCmd {
     /// was typed. See #2979.
     ResetSession {
         text: String,
+        proposal: std::sync::Arc<crate::acp::supervisor::LiveFreshProposal>,
         /// Absolute deadline created by the caller. Starting it before the
         /// command is queued prevents a delayed command from resetting the
         /// session after the caller has already timed out.
         deadline: tokio::time::Instant,
         respond_to: oneshot::Sender<ResetSessionOutcome>,
     },
-    /// Spawn a tailer for each `(agent_id, output_file)` pair: sub-agents
-    /// launched by a previous daemon that survived the restart. Issued by
-    /// `Supervisor::attach` once, right after the connection is up, so
-    /// tracking resumes instead of the panel showing them as detached.
-    ResumeBackgroundTailing(Vec<(String, String)>),
+    /// Restore tracking with its original persisted allocation evidence.
+    ResumeBackgroundTailing(Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>),
     /// Re-tail the exact background task launches a previous daemon left open.
     ResumeTaskTailing(Vec<crate::acp::state::BackgroundTaskLaunch>),
     #[cfg(test)]
@@ -66,24 +78,21 @@ pub(super) enum ClientCmd {
     Shutdown,
 }
 
-/// Handshake mode. `Fresh` loads or creates a session. `Resume` attaches to a
-/// runner that survived the daemon, reusing its session id so an in-flight turn
-/// and its context are not split onto a new session.
+impl ClientCmd {
+    pub(super) fn requires_operation(&self) -> bool {
+        match self {
+            Self::Shutdown | Self::ResumeBackgroundTailing(_) | Self::ResumeTaskTailing(_) => false,
+            #[cfg(test)]
+            Self::FlushForTest(_) => false,
+            _ => true,
+        }
+    }
+}
+
+/// Transport mode; the original lifecycle attempt owns conversation selection.
 #[derive(Debug, Clone)]
 pub(super) enum ConnectMode {
-    Fresh {
-        stored_acp_session_id: Option<String>,
-        /// Seed the event store from the `session/load` history replay
-        /// instead of suppressing it (imported session, empty store). See
-        /// #2276.
-        seed_history_replay: bool,
-        /// Parent ACP session id to fork from. When set and the agent
-        /// advertises the fork capability, the handshake sends
-        /// `session/fork` instead of `session/new` / `session/load`.
-        fork_from: Option<String>,
-        /// A conversation existed before this launch, even without a stored id.
-        prior_conversation: bool,
-    },
+    Fresh,
     Resume {
         acp_session_id: String,
         in_flight_turn: bool,

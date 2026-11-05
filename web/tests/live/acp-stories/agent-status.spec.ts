@@ -10,6 +10,7 @@ import {
   replayFrames,
   script,
   sessionIdByTitle,
+  spawnAcpAgent,
   startAcpSession,
   waitForReplayContains,
 } from "../../helpers/acp";
@@ -147,12 +148,11 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
         },
       },
     },
-    seedFn: seedSessionViaAoeAdd({ title: "story-native-binary" }),
+    seedFn: seedSessionViaAoeAdd({ title: "story-native-binary", structuredView: true }),
   });
   const sessionId = await sessionIdByTitle(serve.baseUrl, "story-native-binary");
-  // enableStructuredViewAndWait throws on the AgentStartupError this test wants.
-  const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
-  expect(enableRes.ok).toBe(true);
+  // Spawn without waiting for readiness so the startup error remains observable.
+  await spawnAcpAgent(serve.baseUrl, sessionId);
   const startupError = async () =>
     ((await replayFrames(serve.baseUrl, sessionId)) as { event?: { AgentStartupError?: { message?: string } } }[])
       .map((f) => f.event?.AgentStartupError?.message)

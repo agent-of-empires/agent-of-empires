@@ -214,6 +214,31 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
+    build_test_app_state_with_event_capacity(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        (event_store, 8),
+        configure,
+        customize,
+    )
+}
+
+/// The managed SDK host observes complete bounded workloads without changing retention.
+pub(crate) fn build_test_app_state_with_event_capacity(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    events: (Option<Arc<crate::acp::event_store::EventStore>>, usize),
+    configure: impl FnOnce(&mut AppState),
+    customize: impl FnOnce(
+        crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+    )
+        -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+) -> Arc<AppState> {
+    let (event_store, event_capacity) = events;
     let app_dir = event_store
         .is_none()
         .then(|| tempfile::tempdir().expect("tempdir"));
@@ -225,16 +250,20 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
             .join("acp_events.db");
         Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
     });
-    let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
-    let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
+    let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(event_capacity).0;
+    let acp_control_cache = Arc::clone(event_store.control_cache());
     let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
         tx: acp_events_tx.clone(),
         event_store: event_store.clone(),
-        control_cache: acp_control_cache.clone(),
     });
     let supervisor = std::sync::Arc::new(
         customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
             .with_native_admission(),
+    );
+    supervisor.hydrate_seqs(
+        event_store
+            .all_session_seqs()
+            .expect("event publication frontiers"),
     );
     let instances = Arc::new(RwLock::new(prior));
     let instance_locks = Arc::new(RwLock::new(HashMap::new()));
@@ -367,6 +396,17 @@ pub async fn accept_runtime_read_cache_for_test(state: &Arc<AppState>) {
         Default::default(),
     )
     .await;
+}
+
+#[cfg(test)]
+pub(crate) fn select_retained_for_test(row: &mut Instance) {
+    assert!(row.acp_establishment.is_none());
+    assert!(row.fork_pending.is_none() && row.import_pending != Some(true));
+    let id = row
+        .acp_session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    row.resume_intent = crate::session::ResumeIntent::Use(id);
 }
 
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
@@ -564,23 +604,6 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
-/// A launcher that hands back a fake worker that accepts commands, keeping the
-/// event senders alive so the drains never see a close.
-#[cfg(test)]
-pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
-    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
-        Default::default();
-    Arc::new(move |_config, id| {
-        let senders = Arc::clone(&senders);
-        Box::pin(async move {
-            let (client, tx, _cmds) =
-                crate::acp::acp_client::AcpClient::fake_for_test_cmd_recording(id);
-            senders.lock().unwrap().push(tx);
-            Ok(client)
-        })
-    })
-}
-
 /// Fails every `sessions.json` write while the guard lives, leaving rows loadable.
 /// The failpoint is process-wide, so the test must be serial.
 #[cfg(test)]
@@ -670,4 +693,292 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     );
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
+}
+#[cfg(test)]
+pub(crate) struct ManagedControlSession {
+    pub(crate) client: crate::acp::supervisor::test_support::managed::ManagedClient,
+    pub(crate) native: crate::acp::supervisor::test_support::managed::NativePeer,
+    pub(crate) state: Arc<super::AppState>,
+    pub(crate) sid: String,
+    prompts: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+}
+
+#[cfg(test)]
+impl ManagedControlSession {
+    pub(crate) fn id(&self) -> &str {
+        &self.client.id
+    }
+
+    pub(crate) async fn next_prompt(&mut self) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(10), self.prompts.recv())
+            .await
+            .expect("actual native prompt arrives")
+            .expect("native request lane remains open")
+    }
+
+    pub(crate) async fn start_prompt(&mut self, text: &str) -> serde_json::Value {
+        use super::session_service::{SendTurnRequest, SessionCaller};
+        let id = self.client.id.clone();
+        let submission = self.state.session_service.prompt_submission(&id).await;
+        self.state
+            .session_service
+            .send_turn(
+                &SessionCaller::User,
+                &id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    resume_reservation: None,
+                    text,
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_id: None,
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("explicit input rejected by real retained actor: {error}")
+            });
+        drop(submission);
+        let request = self.next_prompt().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if self
+                    .state
+                    .session_service
+                    .fold_control_state(&id)
+                    .await
+                    .unwrap()
+                    .turn_active
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actual Native input establishes durable active state");
+        request
+    }
+
+    pub(crate) async fn finish_prompt(
+        &mut self,
+        request: &serde_json::Value,
+        error_kind: Option<&str>,
+    ) {
+        let response = match error_kind {
+            Some(kind) => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                "error":{"code":-32603,"message":"original request failed","data":{"errorKind":kind}}}),
+            None => {
+                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}})
+            }
+        };
+        self.native.send(response).await;
+        let reason = if error_kind == Some("rate_limit") {
+            "rate_limited"
+        } else if error_kind.is_some() {
+            "prompt_failed"
+        } else {
+            "prompt_complete"
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = self
+                    .client
+                    .next_event()
+                    .await
+                    .expect("managed drain stays alive");
+                if matches!(&event, crate::acp::Event::Stopped { reason: got } if got == reason) {
+                    break;
+                }
+                assert!(!matches!(
+                    event,
+                    crate::acp::Event::AgentStartupError { .. }
+                        | crate::acp::Event::AcpConnectionUnavailable { .. }
+                ));
+            }
+        })
+        .await
+        .expect("the original result reaches its durable terminal");
+    }
+
+    pub(crate) async fn park(&mut self, text: &str) {
+        let request = self.start_prompt(text).await;
+        self.finish_prompt(&request, Some("rate_limit")).await;
+        assert!(matches!(
+            self.state
+                .acp_event_store
+                .rate_limit_park(self.id())
+                .unwrap(),
+            crate::acp::event_store::ControlKnowledge::Known(Some(_))
+        ));
+    }
+
+    /// Change clock data only, preserving actual Native provenance and durable budget.
+    pub(crate) fn make_quota_due(&self) {
+        self.state
+            .acp_event_store
+            .test_conn()
+            .execute(
+                "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
+                rusqlite::params![
+                    self.id(),
+                    (chrono::Utc::now() - chrono::Duration::days(3)).timestamp_millis()
+                ],
+            )
+            .unwrap();
+        self.state.acp_event_store.control_cache().forget(self.id());
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn managed_control_session(
+    scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    label: &str,
+) -> ManagedControlSession {
+    let project = scope.tempdir();
+    let native_store = crate::session::get_app_dir()
+        .unwrap()
+        .join("managed-control-native-store");
+    std::fs::create_dir_all(&native_store).unwrap();
+    scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+    std::env::set_var("CLAUDE_CONFIG_DIR", &native_store);
+    let sid = uuid::Uuid::new_v4().to_string();
+    let response_sid = sid.clone();
+    let (sent, prompts) = tokio::sync::mpsc::unbounded_channel();
+    let mut config_options = serde_json::json!([{
+        "id": "model", "name": "Model", "category": "model", "type": "select",
+        "currentValue": "old-model", "options": [
+            {"value": "old-model", "name": "Old model"},
+            {"value": "new-model", "name": "New model"},
+            {"value": "plan", "name": "Plan"}
+        ]
+    }]);
+    let mut modes = serde_json::json!({
+        "currentModeId": "old-mode", "availableModes": [
+            {"id": "old-mode", "name": "Old mode"},
+            {"id": "new-mode", "name": "New mode"},
+            {"id": "plan", "name": "Plan"}
+        ]
+    });
+    let (config, native) = scope.native_peer(
+        project.path().into(),
+        "claude",
+        "claude",
+        move |request| match request["method"].as_str().unwrap() {
+            "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}})),
+            "session/new" | "session/load" => {
+                let sid = if request["method"] == "session/new" {
+                    serde_json::Value::String(response_sid.clone())
+                } else {
+                    request["params"]["sessionId"].clone()
+                };
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "result":{"sessionId":sid,"configOptions":config_options,"modes":modes}}))
+            }
+            "session/set_mode" => {
+                modes["currentModeId"] = request["params"]["modeId"].clone();
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}))
+            }
+            "session/set_config_option" => {
+                assert_eq!(request["params"]["configId"], "model");
+                config_options[0]["currentValue"] = request["params"]["value"].clone();
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "result":{"configOptions":config_options}}))
+            }
+            "session/prompt" => {
+                sent.send(request.clone()).unwrap();
+                None
+            }
+            "session/cancel" => None,
+            other => panic!("unexpected Native method: {other}"),
+        },
+    );
+    let mut client = scope.spawn(config, label).await.unwrap();
+    client.ready().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .expect("actual original assignment");
+            if matches!(&event, crate::acp::Event::AcpSessionAssigned {
+                acp_session_id, connection_ready: true, native_subject: Some(_),
+            } if acp_session_id == &sid)
+            {
+                break;
+            }
+            assert!(!matches!(
+                event,
+                crate::acp::Event::AgentStartupError { .. }
+            ));
+        }
+    })
+    .await
+    .unwrap();
+    let state = scope.state.clone();
+    accept_runtime_read_cache_for_test(&state).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let finalized = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == client.id)
+                .is_some_and(|row| row.launch_is_finalized());
+            if finalized {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual creation finishes before control fixture use");
+    let creation = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.session_service.prompt_submission(&client.id),
+    )
+    .await
+    .expect("the actual creation releases its submission custody");
+    drop(creation);
+    let owner = state
+        .acp_supervisor
+        .current_native_availability(&client.id)
+        .await
+        .unwrap()
+        .owner
+        .expect("actual runner birth");
+    assert_eq!(Some(owner), client.lease.spawned_runner());
+    assert_ne!(owner.pid, std::process::id());
+    ManagedControlSession {
+        client,
+        native,
+        state,
+        sid,
+        prompts,
+    }
+}
+
+/// DATA-only fixture. Never pass this metadata to a sink, Native gate, resource, or runtime admission.
+#[cfg(test)]
+pub(crate) fn sql_projection_metadata() -> crate::acp::event_sender::EventMetadata {
+    use crate::acp::event_sender::{EventMetadata, EventScope};
+    EventMetadata {
+        scope: EventScope::OperationCurrent,
+        native_origin: Some(crate::acp::state::NativeEventOrigin {
+            context: serde_json::from_value(serde_json::to_value([0_u8; 32]).unwrap()).unwrap(),
+            generation: 1,
+            attempt_id: serde_json::from_value(serde_json::json!(uuid::Uuid::new_v4())).unwrap(),
+            producer: uuid::Uuid::new_v4(),
+            owner: None,
+        }),
+        operation: Some(crate::acp::protocol::AcpOperationMetadata {
+            correlation: crate::acp::establishment::NativeOperationCorrelation::new(None),
+            outcome: None,
+        }),
+        ..EventMetadata::history()
+    }
 }

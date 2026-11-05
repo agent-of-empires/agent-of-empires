@@ -75,11 +75,15 @@ impl SteerOutcome {
 }
 
 #[cfg(test)]
+pub(super) static COMPACTION_FOLD_OBSERVED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
-    use crate::acp::acp_client::AcpClient;
-    use crate::acp::state::{AcpSessionId, Event};
+    use crate::acp::state::Event;
     use agent_client_protocol::schema::v1::TextContent;
 
     /// The wire contract (#2805): a typo in `sessionId` or the `_meta` opt-in
@@ -125,10 +129,6 @@ mod tests {
         }
     }
 
-    /// Opens a typed `/compact` compaction then goes silent, as
-    /// claude-agent-acp does while summarizing. It answers
-    /// `_session/steering` with a normal success, so a daemon that DID steer
-    /// would look like it worked; the test proves nothing was sent.
     #[cfg(unix)]
     fn write_compacting_fake_agent(
         dir: &std::path::Path,
@@ -137,6 +137,7 @@ mod tests {
         let script_path = dir.join("fake-compacting-agent.sh");
         let script = r#"#!/bin/sh
 CAPTURE=__CAPTURE__
+new_count=0
 
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CAPTURE"
@@ -146,14 +147,19 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"_meta":{"steering":{"supported":true}}}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      new_count=$((new_count + 1))
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%s"}}\n' "$id" "$new_count"
+      if [ "$new_count" -gt 1 ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting... from old conversation"}}}}\n'
+      fi
       ;;
     *'"method":"_session/steering"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"outcome":"injected"}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"compaction_update","compactionId":"c-1","status":"in_progress"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n' "$new_count"
       while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.prompt-release" ]; do sleep 0.01; done
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting completed."}}}}\n' "$new_count"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       ;;
   esac
@@ -165,79 +171,337 @@ done
         (script_path, capture)
     }
 
-    /// #3219: a `/compact` turn only summarizes, so a follow-up steered into
-    /// it is answered `Injected` and swallowed by a turn that never replies,
-    /// with no Retry pill and no re-dispatch. Driven through the live prompt
-    /// loop because what can break is whether the compaction latch is applied
-    /// by the time the follow-up reaches the `cmd_rx` arm.
     #[cfg(unix)]
     #[tokio::test]
     async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, capture) = write_compacting_fake_agent(tmp.path());
-        let mut config = reset_fake_spawn_config(&script, tmp.path());
-        config.spec.description = "scripted compacting fake".into();
-        let mut client = AcpClient::spawn(config, AcpSessionId("compact-3219".into()))
-            .await
-            .expect("spawn scripted fake agent");
+        managed_compaction_regression(None).await;
+    }
 
-        client
-            .send_prompt("/compact", &[])
-            .await
-            .expect("send /compact");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_compaction_start_survives_registry_and_lifecycle_contention() {
+        for lifecycle in [false, true] {
+            managed_compaction_regression(Some((lifecycle, true))).await;
+        }
+    }
 
-        // The typed event, not just the chunk: it proves the latch is set, so
-        // the follow-up cannot pass the steering gate for the wrong reason.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let ev = tokio::time::timeout_at(deadline, client.next_event())
-                .await
-                .expect("timed out waiting for the compaction to start")
-                .expect("event channel closed");
-            if matches!(&ev, Event::ConversationCompactionStarted) {
-                break;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_compaction_completion_survives_registry_and_lifecycle_contention() {
+        for lifecycle in [false, true] {
+            managed_compaction_regression(Some((lifecycle, false))).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn release_captured_compaction_through_contention(
+        client: &crate::acp::supervisor::test_support::managed::ManagedClient,
+        captured: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Sender<()>,
+        lifecycle: bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), captured)
+            .await
+            .expect("actual Native compaction cue reaches its captured SDK boundary")
+            .unwrap();
+        let storage = crate::session::Storage::open_reference("test").unwrap();
+        let registry = (!lifecycle).then(|| {
+            crate::process::worker_registry::try_registry_lock(&client.id)
+                .unwrap()
+                .expect("hold actual original registry exclusion")
+        });
+        let native = lifecycle.then(|| {
+            storage
+                .acquire_instance_lifecycle_lock(&client.id)
+                .expect("hold actual original lifecycle exclusion")
+        });
+        let state = client.actual().test_connection_state();
+        let key = std::sync::Arc::as_ptr(&state) as usize;
+        struct FoldObservation(usize);
+        impl Drop for FoldObservation {
+            fn drop(&mut self) {
+                COMPACTION_FOLD_OBSERVED.lock().unwrap().remove(&self.0);
             }
         }
-
-        client
-            .send_prompt("also check the tests", &[])
+        let _observation = FoldObservation(key);
+        let (folded, folded_wait) = tokio::sync::oneshot::channel();
+        assert!(COMPACTION_FOLD_OBSERVED
+            .lock()
+            .unwrap()
+            .insert(key, folded)
+            .is_none());
+        let (busy, observed) = tokio::sync::oneshot::channel();
+        assert!(state
+            .test_prompt_admission_busy
+            .lock()
+            .unwrap()
+            .replace(busy)
+            .is_none());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), observed)
             .await
-            .expect("send follow-up");
+            .expect("the captured Native cue encounters actual guard contention")
+            .unwrap();
+        // Keep the real exclusion held after observed guard contention.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_millis(3001)).await;
+        let folded = tokio::time::timeout(std::time::Duration::from_secs(1), folded_wait).await;
+        tokio::time::resume();
+        folded
+            .expect("runtime fold passes its former cutoff while exclusion remains held")
+            .unwrap();
+        drop(native);
+        drop(registry);
+    }
 
-        let mut saw_rejected = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let ev = tokio::time::timeout_at(deadline, client.next_event())
-                .await
-                .expect("timed out waiting for PromptRejected + Stopped")
-                .expect("event channel closed");
-            match &ev {
-                Event::PromptRejected { reason, text } => {
-                    assert_eq!(reason, "agent_busy");
-                    assert_eq!(
-                        text, "also check the tests",
-                        "the retry pill needs the text"
-                    );
-                    saw_rejected = true;
-                    std::fs::write(tmp.path().join("capture.ndjson.prompt-release"), "release")
+    #[cfg(unix)]
+    async fn managed_compaction_regression(contended: Option<(bool, bool)>) {
+        crate::acp::supervisor::test_support::managed::with_managed(move |scope| {
+            Box::pin(async move {
+                let tmp = scope.tempdir();
+                let (script, capture) = write_compacting_fake_agent(tmp.path());
+                let mut config = reset_fake_spawn_config(&script, tmp.path());
+                config.spec.description = "scripted compacting fake".into();
+                let mut client = scope
+                    .spawn(config, "compact-3219")
+                    .await
+                    .expect("spawn real managed original with compacting Native");
+                client.ready().await;
+                for generation in 1..=2 {
+                    if generation > 1 {
+                        std::fs::remove_file(tmp.path().join("capture.ndjson.prompt-release"))
+                            .unwrap();
+                    }
+                    let native_sid = format!("sid-{generation}");
+                    let start_gate = contended.filter(|(_, start)| *start).map(|_| {
+                        let (entered, captured) = tokio::sync::oneshot::channel();
+                        let (release, released) = tokio::sync::oneshot::channel();
+                        assert!(client
+                            .actual()
+                            .test_connection_state()
+                            .test_session_update
+                            .lock()
+                            .unwrap()
+                            .replace((SessionId::new(native_sid.as_str()), (entered, released)))
+                            .is_none());
+                        (captured, release)
+                    });
+                    let before_compaction = scope
+                        .state
+                        .acp_event_store
+                        .highest_seq_checked(&client.id)
                         .unwrap();
-                }
-                Event::Stopped { .. } => break,
-                _ => {}
-            }
-        }
-        assert!(
-            saw_rejected,
-            "a follow-up refused during compaction must emit PromptRejected so the \
-             user gets a Retry pill instead of a silently swallowed message"
-        );
+                    client
+                        .send_prompt("/compact", &[])
+                        .await
+                        .expect("send /compact");
+                    if let (Some((lifecycle, _)), Some((captured, release))) =
+                        (contended, start_gate)
+                    {
+                        release_captured_compaction_through_contention(
+                            &client, captured, release, lifecycle,
+                        )
+                        .await;
+                    }
 
-        let wire = std::fs::read_to_string(&capture).expect("read capture");
-        assert!(
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let started = scope
+                            .state
+                            .acp_event_store
+                            .replay_from(&client.id, before_compaction)
+                            .unwrap()
+                            .iter()
+                            .any(|stored| {
+                                matches!(
+                                    stored.event.as_ref(),
+                                    Event::ConversationCompactionStarted
+                                ) && stored.metadata.scope
+                                    == crate::acp::event_sender::EventScope::SessionCurrent
+                                    && stored
+                                        .metadata
+                                        .reported_session_id
+                                        .as_ref()
+                                        .map(|sid| sid.0.as_ref())
+                                        == Some(native_sid.as_str())
+                            });
+                        if started {
+                            break;
+                        }
+                        tokio::time::timeout_at(deadline, client.next_event())
+                            .await
+                            .expect("current Native compaction starts")
+                            .expect("event channel closed");
+                    }
+                    let history = scope
+                        .state
+                        .acp_event_store
+                        .replay_from(&client.id, 0)
+                        .unwrap();
+                    let mut projected = crate::acp::state::AcpState::new(
+                        crate::acp::state::AcpSessionId(client.id.clone()),
+                        crate::acp::state::AgentName("claude".into()),
+                        None,
+                    );
+                    for stored in &history {
+                        projected
+                            .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                            .unwrap();
+                    }
+                    projected.steering = true;
+                    assert_eq!(
+                        crate::acp::dispatch::decide(
+                            &projected,
+                            crate::acp::dispatch::WorkerLiveness {
+                                running: true,
+                                idle_dormant: false,
+                                rate_limit_parked: false,
+                            },
+                        ),
+                        crate::acp::dispatch::PromptDispatch::Queued {
+                            reason: crate::acp::dispatch::QueueReason::Compacting,
+                        },
+                        "generation {generation}; active={}, compacting={}; frames={:?}; wire={}",
+                        projected.turn_active,
+                        projected.compacting,
+                        history
+                            .iter()
+                            .map(|stored| (stored.seq, stored.event.as_ref(), &stored.metadata))
+                            .collect::<Vec<_>>(),
+                        std::fs::read_to_string(&capture).unwrap(),
+                    );
+
+                    let follow_up = format!("also check the tests in conversation {generation}");
+                    client
+                        .send_prompt(&follow_up, &[])
+                        .await
+                        .expect("send follow-up");
+
+                    let mut completion_gate = contended.filter(|(_, start)| !*start).map(|_| {
+                        let (entered, captured) = tokio::sync::oneshot::channel();
+                        let (release, released) = tokio::sync::oneshot::channel();
+                        assert!(client
+                            .actual()
+                            .test_connection_state()
+                            .test_session_update
+                            .lock()
+                            .unwrap()
+                            .replace((SessionId::new(native_sid.as_str()), (entered, released)))
+                            .is_none());
+                        (captured, release)
+                    });
+                    let mut saw_rejected = false;
+                    let mut saw_stopped = false;
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let ev = tokio::time::timeout_at(deadline, client.next_event())
+                            .await
+                            .expect("timed out waiting for PromptRejected + Stopped")
+                            .expect("event channel closed");
+                        match ev {
+                            Event::PromptRejected { reason, text } => {
+                                assert_eq!(reason, "agent_busy");
+                                assert_eq!(
+                                    text, follow_up,
+                                    "the retry pill retains the refused input"
+                                );
+                                saw_rejected = true;
+                                std::fs::write(
+                                    tmp.path().join("capture.ndjson.prompt-release"),
+                                    "release",
+                                )
+                                .unwrap();
+                                if let (Some((lifecycle, _)), Some((captured, release))) =
+                                    (contended, completion_gate.take())
+                                {
+                                    release_captured_compaction_through_contention(
+                                        &client, captured, release, lifecycle,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Event::Stopped { .. } => saw_stopped = true,
+                            _ => {}
+                        }
+                        let completed = scope
+                            .state
+                            .acp_event_store
+                            .replay_from(&client.id, before_compaction)
+                            .unwrap()
+                            .iter()
+                            .any(|stored| {
+                                matches!(stored.event.as_ref(), Event::ConversationCompacted)
+                                    && stored.metadata.scope
+                                        == crate::acp::event_sender::EventScope::SessionCurrent
+                                    && stored
+                                        .metadata
+                                        .reported_session_id
+                                        .as_ref()
+                                        .map(|sid| sid.0.as_ref())
+                                        == Some(native_sid.as_str())
+                            });
+                        if saw_rejected && saw_stopped && completed {
+                            break;
+                        }
+                    }
+                    assert!(
+                        saw_rejected,
+                        "a follow-up refused during compaction must emit PromptRejected so the \
+             user gets a Retry pill instead of a silently swallowed message"
+                    );
+
+                    let wire = std::fs::read_to_string(&capture).expect("read capture");
+                    assert!(
             !wire.contains("\"method\":\"_session/steering\""),
             "the follow-up must not be steered into the compaction turn;\nwire capture:\n{wire}"
         );
-        let _ = client.shutdown().await;
+                    let completed = scope
+                        .state
+                        .acp_event_store
+                        .replay_from(&client.id, projected.last_seq)
+                        .unwrap();
+                    for stored in completed {
+                        projected
+                            .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                            .unwrap();
+                    }
+                    assert!(!projected.compacting, "real completion releases compaction");
+                    let expected_sid = format!("sid-{}", generation + 1);
+                    assert!(matches!(
+                        client.reset_session("/clear").await.unwrap(),
+                        crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id }
+                            if new_acp_session_id == expected_sid
+                    ));
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let event = tokio::time::timeout_at(deadline, client.next_event())
+                            .await
+                            .expect("old conversation update arrives after reset")
+                            .expect("event channel closed");
+                        if matches!(event, Event::AgentMessageChunk { text, .. }
+                        if text == "Compacting... from old conversation")
+                        {
+                            break;
+                        }
+                    }
+                    for stored in scope
+                        .state
+                        .acp_event_store
+                        .replay_from(&client.id, projected.last_seq)
+                        .unwrap()
+                    {
+                        projected
+                            .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                            .unwrap();
+                    }
+                    assert!(
+                        !projected.compacting,
+                        "old Native SID cannot block new conversation"
+                    );
+                }
+                let _ = client.shutdown().await;
+            })
+        })
+        .await;
     }
 }

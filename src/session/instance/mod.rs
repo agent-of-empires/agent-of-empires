@@ -835,14 +835,11 @@ pub struct Instance {
     /// new one. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_effort: Option<String>,
-    /// Agent-assigned ACP session id captured from `session/new`. When
-    /// the agent advertises `agent_capabilities.load_session = true`
-    /// (claude-agent-acp does), the next spawn calls `session/load`
-    /// with this id so the agent reloads its on-disk transcript and
-    /// the model retains context across `aoe serve` restarts. Cleared
-    /// on acp_disable, session delete, or `session/load` failure.
+    /// Native ACP identity selected only by a correlated establishment commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acp_establishment: Option<crate::acp::establishment::AcpEstablishment>,
 
     /// Set when this session was imported from an existing Claude Code
     /// session on disk. While true, the next structured spawn seeds the

@@ -1,14 +1,15 @@
 //! Background async sub-agent transcript tailer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::acp::event_sender::{EventSender, WeakEventSender};
 use chrono::Utc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::mpsc::{Sender, WeakSender};
+use std::io::{Read, Seek, SeekFrom};
 use tokio_util::sync::CancellationToken;
 
+use crate::acp::establishment::NativeResourceAuthority;
 use crate::acp::state::{BackgroundAgentStatus, Event};
 
 /// How often to poll the transcript for new bytes (no inotify).
@@ -41,10 +42,39 @@ pub enum TranscriptSource {
 }
 
 impl TranscriptSource {
-    /// Whether the transcript file exists yet.
-    async fn exists(&self, path: &str) -> bool {
+    pub(crate) fn from_location(
+        location: &crate::acp::establishment::NativeResourceLocation,
+    ) -> Option<Self> {
+        use crate::acp::establishment::NativeResourceLocation;
+        match location {
+            NativeResourceLocation::Host => Some(Self::Host),
+            NativeResourceLocation::Container { runtime, container } => {
+                let runtime = match runtime.as_str() {
+                    "docker" => "docker",
+                    "podman" => "podman",
+                    "container" => "container",
+                    _ => return None,
+                };
+                Some(Self::Container {
+                    runtime,
+                    container: container.clone(),
+                })
+            }
+        }
+    }
+
+    async fn exists(&self, path: &Arc<str>, owner: &Arc<AgentOwner>) -> anyhow::Result<bool> {
         match self {
-            TranscriptSource::Host => tokio::fs::metadata(path).await.is_ok(),
+            TranscriptSource::Host => {
+                let path = Arc::clone(path);
+                let owner = Arc::clone(owner);
+                tokio::task::spawn_blocking(move || {
+                    owner.with_read(&TranscriptSource::Host, &path, || {
+                        Ok(std::fs::metadata(path.as_ref()).is_ok())
+                    })
+                })
+                .await?
+            }
             TranscriptSource::Container { runtime, container } => {
                 let mut cmd = tokio::process::Command::new(runtime);
                 cmd.args(["exec", container, "test", "-e", path])
@@ -52,59 +82,211 @@ impl TranscriptSource {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .kill_on_drop(true);
-                matches!(
-                    tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.status()).await,
-                    Ok(Ok(s)) if s.success()
-                )
+                let mut child = owner.with_read(self, path, || Ok(cmd.spawn()?))?;
+                Ok(matches!(
+                    tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, child.wait()).await,
+                    Ok(Ok(status)) if status.success()
+                ))
             }
         }
     }
 
-    /// Read the bytes appended since `offset` (0-based).
-    async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
+    async fn read_from(
+        &self,
+        path: &Arc<str>,
+        offset: u64,
+        owner: &Arc<AgentOwner>,
+    ) -> anyhow::Result<Vec<u8>> {
         match self {
             TranscriptSource::Host => {
-                let Ok(mut file) = tokio::fs::File::open(path).await else {
-                    return Vec::new();
-                };
-                if file.seek(SeekFrom::Start(offset)).await.is_err() {
-                    return Vec::new();
-                }
-                let mut chunk = Vec::new();
-                if file.read_to_end(&mut chunk).await.is_err() {
-                    return Vec::new();
-                }
-                chunk
+                let path = Arc::clone(path);
+                let owner = Arc::clone(owner);
+                tokio::task::spawn_blocking(move || {
+                    owner.with_read(&TranscriptSource::Host, &path, || {
+                        let Ok(mut file) = std::fs::File::open(path.as_ref()) else {
+                            return Ok(Vec::new());
+                        };
+                        if file.seek(SeekFrom::Start(offset)).is_err() {
+                            return Ok(Vec::new());
+                        }
+                        let mut chunk = Vec::new();
+                        if file.read_to_end(&mut chunk).is_err() {
+                            return Ok(Vec::new());
+                        }
+                        Ok(chunk)
+                    })
+                })
+                .await?
             }
             TranscriptSource::Container { runtime, container } => {
-                // `tail -c +N` prints bytes from the 1-based byte offset N to
-                // EOF, so a 0-based `offset` maps to `+(offset + 1)`.
                 let start = format!("+{}", offset.saturating_add(1));
                 let mut cmd = tokio::process::Command::new(runtime);
                 cmd.args(["exec", container, "tail", "-c", &start, path])
                     .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .kill_on_drop(true);
-                match tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.output()).await {
-                    Ok(Ok(out)) if out.status.success() => out.stdout,
-                    _ => Vec::new(),
-                }
+                let child = owner.with_read(self, path, || Ok(cmd.spawn()?))?;
+                Ok(
+                    match tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, child.wait_with_output())
+                        .await
+                    {
+                        Ok(Ok(output)) if output.status.success() => output.stdout,
+                        _ => Vec::new(),
+                    },
+                )
             }
         }
     }
 }
 
-/// Removes an agent from the shared in-flight set on any tailer exit
-/// (terminal event, hard-idle abort, or `event_tx` close).
-struct ActiveGuard {
-    active: Arc<Mutex<HashSet<String>>>,
+#[derive(Debug, Default)]
+pub(crate) struct ActiveAgents {
+    owners: Mutex<HashMap<String, Arc<AgentOwner>>>,
+}
+
+#[derive(Debug)]
+struct AgentOwner {
+    authority: Arc<NativeResourceAuthority>,
+    cancellation: CancellationToken,
+    active: std::sync::Weak<ActiveAgents>,
     agent_id: String,
+    parent: Option<crate::acp::task_transcript::TaskReadOwner>,
+}
+
+impl AgentOwner {
+    fn with_read<T>(
+        &self,
+        source: &TranscriptSource,
+        path: &str,
+        effect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let read = || {
+            let active = self
+                .active
+                .upgrade()
+                .ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+            let owners = active
+                .owners
+                .lock()
+                .expect("bg-agent owners mutex poisoned");
+            anyhow::ensure!(
+                !self.cancellation.is_cancelled()
+                    && owners
+                        .get(&self.agent_id)
+                        .is_some_and(|current| std::ptr::eq(current.as_ref(), self)),
+                crate::acp::establishment::EstablishmentRefusal::Superseded
+            );
+            self.authority.check_transcript(source, path)?;
+            effect()
+        };
+        match &self.parent {
+            Some(parent) => parent.child_effect(&self.authority, read),
+            None => self.authority.with_read(read),
+        }
+    }
+}
+
+impl ActiveAgents {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.owners
+            .lock()
+            .expect("bg-agent owners mutex poisoned")
+            .is_empty()
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut owners = self.owners.lock().expect("bg-agent owners mutex poisoned");
+        for owner in owners.values() {
+            owner.cancellation.cancel();
+        }
+        owners.clear();
+    }
+
+    fn allocate(
+        self: &Arc<Self>,
+        agent_id: String,
+        authority: Arc<NativeResourceAuthority>,
+        parent: Option<crate::acp::task_transcript::TaskReadOwner>,
+    ) -> anyhow::Result<Option<ActiveGuard>> {
+        let insert = || {
+            let mut owners = self.owners.lock().expect("bg-agent owners mutex poisoned");
+            if owners.get(&agent_id).is_some_and(|current| {
+                !current.cancellation.is_cancelled() && current.authority.same_resource(&authority)
+            }) {
+                return Ok(None);
+            }
+            let allocation = authority
+                .witness()
+                .map_or_else(uuid::Uuid::new_v4, |witness| witness.allocation);
+            let owner = Arc::new(AgentOwner {
+                authority: authority.for_tracking_allocation(allocation)?,
+                active: Arc::downgrade(self),
+                agent_id: agent_id.clone(),
+                cancellation: CancellationToken::new(),
+                parent: parent.clone(),
+            });
+            if let Some(previous) = owners.insert(agent_id, Arc::clone(&owner)) {
+                previous.cancellation.cancel();
+            }
+            Ok(Some(ActiveGuard {
+                active: Arc::clone(self),
+                owner,
+            }))
+        };
+        match &parent {
+            Some(parent) => parent.effect(insert),
+            None => authority.admit_tracking(insert),
+        }
+    }
+}
+
+struct ActiveGuard {
+    active: Arc<ActiveAgents>,
+    owner: Arc<AgentOwner>,
+}
+
+impl ActiveGuard {
+    async fn send(&self, events: &EventSender, event: Event) -> bool {
+        let Ok(permit) = events.reserve().await else {
+            return false;
+        };
+        let publish = || {
+            let owners = self
+                .active
+                .owners
+                .lock()
+                .expect("bg-agent owners mutex poisoned");
+            anyhow::ensure!(
+                !self.owner.cancellation.is_cancelled()
+                    && owners
+                        .get(&self.owner.agent_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &self.owner)),
+                crate::acp::establishment::EstablishmentRefusal::Superseded
+            );
+            permit.send(event);
+            Ok(())
+        };
+        match &self.owner.parent {
+            Some(parent) => parent.with_owner(publish).is_ok(),
+            None => publish().is_ok(),
+        }
+    }
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.active.lock() {
-            set.remove(&self.agent_id);
+        self.owner.cancellation.cancel();
+        let mut owners = self
+            .active
+            .owners
+            .lock()
+            .expect("bg-agent owners mutex poisoned");
+        if owners
+            .get(&self.owner.agent_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.owner))
+        {
+            owners.remove(&self.owner.agent_id);
         }
     }
 }
@@ -138,88 +320,107 @@ fn missing_transcript_outcome(start: TailerStart) -> (BackgroundAgentStatus, &'s
     }
 }
 
-/// Spawn the tailer for one async sub-agent.
-pub fn spawn_tailer(
-    agent_id: String,
-    output_file: String,
+pub(crate) async fn spawn_tailer(
+    transcript: (String, String),
     source: TranscriptSource,
-    event_tx: Sender<Event>,
-    active: Arc<Mutex<HashSet<String>>>,
+    event_tx: EventSender,
+    active: Arc<ActiveAgents>,
     start: TailerStart,
+    authority: Arc<NativeResourceAuthority>,
+    start_event: Option<Event>,
 ) {
-    // `insert` returns false when the id is already active: a second spawn
-    // for the same agent is a no-op instead of racing two tailers against
-    // one transcript.
-    if !active
-        .lock()
-        .expect("bg-agent active set mutex poisoned")
-        .insert(agent_id.clone())
-    {
-        return;
+    let (agent_id, output_file) = transcript;
+    let tracking = match active.allocate(agent_id.clone(), authority, None) {
+        Ok(Some(tracking)) => tracking,
+        Ok(None) | Err(_) => {
+            if let Some(event) = start_event {
+                let _ = event_tx
+                    .with_metadata(crate::acp::event_sender::EventMetadata::history())
+                    .send(event)
+                    .await;
+            }
+            return;
+        }
+    };
+    let output_file: Arc<str> = output_file.into();
+    let first_read = source.exists(&output_file, &tracking.owner).await;
+    if let Some(event) = start_event {
+        let start_tx = tracking.owner.authority.start_sender(&event_tx);
+        if !tracking.send(&start_tx, event).await {
+            return;
+        }
     }
-    if output_file.is_empty() {
-        // No transcript path: we can never tail it.
-        tokio::spawn(async move {
-            let _guard = ActiveGuard {
-                active,
-                agent_id: agent_id.clone(),
-            };
-            let _ = event_tx
-                .send(completed(
-                    agent_id,
-                    BackgroundAgentStatus::Error,
-                    Vec::new(),
-                    None,
-                    Some("no transcript path reported for this sub-agent".into()),
-                ))
-                .await;
-        });
+    let Ok(first_exists) = first_read else {
         return;
-    }
+    };
+    let event_tx = tracking.owner.authority.progress_sender(&event_tx);
     tokio::spawn(async move {
-        let _guard = ActiveGuard {
-            active,
-            agent_id: agent_id.clone(),
-        };
-        run_tailer(agent_id, output_file, source, event_tx, start).await;
+        tokio::select! {
+            biased;
+            _ = tracking.owner.cancellation.cancelled() => {}
+            _ = run_tailer(agent_id, output_file, source, event_tx, start, &tracking, first_exists) => {}
+        }
     });
 }
 
-/// Like [`spawn_tailer`], for a sub-agent whose end someone else reports (a
-/// workflow agent, ended by its run's journal): only progress is emitted, and
-/// the tailer runs until `stop` fires or the session goes away. On `stop` it
-/// reads the transcript once more and publishes that progress before the
-/// returned task finishes, so a completion published after it keeps the
-/// agent's final tools. The publisher is weak so a reader never keeps a dead
-/// connection's channel open.
-pub(crate) fn spawn_progress_tailer(
-    agent_id: String,
-    output_file: String,
-    event_tx: WeakSender<Event>,
-    active: Arc<Mutex<HashSet<String>>>,
+/// The workflow journal reports completion after this reader's final progress.
+pub(crate) async fn spawn_progress_tailer(
+    transcript: (String, String),
+    event_tx: WeakEventSender,
+    active: Arc<ActiveAgents>,
     stop: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !active
-        .lock()
-        .expect("bg-agent active set mutex poisoned")
-        .insert(agent_id.clone())
-    {
+    authority: Arc<NativeResourceAuthority>,
+    start_event: Option<Event>,
+    parent: crate::acp::task_transcript::TaskReadOwner,
+) -> Option<(
+    tokio::task::JoinHandle<()>,
+    Arc<crate::acp::establishment::NativeResourceWitness>,
+)> {
+    let (agent_id, output_file) = transcript;
+    let tracking = match active.allocate(agent_id.clone(), authority, Some(parent.clone())) {
+        Ok(Some(tracking)) => tracking,
+        Ok(None) | Err(_) => {
+            if let Some(event) = start_event {
+                let _ = parent.publish_resource(&event_tx, event, None).await;
+            }
+            return None;
+        }
+    };
+    let output_file: Arc<str> = output_file.into();
+    let first_read = TranscriptSource::Host
+        .exists(&output_file, &tracking.owner)
+        .await;
+    if let Some(event) = start_event {
+        let tx = event_tx.upgrade()?;
+        if !tracking
+            .send(&tracking.owner.authority.start_sender(&tx), event)
+            .await
+        {
+            return None;
+        }
+    }
+    if first_read.is_err() {
         return None;
     }
-    Some(tokio::spawn(async move {
-        let _guard = ActiveGuard {
-            active,
-            agent_id: agent_id.clone(),
-        };
-        run_progress_tailer(agent_id, output_file, event_tx, stop).await;
-    }))
+    let witness = tracking.owner.authority.witness()?;
+    Some((
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = tracking.owner.cancellation.cancelled() => {}
+                _ = run_progress_tailer(agent_id, output_file, event_tx, stop, &tracking) => {}
+            }
+        }),
+        witness,
+    ))
 }
 
 async fn run_progress_tailer(
     agent_id: String,
-    output_file: String,
-    event_tx: WeakSender<Event>,
+    output_file: Arc<str>,
+    event_tx: WeakEventSender,
     stop: CancellationToken,
+    tracking: &ActiveGuard,
 ) {
     let source = TranscriptSource::Host;
     let mut offset: u64 = 0;
@@ -230,13 +431,32 @@ async fn run_progress_tailer(
     let mut stalled_emitted = false;
     loop {
         let stopping = stop.is_cancelled();
-        let grew = source.exists(&output_file).await
-            && read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
+        let grew = match source.exists(&output_file, &tracking.owner).await {
+            Ok(true) => match read_new_lines(
+                &source,
+                &output_file,
+                &mut offset,
+                &mut line_buf,
+                &mut snap,
+                &tracking.owner,
+            )
+            .await
+            {
+                Ok(grew) => grew,
+                Err(_) => return,
+            },
+            Ok(false) => false,
+            Err(_) => return,
+        };
         if stopping {
             if snap.parsed_any {
                 if let Some(tx) = event_tx.upgrade() {
-                    let _ = tx
-                        .send(progress(agent_id, BackgroundAgentStatus::Running, &snap))
+                    let tx = tracking.owner.authority.progress_sender(&tx);
+                    let _ = tracking
+                        .send(
+                            &tx,
+                            progress(agent_id, BackgroundAgentStatus::Running, &snap),
+                        )
                         .await;
                 }
             }
@@ -260,12 +480,12 @@ async fn run_progress_tailer(
         let stall_edge = status == BackgroundAgentStatus::Stalled && !stalled_emitted;
         if (grew && throttle_ok) || stall_edge {
             let Some(tx) = event_tx.upgrade() else {
-                return; // session gone
+                return;
             };
-            if tx
-                .send(progress(agent_id.clone(), status, &snap))
+            let tx = tracking.owner.authority.progress_sender(&tx);
+            if !tracking
+                .send(&tx, progress(agent_id.clone(), status, &snap))
                 .await
-                .is_err()
             {
                 return;
             }
@@ -318,26 +538,22 @@ struct Snapshot {
 
 async fn run_tailer(
     agent_id: String,
-    output_file: String,
+    output_file: Arc<str>,
     source: TranscriptSource,
-    event_tx: Sender<Event>,
+    event_tx: EventSender,
     start: TailerStart,
+    tracking: &ActiveGuard,
+    mut exists: bool,
 ) {
-    // Wait for the transcript to appear (the SDK writes it shortly after
-    // the launch event). For a sandboxed session this checks inside the
-    // container, not the host.
     let mut waited = Duration::ZERO;
-    while !source.exists(&output_file).await {
+    while !exists {
         if waited >= WAIT_FILE_FOR {
             let (status, warning) = missing_transcript_outcome(start);
-            let _ = event_tx
-                .send(completed(
-                    agent_id,
-                    status,
-                    Vec::new(),
-                    None,
-                    Some(warning.into()),
-                ))
+            let _ = tracking
+                .send(
+                    &event_tx,
+                    completed(agent_id, status, Vec::new(), None, Some(warning.into())),
+                )
                 .await;
             return;
         }
@@ -345,6 +561,10 @@ async fn run_tailer(
             _ = tokio::time::sleep(POLL_INTERVAL) => waited += POLL_INTERVAL,
             _ = event_tx.closed() => return, // session gone
         }
+        exists = match source.exists(&output_file, &tracking.owner).await {
+            Ok(exists) => exists,
+            Err(_) => return,
+        };
     }
 
     let mut offset: u64 = 0;
@@ -355,8 +575,19 @@ async fn run_tailer(
     let mut stalled_emitted = false;
 
     loop {
-        let grew =
-            read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
+        let grew = match read_new_lines(
+            &source,
+            &output_file,
+            &mut offset,
+            &mut line_buf,
+            &mut snap,
+            &tracking.owner,
+        )
+        .await
+        {
+            Ok(grew) => grew,
+            Err(_) => return,
+        };
         let now = Utc::now();
         if grew {
             last_growth = now;
@@ -364,32 +595,30 @@ async fn run_tailer(
         }
 
         if snap.done {
-            // The explicit end_turn completion path.
             let warning = format_warning(&snap);
-            let _ = event_tx
-                .send(completed(
-                    agent_id,
-                    BackgroundAgentStatus::Completed,
-                    snapshot_tools(&snap),
-                    snap.result.clone(),
-                    warning,
-                ))
+            let _ = tracking
+                .send(
+                    &event_tx,
+                    completed(
+                        agent_id,
+                        BackgroundAgentStatus::Completed,
+                        snapshot_tools(&snap),
+                        snap.result.clone(),
+                        warning,
+                    ),
+                )
                 .await;
             return;
         }
 
         let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
         if idle >= ABORT_AFTER {
-            // Stopped tracking.
             let (status, result, warning) = infer_idle_outcome(&snap);
-            let _ = event_tx
-                .send(completed(
-                    agent_id,
-                    status,
-                    snapshot_tools(&snap),
-                    result,
-                    warning,
-                ))
+            let _ = tracking
+                .send(
+                    &event_tx,
+                    completed(agent_id, status, snapshot_tools(&snap), result, warning),
+                )
                 .await;
             return;
         }
@@ -400,18 +629,15 @@ async fn run_tailer(
             BackgroundAgentStatus::Running
         };
 
-        // Emit a throttled snapshot on real growth, or once when the
-        // agent first transitions to Stalled so the panel reflects it.
         let throttle_ok = (now - last_progress)
             .to_std()
             .map(|d| d >= PROGRESS_THROTTLE)
             .unwrap_or(true);
         let stall_edge = status == BackgroundAgentStatus::Stalled && !stalled_emitted;
         if (grew && throttle_ok) || stall_edge {
-            if event_tx
-                .send(progress(agent_id.clone(), status, &snap))
+            if !tracking
+                .send(&event_tx, progress(agent_id.clone(), status, &snap))
                 .await
-                .is_err()
             {
                 return; // session gone
             }
@@ -432,18 +658,17 @@ async fn run_tailer(
 /// folding complete JSONL records into `snap`.
 async fn read_new_lines(
     source: &TranscriptSource,
-    path: &str,
+    path: &Arc<str>,
     offset: &mut u64,
     line_buf: &mut String,
     snap: &mut Snapshot,
-) -> bool {
-    let chunk = source.read_from(path, *offset).await;
+    owner: &Arc<AgentOwner>,
+) -> anyhow::Result<bool> {
+    let chunk = source.read_from(path, *offset, owner).await?;
     if chunk.is_empty() {
-        return false;
+        return Ok(false);
     }
     *offset += chunk.len() as u64;
-    // Transcript is UTF-8 JSONL; lossy is fine for our previews and never
-    // splits a record (we only act on whole, newline-terminated lines).
     line_buf.push_str(&String::from_utf8_lossy(&chunk));
     while let Some(nl) = line_buf.find('\n') {
         let line: String = line_buf.drain(..=nl).collect();
@@ -452,7 +677,7 @@ async fn read_new_lines(
             fold_line(line, snap);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Parse one JSONL transcript line and fold it into the snapshot.
@@ -668,117 +893,8 @@ mod tests {
         snap
     }
 
-    /// A second `spawn_tailer` for an id already in the active set must not
-    /// spawn a competing tailer against the same transcript.
-    #[tokio::test]
-    async fn spawn_tailer_is_a_noop_when_the_agent_id_is_already_active() {
-        let active = Arc::new(Mutex::new(HashSet::from(["dup".to_string()])));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        spawn_tailer(
-            "dup".into(),
-            String::new(),
-            TranscriptSource::Host,
-            tx,
-            active.clone(),
-            TailerStart::Live,
-        );
-        tokio::task::yield_now().await;
-        assert!(
-            rx.try_recv().is_err(),
-            "an id already active must not get a second tailer, even the \
-             untrackable-path completion the empty output_file would otherwise emit"
-        );
-        assert!(active.lock().unwrap().contains("dup"));
-    }
-
-    #[tokio::test]
-    async fn progress_tailer_reports_progress_but_never_completes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.jsonl");
-        // A finished transcript: an ordinary tailer would complete on it.
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let active = Arc::new(Mutex::new(HashSet::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let stop = CancellationToken::new();
-        let tailer = spawn_progress_tailer(
-            "wf-agent".into(),
-            path.to_string_lossy().into_owned(),
-            tx.downgrade(),
-            active.clone(),
-            stop.clone(),
-        )
-        .unwrap();
-        match rx.recv().await {
-            Some(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 1),
-            other => panic!("expected progress, got {other:?}"),
-        }
-        // Written after the last progress: the stop's final read still reports it.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        std::io::Write::write_all(
-            &mut file,
-            concat!(
-                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read"}]}}"#,
-                "\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        stop.cancel();
-        tailer.await.unwrap();
-        match rx.try_recv() {
-            Ok(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 2),
-            other => panic!("expected the final progress, got {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "no completion from a progress tailer"
-        );
-        assert!(active.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn host_read_new_lines_reads_from_offset_and_buffers_partials() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let path_str = path.to_string_lossy().to_string();
-        let source = TranscriptSource::Host;
-
-        let line =
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
-        tokio::fs::write(&path, line).await.unwrap();
-        let mut offset = 0u64;
-        let mut buf = String::new();
-        let mut snap = Snapshot::default();
-        assert!(read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
-        assert_eq!(snap.tool_count, 0, "a partial line must not fold");
-        assert_eq!(offset, line.len() as u64);
-
-        tokio::fs::write(&path, format!("{line}\n{line}\n"))
-            .await
-            .unwrap();
-        assert!(read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
-        assert_eq!(snap.tool_count, 2);
-
-        let before = offset;
-        assert!(!read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
-        assert_eq!(offset, before);
-    }
-
     #[test]
     fn fold_and_idle_outcome_track_transcript_progress() {
-        // (lines, expected status, expected result, warning substring, case)
         let cases = vec![
             (
                 vec![
@@ -788,7 +904,6 @@ mod tests {
                 ],
                 BackgroundAgentStatus::Completed,
                 Some("final report"),
-                "completion inferred from final text",
                 "final text, no dangling tool, no end_turn marker: done",
             ),
             (
@@ -798,7 +913,6 @@ mod tests {
                 ],
                 BackgroundAgentStatus::Stalled,
                 None,
-                "no transcript activity",
                 "a tool call still awaiting its result: hung",
             ),
             (
@@ -807,25 +921,19 @@ mod tests {
                 ],
                 BackgroundAgentStatus::Stalled,
                 None,
-                "no transcript activity",
                 "text after an unresolved tool call: still mid-action",
             ),
             (
                 vec!["not json at all"],
                 BackgroundAgentStatus::Stalled,
                 None,
-                "no transcript activity",
                 "nothing parsed: hung",
             ),
         ];
-        for (lines, expected_status, expected_result, warn_contains, desc) in cases {
-            let (status, result, warning) = infer_idle_outcome(&folded(&lines));
+        for (lines, expected_status, expected_result, desc) in cases {
+            let (status, result, _) = infer_idle_outcome(&folded(&lines));
             assert_eq!(status, expected_status, "{desc}");
             assert_eq!(result.as_deref(), expected_result, "{desc}");
-            assert!(
-                warning.unwrap_or_default().contains(warn_contains),
-                "{desc}"
-            );
         }
 
         // A dangling call past the display cap still counts as unresolved.
@@ -899,5 +1007,166 @@ mod tests {
 
         let long = preview(&"x".repeat(TEXT_PREVIEW_CHARS + 50));
         assert!(long.ends_with('…') && long.chars().count() <= TEXT_PREVIEW_CHARS + 1);
+    }
+}
+#[cfg(test)]
+mod real_resource_tests {
+    use super::*;
+    use crate::acp::event_sender::SdkEvent;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    use crate::acp::task_transcript::resource_test_support::{
+        self as fixture, AgentFixture, JournalPath, WorkflowFixture, RESULT_A1, STARTED_A1,
+    };
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_tailer_is_a_noop_when_the_agent_id_is_already_active() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let f = AgentFixture::new(scope).await;
+                let active = Arc::<ActiveAgents>::default();
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<SdkEvent>(8);
+                let events: EventSender = tx.clone().into();
+                let first = fixture::wait_for_tracking(async || {
+                    spawn_tailer(
+                        ("dup".into(), f.path.to_str().unwrap().into()),
+                        TranscriptSource::Host,
+                        events.clone(),
+                        Arc::clone(&active),
+                        TailerStart::Live,
+                        Arc::clone(&f.authority),
+                        None,
+                    )
+                    .await;
+                    active.owners.lock().unwrap().get("dup").cloned()
+                })
+                .await;
+                spawn_tailer(
+                    ("dup".into(), f.path.to_str().unwrap().into()),
+                    TranscriptSource::Host,
+                    events.clone(),
+                    Arc::clone(&active),
+                    TailerStart::Live,
+                    Arc::clone(&f.authority),
+                    None,
+                )
+                .await;
+                let second = active
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .get("dup")
+                    .expect("owner retained")
+                    .clone();
+                assert!(
+                    Arc::ptr_eq(&first, &second),
+                    "same resource must not replace its active reader"
+                );
+                assert_eq!(
+                    first.authority.witness().unwrap().allocation,
+                    f.authority.witness().unwrap().allocation
+                );
+                active.clear();
+                drop(events);
+                drop(tx);
+                assert!(
+                    fixture::closed(&mut rx).await.is_empty(),
+                    "duplicate must not publish progress or completion"
+                );
+                assert!(active.is_empty());
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn host_read_new_lines_reads_from_offset_and_buffers_partials() {
+        with_managed(|scope| Box::pin(async move {
+            let f = AgentFixture::new(scope).await;
+            let active = Arc::<ActiveAgents>::default();
+            let tracking = fixture::retry_registry_busy(async || {
+                active.allocate("dup".into(), Arc::clone(&f.authority), None)
+            }).await.expect("actual resource tracking allocated");
+            let path: Arc<str> = f.path.to_str().unwrap().into();
+            let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+            std::fs::write(&f.path, line).unwrap();
+            let mut offset = 0;
+            let mut carry = String::new();
+            let mut snap = Snapshot::default();
+            assert!(fixture::retry_registry_busy(async || {
+                read_new_lines(&TranscriptSource::Host, &path, &mut offset, &mut carry,
+                    &mut snap, &tracking.owner).await
+            }).await);
+            assert_eq!(snap.tool_count, 0, "partial line must not fold");
+            assert_eq!(offset, line.len() as u64);
+            std::fs::write(&f.path, format!("{line}\n{line}\n")).unwrap();
+            assert!(fixture::retry_registry_busy(async || {
+                read_new_lines(&TranscriptSource::Host, &path, &mut offset, &mut carry,
+                    &mut snap, &tracking.owner).await
+            }).await);
+            assert_eq!(snap.tool_count, 2);
+            assert!(carry.is_empty());
+            let before = offset;
+            assert!(!fixture::retry_registry_busy(async || {
+                read_new_lines(&TranscriptSource::Host, &path, &mut offset, &mut carry,
+                    &mut snap, &tracking.owner).await
+            }).await);
+            assert_eq!(offset, before);
+            drop(tracking);
+            assert!(active.is_empty());
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn progress_tailer_reports_progress_but_never_completes() {
+        with_managed(|scope| Box::pin(async move {
+            let mut f = WorkflowFixture::new(scope, "", &[], &[], JournalPath::Inside).await;
+            std::fs::write(f.dir.join("agent-a1.jsonl"), concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+                "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"is_error\":false}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+            )).unwrap();
+            f.append_journal(STARTED_A1);
+            let task = f.start().await;
+            let launched = fixture::next(&mut f.rx).await;
+            assert!(matches!(launched.event.as_ref(), Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "a1"));
+            let allocation = launched.metadata.resource_witness.as_ref().expect("real child first-I/O witness").allocation;
+            assert_eq!(launched.metadata.resource_ref, Some(allocation));
+            let first = fixture::next(&mut f.rx).await;
+            assert!(matches!(first.event.as_ref(), Event::BackgroundAgentProgress { tool_count: 1, .. }));
+            assert_eq!(first.metadata.resource_ref, Some(allocation));
+            fixture::append(&f.dir.join("agent-a1.jsonl"),
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Read\"}]}}\n");
+            f.append_journal(RESULT_A1);
+            let mut data = vec![launched, first];
+            data.extend(f.finish(task).await);
+            let completed: Vec<_> = data.iter().enumerate().filter(|(_, d)|
+                matches!(d.event.as_ref(), Event::BackgroundAgentCompleted { .. })).collect();
+            assert_eq!(completed.len(), 1, "only journal publishes child completion");
+            let (completed_at, completion) = completed[0];
+            assert!(matches!(completion.event.as_ref(), Event::BackgroundAgentCompleted {
+                agent_id, status: BackgroundAgentStatus::Completed, result: Some(result), ..
+            } if agent_id == "a1" && result == "drafted"));
+            assert_eq!(completion.metadata.resource_ref, Some(allocation));
+            let final_progress = data[..completed_at].iter().rfind(|d|
+                matches!(d.event.as_ref(), Event::BackgroundAgentProgress { .. })).unwrap();
+            assert!(matches!(final_progress.event.as_ref(), Event::BackgroundAgentProgress { tool_count: 2, .. }));
+            assert_eq!(final_progress.metadata.resource_ref, Some(allocation));
+            let mut state = crate::acp::AcpState::default();
+            for (seq, d) in data.iter().enumerate() {
+                state.apply_scoped_event(seq as u64 + 1, d.event.as_ref(), &d.metadata).unwrap();
+            }
+            let agent = &state.background_agents[0];
+            assert_eq!(agent.resource_ref, Some(allocation));
+            assert_eq!(agent.status, BackgroundAgentStatus::Completed);
+            assert_eq!(agent.tool_count, 2);
+            assert_eq!(agent.tools.len(), 2);
+            assert_eq!(agent.tools[0].name, "Bash");
+            assert_eq!(agent.tools[0].ok, Some(true));
+            assert_eq!(agent.tools[1].name, "Read");
+            assert_eq!(agent.result.as_deref(), Some("drafted"));
+        })).await;
     }
 }

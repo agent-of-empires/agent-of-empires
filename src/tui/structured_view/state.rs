@@ -404,6 +404,19 @@ impl StructuredViewState {
             && self.transcript.connection_unavailable.is_none()
     }
 
+    /// Reply authority is request-specific while Original establishment is pending.
+    /// Transport and a fresh canonical snapshot remain mandatory for both sources.
+    pub fn can_decide(&self, nonce: &str) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && (self.native_input_available()
+                || self
+                    .transcript
+                    .original_decision_nonces
+                    .iter()
+                    .any(|original| original.0 == nonce))
+    }
+
     pub fn can_submit_prompt_intent(&self) -> bool {
         self.ws.is_some()
             && self.transcript.native_snapshot_seq.is_some()
@@ -412,9 +425,28 @@ impl StructuredViewState {
     }
 
     pub fn can_accept_choice(&self) -> bool {
-        self.choice.as_ref().is_none_or(|choice| {
-            matches!(&choice.purpose, ChoicePurpose::OpenLink) || self.native_input_available()
-        })
+        self.choice
+            .as_ref()
+            .is_none_or(|choice| match &choice.purpose {
+                ChoicePurpose::OpenLink => true,
+                ChoicePurpose::Mode => self.native_input_available(),
+                ChoicePurpose::Approval { nonce } => {
+                    self.can_decide(nonce)
+                        && self
+                            .transcript
+                            .pending_approvals
+                            .iter()
+                            .any(|pending| pending.nonce == *nonce)
+                }
+                ChoicePurpose::Elicitation { nonce, .. } => {
+                    self.can_decide(nonce)
+                        && self
+                            .transcript
+                            .pending_elicitations
+                            .iter()
+                            .any(|pending| pending.nonce == *nonce)
+                }
+            })
     }
 
     pub fn disconnect_management(&mut self) {

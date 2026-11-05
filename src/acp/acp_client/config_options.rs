@@ -1,21 +1,25 @@
 //! Session config options and modes: the ACP wire mapping and the
 //! dispatch that applies a requested value.
 
+use crate::acp::establishment::NativeRequestContext;
+use crate::acp::event_sender::EventSender;
+use crate::acp::protocol::AcpOriginalRequestResult;
 use crate::acp::state::{
     ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor, Event, ModeInfo,
 };
 use agent_client_protocol::schema::v1::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeState,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionModeState,
     SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::connection::ConnectionState;
-use super::errors::public_error_message;
-use super::session_identity::{ordered_native_request, spawn_native_request, OrderedRequestResult};
+use super::errors::{acp_internal_error, public_error_message};
+use super::session_identity::{
+    ordered_native_request, prepare_native_request, OrderedRequestResult,
+};
 use std::sync::Arc;
 
 /// `None` when the response carried no options, so cached selectors persist.
@@ -110,52 +114,93 @@ pub(super) fn config_option_failure_event(
     }
 }
 
-/// The adapter's response itself supplies the option list. Its application
-/// scope belongs to the SDK connection and settles at ordered native loss.
+/// The adapter's response supplies the option list. SDK-owned application
+/// custody lasts through the ordered result and publication of its events.
 pub(super) fn dispatch_set_config_option(
     connection: &ConnectionTo<Agent>,
     state: &Arc<ConnectionState>,
-    acp_session_id: &SessionId,
-    config_id: String,
-    value: String,
+    request: SetSessionConfigOptionRequest,
     purpose: ConfigOptionDispatchPurpose,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: EventSender,
+    context: Option<NativeRequestContext>,
 ) {
+    let config_id = request.config_id.0.to_string();
+    let value = request
+        .value
+        .as_value_id()
+        .expect("select config request")
+        .0
+        .to_string();
     info!(
         target: "acp.protocol",
         "sending session/set_config_option {config_id}={value}"
     );
-    let request = SetSessionConfigOptionRequest::new(
-        acp_session_id.clone(),
-        SessionConfigId::new(config_id.clone()),
-        SessionConfigValueId::new(value.clone()),
-    );
-    let _ = spawn_native_request(connection, state, request, move |request| async move {
-        let events = match request.wait().await {
-            OrderedRequestResult::Correlated(Ok(response)) => {
-                config_option_success_events(response.config_options, value, purpose)
+    let native = state.control.get().is_some();
+    let sender = if native {
+        event_tx.with_context(context.clone().map(Arc::new))
+    } else {
+        event_tx
+    };
+    let request = state
+        .admit(|| prepare_native_request(connection, state, context, request))
+        .and_then(|request| request);
+    let refused = request.is_err();
+    let publish = async move {
+        let (request, _outcome) = match request {
+            Ok((request, outcome)) => (Ok(request), Some(outcome)),
+            Err(error) => (Err(error), None),
+        };
+        let result = match request {
+            Ok(request) => request.wait().await,
+            Err(error) => {
+                OrderedRequestResult::Refused(acp_internal_error(format!("NotIssued: {error}")))
             }
-            OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error) => {
-                warn!(target: "acp.protocol", ?error, "session/set_config_option failed");
+        };
+        let (sender, events) = match result {
+            OrderedRequestResult::Correlated(Ok(response)) => (
+                sender.with_outcome(AcpOriginalRequestResult::Succeeded),
+                config_option_success_events(response.config_options, value, purpose),
+            ),
+            OrderedRequestResult::Correlated(Err(error)) => (
+                sender.with_outcome(AcpOriginalRequestResult::Failed),
                 vec![config_option_failure_event(
                     config_id,
                     value,
                     public_error_message(&error),
                     purpose,
-                )]
-            }
-            OrderedRequestResult::Unavailable(_) => return,
-            OrderedRequestResult::Abandoned => vec![config_option_failure_event(
-                config_id,
-                value,
-                "Config response was not observed".into(),
-                purpose,
-            )],
+                )],
+            ),
+            OrderedRequestResult::Refused(error) => (
+                sender.historical(),
+                vec![config_option_failure_event(
+                    config_id,
+                    value,
+                    public_error_message(&error),
+                    purpose,
+                )],
+            ),
+            OrderedRequestResult::Unavailable(_) | OrderedRequestResult::Abandoned => (
+                sender.historical(),
+                vec![config_option_failure_event(
+                    config_id,
+                    value,
+                    "Config response was not observed".into(),
+                    purpose,
+                )],
+            ),
         };
         for event in events {
-            let _ = event_tx.send(event).await;
+            let _ = sender.send(event).await;
         }
-    });
+        Ok(())
+    };
+    if refused {
+        tokio::spawn(async move {
+            let _ = publish.await;
+        });
+    } else if let Err(error) = connection.spawn(publish) {
+        warn!(target: "acp.protocol", %error, "config response task could not be admitted");
+    }
 }
 
 /// Best-effort application of a configured default. A value the agent no
@@ -164,30 +209,29 @@ pub(super) fn dispatch_set_config_option(
 pub(super) async fn apply_config_default(
     connection: &ConnectionTo<Agent>,
     state: &Arc<ConnectionState>,
-    event_tx: &mpsc::Sender<Event>,
-    session_id: SessionId,
-    config_id: SessionConfigId,
-    value: &str,
+    event_tx: &EventSender,
+    request: SetSessionConfigOptionRequest,
     session_label: &str,
+    context: Option<NativeRequestContext>,
 ) -> Result<Vec<SessionConfigOption>, String> {
     info!(
         target: "acp.protocol",
         session = %session_label,
-        config_id = %config_id.0,
-        value,
+        config_id = %request.config_id.0,
+        value = ?request.value,
         "applying structured view default"
     );
-    let request = SetSessionConfigOptionRequest::new(
-        session_id,
-        config_id,
-        SessionConfigValueId::new(value.to_string()),
-    );
-    let request = ordered_native_request(connection, state, request)
+    let sender = if state.control.get().is_some() {
+        event_tx.with_context(context.clone().map(Arc::new))
+    } else {
+        event_tx.clone()
+    };
+    let request = ordered_native_request(connection, state, context, request)
         .map_err(|_| "ACP connection unavailable".to_string())?;
     match request.wait().await {
         OrderedRequestResult::Correlated(Ok(resp)) => {
             if let Some(event) = config_options_event(Some(resp.config_options.clone())) {
-                let _ = event_tx.send(event).await;
+                let _ = sender.send(event).await;
             }
             Ok(resp.config_options)
         }
@@ -349,12 +393,13 @@ fn resolve_mode_set_target<'a>(
 pub(super) fn dispatch_set_mode(
     connection: &ConnectionTo<Agent>,
     state: &Arc<ConnectionState>,
-    acp_session_id: &SessionId,
-    mode_id: String,
+    request: SetSessionModeRequest,
     channels: &SessionChannels,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: EventSender,
     while_prompting: bool,
+    context: Option<NativeRequestContext>,
 ) {
+    let mode_id = request.mode_id.0.to_string();
     let target = resolve_mode_set_target(
         &mode_id,
         &channels.available_mode_ids,
@@ -368,11 +413,14 @@ pub(super) fn dispatch_set_mode(
         dispatch_set_config_option(
             connection,
             state,
-            acp_session_id,
-            config_id.to_string(),
-            mode_id,
+            SetSessionConfigOptionRequest::new(
+                request.session_id,
+                SessionConfigId::new(config_id.to_string()),
+                SessionConfigValueId::new(mode_id),
+            ),
             ConfigOptionDispatchPurpose::Mode,
             event_tx,
+            context,
         );
         return;
     }
@@ -381,32 +429,318 @@ pub(super) fn dispatch_set_mode(
         while_prompting,
         "sending session/set_mode mode={mode_id}"
     );
-    let request = SetSessionModeRequest::new(acp_session_id.clone(), mode_id.clone());
-    let _ = spawn_native_request(connection, state, request, move |request| async move {
-        let event = match request.wait().await {
-            OrderedRequestResult::Correlated(Ok(_)) => Event::CurrentModeChanged {
-                current_mode_id: mode_id,
-            },
-            OrderedRequestResult::Correlated(Err(error)) | OrderedRequestResult::Refused(error) => {
-                warn!(target: "acp.protocol", while_prompting, ?error, "session/set_mode failed");
+    let native = state.control.get().is_some();
+    let sender = if native {
+        event_tx.with_context(context.clone().map(Arc::new))
+    } else {
+        event_tx
+    };
+    let request = state
+        .admit(|| prepare_native_request(connection, state, context, request))
+        .and_then(|request| request);
+    let refused = request.is_err();
+    let publish = async move {
+        let (request, _outcome) = match request {
+            Ok((request, outcome)) => (Ok(request), Some(outcome)),
+            Err(error) => (Err(error), None),
+        };
+        let result = match request {
+            Ok(request) => request.wait().await,
+            Err(error) => {
+                OrderedRequestResult::Refused(acp_internal_error(format!("NotIssued: {error}")))
+            }
+        };
+        let (sender, event) = match result {
+            OrderedRequestResult::Correlated(Ok(_)) => (
+                sender.with_outcome(AcpOriginalRequestResult::Succeeded),
+                Event::CurrentModeChanged {
+                    current_mode_id: mode_id,
+                },
+            ),
+            OrderedRequestResult::Correlated(Err(error)) => (
+                sender.with_outcome(AcpOriginalRequestResult::Failed),
                 Event::ModeSwitchFailed {
                     mode_id,
                     reason: public_error_message(&error),
-                }
-            }
-            OrderedRequestResult::Unavailable(_) => return,
-            OrderedRequestResult::Abandoned => Event::ModeSwitchFailed {
-                mode_id,
-                reason: "Mode response was not observed".into(),
-            },
+                },
+            ),
+            OrderedRequestResult::Refused(error) => (
+                sender.historical(),
+                Event::ModeSwitchFailed {
+                    mode_id,
+                    reason: public_error_message(&error),
+                },
+            ),
+            OrderedRequestResult::Unavailable(_) | OrderedRequestResult::Abandoned => (
+                sender.historical(),
+                Event::ModeSwitchFailed {
+                    mode_id,
+                    reason: "Mode response was not observed".into(),
+                },
+            ),
         };
-        let _ = event_tx.send(event).await;
-    });
+        let _ = sender.send(event).await;
+        Ok(())
+    };
+    if refused {
+        tokio::spawn(async move {
+            let _ = publish.await;
+        });
+    } else if let Err(error) = connection.spawn(publish) {
+        warn!(target: "acp.protocol", %error, "mode response task could not be admitted");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_config_and_mode_hold_fresh_until_native_result_is_applied() {
+        use crate::acp::acp_client::test_helpers::SdkTestOptions;
+        use crate::acp::establishment::{
+            AcpEstablishment, EstablishmentOrigin, EstablishmentTarget,
+        };
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use serde_json::json;
+        use std::future::Future;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        async fn bounded<T>(future: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(15), future)
+                .await
+                .expect("actual managed config/Fresh boundary")
+        }
+
+        fn durable_row(id: &str) -> crate::session::Instance {
+            crate::session::Storage::open_unwatched("test")
+                .unwrap()
+                .load_instances_complete()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .expect("genuine managed row")
+        }
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for case in ["config", "mode-config", "mode-legacy"] {
+                    let directory = scope.tempdir();
+                    let (write_pending, writing) = oneshot::channel();
+                    scope.configure_sdk(SdkTestOptions {
+                        fresh_write_pending: Some(write_pending),
+                        ..Default::default()
+                    });
+                    let option = |value: &str| {
+                        let mut option = json!({
+                            "id":"test-option", "name":"Test option", "type":"select",
+                            "currentValue":value,
+                            "options":[{"value":"old","name":"Old"},{"value":"new","name":"New"}]
+                        });
+                        if case == "mode-config" {
+                            option["category"] = json!("mode");
+                        }
+                        option
+                    };
+                    let initial_option = option("old");
+                    let applied_option = option("new");
+                    let (setter_seen, setter_received) = oneshot::channel();
+                    let (fresh_seen, fresh_received) = oneshot::channel();
+                    let (mut setter_seen, mut fresh_seen) = (Some(setter_seen), Some(fresh_seen));
+                    let mut news = 0;
+                    let (config, native) = scope.native_peer(
+                        directory.path().into(),
+                        "codex",
+                        "codex",
+                        move |request| {
+                            let id = request.get("id")?;
+                            match request["method"].as_str().unwrap() {
+                                "initialize" => Some(json!({"jsonrpc":"2.0","id":id,"result":{
+                                    "protocolVersion":1,"agentCapabilities":{}
+                                }})),
+                                "session/new" => {
+                                    news += 1;
+                                    match news {
+                                        1 => {
+                                            let mut result = json!({"sessionId":"config-old"});
+                                            if case == "mode-legacy" {
+                                                result["modes"] = json!({
+                                                    "currentModeId":"old",
+                                                    "availableModes":[
+                                                        {"id":"old","name":"Old"},
+                                                        {"id":"new","name":"New"}
+                                                    ]
+                                                });
+                                            } else {
+                                                result["configOptions"] = json!([initial_option]);
+                                            }
+                                            Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                                        }
+                                        2 => {
+                                            fresh_seen.take().unwrap().send(id.clone()).unwrap();
+                                            None
+                                        }
+                                        _ => panic!("Fresh cannot issue another Native New"),
+                                    }
+                                }
+                                "session/set_config_option" | "session/set_mode" => {
+                                    let expected = if case == "mode-legacy" {
+                                        "session/set_mode"
+                                    } else {
+                                        "session/set_config_option"
+                                    };
+                                    assert_eq!(request["method"], expected);
+                                    assert_eq!(request["params"]["sessionId"], "config-old");
+                                    setter_seen.take().unwrap().send(id.clone()).unwrap();
+                                    None
+                                }
+                                other => panic!("unexpected Native operation: {other}"),
+                            }
+                        },
+                    );
+                    let mut client = scope.spawn(config, case).await.unwrap();
+                    bounded(client.ready()).await;
+                    let actual = client.actual();
+                    let owner = actual.connected_runner().unwrap();
+                    let original = actual
+                        .establishment_projection()
+                        .unwrap()
+                        .receipt_snapshot()
+                        .unwrap();
+                    let predecessor = durable_row(&client.id).acp_establishment;
+                    if case == "config" {
+                        client
+                            .set_config_option("test-option", "new", None)
+                            .await
+                            .unwrap();
+                    } else {
+                        client.set_mode("new", None).await.unwrap();
+                    }
+                    let setter_id = bounded(setter_received).await.unwrap();
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                    let proposal = client.prepare_reset(deadline).await;
+                    let (reset_completed, reset_result) = oneshot::channel();
+                    let reset = scope.spawn_helper(async move {
+                        let result = actual
+                            .reset_session("clear", proposal, deadline, deadline)
+                            .await;
+                        let _ = reset_completed.send(result);
+                    });
+                    // This signal comes from the actual writer's first Pending poll.
+                    // The peer still owns the unanswered setter on this same runner.
+                    bounded(writing).await.unwrap();
+                    assert_eq!(durable_row(&client.id).acp_establishment, predecessor);
+                    assert_eq!(client.actual().connected_runner(), Some(owner));
+                    assert_eq!(
+                        native
+                            .requests()
+                            .iter()
+                            .filter(|method| *method == "session/new")
+                            .count(),
+                        1
+                    );
+
+                    let result = if case == "mode-legacy" {
+                        json!({})
+                    } else {
+                        json!({"configOptions":[applied_option]})
+                    };
+                    native
+                        .send(json!({"jsonrpc":"2.0","id":setter_id,"result":result}))
+                        .await;
+                    bounded(async {
+                        loop {
+                            match client
+                                .next_event()
+                                .await
+                                .expect("actual managed publication")
+                            {
+                                Event::ConfigOptionsUpdated { options }
+                                    if case == "config"
+                                        && options.iter().any(|option| {
+                                            option.id == "test-option"
+                                                && option.current_value == "new"
+                                        }) =>
+                                {
+                                    break
+                                }
+                                Event::CurrentModeChanged { current_mode_id }
+                                    if case != "config" && current_mode_id == "new" =>
+                                {
+                                    break
+                                }
+                                Event::ConfigOptionSwitchFailed { reason, .. }
+                                | Event::ModeSwitchFailed { reason, .. } => panic!("{reason}"),
+                                Event::AcpConnectionUnavailable { .. } => {
+                                    panic!("original physical Native owner must remain live")
+                                }
+                                Event::AgentStartupError { message, .. } => panic!("{message}"),
+                                _ => {}
+                            }
+                        }
+                    })
+                    .await;
+                    // Fresh may issue now, but cannot replace the snapshot until its
+                    // actual Native response below. Inspect the applied setter first.
+                    let fresh_id = bounded(fresh_received).await.unwrap();
+                    let snapshot = client
+                        .app_state()
+                        .session_service
+                        .fold_control_state(&client.id)
+                        .await
+                        .unwrap();
+                    if case == "config" {
+                        assert!(snapshot
+                            .config_options
+                            .iter()
+                            .any(|option| option.id == "test-option"
+                                && option.current_value == "new"));
+                    } else {
+                        assert_eq!(snapshot.current_mode_id.as_deref(), Some("new"));
+                    }
+                    native
+                        .send(json!({"jsonrpc":"2.0","id":fresh_id,
+                    "result":{"sessionId":"config-fresh"}}))
+                        .await;
+                    assert!(matches!(bounded(reset_result).await.unwrap().unwrap(),
+                    crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id }
+                        if new_acp_session_id == "config-fresh"));
+                    bounded(reset).await.unwrap();
+                    bounded(client.ready()).await;
+                    let row = durable_row(&client.id);
+                    let receipt = client
+                        .actual()
+                        .establishment_projection()
+                        .unwrap()
+                        .receipt_snapshot()
+                        .unwrap();
+                    assert_eq!(client.actual().connected_runner(), Some(owner));
+                    assert_eq!(receipt.owner, owner);
+                    assert_ne!(receipt.attempt.id, original.attempt.id);
+                    assert_eq!(receipt.attempt.origin, EstablishmentOrigin::Fresh);
+                    assert_eq!(receipt.attempt.target, EstablishmentTarget::New);
+                    assert_eq!(row.acp_session_id.as_deref(), Some("config-fresh"));
+                    assert!(matches!(row.acp_establishment,
+                    Some(AcpEstablishment::Applied { attempt_id })
+                        if attempt_id == receipt.attempt.id));
+                    let setter = if case == "mode-legacy" {
+                        "session/set_mode"
+                    } else {
+                        "session/set_config_option"
+                    };
+                    assert_eq!(
+                        native.requests(),
+                        ["initialize", "session/new", setter, "session/new"]
+                    );
+                    client.shutdown().await.unwrap();
+                }
+            })
+        })
+        .await;
+    }
 
     /// #3403: `ModelConfig` maps explicitly, without the unknown-variant warning.
     #[test]

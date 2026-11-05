@@ -1000,7 +1000,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         ) {
             return Ok(false);
         }
-        all_instances.push(instance.clone());
+        crate::acp::establishment::insert_created_instance(
+            all_instances,
+            &mut instance,
+            &storage,
+            crate::acp::establishment::CreationAdmission::Later,
+        )?;
         if !instance.group_path.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(all_instances, groups);
             group_tree.create_group(&instance.group_path);

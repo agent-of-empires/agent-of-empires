@@ -42,13 +42,69 @@ fn strip_transcript_path(event: &Event) -> Cow<'_, Event> {
     }
 }
 
-/// One frame on the per-AppState structured view broadcast channel: the structured view
-/// session id plus the typed structured view Event.
+/// Permitted current-state effects, independent of conversation visibility.
+/// Temporal observation and session identity never prove an operation outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpEventScope {
+    HistoryOnly,
+    SessionCurrent,
+    OperationCurrent,
+}
+
+/// Host observation identity, never a native prompt ID or an operation ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AcpPromptWindowId(uuid::Uuid);
+
+impl AcpPromptWindowId {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AcpPromptObservation {
+    NoWrittenPrompt,
+    Written { window_id: AcpPromptWindowId },
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpOriginalRequestResult {
+    /// Requires the original operation's genuinely correlated positive Native result.
+    Succeeded,
+    /// Ends only the original waiter; this does not prove Native state was unchanged.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpOperationMetadata {
+    pub correlation: crate::acp::establishment::NativeOperationCorrelation,
+    /// Absent for admission/progress. Correlation or scope alone is never an ACK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AcpOriginalRequestResult>,
+}
+
+/// Structured view broadcast with qualified control and display metadata.
 #[derive(Debug, Clone)]
 pub struct AcpBroadcastFrame {
     pub session_id: String,
     pub seq: u64,
     pub event: Arc<Event>,
+    pub scope: AcpEventScope,
+    pub operation: Option<AcpOperationMetadata>,
+    pub prompt_observation: Option<AcpPromptObservation>,
+    /// Uncertain attribution for this exact original terminal, not HasOutput.
+    pub output_uncertainty: Option<AcpPromptWindowId>,
+    pub clear_after_seq: Option<u64>,
+    pub resource_ref: Option<uuid::Uuid>,
+    pub(crate) native_origin: Option<crate::acp::state::NativeEventOrigin>,
+    pub(crate) availability_denial: bool,
+    pub(crate) host_action: bool,
     /// Which installed worker produced this frame, for in-process
     /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
@@ -60,32 +116,123 @@ pub struct AcpBroadcastFrame {
     pub sidebar_status: Option<crate::session::Status>,
 }
 
+impl AcpBroadcastFrame {
+    pub(crate) fn view_metadata(&self) -> crate::acp::event_sender::EventMetadata {
+        use crate::acp::event_sender::{EventMetadata, EventScope};
+        EventMetadata {
+            scope: match self.scope {
+                AcpEventScope::HistoryOnly => EventScope::HistoryOnly,
+                AcpEventScope::SessionCurrent => EventScope::SessionCurrent,
+                AcpEventScope::OperationCurrent => EventScope::OperationCurrent,
+            },
+            native_origin: self.native_origin,
+            operation: self.operation,
+            prompt_observation: self.prompt_observation,
+            output_uncertainty: self.output_uncertainty,
+            clear_after_seq: self.clear_after_seq,
+            resource_ref: self.resource_ref,
+            availability_denial: self.availability_denial,
+            host_action: self.host_action,
+            ..EventMetadata::history()
+        }
+    }
+
+    pub(crate) fn from_qualified(
+        session_id: String,
+        seq: u64,
+        event: Arc<Event>,
+        metadata: &crate::acp::event_sender::EventMetadata,
+        worker_generation: Option<u64>,
+        native_subject: Option<crate::acp::state::NativeEventSubject>,
+        sidebar_status: Option<crate::session::Status>,
+    ) -> Self {
+        Self {
+            session_id,
+            seq,
+            native_subject: native_subject.or_else(|| event.native_subject()),
+            event,
+            scope: metadata.scope.public(),
+            operation: metadata.operation,
+            prompt_observation: metadata.prompt_observation,
+            output_uncertainty: metadata.output_uncertainty,
+            clear_after_seq: metadata.clear_after_seq,
+            resource_ref: metadata.resource_ref,
+            native_origin: metadata.native_origin,
+            availability_denial: metadata.availability_denial,
+            host_action: metadata.host_action,
+            worker_generation,
+            sidebar_status,
+        }
+    }
+}
+
 impl Serialize for AcpBroadcastFrame {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("AcpBroadcastFrame", 3)?;
+        let fields = 4
+            + usize::from(self.operation.is_some())
+            + usize::from(self.prompt_observation.is_some())
+            + usize::from(self.output_uncertainty.is_some())
+            + usize::from(self.clear_after_seq.is_some())
+            + usize::from(self.resource_ref.is_some());
+        let mut s = serializer.serialize_struct("AcpBroadcastFrame", fields)?;
         s.serialize_field("session_id", &self.session_id)?;
         s.serialize_field("seq", &self.seq)?;
+        s.serialize_field("scope", &self.scope)?;
         s.serialize_field("event", &*strip_transcript_path(&self.event))?;
+        if let Some(operation) = self.operation {
+            s.serialize_field("operation", &operation)?;
+        }
+        if let Some(observation) = self.prompt_observation {
+            s.serialize_field("prompt_observation", &observation)?;
+        }
+        if let Some(window) = self.output_uncertainty {
+            s.serialize_field("output_uncertainty", &window)?;
+        }
+        if let Some(cut) = self.clear_after_seq {
+            s.serialize_field("clear_after_seq", &cut)?;
+        }
+        if let Some(resource) = self.resource_ref {
+            s.serialize_field("resource_ref", &resource)?;
+        }
         s.end()
     }
 }
 
 impl<'de> Deserialize<'de> for AcpBroadcastFrame {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Mirror of the Serialize impl.
         #[derive(Deserialize)]
         struct Wire {
             session_id: String,
             seq: u64,
+            scope: AcpEventScope,
             event: Event,
+            operation: Option<AcpOperationMetadata>,
+            prompt_observation: Option<AcpPromptObservation>,
+            output_uncertainty: Option<AcpPromptWindowId>,
+            clear_after_seq: Option<u64>,
+            resource_ref: Option<uuid::Uuid>,
         }
         let w = Wire::deserialize(deserializer)?;
+        if w.clear_after_seq
+            .is_some_and(|cut| cut >= w.seq || !matches!(w.event, Event::SessionCleared))
+        {
+            return Err(serde::de::Error::custom("invalid conversation display cut"));
+        }
         Ok(AcpBroadcastFrame {
             native_subject: None,
             session_id: w.session_id,
             seq: w.seq,
+            scope: w.scope,
             event: Arc::new(w.event),
+            operation: w.operation,
+            prompt_observation: w.prompt_observation,
+            output_uncertainty: w.output_uncertainty,
+            clear_after_seq: w.clear_after_seq,
+            resource_ref: w.resource_ref,
+            native_origin: None,
+            availability_denial: false,
+            host_action: false,
             worker_generation: None,
             sidebar_status: None,
         })
@@ -330,13 +477,16 @@ mod tests {
 
     #[test]
     fn broadcast_frame_strips_transcript_paths() {
-        let frame = |event: Event| AcpBroadcastFrame {
-            native_subject: None,
-            session_id: "s-1".into(),
-            seq: 1,
-            event: Arc::new(event),
-            worker_generation: None,
-            sidebar_status: None,
+        let frame = |event: Event| {
+            AcpBroadcastFrame::from_qualified(
+                "s-1".into(),
+                1,
+                Arc::new(event),
+                &crate::acp::event_sender::EventMetadata::history(),
+                None,
+                None,
+                None,
+            )
         };
         let agent = frame(Event::BackgroundAgentLaunched {
             agent_id: "a1".into(),

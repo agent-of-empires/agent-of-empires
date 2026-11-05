@@ -2,16 +2,15 @@
 // File listing skip rules, log-tail windowing and config-option rejection are pinned by Rust unit and
 // integration tests (list_files_sorts_skips_and_caps, read_log_tail_windows_and_partial_lines, acp_model_respawn).
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { test, expect } from "../helpers/liveTest";
+import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { SYSTEMD_OFF, appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 import {
   postAcp,
   replayJson,
   seedAcpSession,
   waitForAcpReady,
-  spawnAcpAgent,
   startAcpSession,
   waitForReplayContains,
 } from "../helpers/acp";
@@ -24,9 +23,23 @@ const expect2xx = (res: Response) => {
 const isStructured = async (baseUrl: string, sessionId: string) =>
   (await listSessions(baseUrl)).find((s) => s.id === sessionId)?.view === "structured";
 
+async function seedNativeTranscript(serve: ServeHandle, sessionId: string) {
+  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+  expect(typeof session?.acp_session_id).toBe("string");
+  expect(session?.acp_session_id).not.toBe("");
+  expect(typeof session?.project_path).toBe("string");
+  const cwd = realpathSync(session!.project_path as string);
+  const dir = join(serve.home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9-]/g, "-"));
+  mkdirSync(dir, { recursive: true });
+  const message = { role: "user", content: [{ type: "text", text: "view handoff" }] };
+  writeFileSync(join(dir, `${session!.acp_session_id}.jsonl`), `${JSON.stringify({ type: "user", cwd, message })}\n`);
+  return session!.acp_session_id as string;
+}
+
 test("view switch round-trips between tmux and structured view", async ({ spawnServe }) => {
-  const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "acp-view" });
-  // `aoe add` defaults to tmux.
+  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-view" });
+  const nativeSessionId = await seedNativeTranscript(serve, sessionId);
+  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBeTruthy();
   expect(await isStructured(serve.baseUrl, sessionId)).toBeFalsy();
 
   const spawnBeforeEnable = await postAcp(serve.baseUrl, sessionId, "/spawn", {});
@@ -50,17 +63,24 @@ test("view switch round-trips between tmux and structured view", async ({ spawnS
     const again = await postAcp(serve.baseUrl, sessionId, path);
     expect(again.ok).toBeTruthy();
     expect(((await again.json()) as { view?: string }).view === "structured").toBe(structured);
+    if (structured) {
+      await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+      expect((await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id).toBe(nativeSessionId);
+    }
   }
 });
 
 test("DELETE /acp refuses terminal view and durably stops a structured worker", async ({ spawnServe }) => {
-  const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "acp-shutdown" });
+  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-shutdown" });
+  const nativeSessionId = await seedNativeTranscript(serve, sessionId);
+  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBeTruthy();
   const shutdown = () => fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp`, { method: "DELETE" });
   expect((await shutdown()).status).toBe(409);
   expect(await isStructured(serve.baseUrl, sessionId)).toBeFalsy();
 
   expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBeTruthy();
   await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  expect((await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id).toBe(nativeSessionId);
   expect((await shutdown()).status).toBe(204);
 
   const stoppedState = async () => {
@@ -84,10 +104,7 @@ test("DELETE /acp refuses terminal view and durably stops a structured worker", 
 });
 
 test("session/mode round-trips through the fake ACP agent", async ({ spawnServe }) => {
-  const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "mode-trace" });
-  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBeTruthy();
-  // Races enable's own spawn: 409 or 2xx both mean the supervisor registered the session.
-  await spawnAcpAgent(serve.baseUrl, sessionId);
+  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "mode-trace" });
   expect2xx(await postAcp(serve.baseUrl, sessionId, "/mode", { mode_id: "plan" }));
   await waitForReplayContains(serve.baseUrl, sessionId, ["current_mode_changed", "CurrentModeChanged"]);
 });
@@ -102,10 +119,7 @@ test.describe("config options", () => {
     title: string,
     extraEnv?: Record<string, string>,
   ) {
-    const started = await seedAcpSession(spawnServe, { title, extraEnv });
-    expect((await postAcp(started.serve.baseUrl, started.sessionId, "/enable")).ok).toBeTruthy();
-    await spawnAcpAgent(started.serve.baseUrl, started.sessionId);
-    return started;
+    return startAcpSession(spawnServe, { title, extraEnv });
   }
 
   test("initial snapshot lands in replay and set_config_option round-trips for model and effort", async ({

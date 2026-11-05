@@ -1,18 +1,17 @@
-//! Handshake-only ACP catalog probe (plugin-picker model-discovery fix).
+//! Disposable standalone ACP catalog probe (plugin-picker model-discovery fix).
 
 use std::time::Duration;
 
-use crate::acp::acp_client::{AcpClient, SpawnConfig};
-use crate::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::{probe_option_catalog, SpawnConfig};
 use crate::acp::AgentRegistry;
 
-/// Whole-spawn bound: initialize + `session/new` must complete within this or
+/// Whole-handshake bound: initialize + `session/new` must complete within this or
 /// the adapter is treated as undiscovered.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for the first `ConfigOptionsUpdated` after `session/new`.
+/// How long to wait for the first nonempty config snapshot after `session/new`.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Probe `agent`'s advertised option catalog via a handshake-only ACP session
+/// Probe `agent`'s advertised option catalog via a disposable standalone ACP session
 /// and record it into [`crate::acp::option_catalog`].
 pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     // Registry agents only.
@@ -32,8 +31,8 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         }
     }
 
-    // Throwaway absolute cwd: `session/new` requires an existing absolute
-    // directory, but a handshake writes nothing to it.
+    // Throwaway absolute cwd: `session/new` requires an existing absolute directory.
+    // This session has no managed identity and grants no filesystem or responder authority.
     let tmp = tempfile::tempdir()?;
 
     let config = SpawnConfig {
@@ -68,49 +67,19 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         base_host_environment: Vec::new(),
     };
 
-    // Probe-scoped id so it never collides with a real structured-view worker.
-    let session_id = AcpSessionId(format!("__probe__{agent}"));
-
-    let mut client =
-        match tokio::time::timeout(SPAWN_TIMEOUT, AcpClient::spawn(config, session_id.clone()))
-            .await
-        {
-            Ok(Ok(client)) => client,
-            Ok(Err(e)) => {
-                tracing::debug!(target: "acp.probe", agent, error = %e, "probe handshake failed");
-                return Ok(false);
-            }
-            Err(_) => {
-                tracing::debug!(target: "acp.probe", agent, "probe handshake timed out");
-                return Ok(false);
-            }
-        };
-
-    let recorded = tokio::time::timeout(DRAIN_TIMEOUT, drain_first_snapshot(&mut client, agent))
-        .await
-        .unwrap_or(false);
-
-    let _ = client.close_session().await;
-    let _ = client.shutdown().await;
-    Ok(recorded)
-}
-
-/// Drain events until the first non-empty `ConfigOptionsUpdated`, record it, and
-/// return `true`.
-async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
-    while let Some(event) = client.next_event().await {
-        if let Event::ConfigOptionsUpdated { options } = event {
-            if options.is_empty() {
-                continue;
-            }
-            let agent = agent.to_string();
-            let now = chrono::Utc::now().to_rfc3339();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::acp::option_catalog::record(&agent, &options, now)
-            })
-            .await;
-            return true;
+    let options = match probe_option_catalog(config, SPAWN_TIMEOUT, DRAIN_TIMEOUT).await {
+        Ok(Some(options)) => options,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            tracing::debug!(target: "acp.probe", agent, error = %error, "probe handshake failed");
+            return Ok(false);
         }
-    }
-    false
+    };
+    let agent = agent.to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    Ok(tokio::task::spawn_blocking(move || {
+        crate::acp::option_catalog::record(&agent, &options, now).is_ok()
+    })
+    .await
+    .unwrap_or(false))
 }

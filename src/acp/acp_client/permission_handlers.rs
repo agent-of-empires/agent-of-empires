@@ -6,6 +6,7 @@ use crate::acp::approvals::{
     is_choice_list, ApprovalDecision, ApprovalOption, ApprovalOptionKind, Nonce,
 };
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
+use crate::acp::event_sender::EventSender;
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
 use agent_client_protocol::schema::v1::{
@@ -13,8 +14,11 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome,
 };
+use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{trace, warn};
 
 use super::fs_handlers::enter_timestamp_ns;
@@ -112,11 +116,12 @@ fn decision_for_option(
 /// Pairs the start frame `handle_permission_request` emits; without it a
 /// denied tool hangs on "running" until the turn ends (#1713).
 pub(super) async fn emit_permission_denied(
-    event_tx: &mpsc::Sender<Event>,
+    event_tx: &EventSender,
     tool_call_id: &str,
     content: &str,
 ) {
     let _ = event_tx
+        .historical()
         .send(Event::ToolCallCompleted {
             tool_call_id: tool_call_id.to_string(),
             is_error: true,
@@ -131,7 +136,7 @@ pub(super) async fn emit_permission_denied(
 /// Clear the approval card and close the start frame `handle_permission_request`
 /// emitted. Neither a cancel nor an unmatched option produces an agent
 /// completion, so nothing else would terminate the tool card (#1713).
-async fn cancel_approval(event_tx: &mpsc::Sender<Event>, nonce: &Nonce, tool_call_id: &str) {
+async fn cancel_approval(event_tx: &EventSender, nonce: &Nonce, tool_call_id: &str) {
     let _ = event_tx
         .send(Event::ApprovalResolved {
             nonce: nonce.clone(),
@@ -143,10 +148,11 @@ async fn cancel_approval(event_tx: &mpsc::Sender<Event>, nonce: &Nonce, tool_cal
 
 pub(super) async fn handle_permission_request(
     request: RequestPermissionRequest,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: EventSender,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
-    tool_context_cache: ToolContextCache,
+    tool_context_cache: Option<ToolContextCache>,
+    native_callback: Option<Arc<super::session_identity::CapturedCallback>>,
 ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -163,10 +169,12 @@ pub(super) async fn handle_permission_request(
         .title
         .clone()
         .unwrap_or_else(|| "tool call".into());
-    let cached_raw_input = tool_context_cache
-        .lock()
-        .expect("tool context cache mutex poisoned")
-        .get(&tool_call_id);
+    let cached_raw_input = tool_context_cache.as_ref().and_then(|cache| {
+        cache
+            .lock()
+            .expect("tool context cache mutex poisoned")
+            .get(&tool_call_id)
+    });
     // Gemini's confirm-required tools routinely carry no raw_input (#1713), and
     // opencode reuses a tool_call_id whose earlier update had the command, so
     // merge the cached context before emitting events.
@@ -195,6 +203,7 @@ pub(super) async fn handle_permission_request(
     // approved tool would have no transcript card. The reducer dedupes
     // tool_start by id, so a later real start frame merges in place (#1713).
     let _ = event_tx
+        .historical()
         .send(Event::ToolCallStarted {
             tool_call: tool_call.clone(),
         })
@@ -212,19 +221,54 @@ pub(super) async fn handle_permission_request(
     }
     let nonce = approval.nonce.clone();
 
+    let event = Event::ApprovalRequested { approval };
+    let (publication, event) = match &native_callback {
+        Some(callback) => (
+            Some(Arc::new(super::pending::PendingRequestPublication::new(
+                Arc::new(event),
+                Arc::clone(callback),
+                callback.connection.clone(),
+                &pending,
+            ))),
+            None,
+        ),
+        None => (None, Some(event)),
+    };
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
-    pending.lock().await.insert(
-        nonce.clone(),
-        PendingResponder {
-            resolver: PendingResolver::Approval(resolve_tx),
-        },
-    );
-
-    if event_tx
-        .send(Event::ApprovalRequested { approval })
-        .await
-        .is_err()
-    {
+    let published = match event_tx.reserve().await {
+        Ok(permit) => {
+            let (mut responders, _decision) = match &publication {
+                Some(publication) => {
+                    let (responders, native, registry) = publication
+                        .lock_responders_for_publication(&pending)
+                        .await
+                        .map_err(|_| super::session_identity::SessionIngress::request_refused())?;
+                    (responders, Some((native, registry)))
+                }
+                None => (pending.lock().await, None),
+            };
+            responders.insert(
+                nonce.clone(),
+                PendingResponder {
+                    resolver: PendingResolver::Approval(resolve_tx),
+                    publication: publication.clone(),
+                },
+            );
+            if let Some(publication) = &publication {
+                permit.send_pending_request(Arc::clone(publication));
+            } else {
+                permit.send(event.expect("non-Native request retains its owned payload"));
+            }
+            true
+        }
+        Err(_) => false,
+    };
+    if !published {
+        if publication.is_some() {
+            return Err(agent_client_protocol::util::internal_error(
+                "native approval request could not be published",
+            ));
+        }
         // Receiver gone: cancel.
         pending.lock().await.remove(&nonce);
         trace!(
@@ -256,6 +300,15 @@ pub(super) async fn handle_permission_request(
     // a foreign `#[non_exhaustive]` enum it doesn't fully own.
     let (outcome, outcome_label): (RequestPermissionOutcome, &'static str) = match resolve_rx.await
     {
+        Err(_)
+            if publication
+                .as_ref()
+                .is_some_and(|publication| !publication.published_at(u64::MAX)) =>
+        {
+            return Err(agent_client_protocol::util::internal_error(
+                "native approval request could not be published",
+            ));
+        }
         Ok(ApprovalResolutionMessage::Decision {
             decision,
             option_id: requested,
@@ -317,6 +370,12 @@ pub(super) async fn handle_permission_request(
         outcome = outcome_label,
         "responding to permission request"
     );
+    if let Some(publication) = &publication {
+        publication
+            .wait_for_publication_guard()
+            .await
+            .map_err(|_| super::session_identity::SessionIngress::request_refused())?;
+    }
     Ok(RequestPermissionResponse::new(outcome))
 }
 
@@ -325,8 +384,9 @@ pub(super) async fn handle_permission_request(
 /// both fall back to a graceful response so the agent's turn never hangs.
 pub(super) async fn handle_elicitation_request(
     request: CreateElicitationRequest,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: EventSender,
     pending: PendingResponders,
+    native_callback: Option<Arc<super::session_identity::CapturedCallback>>,
 ) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
@@ -338,42 +398,86 @@ pub(super) async fn handle_elicitation_request(
             return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };
+    let event = Event::ElicitationRequested {
+        elicitation: elicitation.clone(),
+    };
+    let (publication, event) = match &native_callback {
+        Some(callback) => (
+            Some(Arc::new(super::pending::PendingRequestPublication::new(
+                Arc::new(event),
+                Arc::clone(callback),
+                callback.connection.clone(),
+                &pending,
+            ))),
+            None,
+        ),
+        None => (None, Some(event)),
+    };
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ElicitationResolutionMessage>();
-    pending.lock().await.insert(
-        nonce.clone(),
-        PendingResponder {
-            resolver: PendingResolver::Elicitation {
-                elicitation: Box::new(elicitation.clone()),
-                resolver: resolve_tx,
-            },
-        },
-    );
-
-    if event_tx
-        .send(Event::ElicitationRequested {
-            elicitation: elicitation.clone(),
-        })
-        .await
-        .is_err()
-    {
-        pending.lock().await.remove(&nonce);
+    // Request purpose was frozen at native framing, before any queue or wait.
+    let published = match event_tx.reserve().await {
+        Ok(permit) => {
+            let (mut responders, _decision) = match &publication {
+                Some(publication) => {
+                    let (responders, native, registry) = publication
+                        .lock_responders_for_publication(&pending)
+                        .await
+                        .map_err(|_| super::session_identity::SessionIngress::request_refused())?;
+                    (responders, Some((native, registry)))
+                }
+                None => (pending.lock().await, None),
+            };
+            responders.insert(
+                nonce.clone(),
+                PendingResponder {
+                    resolver: PendingResolver::Elicitation {
+                        elicitation: Box::new(elicitation.clone()),
+                        resolver: resolve_tx,
+                    },
+                    publication: publication.clone(),
+                },
+            );
+            if let Some(publication) = &publication {
+                permit.send_pending_request(Arc::clone(publication));
+            } else {
+                permit.send(event.expect("non-Native request retains its owned payload"));
+            }
+            true
+        }
+        Err(_) => false,
+    };
+    if !published {
+        if publication.is_some() {
+            return Err(agent_client_protocol::util::internal_error(
+                "native elicitation request could not be published",
+            ));
+        }
         return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
-    // `resolve_elicitation` validates before sending, so what arrives is
-    // already a valid response. A dropped resolver cancels the tool call.
+    // A journal failure is a host refusal, not a user cancellation.
     let ElicitationResolutionMessage {
         response,
         outcome,
         answers,
-    } = resolve_rx
-        .await
-        .unwrap_or_else(|_| ElicitationResolutionMessage {
+    } = match resolve_rx.await {
+        Ok(resolution) => resolution,
+        Err(_)
+            if publication
+                .as_ref()
+                .is_some_and(|publication| !publication.published_at(u64::MAX)) =>
+        {
+            return Err(agent_client_protocol::util::internal_error(
+                "native elicitation request could not be published",
+            ));
+        }
+        Err(_) => ElicitationResolutionMessage {
             response: CreateElicitationResponse::new(ElicitationAction::Cancel),
             outcome: ElicitationOutcome::Cancelled,
             answers: Vec::new(),
-        });
+        },
+    };
 
     let _ = event_tx
         .send(Event::ElicitationResolved {
@@ -383,6 +487,13 @@ pub(super) async fn handle_elicitation_request(
         })
         .await;
 
+    // A user answer must not become a decision for an owner retired while waiting.
+    if let Some(publication) = &publication {
+        publication
+            .wait_for_publication_guard()
+            .await
+            .map_err(|_| super::session_identity::SessionIngress::request_refused())?;
+    }
     Ok(response)
 }
 
@@ -513,18 +624,25 @@ mod tests {
             ));
         let handle = tokio::spawn(handle_permission_request(
             request,
-            event_tx,
+            event_tx.into(),
             pending.clone(),
             &crate::acp::agent_profiles::GEMINI,
-            cache,
+            Some(cache),
+            None,
         ));
         let nonce = loop {
-            if let Event::ApprovalRequested { approval } = event_rx.recv().await.expect("events") {
-                break approval.nonce;
+            let crate::acp::event_sender::SdkEvent::Data(data) =
+                event_rx.recv().await.expect("events")
+            else {
+                panic!("unexpected control event");
+            };
+            if let Event::ApprovalRequested { approval } = data.event.as_ref() {
+                break approval.nonce.clone();
             }
         };
         // Generic answer: Allow with no option id, as the home dialog sends.
-        let PendingResponder { resolver } = pending.lock().await.remove(&nonce).expect("parked");
+        let PendingResponder { resolver, .. } =
+            pending.lock().await.remove(&nonce).expect("parked");
         let PendingResolver::Approval(tx) = resolver else {
             panic!("approval resolver expected");
         };
@@ -541,10 +659,13 @@ mod tests {
         );
         // The card closes on Cancelled, never on an Allow.
         loop {
-            if let Event::ApprovalResolved { decision, .. } =
+            let crate::acp::event_sender::SdkEvent::Data(data) =
                 event_rx.recv().await.expect("resolution event")
-            {
-                assert_eq!(decision, ApprovalDecision::Cancelled);
+            else {
+                panic!("unexpected control event");
+            };
+            if let Event::ApprovalResolved { decision, .. } = data.event.as_ref() {
+                assert_eq!(*decision, ApprovalDecision::Cancelled);
                 break;
             }
         }
@@ -593,20 +714,547 @@ mod tests {
                 ));
             let handle = tokio::spawn(handle_permission_request(
                 request,
-                event_tx,
+                event_tx.into(),
                 pending,
                 &crate::acp::agent_profiles::CLAUDE,
-                cache,
+                Some(cache),
+                None,
             ));
-            let approval = loop {
-                if let Event::ApprovalRequested { approval } =
+            let has_plan = loop {
+                let crate::acp::event_sender::SdkEvent::Data(data) =
                     event_rx.recv().await.expect("events")
-                {
-                    break approval;
+                else {
+                    panic!("unexpected control event");
+                };
+                if let Event::ApprovalRequested { approval } = data.event.as_ref() {
+                    break approval.plan.is_some();
                 }
             };
             handle.abort();
-            assert_eq!(approval.plan.is_some(), want_plan, "{title}");
+            assert_eq!(has_plan, want_plan, "{title}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_native_unpublished_decisions_refuse_without_user_outcomes() {
+        use crate::acp::supervisor::test_support::managed::{with_managed, ManagedClient};
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use serde_json::json;
+        use std::time::Duration;
+
+        struct PublicationFault {
+            state: Arc<crate::server::AppState>,
+            id: String,
+            status: Option<crate::session::Status>,
+            sqlite: bool,
+        }
+
+        impl PublicationFault {
+            fn restore(&mut self) -> anyhow::Result<()> {
+                if let Some(status) = self.status {
+                    crate::session::Storage::open_unwatched("test")?.update(|rows, _| {
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.id == self.id)
+                            .ok_or(crate::session::SessionGone)?;
+                        anyhow::ensure!(
+                            row.status == crate::session::Status::Stopped || row.status == status,
+                            crate::session::LifecycleReservationError::Superseded
+                        );
+                        row.status = status;
+                        Ok(())
+                    })?;
+                    self.status = None;
+                }
+                if self.sqlite {
+                    self.state
+                        .acp_event_store
+                        .test_conn()
+                        .execute_batch("DROP TRIGGER IF EXISTS reject_pending_request;")?;
+                    self.sqlite = false;
+                }
+                Ok(())
+            }
+        }
+
+        impl Drop for PublicationFault {
+            fn drop(&mut self) {
+                if let Err(error) = self.restore() {
+                    eprintln!("owned publication fault restoration failed: {error}");
+                }
+            }
+        }
+
+        async fn assert_unresolvable(client: &ManagedClient, nonce: &Nonce, question: bool) {
+            let state = State(client.app_state());
+            let path = Path((client.id.clone(), nonce.0.clone()));
+            let response = if question {
+                crate::server::api::resolve_elicitation(
+                    state,
+                    path,
+                    Ok(Json(
+                        serde_json::from_value(json!({
+                            "action": "accept", "answers": {"name": "Not published"}
+                        }))
+                        .unwrap(),
+                    )),
+                )
+                .await
+                .into_response()
+            } else {
+                crate::server::api::resolve_approval(
+                    state,
+                    path,
+                    Ok(Json(
+                        serde_json::from_value(json!({"decision": "Allow"})).unwrap(),
+                    )),
+                )
+                .await
+                .into_response()
+            };
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        with_managed(|scope| Box::pin(async move {
+            for original in [true, false] {
+                for question in [false, true] {
+                    for discard in [false, true] {
+                        tokio::time::timeout(Duration::from_secs(30), async {
+                            let directory = scope.tempdir();
+                            let sid = uuid::Uuid::new_v4().to_string();
+                            let callback_id = format!("callback-{sid}");
+                            let (constructor_tx, constructor_rx) = oneshot::channel();
+                            let (prompt_tx, prompt_rx) = oneshot::channel();
+                            let mut constructor_tx = Some(constructor_tx);
+                            let mut prompt_tx = Some(prompt_tx);
+                            let (config, mut native) = scope.native_peer(
+                                directory.path().into(), "codex", "codex", move |request| {
+                                    let id = request.get("id")?;
+                                    match request["method"].as_str().unwrap() {
+                                        "initialize" => Some(json!({"jsonrpc":"2.0","id":id,
+                                            "result":{"protocolVersion":1,"agentCapabilities":{}}})),
+                                        "session/new" => {
+                                            constructor_tx.take().unwrap().send(id.clone()).unwrap();
+                                            None
+                                        }
+                                        "session/prompt" => {
+                                            prompt_tx.take().unwrap().send(id.clone()).unwrap();
+                                            None
+                                        }
+                                        "session/cancel" => None,
+                                        other => panic!("unexpected Native operation: {other}"),
+                                    }
+                                },
+                            );
+                            let mut client = scope.spawn(config, "unpublished-decision").await.unwrap();
+                            let constructor_id = constructor_rx.await.unwrap();
+                            let mut prompt_id = None;
+                            if !original {
+                                native.send(json!({"jsonrpc":"2.0","id":constructor_id,
+                                    "result":{"sessionId":sid}})).await;
+                                client.ready().await;
+                                client.send_prompt("one explicit prompt", &[]).await.unwrap();
+                                prompt_id = Some(prompt_rx.await.unwrap());
+                            }
+                            let state = client.app_state();
+                            let actual = client.actual();
+                            let owner = actual.connected_runner().unwrap();
+                            let pause = client.pause_drain().await;
+                            let prefix = state.acp_event_store.highest_seq(&client.id);
+                            let params = if question {
+                                serde_json::to_value(CreateElicitationRequest::new(
+                                    agent_client_protocol::schema::v1::ElicitationFormMode::new(
+                                        agent_client_protocol::schema::v1::ElicitationSessionScope::new(sid.clone()),
+                                        agent_client_protocol::schema::v1::ElicitationSchema::new().string("name", true),
+                                    ),
+                                    "A question the host cannot publish",
+                                )).unwrap()
+                            } else {
+                                json!({"sessionId":sid,
+                                    "toolCall":{"toolCallId":"unpublished-tool","title":"Unpublished tool"},
+                                    "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]})
+                            };
+                            native.send(json!({"jsonrpc":"2.0","id":callback_id,
+                                "method":if question { "elicitation/create" } else { "session/request_permission" },
+                                "params":params})).await;
+                            // The real handler parked its real responder before the drain's dequeue.
+                            let (nonce, publication) = loop {
+                                let responders = actual.pending_responders.lock().await;
+                                if let Some((nonce, responder)) = responders.iter().next() {
+                                    break (nonce.clone(), responder.publication.clone().unwrap());
+                                }
+                                drop(responders);
+                                tokio::task::yield_now().await;
+                            };
+                            assert_eq!(publication.is_original(), original);
+                            assert!(!publication.published_at(u64::MAX));
+                            assert_unresolvable(&client, &nonce, question).await;
+                            let storage = crate::session::Storage::open_unwatched("test").unwrap();
+                            let status = storage.load_instances_complete().unwrap().into_iter()
+                                .find(|row| row.id == client.id).unwrap().status;
+                            let mut fault = PublicationFault {
+                                state: Arc::clone(&state),
+                                id: client.id.clone(),
+                                status: discard.then_some(status),
+                                sqlite: !discard,
+                            };
+                            if discard {
+                                storage.update(|rows, _| {
+                                    rows.iter_mut().find(|row| row.id == client.id).unwrap().status = crate::session::Status::Stopped;
+                                    Ok(())
+                                }).unwrap();
+                            } else {
+                                // Use the existing SQLite fault seam, not a sink that pretends to fail.
+                                state.acp_event_store.test_conn().execute_batch(
+                                    "CREATE TEMP TRIGGER reject_pending_request BEFORE INSERT ON acp_events
+                                     WHEN NEW.discriminant IN ('ApprovalRequested','ElicitationRequested')
+                                     BEGIN SELECT RAISE(ABORT,'pending request append fault'); END;"
+                                ).unwrap();
+                            }
+                            drop(pause);
+                            let refused = native.reply().await;
+                            assert_eq!(refused["id"], callback_id, "{refused}");
+                            assert_eq!(refused["error"]["code"], -32603, "{refused}");
+                            assert!(refused.get("result").is_none(), "host refusal is not a user decision: {refused}");
+                            assert!(actual.pending_responders.lock().await.is_empty());
+                            assert!(!publication.published_at(u64::MAX));
+                            assert_eq!(actual.connected_runner(), Some(owner));
+                            assert_unresolvable(&client, &nonce, question).await;
+                            if !discard {
+                                loop {
+                                    match client.next_event().await.expect("public append failure") {
+                                        Event::SessionNotice { severity, .. } if severity == "error" => {
+                                            break;
+                                        }
+                                        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } =>
+                                            panic!("unpublished request must not grant a UI capability"),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            fault.restore().unwrap();
+                            let reduced = state.session_service.fold_control_state(&client.id).await.unwrap();
+                            assert!(reduced.pending_approvals.is_empty());
+                            assert!(reduced.pending_elicitations.is_empty());
+                            assert!(reduced.original_decision_nonces.is_empty());
+                            let suffix = state.acp_event_store.replay_from(&client.id, prefix).unwrap();
+                            assert!(!suffix.iter().any(|stored| matches!(stored.event.as_ref(),
+                                Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+                                | Event::ApprovalResolved { .. } | Event::ElicitationResolved { .. }
+                                | Event::SessionContextReset { .. })));
+                            assert!(state.acp_supervisor.take_startup_requeues().is_empty());
+                            if original {
+                                assert!(!reduced.connection_ready);
+                                assert_eq!(native.requests(), ["initialize", "session/new"]);
+                                native.send(json!({"jsonrpc":"2.0","id":constructor_id,
+                                    "result":{"sessionId":sid}})).await;
+                                let ready = state.acp_supervisor.wait_until_ready(&client.id).await;
+                                assert!(matches!(ready,
+                                    Err(crate::acp::supervisor::SupervisorError::Establishment(
+                                        crate::acp::establishment::EstablishmentRefusal::Unconfirmed
+                                            | crate::acp::establishment::EstablishmentRefusal::Superseded
+                                    ))
+                                ), "an uncertified Original prefix cannot grant readiness");
+                                assert!(actual.establishment_projection().unwrap().applied().is_none());
+                            } else {
+                                assert_eq!(native.requests(), ["initialize", "session/new", "session/prompt"]);
+                                if !discard {
+                                    native.send(json!({"jsonrpc":"2.0","id":prompt_id.unwrap(),
+                                        "result":{"stopReason":"end_turn"}})).await;
+                                    while !matches!(client.next_event().await.expect("genuine prompt completion"), Event::Stopped { .. }) {}
+                                }
+                            }
+                            client.shutdown().await.unwrap();
+                        }).await.expect("actual unpublished Native callback must receive its host refusal");
+                    }
+                }
+            }
+        })).await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_native_original_decisions_do_not_grant_current_and_current_resolves_through_http(
+    ) {
+        use crate::acp::elicitations::ElicitationResolution;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use serde_json::json;
+        use std::time::Duration;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for target in ["load", "new"] {
+                let mut stage = "Native constructor request";
+                let observed = tokio::time::timeout(Duration::from_secs(30), async {
+                    let directory = scope.tempdir();
+                    let original_file = directory.path().join("constructor-original.txt");
+                    std::fs::write(&original_file, "Original constructor I/O").unwrap();
+                    let original_id = if target == "load" {
+                        let (config, original_native) = scope.native_peer(
+                            directory.path().into(),
+                            "codex",
+                            "codex",
+                            |request| {
+                                let id = request.get("id")?;
+                                Some(match request["method"].as_str().unwrap() {
+                                    "initialize" => json!({"jsonrpc":"2.0","id":id,
+                                        "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+                                    "session/new" => json!({"jsonrpc":"2.0","id":id,
+                                        "result":{"sessionId":"elicitation-native"}}),
+                                    method => panic!("unexpected priming Native request: {method}"),
+                                })
+                            },
+                        );
+                        let original = scope.spawn(config, "elicitation-prime").await.unwrap();
+                        original.ready().await;
+                        let id = original.id.clone();
+                        original.stop_session().await;
+                        assert_eq!(original_native.requests(), ["initialize", "session/new"]);
+                        Some(id)
+                    } else {
+                        None
+                    };
+                    let constructor_method = if target == "load" {
+                        "session/load"
+                    } else {
+                        "session/new"
+                    };
+                    let (new_seen, new_received) = oneshot::channel();
+                    let (prompt_seen, prompt_received) = oneshot::channel();
+                    let mut new_seen = Some(new_seen);
+                    let mut prompt_seen = Some(prompt_seen);
+                    let (config, mut native) = scope.native_peer(
+                        directory.path().into(),
+                        "codex",
+                        "codex",
+                        move |request| {
+                            let id = request.get("id")?;
+                            match request["method"].as_str().unwrap() {
+                                "initialize" => Some(json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}
+                                })),
+                                method if method == constructor_method => {
+                                    new_seen.take().unwrap().send(id.clone()).unwrap();
+                                    None
+                                }
+                                "session/prompt" => {
+                                    prompt_seen.take().unwrap().send(id.clone()).unwrap();
+                                    None
+                                }
+                                other => panic!("unexpected managed native operation: {other}"),
+                            }
+                        },
+                    );
+                    let mut client = match original_id {
+                        Some(id) => scope.resume_stopped(&id, config).await,
+                        None => scope.spawn(config, "native-elicitation").await.unwrap(),
+                    };
+                    let constructor_id = new_received.await.unwrap();
+                    stage = "Original constructor I/O";
+                    native
+                        .send(json!({
+                            "jsonrpc": "2.0", "id": "pending-original-read",
+                            "method": "fs/read_text_file",
+                            "params": {"sessionId": "elicitation-native", "path": original_file}
+                        }))
+                        .await;
+                    let original_read = native.reply().await;
+                    assert_eq!(original_read["id"], "pending-original-read");
+                    assert_eq!(original_read["result"]["content"], "Original constructor I/O", "{original_read}");
+                    stage = "Original decisions without Current authority";
+                    let state = client.app_state();
+                    assert!(!state.session_service.fold_control_state(&client.id).await.unwrap().connection_ready);
+                    assert!(client.send_prompt("must not become a Current prompt", &[]).await.is_err());
+                    let question = CreateElicitationRequest::new(
+                        agent_client_protocol::schema::v1::ElicitationFormMode::new(
+                            agent_client_protocol::schema::v1::ElicitationSessionScope::new(
+                                "elicitation-native",
+                            ),
+                            agent_client_protocol::schema::v1::ElicitationSchema::new()
+                                .string("name", true),
+                        ),
+                        "Please enter your name",
+                    );
+                    for (request_id, method, params) in [
+                        ("pending-permission", "session/request_permission", json!({
+                            "sessionId": "elicitation-native",
+                            "toolCall": {"toolCallId": "pending-tool", "title": "Pending tool"},
+                            "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+                        })),
+                        ("pending-question", "elicitation/create", serde_json::to_value(&question).unwrap()),
+                    ] {
+                        native
+                            .send(json!({
+                                "jsonrpc": "2.0", "id": request_id,
+                                "method": method, "params": params
+                            }))
+                            .await;
+                        let nonce = loop {
+                            tokio::select! {
+                                response = native.reply() => panic!("Original question returned before a human answer: {response}"),
+                                event = client.next_event() => match event.expect("pending constructor publication") {
+                                    Event::ApprovalRequested { approval } => {
+                                        assert_eq!(request_id, "pending-permission");
+                                        break approval.nonce;
+                                    }
+                                    Event::ElicitationRequested { elicitation } => {
+                                        assert_eq!(request_id, "pending-question");
+                                        break elicitation.nonce;
+                                    }
+                                    Event::AcpConnectionUnavailable { .. } => panic!("original Native must remain connected"),
+                                    _ => {}
+                                }
+                            }
+                        };
+                        let publication = client.actual().pending_responders.lock().await
+                            .get(&nonce).unwrap().publication.clone().expect("actual Native request custody");
+                        assert!(publication.is_original());
+                        assert_eq!(publication.metadata().scope, crate::acp::event_sender::EventScope::HistoryOnly);
+                        let reduced = state.session_service.fold_control_state(&client.id).await.unwrap();
+                        assert!(!reduced.connection_ready);
+                        assert_eq!(reduced.original_decision_nonces.as_slice(), std::slice::from_ref(&nonce));
+                        if request_id == "pending-permission" {
+                            client.actual().resolve_permission(nonce, ApprovalDecision::Allow, None).await.unwrap();
+                        } else {
+                            client.actual().resolve_elicitation(nonce, serde_json::from_value(json!({
+                                "action": "accept", "answers": {"name": "Original"}
+                            })).unwrap()).await.unwrap();
+                        }
+                        let answered = native.reply().await;
+                        assert_eq!(answered["id"], request_id);
+                        assert!(answered.get("error").is_none(), "{answered}");
+                        assert!(answered.get("result").is_some(), "{answered}");
+                    }
+                    // Answering Original requests never establishes Current readiness.
+                    assert!(client.actual().pending_responders.lock().await.is_empty());
+                    let reduced = state
+                        .session_service
+                        .fold_control_state(&client.id)
+                        .await
+                        .unwrap();
+                    assert!(reduced.pending_elicitations.is_empty());
+                    assert!(!reduced.connection_ready);
+                    assert!(reduced.original_decision_nonces.is_empty());
+                    assert!(state.acp_event_store.pending_approval_requests(&client.id).is_empty());
+
+                    stage = "genuine constructor readiness";
+                    native
+                        .send(json!({
+                            "jsonrpc": "2.0", "id": constructor_id,
+                            "result": if target == "load" { json!({}) } else { json!({"sessionId": "elicitation-native"}) }
+                        }))
+                        .await;
+                    client.ready().await;
+                    stage = "Native prompt request";
+                    client
+                        .send_prompt("answer the native question", &[])
+                        .await
+                        .unwrap();
+                    let prompt_id = prompt_received.await.unwrap();
+                    stage = "Current question publication";
+                    native
+                        .send(json!({
+                            "jsonrpc": "2.0", "id": "current-question",
+                            "method": "elicitation/create", "params": question
+                        }))
+                        .await;
+                    let elicitation = loop {
+                        tokio::select! {
+                            response = native.reply() => {
+                                panic!("Current question returned before user resolution: {response}")
+                            }
+                            event = client.next_event() => match event.expect("managed publication") {
+                                Event::ElicitationRequested { elicitation } => break elicitation,
+                                Event::AgentStartupError { message, .. } => panic!("{message}"),
+                                Event::AcpConnectionUnavailable { .. } => {
+                                    panic!("original Native must remain connected")
+                                }
+                                _ => {}
+                            }
+                        }
+                    };
+                    let reduced = state
+                        .session_service
+                        .fold_control_state(&client.id)
+                        .await
+                        .unwrap();
+                    assert_eq!(reduced.pending_elicitations.len(), 1);
+                    assert_eq!(reduced.pending_elicitations[0], elicitation);
+                    assert_eq!(elicitation.message, "Please enter your name");
+                    stage = "HTTP resolution";
+                    let resolution: ElicitationResolution = serde_json::from_value(json!({
+                        "action": "accept", "answers": {"name": "Ada"}
+                    }))
+                    .unwrap();
+                    let response = crate::server::api::resolve_elicitation(
+                        State(state.clone()),
+                        Path((client.id.clone(), elicitation.nonce.0.clone())),
+                        Ok(Json(resolution)),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    stage = "Native answer";
+                    let answered = native.reply().await;
+                    assert_eq!(answered["id"], "current-question");
+                    assert_eq!(answered["result"]["action"], "accept", "{answered}");
+                    assert_eq!(answered["result"]["content"]["name"], "Ada", "{answered}");
+                    stage = "resolution publication";
+                    loop {
+                        if let Event::ElicitationResolved { nonce, .. } =
+                            client.next_event().await.expect("managed resolution")
+                        {
+                            assert_eq!(nonce, elicitation.nonce);
+                            break;
+                        }
+                    }
+                    let reduced = state
+                        .session_service
+                        .fold_control_state(&client.id)
+                        .await
+                        .unwrap();
+                    assert!(reduced.pending_elicitations.is_empty());
+                    assert!(client.actual().pending_responders.lock().await.is_empty());
+                    stage = "genuine prompt completion";
+                    native
+                        .send(json!({
+                            "jsonrpc": "2.0", "id": prompt_id,
+                            "result": {"stopReason": "end_turn"}
+                        }))
+                        .await;
+                    loop {
+                        if let Event::Stopped { .. } = client
+                            .next_event()
+                            .await
+                            .expect("managed prompt completion")
+                        {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        state.acp_event_store.has_in_flight_main_turn(&client.id).unwrap(),
+                        crate::acp::event_store::ControlKnowledge::Known(false)
+                    );
+                    assert_eq!(
+                        native.requests(),
+                        ["initialize", constructor_method, "session/prompt"]
+                    );
+                    stage = "owned shutdown";
+                    client.shutdown().await.unwrap();
+                })
+                .await;
+                observed.unwrap_or_else(|_| panic!("managed elicitation timed out during {stage}"));
+                }
+            })
+        })
+        .await;
     }
 }

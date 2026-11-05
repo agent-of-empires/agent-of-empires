@@ -157,6 +157,8 @@ struct Construction {
     idle_baseline_ms: std::sync::atomic::AtomicI64,
     #[cfg(test)]
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
+    original_constructor_obligations: std::sync::atomic::AtomicUsize,
+    original_constructor_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
 }
 
 impl Default for Construction {
@@ -183,6 +185,8 @@ impl Default for Construction {
             ),
             #[cfg(test)]
             child_wait_completed: tokio::sync::watch::channel(None).0,
+            original_constructor_obligations: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            original_constructor_notify: std::sync::OnceLock::new(),
         }
     }
 }
@@ -211,11 +215,122 @@ pub(crate) struct AdapterRetirementRoute {
     pub(crate) retired: std::sync::atomic::AtomicBool,
 }
 
+/// Tracks actual original constructor work independently of Native authority and retirement.
+pub(crate) struct OriginalConstructionObligation {
+    construction: std::sync::Weak<Construction>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl OriginalConstructionObligation {
+    fn retain(construction: &Arc<Construction>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let notify = construction.original_constructor_notify.get()?.clone();
+        let obligations = &construction.original_constructor_obligations;
+        let mut active = obligations.load(Ordering::Acquire);
+        loop {
+            if active == 0 || active >= usize::MAX - 1 {
+                return None;
+            }
+            match obligations.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+        Some(Self {
+            construction: Arc::downgrade(construction),
+            notify,
+        })
+    }
+
+    /// Fork only while this actual owner still holds its original obligation.
+    pub(crate) fn fork(&self) -> Self {
+        let construction = self
+            .construction
+            .upgrade()
+            .expect("live constructor owner retains its original construction");
+        Self::retain(&construction).expect("a live constructor obligation cannot be terminal")
+    }
+}
+
+impl Drop for OriginalConstructionObligation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let Some(construction) = self.construction.upgrade() else {
+            // No original observer remains. This is not evidence of completion.
+            return;
+        };
+        let obligations = &construction.original_constructor_obligations;
+        let mut active = obligations.load(Ordering::Acquire);
+        let previous = loop {
+            assert!(
+                active > 0 && active < usize::MAX,
+                "only an active constructor obligation can be released"
+            );
+            match obligations.compare_exchange_weak(
+                active,
+                active - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => break previous,
+                Err(current) => active = current,
+            }
+        };
+        if previous == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
 impl Lease {
     pub(crate) fn constructor_finished(&self) -> bool {
         self.construction
             .constructor_finished
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Arm one actual admitted original; aliases and captured-stop recreation never arm it.
+    pub(crate) fn begin_original_constructor(
+        &self,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> OriginalConstructionObligation {
+        use std::sync::atomic::Ordering;
+        assert!(
+            self.construction
+                .original_constructor_notify
+                .set(notify.clone())
+                .is_ok(),
+            "each original constructor is armed exactly once"
+        );
+        assert_eq!(
+            self.construction
+                .original_constructor_obligations
+                .compare_exchange(usize::MAX, 1, Ordering::AcqRel, Ordering::Acquire,),
+            Ok(usize::MAX),
+            "completed original construction cannot be reopened"
+        );
+        OriginalConstructionObligation {
+            construction: Arc::downgrade(&self.construction),
+            notify,
+        }
+    }
+
+    /// An SDK/deferred child can retain only an already active original.
+    pub(crate) fn retain_original_constructor(&self) -> Option<OriginalConstructionObligation> {
+        OriginalConstructionObligation::retain(&self.construction)
+    }
+
+    /// NeverStarted is deliberately not completed. This proves no physical or metadata fact.
+    pub(crate) fn original_constructor_completed(&self) -> bool {
+        self.construction
+            .original_constructor_obligations
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
     }
 
     /// When this epoch was admitted or last became running, in ms since the Unix epoch.
@@ -515,6 +630,150 @@ impl Lease {
             None => Ok(None),
             Some(admission) => admission.native_scope.clone().map(Some).ok_or(()),
         }
+    }
+
+    pub(crate) fn bind_establishment_admission(
+        &self,
+        prepared: &crate::acp::supervisor::LaunchAdmission,
+    ) -> bool {
+        let mut admission = self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(current) = admission.as_mut() else {
+            return false;
+        };
+        let (Some(old), Some(new), Some(source), Some(destination)) = (
+            current.establishment.as_ref(),
+            prepared.establishment.as_ref(),
+            current.native_scope.as_ref(),
+            prepared.native_scope.as_ref(),
+        ) else {
+            return false;
+        };
+        if !old.same_attempt(new)
+            || old.context != new.context
+            || old.generation != new.generation
+            || old.destination != new.destination
+            || new.producer != Some(self.producer_id())
+            || old
+                .producer
+                .is_some_and(|producer| producer != self.producer_id())
+            || source.context != destination.context
+            || source.choice != destination.choice
+            || current.generation != prepared.generation
+            || !Arc::ptr_eq(&current.store, &prepared.store)
+        {
+            return false;
+        }
+        current.establishment = prepared.establishment.clone();
+        current.native_scope = prepared.native_scope.clone();
+        true
+    }
+
+    fn replace_fresh_admission(
+        &self,
+        expected: &crate::acp::supervisor::LaunchAdmission,
+        prepared: crate::acp::supervisor::LaunchAdmission,
+    ) -> bool {
+        use crate::acp::establishment::{AuthorityPhase, EstablishmentOrigin, EstablishmentTarget};
+        let mut slot = self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(current) = slot.as_ref() else {
+            return false;
+        };
+        let (Some(new), Some(source), Some(expected_scope), Some(destination)) = (
+            prepared.establishment.as_ref(),
+            current.native_scope.as_ref(),
+            expected.native_scope.as_ref(),
+            prepared.native_scope.as_ref(),
+        ) else {
+            return false;
+        };
+        let Some(old_authority) = source
+            .choice
+            .as_ref()
+            .and_then(|choice| choice.authority)
+            .filter(|authority| authority.phase == AuthorityPhase::Applied)
+        else {
+            return false;
+        };
+        let same_namespace = match (&current.namespace, &prepared.namespace, &expected.namespace) {
+            (None, None, None) => true,
+            (Some(current), Some(prepared), Some(expected)) => {
+                Arc::ptr_eq(current, prepared) && Arc::ptr_eq(current, expected)
+            }
+            _ => false,
+        };
+        if self.cancellation().is_cancelled()
+            || !same_namespace
+            || !Arc::ptr_eq(&current.store, &expected.store)
+            || !Arc::ptr_eq(&current.store, &prepared.store)
+            || current.generation != expected.generation
+            || current.generation != prepared.generation
+            || current.establishment != expected.establishment
+            || source.context != expected_scope.context
+            || source.choice != expected_scope.choice
+            || new.id == old_authority.id
+            || new.origin != EstablishmentOrigin::Fresh
+            || new.target != EstablishmentTarget::New
+            || new.producer != Some(self.producer_id())
+            || new.profile != current.store.storage().profile()
+            || new.session_id != self.session_id()
+            || current
+                .establishment
+                .as_ref()
+                .is_some_and(|old| old.id != old_authority.id || old.created_at != new.created_at)
+            || new.generation != current.generation
+            || new.source_context != source.context
+            || new.context != source.context
+            || !source.choice.as_ref().is_some_and(|choice| {
+                choice
+                    .authority
+                    .is_some_and(|authority| authority == old_authority)
+                    && choice.as_ref() == &new.preimage
+            })
+            || destination.context != new.context
+            || !destination.choice.as_ref().is_some_and(|choice| {
+                choice.as_ref() == &new.destination
+                    && choice.authority.is_some_and(|authority| {
+                        authority.id == new.id && authority.phase == AuthorityPhase::Pending
+                    })
+            })
+        {
+            return false;
+        }
+        *slot = Some(prepared);
+        true
+    }
+
+    pub(crate) fn resolve_establishment_scope(
+        &self,
+        source: &crate::acp::state::NativeObservationScope,
+        destination: crate::acp::state::NativeObservationScope,
+        generation: u64,
+    ) -> bool {
+        let mut admission = self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(admission) = admission.as_mut() else {
+            return false;
+        };
+        let Some(current) = admission.native_scope.as_ref() else {
+            return false;
+        };
+        if current.context != source.context || current.choice != source.choice {
+            return false;
+        }
+        admission.generation = generation;
+        admission.native_scope = Some(destination);
+        true
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {
@@ -881,6 +1140,35 @@ impl LifecycleTable {
             .get(session_id)
             .map(|entry| self.lease(session_id, entry.epoch))
     }
+
+    /// Caller has committed the exact native Fresh CAS outside this table.
+    /// No new lease, producer, actor, store, or projection is introduced here.
+    pub(crate) fn replace_live_fresh_admission(
+        &self,
+        lease: &Lease,
+        owner: RunnerIdentity,
+        expected: &crate::acp::supervisor::LaunchAdmission,
+        prepared: crate::acp::supervisor::LaunchAdmission,
+    ) -> bool {
+        let Some(entry) = self.entries.get(lease.session_id()) else {
+            return false;
+        };
+        if entry.epoch != lease.epoch()
+            || !Arc::ptr_eq(&entry.construction, &lease.construction)
+            || !matches!(entry.phase, Phase::Running { identity: Some(current) } if current == owner)
+            || owner.birth_fingerprint.is_none()
+            || !lease.constructor_finished()
+            || lease.cancellation().is_cancelled()
+            || lease.stop_completion_pending()
+            || entry.journal_ack_required
+            || lease.retirement().binding_checkpoint().is_some()
+            || lease.retirement().has_deferred()
+            || lease.retirement().deferred_is_claimed()
+        {
+            return false;
+        }
+        lease.replace_fresh_admission(expected, prepared)
+    }
     pub(crate) fn owned_leases(&self) -> Vec<Lease> {
         self.entries
             .keys()
@@ -1034,6 +1322,17 @@ impl LifecycleTable {
             }
             return true;
         }
+        if lease.was_cancelled_before_birth() {
+            if let Some(projection) = lease.retirement().establishment_projection() {
+                projection.seal_retirement();
+                if projection.retirement_checkpoint_pending() {
+                    if !entry.journal_ack_required {
+                        lease.retirement().delegate_binding_checkpoint(true);
+                    }
+                    entry.journal_ack_required = true;
+                }
+            }
+        }
         if entry.journal_ack_required && lease.was_cancelled_before_birth() {
             entry.phase = Phase::RetirementComplete;
             return true;
@@ -1095,6 +1394,30 @@ impl LifecycleTable {
         }
         true
     }
+    /// The installed reservation has dropped after completing its deferred work.
+    /// This records constructor completion only, not native retirement authority.
+    /// Incomplete registration cannot reach Running; any deferred work there is
+    /// a complete installation/post-install obligation checked below.
+    pub(crate) fn finish_installed_construction(&mut self, lease: &Lease) -> bool {
+        let Some(entry) = self.current(lease) else {
+            return false;
+        };
+        if !matches!(
+            entry.phase,
+            Phase::Running { identity: Some(identity) }
+                if lease.spawned_runner() == Some(identity)
+        ) || lease.retirement().has_deferred()
+            || lease.retirement().deferred_is_claimed()
+        {
+            return false;
+        }
+        entry
+            .construction
+            .constructor_finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
     pub(crate) fn finish_preserved_construction(&mut self, lease: &Lease) -> bool {
         let Some(entry) = self.current(lease) else {
             return false;
@@ -1252,6 +1575,9 @@ impl LifecycleTable {
 
     /// The caller has durably acknowledged this exact completed construction.
     pub(crate) fn acknowledge_retirement(&mut self, lease: &Lease) -> bool {
+        if lease.retirement().shutdown_pending() {
+            return false;
+        }
         match self.entries.get(lease.session_id()) {
             None => return true,
             Some(entry)
@@ -1260,7 +1586,11 @@ impl LifecycleTable {
                     && matches!(entry.phase, Phase::RetirementComplete) => {}
             Some(_) => return false,
         }
-        if lease.retirement().fork_rejection_pending() {
+        if lease
+            .retirement()
+            .establishment_projection()
+            .is_some_and(|projection| projection.retirement_checkpoint_pending())
+        {
             return false;
         }
         self.entries.remove(lease.session_id());
@@ -1302,6 +1632,7 @@ impl LifecycleTable {
         match settlement {
             Settlement::Proven => {
                 if lease.stop_completion_pending()
+                    || lease.retirement().shutdown_pending()
                     || (entry.delete_adapter_state
                         && !entry
                             .construction

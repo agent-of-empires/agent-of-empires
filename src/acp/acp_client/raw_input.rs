@@ -78,93 +78,148 @@ pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Ev
     Some(Event::MonitorArmed { description })
 }
 
-/// A `Bash` launched with `run_in_background`: the adapter's metadata-only
-/// update carries `toolResponse.backgroundTaskId`. Shown with the Monitor
-/// badge since both are off-turn work that reports back later.
-pub(super) fn background_command_launched_from_value(v: &serde_json::Value) -> Option<Event> {
-    let cc = v.get("_meta")?.get("claudeCode")?;
-    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Bash") {
-        return None;
-    }
-    cc.get("toolResponse")?.get("backgroundTaskId")?.as_str()?;
-    Some(Event::MonitorArmed { description: None })
+/// Borrowed launch shape only. SDK mapping retains its existing fallback and
+/// profile gates; recognizing a shape grants no permission or prompt causality.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BackgroundResourceCue<'a> {
+    Agent {
+        agent_id: &'a str,
+        tool_call_id: &'a str,
+        description: &'a str,
+        prompt: &'a str,
+        model: &'a str,
+        output_file: &'a str,
+    },
+    Bash {
+        task_id: &'a str,
+        tool_call_id: Option<&'a str>,
+    },
+    Workflow {
+        task_id: &'a str,
+        tool_call_id: &'a str,
+        run_id: &'a str,
+        name: &'a str,
+        summary: Option<&'a str>,
+        transcript_dir: &'a str,
+    },
 }
 
-/// The background task such a `Bash` launch, or a `Workflow` run, started, so
-/// the session stays busy until the task ends (reported through the session
-/// transcript, see `crate::acp::task_transcript`).
-pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Option<Event> {
-    let cc = v.get("_meta")?.get("claudeCode")?;
-    let tr = cc.get("toolResponse")?;
-    let tool_call_id = v
-        .get("toolCallId")
-        .and_then(|id| id.as_str())
-        .map(str::to_string);
-    let str_field = |key: &str| {
-        tr.get(key)
-            .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-    };
-    match cc.get("toolName").and_then(|t| t.as_str())? {
-        "Bash" => Some(Event::BackgroundTaskStarted {
-            task_id: tr.get("backgroundTaskId")?.as_str()?.to_string(),
+/// One pure extractor shared by native framing and typed SDK mapping.
+/// Native framing only tests its borrowed result; it allocates no events,
+/// strings, timestamps, or JSON copies.
+pub(crate) fn background_resource_from_parts<'a>(
+    tool_call_id: Option<&'a str>,
+    claude_code: Option<&'a serde_json::Value>,
+) -> Option<BackgroundResourceCue<'a>> {
+    let cc = claude_code?;
+    let response = cc.get("toolResponse")?;
+    let field = |key: &str| response.get(key).and_then(serde_json::Value::as_str);
+    let nonempty = |key: &str| field(key).filter(|value| !value.is_empty());
+    match cc.get("toolName").and_then(serde_json::Value::as_str)? {
+        "Agent" if field("status") == Some("async_launched") => {
+            Some(BackgroundResourceCue::Agent {
+                agent_id: field("agentId")?,
+                tool_call_id: tool_call_id.unwrap_or_default(),
+                description: field("description").unwrap_or_default(),
+                prompt: field("prompt").unwrap_or_default(),
+                model: field("resolvedModel").unwrap_or_default(),
+                output_file: field("outputFile").unwrap_or_default(),
+            })
+        }
+        "Bash" => Some(BackgroundResourceCue::Bash {
+            task_id: field("backgroundTaskId")?,
             tool_call_id,
-            description: String::new(),
-            workflow: None,
         }),
-        // The task tailer needs the tool call id to recognise the run's end.
-        "Workflow" if str_field("status") == Some("async_launched") && tool_call_id.is_some() => {
-            let name = str_field("workflowName").unwrap_or("Workflow").to_string();
-            Some(Event::BackgroundTaskStarted {
-                task_id: str_field("taskId")?.to_string(),
-                tool_call_id,
-                description: name.clone(),
-                workflow: Some(WorkflowLaunch {
-                    run_id: str_field("runId")?.to_string(),
-                    name,
-                    summary: str_field("summary").map(str::to_string),
-                    transcript_dir: str_field("transcriptDir").unwrap_or_default().to_string(),
-                }),
+        "Workflow" if nonempty("status") == Some("async_launched") => {
+            Some(BackgroundResourceCue::Workflow {
+                task_id: nonempty("taskId")?,
+                tool_call_id: tool_call_id?,
+                run_id: nonempty("runId")?,
+                name: nonempty("workflowName").unwrap_or("Workflow"),
+                summary: nonempty("summary"),
+                transcript_dir: nonempty("transcriptDir").unwrap_or_default(),
             })
         }
         _ => None,
     }
 }
 
-/// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
-/// `toolName: "Agent"` and a `toolResponse` whose `status` is
-/// `"async_launched"`. `agentId` is the only required field; anything else
-/// falls back to `RawAgentUpdate`.
-pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> {
-    let cc = v.get("_meta")?.get("claudeCode")?;
-    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Agent") {
-        return None;
+pub(crate) fn background_resource_from_value(
+    value: &serde_json::Value,
+) -> Option<BackgroundResourceCue<'_>> {
+    background_resource_from_parts(
+        value.get("toolCallId").and_then(serde_json::Value::as_str),
+        value.get("_meta").and_then(|meta| meta.get("claudeCode")),
+    )
+}
+
+impl BackgroundResourceCue<'_> {
+    pub(super) fn into_agent_event(self) -> Option<Event> {
+        let Self::Agent {
+            agent_id,
+            tool_call_id,
+            description,
+            prompt,
+            model,
+            output_file,
+        } = self
+        else {
+            return None;
+        };
+        Some(Event::BackgroundAgentLaunched {
+            agent_id: agent_id.into(),
+            tool_call_id: tool_call_id.into(),
+            description: description.into(),
+            prompt: prompt.into(),
+            model: model.into(),
+            output_file: output_file.into(),
+            started_at: chrono::Utc::now(),
+            workflow: None,
+        })
     }
-    let tr = cc.get("toolResponse")?;
-    if tr.get("status").and_then(|s| s.as_str()) != Some("async_launched") {
-        return None;
+
+    pub(super) fn into_monitor_event(self) -> Option<Event> {
+        matches!(self, Self::Bash { .. }).then_some(Event::MonitorArmed { description: None })
     }
-    let agent_id = tr.get("agentId").and_then(|s| s.as_str())?.to_string();
-    let str_field = |key: &str| {
-        tr.get(key)
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-    Some(Event::BackgroundAgentLaunched {
-        agent_id,
-        tool_call_id: v
-            .get("toolCallId")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        description: str_field("description"),
-        prompt: str_field("prompt"),
-        model: str_field("resolvedModel"),
-        output_file: str_field("outputFile"),
-        started_at: chrono::Utc::now(),
-        workflow: None,
-    })
+
+    pub(super) fn into_task_event(self) -> Option<Event> {
+        let (task_id, tool_call_id, description, workflow) = match self {
+            Self::Bash {
+                task_id,
+                tool_call_id,
+            } => (
+                task_id.into(),
+                tool_call_id.map(str::to_string),
+                String::new(),
+                None,
+            ),
+            Self::Workflow {
+                task_id,
+                tool_call_id,
+                run_id,
+                name,
+                summary,
+                transcript_dir,
+            } => (
+                task_id.into(),
+                Some(tool_call_id.into()),
+                name.into(),
+                Some(WorkflowLaunch {
+                    run_id: run_id.into(),
+                    name: name.into(),
+                    summary: summary.map(str::to_string),
+                    transcript_dir: transcript_dir.into(),
+                }),
+            ),
+            Self::Agent { .. } => return None,
+        };
+        Some(Event::BackgroundTaskStarted {
+            task_id,
+            tool_call_id,
+            description,
+            workflow,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -176,14 +231,18 @@ mod tests {
         let launched = |tool: &str, response: serde_json::Value| serde_json::json!({"_meta": {"claudeCode": {"toolName": tool, "toolResponse": response}}});
         let bg = serde_json::json!({"stdout": "", "backgroundTaskId": "byiee4aex"});
         assert!(matches!(
-            background_command_launched_from_value(&launched("Bash", bg.clone())),
+            background_resource_from_value(&launched("Bash", bg.clone()))
+                .and_then(BackgroundResourceCue::into_monitor_event),
             Some(Event::MonitorArmed { description: None })
         ));
-        assert!(background_command_launched_from_value(&launched("Read", bg)).is_none());
-        assert!(background_command_launched_from_value(&launched(
+        assert!(background_resource_from_value(&launched("Read", bg))
+            .and_then(BackgroundResourceCue::into_monitor_event)
+            .is_none());
+        assert!(background_resource_from_value(&launched(
             "Bash",
             serde_json::json!({"stdout": "ok"})
         ))
+        .and_then(BackgroundResourceCue::into_monitor_event)
         .is_none());
     }
 
@@ -196,7 +255,9 @@ mod tests {
             })
         };
         let bg = serde_json::json!({"stdout": "", "backgroundTaskId": "byiee4aex"});
-        match background_task_started_from_value(&update("Bash", bg.clone())) {
+        match background_resource_from_value(&update("Bash", bg.clone()))
+            .and_then(BackgroundResourceCue::into_task_event)
+        {
             Some(Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
@@ -207,11 +268,14 @@ mod tests {
             }
             other => panic!("expected BackgroundTaskStarted, got {other:?}"),
         }
-        assert!(background_task_started_from_value(&update("Read", bg)).is_none());
-        assert!(background_task_started_from_value(&update(
+        assert!(background_resource_from_value(&update("Read", bg))
+            .and_then(BackgroundResourceCue::into_task_event)
+            .is_none());
+        assert!(background_resource_from_value(&update(
             "Bash",
             serde_json::json!({"stdout": "ok"})
         ))
+        .and_then(BackgroundResourceCue::into_task_event)
         .is_none());
     }
 
@@ -233,7 +297,9 @@ mod tests {
                 "_meta": {"claudeCode": {"toolName": "Workflow", "toolResponse": response}},
             })
         };
-        match background_task_started_from_value(&update(Some("toolu_1"), launched.clone())) {
+        match background_resource_from_value(&update(Some("toolu_1"), launched.clone()))
+            .and_then(BackgroundResourceCue::into_task_event)
+        {
             Some(Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
@@ -269,7 +335,9 @@ mod tests {
             ("not launched", Some("toolu_1"), without("status")),
         ] {
             assert!(
-                background_task_started_from_value(&update(tool_call_id, response)).is_none(),
+                background_resource_from_value(&update(tool_call_id, response))
+                    .and_then(BackgroundResourceCue::into_task_event)
+                    .is_none(),
                 "{label}"
             );
         }
@@ -318,7 +386,9 @@ mod tests {
                 serde_json::json!({}),
             ] {
                 assert!(
-                    background_agent_launched_from_value(&raw).is_none(),
+                    background_resource_from_value(&raw)
+                        .and_then(BackgroundResourceCue::into_agent_event)
+                        .is_none(),
                     "{raw}"
                 );
             }

@@ -436,40 +436,45 @@ fn peer_pid_for(session_id: &str) -> Result<Option<u32>> {
 }
 
 pub(crate) fn capture_runner(session_id: &str) -> RunnerCapture {
-    match crate::process::worker_registry::load_strict(session_id) {
-        Ok(Some(record)) if record.pid > 0 && i32::try_from(record.pid).is_ok() => {
-            RunnerCapture::Captured {
-                pid: record.pid,
-                generation: record.generation,
-                birth_fingerprint: crate::acp::runner_lifecycle::RunnerIdentity::from_record(
-                    &record,
-                )
-                .birth_fingerprint,
-                prime: PrimeOwnership::from_record(&record),
-                scopes: vec![record.scope],
+    capture_runner_checked(session_id).unwrap_or_else(|error| RunnerCapture::Unresolved {
+        error: format!("{error:#}"),
+    })
+}
+
+pub(crate) fn capture_runner_checked(session_id: &str) -> Result<RunnerCapture> {
+    Ok(
+        match crate::process::worker_registry::load_strict(session_id)? {
+            Some(record) if record.pid > 0 && i32::try_from(record.pid).is_ok() => {
+                RunnerCapture::Captured {
+                    pid: record.pid,
+                    generation: record.generation,
+                    birth_fingerprint: crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                        &record,
+                    )
+                    .birth_fingerprint,
+                    prime: PrimeOwnership::from_record(&record),
+                    scopes: vec![record.scope],
+                }
             }
-        }
-        Ok(Some(_)) => RunnerCapture::Unresolved {
-            error: "Invalid captured runner pid".into(),
-        },
-        Ok(None) => match peer_pid_for(session_id) {
-            Ok(None) => RunnerCapture::Uncaptured {
-                scopes: Vec::new(),
-                producer_epoch: None,
-                producer_id: None,
-                prime: PrimeOwnership::NotPrime,
+            Some(_) => RunnerCapture::Unresolved {
+                error: "Invalid captured runner pid".into(),
             },
-            Ok(Some(pid)) => RunnerCapture::Unresolved {
-                error: format!("registry absent but runner socket peer {pid} is active"),
-            },
-            Err(error) => RunnerCapture::Unresolved {
-                error: format!("runner socket probe failed: {error:#}"),
+            None => match peer_pid_for(session_id) {
+                Ok(None) => RunnerCapture::Uncaptured {
+                    scopes: Vec::new(),
+                    producer_epoch: None,
+                    producer_id: None,
+                    prime: PrimeOwnership::NotPrime,
+                },
+                Ok(Some(pid)) => RunnerCapture::Unresolved {
+                    error: format!("registry absent but runner socket peer {pid} is active"),
+                },
+                Err(error) => RunnerCapture::Unresolved {
+                    error: format!("runner socket probe failed: {error:#}"),
+                },
             },
         },
-        Err(error) => RunnerCapture::Unresolved {
-            error: format!("{error:#}"),
-        },
-    }
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -515,14 +520,14 @@ fn open_for(storage: &Storage) -> Result<ResolvedDataFile> {
 
 fn decode(content: Option<&str>) -> Result<Journal> {
     let content = content.context("Pending purge ownership journal is missing")?;
-    let journal =
+    let mut journal =
         serde_json::from_str::<Journal>(content).context("reading pending purge ownership")?;
     anyhow::ensure!(
         journal.version == 3,
         "Unsupported pending purge ownership version"
     );
     let mut tokens = HashSet::with_capacity(journal.owners.len());
-    for owner in &journal.owners {
+    for owner in &mut journal.owners {
         anyhow::ensure!(
             uuid::Uuid::parse_str(&owner.token).is_ok()
                 && tokens.insert(&owner.token)
@@ -559,7 +564,7 @@ fn decode(content: Option<&str>) -> Result<Journal> {
                 "Invalid captured runner pid"
             );
         }
-        if let Some(request) = &owner.request {
+        if let Some(request) = &mut owner.request {
             let source_profile_matches = request.instance.source_profile.is_empty()
                 || request.instance.source_profile == owner.profile;
             anyhow::ensure!(
@@ -569,6 +574,9 @@ fn decode(content: Option<&str>) -> Result<Journal> {
                     && source_profile_matches,
                 "Pending purge request identity does not match its owner"
             );
+            // Instance deliberately omits this runtime field from serialization.
+            // Rehydrate only from the validated durable owner, never a caller default.
+            request.instance.source_profile.clone_from(&owner.profile);
         }
         if let Some(protection) = &owner.additional_protection {
             protection.validate()?;
@@ -660,6 +668,36 @@ pub(crate) fn initialize(root: &Path) -> Result<()> {
         )?,
     }
     Ok(())
+}
+
+/// In-memory evidence from an existing committed purge journal, never Native
+/// establishment success or authority to acknowledge a different producer.
+pub(crate) struct PermanentEstablishmentRetirement<'a> {
+    token: uuid::Uuid,
+    attempt: &'a crate::acp::establishment::EstablishmentAttempt,
+    owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    producer: uuid::Uuid,
+}
+
+impl PermanentEstablishmentRetirement<'_> {
+    pub(crate) fn token(&self) -> uuid::Uuid {
+        self.token
+    }
+
+    pub(crate) fn matches(
+        &self,
+        attempt: &crate::acp::establishment::EstablishmentAttempt,
+        receipt: Option<&crate::acp::establishment::NativeEstablishmentReceipt>,
+    ) -> bool {
+        self.attempt.same_source(attempt)
+            && self.attempt.destination == attempt.destination
+            && match receipt {
+                Some(receipt) => {
+                    receipt.owner == self.owner && receipt.attempt.same_source(attempt)
+                }
+                None => attempt.producer == Some(self.producer),
+            }
+    }
 }
 
 /// Dropping this handle deliberately leaves its durable ownership intact.
@@ -1103,6 +1141,111 @@ impl PurgeOwner {
         save(&self.file, &journal)?;
         self.runner = journal.owners.swap_remove(index).runner;
         Ok(())
+    }
+
+    /// Mint only under the committed remover's identity/lifecycle exclusion.
+    /// The journal supplies intent and source; actual exit and constructor
+    /// completion supply physical proof. A missing row supplies neither.
+    pub(super) fn permanent_establishment_retirement<'a>(
+        &self,
+        storage: &Storage,
+        attempt: &'a crate::acp::establishment::EstablishmentAttempt,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<PermanentEstablishmentRetirement<'a>> {
+        use crate::acp::establishment::AcpEstablishment;
+        let lease = target
+            .lease
+            .as_ref()
+            .context("Permanent purge has no captured producer")?;
+        let identity = target
+            .identity
+            .filter(|identity| identity.birth_fingerprint.is_some())
+            .context("Permanent purge has no attested original runner")?;
+        anyhow::ensure!(
+            target.journalled
+                && lease.original_constructor_completed()
+                && lease.spawned_runner() == Some(identity)
+                && lease.session_id() == attempt.session_id,
+            "Permanent purge producer has not completed its exact captured construction"
+        );
+        let scope = lease
+            .native_scope()
+            .map_err(|_| anyhow::anyhow!("Permanent purge Native source is unavailable"))?
+            .context("Permanent purge has no captured Native source")?;
+        anyhow::ensure!(
+            scope
+                .choice
+                .as_ref()
+                .and_then(|choice| choice.authority)
+                .is_some_and(|authority| authority.id == attempt.id),
+            "Permanent purge Native source differs from its captured producer"
+        );
+        self.ensure_captured_runner_stopped()?;
+        let (lock, path) = self.file.open_sidecar()?;
+        let _guard = acquire_open_storage_flock(lock, &path)?;
+        let journal = decode(self.file.read()?.as_deref())?;
+        let owner = journal
+            .owners
+            .iter()
+            .find(|owner| owner.token == self.token)
+            .context("Permanent purge journal disappeared before establishment retirement")?;
+        let request = owner
+            .request
+            .as_ref()
+            .context("Permanent purge journal has no exact removal request")?;
+        let row = &request.instance;
+        let source_matches = match &row.acp_establishment {
+            Some(AcpEstablishment::Pending { attempt: recorded })
+            | Some(AcpEstablishment::Blocked {
+                attempt: recorded, ..
+            }) => attempt.same_source(recorded) && attempt.destination == recorded.destination,
+            Some(AcpEstablishment::Applied { attempt_id }) => *attempt_id == attempt.id,
+            None => false,
+        };
+        anyhow::ensure!(
+            owner.runner == self.runner
+                && Some(&owner.session_id) == self.session_id.as_ref()
+                && owner.session_id == attempt.session_id
+                && request.session_id == owner.session_id
+                && owner.profile == storage.profile()
+                && row.source_profile == owner.profile
+                && row.lifecycle_reservation_is_owned(
+                    super::LifecycleOperation::Purge,
+                    owner.generation
+                )
+                && source_matches
+                && attempt.matches_physical_source(row, storage)?,
+            "Permanent purge journal does not own this exact Native source"
+        );
+        let RunnerCapture::Captured {
+            pid,
+            generation,
+            birth_fingerprint,
+            prime,
+            scopes,
+        } = &owner.runner
+        else {
+            anyhow::bail!("Permanent purge runner completion is not durably captured");
+        };
+        anyhow::ensure!(
+            identity.pid == *pid
+                && identity.generation == *generation
+                && identity.birth_fingerprint == *birth_fingerprint
+                && target.prime == *prime
+                && lease.prime() == *prime
+                && target
+                    .scopes
+                    .iter()
+                    .chain(lease.scopes().iter())
+                    .all(|scope| scopes.contains(scope)),
+            "Permanent purge journal does not own this exact runner birth and scopes"
+        );
+        Ok(PermanentEstablishmentRetirement {
+            token: uuid::Uuid::parse_str(&owner.token)?,
+            attempt,
+            owner: identity,
+            producer: lease.producer_id(),
+        })
     }
 
     pub(crate) fn ensure_current(&self, store: &impl super::SessionStore) -> Result<()> {

@@ -5,21 +5,23 @@ import {
   DEFAULT_HISTORY_WINDOW,
   HISTORY_WINDOW_STEP,
   canLoadEarlierFrom,
+  clearHistoryProjection,
   historyWindow,
   initialHistoryWindow,
 } from "../lib/acpHistoryWindow";
 
 export interface HistoryWindowState {
-  windowedActivity: ActivityRow[];
+  windowedActivity: readonly ActivityRow[];
   canLoadEarlier: boolean;
   loadEarlier: () => void;
 }
 
 export function useHistoryWindow(
   sessionId: string,
-  activity: ActivityRow[],
+  rawActivity: readonly ActivityRow[],
   showClearedTurns: boolean,
 ): HistoryWindowState {
+  const activity = useMemo(() => clearHistoryProjection(rawActivity), [rawActivity]);
   const [visibleRows, setVisibleRows] = useState(DEFAULT_HISTORY_WINDOW);
   const [windowSessionId, setWindowSessionId] = useState(sessionId);
   // null until first populate, so the initial page lands as the default window, not as growth.

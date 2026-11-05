@@ -782,6 +782,9 @@ mod tests {
             row.view = View::Structured;
             row.status = status;
             row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+            row.acp_session_id = Some("retained-startup-recovery".into());
+            row.resume_intent =
+                crate::session::ResumeIntent::Use("retained-startup-recovery".into());
             test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
             let disk_before =
                 serde_json::to_value(test_support::load_instances_from_disk_for_test("test"))
@@ -835,73 +838,181 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_refuses_shelved_rows_after_the_candidate_snapshot() {
-        use crate::session::{Instance, Status, View};
-        let _home = crate::session::test_support::isolate_app_dir();
-        for structured in [false, true] {
-            for (shelve, code) in [
-                (Instance::archive as fn(&mut Instance), "session_archived"),
-                (Instance::trash as fn(&mut Instance), "session_trashed"),
-            ] {
-                for published in [false, true] {
-                    let mut candidate = Instance::new("shelved recovery", "/tmp/recovery");
-                    candidate.source_profile = "test".into();
-                    candidate.view = if structured {
-                        View::Structured
-                    } else {
-                        View::Terminal
-                    };
-                    candidate.status = Status::Running;
-                    candidate.last_error = Some("previous diagnostic".into());
-                    let mut shelved = candidate.clone();
-                    shelve(&mut shelved);
-                    test_support::seed_instances_on_disk_for_test("test", vec![shelved.clone()]);
-                    let visible = if published {
-                        shelved
-                    } else {
-                        candidate.clone()
-                    };
-                    let state = test_support::build_test_app_state(vec![visible.clone()]);
-                    test_support::refresh_canonical_metadata_for_test(&state).await;
-                    let disk_before = serde_json::to_value(
-                        test_support::load_instances_from_disk_for_test("test"),
-                    )
-                    .unwrap();
-                    let mut rx = state.status_tx.subscribe();
-                    let response = crate::server::api::sessions::recovery_restart(
-                        state.clone(),
-                        candidate.id,
-                        candidate.lifecycle_generation,
-                    )
-                    .await;
-                    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                        .await
-                        .unwrap();
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(
-                        body["error"], code,
-                        "structured={structured} published={published}"
-                    );
-                    assert!(
-                        rx.try_recv().is_err(),
-                        "refused recovery publishes no status edge"
-                    );
-                    let current = state.instances.read().await;
-                    assert_eq!(
-                        serde_json::to_value(&current[0]).unwrap(),
-                        serde_json::to_value(visible).unwrap()
-                    );
-                    let disk_after = serde_json::to_value(
-                        test_support::load_instances_from_disk_for_test("test"),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        disk_after, disk_before,
-                        "recovery must not mutate shelved metadata"
-                    );
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::session::{Instance, Status};
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for structured in [false, true] {
+                    for (shelve, code) in [
+                        (Instance::archive as fn(&mut Instance), "session_archived"),
+                        (Instance::trash as fn(&mut Instance), "session_trashed"),
+                    ] {
+                        for published in [false, true] {
+                            let (state, candidate, original, launches) = if structured {
+                                let original = test_support::managed_control_session(
+                                    scope,
+                                    "shelved-recovery",
+                                )
+                                .await;
+                                original.client.stop_session().await;
+                                original.client.shutdown().await.unwrap();
+                                let candidate = original
+                                    .state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == original.id())
+                                    .unwrap()
+                                    .clone();
+                                assert_eq!(candidate.status, Status::Stopped);
+                                candidate.require_resolved_acp_selection().unwrap();
+                                assert_eq!(
+                                    candidate.acp_session_id.as_deref(),
+                                    Some(original.sid.as_str())
+                                );
+                                (original.state.clone(), candidate, Some(original), None)
+                            } else {
+                                let project = scope.tempdir();
+                                let mut candidate = Instance::new(
+                                    "shelved recovery",
+                                    project.path().to_str().unwrap(),
+                                );
+                                candidate.source_profile = "test".into();
+                                candidate.status = Status::Running;
+                                candidate.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+                                let storage =
+                                    crate::session::Storage::open_reference("test").unwrap();
+                                storage
+                                    .update(|rows, _| {
+                                        rows.push(candidate.clone());
+                                        Ok(())
+                                    })
+                                    .unwrap();
+                                let (launcher, launches) =
+                                    test_support::counting_failing_launcher();
+                                let state = test_support::build_test_app_state_with_launcher(
+                                    vec![candidate.clone()],
+                                    launcher,
+                                );
+                                (state, candidate, None, Some(launches))
+                            };
+                            candidate.ensure_startable().unwrap();
+                            let queued = state
+                                .session_service
+                                .enqueue_prompt(
+                                    &candidate.id,
+                                    "shelved-recovery-queue".into(),
+                                    "preserve this explicit input".into(),
+                                    Vec::new(),
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            let mut candidate = state
+                                .instances
+                                .read()
+                                .await
+                                .iter()
+                                .find(|row| row.id == candidate.id)
+                                .unwrap()
+                                .clone();
+                            candidate.last_error = Some("previous diagnostic".into());
+                            // Establish the candidate before the concurrent shelf.
+                            // Structured rows retain their actual stopped Native selection.
+                            let mut shelved = candidate.clone();
+                            shelve(&mut shelved);
+                            let storage = crate::session::Storage::open_reference("test").unwrap();
+                            storage
+                                .update(|rows, _| {
+                                    *rows.iter_mut().find(|row| row.id == candidate.id).unwrap() =
+                                        shelved.clone();
+                                    Ok(())
+                                })
+                                .unwrap();
+                            let visible = if published {
+                                shelved
+                            } else {
+                                candidate.clone()
+                            };
+                            *state
+                                .instances
+                                .write()
+                                .await
+                                .iter_mut()
+                                .find(|row| row.id == candidate.id)
+                                .unwrap() = visible.clone();
+                            test_support::refresh_canonical_metadata_for_test(&state).await;
+                            let disk_before = serde_json::to_value(
+                                test_support::load_instances_from_disk_for_test("test"),
+                            )
+                            .unwrap();
+                            let native_before =
+                                original.as_ref().map(|session| session.native.requests());
+                            let seq_before = state.acp_event_store.highest_seq(&candidate.id);
+                            let mut rx = state.status_tx.subscribe();
+                            let response = crate::server::api::sessions::recovery_restart(
+                                state.clone(),
+                                candidate.id.clone(),
+                                candidate.lifecycle_generation,
+                            )
+                            .await;
+                            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+                            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                                .await
+                                .unwrap();
+                            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(
+                                body["error"], code,
+                                "structured={structured} published={published}"
+                            );
+                            assert!(
+                                rx.try_recv().is_err(),
+                                "refused recovery publishes no status edge"
+                            );
+                            let current = state.instances.read().await;
+                            let current =
+                                current.iter().find(|row| row.id == candidate.id).unwrap();
+                            assert_eq!(
+                                serde_json::to_value(current).unwrap(),
+                                serde_json::to_value(visible).unwrap()
+                            );
+                            assert_eq!(current.queued_prompts, vec![queued]);
+                            let disk_after = serde_json::to_value(
+                                test_support::load_instances_from_disk_for_test("test"),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                disk_after, disk_before,
+                                "recovery must not mutate shelved metadata"
+                            );
+                            assert_eq!(
+                                state.acp_event_store.highest_seq(&candidate.id),
+                                seq_before,
+                                "refused recovery publishes no ACP effects"
+                            );
+                            if let Some(original) = original {
+                                assert_eq!(Some(original.native.requests()), native_before);
+                                assert_eq!(
+                                    state.acp_supervisor.worker_state(&candidate.id).await,
+                                    crate::daemon::AcpWorkerState::Absent
+                                );
+                            }
+                            if let Some(launches) = launches {
+                                assert_eq!(
+                                    launches.load(std::sync::atomic::Ordering::SeqCst),
+                                    0,
+                                    "shelved terminal recovery never reaches the launcher"
+                                );
+                            }
+                        }
+                    }
                 }
-            }
-        }
+            })
+        })
+        .await;
     }
 
     /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A).

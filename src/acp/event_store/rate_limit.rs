@@ -1,429 +1,164 @@
-//! Rate-limit parks and the redelivery budget that bounds auto-resume.
+//! Qualified rate-limit parks and the durable redelivery budget.
 
-use rusqlite::{params, OptionalExtension};
-use tracing::warn;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{decode_logged, logged, EventStore};
-use crate::acp::state::{Event, RateLimitInfo, RATE_LIMIT_EXHAUSTED_RETRIES_REASON};
+use super::{ControlKnowledge, EventStore};
+use crate::acp::state::{Event, RateLimitInfo};
 use crate::events;
 
-/// A session parked on a provider rate limit.
 #[derive(Debug, Clone)]
 pub struct RateLimitPark {
     pub seq: u64,
-    /// The latest reported limit; `None` for a park whose `RateLimit` row was pruned.
     pub info: Option<RateLimitInfo>,
-    /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
     pub recorded_at_ms: i64,
-    /// The redelivery cap already parked the session; only a queued prompt
-    /// or a manual resume releases it.
     pub cap_reached: bool,
-    /// When auto-resume last fired for this park, so a failed resume retries on a schedule.
     pub last_resume_attempt_ms: Option<i64>,
 }
 
-impl EventStore {
-    /// The most recent `RateLimit` and the epoch ms it was recorded at.
-    pub fn latest_rate_limit_event(&self, session_id: &str) -> Option<(RateLimitInfo, i64)> {
-        let (json, created_at): (String, i64) = self
-            .conn()
-            .query_row(
-                "SELECT event_json, created_at FROM acp_events
-                 WHERE session_id = ?1
-                   AND discriminant = 'RateLimit'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .ok()
-            .flatten()?;
-        match decode_logged(&json, session_id, "latest_rate_limit_event")? {
-            Event::RateLimit { info } => Some((info, created_at)),
-            _ => None,
-        }
-    }
+fn control_event(conn: &Connection, session_id: &str, seq: u64) -> Result<Option<Event>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT event_json FROM acp_events WHERE session_id=?1 AND seq=?2",
+            params![session_id, i64::try_from(seq)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    json.map(|json| {
+        serde_json::from_str(&json)
+            .with_context(|| format!("invalid ACP control event at {session_id}@{seq}"))
+    })
+    .transpose()
+}
 
-    /// The session's current rate-limit park, unless a real continuation
-    /// (a prompt, an agent switch, an explicit clear, or an organic stop) superseded it.
-    pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
-        let conn = self.conn();
-        let latest_rate_limit: Option<(i64, String, i64)> = conn
-            .query_row(
-                "SELECT seq, event_json, created_at FROM acp_events
-                 WHERE session_id = ?1 AND discriminant = 'RateLimit'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .unwrap_or_else(|e| {
-                warn!(target: "acp.event_store", "rate_limit_park query for {session_id}: {e}");
-                None
-            });
-        let (anchor_seq, info, recorded_at_ms) = match latest_rate_limit {
-            Some((seq, json, created_at)) => {
-                match decode_logged(&json, session_id, "rate_limit_park") {
-                    Some(Event::RateLimit { info }) => (seq, Some(info), created_at),
-                    _ => (seq, None, created_at),
-                }
-            }
-            // Retention may have pruned the `RateLimit` row while its stop survives.
-            None => conn
-                .query_row(
-                    "SELECT seq, created_at FROM acp_events
-                     WHERE session_id = ?1 AND discriminant = 'Stopped'
-                       AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'
-                     ORDER BY seq DESC LIMIT 1",
-                    params![session_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .unwrap_or(None)
-                .map_or((0, None, 0), |(seq, created_at)| (seq, None, created_at)),
-        };
-        let cap_seq: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(seq) FROM acp_events
-                 WHERE session_id = ?1 AND seq > ?2 AND discriminant = 'Stopped'
-                   AND json_extract(event_json, '$.Stopped.reason') = ?3",
-                params![session_id, anchor_seq, RATE_LIMIT_EXHAUSTED_RETRIES_REASON],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .unwrap_or(None);
-        let park_seq = match (cap_seq, anchor_seq) {
-            (Some(cap), _) => cap,
-            (None, 0) => return None,
-            (None, anchor) => anchor,
-        };
-        let superseded: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM acp_events
-                   WHERE session_id = ?1 AND seq > ?2
-                     AND (discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
-                                           'AgentSwitched', 'SessionCleared')
-                       OR (discriminant = 'Stopped'
-                           AND json_extract(event_json, '$.Stopped.reason')
-                               NOT IN ('rate_limited', ?3))))",
-                params![session_id, park_seq, RATE_LIMIT_EXHAUSTED_RETRIES_REASON],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-        if superseded {
-            return None;
-        }
-        let last_resume_attempt_ms: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(created_at) FROM acp_events
-                 WHERE session_id = ?1 AND seq > ?2
-                   AND discriminant = 'RateLimitAutoResumed'",
-                params![session_id, anchor_seq],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .unwrap_or(None);
-        Some(RateLimitPark {
-            seq: u64::try_from(park_seq).ok()?,
-            info,
-            recorded_at_ms,
-            cap_reached: cap_seq.is_some(),
-            last_resume_attempt_ms,
+fn quota_at(conn: &Connection, session_id: &str, seq: u64) -> Result<Option<RateLimitInfo>> {
+    match control_event(conn, session_id, seq)? {
+        Some(Event::RateLimit { info }) => Ok(Some(info)),
+        None => Ok(None),
+        _ => anyhow::bail!("quota anchor does not identify a RateLimit event"),
+    }
+}
+
+impl EventStore {
+    pub fn latest_rate_limit_event(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(RateLimitInfo, i64)>> {
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            let Some(quota) = cursor.projection.last_quota else {
+                return Ok(None);
+            };
+            Ok(quota_at(conn, session_id, quota.seq)?.map(|info| (info, quota.created_at_ms)))
         })
     }
 
-    /// The prompt a rate limit interrupted: the latest `UserPromptSent` or
-    /// diff-comments submission whose next terminal event is
-    /// `Stopped { reason: "rate_limited" }`.
+    /// Read quota park knowledge and its exact projection frontier without loading payloads.
+    pub fn rate_limit_park_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<(u64, ControlKnowledge<Option<bool>>)> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            let park = match cursor.projection.park {
+                ControlKnowledge::Known(park) => {
+                    ControlKnowledge::Known(park.map(|park| park.cap_reached))
+                }
+                ControlKnowledge::Indeterminate => ControlKnowledge::Indeterminate,
+            };
+            Ok((cursor.seq, park))
+        })
+    }
+
+    pub fn rate_limit_park(
+        &self,
+        session_id: &str,
+    ) -> Result<ControlKnowledge<Option<RateLimitPark>>> {
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            Ok(match cursor.projection.park {
+                ControlKnowledge::Known(Some(park)) => {
+                    ControlKnowledge::Known(Some(RateLimitPark {
+                        seq: park.seq,
+                        info: match park.quota {
+                            Some(quota) => quota_at(conn, session_id, quota.seq)?,
+                            None => None,
+                        },
+                        recorded_at_ms: park.recorded_at_ms,
+                        cap_reached: park.cap_reached,
+                        last_resume_attempt_ms: park.last_resume_attempt_ms,
+                    }))
+                }
+                ControlKnowledge::Known(None) => ControlKnowledge::Known(None),
+                ControlKnowledge::Indeterminate => ControlKnowledge::Indeterminate,
+            })
+        })
+    }
+
     pub fn rate_limited_turn_prompt(
         &self,
         session_id: &str,
-    ) -> Option<(String, Vec<crate::daemon::PromptAttachmentRef>)> {
-        let conn = self.conn();
-        let (prompt_seq, prompt_json): (i64, String) = logged(
-            conn.query_row(
-                "SELECT seq, event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')
-                 ORDER BY seq DESC
-                 LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional(),
-            "rate_limited_turn_prompt prompt query",
-            session_id,
-        )
-        .flatten()?;
-        let (text, attachments) =
-            match decode_logged(&prompt_json, session_id, "rate_limited_turn_prompt")? {
-                Event::UserPromptSent {
-                    text, attachments, ..
-                } => (text, attachments),
-                // The agent received only the assembled markdown.
-                Event::UserDiffCommentsPrompt {
-                    assembled_markdown, ..
-                } => (assembled_markdown, Vec::new()),
-                _ => return None,
-            };
-        let terminator: Option<String> = logged(
-            conn.query_row(
-                concat!(
-                    "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq > ?2
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
-                     OR ",
-                    native_channel_loss_sql!("event_json"),
-                    ")
-                 ORDER BY seq ASC
-                 LIMIT 1"
-                ),
-                params![session_id, prompt_seq],
-                |row| row.get(0),
-            )
-            .optional(),
-            "rate_limited_turn_prompt terminator query",
-            session_id,
-        )
-        .flatten();
-        match terminator
-            .and_then(|json| decode_logged(&json, session_id, "rate_limited_turn_prompt"))
-        {
-            Some(Event::Stopped { reason }) if reason == "rate_limited" => {
-                Some((text, attachments))
-            }
-            _ => None,
-        }
+    ) -> Result<ControlKnowledge<Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>>> {
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            Ok(match cursor.projection.interrupted_prompt {
+                ControlKnowledge::Known(Some(seq)) => match control_event(conn, session_id, seq)? {
+                    Some(Event::UserPromptSent {
+                        text, attachments, ..
+                    }) => ControlKnowledge::Known(Some((text, attachments))),
+                    Some(Event::UserDiffCommentsPrompt {
+                        assembled_markdown, ..
+                    }) => ControlKnowledge::Known(Some((assembled_markdown, Vec::new()))),
+                    None => ControlKnowledge::Indeterminate,
+                    _ => anyhow::bail!("interrupted prompt anchor does not identify an input"),
+                },
+                ControlKnowledge::Known(None) => ControlKnowledge::Known(None),
+                ControlKnowledge::Indeterminate => ControlKnowledge::Indeterminate,
+            })
+        })
     }
 
-    /// Whether the latest `Stopped { rate_limited }` ended a turn nobody
-    /// prompted: the agent worked since the previous terminal event, with no
-    /// user prompt to redeliver.
-    pub fn rate_limit_interrupted_agent_turn(&self, session_id: &str) -> bool {
-        let conn = self.conn();
-        let Some(stop_seq) = logged(
-            conn.query_row(
-                "SELECT MAX(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional(),
-            "rate_limit_interrupted_agent_turn stop query",
-            session_id,
-        )
-        .flatten()
-        .flatten() else {
-            return false;
-        };
-        logged(
-            conn.query_row(
-                concat!("SELECT IFNULL(SUM(discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')), 0),
-                        IFNULL(SUM(discriminant IN ('AgentMessageChunk', 'ToolCallStarted')), 0)
-                 FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq < ?2
-                   AND seq > (
-                       SELECT IFNULL(MAX(seq), 0) FROM acp_events
-                       WHERE session_id = ?1
-                         AND seq < ?2
-                         AND (discriminant IN ('Stopped', 'AgentStartupError')
-                              OR ", native_channel_loss_sql!("event_json"), "))"),
-                params![session_id, stop_seq],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional(),
-            "rate_limit_interrupted_agent_turn window query",
-            session_id,
-        )
-        .flatten()
-        .is_some_and(|(prompts, worked)| prompts == 0 && worked > 0)
+    pub fn rate_limit_interrupted_agent_turn(
+        &self,
+        session_id: &str,
+    ) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            Ok(cursor.projection.interrupted_agent)
+        })
     }
 
-    /// Redeliveries in the current streak: automatic resumes that re-sent the
-    /// interrupted prompt without a turn getting through. Read from the
-    /// durable budget row, or derived from the log for sessions without one.
-    pub fn rate_limit_redelivery_streak(&self, session_id: &str) -> i64 {
-        let conn = self.conn();
-        let durable: Option<i64> = logged(
-            conn.query_row(
-                &format!(
-                    "SELECT spent FROM {} WHERE session_id = ?1",
-                    self.schema.rate_limit_budgets_table()
-                ),
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional(),
-            "rate_limit budget row read",
-            session_id,
-        )
-        .flatten();
-        if let Some(spent) = durable {
-            return spent;
-        }
-        logged(
-            conn.query_row(
-                &streak_sql("acp_events", false),
-                params![session_id],
-                |row| row.get::<_, i64>(0),
-            ),
-            "rate_limit_redelivery_streak",
-            session_id,
-        )
-        .unwrap_or(0)
+    pub fn rate_limit_redelivery_streak(&self, session_id: &str) -> Result<ControlKnowledge<i64>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            Ok(match cursor.projection.budget {
+                ControlKnowledge::Known(budget) => ControlKnowledge::Known(budget.spent),
+                ControlKnowledge::Indeterminate => ControlKnowledge::Indeterminate,
+            })
+        })
     }
 }
 
-/// The log derivation of the streak: automatic resume breadcrumbs after the
-/// last organic boundary whose next prompt, loss, startup error, or resume is the
-/// redelivered `UserPromptSent`. `bounded` restricts it to rows below `?2`.
-fn streak_sql(events_table: &str, bounded: bool) -> String {
-    let below = if bounded { "AND r.seq < ?2" } else { "" };
-    let next_below = if bounded { "AND n.seq < ?2" } else { "" };
-    let native_loss = native_channel_loss_sql!("n.event_json");
-    format!(
-        "SELECT COUNT(*) FROM {events_table} r
-         WHERE r.session_id = ?1
-           AND r.discriminant = 'RateLimitAutoResumed'
-           AND IFNULL(
-                 json_extract(r.event_json, '$.RateLimitAutoResumed.manual'), 0) = 0
-           {below}
-           AND r.seq > (
-               SELECT IFNULL(MAX(seq), 0) FROM {events_table}
-               WHERE session_id = ?1
-                 AND (discriminant = 'AgentSwitched'
-                   OR (discriminant = 'Stopped'
-                       AND json_extract(event_json, '$.Stopped.reason')
-                           != 'rate_limited'))
-           )
-           AND IFNULL((
-               SELECT n.discriminant FROM {events_table} n
-               WHERE n.session_id = ?1
-                 AND n.seq > r.seq
-                 {next_below}
-                 AND (n.discriminant IN ('UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
-                      OR {native_loss})
-               ORDER BY n.seq ASC
-               LIMIT 1
-           ), '') = 'UserPromptSent'"
-    )
-}
-
-/// Advance the durable redelivery budget for one newly inserted event,
-/// following the same rules as the log derivation.
-pub(super) fn update_rate_limit_budget(
+pub(super) fn preserve_legacy_budgets(
     conn: &rusqlite::Transaction<'_>,
     schema: &events::Schema,
-    session_id: &str,
-    seq: u64,
-    event: &Event,
-) {
-    enum Step {
-        /// An automatic resume fired; its redelivery has not landed yet.
-        Arm,
-        /// The redelivered (or organic) prompt.
-        Spend,
-        /// A manual resume, or a spawn that burned no prompt: keep the spend, drop the arming.
-        Disarm,
-        /// An organic turn end or an agent switch ends the streak.
-        Reset,
-    }
-    let step = match event {
-        Event::RateLimitAutoResumed { manual: false, .. } => Step::Arm,
-        Event::RateLimitAutoResumed { manual: true, .. } | Event::AgentStartupError { .. } => {
-            Step::Disarm
-        }
-        event if event.is_channel_loss() => Step::Disarm,
-        Event::UserPromptSent { .. } => Step::Spend,
-        Event::AgentSwitched { .. } => Step::Reset,
-        Event::Stopped { reason } if reason != "rate_limited" => Step::Reset,
-        _ => return,
-    };
+) -> Result<()> {
     let table = schema.rate_limit_budgets_table();
-    let existing: Option<(i64, i64)> = logged(
-        conn.query_row(
-            &format!("SELECT spent, armed FROM {table} WHERE session_id = ?1"),
-            params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional(),
-        "budget row read",
-        session_id,
-    )
-    .flatten();
-    let (spent, armed) =
-        existing.unwrap_or_else(|| seed_budget_from_log(conn, schema, session_id, seq));
-    let (spent, armed) = match step {
-        Step::Arm => (spent, 1),
-        Step::Spend if armed == 1 => (spent + 1, 0),
-        Step::Spend | Step::Disarm => (spent, 0),
-        Step::Reset => (0, 0),
-    };
-    let wrote = conn
-        .execute(
-            &format!(
-                "INSERT INTO {table} (session_id, spent, armed)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                     spent = excluded.spent,
-                     armed = excluded.armed"
-            ),
-            params![session_id, spent, armed],
-        )
-        .unwrap_or(0);
-    if wrote == 0 {
-        warn!(target: "acp.event_store", "budget row write {session_id}@{seq} failed");
+    let mut existing = conn.prepare(&format!("SELECT session_id, spent, armed FROM {table}"))?;
+    let mut rows = existing.query([])?;
+    while let Some(row) = rows.next()? {
+        let _: String = row.get(0)?;
+        let spent: i64 = row.get(1)?;
+        let armed: i64 = row.get(2)?;
+        anyhow::ensure!(
+            spent >= 0 && matches!(armed, 0 | 1),
+            "invalid durable rate-limit budget"
+        );
     }
-}
-
-/// Derive `(spent, armed)` for a session without a budget row from the log
-/// below `seq`.
-fn seed_budget_from_log(
-    conn: &rusqlite::Transaction<'_>,
-    schema: &events::Schema,
-    session_id: &str,
-    seq: u64,
-) -> (i64, i64) {
-    let events_table = schema.events_table();
-    let spent: i64 = conn
-        .query_row(
-            &streak_sql(events_table, true),
-            params![session_id, seq as i64],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    // Armed iff the newest relevant event before `seq` is an automatic resume.
-    let native_loss = native_channel_loss_sql!("d.event_json");
-    let armed: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT IFNULL((
-                    SELECT CASE WHEN d.discriminant = 'RateLimitAutoResumed'
-                                AND IFNULL(json_extract(d.event_json,
-                                    '$.RateLimitAutoResumed.manual'), 0) = 0
-                            THEN 1 ELSE 0 END
-                    FROM {events_table} d
-                    WHERE d.session_id = ?1 AND d.seq < ?2
-                      AND (d.discriminant IN ('UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
-                           OR {native_loss})
-                    ORDER BY d.seq DESC LIMIT 1
-                ), 0)"
-            ),
-            params![session_id, seq as i64],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    (spent, armed)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
     use chrono::Utc;
+    use ControlKnowledge::{Indeterminate, Known};
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
@@ -435,121 +170,149 @@ mod tests {
         }
     }
 
-    fn auto_resume() -> Event {
+    fn resume(manual: bool) -> Event {
         Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
-            manual: false,
+            manual,
         }
     }
 
     #[test]
-    fn rate_limit_park_and_interrupted_prompt_read_back() {
-        let (_tmp, store) = open_store(1000);
-        let info = RateLimitInfo {
-            status: "limited".into(),
-            resets_at: None,
-            kind: "usage".into(),
-        };
-        let cases: Vec<(&str, Vec<Event>, bool, bool)> = vec![
-            ("bare park", vec![], true, false),
+    fn quota_snapshot_tracks_canonical_park_frontier_across_history_and_reopen() {
+        let (tmp, store) = open_store(0);
+        assert_eq!(
+            store.rate_limit_park_snapshot("s").unwrap(),
+            (0, Known(None))
+        );
+        record_projection(
+            &store,
+            "s",
+            1,
+            [Event::ThinkingStarted, rate_limit_event(60)],
+        );
+        assert_eq!(
+            store.rate_limit_park_snapshot("s").unwrap(),
+            (2, Known(Some(false)))
+        );
+        record_from(
+            &store,
+            "s",
+            3,
+            [
+                stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+                user_prompt("historical input"),
+                resume(false),
+            ],
+        );
+        assert_eq!(
+            store.rate_limit_park_snapshot("s").unwrap(),
+            (5, Known(Some(false)))
+        );
+        record_projection(
+            &store,
+            "s",
+            6,
+            [stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON)],
+        );
+        assert_eq!(
+            store.rate_limit_park_snapshot("s").unwrap(),
+            (6, Known(Some(true)))
+        );
+        drop(store);
+        let cold = EventStore::open(&tmp.path().join("acp.db"), 0).unwrap();
+        assert_eq!(
+            cold.rate_limit_park_snapshot("s").unwrap(),
+            (6, Known(Some(true)))
+        );
+        record_projection(&cold, "s", 7, [user_prompt("new explicit input")]);
+        assert_eq!(
+            cold.rate_limit_park_snapshot("s").unwrap(),
+            (7, Known(None))
+        );
+
+        record_from(&cold, "legacy", 1, [stopped("rate_limited")]);
+        cold.control_cache.forget("legacy");
+        assert_eq!(
+            cold.rate_limit_park_snapshot("legacy").unwrap(),
+            (1, Indeterminate)
+        );
+    }
+
+    #[test]
+    fn qualified_parks_preserve_limit_and_resume_attempt_until_host_boundary() {
+        for (tail, parked, cap, attempted) in [
+            (vec![], true, false, false),
+            (vec![resume(false)], true, false, true),
             (
-                "failed resume",
                 vec![
-                    auto_resume(),
-                    Event::AgentStartupError {
-                        message: "spawn failed".into(),
-                        native_subject: None,
-                    },
-                ],
-                true,
-                false,
-            ),
-            (
-                "a second rate-limited stop",
-                vec![stopped("rate_limited")],
-                true,
-                false,
-            ),
-            (
-                "prompt got through",
-                vec![user_prompt("again")],
-                false,
-                false,
-            ),
-            (
-                "agent switched",
-                vec![Event::AgentSwitched {
-                    from: "claude".into(),
-                    to: "codex".into(),
-                    reason: "rate_limited".into(),
-                }],
-                false,
-                false,
-            ),
-            (
-                "read-only reattach",
-                vec![
-                    Event::RateLimitAutoResumed {
-                        resets_at: Utc::now(),
-                        manual: true,
-                    },
+                    resume(true),
                     Event::AcpSessionAssigned {
-                        acp_session_id: "acp-2".into(),
+                        acp_session_id: "read-only".into(),
                         connection_ready: false,
                         native_subject: None,
                     },
                 ],
                 true,
                 false,
+                true,
             ),
-            ("explicit clear", vec![Event::SessionCleared], false, false),
-            ("user stopped", vec![stopped("user_stopped")], false, false),
             (
-                "cap reached",
                 vec![stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON)],
                 true,
                 true,
+                false,
             ),
-        ];
-        for (i, (label, events, parked, cap)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(
+            (vec![user_prompt("next")], false, false, false),
+            (vec![Event::SessionCleared], false, false, false),
+            (vec![stopped("user_stopped")], false, false, false),
+            (
+                vec![Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "explicit".into(),
+                }],
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let (_tmp, store) = open_store(0);
+            // Admission is stored SDK metadata, not Native establishment.
+            record_projection(
                 &store,
-                &id,
+                "s",
                 1,
-                [
-                    Event::RateLimit { info: info.clone() },
-                    stopped("rate_limited"),
-                ],
+                [Event::ThinkingStarted, rate_limit_event(60)],
             );
-            record_from(&store, &id, 3, events);
-            let got = store.rate_limit_park(&id);
-            assert_eq!(got.is_some(), parked, "{label}: parked");
-            if let Some(got) = got {
-                assert_eq!(got.cap_reached, cap, "{label}: cap");
-                assert!(got.info.is_some(), "{label}: carries the limit");
-                assert_eq!(
-                    got.last_resume_attempt_ms.is_some(),
-                    matches!(label, "failed resume" | "read-only reattach"),
-                    "{label}: resume attempt"
-                );
+            record_projection(&store, "s", 3, tail);
+            match store.rate_limit_park("s").unwrap() {
+                Known(Some(park)) if parked => {
+                    assert_eq!(park.cap_reached, cap);
+                    assert!(park.info.is_some());
+                    assert_eq!(park.last_resume_attempt_ms.is_some(), attempted);
+                }
+                Known(None) if !parked => {}
+                actual => panic!("unexpected park: {actual:?}"),
             }
         }
-
-        // A cap park whose RateLimit row is gone still reads as a cap park.
+        let (_tmp, store) = open_store(0);
+        let cap = stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON);
         store
             .record(
-                "s-cap-only",
+                "s",
                 1,
-                &stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+                &cap,
+                &crate::acp::event_sender::EventMetadata::host(&cap),
             )
             .unwrap();
-        let cap_only = store.rate_limit_park("s-cap-only").expect("cap park");
-        assert!(cap_only.cap_reached && cap_only.info.is_none());
-        assert!(store.rate_limit_park("never-limited").is_none());
+        let Known(Some(park)) = store.rate_limit_park("s").unwrap() else {
+            panic!("cap park");
+        };
+        assert!(park.cap_reached && park.info.is_none());
+    }
 
-        // The interrupted prompt, and the latest limit event, are read back.
-        let (_tmp, store) = open_store(1000);
+    #[test]
+    fn interrupted_input_preserves_attachments_and_diff_comments() {
         let attachment = crate::daemon::PromptAttachmentRef {
             id: "att-1".into(),
             kind: crate::daemon::PromptAttachmentKind::Image,
@@ -557,397 +320,288 @@ mod tests {
             name: Some("shot.png".into()),
             size: 42,
         };
-        let with_attachment = Event::UserPromptSent {
-            prompt_id: None,
-            text: "look at this".into(),
-            attachments: vec![attachment.clone()],
-            synthesized: false,
-            origin_plugin: None,
-        };
-        // (events, expected prompt)
-        let cases = [
+        for (input, text, attachments) in [
+            (user_prompt("plain"), "plain", vec![]),
             (
-                vec![user_prompt("keep working"), stopped("rate_limited")],
-                Some(("keep working", vec![])),
+                Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "image".into(),
+                    attachments: vec![attachment.clone()],
+                    synthesized: false,
+                    origin_plugin: None,
+                },
+                "image",
+                vec![attachment],
             ),
             (
-                vec![with_attachment, stopped("rate_limited")],
-                Some(("look at this", vec![attachment])),
+                Event::UserDiffCommentsPrompt {
+                    intro: String::new(),
+                    outro: String::new(),
+                    is_multi_repo: false,
+                    comments: vec![],
+                    assembled_markdown: "review notes".into(),
+                },
+                "review notes",
+                vec![],
             ),
-            (
-                vec![
-                    Event::UserDiffCommentsPrompt {
-                        intro: String::new(),
-                        outro: String::new(),
-                        is_multi_repo: false,
-                        comments: Vec::new(),
-                        assembled_markdown: "review notes".into(),
-                    },
+        ] {
+            let (_tmp, store) = open_store(0);
+            record_projection(
+                &store,
+                "s",
+                1,
+                [
+                    input,
+                    Event::ThinkingStarted,
+                    rate_limit_event(60),
                     stopped("rate_limited"),
                 ],
-                Some(("review notes", vec![])),
-            ),
-            (vec![user_prompt("go"), stopped("prompt_complete")], None),
-            // An agent-initiated turn hit the limit after a completed prompt.
-            (
-                vec![
-                    user_prompt("old"),
-                    stopped("prompt_complete"),
-                    stopped("rate_limited"),
-                ],
-                None,
-            ),
-            (vec![], None),
-        ];
-        for (i, (events, want)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            let want = want.map(|(text, attachments)| (text.to_string(), attachments));
-            assert_eq!(store.rate_limited_turn_prompt(&id), want, "case {i}");
+            );
+            assert_eq!(
+                store.rate_limited_turn_prompt("s").unwrap(),
+                Known(Some((text.to_owned(), attachments)))
+            );
+            assert_eq!(
+                store.rate_limit_interrupted_agent_turn("s").unwrap(),
+                Known(false)
+            );
         }
+    }
 
+    #[test]
+    fn latest_quota_is_result_option_and_preserves_recording_time() {
+        let (_tmp, store) = open_store(0);
         let before = Utc::now().timestamp_millis();
-        store.record("latest", 1, &rate_limit_event(3600)).unwrap();
-        let second = rate_limit_event(7200);
-        let Event::RateLimit { info: ref expected } = second else {
+        let latest = rate_limit_event(120);
+        let Event::RateLimit { info: expected } = &latest else {
             unreachable!()
         };
         let expected_resets = expected.resets_at;
-        store.record("latest", 2, &second).unwrap();
-        let after = Utc::now().timestamp_millis();
-
-        let (info, recorded_at) = store.latest_rate_limit_event("latest").expect("stored");
-        assert_eq!(info.resets_at, expected_resets, "latest event wins");
-        assert!((before..=after).contains(&recorded_at));
-        assert!(store.latest_rate_limit_event("latest-none").is_none());
-    }
-
-    #[test]
-    fn rate_limit_redelivery_streak_counts_resumes_and_resets_organically() {
-        let (_tmp, store) = open_store(1000);
-        let manual_resume = || Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
-            manual: true,
-        };
-        let streak = || store.rate_limit_redelivery_streak("s-1");
-
-        record_from(
+        record_projection(
             &store,
-            "s-1",
+            "s",
             1,
             [
-                user_prompt("run the nightly task"),
-                rate_limit_event(0),
+                Event::ThinkingStarted,
+                rate_limit_event(60),
                 stopped("rate_limited"),
+                Event::ThinkingStarted,
+                latest,
             ],
         );
-        for seq in 4..=18 {
-            let ev = match seq % 3 {
-                1 => auto_resume(),
-                2 => user_prompt("run the nightly task"),
-                _ => rate_limit_event(0),
-            };
-            store.record("s-1", seq, &ev).unwrap();
-            if seq % 3 == 0 {
-                store
-                    .record("s-1", seq + 15, &stopped("rate_limited"))
-                    .unwrap();
-            }
-        }
-        assert_eq!(streak(), 5, "five park, resume, redeliver cycles");
-
-        record_from(
-            &store,
-            "s-1",
-            100,
-            [
-                stopped("prompt_complete"),
-                user_prompt("run the nightly task"),
-                rate_limit_event(0),
-                stopped("rate_limited"),
-                auto_resume(),
-            ],
-        );
-        assert_eq!(streak(), 0, "an organic stop resets the streak");
-        store
-            .record("s-1", 105, &user_prompt("run the nightly task"))
-            .unwrap();
-        assert_eq!(streak(), 1);
-
-        record_from(
-            &store,
-            "s-1",
-            106,
-            [
-                rate_limit_event(0),
-                stopped("rate_limited"),
-                auto_resume(),
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                    native_subject: None,
-                },
-            ],
-        );
-        assert_eq!(streak(), 1, "a resume whose spawn failed spends nothing");
-        record_from(
-            &store,
-            "s-1",
-            110,
-            [auto_resume(), user_prompt("run the nightly task")],
-        );
-        assert_eq!(streak(), 2);
-
-        record_from(
-            &store,
-            "s-1",
-            113,
-            [
-                rate_limit_event(0),
-                stopped("rate_limited"),
-                manual_resume(),
-                user_prompt("run the nightly task"),
-            ],
-        );
-        assert_eq!(streak(), 2, "a manual resume does not count");
-
-        let switched = Event::AgentSwitched {
-            from: "claude".into(),
-            to: "codex".into(),
-            reason: "rate_limit".into(),
-        };
-        store.record("s-1", 117, &switched).unwrap();
-        assert_eq!(streak(), 0, "an agent switch resets the streak");
-        record_from(
-            &store,
-            "s-1",
-            118,
-            [auto_resume(), user_prompt("run the nightly task")],
-        );
-        assert_eq!(streak(), 1);
-
-        store.record("s-3", 1, &stopped("prompt_complete")).unwrap();
-        for seq in 2..=16 {
-            let ev = match seq % 3 {
-                2 => rate_limit_event(0),
-                0 => stopped("rate_limited"),
-                _ => auto_resume(),
-            };
-            store.record("s-3", seq, &ev).unwrap();
-        }
-        assert_eq!(
-            store.rate_limit_redelivery_streak("s-3"),
-            0,
-            "resumes that re-delivered nothing must not count toward the cap"
-        );
-        assert_eq!(store.rate_limit_redelivery_streak("s-2"), 0);
+        let after = Utc::now().timestamp_millis();
+        let (info, at) = store
+            .latest_rate_limit_event("s")
+            .unwrap()
+            .expect("stored quota");
+        assert_eq!(info.resets_at, expected_resets);
+        assert!((before..=after).contains(&at));
+        assert!(store.latest_rate_limit_event("missing").unwrap().is_none());
     }
 
     #[test]
-    fn rate_limit_redelivery_streak_survives_retention_and_budget_loss() {
-        for cap in [3, 1] {
-            let (_tmp, store) = open_store(cap);
-            store
-                .record("s-1", 1, &user_prompt("run the nightly task"))
-                .unwrap();
-            for cycle in 0..5 {
-                let base = 2 + cycle * 4;
+    fn interrupted_agent_requires_work_in_admitted_unprompted_operation() {
+        for (prefix, work, expected) in [
+            (vec![], true, true),
+            (vec![], false, false),
+            (vec![user_prompt("work")], true, false),
+            (
+                vec![
+                    user_prompt("old"),
+                    Event::ThinkingStarted,
+                    stopped("prompt_complete"),
+                    Event::SessionCleared,
+                ],
+                true,
+                true,
+            ),
+            (
+                vec![
+                    Event::ThinkingStarted,
+                    agent_chunk("old"),
+                    stopped("agent_idle"),
+                ],
+                false,
+                false,
+            ),
+        ] {
+            let (_tmp, store) = open_store(0);
+            let mut events = prefix;
+            events.push(Event::ThinkingStarted);
+            if work {
+                events.push(agent_chunk("new"));
+            }
+            events.extend([rate_limit_event(0), stopped("rate_limited")]);
+            record_projection(&store, "s", 1, events);
+            assert_eq!(
+                store.rate_limit_interrupted_agent_turn("s").unwrap(),
+                Known(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn durable_budget_survives_retention_and_missing_budget_never_uses_history_arithmetic() {
+        for cap in [0, 1, 3] {
+            for durable in [None, Some((7, 1, 1)), Some((4, 1, 0))] {
+                let (tmp, store) = open_store(cap);
                 record_from(
                     &store,
-                    "s-1",
-                    base,
+                    "s",
+                    1,
                     [
-                        auto_resume(),
-                        user_prompt("run the nightly task"),
-                        rate_limit_event(0),
+                        user_prompt("historical"),
+                        resume(false),
+                        user_prompt("historical redelivery"),
+                        stopped("prompt_complete"),
                     ],
                 );
-                store
-                    .record("s-1", base + 17, &stopped("rate_limited"))
+                {
+                    let conn = store.conn();
+                    conn.execute(
+                        "DELETE FROM acp_rate_limit_budgets WHERE session_id='s'",
+                        [],
+                    )
                     .unwrap();
-            }
-            assert_eq!(store.rate_limit_redelivery_streak("s-1"), 5, "cap {cap}");
-
-            record_from(
-                &store,
-                "s-1",
-                40,
-                [stopped("prompt_complete"), auto_resume()],
-            );
-            assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0, "cap {cap}");
-            store
-                .record("s-1", 42, &user_prompt("run the nightly task"))
+                    if let Some((spent, armed, known)) = durable {
+                        conn.execute(
+                            "INSERT INTO acp_rate_limit_budgets VALUES('s',?1,?2,?3)",
+                            params![spent, armed, known],
+                        )
+                        .unwrap();
+                    }
+                }
+                store.control_cache.forget("s");
+                let expected = match durable {
+                    Some((spent, _, 1)) => Known(spent),
+                    _ => Indeterminate,
+                };
+                assert_eq!(store.rate_limit_redelivery_streak("s").unwrap(), expected);
+                drop(store);
+                let cold = EventStore::open(&tmp.path().join("acp.db"), cap).unwrap();
+                assert_eq!(cold.rate_limit_redelivery_streak("s").unwrap(), expected);
+                // An explicit input neither seeds a lost budget nor spends a historical resume.
+                let input = user_prompt("new explicit input");
+                cold.record(
+                    "s",
+                    5,
+                    &input,
+                    &crate::acp::event_sender::EventMetadata::host(&input),
+                )
                 .unwrap();
-            assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1, "cap {cap}");
+                let expected = match durable {
+                    Some((spent, 1, 1)) => Known(spent + 1),
+                    _ => expected,
+                };
+                assert_eq!(cold.rate_limit_redelivery_streak("s").unwrap(), expected);
+                record_projection(&cold, "s", 6, [Event::ThinkingStarted]);
+                assert_eq!(cold.rate_limit_redelivery_streak("s").unwrap(), expected);
+            }
         }
+    }
 
-        // An upgraded session with no budget row seeds its streak from the log.
-        let (_tmp, store) = open_store(1000);
-        record_from(
-            &store,
-            "s-seed",
-            1,
-            [
-                user_prompt("run the nightly task"),
+    #[test]
+    fn stored_sdk_retry_budget_arms_spends_disarms_and_resets() {
+        for (tail, expected) in [
+            (vec![resume(false)], 0),
+            (vec![resume(false), user_prompt("retry")], 1),
+            (vec![resume(true), user_prompt("manual retry")], 0),
+            (
+                vec![
+                    resume(false),
+                    Event::AgentStartupError {
+                        message: "spawn failed".into(),
+                        native_subject: None,
+                    },
+                    user_prompt("later explicit"),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    resume(false),
+                    user_prompt("retry"),
+                    stopped("prompt_complete"),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    resume(false),
+                    user_prompt("retry"),
+                    Event::AgentSwitched {
+                        from: "claude".into(),
+                        to: "codex".into(),
+                        reason: "explicit".into(),
+                    },
+                ],
+                0,
+            ),
+        ] {
+            let (_tmp, store) = open_store(0);
+            let mut events = vec![
+                user_prompt("original"),
+                Event::ThinkingStarted,
                 rate_limit_event(0),
                 stopped("rate_limited"),
-                auto_resume(),
-                user_prompt("run the nightly task"),
+            ];
+            events.extend(tail);
+            record_projection(&store, "s", 1, events);
+            assert_eq!(
+                store.rate_limit_redelivery_streak("s").unwrap(),
+                Known(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn historical_controls_cannot_park_interrupt_or_rearm_budget() {
+        let (_tmp, store) = open_store(0);
+        record_from(
+            &store,
+            "s",
+            1,
+            [
+                user_prompt("old"),
+                Event::ThinkingStarted,
+                agent_chunk("old work"),
                 rate_limit_event(0),
+                stopped("rate_limited"),
+                resume(false),
             ],
         );
-        store
-            .record("s-seed", 21, &stopped("rate_limited"))
-            .unwrap();
+        assert!(matches!(store.rate_limit_park("s").unwrap(), Known(None)));
+        assert_eq!(store.rate_limited_turn_prompt("s").unwrap(), Known(None));
+        assert_eq!(
+            store.rate_limit_interrupted_agent_turn("s").unwrap(),
+            Known(false)
+        );
+        assert_eq!(store.rate_limit_redelivery_streak("s").unwrap(), Known(0));
+        assert!(store.latest_rate_limit_event("s").unwrap().is_none());
+    }
+
+    #[test]
+    fn quota_payload_and_projection_storage_errors_are_results() {
+        let (_tmp, store) = open_store(0);
+        record_projection(
+            &store,
+            "s",
+            1,
+            [Event::ThinkingStarted, rate_limit_event(0)],
+        );
         store
             .conn()
             .execute(
-                &format!(
-                    "DELETE FROM {} WHERE session_id = ?1",
-                    store.schema.rate_limit_budgets_table()
-                ),
-                params!["s-seed"],
+                "UPDATE acp_events SET event_json='not json' WHERE session_id='s' AND seq=2",
+                [],
             )
             .unwrap();
-        assert_eq!(
-            store.rate_limit_redelivery_streak("s-seed"),
-            1,
-            "derived from the log"
-        );
-        store.record("s-seed", 22, &auto_resume()).unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 1);
-        store
-            .record("s-seed", 23, &user_prompt("run the nightly task"))
-            .unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 2);
-    }
-
-    #[test]
-    fn admission_refusal_does_not_consume_native_retry_budget_boundaries() {
-        for (source, expected) in [
-            (crate::acp::state::AcpConnectionSource::RunnerRecord, 1),
-            (crate::acp::state::AcpConnectionSource::Native, 0),
-        ] {
-            let (_tmp, store) = open_store(1000);
-            record_from(
-                &store,
-                "retained",
-                1,
-                [
-                    auto_resume(),
-                    Event::AcpConnectionUnavailable {
-                        source,
-                        cause: if source == crate::acp::state::AcpConnectionSource::RunnerRecord {
-                            crate::acp::state::AcpConnectionCause::ControlProtocolUnknown
-                        } else {
-                            crate::acp::state::AcpConnectionCause::StdoutEof
-                        },
-                        phase: if source == crate::acp::state::AcpConnectionSource::RunnerRecord {
-                            crate::acp::state::AcpConnectionPhase::Establishing
-                        } else {
-                            crate::acp::state::AcpConnectionPhase::Established
-                        },
-                        native_subject: None,
-                    },
-                    user_prompt("already governed redelivery"),
-                ],
-            );
-            assert_eq!(store.rate_limit_redelivery_streak("retained"), expected);
-            store
-                .conn()
-                .execute(
-                    &format!(
-                        "DELETE FROM {} WHERE session_id = ?1",
-                        store.schema.rate_limit_budgets_table()
-                    ),
-                    params!["retained"],
-                )
-                .unwrap();
-            assert_eq!(
-                store.rate_limit_redelivery_streak("retained"),
-                expected,
-                "the log fallback must agree with the durable budget"
-            );
-        }
-    }
-
-    #[test]
-    fn interrupted_agent_turn_needs_agent_work_and_no_prompt() {
-        let chunk = || Event::AgentMessageChunk {
-            text: "x".into(),
-            message_id: None,
-        };
-        let diff_comments = || Event::UserDiffCommentsPrompt {
-            intro: String::new(),
-            outro: String::new(),
-            is_multi_repo: false,
-            comments: Vec::new(),
-            assembled_markdown: "review notes".into(),
-        };
-        let limit = || Event::RateLimit {
-            info: RateLimitInfo {
-                status: "limited".into(),
-                resets_at: None,
-                kind: "usage".into(),
-            },
-        };
-        let cases: Vec<(&str, Vec<Event>, bool)> = vec![
-            (
-                "agent turn",
-                vec![chunk(), limit(), stopped("rate_limited")],
-                true,
-            ),
-            (
-                "after a finished turn",
-                vec![
-                    user_prompt("old"),
-                    stopped("end_turn"),
-                    chunk(),
-                    limit(),
-                    stopped("rate_limited"),
-                ],
-                true,
-            ),
-            (
-                "prompted turn",
-                vec![
-                    user_prompt("work"),
-                    chunk(),
-                    limit(),
-                    stopped("rate_limited"),
-                ],
-                false,
-            ),
-            (
-                "no agent work, as a startup limit",
-                vec![limit(), stopped("rate_limited")],
-                false,
-            ),
-            (
-                "work belongs to the earlier turn",
-                vec![
-                    chunk(),
-                    stopped("agent_idle"),
-                    limit(),
-                    stopped("rate_limited"),
-                ],
-                false,
-            ),
-            ("never limited", vec![chunk(), stopped("agent_idle")], false),
-            (
-                "diff-comments turn",
-                vec![diff_comments(), chunk(), limit(), stopped("rate_limited")],
-                false,
-            ),
-        ];
-        for (i, (label, events, want)) in cases.into_iter().enumerate() {
-            let (_tmp, store) = open_store(1000);
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            assert_eq!(
-                store.rate_limit_interrupted_agent_turn(&id),
-                want,
-                "{label}"
-            );
-        }
+        // Keep the cached anchor, then require payload reads to report corruption.
+        assert!(store.latest_rate_limit_event("s").is_err());
+        assert!(store.rate_limit_park("s").is_err());
+        store.control_cache.forget("s");
+        assert!(store.rate_limit_redelivery_streak("s").is_err());
+        assert!(store.rate_limited_turn_prompt("s").is_err());
+        assert!(store.rate_limit_interrupted_agent_turn("s").is_err());
     }
 }
