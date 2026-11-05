@@ -421,15 +421,17 @@ impl TuiTestHarness {
         // Path to unique tmux socket for this test.
         let socket_path = home_dir.path().join("tmux.sock");
 
-        // Create a fake `claude` script so `which claude` succeeds.
+        // Create fake `claude` and `fake-agent` scripts so `which` succeeds.
         let stub_path = stub_dir.path().to_path_buf();
-        let claude_stub = stub_path.join("claude");
-        std::fs::write(&claude_stub, "#!/bin/sh\nexit 0\n").expect("write claude stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&claude_stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod claude stub");
+        for name in ["claude", "fake-agent"] {
+            let stub = stub_path.join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod agent stub");
+            }
         }
 
         // Pre-seed config.toml to skip the welcome dialog and update checks.
