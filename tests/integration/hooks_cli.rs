@@ -23,6 +23,25 @@ impl Drop for TmuxCleanup {
     }
 }
 
+struct DaemonCleanup<'a> {
+    home: &'a Path,
+    xdg: &'a Path,
+    stub: &'a Path,
+    socket: &'a Path,
+}
+
+impl Drop for DaemonCleanup<'_> {
+    fn drop(&mut self) {
+        run_aoe(
+            self.home,
+            self.xdg,
+            self.stub,
+            self.socket,
+            &["serve", "--stop"],
+        );
+    }
+}
+
 fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
@@ -66,6 +85,8 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -
         .env_remove("COPILOT_CONFIG_DIR")
         .env_remove("KIRO_CONFIG_DIR")
         .env_remove("AGENT_OF_EMPIRES_PROFILE")
+        .env_remove("AOE_DAEMON_URL")
+        .env_remove("AOE_NO_AUTOSTART")
         .output()
         .expect("run aoe");
     Run {
@@ -267,6 +288,12 @@ fn hooks_approve_clears_the_launch_gate_for_every_path() {
 
     let socket = tmp.path().join("tmux.sock");
     let _cleanup = TmuxCleanup(socket.clone());
+    let _daemon = DaemonCleanup {
+        home: &home,
+        xdg: &xdg,
+        stub: &stub,
+        socket: &socket,
+    };
     write_config(&xdg, "");
 
     // 1. The issue's command: refused, and the refusal says how to clear it.

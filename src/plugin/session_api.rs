@@ -541,6 +541,7 @@ async fn admit_and_create(
         import_binding: None,
         fork_seed: None,
         progress: None,
+        cli: None,
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a

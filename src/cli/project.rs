@@ -150,8 +150,13 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
     // anchored here, where the user typed it. Whether it exists is the
     // Daemon's call.
     let path = std::path::absolute(&args.path)?;
+    let profile = if scope == ProjectScope::Profile || profile_explicit {
+        target_profile(profile, profile_explicit).await?
+    } else {
+        String::new()
+    };
     let body = serde_json::json!({
-        "profile": target_profile(profile, profile_explicit).await?,
+        "profile": profile,
         "scope": scope.as_str(),
         "path": path.to_string_lossy(),
         "name": args.name,

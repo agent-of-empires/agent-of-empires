@@ -1667,7 +1667,7 @@ mod serve {
         if let Err(error) = crate::server::reload::adopt_committed_profiles(
             state,
             [(profile, rows, groups)],
-            |_| false,
+            |_| None,
             &prepared.2,
             &publication,
         )
@@ -3145,8 +3145,6 @@ claude = "repo-wrapper"
             None
         };
 
-        // Scoped: the injection is process-wide, so the guard must drop before
-        // the assertions that read storage back.
         {
             let _failing_writes = storage.fail_writes_for_test();
             let error = apply_terminal_title(

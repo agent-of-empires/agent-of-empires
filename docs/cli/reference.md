@@ -213,7 +213,7 @@ Add a new session
 
 ###### **Options:**
 
-* `-t`, `--title <TITLE>` — Session title (defaults to folder name)
+* `-t`, `--title <TITLE>` — Session title (defaults to a civilization name, or the worktree branch)
 * `-i`, `--interactive` — Prompt for the session name, mirroring the TUI `n` flow. Shows the generated default; press Enter to accept it. Ignored when --title is given. Requires an interactive terminal
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
