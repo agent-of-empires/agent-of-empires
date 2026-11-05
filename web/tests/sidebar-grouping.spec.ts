@@ -2,7 +2,7 @@
 // per-axis collapse persisted in localStorage. Bucketing is unit-tested in src/lib/__tests__/sidebarGroups.test.ts.
 
 import { test, expect } from "./helpers/mockedTest";
-import type { Locator, Page } from "@playwright/test";
+import type { Locator, Page, Route } from "@playwright/test";
 import { installSidebarMocks, type MockSessionInput } from "./helpers/sidebarMocks";
 import { sessionResponse } from "./helpers/sessions";
 
@@ -562,6 +562,65 @@ test.describe("sidebar status axis (#4867)", () => {
     await runningRow.click({ button: "right" });
     await expect(page.getByTestId("sidebar-context-menu-bulk-unsnooze")).toHaveText("Unsnooze 1");
     await expect(page.getByText("Snooze 1", { exact: true })).toBeVisible();
+  });
+
+  test("archiving one status slice leaves its sibling slice's own pending action alone", async ({ page }) => {
+    const sessions: MockSessionInput[] = [
+      {
+        id: "s-wait",
+        title: "wait-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Waiting" },
+      },
+      {
+        id: "s-run",
+        title: "run-session",
+        project_path: "/tmp/shared",
+        branch: "feat/shared",
+        fields: { status: "Running" },
+      },
+    ];
+    const patched: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await installSidebarMocks(page, { sessions });
+    // Hold both PATCHes so the two slices carry pending values at the same time.
+    const hold = async (route: Route) => {
+      const parts = new URL(route.request().url()).pathname.split("/");
+      const id = decodeURIComponent(parts.at(-2)!);
+      patched.push(`${id}:${parts.at(-1)}`);
+      await held;
+      await route.fulfill({ json: sessionResponse({ id }) });
+    };
+    await page.route("**/api/sessions/*/archive", hold);
+    await page.route("**/api/sessions/*/unread", hold);
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
+
+    const row = (title: string) => page.locator(ROW).filter({ hasText: title });
+    await row("wait-session").click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-archive").click();
+    await expect(row("wait-session").getByTitle("Archived")).toBeVisible();
+
+    // The sibling's action must not claim the Waiting slice's pending archive.
+    await row("run-session").click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-unread").click();
+    await expect.poll(() => patched.length).toBe(2);
+
+    await expect(row("wait-session").getByTitle("Archived")).toBeVisible();
+    await expect(row("run-session").getByTitle("Archived")).toHaveCount(0);
+
+    // Bulk eligibility follows each slice's own state: one pending-archived, one live.
+    await row("wait-session").click();
+    await row("wait-session").click({ modifiers: ["Meta"] });
+    await row("run-session").click({ modifiers: ["Meta"] });
+    await row("run-session").click({ button: "right" });
+    await expect(page.getByTestId("sidebar-context-menu-bulk-unarchive")).toHaveText("Unarchive 1");
+    await expect(page.getByTestId("sidebar-context-menu-bulk-archive")).toHaveText("Archive 1");
+
+    release();
+    await expect.poll(() => [...patched].sort()).toEqual(["s-run:unread", "s-wait:archive"]);
   });
 });
 
