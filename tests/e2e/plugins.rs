@@ -151,10 +151,84 @@ fn test_tui_web_toggle_does_not_replay_daemon_rejection() {
     assert_eq!(std::fs::read(config).unwrap(), before);
 }
 
-/// The manager lists builtins by manifest name and version with their state.
-/// Enter opens the details popup (`aoe plugin info`'s TUI twin) and Esc closes
-/// it; Space toggles the plugin and reports where the write landed (no daemon
-/// here, so the plain local message).
+/// A live owner with an unusable RPC endpoint is not an absent daemon.
+#[test]
+#[parallel]
+fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    require_tmux!();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for missing_route in [false, true] {
+        let mut h = TuiTestHarness::new_in_tmp("web_toggle_stale_daemon");
+        h.stop_daemon_on_drop();
+        h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        open_manager(&h);
+        let app = crate::harness::app_dir_in(h.home_path());
+        let config = app.join("config.toml");
+        let before = std::fs::read(&config).unwrap();
+        let pid = std::fs::read(app.join("serve.pid")).unwrap();
+        let socket = app.join("daemon/api.sock");
+        let retained = app.join("daemon/retained-api.sock");
+        std::fs::rename(&socket, &retained).unwrap();
+
+        let (server, received) = if missing_route {
+            let (sent, received) = std::sync::mpsc::channel();
+            let listener = {
+                let _entered = runtime.enter();
+                tokio::net::UnixListener::bind(&socket).unwrap()
+            };
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let router = axum::Router::new().route(
+                "/api/plugins/aoe.web/enabled",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    assert_eq!(body["enabled"], false);
+                    sent.send(()).unwrap();
+                    std::future::ready(axum::http::StatusCode::NOT_FOUND)
+                }),
+            );
+            let server = runtime.spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            (Some(server), Some(received))
+        } else {
+            (None, None)
+        };
+        h.run_cli_ok(&["serve", "--status"]);
+        assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+        h.send_keys("Space");
+        if let Some(received) = received {
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            h.wait_for("HTTP 404");
+        } else {
+            h.wait_for("daemon Unix transport failed");
+        }
+        assert!(
+            std::fs::read(&config).unwrap() == before,
+            "A failed Web RPC rewrote local configuration"
+        );
+        if let Some(server) = server {
+            server.abort();
+            let _ = runtime.block_on(server);
+        }
+        std::fs::rename(&retained, &socket).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        h.send_keys("Space");
+        h.wait_for("Disabled aoe.web; the daemon reconciled its workers.");
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            saved["plugins"]["aoe.web"]["enabled"].as_bool(),
+            Some(false)
+        );
+        h.run_cli_ok(&["serve", "--status"]);
+        assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+    }
+}
+
 #[test]
 #[parallel]
 fn test_tui_manager_lists_details_and_toggles() {

@@ -83,6 +83,7 @@ fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
     })
 }
 
+/// Requires token mode with a passphrase; neither gate may bypass the other.
 pub(super) fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;

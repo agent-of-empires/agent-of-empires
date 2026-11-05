@@ -82,6 +82,8 @@ pub enum LiveToggle {
     LocalDaemonStale { reason: String },
 }
 
+/// Failed discovery permits a local save. After discovery, Web errors are terminal:
+/// a failed RPC can have an unknown outcome. Other plugins retain local fallback.
 pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveToggle> {
     if super::registry().get(plugin_id).is_none() {
         bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");

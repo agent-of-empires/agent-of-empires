@@ -53,6 +53,8 @@ Configured TCP startup failures are reported without automatically starting core
 
 AoE-managed writes to the registered Web plugin's enable state use the daemon's namespace transaction. A save cannot commit during an active start, restart, or rollback; it reports a busy error rather than waiting inside the daemon. Retry rejected saves explicitly after the transition finishes. A save committed first is honored by launch validation. Disabling the plugin does not stop an existing TCP daemon. Hand edits do not participate in this coordination.
 
+See [Web plugin errors](../plugins.md#web-plugin-errors) for the command-palette manager's failure and recovery policy.
+
 An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 
 `aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop`. When `aoe.web` is disabled, replaying a TCP launch refuses before stopping the current daemon; core-only replay remains available. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.

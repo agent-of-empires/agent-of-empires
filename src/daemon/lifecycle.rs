@@ -44,6 +44,8 @@ fn open_lock(name: &str) -> Result<File> {
 }
 
 impl Transaction {
+    /// Daemon mutations must not wait here: the transition may be waiting for
+    /// that same daemon to exit.
     pub(crate) fn try_acquire() -> Result<Self> {
         let file = open_lock("transaction.lock")?;
         match file.try_lock_exclusive() {
@@ -55,12 +57,7 @@ impl Transaction {
         }
     }
 
-    /// Acquire the transaction, giving up after `wait`.
-    ///
-    /// The only blocking acquisition: a daemon transition holds the lock for as
-    /// long as it takes to start or stop, so a caller needs a bound and a message
-    /// naming the transition that is in the way. Its only caller is the TUI key
-    /// handler, where an unbounded wait would freeze the whole UI.
+    /// Bound synchronous TUI actions so lifecycle transitions cannot freeze the UI.
     pub(crate) fn acquire_blocking_for(wait: Duration) -> Result<Self> {
         let file = open_lock("transaction.lock")?;
         let deadline = Instant::now() + wait;
