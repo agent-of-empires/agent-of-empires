@@ -143,6 +143,7 @@ impl StartupErrorDetail {
             Self::MissingAgentInfo { .. } => "missing_agent_info",
             Self::MismatchedAgentName { .. } => "mismatched_agent_name",
             Self::UnparseableAgentVersion { .. } => "unparseable_agent_version",
+            Self::InvalidProxyHello { .. } => "invalid_proxy_hello",
         }
     }
 
@@ -186,6 +187,9 @@ impl StartupErrorDetail {
             Self::UnsupportedProtocolVersion { expected, received } => format!(
                 "Adapter speaks ACP protocol {received}; aoe requires {expected}.",
             ),
+            Self::InvalidProxyHello { reason } => {
+                format!("The agent proxy's hello was rejected: {reason}")
+            }
         }
     }
 }

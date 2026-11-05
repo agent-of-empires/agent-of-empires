@@ -3,6 +3,7 @@
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
 use crate::acp::fs_handler::FsPolicy;
+use crate::acp::state::{IntegrationLostReason, StartupErrorDetail};
 use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use std::collections::HashMap;
@@ -328,6 +329,18 @@ async fn spawn_fake_connection(
     session_id: &'static str,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
+    let (ready, fake) = spawn_fake_connection_with(session_id, "", on_prompt).await;
+    ready.expect("handshake ok");
+    fake
+}
+
+/// `init_extra` is spliced into the `initialize` result after
+/// `agentCapabilities`, e.g. a `_meta` hello.
+async fn spawn_fake_connection_with(
+    session_id: &'static str,
+    init_extra: &'static str,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> (Result<(), AcpError>, FakeConnection) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
@@ -377,7 +390,7 @@ async fn spawn_fake_connection(
             let id = &msg["id"];
             let replies = match msg["method"].as_str() {
                 Some("initialize") => vec![format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}{init_extra}}}}}"#
                 )],
                 Some("session/new") => vec![format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}"}}}}"#
@@ -390,18 +403,16 @@ async fn spawn_fake_connection(
             }
         }
     });
-    ready_rx
-        .await
-        .expect("handshake completes")
-        .expect("handshake ok");
-    FakeConnection {
+    let ready = ready_rx.await.expect("handshake completes");
+    let fake = FakeConnection {
         event_rx,
         cmd_tx,
         agent_write,
         connection,
         agent,
         _cwd: temp,
-    }
+    };
+    (ready, fake)
 }
 
 /// A limit that ends an agent-initiated turn must end the connection, or the
@@ -542,4 +553,68 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         fake.agent.abort();
         let _ = fake.agent.await;
     }
+}
+
+const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
+const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":1}}}"#;
+
+fn tool_call_frame(id: &str, aoe: &str) -> String {
+    let meta = if aoe.is_empty() {
+        String::new()
+    } else {
+        format!(r#","_meta":{{"aoe":{aoe}}}"#)
+    };
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-h","update":{{"sessionUpdate":"tool_call","toolCallId":"{id}","title":"T"{meta}}}}}}}"#
+    )
+}
+
+/// A hello core cannot accept refuses the session; a valid one makes the
+/// agent's `_meta.aoe` frames dedup, drop and reorder before the reducer, and a
+/// broken frame ends the integration.
+#[tokio::test]
+async fn proxy_hello_and_primitives_shape_the_event_stream() {
+    let (ready, fake) = spawn_fake_connection_with("s-h", BAD_HELLO, |_| vec![]).await;
+    assert!(
+        matches!(&ready, Err(AcpError::IncompatibleAgent(e))
+            if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
+        "{ready:?}"
+    );
+    fake.agent.abort();
+    fake.connection.abort();
+
+    let (ready, mut fake) = spawn_fake_connection_with("s-h", GOOD_HELLO, |_| vec![]).await;
+    ready.expect("valid hello accepted");
+    let frames = [
+        tool_call_frame("t1", ""),
+        // Tailer-emitted: waits for adapter frame 3.
+        tool_call_frame("t2", r#"{"v":1,"key":"k2","after_adapter_sequence":3}"#),
+        tool_call_frame("t3", r#"{"v":1,"key":"k3","ephemeral":true}"#),
+        tool_call_frame("t4", r#"{"v":1,"key":"k4"}"#),
+        tool_call_frame("t4-again", r#"{"v":1,"key":"k4"}"#),
+        tool_call_frame("t5", ""),
+        tool_call_frame("t6", r#"{"v":1}"#),
+    ];
+    for frame in &frames {
+        write_line(&fake.agent_write, frame).await;
+    }
+    let (mut started, mut lost) = (Vec::new(), None);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while lost.is_none() {
+            match fake.event_rx.recv().await.expect("connection remains open") {
+                Event::ToolCallStarted { tool_call } => started.push(tool_call.id),
+                Event::IntegrationLost { reason } => lost = Some(reason),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("integration loss is reported");
+    assert_eq!(started, ["t1", "t4", "t2", "t5"]);
+    assert!(matches!(
+        lost,
+        Some(IntegrationLostReason::ContractViolation { .. })
+    ));
+    fake.agent.abort();
+    fake.connection.abort();
 }
