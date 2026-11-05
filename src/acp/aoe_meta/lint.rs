@@ -40,7 +40,8 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         })
     };
     let mut hello_line: Option<usize> = None;
-    let mut keys: HashMap<String, Envelope> = HashMap::new();
+    // The whole update, so a reused key on a different tool call is caught.
+    let mut keys: HashMap<String, serde_json::Value> = HashMap::new();
     let mut leases: HashSet<String> = HashSet::new();
     let mut order: ArrivalOrder<Seen> = ArrivalOrder::default();
 
@@ -112,17 +113,17 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         };
         if let Some(env) = &envelope {
             match keys.get(&env.key) {
-                Some(first) if first != env => add(
+                Some(first) if first != update => add(
                     n,
                     "key_conflict",
                     format!(
-                        "idempotency key {:?} reused with a different payload",
+                        "idempotency key {:?} reused with a different update",
                         env.key
                     ),
                 ),
                 Some(_) => {}
                 None => {
-                    keys.insert(env.key.clone(), env.clone());
+                    keys.insert(env.key.clone(), update.clone());
                 }
             }
         }
@@ -204,6 +205,12 @@ mod tests {
     fn update_of(kind: &str, meta: &str) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"{kind}","_meta":{{"aoe":{meta}}}}}}}}}"#
+        )
+    }
+
+    fn tool_call(id: &str, meta: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call","toolCallId":"{id}","title":"T","_meta":{{"aoe":{meta}}}}}}}}}"#
         )
     }
 
@@ -301,6 +308,24 @@ mod tests {
                 ],
                 false,
                 vec!["key_conflict"],
+            ),
+            (
+                "same envelope on a different tool call",
+                vec![
+                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
+                ],
+                false,
+                vec!["key_conflict"],
+            ),
+            (
+                "identical retransmission of a tool call",
+                vec![
+                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                ],
+                false,
+                vec![],
             ),
             (
                 "anchor past the end",
