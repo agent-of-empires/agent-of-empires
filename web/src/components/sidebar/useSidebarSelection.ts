@@ -32,13 +32,18 @@ export function useSidebarSelection({
     id: string;
     sessionId: string | null;
     fromActiveId: string | null;
+    fromActiveSessionId: string | null;
   } | null>(null);
-  // Drop the hint once activeId moves, so navigating back to `fromActiveId` cannot revive a stale id.
-  if (optimisticActive && optimisticActive.fromActiveId !== activeId) setOptimisticActive(null);
-  const displayedActiveId = optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
+  // Drop the hint once the route moves, on either half of the pair: a sibling session opened by
+  // another route shares the workspace id, so it must still invalidate the hint.
+  const hintApplies =
+    optimisticActive !== null &&
+    optimisticActive.fromActiveId === activeId &&
+    optimisticActive.fromActiveSessionId === activeSessionId;
+  if (optimisticActive && !hintApplies) setOptimisticActive(null);
+  const displayedActiveId = optimisticActive && hintApplies ? optimisticActive.id : activeId;
   // A status slice holds one session, so an active row must match it, not just the workspace id.
-  const displayedActiveSessionId =
-    optimisticActive?.fromActiveId === activeId ? optimisticActive.sessionId : activeSessionId;
+  const displayedActiveSessionId = optimisticActive && hintApplies ? optimisticActive.sessionId : activeSessionId;
 
   // Selection is keyed by the rendered row: the status axis slices one workspace into a row per
   // status, and each row's actions belong to its own session.
@@ -140,7 +145,12 @@ export function useSidebarSelection({
         dispatch(readOnly ? { type: "clear" } : { type: "navigate", id: rowKey });
         // Rows outside the group lists (the Trash panel) key themselves by workspace id.
         const workspaceId = byKey.get(rowKey)?.workspace.id ?? rowKey;
-        setOptimisticActive({ id: workspaceId, sessionId, fromActiveId: activeId });
+        setOptimisticActive({
+          id: workspaceId,
+          sessionId,
+          fromActiveId: activeId,
+          fromActiveSessionId: activeSessionId,
+        });
         onSelect(workspaceId, sessionId);
       } else if (intent === "toggle") {
         dispatch({ type: "toggle", id: rowKey });
@@ -148,7 +158,7 @@ export function useSidebarSelection({
         dispatch({ type: "range", targetId: rowKey, orderedIds, additive: intent === "additive-range" });
       }
     },
-    [activeId, byKey, onSelect, orderedIds, readOnly],
+    [activeId, activeSessionId, byKey, onSelect, orderedIds, readOnly],
   );
 
   const isSelected = (key: string) => !readOnly && selection.selectedIds.has(key);
