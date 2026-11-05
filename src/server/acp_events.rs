@@ -466,15 +466,13 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if status_update.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
-        // Identity events share the per-session mutation lock with pollers and
-        // lifecycle callers. Hold it through the durable write so a concurrent
-        // SID publication cannot be overwritten by a stale ACP observation.
-        let identity_lock = if acp_change.is_some() {
+        // Identity and capability updates share lifecycle snapshot exclusion.
+        let mutation_lock = if acp_change.is_some() || load_session_capability.is_some() {
             Some(state.instance_lock(&frame.session_id).await)
         } else {
             None
         };
-        let _identity_guard = match &identity_lock {
+        let mutation_guard = match &mutation_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
@@ -559,10 +557,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 .mutation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        // Identity and turn-end are disjoint ACP events. If a future event ever
-        // combines them, release the identity guard before the unread helper takes it.
+        // Turn-end helpers acquire the same per-session lock.
         if unread_profile.is_some() {
-            drop(_identity_guard);
+            drop(mutation_guard);
         }
 
         // The turn just finished, so the row takes the automatic unread mark.

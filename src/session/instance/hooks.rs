@@ -4,6 +4,10 @@ use super::*;
 use crate::session::SessionStore;
 use anyhow::bail;
 
+#[derive(Debug, thiserror::Error)]
+#[error("agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching this host session")]
+pub(crate) struct HostHookApprovalRequired;
+
 /// `program` is the basename of the executable the launch runs. A bare-token wrapper such as
 /// `company-codex` can be the agent itself under another name (a symlink or copy), so the identity
 /// hook's ancestor walk must count that name too: otherwise a nested `codex exec` is the only
@@ -497,10 +501,7 @@ impl Instance {
             return Ok(());
         }
         if !host_hooks_acknowledged() {
-            bail!(
-                "agent hook paths have not been approved; run `aoe hooks approve` \
-                 before launching this host session"
-            );
+            return Err(HostHookApprovalRequired.into());
         }
         let profile_environment = self.profile_host_environment();
         let resolved_environment = self.resolved_host_environment();
