@@ -8,6 +8,8 @@ export interface ToastApi {
    *  worker `ui.open_url`, which cannot `window.open` from an async push without
    *  the popup blocker, so the open waits for the user's click. */
   openLink: (message: string, href: string) => void;
+  /** An error toast with one button, such as reopening what failed. */
+  action: (message: string, label: string, onAction: () => void) => void;
 }
 
 interface ToastBus {

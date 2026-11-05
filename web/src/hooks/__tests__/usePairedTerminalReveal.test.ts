@@ -73,6 +73,13 @@ describe("usePairedTerminalReveal", () => {
       activated: ["right", "terminal:1"],
     },
     {
+      label: "Cmd+` with a terminal shown in each dock focuses the right one by its index",
+      singlePane: false,
+      layout: layout([group(["terminal:1"])], [group(["terminal:2"])]),
+      shows: 1,
+      focusedNow: true,
+    },
+    {
       label: "a visible terminal wins over an active one in a collapsed dock",
       singlePane: false,
       layout: layout([group(["terminal:1"])], [group(["terminal:2"])], ["right"]),
@@ -110,9 +117,10 @@ describe("usePairedTerminalReveal", () => {
 
     expect(result.current(prepare)).toBe(shows);
     if (prepare) expect(prepare.mock.calls).toEqual([[shows]]);
-    expect(focus.dispatchFocusTerminal.mock.calls).toEqual(singlePane || focusedNow ? [["paired"]] : []);
+    // Both name the shown terminal, so a second docked one doesn't take the focus.
+    expect(focus.dispatchFocusTerminal.mock.calls).toEqual(singlePane || focusedNow ? [["paired", shows]] : []);
     // Focus that can't happen now is latched for the shell to take once ready.
-    expect(focus.setPendingTerminalFocus.mock.calls).toEqual(focusedNow ? [] : [["paired"]]);
+    expect(focus.setPendingTerminalFocus.mock.calls).toEqual(focusedNow ? [] : [["paired", shows]]);
     expect(raf).toHaveBeenCalledTimes(singlePane ? 1 : 0);
     expect(setRightPanelView.mock.calls).toEqual(singlePane ? [["paired"]] : []);
     expect(activateTab.mock.calls).toEqual(activated ? [activated] : []);
@@ -144,5 +152,23 @@ describe("useOpenPairedTerminal", () => {
     ]);
     expect(shownMode).toHaveBeenCalledWith("active", 2);
     expect(remounts).toEqual([true, false]);
+  });
+
+  it("Open Terminal with a terminal shown in each dock focuses the one it set the mode on", () => {
+    const setMode = vi.fn();
+    const { result } = renderHook(() => {
+      const reveal = usePairedTerminalReveal({
+        singlePane: false,
+        layout: layout([group(["terminal:1"])], [group(["terminal:2"])]),
+        openTab: vi.fn(),
+        activateTab: vi.fn(),
+        setRightPanelView: vi.fn(),
+      });
+      return useOpenPairedTerminal("active", reveal, () => "host", setMode);
+    });
+
+    result.current("active", "host");
+    expect(setMode.mock.calls).toEqual([["active", 1, "host"]]);
+    expect(focus.dispatchFocusTerminal.mock.calls).toEqual([["paired", 1]]);
   });
 });

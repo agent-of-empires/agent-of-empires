@@ -146,6 +146,7 @@ impl Session {
             control.supersede_adopted_turn();
         }
         shared.reset_message_dedup();
+        shared.seed_user_replay.store(false, Ordering::Relaxed);
         if shared
             .suppress_history_replay
             .swap(false, Ordering::Relaxed)
