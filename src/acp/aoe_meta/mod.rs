@@ -27,8 +27,11 @@ type Meta = serde_json::Map<String, serde_json::Value>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyHello {
+    #[schemars(regex(pattern = r"\S"))]
     pub plugin_id: String,
+    #[schemars(range(min = 1, max = 1))]
     pub protocol_version: u32,
+    #[schemars(range(min = 1, max = 1))]
     pub primitive_schema_version: u32,
 }
 
@@ -96,6 +99,7 @@ pub struct LeaseOp {
     #[serde(default, skip_serializing_if = "is_default")]
     pub op: LeaseVerb,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 3_600_000))]
     pub ttl_ms: Option<u64>,
 }
 
@@ -151,7 +155,9 @@ pub struct OptionPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
+    #[schemars(range(min = 1, max = 1))]
     pub v: u32,
+    #[schemars(length(min = 1))]
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_adapter_sequence: Option<u64>,
@@ -373,14 +379,51 @@ mod tests {
         assert_eq!(on_disk, schema_json(), "run `cargo xtask gen-meta-schema`");
     }
 
+    /// Every constraint the runtime enforces that JSON Schema can express. A
+    /// lease acquire or renew without `ttl_ms` is a runtime rule only.
     #[test]
     fn published_schema_agrees_with_the_types() {
         let schema: serde_json::Value = serde_json::from_str(&schema_json()).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        let primitive = json!({"v": 1, "key": "k", "ephemeral": true,
-            "lease": {"id": "a", "kind": "busy", "ttl_ms": 5000}});
         let hello = json!({"plugin_id": "p", "protocol_version": 1, "primitive_schema_version": 1});
-        assert!(validator.is_valid(&json!({"proxy": hello, "primitive": primitive})));
-        assert!(!validator.is_valid(&json!({"proxy": hello, "primitive": {"v": 1}})));
+        let lease = |ttl: u64| json!({"id": "a", "kind": "busy", "ttl_ms": ttl});
+        let with = |primitive: serde_json::Value| json!({"proxy": hello, "primitive": primitive});
+        // (name, document, valid)
+        let cases = [
+            ("minimal", with(json!({"v": 1, "key": "k"})), true),
+            (
+                "ephemeral lease",
+                with(json!({"v": 1, "key": "k", "ephemeral": true, "lease": lease(5000)})),
+                true,
+            ),
+            ("missing key", with(json!({"v": 1})), false),
+            ("future version", with(json!({"v": 2, "key": "k"})), false),
+            ("empty key", with(json!({"v": 1, "key": ""})), false),
+            (
+                "zero ttl",
+                with(json!({"v": 1, "key": "k", "lease": lease(0)})),
+                false,
+            ),
+            (
+                "ttl over the cap",
+                with(json!({"v": 1, "key": "k", "lease": lease(MAX_LEASE_TTL_MS + 1)})),
+                false,
+            ),
+            (
+                "blank plugin id",
+                json!({"proxy": {"plugin_id": "  ", "protocol_version": 1, "primitive_schema_version": 1},
+                       "primitive": {"v": 1, "key": "k"}}),
+                false,
+            ),
+            (
+                "future protocol",
+                json!({"proxy": {"plugin_id": "p", "protocol_version": 2, "primitive_schema_version": 1},
+                       "primitive": {"v": 1, "key": "k"}}),
+                false,
+            ),
+        ];
+        for (name, document, valid) in cases {
+            assert_eq!(validator.is_valid(&document), valid, "{name}");
+        }
     }
 }
