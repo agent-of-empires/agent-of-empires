@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
@@ -85,6 +86,7 @@ pub(super) struct Shared {
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
+    pub(super) aoe: AoeIngress,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -134,6 +136,7 @@ impl Shared {
             subagents: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            aoe: AoeIngress::default(),
             claude_home,
         }
     }
@@ -204,6 +207,33 @@ impl Shared {
     /// the session: it belongs to no local prompt, so it must not reach the
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
+        &self,
+        notification: SessionNotification,
+        local_prompt_signals: bool,
+    ) {
+        match self
+            .aoe
+            .ingest(notification, local_prompt_signals, now_ms())
+        {
+            Ingested::Deliver(frames) => {
+                for (notification, local_prompt_signals) in frames {
+                    self.handle_adapter_notification(notification, local_prompt_signals)
+                        .await;
+                }
+            }
+            Ingested::Lost(reason) => {
+                tracing::warn!(
+                    target: "acp.protocol",
+                    session = %self.session_label,
+                    ?reason,
+                    "agent integration lost; ignoring further frames"
+                );
+                self.emit(Event::IntegrationLost { reason }).await;
+            }
+        }
+    }
+
+    async fn handle_adapter_notification(
         &self,
         mut notification: SessionNotification,
         local_prompt_signals: bool,

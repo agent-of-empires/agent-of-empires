@@ -39,6 +39,22 @@ impl LeaseTable {
         Ok(())
     }
 
+    pub fn clear(&self) {
+        self.held
+            .lock()
+            .expect("lease table mutex poisoned")
+            .clear();
+    }
+
+    /// Any lease of any kind.
+    pub fn any_live(&self, now_ms: i64) -> bool {
+        self.held
+            .lock()
+            .expect("lease table mutex poisoned")
+            .values()
+            .any(|(_, deadline)| *deadline > now_ms)
+    }
+
     pub fn live(&self, kind: LeaseKind, now_ms: i64) -> bool {
         self.held
             .lock()

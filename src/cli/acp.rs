@@ -1363,6 +1363,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",
+        Event::IntegrationLost { .. } => "integration_lost",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
         Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
