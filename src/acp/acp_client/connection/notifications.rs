@@ -187,14 +187,22 @@ impl Shared {
         notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
+        // A frame the contract consumes without delivering (a lease renewal)
+        // still proves the agent is alive.
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
         match self
             .aoe
-            .ingest(notification, local_prompt_signals, now_ms())
+            .ingest(notification, local_prompt_signals, epoch, now_ms())
         {
             Ingested::Deliver(frames) => {
-                for (notification, local_prompt_signals) in frames {
-                    self.handle_adapter_notification(notification, local_prompt_signals)
-                        .await;
+                for frame in frames {
+                    self.handle_adapter_notification(
+                        frame.notification,
+                        frame.local_prompt_signals,
+                        frame.epoch,
+                    )
+                    .await;
                 }
             }
             Ingested::Lost(reason) => {
@@ -213,6 +221,7 @@ impl Shared {
         &self,
         mut notification: SessionNotification,
         local_prompt_signals: bool,
+        epoch: u64,
     ) {
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
@@ -253,9 +262,8 @@ impl Shared {
         let restored_wake_event = restored_title
             .as_deref()
             .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
-        // One epoch per notification, so its signals belong to the prompt
-        // that was current when it arrived.
-        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        // `epoch` is the prompt current when the frame arrived, so its signals
+        // belong to that prompt even if the frame was held.
         let (lifecycle, wakeup) = classify_watchdog_notification_signals(
             &notification.update,
             restored_title.as_deref(),
