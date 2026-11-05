@@ -53,6 +53,16 @@ impl<T> ArrivalOrder<T> {
         self.held_len = 0;
     }
 
+    /// Numbers an adapter frame core is not delivering, so the count keeps up
+    /// with the proxy's. Frames its number releases are discarded.
+    pub fn count_frame(&mut self) {
+        self.adapter_frames += 1;
+        let frames = self.adapter_frames;
+        let kept = self.held.split_off(&(frames + 1));
+        self.held_len = kept.values().map(Vec::len).sum();
+        self.held = kept;
+    }
+
     /// Frames still waiting on an anchor, as `(anchor, frame)`.
     pub fn drain_held(&mut self) -> Vec<(u64, T)> {
         self.held_len = 0;
@@ -193,6 +203,16 @@ mod tests {
         assert_eq!(o.arrive(plain(), "f4").unwrap(), ["f4"]);
         assert_eq!(o.arrive(after("n", 3), "n").unwrap(), ["n"], "count kept");
         assert!(!o.held_full());
+    }
+
+    #[test]
+    fn count_frame_numbers_a_frame_without_delivering_it() {
+        let mut o = ArrivalOrder::default();
+        assert!(o.arrive(after("t", 2), "t").unwrap().is_empty());
+        o.count_frame();
+        o.count_frame();
+        assert!(o.drain_held().is_empty(), "released frames are discarded");
+        assert_eq!(o.arrive(after("n", 2), "n").unwrap(), ["n"], "count kept");
     }
 
     #[test]
