@@ -198,7 +198,9 @@ api_version = 2
 "#,
     );
 
-    let report = install::install(dir.to_str().unwrap(), true).await.unwrap();
+    let report = install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
     assert_eq!(report.id, "acme.local");
     assert!(report.granted);
 
@@ -259,7 +261,7 @@ async fn invalid_manifests_are_rejected() {
     ] {
         let src = tempfile::tempdir().unwrap();
         let dir = write_plugin_dir(src.path(), manifest);
-        let err = install::install(dir.to_str().unwrap(), true)
+        let err = install::install(dir.to_str().unwrap(), true, false)
             .await
             .unwrap_err()
             .to_string();
@@ -286,7 +288,9 @@ api_version = 2
 capabilities = ["net"]
 "#,
     );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
     assert!(load_registry().get("acme.regrant").unwrap().active());
 
     // The grant pins the manifest bytes: a comment-only edit revokes it.
@@ -361,7 +365,9 @@ api_version = 2
 capabilities = ["net"]
 "#,
     );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
 
     // Stale the grant so there is a disclosure to approve.
     let installed = agent_of_empires::plugin::plugins_dir()
@@ -417,7 +423,9 @@ api_version = 2
 
     // An explicit `@ref` installs that ref directly (no release resolution);
     // --yes bypasses the unverified confirmation.
-    let report = install::install("gh:acme/widget@main", true).await.unwrap();
+    let report = install::install("gh:acme/widget@main", true, false)
+        .await
+        .unwrap();
     assert_eq!(report.id, "acme.widget");
     assert_eq!(
         report.validation.as_str(),
@@ -480,7 +488,7 @@ api_version = 2
     // No `@ref`: resolves and installs the latest release tag. `false` (no
     // --yes) proves the resolved-release path is not treated as unverified, so
     // it installs without an interactive confirmation.
-    install::install("gh:acme/rel", false).await.unwrap();
+    install::install("gh:acme/rel", false, false).await.unwrap();
 
     let lock = Lockfile::load().unwrap();
     let locked = lock.get("acme.rel").expect("lock entry");
@@ -529,7 +537,7 @@ async fn unverified_github_sources_require_confirmation_without_yes() {
         );
         let server = spawn_latest_release("other", "repo", "v9").await;
 
-        let err = install::install(source, false)
+        let err = install::install(source, false, false)
             .await
             .unwrap_err()
             .to_string();
@@ -558,7 +566,7 @@ async fn outdated_tracks_release_not_default_branch() {
     );
     tag_bare_repo(base.path(), "acme", "rel", "v1.0.0", false);
     let server = spawn_latest_release("acme", "rel", "v1.0.0").await;
-    install::install("gh:acme/rel", true).await.unwrap();
+    install::install("gh:acme/rel", true, false).await.unwrap();
 
     // Advance the default branch but leave the release tag at v1.0.0. A
     // release-tracking install must NOT report this as an update.
@@ -602,7 +610,9 @@ api_version = 2
         dir.to_str().unwrap(),
         &tree_hash,
     );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
 
     // Simulate a build that creates the reserved build-output dir with a symlink
     // inside the installed plugin, the way plugin-github's venv build would.
@@ -684,7 +694,7 @@ async fn featured_pins_gate_the_reserved_namespace() {
             &[("0.9.0", UNVETTED), ("1.0.0", current)],
         );
 
-        let result = install::install(dir.to_str().unwrap(), true).await;
+        let result = install::install(dir.to_str().unwrap(), true, false).await;
         match expected {
             Ok(validation) => {
                 let report = result.unwrap_or_else(|e| panic!("{id} vetted={vetted}: {e}"));
@@ -774,7 +784,7 @@ asset = "bin-${os}-${arch}"
     );
     tag_bare_repo(base.path(), "acme", "bin", "v1.0.0", false);
 
-    install::install("gh:acme/bin", true).await.unwrap();
+    install::install("gh:acme/bin", true, false).await.unwrap();
 
     let placed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
@@ -834,7 +844,9 @@ platforms = ["windows"]
 "#,
     );
 
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
 
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
@@ -875,7 +887,7 @@ system = true
 "#,
     );
 
-    install::install(dir.to_str().unwrap(), true)
+    install::install(dir.to_str().unwrap(), true, false)
         .await
         .expect("system-tool worker installs without an install-time PATH check");
 
@@ -913,7 +925,7 @@ command = ["false"]
 "#,
     );
 
-    let err = install::install(dir.to_str().unwrap(), true)
+    let err = install::install(dir.to_str().unwrap(), true, false)
         .await
         .unwrap_err()
         .to_string();
@@ -956,7 +968,9 @@ command = ["cp", "aoe-plugin.toml", "v1-marker"]
 "#,
     );
     let dir = src.path().join("src-plugin");
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
         .join("acme.upd");
@@ -1033,7 +1047,9 @@ command = ["cp", "aoe-plugin.toml", "marker-v1"]
 "#,
     );
     let dir = src.path().join("src-plugin");
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
 
     // Same capability, but the build recipe changed.
     std::fs::write(
@@ -1111,7 +1127,9 @@ tool = "session-helper"
 command = "session-helper --safe"
 "#,
     );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    install::install(dir.to_str().unwrap(), true, false)
+        .await
+        .unwrap();
 
     std::fs::write(
         dir.join("aoe-plugin.toml"),
@@ -1212,7 +1230,9 @@ async fn auto_update_applies_clean_github_update() {
     );
     // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
     // branch (no release resolution), which these update-mechanics tests need.
-    install::install("gh:acme/upd@main", true).await.unwrap();
+    install::install("gh:acme/upd@main", true, false)
+        .await
+        .unwrap();
     let before = update_check::outdated().await;
     let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
     assert!(
@@ -1261,7 +1281,9 @@ async fn install_then_push_cap_update() -> TempDir {
         "upd",
         &[("aoe-plugin.toml", PLAIN_MANIFEST)],
     );
-    install::install("gh:acme/upd@main", true).await.unwrap();
+    install::install("gh:acme/upd@main", true, false)
+        .await
+        .unwrap();
     push_new_commit(
         base.path(),
         "acme",

@@ -156,13 +156,25 @@ pub struct InstallReport {
     pub validation: ValidationState,
 }
 
-fn install_validation(featured_verified: bool, source: &str) -> ValidationState {
-    if featured_verified {
+fn install_validation(featured_verified: bool, dev: bool, source: &str) -> ValidationState {
+    if dev {
+        ValidationState::Dev
+    } else if featured_verified {
         ValidationState::Featured
     } else if source.starts_with("gh:") {
         ValidationState::Community
     } else {
         ValidationState::Local
+    }
+}
+
+fn trust_label(featured_verified: bool, dev: bool) -> &'static str {
+    if dev {
+        "dev"
+    } else if featured_verified {
+        "featured"
+    } else {
+        "community"
     }
 }
 
@@ -229,6 +241,7 @@ struct PreparedInstall {
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
+    dev: bool,
     id: String,
     capabilities: Vec<String>,
     manifest_hash: String,
@@ -251,14 +264,17 @@ pub struct InstallConsent {
     pub fingerprint: String,
 }
 
-async fn prepare_install(input: &str) -> Result<PreparedInstall> {
+async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     let source = PluginSource::parse(input)?;
+    if dev && !matches!(source, PluginSource::Local(_)) {
+        bail!("--dev requires a local plugin directory");
+    }
     let resolved = resolve_source(source, true).await?;
     let fetched = fetch::fetch(&resolved.source).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
-    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
 
     if super::plugins_dir()?.join(&id).exists() {
@@ -267,14 +283,10 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let trust = if featured_verified {
-        "featured"
-    } else {
-        "community"
-    };
+    let trust = trust_label(featured_verified, dev);
     let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
     let persisted_source = persisted_source(&resolved.source, input);
-    let validation = install_validation(featured_verified, &persisted_source);
+    let validation = install_validation(featured_verified, dev, &persisted_source);
 
     Ok(PreparedInstall {
         persisted_source,
@@ -282,6 +294,7 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
         notice: resolved.notice,
         fetched,
         featured_verified,
+        dev,
         id,
         capabilities,
         manifest_hash,
@@ -316,8 +329,14 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
             &p.id,
             &p.capabilities,
             &p.manifest_hash,
+            p.dev,
         )?;
-        write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)
+        write_lock(
+            &p.id,
+            &p.fetched,
+            &p.manifest_hash,
+            trust_label(p.featured_verified, p.dev),
+        )
     })();
     if let Err(e) = persisted {
         // Not `uninstall`: nothing finished installing, so nothing is announced as uninstalled.
@@ -354,8 +373,8 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
     })
 }
 
-pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
-    let prepared = prepare_install(input).await?;
+pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<InstallReport> {
+    let prepared = prepare_install(input, dev).await?;
     eprintln!("{}", prepared.notice);
     if prepared.unverified && !assume_yes && !confirm_unverified()? {
         bail!("install cancelled; the unverified source was not approved");
@@ -388,7 +407,7 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
     if !input.starts_with("gh:") {
         bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
     }
-    let p = prepare_install(input).await?;
+    let p = prepare_install(input, false).await?;
     Ok(InstallConsent {
         id: p.id.clone(),
         version: p.fetched.manifest.version.clone(),
@@ -424,7 +443,7 @@ pub async fn apply_install(
     if !input.starts_with("gh:") {
         bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
     }
-    let prepared = prepare_install(input).await?;
+    let prepared = prepare_install(input, false).await?;
     if prepared.fingerprint != expected_fingerprint {
         bail!(
             "the plugin at {input} changed since it was shown; review it again before installing"
@@ -457,6 +476,7 @@ struct Prepared {
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
+    dev: bool,
     prior_grant: Option<CapabilityGrant>,
     capabilities: Vec<String>,
     manifest_hash: String,
@@ -545,6 +565,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         .clone()
         .ok_or_else(|| anyhow!("{id} is a builtin plugin; there is nothing to update"))?;
     let prior_grant = plugin_config.grant.clone();
+    let dev = plugin_config.dev;
 
     let source = PluginSource::parse(&source_str)?;
     let resolved = resolve_source(source, false).await?;
@@ -556,7 +577,11 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         );
     }
     let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    if dev && featured_verified {
+        eprintln!("{id} matches a featured release but stays a dev install; reinstall without --dev to use the featured build.");
+    }
+    let featured_verified = featured_verified && !dev;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
 
     let capabilities = capability_strings(&fetched)?;
@@ -583,11 +608,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let target_requested_ref = fetched.requested_ref.clone();
     let target_resolved_commit = fetched.resolved_commit.clone();
 
-    let trust = if featured_verified {
-        "featured"
-    } else {
-        "community"
-    };
+    let trust = trust_label(featured_verified, dev);
     let prior_fingerprint =
         prior_locked.map(|l| fingerprint(&l.tree_hash, l.asset_sha256.as_deref(), &l.trust));
     let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
@@ -649,6 +670,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         notice: resolved.notice,
         fetched,
         featured_verified,
+        dev,
         prior_grant,
         capabilities,
         manifest_hash,
@@ -693,7 +715,7 @@ fn apply_prepared(
         id,
         &prepared.fetched,
         &prepared.manifest_hash,
-        prepared.featured_verified,
+        trust_label(prepared.featured_verified, prepared.dev),
     )?;
     super::reload_registry();
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -709,7 +731,11 @@ fn apply_prepared(
         version: prepared.fetched.manifest.version.clone(),
         capabilities: prepared.capabilities.clone(),
         granted,
-        validation: install_validation(prepared.featured_verified, &prepared.source_str),
+        validation: install_validation(
+            prepared.featured_verified,
+            prepared.dev,
+            &prepared.source_str,
+        ),
     })
 }
 
@@ -1421,6 +1447,7 @@ fn persist_install(
     id: &str,
     capabilities: &[String],
     manifest_hash: &str,
+    dev: bool,
 ) -> Result<()> {
     update_config(|config| {
         let entry = config
@@ -1428,6 +1455,7 @@ fn persist_install(
             .entry(id.to_string())
             .or_insert_with(PluginConfig::default);
         entry.source = Some(source.to_string());
+        entry.dev = dev;
         entry.grant = Some(CapabilityGrant {
             manifest_hash: manifest_hash.to_string(),
             capabilities: capabilities.to_vec(),
@@ -1448,12 +1476,7 @@ fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Res
     })
 }
 
-fn write_lock(
-    id: &str,
-    fetched: &FetchedPlugin,
-    manifest_hash: &str,
-    featured_verified: bool,
-) -> Result<()> {
+fn write_lock(id: &str, fetched: &FetchedPlugin, manifest_hash: &str, trust: &str) -> Result<()> {
     let mut lock = Lockfile::load()?;
     lock.upsert(
         id,
@@ -1464,12 +1487,7 @@ fn write_lock(
             version: fetched.manifest.version.clone(),
             manifest_hash: manifest_hash.to_string(),
             tree_hash: fetched.tree_hash.clone(),
-            trust: if featured_verified {
-                "featured"
-            } else {
-                "community"
-            }
-            .to_string(),
+            trust: trust.to_string(),
             release_tag: fetched.release_tag.clone(),
             asset_name: fetched.asset_name.clone(),
             asset_sha256: fetched.asset_sha256.clone(),

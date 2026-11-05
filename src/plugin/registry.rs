@@ -14,6 +14,7 @@ pub enum ValidationState {
     Featured,
     Community,
     Local,
+    Dev,
 }
 
 impl ValidationState {
@@ -23,6 +24,7 @@ impl ValidationState {
             ValidationState::Featured => "featured",
             ValidationState::Community => "community",
             ValidationState::Local => "local",
+            ValidationState::Dev => "dev",
         }
     }
 }
@@ -150,13 +152,18 @@ impl PluginRegistry {
 }
 
 /// `Featured` is re-derived from the embedded index and tree hash, never trusted from the
-/// user-writable lockfile, because it also lifts the reserved-namespace gate.
+/// user-writable lockfile, because it also lifts the reserved-namespace gate. `Dev` needs a
+/// local source and outranks `Featured`, so a dev install never reads as verified.
 fn validation_for(
     featured: &FeaturedIndex,
     id: &str,
     dir: &Path,
     source: Option<&str>,
+    dev: bool,
 ) -> ValidationState {
+    if dev && source.is_some_and(|s| !s.starts_with("gh:")) {
+        return ValidationState::Dev;
+    }
     if let Some(entry) = featured.get(id) {
         if integrity::tree_hash(dir).is_ok_and(|h| entry.verifies(&h)) {
             return ValidationState::Featured;
@@ -233,9 +240,12 @@ fn load_external(
 
         let plugin_config = config.plugins.get(&id);
         let source = plugin_config.and_then(|p| p.source.clone());
-        let validation = validation_for(featured, &id, &dir, source.as_deref());
+        let dev = plugin_config.is_some_and(|p| p.dev);
+        let validation = validation_for(featured, &id, &dir, source.as_deref(), dev);
 
-        if manifest.id.is_reserved_namespace() && validation != ValidationState::Featured {
+        if manifest.id.is_reserved_namespace()
+            && !matches!(validation, ValidationState::Featured | ValidationState::Dev)
+        {
             load_errors.push(format!(
                 "plugin {id:?} at {} uses a reserved namespace and was skipped",
                 dir.display()
