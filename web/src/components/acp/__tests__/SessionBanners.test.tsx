@@ -244,7 +244,12 @@ describe("StartupWaitLine", () => {
     expect(onRestarted.mock.calls).toEqual([[0, false]]);
   });
 
-  it("keeps saying the sent message was stopped when the restart's stop lands first and the replacement stalls", async () => {
+  const frame = (seq: number, event: AcpEvent): Action => ({
+    kind: "frame",
+    frame: { session_id: "s1", seq, event },
+  });
+  /** The owner StructuredView gives SessionBanners, with a sent prompt waiting on the start and the restart held. */
+  function renderOwner() {
     vi.useFakeTimers();
     reducedMotion(true);
     let respond!: (res: unknown) => void;
@@ -252,12 +257,7 @@ describe("StartupWaitLine", () => {
       "fetch",
       vi.fn(() => new Promise((resolve) => (respond = resolve))),
     );
-    const frame = (seq: number, event: AcpEvent): Action => ({
-      kind: "frame",
-      frame: { session_id: "s1", seq, event },
-    });
     let dispatch!: (action: Action) => void;
-    // The owner StructuredView gives SessionBanners: the line shows while the new Session is starting.
     function Owner() {
       const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
       dispatch = send;
@@ -275,6 +275,9 @@ describe("StartupWaitLine", () => {
           startingAgent={isNewSessionStarting(state, connection, "resuming", false) ? "Claude Code" : null}
           canRestart
           onRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
+          onRestartFailed={(epoch, message, stoppedSent) =>
+            send({ kind: "restart_failed", epoch, message, stoppedSent })
+          }
           acpWorkerState="resuming"
           trashedAt={null}
           archivedAt={null}
@@ -283,21 +286,51 @@ describe("StartupWaitLine", () => {
         />
       );
     }
-    const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
     render(<Owner />);
     act(() => vi.advanceTimersByTime(30_000));
-    expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
     fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    return {
+      dispatch: (action: Action) => act(() => dispatch(action)),
+      respond: (status: number, body: string) =>
+        act(async () => respond({ ok: status < 400, status, text: () => Promise.resolve(body) })),
+    };
+  }
+  const cost = () => screen.queryByTestId("startup-wait-restart-cost")?.textContent;
+  const restartFailure = () => screen.queryByTestId("worker-stopped-restart-failure")?.textContent ?? null;
+
+  it("keeps saying the sent message was stopped when the restart's stop lands first and the replacement stalls", async () => {
+    const owner = renderOwner();
     // The Daemon answers the restart only after the old Worker stopped, so its stop arrives first.
-    act(() => dispatch(frame(2, { Stopped: { reason: "user_stopped" } })));
+    owner.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
     expect(screen.queryByTestId("startup-wait-line")).toBeNull();
-    await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
+    await owner.respond(200, "");
     expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
     // The replacement stalls too.
     act(() => vi.advanceTimersByTime(30_000));
     expect(cost()).toBe("The message you sent was stopped. Send it again once Claude Code is ready.");
-    act(() => dispatch(frame(3, { UserPromptSent: { text: "hi" } })));
+    owner.dispatch(frame(3, { UserPromptSent: { text: "hi" } }));
     expect(cost()).toBe("Restarting stops the message you sent. Send it again once Claude Code is ready.");
+  });
+
+  it("names a restart that failed after its stop on the stopped banner", async () => {
+    const owner = renderOwner();
+    owner.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
+    await owner.respond(500, "restart spawn failed: boom");
+    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
+    expect(restartFailure()).toBe(
+      "Restart failed: Server returned 500. restart spawn failed: boom The message you sent was stopped. Send it again once you reconnect.",
+    );
+  });
+
+  it("leaves a refusal before the stop on the line, not on a later stop's banner", async () => {
+    const owner = renderOwner();
+    await owner.respond(409, "worker_not_stopped: the previous worker has not finished stopping");
+    expect(screen.getByTestId("startup-wait-restart-error").textContent).toContain("worker_not_stopped");
+    // The user then stops the start themselves.
+    owner.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
+    expect(restartFailure()).toBeNull();
   });
 
   it.each([

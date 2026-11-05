@@ -197,14 +197,16 @@ describe("persistState (#1833)", () => {
       inflightPromptIds: ["o1"],
       restartInFlight: true,
       restartStoppedSent: true,
+      restartFailure: "Server returned 500.",
     });
     const { state } = JSON.parse(localStorage.getItem(key("overlay"))!) as { state: AcpState };
-    expect([state.optimisticRows, state.inflightPromptIds, state.restartInFlight, state.restartStoppedSent]).toEqual([
-      [],
-      [],
-      false,
-      false,
-    ]);
+    expect([
+      state.optimisticRows,
+      state.inflightPromptIds,
+      state.restartInFlight,
+      state.restartStoppedSent,
+      state.restartFailure,
+    ]).toEqual([[], [], false, false, null]);
   });
 });
 

@@ -56,6 +56,7 @@ export type Action =
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
+  | { kind: "restart_failed"; epoch: number; message: string; stoppedSent: boolean }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -238,6 +239,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
         optimisticRows: state.optimisticRows.concat(row),
         startupError: null,
         lastError: null,
+        restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds
           : state.inflightPromptIds.concat(id),
@@ -288,6 +290,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
         workerStopped: false,
         workerRestarting: false,
         restartInFlight: true,
+        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        restartFailure: null,
+      };
+    case "restart_failed":
+      if (action.epoch !== state.restartEpoch) return state;
+      return {
+        ...state,
+        restartFailure: action.message,
         restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
       };
     case "dismiss_compaction_reminder":

@@ -390,4 +390,16 @@ describe("a restart of a start in progress", () => {
   ])("%s", (_label, actions, expected) => {
     expect(run(empty(), ...actions).restartStoppedSent).toBe(expected);
   });
+
+  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500.", stoppedSent: true };
+  it.each<[string, Action[], string | null, boolean]>([
+    ["a failure after its stop keeps the stop and names the reason", [stop(1), failed], "Server returned 500.", true],
+    ["a failure after the restart already ended is ignored", [stop(1), assigned(2), failed], null, false],
+    ["the replacement's assignment clears it", [stop(1), failed, assigned(2)], null, false],
+    ["the next restart clears it", [stop(1), failed, restarted], null, false],
+    ["sending again clears it", [stop(1), failed, { kind: "user_prompt", text: "hi" }], null, true],
+  ])("%s", (_label, actions, restartFailure, workerStopped) => {
+    const state = run(empty(), ...actions);
+    expect([state.restartFailure, state.workerStopped]).toEqual([restartFailure, workerStopped]);
+  });
 });

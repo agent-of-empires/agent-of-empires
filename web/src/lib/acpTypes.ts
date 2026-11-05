@@ -571,6 +571,8 @@ export interface AcpState {
   /** A restart stopped the sent prompt and it hasn't been sent again. Kept here because the restart's stop
    *  unmounts the startup line before the restart answers. Not persisted. */
   restartStoppedSent: boolean;
+  /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
+  restartFailure: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -916,6 +918,7 @@ export function emptyAcpState(): AcpState {
     restartInFlight: false,
     restartEpoch: 0,
     restartStoppedSent: false,
+    restartFailure: null,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1399,6 +1402,7 @@ function closeWorkflowRun(
 function endRestart(next: AcpState): void {
   next.restartInFlight = false;
   next.restartEpoch += 1;
+  next.restartFailure = null;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */

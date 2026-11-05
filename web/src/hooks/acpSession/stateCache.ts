@@ -80,8 +80,16 @@ function toPersistedState(state: AcpState): AcpState {
     state.optimisticRows.length > 0 ||
     state.inflightPromptIds.length > 0 ||
     state.restartInFlight ||
-    state.restartStoppedSent
-      ? { ...state, optimisticRows: [], inflightPromptIds: [], restartInFlight: false, restartStoppedSent: false }
+    state.restartStoppedSent ||
+    state.restartFailure !== null
+      ? {
+          ...state,
+          optimisticRows: [],
+          inflightPromptIds: [],
+          restartInFlight: false,
+          restartStoppedSent: false,
+          restartFailure: null,
+        }
       : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };

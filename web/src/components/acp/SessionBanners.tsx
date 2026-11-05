@@ -21,6 +21,7 @@ export function SessionBanners({
   startingAgent,
   canRestart,
   onRestarted,
+  onRestartFailed,
 }: {
   sessionId: string;
   state: AcpState;
@@ -29,6 +30,7 @@ export function SessionBanners({
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart: boolean;
   onRestarted?: (epoch: number, stoppedSent: boolean) => void;
+  onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -62,7 +64,13 @@ export function SessionBanners({
       {variant === "snoozed" && snoozedUntil && (
         <SnoozedWorkerStoppedBanner sessionId={sessionId} snoozedUntil={snoozedUntil} />
       )}
-      {variant === "generic" && <WorkerStoppedBanner sessionId={sessionId} />}
+      {variant === "generic" && (
+        <WorkerStoppedBanner
+          sessionId={sessionId}
+          restartFailure={state.restartFailure}
+          sentStopped={state.restartStoppedSent}
+        />
+      )}
       {state.workerRestarting && !state.startupError && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
@@ -76,6 +84,7 @@ export function SessionBanners({
           restartEpoch={state.restartEpoch}
           sentStopped={state.restartStoppedSent}
           onRestarted={onRestarted}
+          onRestartFailed={onRestartFailed}
         />
       ) : (
         acpWorkerState === "resuming" &&
@@ -120,6 +129,7 @@ export function StartupWaitLine({
   restartEpoch,
   sentStopped,
   onRestarted,
+  onRestartFailed,
 }: {
   sessionId: string;
   agent: string;
@@ -132,12 +142,23 @@ export function StartupWaitLine({
   /** A restart stopped the sent message and it hasn't been sent again. */
   sentStopped: boolean;
   onRestarted?: (epoch: number, stoppedSent: boolean) => void;
+  onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
 }) {
   const [startedAt, setStartedAt] = useState(() => Date.now());
   const [seconds, setSeconds] = useState(0);
   const [frame, setFrame] = useState(0);
   const [still] = useState(reducedMotion);
-  const { state: restartState, error: restartError, respawn } = useRespawnSession(sessionId, null, { restart: true });
+  const {
+    state: restartState,
+    error: restartError,
+    respawn,
+  } = useRespawnSession(sessionId, null, {
+    restart: true,
+    // Refusals (4xx) come before the stop and this line shows them; a server error comes after it, which unmounts the line.
+    onFailed: (status, error) => {
+      if (status !== null && status >= 500) onRestartFailed?.(restartEpoch, error, sentPending);
+    },
+  });
   useEffect(() => {
     const tick = setInterval(() => setSeconds(Math.floor((Date.now() - startedAt) / 1000)), 1000);
     return () => clearInterval(tick);
@@ -374,7 +395,15 @@ function StoppedPanel({
   );
 }
 
-function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
+function WorkerStoppedBanner({
+  sessionId,
+  restartFailure,
+  sentStopped,
+}: {
+  sessionId: string;
+  restartFailure: string | null;
+  sentStopped: boolean;
+}) {
   const { state: retryState, error: retryError, respawn: handleReconnect } = useRespawnSession(sessionId);
   return (
     <StoppedPanel
@@ -386,6 +415,12 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
       }
       footer={
         <>
+          {restartFailure && (
+            <div data-testid="worker-stopped-restart-failure" className="mt-2 text-xs text-status-warning/90">
+              Restart failed: {restartFailure}
+              {sentStopped && " The message you sent was stopped. Send it again once you reconnect."}
+            </div>
+          )}
           {retryState === "ok" && (
             <div className="mt-2 text-xs text-emerald-200/90">
               Spawn requested. The composer will re-enable when the agent is back online.
