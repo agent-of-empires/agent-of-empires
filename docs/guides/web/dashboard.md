@@ -70,6 +70,8 @@ Drag-to-reorder is disabled in the computed modes. The picker's state is per-bro
 
 A grouping picker (layers icon) next to the sort picker opens a menu of axes, so any of them is one pick away:
 
+![The sidebar grouped by session status, with the grouping picker open](../../assets/web/sidebar-grouping.png)
+
 - **By repo** (default): groups by git repository.
 - **By org**: groups repositories by their remote owner, across any hosted git remote. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
 - **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
