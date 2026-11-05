@@ -1271,7 +1271,6 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
                 dev_plugins.join(", ")
             );
         }
-        crate::plugin::set_remote_exposure();
         // The same decision `start_server` makes, so a wedged Tailscale fails here with the
         // probe's `--no-tailscale` advice rather than the cloudflared install error below.
         use crate::server::tunnel::{skips_tailscale, tailscale_probe};
@@ -1319,6 +1318,9 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
     } = startup;
 
     let auth_mode = validate_launch_args(profile, &args).await?;
+    if args.remote {
+        crate::plugin::set_remote_exposure();
+    }
     let is_localhost = host_is_localhost(&args.host);
 
     if args.behind_proxy && args.remote {
