@@ -406,6 +406,9 @@ fn diff_comments_not_now(reason: QueueReason) -> Response {
         QueueReason::Compacting => {
             "the agent is compacting its context; send the comments again when it finishes"
         }
+        QueueReason::IntegrationLost => {
+            "the agent's integration was lost; restart the session, then send the comments again"
+        }
     };
     (StatusCode::CONFLICT, message).into_response()
 }
