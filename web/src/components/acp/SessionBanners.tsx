@@ -228,7 +228,7 @@ export function StartupWaitLine({
         <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
           {cost}
         </span>
-      )}{" "}
+      )}
       {restartState === "failed" && restartError && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
           Restart failed: {restartError}
