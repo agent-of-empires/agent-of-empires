@@ -73,6 +73,8 @@ pub(crate) struct UnassignedPrompt {
 
 /// Per session, present while the worker has no ACP session yet.
 type UnassignedPrompts = Arc<std::sync::Mutex<HashMap<String, Vec<UnassignedPrompt>>>>;
+/// Per session, held by a restart while it delivers carried prompts.
+type HandoffGates = Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
@@ -231,6 +233,7 @@ pub struct Supervisor<S: BroadcastSink> {
     /// Sessions whose crashed worker the drain task relaunched in place.
     respawned_in_place: SharedSet,
     unassigned_prompts: UnassignedPrompts,
+    handoff_gates: HandoffGates,
     max_concurrent_workers: u32,
 }
 
@@ -501,6 +504,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             unassigned_prompts: Arc::default(),
+            handoff_gates: Arc::default(),
             max_concurrent_workers,
         }
     }
@@ -607,6 +611,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
         lock_recover(&self.unassigned_prompts).remove(session_id);
+        lock_recover(&self.handoff_gates).remove(session_id);
         Ok(())
     }
 
