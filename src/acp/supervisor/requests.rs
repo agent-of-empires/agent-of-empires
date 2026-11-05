@@ -105,7 +105,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(gate) = gate {
             drop(gate.lock().await);
         }
-        self.send_prompt_ungated(session_id, text, attachments).await
+        self.send_prompt_ungated(session_id, text, attachments)
+            .await
     }
 
     async fn send_prompt_ungated(

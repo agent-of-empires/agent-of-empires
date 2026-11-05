@@ -2890,7 +2890,9 @@ mod tests {
                         .acp_event_store
                         .replay_from(&id, 0)
                         .iter()
-                        .any(|(_, e)| matches!(e, crate::acp::state::Event::AcpSessionAssigned { .. }))
+                        .any(|(_, e)| {
+                            matches!(e, crate::acp::state::Event::AcpSessionAssigned { .. })
+                        })
                     {
                         tokio::task::yield_now().await;
                     }
