@@ -661,11 +661,6 @@ impl PluginHost {
             .map(|u| (u.slot, u.id.clone()))
             .collect();
 
-        if plugin.validation == crate::plugin::registry::ValidationState::Dev
-            && crate::plugin::remote_exposure()
-        {
-            anyhow::bail!("dev plugin {plugin_id} cannot run under remote exposure");
-        }
         let launch = resolve_launch(plugin, &OsLaunchResolver)?;
         let prepared = self.sandbox.prepare(&launch)?;
 
