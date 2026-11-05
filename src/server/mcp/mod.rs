@@ -11,6 +11,7 @@ use rmcp::{
         wrapper::{Json, Parameters},
     },
     model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
         session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
@@ -19,7 +20,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::api::sessions::{list_sessions_envelope, SessionFilter, SessionsView};
+use super::api::sessions::{
+    list_sessions_envelope, session_response_from_instance, SessionFilter, SessionsView,
+};
+use super::auth::AuthenticatedCallerSession;
 use super::state::AppState;
 use crate::daemon::SessionResponse;
 use crate::session::SessionScope;
@@ -84,8 +88,20 @@ impl McpServer {
     #[rmcp::tool(
         description = "The calling session, or null when the caller is not a session AoE launched."
     )]
-    async fn whoami(&self) -> Json<Option<SessionResponse>> {
-        Json(None)
+    async fn whoami(&self, context: RequestContext<RoleServer>) -> Json<Option<SessionResponse>> {
+        let caller_session_id = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthenticatedCallerSession>())
+            .map(|AuthenticatedCallerSession(id)| id.clone());
+        let Some(id) = caller_session_id else {
+            return Json(None);
+        };
+        let instances = self.state.instances.read().await;
+        let response = instances.iter().find(|inst| inst.id == id).map(|inst| {
+            session_response_from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        });
+        Json(response)
     }
 }
 
