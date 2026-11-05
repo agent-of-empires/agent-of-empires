@@ -2,7 +2,7 @@
 
 use crate::acp::agent_profiles;
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CompactionStatus, ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
 };
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -267,7 +267,7 @@ pub(super) fn wakeup_lifecycle_signal_from_update(
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::{compaction_chunk, compaction_update, text_chunk};
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         Content, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
     };
 

@@ -1,11 +1,11 @@
 //! The `initialize` request aoe sends and the wait for the agent's reply.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ElicitationCapabilities,
     ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
     NoticeCapabilities,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
@@ -123,7 +123,7 @@ mod tests {
         // downgrade) or fail the response parse, and the fake agent sends these
         // exact keys, so it would otherwise mask the drift.
         {
-            use agent_client_protocol::schema::v1::{ForkSessionResponse, SessionCapabilities};
+            use agent_client_protocol::v1::schema::{ForkSessionResponse, SessionCapabilities};
 
             let caps: SessionCapabilities =
                 serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");

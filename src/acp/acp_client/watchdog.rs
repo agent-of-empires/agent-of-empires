@@ -2,7 +2,7 @@
 //! enough that the agent is presumed gone.
 
 use crate::acp::agent_profiles;
-use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol::v1::schema::SessionUpdate;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn classify_watchdog_notification_signals_cases() {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             AvailableCommand, AvailableCommandsUpdate, ToolCallUpdate, ToolCallUpdateFields,
         };
         let ambient = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![

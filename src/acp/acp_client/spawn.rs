@@ -3,7 +3,7 @@
 
 use crate::acp::agent_registry::AgentSpec;
 use crate::session::SandboxInfo;
-use agent_client_protocol::schema::v1::McpServer;
+use agent_client_protocol::v1::schema::McpServer;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tracing::{debug, info, warn};

@@ -3,7 +3,7 @@
 
 use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::PromptResponse;
+use agent_client_protocol::v1::schema::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
@@ -1913,7 +1913,7 @@ mod tests {
             let marker_client = client.clone();
             let (read, write) = tokio::io::split(crate_side);
             Client
-                .builder()
+                .v1()
                 // One handler for both, as the connection registers them.
                 .on_receive_notification(
                     {

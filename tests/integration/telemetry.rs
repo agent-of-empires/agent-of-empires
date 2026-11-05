@@ -12,14 +12,16 @@ use serial_test::serial;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-/// Redirect the app dir at a temp location and clear the telemetry env vars.
+/// Redirect the app dir at a temp location, clear `DO_NOT_TRACK`, and point the
+/// endpoint at the discard port so nothing reaches production.
 /// Keep the guard alive for the test's duration.
 fn isolate() -> crate::common::TestHome {
     let mut home = crate::common::setup_temp_home();
     home.env = home.env.and_set("DO_NOT_TRACK", "");
-    home.env = home.env.and_set("AOE_TELEMETRY_ENDPOINT", "");
+    home.env = home
+        .env
+        .and_set("AOE_TELEMETRY_ENDPOINT", "http://127.0.0.1:9/ingest");
     std::env::remove_var("DO_NOT_TRACK");
-    std::env::remove_var("AOE_TELEMETRY_ENDPOINT");
     home
 }
 

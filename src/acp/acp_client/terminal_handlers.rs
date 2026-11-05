@@ -1,7 +1,7 @@
 //! `terminal/*`: create, read output from, wait on, kill, and release the
 //! terminals an agent asks aoe to run.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, TerminalId, TerminalOutputRequest,
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
@@ -28,9 +28,8 @@ pub(super) async fn handle_create_terminal(
     let cwd = request.cwd.clone().unwrap_or_else(|| res.cwd.clone());
     // Sandbox the cwd: must be inside session roots.
     if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-        let r = Err(agent_client_protocol::util::internal_error(format!(
-            "terminal cwd outside session roots: {e}"
-        )));
+        let r = Err(agent_client_protocol::Error::internal_error()
+            .data(format!("terminal cwd outside session roots: {e}")));
         trace!(
             target: "acp.protocol.tool_dispatch",
             handler = "create_terminal",
@@ -60,7 +59,7 @@ pub(super) async fn handle_create_terminal(
         .await
     {
         Ok(id) => Ok(CreateTerminalResponse::new(TerminalId::new(id))),
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -74,8 +73,8 @@ pub(super) async fn handle_create_terminal(
 
 pub(super) fn build_exit_status(
     exit_code: Option<i32>,
-) -> agent_client_protocol::schema::v1::TerminalExitStatus {
-    use agent_client_protocol::schema::v1::TerminalExitStatus;
+) -> agent_client_protocol::v1::schema::TerminalExitStatus {
+    use agent_client_protocol::v1::schema::TerminalExitStatus;
     let cast = exit_code.and_then(|c| u32::try_from(c).ok());
     TerminalExitStatus::new().exit_code(cast)
 }
@@ -98,7 +97,7 @@ pub(super) async fn handle_terminal_output(
             Ok(TerminalOutputResponse::new(combined, false)
                 .exit_status(build_exit_status(out.exit_code)))
         }
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -129,7 +128,7 @@ pub(super) async fn handle_wait_for_terminal_exit(
         Ok(out) => Ok(WaitForTerminalExitResponse::new(build_exit_status(
             out.exit_code,
         ))),
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",

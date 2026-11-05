@@ -2,6 +2,7 @@
 
 use axum::Router;
 use std::sync::Arc;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tracing::Instrument;
 
 use super::access::{access_policy, cityhall_gate, security_headers};
@@ -556,8 +557,27 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     ))
     .layer(axum::middleware::from_fn(security_headers))
     .layer(axum::middleware::from_fn(http_request_span))
+    .layer(compression_layer())
     .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
     .with_state(state)
+}
+
+/// gzip/zstd for JSON bodies only. Upgrades, SSE, replay streams and assets
+/// carry other content types and pass through untouched.
+fn compression_layer() -> tower_http::compression::CompressionLayer<impl Predicate> {
+    let json = |_: axum::http::StatusCode,
+                _: axum::http::Version,
+                headers: &axum::http::HeaderMap,
+                _: &axum::http::Extensions| {
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json"))
+    };
+    tower_http::compression::CompressionLayer::new()
+        .no_br()
+        .no_deflate()
+        .compress_when(SizeAbove::new(1024).and(json))
 }
 
 /// Placeholder logged in place of a route template when axum matched no
@@ -821,6 +841,47 @@ mod tests {
                 "{header:?}: got {line}"
             );
             assert!(line.contains("request_id="), "no request id at all: {line}");
+        }
+    }
+
+    /// Only large JSON is compressed; streams, other types and small bodies
+    /// pass through byte-identical.
+    #[tokio::test]
+    async fn compression_skips_non_json_and_small_bodies() {
+        use tower::ServiceExt;
+        let big = "x".repeat(8192);
+        let cases = [
+            ("application/json", big.clone(), true),
+            ("application/json; charset=utf-8", big.clone(), true),
+            ("application/json", "{}".to_string(), false),
+            ("text/event-stream", big.clone(), false),
+            ("text/plain", big.clone(), false),
+            ("application/octet-stream", big.clone(), false),
+        ];
+        for (content_type, body, compressed) in cases {
+            let payload = body.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/",
+                    axum::routing::get(move || async move {
+                        ([(axum::http::header::CONTENT_TYPE, content_type)], payload)
+                    }),
+                )
+                .layer(compression_layer());
+            let req = axum::http::Request::builder()
+                .uri("/")
+                .header("accept-encoding", "gzip, zstd")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let encoded = resp.headers().contains_key("content-encoding");
+            assert_eq!(encoded, compressed, "{content_type} len={}", body.len());
+            if !compressed {
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes, body.as_bytes(), "{content_type}");
+            }
         }
     }
 }
