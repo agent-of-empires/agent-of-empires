@@ -5,7 +5,7 @@ use crate::acp::aoe_meta::lease::LeaseTable;
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
 use crate::acp::state::IntegrationLostReason;
-use agent_client_protocol::schema::v1::SessionNotification;
+use agent_client_protocol::v1::schema::SessionNotification;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -139,7 +139,7 @@ impl AoeIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall};
+    use agent_client_protocol::v1::schema::{SessionUpdate, ToolCall};
     use serde_json::json;
 
     fn frame(id: &str, aoe: serde_json::Value) -> SessionNotification {

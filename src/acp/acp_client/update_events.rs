@@ -1785,7 +1785,7 @@ mod tests {
     /// profile, reduces to the same events as the `claudeCode` form.
     #[test]
     fn aoe_primitives_match_the_claude_meta_events() {
-        use agent_client_protocol::schema::v1::{ToolCallLocation, ToolKind};
+        use agent_client_protocol::v1::schema::{ToolCallLocation, ToolKind};
         use serde_json::json;
 
         fn tool_call(
