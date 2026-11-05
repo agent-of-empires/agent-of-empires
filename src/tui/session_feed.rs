@@ -432,9 +432,13 @@ async fn run_command_writer(
             let client = client.clone();
             let epoch = epoch.clone();
             let grant = grant.clone();
-            preparations.spawn(async move {
-                run_queued_command(&client, &epoch, &grant, request).await;
-            });
+            preparations.spawn(crate::task_util::supervise(
+                "tui.session_preparation",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    run_queued_command(&client, &epoch, &grant, request).await;
+                },
+            ));
         } else {
             run_queued_command(&client, &epoch, &grant, request).await;
         }

@@ -694,8 +694,9 @@ A failed launch can still commit a lifecycle generation. The finite
 acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
 probe failure can likewise retain a preparation cursor; it does not acknowledge
-message delivery. Transport loss or malformed mutation receipts remain unknown;
-effect-free daemon refusals do not acknowledge a commit.
+message delivery. Transport loss, local request-task failure, or malformed
+mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
+a commit.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.
