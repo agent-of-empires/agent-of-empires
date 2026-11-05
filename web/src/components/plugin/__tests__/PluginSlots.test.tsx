@@ -14,11 +14,12 @@ import {
 } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
-const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock } = vi.hoisted(() => ({
+const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock, fetchPaneMock } = vi.hoisted(() => ({
   entriesRef: { current: [] as PluginUiEntry[] },
   refreshingRef: { current: false },
   revisionRef: { current: 0 },
   pokeMock: vi.fn(),
+  fetchPaneMock: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
   invokeMock: vi.fn(async (): Promise<{ baselineRevision: number | null } | null> => ({ baselineRevision: 0 })),
 }));
 vi.mock("../../../lib/pluginUiContext", () => ({
@@ -27,7 +28,7 @@ vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiRevision: () => revisionRef.current,
   usePluginUiPoke: () => pokeMock,
 }));
-vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
+vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock, fetchPluginPane: fetchPaneMock }));
 
 const pane = (payload: Record<string, unknown>): PluginUiEntry => ({
   plugin_id: "acme.kit",
@@ -53,6 +54,8 @@ beforeEach(() => {
   refreshingRef.current = false;
   revisionRef.current = 0;
   pokeMock.mockClear();
+  fetchPaneMock.mockReset();
+  fetchPaneMock.mockResolvedValue(null);
   invokeMock.mockReset();
   invokeMock.mockImplementation(async () => ({ baselineRevision: 0 }));
 });
@@ -786,5 +789,45 @@ describe("pane blocks", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
+  });
+});
+
+describe("lazy pane", () => {
+  const stub = (): PluginUiEntry => ({ ...pane({ title: "Stub title" }), lazy: true });
+  const content = (text: string) => ({ blocks: [{ kind: "heading", text }] });
+
+  it("fetches the content for the opened session and renders it over the stub", async () => {
+    fetchPaneMock.mockResolvedValue(content("Rendered"));
+    render(<PluginPaneBody entry={stub()} />);
+    expect(await screen.findByText("Rendered")).toBeTruthy();
+    expect(fetchPaneMock).toHaveBeenCalledWith("acme.kit", "p", "s1", expect.any(AbortSignal));
+  });
+
+  it("refetches when the session's UI revision moves and keeps the old content meanwhile", async () => {
+    fetchPaneMock.mockResolvedValueOnce(content("First"));
+    const entry = stub();
+    const { rerender } = render(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByText("First")).toBeTruthy();
+
+    fetchPaneMock.mockResolvedValueOnce(null);
+    revisionRef.current = 1;
+    rerender(<PluginPaneBody entry={entry} />);
+    await waitFor(() => expect(fetchPaneMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("First")).toBeTruthy();
+
+    fetchPaneMock.mockResolvedValueOnce(content("Second"));
+    revisionRef.current = 2;
+    rerender(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByText("Second")).toBeTruthy();
+  });
+
+  it("says so when a pane that never loaded cannot be rendered", async () => {
+    render(<PluginPaneBody entry={stub()} />);
+    expect(await screen.findByTestId("plugin-pane-failed")).toBeTruthy();
+  });
+
+  it("never fetches for an eager pane", () => {
+    renderPane({ title: "Eager" });
+    expect(fetchPaneMock).not.toHaveBeenCalled();
   });
 });

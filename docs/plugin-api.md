@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `21`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 20
+api_version = 21
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `21`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -373,6 +373,7 @@ id = "my_pane"
 | `icon` | string | no | Page only. A [lucide](https://lucide.dev/icons/) kebab-case icon name. |
 | `entry` | string | page only | Plugin-relative path to the page's `.html` file. Required on a `page`. See [Pages](#pages). |
 | `deep_link` | bool | no | Page only; requires `api_version >= 20`. Opts the page in to receive the `?link=` value of its dashboard URL. See [Deep links](#deep-links). |
+| `lazy` | bool | no | Pane only; requires `api_version >= 21`. The pane's content is rendered by the worker when the pane is opened instead of being pushed. See [Lazy panes](#lazy-panes). |
 
 | Slot | Scope | Renders |
 |---|---|---|
@@ -558,6 +559,14 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 **`columns`** lays its `children` out in equal fractions, and a single child spans the full width, so eliding one card collapses the row cleanly.
 
 **`action`** forwards `method` to the worker (see [Pane actions](#pane-actions)); with `href` and no `method` it is a link-out button. `disabled` renders it inert and non-navigating, and `variant: "primary"` gives the brand-filled treatment.
+
+#### Lazy panes
+
+Every pushed `pane` entry rides in each `GET /api/plugins/ui-state` poll, whether or not anyone has the pane open. A pane with `lazy = true` (`api_version >= 21`) avoids that: the worker pushes only a small stub per session with `ui.state.set`, such as `{ "title": "PR Watch" }`, and the dashboard asks for the content when the pane is opened.
+
+The host sends the worker the request `ui.pane.render` with `{ "id", "session_id" }` and waits up to 5 seconds for the reply, which is a pane payload held to the same rules and 64 KiB cap as a pushed one. It is served as `GET /api/plugins/{id}/panes/{pane_id}?session_id=` and is never stored in the snapshot.
+
+The dashboard fetches when the pane opens and again whenever the plugin's UI revision for that session moves, so a worker refreshes an open pane by pushing its stub again. The stub's own fields (`title`, `icon`, `default_location`) still apply and the rendered content is laid over it. A pane that cannot be rendered shows an error. The TUI reads the snapshot only and shows just the stub.
 
 #### Pane actions
 
