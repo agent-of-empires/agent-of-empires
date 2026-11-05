@@ -1,5 +1,6 @@
-import type { AgentInfo, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
+import type { AgentInfo, CreateFailure, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
 import { normalizeProjectPathKey } from "../../lib/registeredProjects";
+import { failureFields } from "./createFailureView";
 import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -63,9 +64,13 @@ export interface WizardState {
   data: WizardData;
   isSubmitting: boolean;
   error: string | null;
+  /** A create the server refused, shown as the failure box instead of `error`. */
+  failure: CreateFailure | null;
   agents: AgentInfo[];
-  /** Until "ready", which agents always run in Yolo mode is unknown. */
-  agentsStatus: "loading" | "ready" | "failed";
+  /** Until "ready", which agents always run in Yolo mode is unknown. "missing": the profile is gone. */
+  agentsStatus: "loading" | "ready" | "failed" | "missing";
+  /** Which profile `agents` and `agentsStatus` describe; any other profile is still loading. */
+  agentsFor: string | null;
   groups: GroupInfo[];
   /** Which profile `groups` was fetched for; any other profile sees no Groups. */
   groupsFor: string | null;
@@ -81,11 +86,11 @@ export type Action =
   | { type: "SET_FIELD"; field: string; value: unknown }
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
+  | { type: "SUBMIT_FAILED"; failure: CreateFailure }
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
-  | { type: "SET_AGENTS"; agents: AgentInfo[] }
-  | { type: "AGENTS_FAILED" }
-  | { type: "AGENTS_LOADING" }
+  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string }
+  | { type: "AGENTS_FAILED"; agentsFor: string; missing: boolean }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
   | { type: "SET_DOCKER"; available: boolean; runtimeName: string | null }
@@ -157,6 +162,8 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   }
   // Any branch edit, even clearing it, stops the title mirror.
   if (field === "worktreeBranch") next.worktreeBranchDirty = true;
+  // The seeded model and effort belong to the previous agent; unset, the server uses the new agent's defaults.
+  if (field === "tool" && value !== data.tool) Object.assign(next, { agentModel: "", agentEffort: "" });
   if (field === "scratch" && value === true) {
     Object.assign(next, {
       path: "",
@@ -222,7 +229,27 @@ function seededStructuredView(data: WizardData, action: { useStructuredView?: bo
   return action.useStructuredView ?? data.useStructuredView;
 }
 
+const NO_AGENTS: AgentInfo[] = [];
+
+/** The agent list for `profile`: one loaded for another profile reads as still loading. */
+export function agentsView(
+  state: Pick<WizardState, "agents" | "agentsStatus" | "agentsFor">,
+  profile: string,
+): { agents: AgentInfo[]; agentsStatus: WizardState["agentsStatus"] } {
+  return state.agentsFor === profile
+    ? { agents: state.agents, agentsStatus: state.agentsStatus }
+    : { agents: NO_AGENTS, agentsStatus: "loading" };
+}
+
 export function reducer(state: WizardState, action: Action): WizardState {
+  const next = reduce(state, action);
+  const { failure } = next;
+  if (failure && failure === state.failure && failureFields(failure).some((f) => next.data[f] !== state.data[f]))
+    return { ...next, failure: null };
+  return next;
+}
+
+function reduce(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
@@ -254,19 +281,25 @@ export function reducer(state: WizardState, action: Action): WizardState {
       };
     }
     case "SUBMIT_START":
-      return { ...state, isSubmitting: true, error: null };
+      return { ...state, isSubmitting: true, error: null, failure: null };
     case "SUBMIT_ERROR":
-      return { ...state, isSubmitting: false, error: action.error };
+      return { ...state, isSubmitting: false, error: action.error, failure: null };
+    case "SUBMIT_FAILED":
+      return { ...state, isSubmitting: false, error: null, failure: action.failure };
     case "SUBMIT_SUCCESS":
       return { ...state, isSubmitting: false };
     case "SUBMIT_CANCEL":
-      return { ...state, isSubmitting: false, error: null };
+      return { ...state, isSubmitting: false, error: null, failure: null };
     case "SET_AGENTS":
-      return { ...state, agents: action.agents, agentsStatus: "ready" };
+      return { ...state, agents: action.agents, agentsStatus: "ready", agentsFor: action.agentsFor };
     case "AGENTS_FAILED":
-      return { ...state, agentsStatus: "failed" };
-    case "AGENTS_LOADING":
-      return { ...state, agentsStatus: "loading" };
+      return {
+        ...state,
+        // A retry for the same Profile keeps its list; another Profile's list must not be read for it.
+        agents: action.agentsFor === state.agentsFor ? state.agents : [],
+        agentsStatus: action.missing ? "missing" : "failed",
+        agentsFor: action.agentsFor,
+      };
     case "SET_GROUPS":
       return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":

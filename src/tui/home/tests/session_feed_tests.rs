@@ -2981,7 +2981,7 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
         .with_state(state.clone());
     let socket = app.join("daemon/api.sock");
     let server = crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket.clone(), None);
     let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
         .await
         .unwrap();

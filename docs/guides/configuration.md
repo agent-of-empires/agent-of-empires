@@ -558,6 +558,15 @@ aoe profile list
 aoe profile default work
 ```
 
+Profile writes and global project registration use the Daemon even when the
+profile catalogue is empty or the configured default is missing. Create a
+profile and select it with `aoe profile default NAME` to restore the default.
+These commands do not create the missing profile implicitly. An explicit `-p`
+still selects the profile used for cross-scope project conflict checks.
+Unreadable or malformed configuration remains an error; session operations
+still require a valid default. `--no-autostart` refuses writes when no Daemon
+is available.
+
 ## Repo config
 
 Per-repo settings live in `.agent-of-empires/config.toml`; `aoe init` writes a template. A repo may set `[hooks]`, parts of `[session]`, `[sandbox]`, and `[worktree]`, and nothing else. See [Repo Config & Hooks](repo-config.md) for which keys are accepted and why the rest are not.

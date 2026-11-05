@@ -440,8 +440,9 @@ async fn upgrade_http(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     ReadFailure,
 > {
+    use crate::acp::client::discovery::resolved_passphrase;
     use crate::acp::client::passphrase_session::{self, PassphraseSessionCache};
-    use crate::acp::client::{DaemonEndpoint, Source};
+    use crate::daemon::{DaemonEndpoint, Source};
 
     let peer = stream
         .peer_addr()
@@ -470,8 +471,7 @@ async fn upgrade_http(
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_string);
         let endpoint = DaemonEndpoint::new(base, bearer, Source::Env);
-        endpoint
-            .resolved_passphrase()
+        resolved_passphrase(&endpoint)
             .is_some()
             .then(|| (endpoint, PassphraseSessionCache::default()))
     } else {

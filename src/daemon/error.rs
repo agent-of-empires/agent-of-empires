@@ -28,6 +28,8 @@ pub enum ApiErrorCode {
     CreationCancelled,
     CreationNotPending,
     CreateHookFailed,
+    CreateOutcomeUnknown,
+    AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
     SmartRenameTimeout,
@@ -60,6 +62,8 @@ impl ApiErrorCode {
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
+            Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
@@ -87,6 +91,8 @@ impl ApiErrorCode {
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending
+            | Self::CreateOutcomeUnknown
+            | Self::AgentHooksNotApproved
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
@@ -138,6 +144,8 @@ impl ApiErrorCode {
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
+            b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
+            b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
             b"no_revive" => Self::NoRevive,

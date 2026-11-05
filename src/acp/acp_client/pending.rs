@@ -2,7 +2,7 @@
 
 use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
-use agent_client_protocol::schema::v1::CreateElicitationResponse;
+use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};

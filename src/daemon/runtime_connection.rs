@@ -6,12 +6,12 @@ use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::DaemonEndpoint;
 use super::{
     websocket::{self, NativeSocket},
     CreationProgress, RuntimeFrame, RuntimeInfo, RuntimeSnapshot, WsError,
     RUNTIME_PROTOCOL_VERSION,
 };
-use crate::acp::client::DaemonEndpoint;
 
 #[derive(Debug, Error)]
 pub enum RuntimeConnectionError {

@@ -13,9 +13,10 @@ use super::input::{Focus, Intent};
 use super::queue::QueueMirror;
 use super::reducer::AcpTranscript;
 use super::slash;
-use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
+use crate::acp::client::{HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::{AvailableCommand, SessionNotice};
+use crate::daemon::DaemonEndpoint;
 use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
@@ -636,7 +637,7 @@ impl StructuredViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::Source;
+    use crate::daemon::Source;
 
     fn test_state(ws: Option<WsHandle>) -> StructuredViewState {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);

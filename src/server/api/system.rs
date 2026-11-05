@@ -91,9 +91,15 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// Whether a non-sandboxed structured create would find this agent's ACP adapter
-    /// (the create check, with no project to search relative PATH entries from, so they count).
+    /// Whether this agent's ACP adapter resolves on the host now, for the served profile with no
+    /// sandbox. Relative PATH entries and a host `before_session` hook count, as for a spawn;
+    /// preparation hooks (`on_create`/`on_launch`) don't. The wizard's Import tab and the usage
+    /// limit banner's installed alternatives read it: both run the adapter before those hooks.
     pub acp_installed: bool,
+    /// Whether a non-sandboxed structured create in the served profile will accept this agent:
+    /// the adapter resolves, or the profile's own `on_create`/`on_launch` hooks may install it
+    /// first. The repository's hooks depend on the project, so they are left to the create.
+    pub acp_create_ready: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
     /// fact (an ACP adapter exists for this agent) that an operator policy does
@@ -182,6 +188,7 @@ fn build_custom_agent_infos(
                 acp_allowed: policy.allows(name),
                 // Set by `list_agents`, which holds the config the probe needs.
                 acp_installed: false,
+                acp_create_ready: false,
                 // Custom agents' command values are deliberately never
                 // serialized here; they can hold hostnames or secrets.
                 acp_command: None,
@@ -257,6 +264,7 @@ pub async fn list_agents(
                     lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: false,
+                    acp_create_ready: false,
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
@@ -289,6 +297,7 @@ pub async fn list_agents(
                 oneshot_capable: false,
                 acp_capable: false,
                 acp_installed: false,
+                acp_create_ready: false,
                 acp_allowed: policy.allows(integration.tool),
                 acp_command: None,
                 acp_args: Vec::new(),
@@ -304,11 +313,18 @@ pub async fn list_agents(
         let host_environment =
             crate::session::environment::resolve_host_environment_pairs(&config.environment);
         for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            agent.acp_installed = crate::session::builder::structured::adapter_installed(
-                &agent.name,
-                &config,
-                &host_environment,
-            );
+            let check = |count_profile_hooks| {
+                crate::session::builder::structured::adapter_installed(
+                    &agent.name,
+                    &config,
+                    &host_environment,
+                    count_profile_hooks,
+                )
+            };
+            // An installed adapter is create-ready, so the hooked check runs only when it isn't.
+            let installed = check(false);
+            agent.acp_create_ready = installed || check(true);
+            agent.acp_installed = installed;
         }
         agents
     })
@@ -2365,7 +2381,7 @@ async fn commit_profile_owned(
     mutation: crate::daemon::ProfileMutation,
 ) -> axum::response::Response {
     use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
-    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+    use crate::server::reload::{load_configuration_profiles, merge_loaded_rows};
 
     let transaction = tokio::select! {
         _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2390,9 +2406,6 @@ async fn commit_profile_owned(
             "The profile served by this daemon cannot be deleted",
         );
     }
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     let creation_active = match &mutation {
         ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } => {
             state.session_service.has_profile_creation(name)
@@ -2416,7 +2429,7 @@ async fn commit_profile_owned(
             transaction,
             identity,
         )?;
-        let loaded = load_all_profiles(&file_watch).map(|_| ());
+        let loaded = load_configuration_profiles(&file_watch).map(|loaded| loaded.native_health());
         Ok::<_, anyhow::Error>((catalogue, loaded, reload))
     })
     .await
@@ -2429,12 +2442,17 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    if let Err(error) = preflight {
-        state.mark_reload_failure(error.health).await;
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    let preflight_health = match preflight {
+        Ok(health) => health,
+        Err(error) => {
+            state.mark_reload_failure(error.health).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let publication = state.publication.write().await;
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy
+        && preflight_health == RuntimeHealth::Healthy
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let file_watch = state.file_watch.clone();
@@ -2452,7 +2470,7 @@ async fn commit_profile_owned(
                 .map(|_| ()),
             ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
         };
-        let loaded = load_all_profiles(&file_watch);
+        let loaded = load_configuration_profiles(&file_watch);
         #[cfg(test)]
         {
             let pause = {
@@ -2496,6 +2514,7 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let health = loaded.native_health();
     let suppressed =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
     merge_loaded_rows(
@@ -2505,7 +2524,12 @@ async fn commit_profile_owned(
         &suppressed,
     );
     *state.canonical_metadata.write().await = loaded.metadata;
-    *state.canonical_health.write().await = RuntimeHealth::Healthy;
+    state
+        .runtime_read_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inventory = loaded.inventory;
+    *state.canonical_health.write().await = health;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3711,11 +3735,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// `acp_installed` follows the structured create check, so a custom
-    /// agent counts when its adapter is on the configured `environment` PATH.
+    /// Both fields follow the structured create check, so a custom agent counts when its
+    /// adapter is on the configured `environment` PATH. A profile hook makes a missing adapter
+    /// create-ready but never installed, which the Import tab relies on.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_installed_matches_the_structured_create_check() {
+    async fn acp_installed_and_create_ready_match_the_structured_create_check() {
         use std::os::unix::fs::PermissionsExt;
         let _home = crate::session::test_support::isolate_app_dir();
         let bin = tempfile::tempdir().unwrap();
@@ -3743,22 +3768,53 @@ mod tests {
             config.environment = vec![format!("PATH={}", bin.path().display())];
         })
         .unwrap();
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let Ok(Json(agents)) = list_agents(
-            State(state),
-            axum::extract::Query(AgentsQuery { profile: None }),
-        )
-        .await
-        else {
-            panic!("list_agents failed");
-        };
-        for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
-            let agent = agents.iter().find(|a| a.name == name).unwrap();
-            assert_eq!(agent.acp_installed, installed, "{name}");
-            assert_eq!(agent.display_name, name);
+        // (agent, installed, create-ready) without hooks, then with a profile on_create hook.
+        let passes = [
+            (
+                false,
+                [
+                    ("on-path", true, true),
+                    ("missing", false, false),
+                    ("terminal", false, false),
+                ],
+            ),
+            (
+                true,
+                [
+                    ("on-path", true, true),
+                    ("missing", false, true),
+                    ("terminal", false, false),
+                ],
+            ),
+        ];
+        for (hooked, rows) in passes {
+            if hooked {
+                crate::session::config::update_config(|config| {
+                    config.hooks.on_create = vec!["npm install".into()];
+                })
+                .unwrap();
+            }
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let Ok(Json(agents)) = list_agents(
+                State(state),
+                axum::extract::Query(AgentsQuery { profile: None }),
+            )
+            .await
+            else {
+                panic!("list_agents failed");
+            };
+            for (name, installed, create_ready) in rows {
+                let agent = agents.iter().find(|a| a.name == name).unwrap();
+                assert_eq!(agent.acp_installed, installed, "{name} (hook: {hooked})");
+                assert_eq!(
+                    agent.acp_create_ready, create_ready,
+                    "{name} (hook: {hooked})"
+                );
+                assert_eq!(agent.display_name, name);
+            }
+            let claude = agents.iter().find(|a| a.name == "claude").unwrap();
+            assert_eq!(claude.display_name, "Claude Code");
         }
-        let claude = agents.iter().find(|a| a.name == "claude").unwrap();
-        assert_eq!(claude.display_name, "Claude Code");
     }
 
     #[test]

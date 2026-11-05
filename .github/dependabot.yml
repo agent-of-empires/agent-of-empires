@@ -284,3 +284,41 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "@tailwindcss/*"
         update-types: ["version-update:semver-major"]
+
+  # pip: CI toolchain editor
+  - package-ecosystem: "pip"
+    directory: "/.github/scripts"
+    schedule:
+      interval: "monthly"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "area:infra"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+
+  # pip: optional X publishing
+  - package-ecosystem: "pip"
+    directory: "/marketing/x"
+    versioning-strategy: "increase-if-necessary"
+    schedule:
+      interval: "monthly"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28

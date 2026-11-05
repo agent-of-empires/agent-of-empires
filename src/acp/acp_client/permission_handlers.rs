@@ -8,7 +8,7 @@ use crate::acp::approvals::{
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome,
@@ -29,7 +29,7 @@ use super::tool_output::{preview_optional_args, tool_kind_str};
 /// A kind we cannot map back is dropped rather than guessed at, so no client
 /// offers a button whose meaning is unknown.
 pub(super) fn approval_options(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
 ) -> Vec<ApprovalOption> {
     options
         .iter()
@@ -55,10 +55,10 @@ pub(super) fn approval_options(
 /// by kind would send an option the user never picked, so it resolves to
 /// `None` and the caller cancels. Without one, the decision picks by kind.
 pub(super) fn pick_option_id(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
     decision: ApprovalDecision,
     requested: Option<&str>,
-) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
+) -> Option<agent_client_protocol::v1::schema::PermissionOptionId> {
     if let Some(requested) = requested {
         return options
             .iter()
@@ -95,8 +95,8 @@ pub(super) fn pick_option_id(
 /// would broadcast as an allow and leave the tool card running. `None` for a
 /// kind newer than this build, which keeps the client's decision.
 fn decision_for_option(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
-    option_id: &agent_client_protocol::schema::v1::PermissionOptionId,
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
+    option_id: &agent_client_protocol::v1::schema::PermissionOptionId,
 ) -> Option<ApprovalDecision> {
     let kind = options.iter().find(|o| &o.option_id == option_id)?.kind;
     match kind {
@@ -389,7 +389,7 @@ pub(super) async fn handle_elicitation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+    use agent_client_protocol::v1::schema::{PermissionOption, PermissionOptionId};
 
     fn option(id: &str, name: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption::new(PermissionOptionId::new(id), name, kind)
@@ -490,7 +490,7 @@ mod tests {
     /// `handle_permission_request`, so this drives the whole handler (#3741).
     #[tokio::test]
     async fn choice_list_with_no_picked_option_cancels_instead_of_picking_the_first() {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         use std::collections::HashMap;
@@ -553,7 +553,7 @@ mod tests {
     /// not carry a plan even when its input has a `plan` field.
     #[tokio::test]
     async fn plan_is_only_attached_to_non_destructive_approvals() {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         use std::collections::HashMap;

@@ -15,7 +15,9 @@ import type {
   ProjectInfo,
   ProjectOverrides,
   DockerStatusResponse,
+  CreateFailure,
   CreateProgress,
+  CreateStage,
   CreateSessionRequest,
   CreationTrustFingerprint,
   ImportableSession,
@@ -1014,6 +1016,8 @@ export interface PluginUiNotification {
    *  toast is rendered as click-to-open: a browser blocks `window.open` from an
    *  async push, so the open happens on the user's click. Always http/https. */
   href?: string;
+  /** A dashboard path to a deep-linked plugin page (`ui.notify` `link`). The toast keeps its tone and opens the path on click. */
+  link?: string;
 }
 
 /** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
@@ -1025,6 +1029,8 @@ export interface PluginPage {
   url: string;
   /** The plugin's granted capabilities; the page bridge gates on them. */
   capabilities: string[];
+  /** The page takes the `?link=` value of its dashboard URL over the bridge. Absent on older daemons. */
+  deep_link?: boolean;
 }
 
 export interface PluginUiState {
@@ -1967,8 +1973,22 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 /** Null when the request failed, so callers can tell "no agents" from "unknown". */
 export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const agents = await fetchProfileAgents(profile);
+  return Array.isArray(agents) ? agents : null;
+}
+
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
+export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
   const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
+  try {
+    const res = await fetch(`/api/agents${query}`);
+    if (res.ok) return (await res.json()) as AgentInfo[];
+    if (res.status !== 404) return null;
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+    return body?.error === "profile_not_found" ? "profile_not_found" : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {
@@ -2260,6 +2280,9 @@ export async function reviewCreationTrust(
   }
 }
 
+// The Daemon's create stages; anything else from the wire is no stage.
+const CREATE_STAGES: readonly CreateStage[] = ["preparing", "starting_container", "running_hooks", "starting"];
+
 export async function createSession(body: CreateSessionRequest): Promise<{
   ok: boolean;
   error?: string;
@@ -2271,6 +2294,8 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   network?: boolean;
   /** A restarted daemon cannot tell whether the first attempt ran; retrying stops here. */
   outcomeUnknown?: boolean;
+  /** Set for any typed refusal other than the ones flagged above. */
+  failure?: CreateFailure;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
@@ -2298,7 +2323,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
     if (data.error === "create_outcome_unknown") {
       return { ok: false, error: data.message || "Whether the session was created is unknown.", outcomeUnknown: true };
     }
-    if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
+    if (data.error !== "hooks_need_trust") {
+      const message = data.message || `Server error (${res.status})`;
+      if (typeof data.error !== "string") return { ok: false, error: message };
+      const stage = CREATE_STAGES.find((known) => known === data.stage) ?? null;
+      const reference = typeof data.reference === "string" ? data.reference : res.headers.get("x-request-id");
+      return { ok: false, error: message, failure: { code: data.error, message, stage, reference } };
+    }
     return {
       ok: false,
       error: data.message || "Repository hooks require trust",
@@ -2604,6 +2635,15 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
 /** Restarts a sandboxed session on a new container from the current local image. */
 export async function recreateSessionContainer(id: string): Promise<{ ok: boolean; message?: string }> {
   return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/recreate-container`, { method: "POST" });
+}
+
+/** Restarts a session's Agent, replacing a running structured worker; the conversation resumes. */
+export async function restartSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
 }
 
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */

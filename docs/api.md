@@ -433,6 +433,57 @@ HTTP requests wait for the admitted creation to finish.
 Repository hook and MCP approvals are persisted against the source repository
 before provisioning begins. Failure to persist approval aborts creation.
 
+The optional `cli` object carries CLI selection intent: `parent`, `projects`,
+`command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
+Selectors, project registries, configuration and paths are resolved on the Daemon host.
+CLI agent selection also resolves approved plugin agents on the Daemon host.
+Nonblank configured custom commands take precedence over plugin commands; blank
+custom commands allow built-in or plugin fallback. Plugin `--tool` selections
+reject command overrides, matching configured custom-agent selections.
+A terminal creation with `cli` runs creation hooks and finishes **Stopped**, without
+launching the agent. Launch is a separate epoch-checked request. The CLI client
+allows up to 30 minutes for creation and launch, including host hooks. Requests without
+`cli` keep the existing lifecycle. `GET /api/runtime` advertises `cli_creation: true`;
+clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
+Concurrent CLI requests with the same title and working directory cannot create duplicates.
+Interrupting the CLI while launch is pending leaves the created session intact;
+inspect Daemon state before retrying launch.
+If terminal finalization fails after creation commits, the Daemon returns `409`
+with `aoe-error-code: create_outcome_unknown` and does not roll back the session or resources.
+The CLI checks canonical state without resubmitting creation. A healthy, finalized
+session confirms success; otherwise the CLI reports an unknown outcome.
+
+CLI forks use the latest durable parent binding, including a completed
+`aoe session set-session-id`, without waiting for the filesystem watcher.
+Parent and requested project paths are compared after canonicalization, so
+equivalent symlink paths keep the existing binding.
+For a single repository, base selectors accept its principal identity and the
+input worktree's path or name. Both aliases target the same repository.
+
+CLI sandbox image selections trim surrounding whitespace. A blank explicit image
+uses `sandbox.default_image`; if that configured value is blank too, creation uses
+the container runtime's default image.
+Deferred CLI terminal creation requires an installed sandbox runtime, but not a
+running engine, when no effective `on_create` hooks need a container. Container
+creation hooks and later launch still require the engine. Non-CLI creation
+retains its existing readiness checks.
+
+With CLI intent, `extra_args` uses shell-style word grouping and each decoded
+argument is quoted for literal delivery. Only the authenticated owner on the
+Daemon's Unix socket may use shell metacharacters in decoded arguments or
+canonical project paths. HTTP callers retain the shared shell-metacharacter
+gate, even with `cli`: grouping quotes and empty arguments are accepted, but
+quoted substitutions and model values such as `opus[1m]` are rejected.
+Project paths are canonicalized on the Daemon host before this check, not
+shell-quoted. `cli` expresses selection intent, not authenticated origin.
+Requests without `cli` retain their existing input validation.
+
+Host launches and structured creations that need agent-hook approval return `409`
+with `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
+host; repository creation trust does not grant this approval. The Daemon caches
+failed creations. Use a new key after approval; replaying a cached refusal does
+not repeat creation hooks.
+
 For `trust_hooks`, omission refuses unapproved repository hooks with
 `hooks_need_trust`; `true` approves hooks and project MCP; `false` explicitly
 skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
@@ -444,6 +495,12 @@ granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
+
+For an interactive generated worktree title, the review may also receive
+`generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
+and `worktree_path_id`, computed without provisioning. Pass the accepted title and
+`cli.worktree_path_id` to creation so templates containing `{session-id}` use the
+same identity. Creation rechecks collisions; the suggestion does not reserve a path.
 
 Pass the returned fingerprint as `trust_review` with the chosen `trust_hooks`
 decision in the creation request. A changed source repository, global/profile
