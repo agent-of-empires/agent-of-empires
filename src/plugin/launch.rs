@@ -70,7 +70,15 @@ pub struct OsLaunchResolver;
 
 impl LaunchResolver for OsLaunchResolver {
     fn which(&self, program: &str) -> Option<PathBuf> {
-        which::which(program).ok()
+        // The resolved Node's directory leads the same PATH the child gets, so
+        // `node` and `npm` resolve on a machine with no system Node.
+        let node_path = super::node_env()
+            .into_iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value));
+        match node_path {
+            Some(path) => which::which_in(program, Some(path), std::env::current_dir().ok()?).ok(),
+            None => which::which(program).ok(),
+        }
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -249,6 +257,21 @@ mod tests {
         fn is_executable(&self, path: &Path) -> bool {
             self.executable.contains(path)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn os_resolver_finds_bare_commands_in_the_resolved_node_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = crate::plugin::write_fake_node(temp.path());
+        let tool = temp.path().join("aoe-node-dir-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+
+        assert_eq!(OsLaunchResolver.which("aoe-node-dir-tool"), Some(tool));
     }
 
     fn plugin(runtime: Option<&str>, dir: Option<&str>) -> LoadedPlugin {

@@ -141,11 +141,47 @@ impl Drop for ReloadRegistryOnDrop {
     }
 }
 
+/// A `node` script that reports the pinned version, for `AOE_ACP_NODE`.
+#[cfg(all(test, unix))]
+pub(crate) fn write_fake_node(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let node = dir.join("node");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\necho {}\n",
+            crate::acp::node::PINNED_NODE_VERSION
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    node
+}
+
 #[cfg(test)]
 mod node_env_tests {
     use super::node_env_for;
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn node_env_resolves_aoe_acp_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = super::write_fake_node(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+
+        let env = super::node_env();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("AOE_NODE"), Some(node.into_os_string()));
+        let path = get("PATH").expect("PATH");
+        assert_eq!(std::env::split_paths(&path).next().unwrap(), temp.path());
+    }
 
     #[test]
     fn node_env_sets_aoe_node_and_leads_path_with_its_dir() {
