@@ -24,7 +24,11 @@ pub(super) fn approval_plan_text(
 /// `SessionUpdate::Plan` of its own (#1059). `None` for a missing, non-string,
 /// or bullet-less value, which still renders as a generic tool card.
 pub(super) fn extract_plan_from_switch_mode(raw_input: &serde_json::Value) -> Option<Plan> {
-    let plan_text = raw_input.get("plan")?.as_str()?;
+    plan_from_markdown(raw_input.get("plan")?.as_str()?)
+}
+
+/// `None` for text with no bullet lines.
+pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
     let steps = parse_plan_steps(plan_text);
     if steps.is_empty() {
         return None;
