@@ -1,9 +1,8 @@
 //! Node.js runtime resolution for acp-worker subprocesses.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -92,35 +91,11 @@ pub fn resolve_for(
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn probe_version(path: &Path, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)?;
-            }
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr: Vec::new(),
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "node --version timed out",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let mut cmd = Command::new(path);
+    cmd.arg("--version").stdin(Stdio::null());
+    crate::process::run_with_timeout(&mut cmd, timeout)?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "node --version timed out")
+    })
 }
 
 fn verify_path(path: &Path, source: NodeSource) -> Result<ResolvedNode, NodeError> {
@@ -380,6 +355,7 @@ mod tests {
     #[test]
     fn a_hanging_node_probe_is_killed_after_the_timeout() {
         use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
         let temp = tempfile::tempdir().unwrap();
         let node = temp.path().join("node");
         std::fs::write(&node, "#!/bin/sh\nexec sleep 30\n").unwrap();
@@ -393,6 +369,24 @@ mod tests {
             "{err}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_stdout_does_not_block_the_node_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("node");
+        let script = format!("#!/bin/sh\nsleep 30 &\necho {PINNED_NODE_VERSION}\n");
+        std::fs::write(&node, script).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let resolved = verify_path_within(&node, NodeSource::Env, Duration::from_secs(5))
+            .expect("the version printed before exit is read without waiting for the descendant");
+        assert_eq!(resolved.version, PINNED_NODE_VERSION);
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]
