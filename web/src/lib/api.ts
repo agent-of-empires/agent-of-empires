@@ -334,6 +334,7 @@ export async function ensureTerminal(
       });
       if (res.ok) return { ok: true };
       const body = await res.json().catch(() => ({}));
+      if (signal?.aborted) return { ok: false, error: "aborted" };
       result = {
         ok: false,
         error: typeof body.error === "string" ? body.error : undefined,
