@@ -179,8 +179,17 @@ impl McpServer {
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
         let initial_turn = if structured { prompt.clone() } else { None };
         let wait_ready = !structured && prompt.is_some();
-        let response =
-            create_session_with(self.state.clone(), false, wait_ready, body, initial_turn).await;
+        // Names this create in failure logs and responses, as an HTTP request's id does.
+        let reference = format!("mcp-{}", uuid::Uuid::new_v4());
+        let response = create_session_with(
+            self.state.clone(),
+            false,
+            &reference,
+            wait_ready,
+            body,
+            initial_turn,
+        )
+        .await;
         let session: SessionResponse = success_body(response).await.map_err(|e| *e)?;
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
