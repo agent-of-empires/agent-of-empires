@@ -354,6 +354,43 @@ test.describe("agents and presets", () => {
     await expect.poll(() => created[0]).toMatchObject({ profile: "Beta", tool: "wrapper", yolo_mode: false });
   });
 
+  test("a custom agent with its own adapter locks Yolo mode only in Terminal view", async ({ page }) => {
+    // Its structured session runs its own adapter, which asks; its terminal session runs the Pi CLI, which never does.
+    const ownPi = {
+      ...CLAUDE_AGENT,
+      name: "own-pi",
+      kind: "custom",
+      acp_capable: true,
+      always_yolo: true,
+      acp_always_yolo: false,
+    };
+    const created = await startWizard(page, {
+      settings: { session: { yolo_mode_default: false, default_tool: "own-pi" } },
+      agents: [CLAUDE_AGENT, ownPi],
+    });
+    const w = wizard(page);
+    const yoloRow = w.getByTestId("wizard-yolo-row");
+    const yolo = switchNamed(page, "Yolo mode");
+    await expect(w.getByTestId("wizard-agent-row")).toContainText("own-pi");
+    await expect(w.getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "true");
+    await expect(yoloRow).toContainText("asks before running commands");
+    await expect(yolo).toBeEnabled();
+
+    await w.getByRole("radio", { name: "Terminal view" }).click();
+    await expect(yoloRow).toContainText("always on for own-pi");
+    await expect(yolo).toBeDisabled();
+    await expect(yolo).toHaveAttribute("aria-checked", "true");
+
+    await w.getByRole("radio", { name: "Structured view" }).click();
+    await expect(yoloRow).toContainText("asks before running commands");
+    await expect(yolo).toHaveAttribute("aria-checked", "false");
+
+    await w.getByRole("radio", { name: "Terminal view" }).click();
+    await launch(page);
+    // The wizard sends the user's value; the Daemon forces Yolo mode for the terminal session.
+    await expect.poll(() => created[0]).toMatchObject({ tool: "own-pi", view: "terminal", yolo_mode: false });
+  });
+
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({ page }) => {
     const hidden = [
       "/opt/private/bin/remote-helper",
