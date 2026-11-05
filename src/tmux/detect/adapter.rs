@@ -31,7 +31,6 @@ impl CaptureScope {
 pub struct CapturePolicy {
     pub scope: CaptureScope,
     pub fetch_missing_title: bool,
-    pub observe_ownership: bool,
 }
 
 pub(super) struct Evaluation<'m, 'a> {
@@ -69,7 +68,6 @@ pub(super) static PLAIN: Adapter = Adapter {
     capture: CapturePolicy {
         scope: CaptureScope::History(50),
         fetch_missing_title: false,
-        observe_ownership: false,
     },
     evidence_names: &[],
     observation_token: |_| None,

@@ -79,6 +79,52 @@ const OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 const OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
 const OMP_ROUTING_SECRET: &str = "/aoe-e2e-sensitive-routing-value";
 
+const OMP_E2E_MANIFEST: &str = r#"
+id = "acme.omp-e2e"
+name = "OMP e2e declaration"
+version = "1.0.0"
+api_version = 20
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "omp"
+provider_versions = ["^18"]
+command = "omp"
+replies = true
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+model_flag = "--model"
+install_hint = "curl -fsSL https://omp.sh/install | sh"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+
+[agent_integrations.detection]
+mode = "native_only"
+"#;
+
+fn install_omp_plugin(h: &TuiTestHarness) {
+    let source = h.home_path().join("omp-plugin-src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("aoe-plugin.toml"), OMP_E2E_MANIFEST).unwrap();
+    h.run_cli_ok(&["plugin", "install", source.to_str().unwrap(), "--yes"]);
+}
+
 fn write_project_omp_dotenv(project: &Path, store: &Path) {
     fs::write(
         project.join(".env"),
@@ -326,6 +372,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
     fs::create_dir_all(omp_store.join("sessions/decoy")).expect("create OMP store");
     write_project_omp_dotenv(&project, &omp_store);
     configure_fresh_restart_capture(&h);
+    install_omp_plugin(&h);
     let control = install_toggling_fake_omp(&mut h, &project, &omp_store);
 
     fs::write(
@@ -397,6 +444,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
 fn omp_reconstruction_rejects_cross_project_and_unqualified_legacy_publications() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_reconstruction");
+    install_omp_plugin(&h);
     let project = h.project_path();
     let old_project = h.home_path().join("unrelated-old-project");
     fs::create_dir_all(&old_project).expect("create unrelated old project");
@@ -461,9 +509,11 @@ fn omp_reconstruction_rejects_cross_project_and_unqualified_legacy_publications(
 fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("omp_wrapper_capture_boundary");
+    install_omp_plugin(&h);
     let project = h.project_path();
     let effective = h.home_path().join("effective");
     fs::create_dir_all(&effective).unwrap();
+    let effective = fs::canonicalize(&effective).unwrap();
     let store = h.home_path().join("wrapper-store");
     fs::create_dir_all(&store).unwrap();
     let control = install_toggling_fake_omp(&mut h, &effective, &store);
@@ -510,7 +560,7 @@ fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
         "declaring a wrapper must not authorize automatic capture"
     );
 
-    let transcript = store.join(format!(
+    let transcript = fs::canonicalize(&store).unwrap().join(format!(
         "sessions/home-project/2026-08-05T00-00-00-000Z_{OMP_SID_FIRST}.jsonl"
     ));
     h.run_cli_ok(&[

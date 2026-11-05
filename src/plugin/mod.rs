@@ -75,6 +75,7 @@ pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
 pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
+    agent_integration::clear_declared_agent_cache();
     *REGISTRY.write_safe() = Some(reg.clone());
     reg
 }

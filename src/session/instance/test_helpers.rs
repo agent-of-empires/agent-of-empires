@@ -249,6 +249,91 @@ pub(super) fn test_sandbox(name: &str, workdir: Option<&str>) -> SandboxInfo {
     }
 }
 
+const OMP_TEST_MANIFEST: &str = r#"
+id = "acme.omp-test"
+name = "OMP test declaration"
+version = "1.0.0"
+api_version = 20
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "omp"
+provider_versions = ["^18"]
+command = "omp"
+replies = true
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+model_flag = "--model"
+install_hint = "curl -fsSL https://omp.sh/install | sh"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+
+[agent_integrations.detection]
+mode = "native_only"
+"#;
+
+/// Install the OMP declaration through the same plugin registry production uses.
+/// The app-dir guard drops before the registry reload, so the next test sees the
+/// caller's environment rather than this fixture.
+pub(crate) struct OmpTestPlugin {
+    app: Option<crate::session::test_support::AppDirGuard>,
+    reload: Option<crate::plugin::ReloadRegistryOnDrop>,
+}
+
+impl Drop for OmpTestPlugin {
+    fn drop(&mut self) {
+        self.app.take();
+        self.reload.take();
+    }
+}
+
+pub(crate) fn install_omp_test_plugin() -> OmpTestPlugin {
+    use crate::session::{CapabilityGrant, PluginConfig};
+
+    let app = crate::session::test_support::isolate_app_dir();
+    let plugin_id = "acme.omp-test";
+    let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), OMP_TEST_MANIFEST).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            plugin_id.to_string(),
+            PluginConfig {
+                grant: Some(CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                        OMP_TEST_MANIFEST.as_bytes(),
+                    ),
+                    capabilities: vec!["session.integration".into()],
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..PluginConfig::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::plugin::reload_registry();
+    OmpTestPlugin {
+        app: Some(app),
+        reload: Some(crate::plugin::ReloadRegistryOnDrop),
+    }
+}
+
 pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {
     let mut inst = Instance::new(tool, path);
     inst.tool = tool.to_string();

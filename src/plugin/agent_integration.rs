@@ -4,15 +4,25 @@ use std::{
     collections::{HashMap, HashSet},
     os::fd::AsFd,
     os::unix::fs::MetadataExt,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
 use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
-    AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
-    AgentIntegrationSnapshot, AgentIntegrationStatus, IntegrationApprovalChoice,
+    launch_prefix, AgentCaptureBackend as DeclaredCaptureBackend,
+    AgentCaptureContext as DeclaredCaptureContext, AgentDetectionDeclaration,
+    AgentIntegrationContribution, AgentIntegrationPrompt, AgentIntegrationReply,
+    AgentIntegrationResponse, AgentIntegrationSnapshot, AgentIntegrationStatus,
+    AgentKeyDeclaration, AgentLaunchDeclaration, AgentReplyDeclaration, AgentResumeDeclaration,
+    AgentYoloDeclaration, IntegrationApprovalChoice,
 };
 
+use crate::agents::{
+    AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
+    ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
+    SessionSupport, YoloMode,
+};
 use crate::{hooks::dir_guard, session::Instance};
 
 const MAX_REPORT_BYTES: usize = 64 * 1024;
@@ -76,7 +86,7 @@ fn unique_candidates<'a, 'b, 'c>(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     for (plugin, tool, _) in &candidates {
-        if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+        if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
             // Warn once per (plugin, tool) per process: catalog runs on every
             // agents listing, detection, launch-command resolution and session
             // validation, so repeating it would flood the log.
@@ -153,6 +163,36 @@ pub fn display_command(command: &str) -> String {
         }
     }
     out
+}
+
+/// Resolve a command to a plugin-declared tool without consulting built-ins.
+pub(crate) fn resolve_declared_tool(cmd: &str) -> Option<&'static str> {
+    let cmd_lower = cmd.to_lowercase();
+    if cmd_lower.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for plugin in super::registry().active() {
+        for entry in &plugin.manifest.agent_integrations {
+            let Some(agent) = declared_agent(&entry.tool) else {
+                continue;
+            };
+            for token in std::iter::once(agent.name)
+                .chain(std::iter::once(agent.binary))
+                .chain(agent.aliases.iter().copied())
+            {
+                let token_lower = token.to_lowercase();
+                let matches = cmd_lower
+                    .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.')));
+                if matches.into_iter().any(|part| part == token_lower)
+                    && best.is_none_or(|(len, _)| token_lower.len() > len)
+                {
+                    best = Some((token_lower.len(), agent.name));
+                }
+            }
+        }
+    }
+    best.map(|(_, name)| name)
 }
 
 /// Resolve a unique plugin-provided agent launch command.
@@ -236,6 +276,8 @@ pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::
         AgentIntegrationStatus::Error => crate::session::Status::Error,
     }
 }
+/// An approved integration owns status for its tool, so a missing, stale, or
+/// invalid report is Unknown rather than permission to parse the pane instead.
 pub(crate) fn session_status_override(
     configured: bool,
     pane_dead: bool,
@@ -246,8 +288,380 @@ pub(crate) fn session_status_override(
     } else if pane_dead {
         Some(crate::session::Status::Error)
     } else {
-        status.map(session_status)
+        Some(status.map_or(crate::session::Status::Unknown, session_status))
     }
+}
+
+#[derive(Clone)]
+struct DeclaredAgent {
+    tool: String,
+    command: Option<String>,
+    launch: Option<AgentLaunchDeclaration>,
+    detection: Option<AgentDetectionDeclaration>,
+    reply_fallback: Option<AgentReplyDeclaration>,
+    status: bool,
+}
+
+fn declared_for(tool: &str) -> Option<DeclaredAgent> {
+    let registry = super::registry();
+    let mut candidates = registry.active().flat_map(|plugin| {
+        plugin
+            .manifest
+            .agent_integrations
+            .iter()
+            .filter(move |entry| entry.tool == tool)
+            .map(move |entry| (plugin, entry))
+    });
+    let (plugin, entry) = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(DeclaredAgent {
+        tool: entry.tool.clone(),
+        command: entry.command.clone(),
+        launch: entry.launch.clone(),
+        detection: entry.detection.clone(),
+        reply_fallback: entry.reply_fallback.clone(),
+        status: plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "session.integration"),
+    })
+}
+
+static DECLARED_AGENT_CACHE: LazyLock<Mutex<HashMap<String, Option<&'static AgentDef>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn clear_declared_agent_cache() {
+    DECLARED_AGENT_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
+/// A plugin-declared tool resolved into the host's agent catalog. Built-in
+/// entries win in [`crate::agents::get_agent`], so a declaration only takes
+/// effect once the matching core entry is deleted.
+pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
+    if let Some(cached) = DECLARED_AGENT_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(tool)
+        .copied()
+    {
+        return cached;
+    }
+    let resolved = declared_for(tool).and_then(|declared| {
+        let declares_agent = declared.launch.is_some()
+            || declared.detection.is_some()
+            || declared.reply_fallback.is_some();
+        declares_agent.then(|| build_declared_agent(declared))
+    });
+    DECLARED_AGENT_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(tool.to_string(), resolved);
+    resolved
+}
+
+/// Whether an approved provider integration owns status for `tool`.
+pub(crate) fn status_owned(tool: &str) -> bool {
+    let registry = super::registry();
+    let owned = registry.active().any(|plugin| {
+        plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "session.integration")
+            && plugin
+                .manifest
+                .agent_integrations
+                .iter()
+                .any(|entry| entry.tool == tool)
+    });
+    owned
+}
+
+pub(crate) fn launch_executable(command: &str) -> Option<String> {
+    let (words, _) = launch_prefix(command)?;
+    words.last().map(|word| (*word).to_string())
+}
+
+fn leaked(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn leak_slice<T>(values: Vec<T>) -> &'static [T] {
+    Box::leak(values.into_boxed_slice())
+}
+
+fn native_only_status(_: &str) -> crate::session::Status {
+    crate::session::Status::Unknown
+}
+
+fn idle_status(_: &str) -> crate::session::Status {
+    crate::session::Status::Idle
+}
+
+fn capture_backend(backend: DeclaredCaptureBackend) -> SessionCaptureBackend {
+    match backend {
+        DeclaredCaptureBackend::Claude => SessionCaptureBackend::Claude,
+        DeclaredCaptureBackend::OpenCode => SessionCaptureBackend::OpenCode,
+        DeclaredCaptureBackend::Codex => SessionCaptureBackend::Codex,
+        DeclaredCaptureBackend::Gemini => SessionCaptureBackend::Gemini,
+        DeclaredCaptureBackend::Hermes => SessionCaptureBackend::Hermes,
+        DeclaredCaptureBackend::Kimi => SessionCaptureBackend::Kimi,
+        DeclaredCaptureBackend::Pi => SessionCaptureBackend::Pi,
+        DeclaredCaptureBackend::PrimeAgent => SessionCaptureBackend::PrimeAgent,
+        DeclaredCaptureBackend::Omp => SessionCaptureBackend::Omp,
+    }
+}
+
+fn capture_context(context: DeclaredCaptureContext) -> SessionCaptureContext {
+    match context {
+        DeclaredCaptureContext::PaneScoped => SessionCaptureContext::PaneScoped,
+        DeclaredCaptureContext::Preassigned => SessionCaptureContext::Preassigned,
+        DeclaredCaptureContext::ManagedExclusiveStore => {
+            SessionCaptureContext::ManagedExclusiveStore
+        }
+        DeclaredCaptureContext::Unsupported => SessionCaptureContext::Unsupported,
+    }
+}
+
+fn resume_strategy(resume: &AgentResumeDeclaration) -> ResumeStrategy {
+    match resume {
+        AgentResumeDeclaration::Flag { flag } => ResumeStrategy::Flag(leaked(flag.clone())),
+        AgentResumeDeclaration::FlagPair {
+            existing,
+            new_session,
+        } => ResumeStrategy::FlagPair {
+            existing: leaked(existing.clone()),
+            new_session: leaked(new_session.clone()),
+        },
+        AgentResumeDeclaration::Subcommand { command } => {
+            ResumeStrategy::Subcommand(leaked(command.clone()))
+        }
+    }
+}
+
+fn key_token(key: &AgentKeyDeclaration) -> KeyToken<'static> {
+    match key {
+        AgentKeyDeclaration::Literal { value } => KeyToken::Literal(leaked(value.clone())),
+        AgentKeyDeclaration::Named { value } => KeyToken::Named(leaked(value.clone())),
+    }
+}
+
+fn build_declared_agent(declared: DeclaredAgent) -> &'static AgentDef {
+    let tool = leaked(declared.tool.clone());
+    let binary = leaked(
+        declared
+            .command
+            .as_deref()
+            .and_then(launch_executable)
+            .unwrap_or_else(|| declared.tool.clone()),
+    );
+    let launch = declared.launch.unwrap_or_default();
+    let aliases = leak_slice(
+        launch
+            .aliases
+            .iter()
+            .map(|alias| leaked(alias.clone()))
+            .collect(),
+    );
+    let container_env = leak_slice(
+        launch
+            .container_env
+            .iter()
+            .map(|(key, value)| (leaked(key.clone()), leaked(value.clone())))
+            .collect(),
+    );
+    let session_support = match (&launch.resume, &launch.capture) {
+        (Some(resume), Some(capture)) => Some(SessionSupport {
+            resume: resume_strategy(resume),
+            capture: Some(SessionCaptureSpec {
+                backend: capture_backend(capture.backend),
+                host: capture_context(capture.host),
+                sandbox: capture_context(capture.sandbox),
+            }),
+        }),
+        (Some(resume), None) => Some(SessionSupport {
+            resume: resume_strategy(resume),
+            capture: None,
+        }),
+        _ => None,
+    };
+    let permission_response = declared
+        .reply_fallback
+        .as_ref()
+        .map(|reply| PermissionResponse {
+            allow: leak_slice(reply.allow.iter().map(key_token).collect()),
+            allow_always: reply
+                .allow_always
+                .as_ref()
+                .map(|keys| leak_slice(keys.iter().map(key_token).collect())),
+            deny: leak_slice(reply.deny.iter().map(key_token).collect()),
+        });
+    let yolo = launch.yolo.as_ref().map(|yolo| match yolo {
+        AgentYoloDeclaration::Flag { flag } => YoloMode::CliFlag(leaked(flag.clone())),
+        AgentYoloDeclaration::Always => YoloMode::AlwaysYolo,
+        AgentYoloDeclaration::Env { key, value } => {
+            YoloMode::EnvVar(leaked(key.clone()), leaked(value.clone()))
+        }
+    });
+    let detect_status = if declared.status || declared.detection.is_some() {
+        native_only_status
+    } else {
+        idle_status
+    };
+    Box::leak(Box::new(AgentDef {
+        name: tool,
+        binary,
+        launch_subcommand: None,
+        aliases,
+        detection: DetectionMethod::Which(binary),
+        yolo,
+        spans_agent_generations: false,
+        instruction_flag: launch
+            .instruction_flag
+            .as_deref()
+            .map(|value| leaked(value.to_string())),
+        oneshot_flag: launch
+            .oneshot_flag
+            .as_deref()
+            .map(|value| leaked(value.to_string())),
+        model_flag: launch
+            .model_flag
+            .as_deref()
+            .map(|value| leaked(value.to_string())),
+        set_default_command: false,
+        detect_status,
+        container_env,
+        hook_config: None,
+        sidecar_hooks: None,
+        session_support,
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: launch.host_only,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint: leaked(
+            launch
+                .install_hint
+                .clone()
+                .unwrap_or_else(|| format!("install {tool}")),
+        ),
+        permission_response,
+        lifecycle: AgentLifecycle::Active,
+    }))
+}
+
+fn key_label(key: &AgentKeyDeclaration) -> String {
+    match key {
+        AgentKeyDeclaration::Literal { value } => format!("literal {value:?}"),
+        AgentKeyDeclaration::Named { value } => format!("key {value}"),
+    }
+}
+
+/// One disclosure entry per declaration so install and update previews name
+/// every behavior a plugin adds.
+pub fn declaration_summary(integration: &AgentIntegrationContribution) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{}: {}",
+        integration.tool,
+        integration
+            .command
+            .as_deref()
+            .map(display_command)
+            .unwrap_or_else(|| "No launch command declared".to_string())
+    )];
+    if let Some(launch) = &integration.launch {
+        let mut flags = Vec::new();
+        if let Some(flag) = &launch.oneshot_flag {
+            flags.push(format!("oneshot {flag}"));
+        }
+        if let Some(flag) = &launch.instruction_flag {
+            flags.push(format!("instruction {flag}"));
+        }
+        if let Some(flag) = &launch.model_flag {
+            flags.push(format!("model {flag}"));
+        }
+        if let Some(yolo) = &launch.yolo {
+            flags.push(match yolo {
+                AgentYoloDeclaration::Flag { flag } => format!("yolo {flag}"),
+                AgentYoloDeclaration::Always => "yolo always".to_string(),
+                AgentYoloDeclaration::Env { key, value } => format!("yolo {key}={value}"),
+            });
+        }
+        if !flags.is_empty() {
+            lines.push(format!("  launch flags: {}", flags.join("; ")));
+        }
+        if !launch.container_env.is_empty() {
+            let env = launch
+                .container_env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  sandbox environment: {env}"));
+        }
+        if !launch.aliases.is_empty() {
+            lines.push(format!("  aliases: {}", launch.aliases.join(", ")));
+        }
+        if let Some(resume) = &launch.resume {
+            let resume = match resume {
+                AgentResumeDeclaration::Flag { flag } => format!("flag {flag}"),
+                AgentResumeDeclaration::FlagPair {
+                    existing,
+                    new_session,
+                } => format!("flags {existing} / {new_session}"),
+                AgentResumeDeclaration::Subcommand { command } => {
+                    format!("subcommand {command}")
+                }
+            };
+            let capture = launch.capture.as_ref().map_or_else(
+                || "none".to_string(),
+                |capture| {
+                    format!(
+                        "{:?} (host {:?}, sandbox {:?})",
+                        capture.backend, capture.host, capture.sandbox
+                    )
+                },
+            );
+            lines.push(format!("  resume: {resume}; capture: {capture}"));
+        }
+        if launch.host_only {
+            lines.push("  host only: yes".to_string());
+        }
+        if let Some(hint) = &launch.install_hint {
+            lines.push(format!("  install: {hint}"));
+        }
+    }
+    if integration.detection.is_some() {
+        lines.push("  detection: native_only".to_string());
+    }
+    if let Some(replies) = &integration.reply_fallback {
+        let allow = replies
+            .allow
+            .iter()
+            .map(key_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let deny = replies
+            .deny
+            .iter()
+            .map(key_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let always = replies
+            .allow_always
+            .as_ref()
+            .map(|keys| keys.iter().map(key_label).collect::<Vec<_>>().join(", "));
+        lines.push(format!(
+            "  reply fallback: allow [{allow}], deny [{deny}]{};",
+            always.map_or_else(String::new, |keys| format!(", allow always [{keys}]"))
+        ));
+    }
+    lines
 }
 
 fn check_file(meta: &std::fs::Metadata) -> Result<()> {
@@ -674,6 +1088,237 @@ replies = true
         .unwrap();
     }
 
+    fn install_declared_integration(
+        plugin_id: &str,
+        tool: &str,
+        status: bool,
+        replies: bool,
+        extra: &str,
+    ) {
+        use crate::session::{CapabilityGrant, PluginConfig};
+
+        let capability = if status {
+            "capabilities = [\"session.integration\"]\n"
+        } else {
+            ""
+        };
+        let versions = if status {
+            "provider_versions = [\"^1\"]\n"
+        } else {
+            ""
+        };
+        let manifest = format!(
+            r#"
+id = "{plugin_id}"
+name = "Declared agent test"
+version = "1.0.0"
+api_version = 20
+{capability}
+[[agent_integrations]]
+tool = "{tool}"
+{versions}command = "{tool} --serve"
+replies = {replies}
+{extra}
+"#
+        );
+        let dir = super::super::plugins_dir().unwrap().join(plugin_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        let capabilities = if status {
+            vec!["session.integration".to_string()]
+        } else {
+            Vec::new()
+        };
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                plugin_id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities,
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_launch_env_capture_and_detection_reach_the_host_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration(
+            "acme.declared",
+            "acme-helper",
+            true,
+            false,
+            r#"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+model_flag = "--model"
+instruction_flag = "--append-system-prompt {}"
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+[agent_integrations.detection]
+mode = "native_only"
+"#,
+        );
+
+        let agent = crate::agents::get_agent("acme-helper").expect("plugin agent resolves");
+        assert!(status_owned("acme-helper"));
+        assert_eq!(
+            agent.container_env,
+            &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]
+        );
+        assert_eq!(agent.oneshot_flag, Some("-p"));
+        assert_eq!(agent.oneshot_model_flag(), Some("--model"));
+        assert_eq!(
+            agent
+                .session_support
+                .and_then(|support| support.capture)
+                .map(|capture| capture.backend),
+            Some(crate::agents::SessionCaptureBackend::Omp)
+        );
+        assert_eq!(
+            crate::tmux::detect_status_from_content_in("", "esc to interrupt", "acme-helper"),
+            crate::session::Status::Unknown
+        );
+
+        let resolved = crate::session::config::container_config::resolve_active_agent(
+            "acme-helper",
+            Some("acme-helper --serve"),
+            &crate::session::config::SessionConfig::default(),
+        )
+        .expect("the sandbox launcher resolves the declared env");
+        assert_eq!(resolved.container_env, agent.container_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn built_in_agent_definitions_win_over_plugin_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration(
+            "acme.shadow",
+            "claude",
+            true,
+            false,
+            r#"
+[agent_integrations.launch.container_env]
+SHADOW_ONLY = "1"
+"#,
+        );
+
+        let claude = crate::agents::get_agent("claude").expect("built-in resolves");
+        assert_eq!(
+            claude.container_env,
+            &[("CLAUDE_CONFIG_DIR", "/root/.claude")]
+        );
+        assert!(!claude
+            .container_env
+            .iter()
+            .any(|(key, _)| *key == "SHADOW_ONLY"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reply_fallback_resolves_when_the_integration_does_not_own_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration(
+            "acme.reply",
+            "acme-reply",
+            false,
+            false,
+            r#"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+allow_always = [{ kind = "named", value = "Down" }, { kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+"#,
+        );
+
+        let agent = crate::agents::get_agent("acme-reply").expect("fallback agent resolves");
+        let response = agent.permission_response.expect("fallback keys resolve");
+        assert_eq!(response.allow, &[KeyToken::Named("Enter")]);
+        assert_eq!(
+            response.allow_always,
+            Some(&[KeyToken::Named("Down"), KeyToken::Named("Enter")][..])
+        );
+        assert_eq!(response.deny, &[KeyToken::Literal("n")]);
+    }
+
+    #[test]
+    fn declaration_summary_names_every_launch_declaration() {
+        let integration = AgentIntegrationContribution {
+            tool: "acme-helper".into(),
+            command: Some("acme-helper --serve".into()),
+            launch: Some(AgentLaunchDeclaration {
+                container_env: [(
+                    "PI_CODING_AGENT_DIR".to_string(),
+                    "/root/.omp/agent".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                oneshot_flag: Some("-p".into()),
+                ..Default::default()
+            }),
+            detection: Some(AgentDetectionDeclaration {
+                mode: aoe_plugin_api::agent_integration::AgentDetectionMode::NativeOnly,
+            }),
+            reply_fallback: Some(AgentReplyDeclaration {
+                allow: vec![AgentKeyDeclaration::Named {
+                    value: "Enter".into(),
+                }],
+                allow_always: None,
+                deny: vec![AgentKeyDeclaration::Literal { value: "n".into() }],
+            }),
+            ..Default::default()
+        };
+        let summary = declaration_summary(&integration);
+        assert!(summary.iter().any(|line| line.contains("acme-helper:")));
+        assert!(summary.iter().any(|line| line.contains("-p")));
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("PI_CODING_AGENT_DIR=/root/.omp/agent")),
+            "{summary:?}"
+        );
+        assert!(summary.iter().any(|line| line.contains("native_only")));
+        assert!(summary.iter().any(|line| line.contains("reply fallback")));
+    }
+
     #[test]
     #[serial_test::serial]
     fn provider_rejects_duplicate_active_claims() {
@@ -908,7 +1553,7 @@ replies = true
     }
 
     #[test]
-    fn provider_status_maps_to_terminal_status_and_uses_native_fallback_without_report() {
+    fn provider_status_maps_to_terminal_status_and_fails_closed_without_report() {
         for (provider, expected) in [
             (
                 AgentIntegrationStatus::Running,
@@ -928,7 +1573,11 @@ replies = true
             );
         }
         assert_eq!(session_status_override(false, false, None), None);
-        assert_eq!(session_status_override(true, false, None), None);
+        assert_eq!(
+            session_status_override(true, false, None),
+            Some(crate::session::Status::Unknown),
+            "an approved integration must not fall back to pane detection"
+        );
         assert_eq!(
             session_status_override(true, true, Some(AgentIntegrationStatus::Running)),
             Some(crate::session::Status::Error)
@@ -1014,7 +1663,10 @@ replies = true
             .unwrap_err()
             .to_string()
             .contains("expired"));
-        assert_eq!(session_status_override(true, false, None), None);
+        assert_eq!(
+            session_status_override(true, false, None),
+            Some(crate::session::Status::Unknown)
+        );
         assert!(!base
             .join("host-test")
             .join(format!("integration-{}.reply.json", plugin.id()))

@@ -150,6 +150,11 @@ impl HomeView {
         if inst.is_structured() {
             return;
         }
+        // An approved reply integration owns replies even when its report is
+        // missing; never fall back to terminal keys.
+        if crate::plugin::agent_integration::replies_configured(inst) {
+            return;
+        }
         let Some(response) =
             crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
         else {

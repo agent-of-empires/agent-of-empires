@@ -1398,18 +1398,12 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::declaration_summary(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         if !consent.ui.is_empty() {
@@ -1519,18 +1513,12 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::declaration_summary(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -1610,18 +1598,12 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::declaration_summary(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -2285,6 +2267,7 @@ mod mouse_tests {
                         provider_versions: Vec::new(),
                         command: Some("TOKEN=local session-helper --flag".into()),
                         replies: false,
+                        ..Default::default()
                     },
                 ],
                 fingerprint: "fingerprint".into(),
@@ -2310,6 +2293,7 @@ mod mouse_tests {
                     provider_versions: Vec::new(),
                     command: Some("x\u{1b}[2Jtail".into()),
                     replies: false,
+                    ..Default::default()
                 },
             ],
             manifest_hash: "sha256:hash".into(),

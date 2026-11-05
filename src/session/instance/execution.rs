@@ -1736,8 +1736,13 @@ impl Instance {
         }
         let words =
             shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
-        let program = words.first().context("empty agent command")?;
-        let direct = AGENTS.iter().find(|agent| agent.binary == program);
+        let program = crate::plugin::agent_integration::launch_executable(command)
+            .or_else(|| words.first().cloned())
+            .context("empty agent command")?;
+        let direct = AGENTS
+            .iter()
+            .find(|agent| agent.binary == program)
+            .or_else(|| crate::agents::get_agent(tool).filter(|agent| agent.binary == program));
         let declared = config
             .agent_execution_as
             .get(tool)
@@ -1756,7 +1761,7 @@ impl Instance {
             "agent command contradicts the selected native execution identity"
         );
         if direct.is_none() {
-            let basename = std::path::Path::new(program)
+            let basename = std::path::Path::new(&program)
                 .file_name()
                 .and_then(|name| name.to_str());
             anyhow::ensure!(
@@ -4139,7 +4144,7 @@ mod tests {
 
     #[test]
     fn managed_verbose_flag_is_allowed_without_namespace_effect() {
-        for name in ["claude", "codex", "opencode", "omp", "prime-agent", "kimi"] {
+        for name in ["claude", "codex", "opencode", "prime-agent", "kimi"] {
             let agent = crate::agents::get_agent(name).unwrap();
             assert!(
                 validate_managed_arguments(agent, &[String::from("--verbose")]).is_ok(),

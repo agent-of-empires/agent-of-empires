@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_slow_probe_still_arms_a_window_that_has_not_expired() {
-        let _isolated = crate::session::test_support::isolate_app_dir();
+        let _omp = crate::session::instance::test_helpers::install_omp_test_plugin();
         let mut inst = Instance::new("slow-probe", "/tmp/slow-probe");
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("gen-1".to_string());
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn repair_reprobes_a_session_with_nothing_to_poll() {
-        let _isolated = crate::session::test_support::isolate_app_dir();
+        let _omp = crate::session::instance::test_helpers::install_omp_test_plugin();
         let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("gen-1".to_string());

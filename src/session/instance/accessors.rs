@@ -416,10 +416,12 @@ impl Instance {
         // Pane-scoped publishers confine Default/Cleared wrapper capture to this pane.
         let self_attributing = capture.reads_hook_sidecar(context)
             || capture.backend == crate::agents::SessionCaptureBackend::Pi;
+        let alias_matches = self.effective_detect_as().as_ref() == agent.name;
         let authorized = if self_attributing {
             native.is_none() || self.launch_can_carry_resume_selector(agent)
         } else {
-            native.is_some() && self.launch_invokes_resolved_agent_directly(agent)
+            (native.is_some() || alias_matches)
+                && self.launch_invokes_resolved_agent_directly(agent)
         };
         authorized.then_some((capture, context))
     }

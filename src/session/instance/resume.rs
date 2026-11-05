@@ -994,7 +994,7 @@ mod tests {
             return;
         }
         let temp = tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _omp_plugin = crate::session::instance::test_helpers::install_omp_test_plugin();
         let _env = isolate_resume_environment(temp.path());
         let _omp = crate::session::test_support::install_login_shell_path_command(
             temp.path(),

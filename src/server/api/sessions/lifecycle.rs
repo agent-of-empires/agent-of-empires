@@ -3106,7 +3106,7 @@ mod durable_stop_tests {
             return;
         }
         let root = tempfile::tempdir_in("/tmp").unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _omp_plugin = crate::session::install_omp_test_plugin();
         let _env = crate::session::test_support::EnvGuard::unset(&[
             "TMUX",
             "TMUX_PANE",

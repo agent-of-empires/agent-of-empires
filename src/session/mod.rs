@@ -80,7 +80,7 @@ pub use groups::{
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resolved_agent_for;
 #[cfg(test)]
-pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+pub(crate) use instance::test_helpers::{install_omp_test_plugin, publish_host_pi_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{

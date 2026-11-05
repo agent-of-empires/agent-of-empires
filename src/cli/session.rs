@@ -1625,12 +1625,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             };
             let status_content = status_raw.as_deref().unwrap_or(&raw);
             let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
-            let observation = crate::tmux::Observation::new(
-                &osc_title,
-                hook,
-                !policy.observe_ownership
-                    || inst.live_pane_owned(&tmux_session, None, tmux_session.is_pane_dead()),
-            );
+            let observation = crate::tmux::Observation::new(&osc_title, hook);
             plan.detect(
                 &crate::tmux::utils::strip_ansi(status_content),
                 &observation,

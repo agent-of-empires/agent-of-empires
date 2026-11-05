@@ -1,9 +1,11 @@
 //! Provider-native agent session communication, independent of a specific agent.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Agent communication protocol declared by a plugin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationContribution {
     pub tool: String,
@@ -15,6 +17,127 @@ pub struct AgentIntegrationContribution {
     /// Enable provider-native prompt replies; status-only adapters leave this disabled.
     #[serde(default)]
     pub replies: bool,
+    /// Launch flags, sandbox environment, resume, and capture for the tool (API v20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<AgentLaunchDeclaration>,
+    /// Native-only status ownership for an approved integration (API v20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<AgentDetectionDeclaration>,
+    /// Terminal approval keys for a launch that has no provider-native replies (API v20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_fallback: Option<AgentReplyDeclaration>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunchDeclaration {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// One argv token placed before a oneshot prompt; never contains a `{}` placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oneshot_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo: Option<AgentYoloDeclaration>,
+    /// One argv token containing exactly one `{}` placeholder for the instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_flag: Option<String>,
+    /// Literal environment entries merged into a sandbox launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub container_env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default)]
+    pub host_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<AgentResumeDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<AgentCaptureDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentYoloDeclaration {
+    Flag { flag: String },
+    Always,
+    Env { key: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentResumeDeclaration {
+    Flag {
+        flag: String,
+    },
+    FlagPair {
+        existing: String,
+        new_session: String,
+    },
+    Subcommand {
+        command: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCaptureBackend {
+    Claude,
+    OpenCode,
+    Codex,
+    Gemini,
+    Hermes,
+    Kimi,
+    Pi,
+    PrimeAgent,
+    Omp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCaptureContext {
+    PaneScoped,
+    Preassigned,
+    ManagedExclusiveStore,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCaptureDeclaration {
+    pub backend: AgentCaptureBackend,
+    pub host: AgentCaptureContext,
+    pub sandbox: AgentCaptureContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDetectionDeclaration {
+    pub mode: AgentDetectionMode,
+}
+
+/// Pane detection rules stay in core; a plugin can only declare that an approved
+/// provider integration owns status and therefore suppresses pane parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDetectionMode {
+    NativeOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReplyDeclaration {
+    pub allow: Vec<AgentKeyDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_always: Option<Vec<AgentKeyDeclaration>>,
+    pub deny: Vec<AgentKeyDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentKeyDeclaration {
+    Literal { value: String },
+    Named { value: String },
 }
 
 impl AgentIntegrationContribution {

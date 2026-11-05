@@ -391,6 +391,8 @@ pub struct AgentDef {
     pub instruction_flag: Option<&'static str>,
     /// One argv token placed before the prompt; never contains a `{}` placeholder.
     pub oneshot_flag: Option<&'static str>,
+    /// Model-selection argv token; `None` falls back to the built-in name table.
+    pub model_flag: Option<&'static str>,
     pub set_default_command: bool,
     pub detect_status: fn(&str) -> Status,
     pub container_env: &'static [(&'static str, &'static str)],
@@ -607,6 +609,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
         spans_agent_generations: false,
         instruction_flag: None,
         oneshot_flag: None,
+        model_flag: None,
         set_default_command: false,
         detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
@@ -960,25 +963,6 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         oneshot_flag: Some("-p"),
-        yolo: Some(YoloMode::CliFlag("--auto-approve")),
-        instruction_flag: Some("--append-system-prompt {}"),
-        detect_status: status_detection::detect_omp_status,
-        container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
-        session_support: session_support(
-            ResumeStrategy::Flag("--resume"),
-            SessionCaptureBackend::Omp,
-            SessionCaptureContext::PaneScoped,
-            SessionCaptureContext::PaneScoped,
-        ),
-        permission_response: Some(PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
-            allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
-        }),
-        ..agent("omp", "omp", "curl -fsSL https://omp.sh/install | sh")
-    },
-    AgentDef {
-        oneshot_flag: Some("-p"),
         detect_status: status_detection::detect_native_only_status,
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
@@ -1047,11 +1031,11 @@ impl AgentDef {
     }
 
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
-        match self.name {
-            "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
+        self.model_flag.or(match self.name {
+            "claude" | "copilot" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
-        }
+        })
     }
 
     /// Stable, non-dated aliases only: AoE pins no CLI version.
@@ -1523,7 +1507,10 @@ const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
-    AGENTS.iter().find(|a| a.name == name)
+    AGENTS
+        .iter()
+        .find(|a| a.name == name)
+        .or_else(|| crate::plugin::agent_integration::declared_agent(name))
 }
 
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
@@ -1738,7 +1725,7 @@ pub fn agent_names() -> Vec<&'static str> {
 }
 
 /// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
-pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
+pub(crate) fn resolve_builtin_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
         return Some("claude");
@@ -1752,6 +1739,12 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
         }
     }
     best.map(|(_, name)| name)
+}
+
+/// Resolve a command to a built-in or plugin-declared tool. Built-ins win.
+pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
+    resolve_builtin_tool_name(cmd)
+        .or_else(|| crate::plugin::agent_integration::resolve_declared_tool(cmd))
 }
 
 pub fn install_hint(name: &str) -> Option<&'static str> {
@@ -1907,8 +1900,7 @@ mod tests {
             if agent.oneshot_flag_binds_prompt() {
                 assert!(agent.oneshot_extra_args().is_empty(), "{name}");
             }
-            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "omp" | "prime-agent")
-            {
+            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "prime-agent") {
                 assert!(agent.oneshot_flag_binds_prompt(), "{name}");
             }
             assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");
@@ -2540,6 +2532,15 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         // Identity hooks are mandatory for a resume-capable agent, so turning
         // status hooks off must not stop the install.
         assert!(hook_install_required(codex, false));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_declared_tool_is_resolved_from_command() {
+        let _omp = crate::session::install_omp_test_plugin();
+        assert_eq!(resolve_tool_name("omp --model x"), Some("omp"));
+        assert_eq!(resolve_tool_name("/opt/bin/omp"), Some("omp"));
+        assert_eq!(resolve_tool_name("my-omp --cwd /tmp"), None);
     }
 
     #[test]
