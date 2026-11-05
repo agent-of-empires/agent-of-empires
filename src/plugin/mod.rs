@@ -89,7 +89,12 @@ fn node_env_for(node: &std::path::Path) -> NodeEnv {
 /// Download the pinned Node when nothing resolves, so a build step that needs
 /// it can run on a machine without a system Node.
 pub(crate) async fn ensure_node() {
-    if resolve_node().is_some() {
+    if tokio::task::spawn_blocking(resolve_node)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
         return;
     }
     let Ok(app_dir) = crate::session::get_app_dir() else {
