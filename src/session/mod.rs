@@ -117,6 +117,7 @@ pub(crate) use move_journal::{
 pub(crate) use storage::acquire_session_identity_lock;
 #[cfg(test)]
 pub(crate) use storage::observe_lock_contention_for_test;
+pub(crate) use storage::SessionsFileCache;
 pub(crate) use storage::{
     duplicate_reports, reconcile_profile_duplicates, DuplicateIdReport, ProfileMovePlan,
 };
