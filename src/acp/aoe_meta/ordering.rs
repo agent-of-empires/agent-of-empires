@@ -43,6 +43,21 @@ impl<T> Default for ArrivalOrder<T> {
 }
 
 impl<T> ArrivalOrder<T> {
+    /// A new native session starts a fresh key space, and frames held for the
+    /// old one must not reach it. The adapter frame count is unchanged: the
+    /// adapter process is the same.
+    pub fn session_reset(&mut self) {
+        self.seen.clear();
+        self.seen_order.clear();
+        self.held.clear();
+        self.held_len = 0;
+    }
+
+    /// Whether another anchored frame would overflow the hold buffer.
+    pub fn held_full(&self) -> bool {
+        self.held_len >= MAX_HELD
+    }
+
     /// The frames to deliver now, in order: a duplicate yields none, a frame
     /// whose anchor has not arrived is held, and an adapter frame is followed
     /// by every held frame its number releases.
@@ -151,6 +166,24 @@ mod tests {
         // Frame 2 is the next adapter frame, despite two tailer frames.
         assert!(o.arrive(after("t3", 2), "t3").unwrap().is_empty());
         assert_eq!(o.arrive(plain(), "f2").unwrap(), ["f2", "t3"]);
+    }
+
+    #[test]
+    fn session_reset_drops_held_frames_and_keys_but_not_the_frame_count() {
+        let mut o = ArrivalOrder::default();
+        o.arrive(keyed("k"), "f1").unwrap();
+        o.arrive(plain(), "f2").unwrap();
+        assert!(o.arrive(after("t", 5), "t").unwrap().is_empty());
+        o.session_reset();
+        assert_eq!(
+            o.arrive(keyed("k"), "again").unwrap(),
+            ["again"],
+            "keys forgotten"
+        );
+        // Frames 3 and 4 never release the old held frame; the count carried on.
+        assert_eq!(o.arrive(plain(), "f4").unwrap(), ["f4"]);
+        assert_eq!(o.arrive(after("n", 3), "n").unwrap(), ["n"], "count kept");
+        assert!(!o.held_full());
     }
 
     #[test]

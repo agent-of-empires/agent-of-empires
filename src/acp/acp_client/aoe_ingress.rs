@@ -13,12 +13,20 @@ use std::sync::{Arc, Mutex};
 struct Frame {
     notification: SessionNotification,
     local_prompt_signals: bool,
+    /// The prompt epoch when the frame arrived, not when it is released.
+    epoch: u64,
     envelope: Option<Envelope>,
+}
+
+pub(super) struct Delivered {
+    pub(super) notification: SessionNotification,
+    pub(super) local_prompt_signals: bool,
+    pub(super) epoch: u64,
 }
 
 pub(super) enum Ingested {
     /// Frames to process now, in order.
-    Deliver(Vec<(SessionNotification, bool)>),
+    Deliver(Vec<Delivered>),
     /// A proxied agent broke the contract: stop interpreting its frames.
     Lost(IntegrationLostReason),
 }
@@ -42,10 +50,20 @@ impl AoeIngress {
         *self.order.lock().expect("aoe ordering mutex poisoned") = ArrivalOrder::default();
     }
 
+    /// A reset commit starts a new native session: its keys are fresh and
+    /// frames held for the old one are dropped.
+    pub(super) fn session_reset(&self) {
+        self.order
+            .lock()
+            .expect("aoe ordering mutex poisoned")
+            .session_reset();
+    }
+
     pub(super) fn ingest(
         &self,
         notification: SessionNotification,
         local_prompt_signals: bool,
+        epoch: u64,
         now_ms: i64,
     ) -> Ingested {
         if self.lost.load(Ordering::Relaxed) {
@@ -69,19 +87,24 @@ impl AoeIngress {
         let frame = Frame {
             notification,
             local_prompt_signals,
+            epoch,
             envelope: envelope.clone(),
         };
-        let released = self
-            .order
-            .lock()
-            .expect("aoe ordering mutex poisoned")
-            .arrive(arrival, frame);
-        let released = match released {
-            Ok(released) => released,
-            Err(_) if proxied => return self.lose(IntegrationLostReason::HoldOverflow),
-            // The frame moved into the gate; an agent that is not proxied
-            // has nothing to anchor to, so it simply is not ordered.
-            Err(_) => Vec::new(),
+        let mut order = self.order.lock().expect("aoe ordering mutex poisoned");
+        // An agent that is not proxied has nothing to anchor to: past the
+        // bound its frame is delivered unordered rather than dropped.
+        if arrival.after_adapter_sequence.is_some() && order.held_full() && !proxied {
+            drop(order);
+            return Ingested::Deliver(vec![Delivered {
+                notification: frame.notification,
+                local_prompt_signals,
+                epoch,
+            }]);
+        }
+        let released = order.arrive(arrival, frame);
+        drop(order);
+        let Ok(released) = released else {
+            return self.lose(IntegrationLostReason::HoldOverflow);
         };
         let mut deliver = Vec::with_capacity(released.len());
         for frame in released {
@@ -98,7 +121,11 @@ impl AoeIngress {
             if frame.envelope.as_ref().and_then(|e| e.ephemeral) == Some(true) {
                 continue;
             }
-            deliver.push((frame.notification, frame.local_prompt_signals));
+            deliver.push(Delivered {
+                notification: frame.notification,
+                local_prompt_signals: frame.local_prompt_signals,
+                epoch: frame.epoch,
+            });
         }
         Ingested::Deliver(deliver)
     }
@@ -129,7 +156,7 @@ mod tests {
         };
         frames
             .into_iter()
-            .map(|(n, _)| match n.update {
+            .map(|d| match d.notification.update {
                 SessionUpdate::ToolCall(tc) => tc.tool_call_id.0.to_string(),
                 _ => unreachable!(),
             })
@@ -146,7 +173,7 @@ mod tests {
     fn an_expired_lease_clears_busy_with_no_further_frames() {
         let i = ingress(true);
         let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
-        assert_eq!(ids(i.ingest(frame("t1", lease), true, 0)), ["t1"]);
+        assert_eq!(ids(i.ingest(frame("t1", lease), true, 0, 0)), ["t1"]);
         assert!(i.leases.working(999));
         assert!(!i.leases.working(1000));
     }
@@ -155,7 +182,7 @@ mod tests {
     fn replayed_frames_do_not_hold_leases() {
         let i = ingress(true);
         let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
-        ids(i.ingest(frame("t1", lease), false, 0));
+        ids(i.ingest(frame("t1", lease), false, 0, 0));
         assert!(!i.leases.working(1));
     }
 
@@ -165,11 +192,11 @@ mod tests {
         // (name, proxied, expected)
         for (name, proxied) in [("proxied", true), ("plain agent", false)] {
             let i = ingress(proxied);
-            let out = i.ingest(broken(), true, 0);
+            let out = i.ingest(broken(), true, 0, 0);
             match (proxied, out) {
                 (true, Ingested::Lost(IntegrationLostReason::ContractViolation { .. })) => {
                     // Once lost, nothing else is interpreted.
-                    assert!(ids(i.ingest(frame("after", json!(null)), true, 0)).is_empty());
+                    assert!(ids(i.ingest(frame("after", json!(null)), true, 0, 0)).is_empty());
                 }
                 (false, Ingested::Deliver(frames)) => assert_eq!(frames.len(), 1, "{name}"),
                 _ => panic!("{name}: unexpected outcome"),
@@ -183,12 +210,50 @@ mod tests {
         let i = ingress(true);
         for n in 0..MAX_HELD {
             let aoe = json!({"v":1,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
-            assert!(ids(i.ingest(frame("h", aoe), true, 0)).is_empty());
+            assert!(ids(i.ingest(frame("h", aoe), true, 0, 0)).is_empty());
         }
         let aoe = json!({"v":1,"key":"over","after_adapter_sequence":u64::MAX});
         assert!(matches!(
-            i.ingest(frame("h", aoe), true, 0),
+            i.ingest(frame("h", aoe), true, 0, 0),
             Ingested::Lost(IntegrationLostReason::HoldOverflow)
         ));
+    }
+
+    #[test]
+    fn a_held_frame_keeps_the_epoch_it_arrived_in() {
+        let i = ingress(true);
+        let held = json!({"v":1,"key":"k","after_adapter_sequence":1});
+        assert!(ids(i.ingest(frame("t", held), true, 7, 0)).is_empty());
+        let Ingested::Deliver(out) = i.ingest(frame("a", json!(null)), true, 9, 0) else {
+            panic!("expected delivery");
+        };
+        assert_eq!(out.iter().map(|d| d.epoch).collect::<Vec<_>>(), [9, 7]);
+    }
+
+    #[test]
+    fn a_plain_agent_past_the_hold_bound_is_delivered_not_dropped() {
+        use crate::acp::aoe_meta::ordering::MAX_HELD;
+        let i = ingress(false);
+        for n in 0..MAX_HELD {
+            let aoe = json!({"v":1,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
+            assert!(ids(i.ingest(frame("h", aoe), true, 0, 0)).is_empty());
+        }
+        let aoe = json!({"v":1,"key":"over","after_adapter_sequence":u64::MAX});
+        assert_eq!(ids(i.ingest(frame("over", aoe), true, 0, 0)), ["over"]);
+    }
+
+    #[test]
+    fn a_session_reset_forgets_keys_and_held_frames() {
+        let i = ingress(true);
+        let held = json!({"v":1,"key":"old","after_adapter_sequence":9});
+        assert!(ids(i.ingest(frame("old", held), true, 0, 0)).is_empty());
+        let keyed = json!({"v":1,"key":"k"});
+        assert_eq!(ids(i.ingest(frame("a", keyed.clone()), true, 0, 0)), ["a"]);
+        i.session_reset();
+        assert_eq!(
+            ids(i.ingest(frame("b", keyed), true, 0, 0)),
+            ["b"],
+            "key reusable"
+        );
     }
 }
