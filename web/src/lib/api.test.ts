@@ -861,7 +861,8 @@ describe("ensureTerminal", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(calls);
     });
 
-    it("counts slow busy responses against the budget", async () => {
+    // The budget bounds when retries start; a request already in flight is not aborted.
+    it("starts no retry once slow busy responses have spent the budget", async () => {
       fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 20_000)));
       const result = api.ensureTerminal("s1");
       await vi.advanceTimersByTimeAsync(60_000);
