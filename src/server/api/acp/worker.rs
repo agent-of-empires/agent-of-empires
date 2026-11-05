@@ -380,9 +380,10 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         return response;
     }
 
+    let stop_reason = state.acp_supervisor.restart_stop_reason(&id);
     let stop_request = state
         .acp_supervisor
-        .begin_stop_request(&id, "user_stopped", None, false)
+        .begin_stop_request(&id, stop_reason, None, false)
         .await;
     let was_resuming = stop_request.cancelled_launch();
     // A running worker must finish its current submission before restart
@@ -406,7 +407,12 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     if was_resuming {
         match state
             .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .shutdown_and_wait_for_restart(
+                &id,
+                stop_reason,
+                std::time::Duration::from_secs(5),
+                &restart,
+            )
             .await
         {
             Ok(prompts) => handoff.prompts.extend(prompts),
@@ -468,7 +474,12 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     if !was_resuming {
         match state
             .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .shutdown_and_wait_for_restart(
+                &id,
+                stop_reason,
+                std::time::Duration::from_secs(5),
+                &restart,
+            )
             .await
         {
             Ok(prompts) => handoff.prompts.extend(prompts),
@@ -599,6 +610,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     drop(exclusion);
+    handoff.hold_new_prompts().await;
     match state
         .acp_supervisor
         .spawn_for_restart(
@@ -629,6 +641,8 @@ struct PromptHandoff {
     supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     id: String,
     prompts: Vec<crate::acp::supervisor::UnassignedPrompt>,
+    /// Keeps newer prompts behind the carried ones until delivery finishes.
+    gate: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl PromptHandoff {
@@ -637,6 +651,13 @@ impl PromptHandoff {
             supervisor: Arc::clone(&state.acp_supervisor),
             id: id.to_string(),
             prompts: Vec::new(),
+            gate: None,
+        }
+    }
+
+    async fn hold_new_prompts(&mut self) {
+        if !self.prompts.is_empty() {
+            self.gate = Some(self.supervisor.hold_prompts_for_handoff(&self.id).await);
         }
     }
 
@@ -2708,8 +2729,25 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Replacement {
             Starts,
+            // Holds its prompts until its session is assigned.
+            Stalls,
             FailsToStart,
+            // Starts, but every command fails.
+            DeadConnection,
         }
+        let image = || crate::acp::event_store::AttachmentBlob {
+            id: "att-1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: None,
+            data: b"png".to_vec(),
+        };
+        let carried = || {
+            vec![
+                ("first".to_string(), vec![]),
+                ("second".to_string(), vec!["image/png:cG5n".to_string()]),
+            ]
+        };
         // (name, assigned before restart, replacement, expected replacement prompts,
         // expected Stopped reasons)
         let cases = [
@@ -2717,7 +2755,14 @@ mod tests {
                 "unassigned prompts are carried over",
                 false,
                 Replacement::Starts,
-                vec!["first", "second"],
+                carried(),
+                vec![],
+            ),
+            (
+                "carried prompts wait for the replacement session",
+                false,
+                Replacement::Stalls,
+                carried(),
                 vec![],
             ),
             (
@@ -2731,6 +2776,13 @@ mod tests {
                 "replacement fails to start",
                 false,
                 Replacement::FailsToStart,
+                vec![],
+                vec!["user_stopped"],
+            ),
+            (
+                "redelivery fails on the first carried prompt",
+                false,
+                Replacement::DeadConnection,
                 vec![],
                 vec!["user_stopped"],
             ),
@@ -2751,11 +2803,17 @@ mod tests {
             let first_events = Arc::new(std::sync::Mutex::new(None));
             let replacement_events = Arc::new(std::sync::Mutex::new(None));
             let replacement_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            if matches!(replacement, Replacement::Stalls) {
+                released.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             let launcher: crate::acp::supervisor::Launcher = {
+                let released = Arc::clone(&released);
                 let first_events = Arc::clone(&first_events);
                 let replacement_prompts = Arc::clone(&replacement_prompts);
                 let replacement_events = Arc::clone(&replacement_events);
                 Arc::new(move |_config, session_id| {
+                    let released = Arc::clone(&released);
                     let launch = launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let first_events = Arc::clone(&first_events);
                     let replacement_prompts = Arc::clone(&replacement_prompts);
@@ -2766,21 +2824,29 @@ mod tests {
                             let (client, events) = AcpClient::fake_for_test_prompt_recording(
                                 session_id,
                                 Arc::default(),
+                                Arc::new(std::sync::atomic::AtomicBool::new(true)),
                             );
                             *first_events.lock().unwrap() = Some(events);
                             return Ok(client);
                         }
                         match replacement {
-                            Replacement::Starts => {
+                            Replacement::Starts | Replacement::Stalls => {
                                 let (client, events) = AcpClient::fake_for_test_prompt_recording(
                                     session_id,
                                     replacement_prompts,
+                                    released,
                                 );
                                 *replacement_events.lock().unwrap() = Some(events);
                                 Ok(client)
                             }
                             Replacement::FailsToStart => {
                                 Err(AcpError::Spawn("replacement refused".into()))
+                            }
+                            Replacement::DeadConnection => {
+                                let (client, events) =
+                                    AcpClient::fake_for_test_dead_commands(session_id);
+                                *replacement_events.lock().unwrap() = Some(events);
+                                Ok(client)
                             }
                         }
                     })
@@ -2804,10 +2870,10 @@ mod tests {
             .await
             .into_response();
             assert!(spawned.status().is_success(), "{name}: initial spawn");
-            for text in ["first", "second"] {
+            for (text, attachments) in [("first", vec![]), ("second", vec![image()])] {
                 state
                     .acp_supervisor
-                    .send_prompt(&id, text, &[])
+                    .send_prompt(&id, text, &attachments)
                     .await
                     .unwrap();
             }
@@ -2848,7 +2914,27 @@ mod tests {
             let expect_ok = !matches!(replacement, Replacement::FailsToStart);
             assert_eq!(response.status().is_success(), expect_ok, "{name}");
 
-            if matches!(replacement, Replacement::Starts) {
+            if matches!(replacement, Replacement::Starts | Replacement::Stalls) {
+                // Commands are FIFO, so the flush acks after every carried prompt arrived.
+                state.acp_supervisor.test_flush_worker_commands(&id).await;
+            }
+            if matches!(replacement, Replacement::Stalls) {
+                assert!(
+                    replacement_prompts.lock().unwrap().is_empty(),
+                    "{name}: prompt ran before the session was assigned"
+                );
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                let events = replacement_events
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("replacement worker");
+                events
+                    .send(crate::acp::state::Event::AcpSessionAssigned {
+                        acp_session_id: "native-2".into(),
+                    })
+                    .await
+                    .unwrap();
                 state.acp_supervisor.test_flush_worker_commands(&id).await;
             }
             assert_eq!(
