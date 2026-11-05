@@ -304,9 +304,19 @@ impl Drop for OmpTestPlugin {
 }
 
 pub(crate) fn install_omp_test_plugin() -> OmpTestPlugin {
+    let app = crate::session::test_support::isolate_app_dir();
+    let reload = install_omp_test_plugin_in_current_app();
+    OmpTestPlugin {
+        app: Some(app),
+        reload: Some(reload),
+    }
+}
+
+/// Install the OMP declaration into the caller's already-isolated app dir, for
+/// tests that own their `AppDirGuard` and must keep pointing at its paths.
+pub(crate) fn install_omp_test_plugin_in_current_app() -> crate::plugin::ReloadRegistryOnDrop {
     use crate::session::{CapabilityGrant, PluginConfig};
 
-    let app = crate::session::test_support::isolate_app_dir();
     let plugin_id = "acme.omp-test";
     let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
     std::fs::create_dir_all(&dir).unwrap();
@@ -328,10 +338,7 @@ pub(crate) fn install_omp_test_plugin() -> OmpTestPlugin {
     })
     .unwrap();
     crate::plugin::reload_registry();
-    OmpTestPlugin {
-        app: Some(app),
-        reload: Some(crate::plugin::ReloadRegistryOnDrop),
-    }
+    crate::plugin::ReloadRegistryOnDrop
 }
 
 pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {

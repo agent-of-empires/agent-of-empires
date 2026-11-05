@@ -5808,6 +5808,7 @@ mod tests {
     fn shared_declared_root_preserves_each_agents_configuration() {
         let temporary = tempfile::tempdir().unwrap();
         let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let _omp = crate::session::install_omp_test_plugin_in_current_app();
         let home = dirs::home_dir().unwrap();
         let app = crate::session::get_app_dir().unwrap();
         let shared = home.join("shared-native-config");
@@ -5919,6 +5920,7 @@ mod tests {
     fn owned_root_adds_an_alias_role_without_overwriting_local_state() {
         let temporary = tempfile::tempdir().unwrap();
         let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let _omp = crate::session::install_omp_test_plugin_in_current_app();
         let home = dirs::home_dir().unwrap();
         let app = crate::session::get_app_dir().unwrap();
         let shared = home.join("shared-native-config");
@@ -6009,6 +6011,7 @@ mod tests {
     fn pending_original_cannot_be_bypassed_by_role_or_tool_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let _omp = crate::session::install_omp_test_plugin_in_current_app();
         let home = dirs::home_dir().unwrap();
         let app = crate::session::get_app_dir().unwrap();
         let mut config = crate::session::Config::default();
