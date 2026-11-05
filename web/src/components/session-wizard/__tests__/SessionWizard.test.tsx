@@ -1199,7 +1199,7 @@ describe("SessionWizard Yolo mode", () => {
   it("locks on for a custom agent with its own adapter only in the view that runs its always-Yolo base", async () => {
     // A structured session runs own-pi's adapter; a terminal one runs the Pi CLI it detects as.
     const ownPi = agent("own-pi", { kind: "custom", always_yolo: true, acp_always_yolo: false });
-    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), ownPi]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("claude"), ownPi]);
     vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
     renderWizard({ path: "/tmp/proj", tool: "own-pi" });
     await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
