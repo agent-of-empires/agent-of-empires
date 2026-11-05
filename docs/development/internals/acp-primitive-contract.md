@@ -26,10 +26,10 @@ A proxy adds `_meta.aoe.proxy = {plugin_id, protocol_version, primitive_schema_v
 {"v": 1, "key": "call-17", "parent_tool_call": "call-3"}
 ```
 
-- `key` is an idempotency key. A repeat within a session is dropped.
-- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per connection. At most 1024 frames may wait.
+- `key` is an idempotency key. A repeat is dropped, among the last 4096 keys of a native session; a reset starts a fresh key space. A proxy must not replay a key older than that window.
+- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per connection and keep counting across a conversation reset. At most 1024 frames may wait; a reset drops them.
 - `lease` is described below.
-- Primitives: `parent_tool_call`, `ephemeral` (drop before the reducer), `memory_recall`, `plan_proposal`, `tool_presentation`, `option_preview`. The first four produce the same events as the matching agent-specific path. `tool_presentation` and `option_preview` are validated and carried; no surface renders them yet.
+- Primitives: `parent_tool_call`, `ephemeral` (drop before the reducer), `memory_recall`, `plan_proposal`, `tool_presentation`, `option_preview`. `parent_tool_call`, `memory_recall` and `plan_proposal` are read on `tool_call` updates only, where they produce the same events as the matching agent-specific path. `tool_presentation` and `option_preview` are validated and carried; no surface renders them yet.
 
 Frames are consumed in arrival order before they are mapped to events (`src/acp/acp_client/aoe_ingress.rs`).
 
@@ -43,4 +43,4 @@ For a proxied agent, a frame that breaks the contract, an overfull hold buffer o
 
 ## Conformance
 
-`aoe acp lint-stream <ndjson|->` checks a recorded agent-to-client stream, one JSON-RPC frame per line, and exits 1 on any finding. `--require-hello` also fails a stream with no hello. Plugins run it in CI. It checks the hello, envelope shape and version, empty keys, keys reused with a different payload, lease ttl and unknown lease ids, and anchors beyond the end of the stream.
+`aoe acp lint-stream <ndjson|->` checks a recorded agent-to-client stream, one JSON-RPC frame per line, and exits 1 on any finding. `--require-hello` also fails a stream with no hello. Plugins run it in CI. It replays the stream through the same ordering as the runtime and checks the hello (on an initialize result only), envelope shape and version, empty keys, keys reused with a different payload, lease ttl and unknown lease ids (applied at each frame's anchor), more than 1024 frames waiting on an anchor, anchors beyond the end of the stream, and the three `tool_call`-only primitives elsewhere. It does not count simultaneous leases: a recorded stream has no clock, so it cannot tell which have expired.
