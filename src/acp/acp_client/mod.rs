@@ -367,8 +367,15 @@ impl AcpClient {
     /// ending and its respawn (#3401).
     #[cfg(test)]
     pub fn fake_for_test_dead_connection(session_id: AcpSessionId) -> Self {
+        Self::fake_for_test_dead_commands(session_id).0
+    }
+
+    /// As `fake_for_test_dead_connection`, keeping the event stream open
+    /// through the returned sender.
+    #[cfg(test)]
+    pub fn fake_for_test_dead_commands(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
         let (cmd_tx, _) = mpsc::channel::<ClientCmd>(16);
-        Self::fake(session_id, Some(cmd_tx)).0
+        Self::fake(session_id, Some(cmd_tx))
     }
 
     /// Flags whether `session/delete` was issued, answering it immediately
@@ -432,6 +439,51 @@ impl AcpClient {
             record.lock().expect("cmd record mutex").push(name);
         });
         (client, event_tx, cmds)
+    }
+
+    /// Logs each prompt as its text plus `mime:data` per image attachment. An
+    /// adapter still in `session/new` holds prompts until `released` is set;
+    /// the next command then logs them.
+    #[cfg(test)]
+    pub fn fake_for_test_prompt_recording(
+        session_id: AcpSessionId,
+        prompts: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
+        released: Arc<AtomicBool>,
+    ) -> (Self, mpsc::Sender<Event>) {
+        let mut held = Vec::new();
+        Self::fake_with_consumer(session_id, move |cmd| {
+            if let ClientCmd::Prompt(blocks) = &cmd {
+                let text = match blocks.first() {
+                    Some(ContentBlock::Text(text)) => text.text.clone(),
+                    _ => String::new(),
+                };
+                let attachments = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Image(image) => {
+                            Some(format!("{}:{}", image.mime_type, image.data))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                held.push((text, attachments));
+            }
+            if released.load(std::sync::atomic::Ordering::SeqCst) {
+                prompts.lock().expect("prompt log").append(&mut held);
+            }
+            match cmd {
+                ClientCmd::DeleteSession { respond_to, .. } => {
+                    let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                }
+                ClientCmd::CloseSession(respond_to) => {
+                    let _ = respond_to.send(CloseSessionOutcome::Unsupported);
+                }
+                ClientCmd::FlushForTest(done) => {
+                    let _ = done.send(());
+                }
+                _ => {}
+            }
+        })
     }
 
     /// Fails every driven reset with `message`.

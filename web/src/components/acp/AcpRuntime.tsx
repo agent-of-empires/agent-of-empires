@@ -64,6 +64,8 @@ export interface AcpContext {
   lastActivityRef: Session["lastActivityRef"];
   dismissError: () => void;
   dismissPrimer: () => void;
+  /** After this dashboard's restart of a start in progress succeeds. */
+  markRestartStarted: (epoch: number) => void;
   dismissCompactionReminder: () => void;
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;
@@ -246,6 +248,7 @@ export function AcpRuntime({
         lastActivityRef: acp.lastActivityRef,
         dismissError: acp.dismissError,
         dismissPrimer: acp.dismissPrimer,
+        markRestartStarted: acp.markRestartStarted,
         dismissCompactionReminder: acp.dismissCompactionReminder,
         removeQueuedPrompt: acp.removeQueuedPrompt,
         editQueuedPrompt: acp.editQueuedPrompt,

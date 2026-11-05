@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::{
-    lock_recover, BroadcastSink, RestartRequestGuard, Supervisor, SupervisorError, WorkerHandle,
-    WorkerKind,
+    lock_recover, BroadcastSink, RestartRequestGuard, Supervisor, SupervisorError,
+    UnassignedPrompt, WorkerHandle, WorkerKind, RESTART_HANDOFF_STOP_REASON,
 };
 use crate::acp::acp_client::{AcpClient, DeleteSessionOutcome};
 use crate::acp::runner_lifecycle::{
@@ -195,7 +195,10 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 return false;
             }
         }
-        if let Some(reason) = debt.reason {
+        if let Some(reason) = debt
+            .reason
+            .filter(|reason| reason != RESTART_HANDOFF_STOP_REASON)
+        {
             if !sink.publish_persisted(id, super::next_seq(seqs, id), &Event::Stopped { reason }) {
                 return false;
             }
@@ -452,8 +455,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
         self.cancel_restart_request(session_id).await;
-        self.shutdown_and_wait_with_policy(session_id, deadline, false, Some(target))
-            .await
+        self.shutdown_and_wait_with_policy(
+            session_id,
+            "user_stopped",
+            deadline,
+            false,
+            Some(target),
+        )
+        .await
     }
 
     /// Settle the old runner as part of an explicit resume. The caller owns
@@ -467,6 +476,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         self.shutdown_and_wait_with_pending_cancellation(
             session_id,
+            "user_stopped",
             deadline,
             false,
             Some(target),
@@ -481,7 +491,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
         self.cancel_restart_request(session_id).await;
-        self.shutdown_and_wait_with_policy(session_id, deadline, true, Some(target))
+        self.shutdown_and_wait_with_policy(session_id, "user_stopped", deadline, true, Some(target))
             .await
     }
     /// Stop a worker, keeping its agent-side transcript resumable.
@@ -521,7 +531,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
         self.cancel_restart_request(session_id).await;
-        self.shutdown_and_wait_with_policy(session_id, deadline, true, None)
+        self.shutdown_and_wait_with_policy(session_id, "user_stopped", deadline, true, None)
             .await
     }
 
@@ -532,36 +542,54 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
         self.cancel_restart_request(session_id).await;
-        self.shutdown_and_wait_with_policy(session_id, deadline, false, None)
+        self.shutdown_and_wait_with_policy(session_id, "user_stopped", deadline, false, None)
             .await
     }
 
     /// Internal restart teardown preserves the claim that protects the stop/start sequence.
+    /// With `RESTART_HANDOFF_STOP_REASON` the old worker is stopped first, and the prompts
+    /// it never reached are then taken and returned instead of ending their turns; a
+    /// handoff that carries nothing publishes its own `Stopped`.
     pub(crate) async fn shutdown_and_wait_for_restart(
         &self,
         session_id: &str,
+        stop_reason: &str,
         deadline: Duration,
         restart: &RestartRequestGuard,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<Vec<UnassignedPrompt>, SupervisorError> {
         if restart.session_id() != session_id {
             return Err(SupervisorError::RestartInProgress(session_id.to_string()));
         }
-        if restart.is_cancelled() {
-            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        let stopped = if restart.is_cancelled() {
+            Err(SupervisorError::SpawnCancelled(session_id.to_string()))
+        } else {
+            self.shutdown_and_wait_with_policy(session_id, stop_reason, deadline, false, None)
+                .await
+        };
+        let prompts = self.take_unassigned_prompts(session_id);
+        if stop_reason != RESTART_HANDOFF_STOP_REASON {
+            return stopped.map(|()| Vec::new());
         }
-        self.shutdown_and_wait_with_policy(session_id, deadline, false, None)
-            .await
+        match stopped {
+            Ok(()) if !prompts.is_empty() => Ok(prompts),
+            stopped => {
+                self.publish_stopped_after_handoff(session_id);
+                stopped.map(|()| Vec::new())
+            }
+        }
     }
 
     async fn shutdown_and_wait_with_policy(
         &self,
         session_id: &str,
+        stop_reason: &str,
         deadline: Duration,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
         self.shutdown_and_wait_with_pending_cancellation(
             session_id,
+            stop_reason,
             deadline,
             delete_adapter_state,
             expected,
@@ -573,6 +601,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     async fn shutdown_and_wait_with_pending_cancellation(
         &self,
         session_id: &str,
+        stop_reason: &str,
         deadline: Duration,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
@@ -591,7 +620,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let stopped = self
             .shutdown_with_reason_and_pending_cancellation(
                 session_id,
-                "user_stopped",
+                stop_reason,
                 delete_adapter_state,
                 expected,
                 None,
@@ -739,6 +768,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         match decision {
             StopDecision::TearDown { lease, identity } => {
+                if stop_reason != RESTART_HANDOFF_STOP_REASON {
+                    lock_recover(&self.unassigned_prompts).remove(session_id);
+                }
                 if let Some(target) = expected {
                     lease.record_prime(target.prime.clone());
                     for scope in &target.scopes {
@@ -2361,6 +2393,36 @@ mod tests {
 
         assert!(store.unresolved_background_task_ids(session).is_empty());
         assert!(store.unresolved_background_agent_ids(session).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn only_a_stop_that_tears_the_worker_down_clears_its_unassigned_prompts() {
+        let _home = isolate_home();
+        let id = "s-unassigned";
+        let sup = Supervisor::new(VecSink::new());
+        sup.test_insert_worker(id).await;
+        let queue = || {
+            lock_recover(&sup.unassigned_prompts).insert(
+                id.to_string(),
+                vec![UnassignedPrompt {
+                    text: "carried".into(),
+                    attachments: Vec::new(),
+                }],
+            );
+        };
+        queue();
+        let observed = sup.running_lease(id).unwrap();
+        sup.test_respawn_worker(id).await;
+        assert!(matches!(
+            sup.shutdown_idle(id, Some(&observed)).await,
+            Err(SupervisorError::Superseded(_))
+        ));
+        assert_eq!(sup.take_unassigned_prompts(id).len(), 1);
+
+        queue();
+        sup.shutdown(id).await.unwrap();
+        assert!(sup.take_unassigned_prompts(id).is_empty());
     }
 
     #[tokio::test]

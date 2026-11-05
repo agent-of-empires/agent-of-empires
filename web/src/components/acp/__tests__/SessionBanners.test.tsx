@@ -2,8 +2,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { emptyAcpState } from "../../../lib/acpTypes";
 import {
   ScheduledWakeupBanner,
+  SessionBanners,
   SnoozedWorkerStoppedBanner,
   StartupWaitLine,
   TrashedWorkerStoppedBanner,
@@ -41,7 +43,9 @@ describe("TrashedWorkerStoppedBanner", () => {
     const onRestore = vi.fn(() => new Promise<boolean>(() => {}));
     render(<TrashedWorkerStoppedBanner sessionId="sess-9" onRestore={onRestore} />);
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
-    const pending = screen.getByRole("button", { name: "Restoring…" }) as HTMLButtonElement;
+    const pending = screen.getByRole("button", {
+      name: "Restoring…",
+    }) as HTMLButtonElement;
     expect(pending.disabled).toBe(true);
     fireEvent.click(pending);
     expect(onRestore).toHaveBeenCalledTimes(1);
@@ -111,14 +115,17 @@ describe("StartupWaitLine", () => {
   const reducedMotion = (reduce: boolean) =>
     vi.stubGlobal(
       "matchMedia",
-      vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
+      vi.fn((query: string) => ({
+        matches: reduce && query.includes("reduce"),
+        media: query,
+      })),
     );
   afterEach(() => vi.unstubAllGlobals());
 
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
     reducedMotion(false);
-    render(<StartupWaitLine agent="Claude Code" />);
+    render(<StartupWaitLine sessionId="s1" agent="Claude Code" canRestart />);
     expect(line().textContent).toContain("Starting Claude Code… You can type now.");
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
     act(() => vi.advanceTimersByTime(6_000));
@@ -143,7 +150,7 @@ describe("StartupWaitLine", () => {
   ])("%s", (_label, reduce) => {
     vi.useFakeTimers();
     reducedMotion(reduce);
-    const { unmount } = render(<StartupWaitLine agent="Codex" />);
+    const { unmount } = render(<StartupWaitLine sessionId="s1" agent="Codex" canRestart />);
     const glyph = () => line().firstElementChild!.textContent;
     const first = glyph();
     act(() => vi.advanceTimersByTime(180 * 4));
@@ -158,5 +165,94 @@ describe("StartupWaitLine", () => {
     }
     unmount();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["a successful restart starts the count again", 200, "0:01", null],
+    [
+      "a failed restart keeps Restart and says why",
+      409,
+      "0:31",
+      "Restart failed: Server returned 409. worker_not_stopped",
+    ],
+  ])("offers Restart once the handshake bound has passed: %s", async (_label, status, elapsedAfter, failure) => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const spawn = vi.fn().mockResolvedValue({
+      ok: status === 200,
+      status,
+      text: () => Promise.resolve(status === 200 ? "" : "worker_not_stopped"),
+    });
+    vi.stubGlobal("fetch", spawn);
+    const onRestarted = vi.fn();
+    render(
+      <StartupWaitLine sessionId="s1" agent="Claude Code" canRestart restartEpoch={3} onRestarted={onRestarted} />,
+    );
+    const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
+    act(() => vi.advanceTimersByTime(29_000));
+    expect(restart()).toBeNull();
+    act(() => vi.advanceTimersByTime(1_000));
+    await act(async () => {
+      fireEvent.click(restart()!);
+    });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
+    expect(restart() === null).toBe(failure === null);
+    expect(screen.queryByTestId("startup-wait-restart-error")?.textContent ?? null).toBe(failure);
+    expect(onRestarted.mock.calls).toEqual(failure === null ? [[3]] : []);
+  });
+
+  it("acknowledges a restart with the epoch it was requested in", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    let respond!: (res: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise((resolve) => (respond = resolve))),
+    );
+    const onRestarted = vi.fn();
+    const line = (restartEpoch: number) => (
+      <StartupWaitLine
+        sessionId="s1"
+        agent="Claude Code"
+        canRestart
+        restartEpoch={restartEpoch}
+        onRestarted={onRestarted}
+      />
+    );
+    const { rerender } = render(line(0));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    // The replacement is assigned before the restart request answers.
+    rerender(line(1));
+    await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
+    expect(onRestarted.mock.calls).toEqual([[0]]);
+  });
+});
+
+describe("SessionBanners startup line", () => {
+  it.each([
+    ["offers Restart where the server allows it", true],
+    ["keeps only the elapsed line on read-only and CityHall dashboards", false],
+  ])("%s", (_label, canRestart) => {
+    vi.useFakeTimers();
+    render(
+      <SessionBanners
+        sessionId="s1"
+        state={emptyAcpState()}
+        startingAgent="Claude Code"
+        canRestart={canRestart}
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(31_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
+    expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
   });
 });

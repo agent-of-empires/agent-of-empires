@@ -1,6 +1,6 @@
 //! Supervisor-authored events, each allocated the session's next seq.
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     next_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor, WorkerKind,
@@ -10,11 +10,28 @@ use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
 use crate::acp::state::{BackgroundAgentStatus, Event};
 
+const STOPPED_APPEND_ATTEMPTS: usize = 3;
+
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
         let seq = next_seq(&self.next_seqs, session_id);
         self.sink.publish(session_id, seq, event);
         seq
+    }
+
+    /// End the turns of prompts a restart accepted but could not carry over.
+    pub(crate) fn publish_stopped_after_handoff(&self, session_id: &str) {
+        let event = Event::Stopped {
+            reason: "user_stopped".into(),
+        };
+        for _ in 0..STOPPED_APPEND_ATTEMPTS {
+            let seq = next_seq(&self.next_seqs, session_id);
+            if self.sink.publish_persisted(session_id, seq, &event) {
+                return;
+            }
+        }
+        warn!(target: "acp.supervisor", session = %session_id,
+            "could not persist Stopped after a restart handoff");
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.

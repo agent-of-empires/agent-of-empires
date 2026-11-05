@@ -496,6 +496,15 @@ async function handleRequest(msg) {
 
     case "session/new":
     case "session/load": {
+      // FAKE_ACP_STALL_NEW names a marker file with a line per stall: the first FAKE_ACP_STALL_NEW_TIMES
+      // (default 1) session/new calls append one and never answer.
+      const stallMarker = process.env.FAKE_ACP_STALL_NEW;
+      const stalls =
+        stallMarker && existsSync(stallMarker) ? readFileSync(stallMarker, "utf8").split("\n").length - 1 : 0;
+      if (method === "session/new" && stallMarker && stalls < Number(process.env.FAKE_ACP_STALL_NEW_TIMES ?? 1)) {
+        appendFileSync(stallMarker, `${process.pid}\n`);
+        return;
+      }
       const sessionId = params?.sessionId ?? makeSessionId();
       // FAKE_ACP_COMMANDS: emit available_commands_update after session/new.
       const commandsJson = process.env.FAKE_ACP_COMMANDS;

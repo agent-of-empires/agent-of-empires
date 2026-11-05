@@ -189,11 +189,16 @@ describe("persistState (#1833)", () => {
     expect(readQueue("strip")).toEqual(["q1"]);
   });
 
-  it("drops the optimistic overlay and in-flight prompt ids", () => {
+  it("drops the optimistic overlay, in-flight prompt ids and restart marker", () => {
     const row = { id: "o1", kind: "user_prompt" as const, text: "x", at: "t" };
-    persistState("overlay", { ...emptyAcpState(), optimisticRows: [row], inflightPromptIds: ["o1"] });
+    persistState("overlay", {
+      ...emptyAcpState(),
+      optimisticRows: [row],
+      inflightPromptIds: ["o1"],
+      restartInFlight: true,
+    });
     const { state } = JSON.parse(localStorage.getItem(key("overlay"))!) as { state: AcpState };
-    expect([state.optimisticRows, state.inflightPromptIds]).toEqual([[], []]);
+    expect([state.optimisticRows, state.inflightPromptIds, state.restartInFlight]).toEqual([[], [], false]);
   });
 });
 
