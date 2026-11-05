@@ -515,6 +515,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
         let parent = super::resolve_session(parent_ref, &instances)?;
+        // The Daemon's create refuses a trashed parent as not found; agree with it.
+        if parent.is_trashed() {
+            bail!(
+                "Session '{}' is in the trash, so it can't be a parent. Restore it first.",
+                parent.title
+            );
+        }
         parent.ensure_can_parent()?;
         group_path = Some(parent.group_path.clone());
         Some(parent.id.clone())
@@ -2404,6 +2411,42 @@ command = "plugin-helper --safe"
             assert_eq!(
                 msg,
                 "Cannot create sub-session of a sub-session (single level only)"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_a_trashed_parent() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut trashed =
+                        crate::session::Instance::new("binned", project.path().to_str().unwrap());
+                    trashed.id = "trashed-id".to_string();
+                    trashed.trashed_at = Some(chrono::Utc::now());
+                    *rows = vec![trashed];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--parent",
+                "trashed-id",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("a trashed session can't be a parent, as the Daemon's create decides")
+                .to_string();
+            assert_eq!(
+                msg,
+                "Session 'binned' is in the trash, so it can't be a parent. Restore it first."
             );
         }
 
