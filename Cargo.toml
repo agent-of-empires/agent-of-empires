@@ -149,7 +149,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
-tower-http = { version = "0.7", features = ["fs"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-zstd", "fs"] }
 # Embedded dashboard bundle, behind `web`.
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 # Content type for the session file-read endpoint.
@@ -174,7 +174,7 @@ jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # Agent Client Protocol — drives the structured view surface.
-agent-client-protocol = { version = "3.1", features = ["unstable_end_turn_token_usage", "unstable_session_compaction", "unstable_session_fork", "unstable_session_notices"] }
+agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = "1"
