@@ -393,7 +393,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+    use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
 
     async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
         let (event_tx, mut event_rx) = mpsc::channel(8);
