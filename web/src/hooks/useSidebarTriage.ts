@@ -5,6 +5,7 @@ import { reportError } from "../lib/toastBus";
 import {
   makeOptimisticSnoozedUntil,
   optimisticForRow,
+  optimisticKey,
   reconcileOptimistic,
   withOverride,
   type OptimisticTriage,
@@ -29,10 +30,12 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     setOverlay((prev) => reconcileOptimistic(prev, workspaces));
   }
 
-  const setOverride = useCallback((workspaceId: string, patch: Partial<OptimisticTriage>) => {
+  // One entry per target session: two rows of one workspace can have actions pending at once.
+  const setOverride = useCallback((workspaceId: string, sessionId: string, patch: Partial<OptimisticTriage>) => {
     setOverlay((prev) => {
+      const key = optimisticKey(workspaceId, sessionId);
       const next = new Map(prev);
-      next.set(workspaceId, withOverride(prev.get(workspaceId), patch));
+      next.set(key, withOverride(prev.get(key), { ...patch, sessionId }));
       return next;
     });
   }, []);
@@ -51,9 +54,9 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     ): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
-      setOverride(ws.id, { ...optimistic, sessionId });
+      setOverride(ws.id, sessionId, optimistic);
       if (await call(sessionId)) return { workspaceId: ws.id, ok: true };
-      setOverride(ws.id, revert);
+      setOverride(ws.id, sessionId, revert);
       return { workspaceId: ws.id, ok: false };
     },
     [setOverride],

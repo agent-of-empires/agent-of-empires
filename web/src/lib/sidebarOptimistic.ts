@@ -64,12 +64,22 @@ export function effectiveUnreadOf(optimistic: OptimisticTriage, serverUnread: bo
   return optimistic.unread ?? serverUnread;
 }
 
+/** Overlay keys pair a workspace with the session its pending action targets; ids contain no separator. */
+const KEY_SEP = "\u0000";
+
+export function optimisticKey(workspaceId: string, sessionId: string | null): string {
+  return `${workspaceId}${KEY_SEP}${sessionId ?? ""}`;
+}
+
 /** The override a row may render: a pending action belongs only to the session it was issued for. */
 export function optimisticForRow(map: ReadonlyMap<string, OptimisticTriage>, workspace: Workspace): OptimisticTriage {
-  const override = map.get(workspace.id);
-  if (!override) return EMPTY_OPTIMISTIC;
-  if (override.sessionId == null) return override;
-  return workspace.sessions.some((s) => s.id === override.sessionId) ? override : EMPTY_OPTIMISTIC;
+  const untargeted = map.get(optimisticKey(workspace.id, null));
+  if (untargeted) return untargeted;
+  for (const session of workspace.sessions) {
+    const override = map.get(optimisticKey(workspace.id, session.id));
+    if (override) return override;
+  }
+  return EMPTY_OPTIMISTIC;
 }
 
 /** A boolean clears once it matches the server; a snooze clears when both are unsnoozed or the deadlines are close enough. */
@@ -99,11 +109,12 @@ export function reconcileOptimistic(
   }
   let changed = false;
   const next = new Map<string, OptimisticTriage>();
-  for (const [id, override] of map) {
-    const sessions = sessionsById.get(id);
+  for (const [key, override] of map) {
+    const [workspaceId] = key.split(KEY_SEP);
+    const sessions = sessionsById.get(workspaceId!);
     // Keep a vanished workspace's override so a mid-refresh row doesn't flicker back to stale state.
     if (!sessions) {
-      next.set(id, override);
+      next.set(key, override);
       continue;
     }
     const target = override.sessionId == null ? undefined : sessions.get(override.sessionId);
@@ -135,7 +146,7 @@ export function reconcileOptimistic(
       changed = true;
       continue;
     }
-    next.set(id, { pinned, archived, sessionId: override.sessionId, snoozedUntil, unread });
+    next.set(key, { pinned, archived, sessionId: override.sessionId, snoozedUntil, unread });
   }
   return changed ? next : (map as Map<string, OptimisticTriage>);
 }

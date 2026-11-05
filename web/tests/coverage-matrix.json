@@ -5010,9 +5010,14 @@
       "specs": [
         "src/lib/__tests__/sidebarSelection.test.ts",
         "src/lib/__tests__/sidebarOptimistic.test.ts",
-        "src/lib/__tests__/sidebarBulk.test.ts"
+        "src/lib/__tests__/sidebarBulk.test.ts",
+        "src/hooks/useSidebarTriage.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarBulk.ts"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/sidebarBulk.ts",
+        "web/src/hooks/useSidebarTriage.ts"
+      ]
     },
     {
       "id": "sidebar.multi-select-gestures",
