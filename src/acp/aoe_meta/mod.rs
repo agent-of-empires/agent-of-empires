@@ -363,22 +363,14 @@ mod tests {
         }
     }
 
-    /// The checked-in schema is generated; `AOE_UPDATE_SCHEMA=1` rewrites it.
     #[test]
     fn published_schema_is_current() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/assets/aoe-meta-v1.schema.json"
         );
-        let generated = schema_json();
-        if std::env::var_os("AOE_UPDATE_SCHEMA").is_some() {
-            std::fs::write(path, &generated).expect("write schema");
-        }
         let on_disk = std::fs::read_to_string(path).expect("schema file present");
-        assert_eq!(
-            on_disk, generated,
-            "run with AOE_UPDATE_SCHEMA=1 to refresh"
-        );
+        assert_eq!(on_disk, schema_json(), "run `cargo xtask gen-meta-schema`");
     }
 
     #[test]
