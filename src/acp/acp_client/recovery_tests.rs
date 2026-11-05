@@ -282,6 +282,11 @@ async fn completed_turn_keeps_its_terminal_claim_when_eof_snapshots_it_active() 
         next.inbound.as_mut().unwrap().try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+    runner.disconnect(&mut next).await;
+    assert!(
+        !next.control_loss().unwrap().turn_in_flight,
+        "replayed completion must clear the recovered in-flight flag"
+    );
     next.shutdown().await.unwrap();
 }
 

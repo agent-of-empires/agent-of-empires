@@ -475,6 +475,8 @@ pub(super) async fn connect_runner_control_v3(
                                     if !reader_prompt_in_flight.load(AtomicOrdering::Relaxed)
                                         || terminal_claim.claimed()
                                     {
+                                        reader_prompt_in_flight
+                                            .store(false, AtomicOrdering::Relaxed);
                                         continue;
                                     }
                                     None
