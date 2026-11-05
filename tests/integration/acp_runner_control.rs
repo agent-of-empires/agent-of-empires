@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
@@ -1992,35 +1993,39 @@ for line in sys.stdin:
     }
 }
 
-/// The real runner owns a busy native turn. A proxy withholds only a cached
-/// initialize response, so the daemon deadline cannot be confused with agent death.
-#[tokio::test]
-#[serial_test::serial]
-async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
-    use agent_of_empires::acp::event_store::EventStore;
-    use agent_of_empires::acp::runner_lifecycle::RunnerIdentity;
-    use agent_of_empires::acp::state::Event;
-    use agent_of_empires::acp::supervisor::{
-        BroadcastSink, ChannelSink, Supervisor, SupervisorError,
-    };
-    use agent_of_empires::process::worker_registry;
-    use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+/// A real runner whose stand-in agent holds each `session/prompt` until the
+/// test releases it, standing in for a native command in flight.
+struct HeldTurnRunner {
+    id: &'static str,
+    runner: KillOnDrop,
+    gate: tokio::io::BufReader<tokio::net::UnixStream>,
+    agent_pid: u32,
+    agent_log: PathBuf,
+    real_control: PathBuf,
+    home: PathBuf,
+    scratch: Scratch,
+    _env: agent_of_empires::server::test_support::RuntimeEnvGuard,
+}
 
-    let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
-    let scratch = Scratch::new("borrowedturn");
-    let home = scratch.0.join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    env.bind(&home);
-    let python3 = find_python3().expect("python3 is required for the real-runner turn regression");
-    let gate_path = scratch.0.join("agent-gate.sock");
-    let gate_listener = tokio::net::UnixListener::bind(&gate_path).unwrap();
-    let agent_log = scratch.0.join("methods.log");
-    let agent_script = scratch.0.join("held_turn.py");
-    std::fs::write(
-        &agent_script,
-        r#"
+impl HeldTurnRunner {
+    /// Returns the first control connection, with the native session established.
+    async fn start(label: &str, id: &'static str) -> (Self, tokio::net::UnixStream) {
+        use agent_of_empires::acp::control_protocol::{self, ControlBody};
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
+        let scratch = Scratch::new(label);
+        let home = scratch.0.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        env.bind(&home);
+        let python3 = find_python3().expect("python3 is required for the real-runner turn fixture");
+        let gate_path = scratch.0.join("agent-gate.sock");
+        let gate_listener = tokio::net::UnixListener::bind(&gate_path).unwrap();
+        let agent_log = scratch.0.join("methods.log");
+        let agent_script = scratch.0.join("held_turn.py");
+        std::fs::write(
+            &agent_script,
+            r#"
 import json, os, socket, sys
 control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 control.connect(sys.argv[1])
@@ -2054,91 +2059,248 @@ for line in sys.stdin:
         result = {}
     print(json.dumps({"jsonrpc":"2.0","id":request_id,"result":result}), flush=True)
 "#,
-    )
-    .unwrap();
-    let id = "real-borrowed-turn";
-    let workers = app_dir(&home, &home).join("acp-workers");
-    let socket = workers.join(format!("{id}.sock"));
-    let real_control = workers.join(format!("{id}.control.sock"));
-    let mut runner = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
-            .args([
-                "__acp-runner",
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                id,
-                "--agent-name",
-                "fake-agent",
-                "--agent-key",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--generation",
-                "17",
-                "--",
-                python3.to_str().unwrap(),
-                agent_script.to_str().unwrap(),
-                gate_path.to_str().unwrap(),
-                agent_log.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &home)
-            .spawn()
-            .unwrap(),
+        )
+        .unwrap();
+        let workers = app_dir(&home, &home).join("acp-workers");
+        let socket = workers.join(format!("{id}.sock"));
+        let real_control = workers.join(format!("{id}.control.sock"));
+        let runner = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_aoe"))
+                .args([
+                    "__acp-runner",
+                    "--socket",
+                    socket.to_str().unwrap(),
+                    "--session-id",
+                    id,
+                    "--agent-name",
+                    "fake-agent",
+                    "--agent-key",
+                    "fake-agent",
+                    "--cwd",
+                    home.to_str().unwrap(),
+                    "--generation",
+                    "17",
+                    "--",
+                    python3.to_str().unwrap(),
+                    agent_script.to_str().unwrap(),
+                    gate_path.to_str().unwrap(),
+                    agent_log.to_str().unwrap(),
+                ])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .spawn()
+                .unwrap(),
+        );
+        // Agent startup occurs only after the runner registers and binds its socket.
+        let (gate, _) = tokio::time::timeout(Duration::from_secs(10), gate_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gate = tokio::io::BufReader::new(gate);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), gate.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_pid: u32 = line.trim().parse().unwrap();
+        let mut initial = tokio::net::UnixStream::connect(&real_control)
+            .await
+            .unwrap();
+        assert!(matches!(
+            control_protocol::read_frame(&mut initial).await.unwrap(),
+            Some(ControlBody::Hello { .. })
+        ));
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::Attach {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::Initialize {
+                request: serde_json::json!({"protocolVersion":1}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            control_protocol::read_frame(&mut initial).await.unwrap(),
+            Some(ControlBody::Initialized { .. })
+        ));
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::EstablishSession {
+                method: "session/new".into(),
+                request: serde_json::json!({"cwd":home,"mcpServers":[]}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(control_protocol::read_frame(&mut initial).await.unwrap(),
+            Some(ControlBody::SessionReady { acp_session_id, .. }) if acp_session_id == "owned-native-session")
+        );
+        let held = Self {
+            id,
+            runner,
+            gate,
+            agent_pid,
+            agent_log,
+            real_control,
+            home,
+            scratch,
+            _env: env,
+        };
+        (held, initial)
+    }
+
+    async fn await_prompt_started(&mut self) {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), self.gate.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "prompt_started\n");
+    }
+
+    async fn release_turn(&mut self) {
+        use tokio::io::AsyncWriteExt as _;
+        self.gate.get_mut().write_all(b"c").await.unwrap();
+    }
+
+    /// Route daemon observation through a proxy in front of the real control
+    /// socket while keeping the registry's exact producer identity.
+    fn route_through_proxy(
+        &self,
+    ) -> (
+        tokio::net::UnixListener,
+        agent_of_empires::process::worker_registry::WorkerRecord,
+    ) {
+        use agent_of_empires::process::worker_registry;
+        let proxy_socket = self.scratch.0.join("attempt.sock");
+        let proxy_control =
+            agent_of_empires::process::worker::control_socket_sibling(&proxy_socket);
+        let listener = tokio::net::UnixListener::bind(proxy_control).unwrap();
+        let mut record = worker_registry::load(self.id).unwrap().unwrap();
+        assert_eq!(record.pid, self.runner.0.id());
+        assert_eq!(
+            record.stored_acp_session_id.as_deref(),
+            Some("owned-native-session")
+        );
+        record.socket_path = proxy_socket;
+        worker_registry::save(&record).unwrap();
+        (listener, record)
+    }
+
+    fn method_count(&self, method: &str) -> usize {
+        std::fs::read_to_string(&self.agent_log)
+            .unwrap()
+            .lines()
+            .filter(|logged| *logged == method)
+            .count()
+    }
+
+    fn assert_runtime_alive(&mut self) {
+        assert!(self.runner.0.try_wait().unwrap().is_none());
+        assert!(agent_of_empires::process::worker_registry::is_pid_alive(
+            self.agent_pid
+        ));
+    }
+}
+
+/// A daemon-side consumer whose log has the held turn's prompt in flight.
+fn supervisor_with_prompt_in_flight(
+    held: &HeldTurnRunner,
+) -> (
+    Arc<
+        agent_of_empires::acp::supervisor::Supervisor<
+            agent_of_empires::acp::supervisor::ChannelSink,
+        >,
+    >,
+    Arc<agent_of_empires::acp::event_store::EventStore>,
+    tokio::sync::broadcast::Receiver<agent_of_empires::server::AcpBroadcastFrame>,
+) {
+    use agent_of_empires::acp::event_store::EventStore;
+    use agent_of_empires::acp::state::Event;
+    use agent_of_empires::acp::supervisor::{BroadcastSink, ChannelSink, Supervisor};
+    let store = Arc::new(EventStore::open(&held.scratch.0.join("consumer.db"), 1000).unwrap());
+    let (tx, rx) = tokio::sync::broadcast::channel(64);
+    let sink = Arc::new(ChannelSink {
+        tx,
+        event_store: store.clone(),
+        control_cache: Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
+    });
+    sink.publish(
+        held.id,
+        1,
+        &Event::UserPromptSent {
+            text: "keep going".into(),
+            attachments: vec![],
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        },
     );
-    // Agent startup occurs only after the runner registers and binds its socket.
-    let (gate, _) = tokio::time::timeout(Duration::from_secs(10), gate_listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut gate = tokio::io::BufReader::new(gate);
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(10), gate.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
-    let agent_pid: u32 = line.trim().parse().unwrap();
-    let mut initial = tokio::net::UnixStream::connect(&real_control)
-        .await
-        .unwrap();
-    assert!(matches!(
-        control_protocol::read_frame(&mut initial).await.unwrap(),
-        Some(ControlBody::Hello { .. })
-    ));
-    control_protocol::write_frame(
-        &mut initial,
-        &ControlBody::Attach {
-            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-        },
-    )
+    let supervisor = Arc::new(Supervisor::new(sink));
+    supervisor.hydrate_seqs(store.all_session_seqs());
+    (supervisor, store, rx)
+}
+
+/// Wait for the held turn to end, then check it ended once, by completing,
+/// in the one native session the agent ever opened.
+async fn assert_original_turn_completed(
+    held: &mut HeldTurnRunner,
+    store: &agent_of_empires::acp::event_store::EventStore,
+    rx: &mut tokio::sync::broadcast::Receiver<agent_of_empires::server::AcpBroadcastFrame>,
+) {
+    use agent_of_empires::acp::state::Event;
+    let id = held.id;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.has_in_flight_turn(id) {
+            rx.recv().await.unwrap();
+        }
+    })
     .await
     .unwrap();
-    control_protocol::write_frame(
-        &mut initial,
-        &ControlBody::Initialize {
-            request: serde_json::json!({"protocolVersion":1}),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        control_protocol::read_frame(&mut initial).await.unwrap(),
-        Some(ControlBody::Initialized { .. })
-    ));
-    control_protocol::write_frame(
-        &mut initial,
-        &ControlBody::EstablishSession {
-            method: "session/new".into(),
-            request: serde_json::json!({"cwd":home,"mcpServers":[]}),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(control_protocol::read_frame(&mut initial).await.unwrap(),
-        Some(ControlBody::SessionReady { acp_session_id, .. }) if acp_session_id == "owned-native-session")
-    );
+    let events = store.replay_from(id, 0);
+    assert!(events.iter().any(|(_, event)| matches!(event,
+        Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "owned-native-session")));
+    assert!(events.iter().any(|(_, event)| matches!(event,
+        Event::AgentMessageChunk { text, .. } if text == "real original turn completed")));
+    let stops: Vec<_> = events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            Event::Stopped { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops, ["prompt_complete"]);
+    for method in ["initialize", "session/new", "session/prompt"] {
+        assert_eq!(held.method_count(method), 1, "{method}");
+    }
+    for method in ["session/load", "session/cancel", "session/delete"] {
+        assert_eq!(held.method_count(method), 0, "{method}");
+    }
+    held.assert_runtime_alive();
+}
+
+/// The real runner owns a busy native turn. A proxy withholds only a cached
+/// initialize response, so the daemon deadline cannot be confused with agent death.
+#[tokio::test]
+#[serial_test::serial]
+async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+    use agent_of_empires::acp::runner_lifecycle::RunnerIdentity;
+    use agent_of_empires::acp::state::Event;
+    use agent_of_empires::acp::supervisor::SupervisorError;
+    use agent_of_empires::process::worker_registry;
+
+    let (mut held, mut initial) = HeldTurnRunner::start("borrowedturn", "real-borrowed-turn").await;
+    let id = held.id;
     control_protocol::write_frame(&mut initial, &ControlBody::Prompt {
         request: serde_json::json!({"sessionId":"owned-native-session","prompt":[{"type":"text","text":"keep going"}]}),
     }).await.unwrap();
@@ -2150,27 +2312,11 @@ for line in sys.stdin:
             break;
         }
     }
-    line.clear();
-    tokio::time::timeout(Duration::from_secs(10), gate.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(line, "prompt_started\n");
+    held.await_prompt_started().await;
     drop(initial);
 
-    // Keep the registry's exact producer identity, but route daemon observation
-    // through a gate in front of the real runner's existing control socket.
-    let proxy_socket = scratch.0.join("attempt.sock");
-    let proxy_control = agent_of_empires::process::worker::control_socket_sibling(&proxy_socket);
-    let listener = tokio::net::UnixListener::bind(proxy_control).unwrap();
-    let mut original = worker_registry::load(id).unwrap().unwrap();
-    assert_eq!(original.pid, runner.0.id());
-    assert_eq!(
-        original.stored_acp_session_id.as_deref(),
-        Some("owned-native-session")
-    );
-    original.socket_path = proxy_socket;
-    worker_registry::save(&original).unwrap();
+    let (listener, original) = held.route_through_proxy();
+    let real_control = held.real_control.clone();
     let identity = RunnerIdentity::from_record(&original);
     assert!(identity.birth_fingerprint.is_some());
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
@@ -2185,9 +2331,8 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             if attempt == 1 {
-                tokio::io::copy_bidirectional(&mut daemon, &mut producer)
-                    .await
-                    .unwrap();
+                // macOS reports ENOTCONN when the detached daemon side closes.
+                let _ = tokio::io::copy_bidirectional(&mut daemon, &mut producer).await;
                 continue;
             }
             let hello = control_protocol::read_frame(&mut producer)
@@ -2226,29 +2371,10 @@ for line in sys.stdin:
             closed_tx.take().unwrap().send(()).unwrap();
         }
     });
-    let store = Arc::new(EventStore::open(&scratch.0.join("consumer.db"), 1000).unwrap());
-    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-    let sink = Arc::new(ChannelSink {
-        tx,
-        event_store: store.clone(),
-        control_cache: Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
-    });
-    sink.publish(
-        id,
-        1,
-        &Event::UserPromptSent {
-            text: "keep going".into(),
-            attachments: vec![],
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-        },
-    );
-    let supervisor = Arc::new(Supervisor::new(sink));
-    supervisor.hydrate_seqs(store.all_session_seqs());
+    let (supervisor, store, mut rx) = supervisor_with_prompt_in_flight(&held);
     let attaching = tokio::spawn({
         let supervisor = supervisor.clone();
-        let home = home.clone();
+        let home = held.home.clone();
         async move { supervisor.attach(id.into(), home, vec![], true, None).await }
     });
     held_rx.await.unwrap();
@@ -2262,8 +2388,7 @@ for line in sys.stdin:
         ))
     ));
     closed_rx.await.unwrap();
-    assert!(runner.0.try_wait().unwrap().is_none());
-    assert!(worker_registry::is_pid_alive(agent_pid));
+    held.assert_runtime_alive();
     let retained = worker_registry::load(id).unwrap().unwrap();
     assert_eq!(RunnerIdentity::from_record(&retained), identity);
     assert_eq!(retained.scope, original.scope);
@@ -2279,58 +2404,75 @@ for line in sys.stdin:
         .any(|(_, event)| matches!(event, Event::Stopped { .. })));
 
     supervisor
-        .attach(id.into(), home, vec![], true, None)
+        .attach(id.into(), held.home.clone(), vec![], true, None)
         .await
         .unwrap();
     assert_eq!(supervisor.running_identity(id), Some(identity));
-    gate.get_mut().write_all(b"c").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while store.has_in_flight_turn(id) {
-            rx.recv().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    let events = store.replay_from(id, 0);
-    assert!(events.iter().any(|(_, event)| matches!(event,
-        Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "owned-native-session")));
-    assert!(events.iter().any(|(_, event)| matches!(event,
-        Event::AgentMessageChunk { text, .. } if text == "real original turn completed")));
-    let stops: Vec<_> = events
-        .iter()
-        .filter_map(|(_, event)| match event {
-            Event::Stopped { reason } => Some(reason.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(stops, ["prompt_complete"]);
-    let methods = std::fs::read_to_string(agent_log).unwrap();
-    assert_eq!(
-        methods
-            .lines()
-            .filter(|method| *method == "initialize")
-            .count(),
-        1
-    );
-    assert_eq!(
-        methods
-            .lines()
-            .filter(|method| *method == "session/new")
-            .count(),
-        1
-    );
-    assert_eq!(
-        methods
-            .lines()
-            .filter(|method| *method == "session/prompt")
-            .count(),
-        1
-    );
-    assert!(!methods
-        .lines()
-        .any(|method| matches!(method, "session/load" | "session/cancel" | "session/delete")));
-    assert!(runner.0.try_wait().unwrap().is_none());
-    assert!(worker_registry::is_pid_alive(agent_pid));
+    held.release_turn().await;
+    assert_original_turn_completed(&mut held, &store, &mut rx).await;
     supervisor.detach_all().await;
     proxy.join_next().await.unwrap().unwrap();
+}
+
+/// Losing only the daemon's control connection, while the real runner and its
+/// agent stay alive with a command in flight, reattaches the same runner: the
+/// turn completes once and nothing is relaunched, reloaded or re-prompted.
+#[tokio::test]
+#[serial_test::serial]
+async fn control_connection_loss_reattaches_the_live_runner_mid_command() {
+    use agent_of_empires::acp::runner_lifecycle::RunnerIdentity;
+
+    let (mut held, initial) = HeldTurnRunner::start("ctlloss", "real-control-loss").await;
+    let id = held.id;
+    drop(initial);
+    let (listener, original) = held.route_through_proxy();
+    let identity = RunnerIdentity::from_record(&original);
+    let real_control = held.real_control.clone();
+    let (sever_tx, sever_rx) = tokio::sync::oneshot::channel::<()>();
+    let (reattached_tx, reattached_rx) = tokio::sync::oneshot::channel();
+    let mut proxy = tokio::task::JoinSet::new();
+    proxy.spawn(async move {
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        let mut producer = tokio::net::UnixStream::connect(&real_control)
+            .await
+            .unwrap();
+        tokio::select! {
+            result = tokio::io::copy_bidirectional(&mut daemon, &mut producer) => {
+                panic!("the first connection ended before the test severed it: {result:?}");
+            }
+            _ = sever_rx => {}
+        }
+        // Close only this connection, from both ends.
+        drop((daemon, producer));
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        reattached_tx.send(()).unwrap();
+        let mut producer = tokio::net::UnixStream::connect(&real_control)
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut daemon, &mut producer).await;
+    });
+    let (supervisor, store, mut rx) = supervisor_with_prompt_in_flight(&held);
+    supervisor
+        .attach(id.into(), held.home.clone(), vec![], false, None)
+        .await
+        .unwrap();
+    supervisor.send_prompt(id, "keep going", &[]).await.unwrap();
+    held.await_prompt_started().await;
+    sever_tx.send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), reattached_rx)
+        .await
+        .expect("the daemon never redialed the live runner")
+        .unwrap();
+    held.release_turn().await;
+    assert_original_turn_completed(&mut held, &store, &mut rx).await;
+    assert_eq!(supervisor.running_identity(id), Some(identity));
+    assert_eq!(
+        agent_of_empires::process::worker_registry::load(id)
+            .unwrap()
+            .map(|record| RunnerIdentity::from_record(&record)),
+        Some(identity)
+    );
+    supervisor.detach_all().await;
+    proxy.abort_all();
 }

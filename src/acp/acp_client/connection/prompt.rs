@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, Sleep};
 use tracing::{debug, info, trace, warn};
@@ -267,10 +268,18 @@ impl Session {
         match serde_json::to_value(request) {
             Ok(params) => {
                 let rx = control.prompt(params).await;
+                let control = Arc::clone(control);
                 Box::pin(async move {
-                    // A closed channel ends the turn; the dying connection
-                    // surfaces the underlying failure.
-                    prompt_outcome_to_response(rx.await.unwrap_or(PromptOutcome::Aborted))
+                    match rx.await {
+                        Ok(outcome) => prompt_outcome_to_response(outcome),
+                        // The runner may still own the turn, so it stays open
+                        // for a reattach instead of ending here.
+                        Err(_) if control.lost() => {
+                            Err(acp_internal_error("runner control channel lost".into()))
+                        }
+                        // The dying connection surfaces the underlying failure.
+                        Err(_) => prompt_outcome_to_response(PromptOutcome::Aborted),
+                    }
                 })
             }
             Err(e) => {
