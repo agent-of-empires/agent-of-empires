@@ -874,6 +874,14 @@ describe("ensureTerminal", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(2);
     });
 
+    it("sends no request at or after the deadline", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
     it("stops retrying once its signal aborts", async () => {
       fetchSpy.mockImplementation(async () => busy());
       const controller = new AbortController();

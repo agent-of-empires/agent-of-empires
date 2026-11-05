@@ -364,6 +364,7 @@ export async function ensureTerminal(
     const remaining = deadline - Date.now();
     if (result.error !== "lifecycle_busy" || remaining <= 0) return result;
     await new Promise((resolve) => setTimeout(resolve, Math.min(delay, remaining)));
+    if (Date.now() >= deadline) return result;
   }
 }
 
