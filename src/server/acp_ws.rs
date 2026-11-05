@@ -910,6 +910,121 @@ mod tests {
         assert!(rows[0].message_start);
     }
 
+    #[test]
+    fn cursor_bootstrap_keeps_prefix_tools_for_stored_and_live_terminals() {
+        use crate::acp::state::test_support::{prompt, stopped};
+        use crate::acp::state::ToolCall;
+        use crate::acp::transcript::{TranscriptDelta, TranscriptRowKind};
+        let at = chrono::Utc::now();
+        let started = |id: &str| Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: id.into(),
+                name: id.into(),
+                kind: "read".into(),
+                args_preview: String::new(),
+                started_at: at,
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        let prefix = vec![
+            (1, prompt("run")),
+            (2, started("finished")),
+            (
+                3,
+                Event::ToolCallCompleted {
+                    tool_call_id: "finished".into(),
+                    is_error: false,
+                    content: "done".into(),
+                    output: Vec::new(),
+                    completed_at: at,
+                    async_subagent: false,
+                },
+            ),
+            (4, started("open")),
+            (
+                5,
+                Event::ToolCallContent {
+                    tool_call_id: "open".into(),
+                    content: "old".into(),
+                },
+            ),
+            (
+                6,
+                Event::ToolCallContent {
+                    tool_call_id: "open".into(),
+                    content: "prefix output".into(),
+                },
+            ),
+        ];
+        let suffix = [
+            (
+                7,
+                Event::ToolCallContent {
+                    tool_call_id: "open".into(),
+                    content: "latest output".into(),
+                },
+            ),
+            (8, stopped("cancelled")),
+        ];
+        for stored_terminal in [false, true] {
+            let mut reduced =
+                AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+            let mut transcript = TranscriptModel::new();
+            let mut cold = ColdFieldCache::default();
+            let mut folds = ConnectionFolds {
+                reduced: &mut reduced,
+                transcript: &mut transcript,
+                cold: &mut cold,
+                last_applied_seq: 0,
+            };
+            let mut history = prefix.clone();
+            if stored_terminal {
+                history.extend(suffix.clone());
+            }
+            let forwarded = fold_connect_history(history, 6, &mut folds);
+            assert_eq!(
+                forwarded.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+                if stored_terminal { vec![7, 8] } else { vec![] }
+            );
+            if !stored_terminal {
+                assert!(
+                    folds.transcript.rows().is_empty(),
+                    "connect snapshot omits prefix rows"
+                );
+                let deltas: Vec<_> = suffix
+                    .iter()
+                    .flat_map(|(seq, event)| folds.transcript.apply_event(*seq, event))
+                    .collect();
+                assert!(matches!(deltas.as_slice(), [TranscriptDelta::Append(row)]
+                    if row.kind == TranscriptRowKind::ToolStopped));
+            }
+            let rows = folds.transcript.rows();
+            assert_eq!(rows.len(), 1, "only the post-cursor terminal is rendered");
+            assert_eq!(rows[0].kind, TranscriptRowKind::ToolStopped);
+            assert_eq!(rows[0].tool_call_id.as_deref(), Some("open"));
+            assert_eq!(rows[0].group_id, "tool-open");
+            assert_eq!(rows[0].text, "latest output");
+            let ended_at = rows[0].at;
+            for (seq, event) in &suffix {
+                assert!(
+                    folds.transcript.apply_event(*seq, event).is_empty(),
+                    "overlapping replay"
+                );
+            }
+            assert!(folds
+                .transcript
+                .apply_event(9, &stopped("prompt_complete"))
+                .is_empty());
+            assert_eq!(
+                folds.transcript.rows()[0].at,
+                ended_at,
+                "terminal timestamp stays fixed"
+            );
+        }
+    }
+
     /// Prompt dispatch (Tier 3) reads the daemon's own control state through
     /// `fold_control_state`, so the whole decision is only as good as this fold.
     #[tokio::test]
