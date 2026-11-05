@@ -913,7 +913,7 @@ impl<'a> PluginStatusPlan<'a> {
 }
 
 fn plan_plugin_statuses<'a>(
-    statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
+    statuses: impl Iterator<Item = (&'a str, &'a str, Option<crate::plugin::ui_state::Tone>)> + Clone,
     budget: usize,
 ) -> PluginStatusPlan<'a> {
     let mut plan = PluginStatusPlan {
@@ -922,25 +922,66 @@ fn plan_plugin_statuses<'a>(
         width: 0,
     };
     let budget = budget.min(MAX_PLUGIN_STATUS_WIDTH);
+    let mut contributors = [None; MAX_PLUGIN_STATUS_COUNT];
+    let mut contributor_count = 0;
+    for (plugin, _, _) in statuses.clone() {
+        if contributors[..contributor_count].contains(&Some(plugin)) {
+            continue;
+        }
+        if contributor_count == MAX_PLUGIN_STATUS_COUNT || contributor_count == budget / 2 {
+            break;
+        }
+        contributors[contributor_count] = Some(plugin);
+        contributor_count += 1;
+    }
+    let mut truncated = false;
 
-    for (text, tone) in statuses {
-        if plan.len == MAX_PLUGIN_STATUS_COUNT {
-            break;
+    for round in 0..MAX_PLUGIN_STATUS_COUNT {
+        let mut seen = [None; MAX_PLUGIN_STATUS_COUNT];
+        let mut added = false;
+        for (plugin, text, tone) in statuses.clone() {
+            let index = seen
+                .iter()
+                .position(|entry| entry.is_none_or(|(id, _)| id == plugin));
+            let Some(index) = index else { break };
+            let (_, count) = seen[index].get_or_insert((plugin, 0usize));
+            let current = *count;
+            *count += 1;
+            if current != round {
+                continue;
+            }
+            if plan.len == MAX_PLUGIN_STATUS_COUNT {
+                return plan;
+            }
+            let reserve = if round == 0 {
+                contributor_count.saturating_sub(plan.len + 1) * 2
+            } else {
+                0
+            };
+            let available = budget
+                .saturating_sub(plan.width + reserve)
+                .saturating_sub(1);
+            if available == 0 {
+                return plan;
+            }
+            let text_width = rendered_width(text);
+            let visible_width = text_width.min(available);
+            plan.spans[plan.len] = Some(PluginStatusSpan {
+                text,
+                tone,
+                width: visible_width,
+            });
+            plan.len += 1;
+            plan.width += 1 + visible_width;
+            added = true;
+            if visible_width < text_width {
+                truncated = true;
+                if round != 0 {
+                    return plan;
+                }
+            }
         }
-        let available = budget.saturating_sub(plan.width).saturating_sub(2);
-        if available == 0 {
-            break;
-        }
-        let text_width = rendered_width(text);
-        let visible_width = text_width.min(available);
-        plan.spans[plan.len] = Some(PluginStatusSpan {
-            text,
-            tone,
-            width: visible_width,
-        });
-        plan.len += 1;
-        plan.width += 2 + visible_width;
-        if visible_width < text_width {
+        if !added || truncated {
             break;
         }
     }
@@ -2093,23 +2134,28 @@ impl HomeView {
         } else {
             String::new()
         };
-        let slot_width = if age.is_empty() {
-            0
-        } else {
-            LAST_ACTIVITY_SLOT
-        };
+        let statuses = crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id);
+        let mut slot_width =
+            if self.show_activity_age && (!age.is_empty() || statuses.clone().next().is_some()) {
+                LAST_ACTIVITY_SLOT
+            } else {
+                0
+            };
 
         let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
-        let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
-
+        let mut fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
         let status_budget = room
             .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
             .min(MAX_PLUGIN_STATUS_WIDTH);
-
-        let plugin_status_plan = plan_plugin_statuses(
-            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
-            status_budget,
-        );
+        let mut plugin_status_plan = plan_plugin_statuses(statuses.clone(), status_budget);
+        if plugin_status_plan.width == 0 && age.is_empty() && slot_width > 0 {
+            slot_width = 0;
+            fixed_trailing = badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+            let budget = room
+                .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
+                .min(MAX_PLUGIN_STATUS_WIDTH);
+            plugin_status_plan = plan_plugin_statuses(statuses, budget);
+        }
         let plugin_status_width = plugin_status_plan.width;
 
         let (title_width, keep_tag) = if plugin_status_width > 0 {
@@ -2127,35 +2173,16 @@ impl HomeView {
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
-        for status in plugin_status_plan.iter() {
-            line_spans.push(Span::raw("  "));
-            let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
-            line_spans.push(Span::styled(
-                truncate_to_width(status.text, status.width),
-                if is_selected {
-                    selected_row_style(status_style, theme)
-                } else {
-                    status_style
-                },
-            ));
-        }
         let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
-        let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
+        let column_pad = activity_column_padding(
+            used_width + plugin_status_width,
+            list_width,
+            slot_width,
+            badge_width,
+        );
         let column_fits = column_pad.is_some();
         if let Some(pad_len) = column_pad.filter(|&p| p > 0) {
             line_spans.push(Span::raw(" ".repeat(pad_len)));
-        }
-        if column_fits && slot_width > 0 {
-            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-            let activity_style = Style::default().fg(theme.dimmed);
-            line_spans.push(Span::styled(
-                padded,
-                if is_selected {
-                    selected_row_style(activity_style, theme)
-                } else {
-                    activity_style
-                },
-            ));
         }
 
         if let Some(badge) = terminal_badge {
@@ -2188,6 +2215,35 @@ impl HomeView {
                     selected_row_style(badge_style, theme)
                 } else {
                     badge_style
+                },
+            ));
+        }
+        for status in plugin_status_plan.iter() {
+            line_spans.push(Span::raw(" "));
+            let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
+            let mut text = truncate_to_width(status.text, status.width);
+            text.extend(std::iter::repeat_n(
+                ' ',
+                status.width.saturating_sub(rendered_width(&text)),
+            ));
+            line_spans.push(Span::styled(
+                text,
+                if is_selected {
+                    selected_row_style(status_style, theme)
+                } else {
+                    status_style
+                },
+            ));
+        }
+        if column_fits && slot_width > 0 {
+            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
+            let activity_style = Style::default().fg(theme.dimmed);
+            line_spans.push(Span::styled(
+                padded,
+                if is_selected {
+                    selected_row_style(activity_style, theme)
+                } else {
+                    activity_style
                 },
             ));
         }
@@ -5533,41 +5589,41 @@ mod plugin_status_plan_tests {
     #[test]
     fn status_plan_respects_width_budgets() {
         let statuses = [
-            ("Open", Some(Tone::Success)),
-            ("CI", Some(Tone::Info)),
-            ("WIP", Some(Tone::Warn)),
+            ("plugin", "Open", Some(Tone::Success)),
+            ("plugin", "CI", Some(Tone::Info)),
+            ("plugin", "WIP", Some(Tone::Warn)),
         ];
         let cases: &[StatusPlanCase] = &[
             ("empty", 32, 0, vec![], 0),
-            ("separator only", 2, 3, vec![], 0),
-            ("narrow", 3, 1, vec![("Open", Some(Tone::Success), 1)], 3),
-            ("exact", 6, 1, vec![("Open", Some(Tone::Success), 4)], 6),
+            ("separator only", 1, 3, vec![], 0),
+            ("narrow", 2, 1, vec![("Open", Some(Tone::Success), 1)], 2),
+            ("exact", 5, 1, vec![("Open", Some(Tone::Success), 4)], 5),
             (
                 "multiple",
-                10,
+                8,
                 2,
                 vec![
                     ("Open", Some(Tone::Success), 4),
                     ("CI", Some(Tone::Info), 2),
                 ],
-                10,
+                8,
             ),
             (
                 "truncated first",
-                5,
+                4,
                 1,
                 vec![("Open", Some(Tone::Success), 3)],
-                5,
+                4,
             ),
             (
                 "truncated later",
-                9,
+                7,
                 2,
                 vec![
                     ("Open", Some(Tone::Success), 4),
                     ("CI", Some(Tone::Info), 1),
                 ],
-                9,
+                7,
             ),
         ];
 
@@ -5580,5 +5636,41 @@ mod plugin_status_plan_tests {
             assert_eq!(&actual, expected, "{name}");
             assert_eq!(plan.width, *expected_width, "{name}");
         }
+    }
+
+    #[test]
+    fn status_plan_shares_lane_between_plugins() {
+        let statuses = [
+            ("github", "first pull request", None),
+            ("github", "second pull request", None),
+            ("linear", "ISSUE", None),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
+        assert_eq!(
+            actual,
+            [
+                ("first pull request", 18),
+                ("ISSUE", 5),
+                ("second pull request", 6)
+            ]
+        );
+        assert_eq!(plan.width, 32);
+    }
+
+    #[test]
+    fn status_plan_reserves_space_for_other_plugins() {
+        let statuses = [
+            ("github", "a very long pull request status label", None),
+            ("github", "second", None),
+            ("linear", "L", None),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
+        assert_eq!(
+            actual,
+            [("a very long pull request status label", 29), ("L", 1)]
+        );
+        assert_eq!(plan.width, 32);
     }
 }

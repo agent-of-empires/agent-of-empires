@@ -25,7 +25,7 @@ const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
 const ROW_COLUMN_MAX_WIDTH: usize = 24;
 
 /// Gap between two plugins' cells inside the same column.
-const ROW_COLUMN_GAP: &str = "  ";
+const ROW_COLUMN_GAP: &str = " ";
 
 /// One plugin's `row-column` text plus the tone to paint it in.
 type RowColumnCell = (String, Option<Tone>);
@@ -48,7 +48,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
     let mut budget = ROW_COLUMN_MAX_WIDTH;
     let mut width = 0;
     let mut cells = Vec::new();
-    for (text, tone) in plugin_ui::session_row_statuses(&state.plugin_ui, session_id) {
+    for (_, text, tone) in plugin_ui::session_row_statuses(&state.plugin_ui, session_id) {
         let gap = if cells.is_empty() {
             0
         } else {
@@ -213,6 +213,7 @@ Press r to refresh, q to quit.",
             ];
             if plugin_width > 0 {
                 let (cells, width) = &plugin_cells[idx];
+                spans.push(Span::raw(" ".repeat(plugin_width - width)));
                 for (i, (text, tone)) in cells.iter().enumerate() {
                     if i > 0 {
                         spans.push(Span::raw(ROW_COLUMN_GAP));
@@ -222,13 +223,7 @@ Press r to refresh, q to quit.",
                         readable(plugin_ui::tone_style(*tone, theme)),
                     ));
                 }
-                // Pad to the shared width, then the inter-column gap, so the
-                // path starts at the same screen column on every row.
-                spans.push(Span::raw(format!(
-                    "{:width$}{ROW_COLUMN_GAP}",
-                    "",
-                    width = plugin_width - width
-                )));
+                spans.push(Span::raw("  "));
             }
             spans.push(Span::styled(s.project_path.clone(), readable(path_style)));
             ListItem::new(Line::from(spans))
@@ -387,6 +382,19 @@ mod tests {
         assert_eq!(
             column_of(&painted, "/tmp/s1"),
             column_of(&painted, "/tmp/s2")
+        );
+    }
+
+    #[test]
+    fn plugin_column_right_aligns_statuses() {
+        let state = state_with(
+            &["s1", "s2"],
+            json!([row_column("s1", "long status"), row_column("s2", "short")]),
+        );
+        let painted = rows(&state);
+        assert_eq!(
+            column_of(&painted, "long status") + "long status".len(),
+            column_of(&painted, "short") + "short".len()
         );
     }
 

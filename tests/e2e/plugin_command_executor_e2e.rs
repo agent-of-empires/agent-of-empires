@@ -127,8 +127,8 @@ const send = (method, params) => {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: ++nextId, method, params }) + '\n');
 };
 const resources = {
-  github: { id: 'pr', text: 'Open', tone: 'success' },
-  linear: { id: 'issue', text: 'WIP', tone: 'info' },
+  github: { id: 'pr', text: '⇄', tone: 'success' },
+  linear: { id: 'issue', text: '◐', tone: 'info' },
 };
 const resource = resources[process.argv[2]];
 const rl = readline.createInterface({ input: process.stdin });
@@ -141,7 +141,9 @@ rl.on('line', (line) => {
         slot: 'row-badge',
         id: resource.id,
         session_id: session.id,
-        payload: { text: resource.text, tone: resource.tone },
+        payload: process.argv[2] === 'github'
+          ? { items: [{ text: '⇄', tone: 'success' }, { text: '✓', tone: 'success' }, { text: '✉', tone: 'warn' }] }
+          : { text: resource.text, tone: resource.tone },
       });
     }
   }
@@ -358,7 +360,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         "add",
         project.to_str().unwrap(),
         "-t",
-        "Plugin Resources",
+        "PR",
         "-c",
         "claude",
         "--structured-view",
@@ -368,24 +370,29 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         "session creation failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
-    if include_github {
-        h.wait_for_timeout("Open", Duration::from_secs(30));
-    }
-    if include_linear {
-        h.wait_for_timeout("WIP", Duration::from_secs(30));
-    }
-    let home_screen = h.capture_screen();
-    let status_row = home_screen
-        .lines()
-        .find(|line| line.contains("Plugin Resources"))
-        .unwrap_or_else(|| panic!("session row missing from screen: {home_screen}"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status_row = loop {
+        let screen = h.capture_screen();
+        if let Some(row) = screen.lines().find(|line| {
+            line.contains("PR")
+                && line.contains("⇄") == include_github
+                && line.contains("◐") == include_linear
+        }) {
+            break row.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin badges missing for {scenario}: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
-        status_row.contains("Open"),
+        status_row.contains("⇄"),
         include_github,
         "GitHub row badge presence mismatch for {scenario}: {status_row}"
     );
     assert_eq!(
-        status_row.contains("WIP"),
+        status_row.contains("◐"),
         include_linear,
         "Linear row badge presence mismatch for {scenario}: {status_row}"
     );

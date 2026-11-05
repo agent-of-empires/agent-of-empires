@@ -163,7 +163,7 @@ pub fn compare_sort_values(
 pub fn session_row_statuses<'a>(
     snapshot: &'a UiSnapshot,
     session_id: &'a str,
-) -> impl Iterator<Item = (&'a str, Option<Tone>)> {
+) -> impl Iterator<Item = (&'a str, &'a str, Option<Tone>)> + Clone {
     snapshot
         .entries
         .iter()
@@ -177,7 +177,7 @@ pub fn session_row_statuses<'a>(
                 items
                     .into_iter()
                     .flat_map(|items| items.iter())
-                    .filter_map(|item| {
+                    .filter_map(move |item| {
                         let text = item
                             .get("text")
                             .or_else(|| item.get("tooltip"))
@@ -187,7 +187,7 @@ pub fn session_row_statuses<'a>(
                         let tone = item
                             .get("tone")
                             .and_then(|value| serde_json::from_value(value.clone()).ok());
-                        Some((text, tone))
+                        Some((entry.plugin_id.as_str(), text, tone))
                     });
             let fallback = std::iter::once(entry)
                 .filter(move |_| items.is_none())
@@ -199,7 +199,7 @@ pub fn session_row_statuses<'a>(
                             .map(str::trim)
                             .filter(|text| !text.is_empty())
                     })?;
-                    Some((text, entry_tone(entry)))
+                    Some((entry.plugin_id.as_str(), text, entry_tone(entry)))
                 });
             item_statuses.chain(fallback)
         })
@@ -933,9 +933,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("#42", Some(Tone::Success)),
-                ("CI failed", Some(Tone::Danger)),
-                ("In Progress", Some(Tone::Info)),
+                ("gh", "#42", Some(Tone::Success)),
+                ("gh", "CI failed", Some(Tone::Danger)),
+                ("linear", "In Progress", Some(Tone::Info)),
             ]
         );
     }
