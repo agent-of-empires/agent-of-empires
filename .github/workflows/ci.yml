@@ -10,7 +10,7 @@ on:
   merge_group:
 
 # The event keeps a queue run and the push of its fast-forwarded commit apart.
-# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
+# Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -215,6 +215,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs
       - run: scripts/verify-shared-target.sh --self-test
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
