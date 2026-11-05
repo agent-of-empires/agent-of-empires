@@ -69,6 +69,18 @@ impl AoeIngress {
         now_ms: i64,
     ) -> Ingested {
         if self.lost.load(Ordering::Relaxed) {
+            // Nothing is delivered, but the proxy keeps numbering adapter
+            // frames, so the count must too or anchors lag after recovery.
+            let anchored = serde_json::to_value(&notification.update)
+                .ok()
+                .and_then(|v| aoe_meta::from_update_value(&v).ok().flatten())
+                .is_some_and(|e| e.after_adapter_sequence.is_some());
+            if !anchored {
+                self.order
+                    .lock()
+                    .expect("aoe ordering mutex poisoned")
+                    .count_frame();
+            }
             return Ingested::Deliver(Vec::new());
         }
         let proxied = self.proxied.load(Ordering::Relaxed);
@@ -78,6 +90,12 @@ impl AoeIngress {
         {
             Ok(envelope) => envelope,
             Err(detail) if proxied => {
+                // A malformed envelope cannot be anchored, so it was an
+                // adapter frame the proxy numbered.
+                self.order
+                    .lock()
+                    .expect("aoe ordering mutex poisoned")
+                    .count_frame();
                 return self.lose(IntegrationLostReason::ContractViolation { detail });
             }
             Err(_) => None,
@@ -269,5 +287,20 @@ mod tests {
         assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
         i.session_reset();
         assert_eq!(ids(i.ingest(frame("b", json!(null)), true, 0, 0)), ["b"]);
+    }
+
+    #[test]
+    fn frames_lost_integration_swallows_still_advance_the_adapter_count() {
+        let i = ingress(true);
+        assert!(matches!(
+            i.ingest(frame("bad", json!({"v": 1})), true, 0, 0),
+            Ingested::Lost(_)
+        ));
+        // The bad frame was adapter frame 1; frames 2 and 3 arrive while lost.
+        assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
+        assert!(ids(i.ingest(frame("b", json!(null)), true, 0, 0)).is_empty());
+        i.session_reset();
+        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":3});
+        assert_eq!(ids(i.ingest(frame("t", anchored), true, 0, 0)), ["t"]);
     }
 }
