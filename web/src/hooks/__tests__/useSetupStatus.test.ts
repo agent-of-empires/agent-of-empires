@@ -91,3 +91,25 @@ it("a first read that never answers counts as failed after the deadline", async 
   act(() => vi.advanceTimersByTime(SETUP_READ_DEADLINE_MS));
   expect(result.current.status).toBeNull();
 });
+
+it("a superseded first read doesn't end the deadline while the newer read hangs", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let answerFirst!: () => void;
+  let reads = 0;
+  server.use(
+    http.get("*/api/setup", () => {
+      reads++;
+      if (reads === 1)
+        return new Promise<Response>((resolve) => (answerFirst = () => resolve(HttpResponse.json(status(true)))));
+      return new Promise<Response>(() => {});
+    }),
+  );
+  const { result } = renderHook(() => useSetupStatus(true));
+  await waitFor(() => expect(answerFirst).toBeDefined());
+  act(() => notifySettingsChanged());
+  await waitFor(() => expect(reads).toBe(2));
+  await act(async () => answerFirst());
+  expect(result.current.status).toBeUndefined();
+  act(() => vi.advanceTimersByTime(SETUP_READ_DEADLINE_MS));
+  expect(result.current.status).toBeNull();
+});
