@@ -569,6 +569,11 @@ const requestCases: RequestCase[] = [
   ["GET /api/plugins/commands", () => api.fetchPluginCommands()],
   ["GET /api/plugins/ui-state", () => api.fetchPluginUiState()],
   [
+    "GET /api/plugins/p/panes/q?session_id=s1",
+    () => api.fetchPluginPane("p", "q", "s1"),
+    { respond: json({ blocks: [] }), result: { blocks: [] } },
+  ],
+  [
     "POST /api/plugins/commands/plugin.a.b/invoke",
     () => api.invokePluginCommand("plugin.a.b", "s1"),
     { body: { session_id: "s1" }, respond: empty(202), result: true },

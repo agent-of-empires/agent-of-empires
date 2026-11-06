@@ -1493,6 +1493,7 @@ mod tests {
             icon: None,
             entry: None,
             deep_link: false,
+            lazy: false,
         }
     }
 

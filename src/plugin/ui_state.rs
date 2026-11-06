@@ -598,6 +598,15 @@ fn max_payload_bytes(slot: UiSlot) -> usize {
     }
 }
 
+/// Validates the payload a worker rendered for a lazy pane, held to the same rules and cap as a pushed pane.
+pub fn validate_rendered_pane(raw: &Value) -> Result<Value, String> {
+    let normalized = validate_payload(UiSlot::Pane, raw)?;
+    if normalized.to_string().len() > MAX_PANE_PAYLOAD_BYTES {
+        return Err("payload too large".into());
+    }
+    Ok(normalized)
+}
+
 fn check_scope(slot: UiSlot, session_id: Option<&str>) -> Result<(), UiError> {
     if slot == UiSlot::Notification {
         return Err(UiError::BadRequest(
@@ -735,6 +744,19 @@ mod tests {
         payload: Value,
     ) -> Result<(), UiError> {
         store.set("acme.kit", generation, slot, id, session_id, &payload)
+    }
+
+    #[test]
+    fn rendered_pane_is_held_to_the_pushed_pane_rules() {
+        let blocks = json!({"blocks": [{"kind": "heading", "text": "x"}]});
+        assert_eq!(validate_rendered_pane(&blocks), Ok(blocks.clone()));
+        assert!(validate_rendered_pane(&json!({"bogus": 1})).is_err());
+        assert!(validate_rendered_pane(&json!({"blocks": [{"kind": "markdown"}]})).is_err());
+        let big = json!({"body": "x".repeat(MAX_PANE_PAYLOAD_BYTES)});
+        assert_eq!(
+            validate_rendered_pane(&big),
+            Err("payload too large".to_string())
+        );
     }
 
     fn entry(session_id: &str, payload: Value) -> UiEntry {

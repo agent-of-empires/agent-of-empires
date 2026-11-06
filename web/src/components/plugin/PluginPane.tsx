@@ -1,3 +1,4 @@
+import { useLazyPane } from "../../hooks/useLazyPane";
 import type { PluginUiEntry } from "../../lib/api";
 import { usePluginUiRefreshing } from "../../lib/pluginUiContext";
 import { lucideIcon, payloadStr, toneTextClass, validTone } from "../../lib/pluginUi";
@@ -8,13 +9,15 @@ import { isObject, objectList, renderIcon, str, type Obj } from "./slotPayload";
 /** The scrollable body of one plugin pane: a `blocks` list or the simple
  *  `{ title, body }` form, plus an optional pinned footer. */
 export function PluginPaneBody({
-  entry,
+  entry: stub,
   titleInChrome = false,
 }: {
   entry: PluginUiEntry;
   /** The caller already renders the payload title. */
   titleInChrome?: boolean;
 }) {
+  const lazy = useLazyPane(stub);
+  const entry = lazy?.status === "ready" ? { ...stub, payload: { ...stub.payload, ...lazy.payload } } : stub;
   const blocks = objectList(entry.payload, "blocks");
   const title = titleInChrome ? undefined : payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
@@ -43,6 +46,10 @@ export function PluginPaneBody({
             {blocks.map((b, i) => (
               <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />
             ))}
+          </div>
+        ) : lazy?.status === "failed" ? (
+          <div className="text-xs text-text-dim" data-testid="plugin-pane-failed">
+            Could not load this pane.
           </div>
         ) : (
           <>

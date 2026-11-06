@@ -19,6 +19,7 @@ use serde_json::json;
 use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
+use crate::plugin::worker_requests::WorkerRequestError;
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
 use crate::server::principal::{authorize, Capability, Principal};
 
@@ -320,7 +321,29 @@ pub async fn plugin_ui_state(State(state): State<std::sync::Arc<AppState>>) -> R
         None => empty(),
     };
     body["pages"] = json!(pages);
+    mark_lazy_panes(&mut body);
     Json(body).into_response()
+}
+
+/// Tells the dashboard which pane entries are stubs whose content it fetches on open.
+fn mark_lazy_panes(body: &mut serde_json::Value) {
+    let Some(entries) = body["entries"].as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let lazy = entry["slot"] == "pane"
+            && entry["plugin_id"]
+                .as_str()
+                .zip(entry["id"].as_str())
+                .is_some_and(|(plugin_id, id)| {
+                    plugin::registry()
+                        .get(plugin_id)
+                        .is_some_and(|p| p.manifest.pane_lazy(id))
+                });
+        if lazy {
+            entry["lazy"] = json!(true);
+        }
+    }
 }
 
 /// `GET /api/plugins/updates`: which installed external plugins have an update
@@ -410,6 +433,91 @@ pub async fn plugin_sessions(
         .map(plugin::host_api::session_summary)
         .collect();
     Json(json!({ "sessions": sessions })).into_response()
+}
+const PANE_RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Deserialize)]
+pub struct PluginPaneQuery {
+    pub session_id: String,
+}
+
+/// `GET /api/plugins/{id}/panes/{pane_id}?session_id=`: the content of a lazy
+/// pane, rendered by the worker on request and never stored in the UI snapshot.
+pub async fn plugin_pane(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path((id, pane_id)): Path<(String, String)>,
+    Query(query): Query<PluginPaneQuery>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let lazy = plugin::registry()
+        .get(&id)
+        .filter(|p| p.active())
+        .is_some_and(|p| p.manifest.pane_lazy(&pane_id));
+    if !lazy {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_pane",
+            format!("Plugin {id} has no lazy pane {pane_id}"),
+        );
+    }
+    if !state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == query.session_id)
+    {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            format!("No session {}", query.session_id),
+        );
+    }
+    let Some(host) = state.plugin_host.as_ref() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_host",
+            "Plugin host is not running",
+        );
+    };
+    let params = json!({ "id": pane_id, "session_id": query.session_id });
+    let rendered = match host
+        .request_worker(&id, "ui.pane.render", params, PANE_RENDER_TIMEOUT)
+        .await
+    {
+        Ok(rendered) => rendered,
+        Err(WorkerRequestError::NoWorker) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_worker",
+                format!("No running worker for plugin {id}"),
+            )
+        }
+        Err(WorkerRequestError::Timeout) => {
+            return api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "pane_timeout",
+                format!("Plugin {id} did not render pane {pane_id} in time"),
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "pane_failed",
+                format!("Plugin {id} could not render pane {pane_id}: {e}"),
+            )
+        }
+    };
+    match plugin::ui_state::validate_rendered_pane(&rendered) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => api_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_pane",
+            format!("Plugin {id} rendered an invalid pane {pane_id}: {e}"),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1480,6 +1588,94 @@ id = "voice"
         login.invalidate_session(&session).await;
         let resp = send("GET", board, with_ticket, false).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "after logout");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lazy_pane_is_marked_in_the_snapshot_and_served_only_for_known_panes() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        let id = "acme.lazy";
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"Lazy\"\nversion = \"1.0.0\"\napi_version = 21\n\n\
+             [[ui]]\nslot = \"pane\"\nid = \"lazy\"\nlazy = true\n\n[[ui]]\nslot = \"pane\"\nid = \"eager\"\n"
+        );
+        let dir = crate::plugin::plugins_dir().unwrap().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        update_config(|c| {
+            c.plugins.insert(
+                id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .expect("save config");
+        crate::plugin::reload_registry();
+
+        let mut body = json!({ "entries": [
+            { "plugin_id": id, "slot": "pane", "id": "lazy", "session_id": "s1", "payload": {} },
+            { "plugin_id": id, "slot": "pane", "id": "eager", "session_id": "s1", "payload": {} },
+            { "plugin_id": id, "slot": "row-badge", "id": "lazy", "session_id": "s1", "payload": {} },
+        ]});
+        mark_lazy_panes(&mut body);
+        let marked: Vec<_> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["lazy"].as_bool().unwrap_or(false))
+            .collect();
+        assert_eq!(marked, [true, false, false]);
+
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let get =
+            |path: &str| {
+                let mut req = axum::http::Request::get(path)
+                    .header("host", "127.0.0.1")
+                    .header("cookie", "aoe_token=secret-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+        for (path, code) in [
+            (
+                "/api/plugins/acme.lazy/panes/eager?session_id=s1",
+                "unknown_pane",
+            ),
+            (
+                "/api/plugins/acme.lazy/panes/nope?session_id=s1",
+                "unknown_pane",
+            ),
+            (
+                "/api/plugins/acme.none/panes/lazy?session_id=s1",
+                "unknown_pane",
+            ),
+            (
+                "/api/plugins/acme.lazy/panes/lazy?session_id=s1",
+                "unknown_session",
+            ),
+        ] {
+            let resp = get(path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"], code, "{path}: {json}");
+        }
     }
 
     #[tokio::test]
