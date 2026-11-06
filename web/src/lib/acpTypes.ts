@@ -1488,16 +1488,30 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
-    backgroundShells: (reduced.background_shells ?? []).map((s) => ({
-      taskId: s.task_id,
-      command: s.command,
-      startedAt: s.started_at ?? null,
-      endedAt: s.ended_at ?? null,
-      finished: s.finished ?? false,
-    })),
+    backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     locallyResolved,
   };
+}
+
+/** A snapshot older than a finish already applied must not reopen the shell.
+ *  A reused task id has a different start time, so it still replaces the run. */
+function restoreBackgroundShells(
+  local: BackgroundShell[],
+  records: NonNullable<ReducedState["background_shells"]>,
+): BackgroundShell[] {
+  return records.map((r) => {
+    const startedAt = r.started_at ?? null;
+    const done = local.find((s) => s.taskId === r.task_id && s.finished && s.startedAt === startedAt);
+    if (done && !r.finished) return done;
+    return {
+      taskId: r.task_id,
+      command: r.command,
+      startedAt,
+      endedAt: r.ended_at ?? null,
+      finished: r.finished ?? false,
+    };
+  });
 }
 
 /** The replay window can miss a run's launch or finish. Adopts runs it
