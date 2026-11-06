@@ -2932,6 +2932,7 @@ mod tests {
                     tool_call_id: Some("toolu_1".into()),
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             ];
             if !main_running {
