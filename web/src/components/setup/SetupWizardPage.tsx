@@ -21,7 +21,7 @@ import { AccessStep } from "./steps/AccessStep";
 import { AgentsStep } from "./steps/AgentsStep";
 import { ProjectStep } from "./steps/ProjectStep";
 import { SandboxStep } from "./steps/SandboxStep";
-import { ThemeTelemetryStep } from "./steps/ThemeTelemetryStep";
+import { ThemeTelemetryStep, type TelemetryLoad } from "./steps/ThemeTelemetryStep";
 import { WorktreesStep } from "./steps/WorktreesStep";
 
 interface Props {
@@ -50,7 +50,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const [machine, setMachine] = useState<MachineValues | null>(null);
   const [share, setShare] = useState(false);
   const [doNotTrack, setDoNotTrack] = useState(false);
-  const [telemetryLoaded, setTelemetryLoaded] = useState(false);
+  const [telemetry, setTelemetry] = useState<TelemetryLoad>("loading");
+  const [telemetryChecks, setTelemetryChecks] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -60,13 +61,26 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   useEffect(() => {
     void getSettingsSchema().then((s) => setSchema(s ?? []));
     void fetchMachineSettings().then((s: SettingsResponse | null) => setMachine((s ?? {}) as MachineValues));
-    void fetchTelemetryStatus().then((t) => {
-      if (!t) return;
-      setShare(t.enabled);
-      setDoNotTrack(t.do_not_track);
-      setTelemetryLoaded(true);
-    });
   }, []);
+
+  useEffect(() => {
+    let live = true;
+    void fetchTelemetryStatus().then((t) => {
+      if (!live) return;
+      if (t) {
+        setShare(t.enabled);
+        setDoNotTrack(t.do_not_track);
+      }
+      setTelemetry(t ? "loaded" : "failed");
+    });
+    return () => {
+      live = false;
+    };
+  }, [telemetryChecks]);
+  const retryTelemetry = () => {
+    setTelemetry("loading");
+    setTelemetryChecks((n) => n + 1);
+  };
 
   // A modal <dialog> traps focus, makes the page inert, closes on Escape and restores focus.
   useEffect(() => {
@@ -144,8 +158,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const next = () =>
     run(async () => {
       let current = status;
-      // Without a loaded status, `share` is a placeholder that would overwrite the saved choice.
-      if (step.key === "theme_telemetry" && telemetryLoaded && !doNotTrack) {
+      // Saving the choice is what sets this step up; Next waits for the saved choice to load.
+      if (step.key === "theme_telemetry" && !doNotTrack) {
         if (!(await setTelemetryConsent(share))) {
           setError("Couldn't save your telemetry choice. Try again.");
           return;
@@ -153,7 +167,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
         current = (await refresh()) ?? status;
       }
       // Next on an optional step keeps its defaults, which counts as set up.
-      if (!step.required && !current.steps.find((s) => s.key === step.key)?.configured) {
+      if (
+        !step.required &&
+        step.key !== "theme_telemetry" &&
+        !current.steps.find((s) => s.key === step.key)?.configured
+      ) {
         const result = await updateSetup({ confirmed_steps: [...confirmedKeys, step.key] });
         if (!result.ok) {
           setError(result.message ?? "Couldn't save this step.");
@@ -190,7 +208,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
 
   const done = configuredCount(steps);
   const percent = Math.round((done / steps.length) * 100);
-  const blocked = step.required && !step.configured;
+  const blocked = (step.required && !step.configured) || (step.key === "theme_telemetry" && telemetry !== "loaded");
   const info = SETUP_STEP_INFO[step.key];
   const values = (section: string) => machine?.[section] ?? {};
 
@@ -257,7 +275,13 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
               <p className="text-sm text-text-secondary">{info.lead}</p>
             </header>
             {step.key === "theme_telemetry" && (
-              <ThemeTelemetryStep share={share} onShareChange={setShare} doNotTrack={doNotTrack} />
+              <ThemeTelemetryStep
+                share={share}
+                onShareChange={setShare}
+                doNotTrack={doNotTrack}
+                telemetry={telemetry}
+                onRetryTelemetry={retryTelemetry}
+              />
             )}
             {machine === null && step.key !== "theme_telemetry" && step.key !== "project" && (
               <p className="text-sm text-text-dim">Loading settings…</p>
