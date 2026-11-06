@@ -135,6 +135,25 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
         }
+        // A custom agent's declared reset alias, so the composer treats it as a clear command.
+        if resp.clear_aliases.is_empty() {
+            let agent_key = inst
+                .agent_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&inst.tool);
+            let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
+            if let Some(profile) = crate::acp::agent_profiles::resolve_with_aliases(
+                agent_key,
+                &cfg.declared_clear_aliases(),
+            )
+            .clear_aliases
+            .first()
+            .filter(|_| !crate::acp::agent_profiles::is_builtin(agent_key))
+            {
+                resp.clear_aliases = vec![profile.to_string()];
+            }
+        }
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {
             resp.structured_view_off = !session_cfg_cache

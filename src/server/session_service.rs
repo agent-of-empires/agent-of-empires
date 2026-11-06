@@ -1735,7 +1735,7 @@ impl SessionService {
             return;
         };
 
-        let (caller, agent_key, queue) = {
+        let (caller, agent_key, queue, source_profile, project_path) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
                 return;
@@ -1761,7 +1761,13 @@ impl SessionService {
                 None => SessionCaller::User,
             };
             let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
-            (caller, agent_key, queue)
+            (
+                caller,
+                agent_key,
+                queue,
+                inst.effective_profile(),
+                std::path::PathBuf::from(&inst.project_path),
+            )
         };
 
         // `Status::Idle` above is a mirror the broadcast listener applies one serial task
@@ -1772,7 +1778,9 @@ impl SessionService {
         }
 
         // Leading batch up to a clear or compact boundary.
-        let profile = crate::acp::agent_profiles::resolve(&agent_key);
+        let profile =
+            crate::acp::supervisor::profile_for_agent(&agent_key, &source_profile, &project_path)
+                .await;
         let (sub, combined) = queue_drain_batch(&queue, profile);
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
@@ -2079,11 +2087,24 @@ impl SessionService {
     }
 
     async fn is_solo_command(&self, id: &str, text: &str) -> bool {
-        let instances = self.instances.read().await;
-        instances.iter().find(|i| i.id == id).is_some_and(|inst| {
-            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
-            crate::acp::agent_profiles::resolve(agent_key).is_solo_command(text)
-        })
+        let found = {
+            let instances = self.instances.read().await;
+            instances.iter().find(|i| i.id == id).map(|inst| {
+                (
+                    inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone()),
+                    inst.effective_profile(),
+                    std::path::PathBuf::from(&inst.project_path),
+                )
+            })
+        };
+        match found {
+            Some((agent, profile, path)) => {
+                crate::acp::supervisor::profile_for_agent(&agent, &profile, &path)
+                    .await
+                    .is_solo_command(text)
+            }
+            None => false,
+        }
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].

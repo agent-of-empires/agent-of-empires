@@ -1322,6 +1322,21 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
+    /// Conversation-reset slash command for a custom ACP agent, `"/clear"` or
+    /// `"/new"` (e.g. "my-claude" = "/clear"). A custom agent has no built-in
+    /// profile, so without an entry its reset command reaches the model as an
+    /// ordinary prompt. With one, aoe drives a fresh `session/new` for it as it
+    /// does for a built-in agent. Applies only to an agent with its own `agent_acp_cmd`.
+    /// Repo-denied like `agent_acp_cmd`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Clear Alias",
+        widget = "list",
+        web = "local_only:declares which slash command resets a custom agent's conversation",
+        category = "Agents"
+    )]
+    pub agent_clear_alias: HashMap<String, String>,
+
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
     /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
@@ -2025,6 +2040,7 @@ impl Default for SessionConfig {
             agent_detect_as: HashMap::new(),
             agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_clear_alias: HashMap::new(),
             agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
@@ -2176,6 +2192,17 @@ impl SessionConfig {
         }
     }
 
+    /// The `agent_clear_alias` entries that apply: only an agent launched through its own
+    /// `agent_acp_cmd`. An agent inheriting a built-in adapter through `agent_detect_as` runs as
+    /// that built-in, whose profile already decides its reset command.
+    pub fn declared_clear_aliases(&self) -> HashMap<String, String> {
+        self.agent_clear_alias
+            .iter()
+            .filter(|(name, _)| self.agent_acp_cmd.contains_key(*name))
+            .map(|(name, alias)| (name.clone(), alias.clone()))
+            .collect()
+    }
+
     /// Log warnings for misconfigured custom agent entries.
     /// Called after config load to surface TOML editing mistakes.
     pub fn warn_custom_agent_issues(&self) {
@@ -2211,6 +2238,24 @@ impl SessionConfig {
                     name,
                     target,
                     crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        for (name, alias) in &self.agent_clear_alias {
+            if name.is_empty() || crate::acp::agent_profiles::alias_profile(alias).is_none() {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' = '{}' is ignored; use an agent name and \"/clear\" or \"/new\"",
+                    name, alias
+                );
+            } else if crate::agents::get_agent(name).is_some() {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' is a built-in agent with its own reset command; the entry is ignored",
+                    name
+                );
+            } else if !self.agent_acp_cmd.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' has no agent_acp_cmd entry, so it runs as another agent; the entry is ignored",
+                    name
                 );
             }
         }
@@ -4026,6 +4071,25 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_clear_aliases_apply_only_to_an_agent_with_its_own_acp_command() {
+        let mut config = SessionConfig::default();
+        config.agent_clear_alias = [("own", "/clear"), ("inherits", "/new")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        config
+            .agent_acp_cmd
+            .insert("own".into(), "own-bridge acp".into());
+        // `inherits` has no agent_acp_cmd: it is launched as its agent_detect_as base.
+        config
+            .agent_detect_as
+            .insert("inherits".into(), "claude".into());
+        let declared = config.declared_clear_aliases();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared.get("own").map(String::as_str), Some("/clear"));
+    }
 
     #[test]
     fn notice_policy_hides_by_display_severity_and_age() {

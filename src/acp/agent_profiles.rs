@@ -198,6 +198,52 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     ..DEFAULT
 };
 
+/// True when `key` names an agent with its own built-in profile.
+pub fn is_builtin(key: &str) -> bool {
+    resolve(key).key != DEFAULT.key
+}
+
+/// A custom agent that resets with `/clear`, declared by `session.agent_clear_alias`.
+pub const CUSTOM_CLEAR: AgentProfile = AgentProfile {
+    key: "custom-clear",
+    clear_aliases: &["/clear"],
+    clear_requires_driven_reset: true,
+    ..DEFAULT
+};
+
+/// A custom agent that resets with `/new`, declared by `session.agent_clear_alias`.
+pub const CUSTOM_NEW: AgentProfile = AgentProfile {
+    key: "custom-new",
+    clear_aliases: &["/new"],
+    clear_requires_driven_reset: true,
+    ..DEFAULT
+};
+
+/// The profile a declared reset alias selects, or `None` for anything but `/clear` or `/new`.
+pub fn alias_profile(alias: &str) -> Option<&'static AgentProfile> {
+    match alias.trim() {
+        "/clear" => Some(&CUSTOM_CLEAR),
+        "/new" => Some(&CUSTOM_NEW),
+        _ => None,
+    }
+}
+
+/// [`resolve`], except that an agent with no built-in profile takes the reset alias the
+/// session configuration declares for it. A built-in agent keeps its own profile.
+pub fn resolve_with_aliases(
+    key: &str,
+    clear_aliases: &std::collections::HashMap<String, String>,
+) -> &'static AgentProfile {
+    let profile = resolve(key);
+    if profile.key != DEFAULT.key {
+        return profile;
+    }
+    clear_aliases
+        .get(key)
+        .and_then(|alias| alias_profile(alias))
+        .unwrap_or(profile)
+}
+
 /// Resolve a static profile by registry key.
 pub fn resolve(key: &str) -> &'static AgentProfile {
     match key {
@@ -252,6 +298,40 @@ mod tests {
                 want,
                 "{} {text:?}",
                 profile.key
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_alias_gives_a_custom_agent_a_reset_but_never_a_built_in() {
+        let aliases: std::collections::HashMap<String, String> = [
+            ("my-claude", "/clear"),
+            ("my-codex", " /new "),
+            ("odd", "/compact"),
+            ("claude", "/new"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        // (agent, text, resets)
+        let cases = [
+            ("my-claude", "/clear", true),
+            ("my-claude", "/new", false),
+            ("my-codex", "/new", true),
+            ("my-codex", "/clear", false),
+            ("odd", "/compact", false),
+            ("unlisted", "/clear", false),
+            // A built-in agent keeps its own alias whatever the map says.
+            ("claude", "/clear", true),
+            ("claude", "/new", false),
+        ];
+        for (agent, text, resets) in cases {
+            let profile = resolve_with_aliases(agent, &aliases);
+            assert_eq!(profile.is_clear_command(text), resets, "{agent} {text:?}");
+            assert_eq!(
+                profile.is_clear_command(text) && profile.clear_requires_driven_reset,
+                resets,
+                "{agent} {text:?}"
             );
         }
     }

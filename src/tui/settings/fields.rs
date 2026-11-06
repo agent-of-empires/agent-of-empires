@@ -379,6 +379,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "custom_agents"
                 | "agent_detect_as"
                 | "agent_acp_cmd"
+                | "agent_clear_alias"
                 | "agent_config_dir"
                 | "agent_execution_as"
         )
@@ -1134,6 +1135,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_clear_alias_entries_round_trip_as_a_map_not_an_array() {
+        assert!(is_map_list("session", "agent_clear_alias"));
+        let items = vec!["bridge=/clear".to_string(), "other=/new".to_string()];
+        let value = parse_key_value_object(&items);
+        assert_eq!(value, json!({ "bridge": "/clear", "other": "/new" }));
+        // The settings struct accepts the map the TUI writes, so the entry is not discarded.
+        let config: crate::session::SessionConfig =
+            serde_json::from_value(json!({ "agent_clear_alias": value })).unwrap();
+        assert_eq!(
+            config.agent_clear_alias.get("bridge").map(String::as_str),
+            Some("/clear")
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn smart_rename_picker_retains_a_configured_agent_until_discovery_finishes() {
         let _home = crate::session::test_support::isolate_app_dir();
@@ -1253,6 +1269,7 @@ mod tests {
             "session.agent_command_override",
             "session.agent_extra_args",
             "session.agent_acp_cmd",
+            "session.agent_clear_alias",
             "session.default_tool",
             "session.agent_config_dir",
             "session.agent_execution_as",
