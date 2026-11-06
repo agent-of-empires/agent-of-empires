@@ -378,9 +378,26 @@ mod tests {
         use std::time::Instant;
         let temp = tempfile::tempdir().unwrap();
         let node = temp.path().join("node");
-        let script = format!("#!/bin/sh\nsleep 30 &\necho {PINNED_NODE_VERSION}\n");
+        let pid_file = temp.path().join("descendant.pid");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > {}\necho {PINNED_NODE_VERSION}\n",
+            pid_file.display()
+        );
         std::fs::write(&node, script).unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        struct KillDescendant(std::path::PathBuf);
+        impl Drop for KillDescendant {
+            fn drop(&mut self) {
+                let pid = std::fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<libc::pid_t>().ok());
+                if let Some(pid) = pid {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let _cleanup = KillDescendant(pid_file);
 
         let started = Instant::now();
         let resolved = verify_path_within(&node, NodeSource::Env, Duration::from_secs(5))
