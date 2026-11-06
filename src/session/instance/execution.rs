@@ -2236,7 +2236,9 @@ impl Instance {
             routing.push(("XDG_STATE_HOME".into(), value("XDG_STATE_HOME")));
         }
         let path = value("PATH");
-        let omp = if agent.name == "omp" {
+        let omp = if agent.name == "omp"
+            || capture_backend == Some(crate::agents::SessionCaptureBackend::Omp)
+        {
             let args = if self.command.is_empty() {
                 crate::session::config::quote_model_value_in_args(&self.extra_args)
             } else {

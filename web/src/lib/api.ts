@@ -792,6 +792,8 @@ export interface PluginAgentReplyFallback {
 }
 
 export interface PluginAgentIntegration {
+  provider_versions?: string[];
+  replies?: boolean;
   tool: string;
   command?: string;
   launch?: PluginAgentLaunch;

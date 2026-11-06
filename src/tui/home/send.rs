@@ -153,6 +153,10 @@ impl HomeView {
         // An approved reply integration owns replies even when its report is
         // missing; never fall back to terminal keys.
         if crate::plugin::agent_integration::replies_configured(inst) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Response Not Sent",
+                "This agent now owns replies natively, so no terminal keys were sent.",
+            ));
             return;
         }
         let Some(response) =

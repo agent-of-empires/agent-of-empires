@@ -4,8 +4,8 @@ import type { PluginAgentIntegration } from "../../../lib/api";
 import { agentIntegrationDetails } from "../agentIntegrationDetails";
 
 describe("agentIntegrationDetails", () => {
-  it("discloses nothing beyond the command for a command-only integration", () => {
-    expect(agentIntegrationDetails({ tool: "omp", command: "omp" })).toEqual([]);
+  it("discloses reply ownership for a command-only integration", () => {
+    expect(agentIntegrationDetails({ tool: "omp", command: "omp" })).toEqual(["native replies: no"]);
   });
 
   it("names every launch, detection, and reply declaration shown in consent", () => {
@@ -43,6 +43,7 @@ describe("agentIntegrationDetails", () => {
       "host only",
       "install: curl -fsSL https://omp.sh/install | sh",
       "detection: screen",
+      "native replies: no",
       'reply fallback: allow [yes, "y"], deny [no]',
     ]);
   });
@@ -56,7 +57,7 @@ describe("agentIntegrationDetails", () => {
           resume: { kind: "flag", flag: "--resume" },
         },
       }),
-    ).toEqual(["launch flags: yolo --yolo", "resume: flag --resume"]);
+    ).toEqual(["launch flags: yolo --yolo", "resume: flag --resume", "native replies: no"]);
 
     expect(
       agentIntegrationDetails({
@@ -66,7 +67,7 @@ describe("agentIntegrationDetails", () => {
           resume: { kind: "subcommand", command: "resume" },
         },
       }),
-    ).toEqual(["launch flags: yolo always", "resume: subcommand resume"]);
+    ).toEqual(["launch flags: yolo always", "resume: subcommand resume", "native replies: no"]);
   });
 
   it("escapes control and bidi characters and names permanent approvals", () => {
@@ -85,6 +86,7 @@ describe("agentIntegrationDetails", () => {
     expect(details).toEqual([
       "sandbox environment: TOOL_HOME=/tmp\\u{1b}[2J",
       "install: install \\u{202e}now",
+      "native replies: no",
       "reply fallback: allow [Enter], deny [Escape], allow always [Down]",
     ]);
   });

@@ -1771,11 +1771,26 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
 }
 
 pub fn oneshot_capable_names() -> Vec<&'static str> {
-    AGENTS
+    let mut names: Vec<&'static str> = AGENTS
         .iter()
         .filter(|a| a.oneshot_flag.is_some())
         .map(|a| a.name)
-        .collect()
+        .collect();
+    // Plugin-declared agents can run one-shots too, and they are no longer in
+    // `AGENTS` once their integration moves out of core.
+    let registry = crate::plugin::registry();
+    for entry in crate::plugin::agent_integration::catalog(
+        &registry,
+        AGENTS.iter().map(|agent| agent.name),
+        std::iter::empty::<&str>(),
+    ) {
+        if let Some(agent) = crate::plugin::agent_integration::declared_agent(entry.tool) {
+            if agent.oneshot_flag.is_some() && !names.contains(&agent.name) {
+                names.push(agent.name);
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
