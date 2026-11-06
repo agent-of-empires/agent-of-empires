@@ -236,7 +236,11 @@ pub fn agent_command<'a>(
 }
 
 fn eligible(instance: &Instance) -> bool {
-    !instance.is_structured()
+    // The provider writes its report into the host hook directory, which a
+    // sandboxed agent cannot reach from inside its container, so the pane
+    // stays the status source there.
+    !instance.is_sandboxed()
+        && !instance.is_structured()
         && !instance.is_archived()
         && !matches!(
             instance.status,
@@ -343,6 +347,19 @@ fn declared_for(tool: &str) -> Option<DeclaredAgent> {
             .iter()
             .any(|capability| capability.as_str() == "session.integration"),
     })
+}
+
+/// Launch words for a plugin-declared agent, with its leading environment
+/// assignments counted separately. `None` for a built-in or an undeclared tool,
+/// whose executable is the whole prefix.
+pub(crate) fn declared_launch_words(tool: &str) -> Option<(Vec<String>, usize)> {
+    let declared = declared_agent(tool)?;
+    if !std::ptr::eq(declared, crate::agents::get_agent(tool)?) {
+        return None;
+    }
+    let command = declared_for(tool)?.command?;
+    let (words, assignments) = aoe_plugin_api::agent_integration::literal_command_words(&command)?;
+    Some((words.into_iter().map(str::to_string).collect(), assignments))
 }
 
 static DECLARED_AGENT_CACHE: LazyLock<Mutex<HashMap<String, (u64, Option<&'static AgentDef>)>>> =
@@ -1194,6 +1211,83 @@ replies = {replies}
         })
         .unwrap();
         super::super::reload_registry();
+    }
+
+    #[test]
+    fn sandboxed_sessions_keep_the_pane_as_their_status_source() {
+        let mut instance = Instance::new("acmesandbox0001", "/tmp/acme-sandbox");
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "acme".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert!(!eligible(&instance));
+
+        instance.sandbox_info = None;
+        assert!(eligible(&instance));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_launch_words_keep_assignments_and_fixed_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.oneshot"
+name = "Declared one-shot test"
+version = "1.0.0"
+api_version = 20
+
+[[agent_integrations]]
+tool = "acme-helper"
+command = "ACME_TOKEN=local acme-helper --serve"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.oneshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.oneshot".to_string(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..crate::session::PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        assert_eq!(
+            declared_launch_words("acme-helper"),
+            Some((
+                vec![
+                    "ACME_TOKEN=local".to_string(),
+                    "acme-helper".to_string(),
+                    "--serve".to_string()
+                ],
+                1
+            ))
+        );
+        assert_eq!(declared_launch_words("claude"), None);
     }
 
     #[test]
