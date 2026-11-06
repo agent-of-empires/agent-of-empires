@@ -41,10 +41,19 @@ fn program(command: &str) -> Option<String> {
     )
 }
 
+/// A configured custom agent owns its name, so no plugin declaration
+/// describes its launch, replies or status.
+fn custom_owned(tool: &str) -> bool {
+    super::registry().custom_agents().contains(tool)
+}
+
 /// Whether this session launches the program the declaration names. A
 /// configured custom agent can share a declared tool's name while running
 /// another command, and the declaration does not describe it.
 fn launches_declared(instance: &Instance, entry: &AgentIntegrationContribution) -> bool {
+    if custom_owned(&instance.tool) {
+        return false;
+    }
     let declared = entry
         .command
         .as_deref()
@@ -348,12 +357,10 @@ struct DeclaredAgent {
 }
 
 fn declared_for(tool: &str) -> Option<DeclaredAgent> {
-    let registry = super::registry();
-    // A configured custom agent owns its name, so a declaration of the same
-    // name must not describe its launch or replies.
-    if registry.custom_agents().contains(tool) {
+    if custom_owned(tool) {
         return None;
     }
+    let registry = super::registry();
     let mut candidates = registry.active().flat_map(|plugin| {
         plugin
             .manifest
@@ -430,6 +437,9 @@ pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
 
 /// Whether an approved provider integration owns status for `tool`.
 pub(crate) fn status_owned(tool: &str) -> bool {
+    if custom_owned(tool) {
+        return false;
+    }
     let registry = super::registry();
     let owned = registry.active().any(|plugin| {
         plugin
@@ -1457,6 +1467,42 @@ SHADOW_ONLY = "1"
         declared.status = crate::session::Status::Running;
         assert!(configured(&declared));
         assert!(replies_configured(&declared));
+
+        // A blank custom selection defers to the plugin, so it owns nothing and
+        // the declaration still describes the tool.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("acme-declared".to_string(), "   ".to_string());
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(declared_agent("acme-declared").is_some());
+        assert!(configured(&declared));
+
+        // A custom wrapper whose path basename matches the plugin CLI is still
+        // the custom agent, so neither the integration nor the status gate may
+        // claim it.
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "acme-shared".to_string(),
+                "/opt/custom/acme-shared --custom-mode".to_string(),
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+        let mut colliding = Instance::new("acme-colliding", "/tmp/acme-colliding");
+        colliding.tool = "acme-shared".into();
+        colliding.command = "/opt/custom/acme-shared --custom-mode".into();
+        colliding.status = crate::session::Status::Running;
+        assert!(!configured(&colliding));
+        assert!(!replies_configured(&colliding));
+        assert!(!status_owned("acme-shared"));
+        assert_ne!(
+            crate::tmux::detect_status_from_content_in("", "esc to interrupt", "acme-shared"),
+            crate::session::Status::Unknown
+        );
 
         // A profile or repo config can name a custom agent the global plugin
         // registry never saw; the session's own config still excludes it.

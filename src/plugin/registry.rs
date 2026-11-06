@@ -132,7 +132,13 @@ impl PluginRegistry {
         Self {
             plugins,
             load_errors,
-            custom_agents: config.session.custom_agents.keys().cloned().collect(),
+            custom_agents: config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(name, _)| config.session.custom_agent_selected(name))
+                .map(|(name, _)| name.clone())
+                .collect(),
         }
     }
 
