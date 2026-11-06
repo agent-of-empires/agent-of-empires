@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// A sub-session was named as a new session's parent.
+#[derive(Debug, thiserror::Error)]
+#[error("Cannot create sub-session of a sub-session (single level only)")]
+pub struct NestedSubSession;
+
 fn generate_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
 }
@@ -672,6 +677,15 @@ impl Instance {
     }
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
+    }
+
+    /// Sessions nest one level deep, so a sub-session cannot parent another.
+    pub fn ensure_can_parent(&self) -> Result<(), NestedSubSession> {
+        if self.is_sub_session() {
+            Err(NestedSubSession)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn is_sandboxed(&self) -> bool {

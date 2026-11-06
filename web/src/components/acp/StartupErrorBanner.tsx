@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
+import type { AcpWorkerState } from "../../lib/types";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { ApiKeyAlternative } from "./SignInPopover";
@@ -142,17 +143,29 @@ const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
 export function StartupErrorBanner({
   sessionId,
   message,
+  acpWorkerState,
+  sentStopped = false,
   onSwitchToTerminal,
 }: {
   sessionId: string;
   message: string;
+  acpWorkerState: AcpWorkerState;
+  /** A restart stopped the sent message and it hasn't been sent again. */
+  sentStopped?: boolean;
   /** Opens the switch-view confirmation; omitted where the Session can't switch. */
   onSwitchToTerminal?: () => void;
 }) {
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
   const [infoRequest, setInfoRequest] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const { state: retryState, detail: retryDetail, respawn } = useRespawnSession(sessionId);
+  // A Worker still present would refuse a spawn, so Retry replaces it instead.
+  const {
+    state: retryState,
+    detail: retryDetail,
+    respawn,
+  } = useRespawnSession(sessionId, null, {
+    restart: acpWorkerState !== "absent",
+  });
   // A failed respawn opens Details, where its failure line is, whichever button started it.
   const respawnOrShow = async () => {
     const ok = await respawn();
@@ -240,6 +253,11 @@ export function StartupErrorBanner({
         secondary={[...(canInstall ? [retryAction] : []), ...switchAction]}
         install={install}
       />
+      {sentStopped && (
+        <div data-testid="startup-error-banner-sent-stopped" className="mt-2 text-xs text-text-subtle">
+          The message you sent was stopped. Send it again once {name} is ready.
+        </div>
+      )}
       {retryState === "ok" && (
         <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
       )}

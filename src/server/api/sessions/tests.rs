@@ -12147,3 +12147,307 @@ async fn cli_relative_adapter_uses_the_provisioned_directory_and_effective_hooks
         0
     );
 }
+
+/// A sub-session is created in its parent's group, and only a top-level session can be a
+/// parent, as `aoe add --parent` decides.
+#[tokio::test]
+async fn create_with_a_parent_joins_its_group_one_level_deep() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let mut parent = Instance::new("parent", "/tmp/aoe-parent");
+    parent.id = "parent".into();
+    parent.source_profile = "test".into();
+    parent.group_path = "team".into();
+    let mut child = Instance::new("child", "/tmp/aoe-child");
+    child.id = "child".into();
+    child.source_profile = "test".into();
+    child.parent_session_id = Some("parent".into());
+    let mut trashed = Instance::new("trashed", "/tmp/aoe-trashed");
+    trashed.id = "trashed".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    crate::session::Storage::new_unwatched("other").unwrap();
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-elsewhere");
+    elsewhere.id = "other-parent".into();
+    elsewhere.source_profile = "other".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![parent.clone(), child.clone(), trashed.clone()],
+    );
+    crate::server::test_support::seed_instances_on_disk_for_test("other", vec![elsewhere.clone()]);
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![parent, child, trashed, elsewhere],
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    // (parent, refusal code, or None when created in the parent's group)
+    let cases = [
+        ("missing", Some("parent_not_found")),
+        // Another profile's session can't parent one created in this profile.
+        ("other-parent", Some("parent_not_found")),
+        ("trashed", Some("parent_not_found")),
+        ("child", Some("parent_is_sub_session")),
+        ("parent", None),
+    ];
+    for (parent_id, refusal) in cases {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "scratch": true,
+                "view": "structured", "group": "elsewhere", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        if let Some(code) = refusal {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {session}");
+            assert_eq!(session["error"], code, "{parent_id}");
+            assert_eq!(state.instances.read().await.len(), 4, "{parent_id}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::CREATED, "{parent_id}: {session}");
+        let id = session["id"].as_str().unwrap();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(row.group_path, "team");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}
+
+/// CityHall answers a Terminal view parent like a missing one, so the mode doesn't reveal which
+/// ids exist, and neither refusal writes a child; a Structured view parent still works.
+#[tokio::test]
+async fn cityhall_create_hides_terminal_parents_like_missing_ones() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    // CityHall creates only in a configured project.
+    let project = tempfile::tempdir().unwrap();
+    crate::session::projects::add(
+        "test",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "cityhall",
+            project.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    let mut structured = Instance::new("structured-parent", "/tmp/aoe-structured-parent");
+    structured.id = "structured-parent".into();
+    structured.source_profile = "test".into();
+    structured.view = crate::session::View::Structured;
+    structured.group_path = "team".into();
+    let mut terminal = Instance::new("terminal-parent", "/tmp/aoe-terminal-parent");
+    terminal.id = "terminal-parent".into();
+    terminal.source_profile = "test".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![structured.clone(), terminal.clone()],
+    );
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![structured, terminal],
+        Vec::new(),
+        Vec::new(),
+        None,
+        true,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for parent_id in ["terminal-parent", "missing"] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {body}");
+        assert_eq!(body["error"], "parent_not_found", "{parent_id}");
+        assert_eq!(state.instances.read().await.len(), 2, "{parent_id}");
+    }
+
+    let (status, session) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "sub", "path": "", "tool": "claude", "parent_session_id": "structured-parent",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["id"].as_str().unwrap();
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row.parent_session_id.as_deref(), Some("structured-parent"));
+    assert_eq!(row.group_path, "team");
+    assert!(row.is_structured());
+    wait_for("launcher-rejected startup", || {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .iter()
+            .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+    })
+    .await;
+}
+
+/// `aoe add --parent` refuses a trashed parent as HTTP's create does, with
+/// `parent_not_found`, and says why.
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_create_refuses_a_trashed_parent() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut trashed = Instance::new("old", project.path().to_str().unwrap());
+    trashed.id = "trashed-id".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    support::seed_instances_on_disk_for_test("test", vec![trashed.clone()]);
+    let state = support::build_test_app_state(vec![trashed]);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let (status, refused) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "child", "path": project.path(), "tool": "", "profile": "test",
+            "cli": {"parent": "trashed-id"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "parent_not_found", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("in the trash"),
+        "{refused}"
+    );
+    assert_eq!(state.instances.read().await.len(), 1);
+}
+
+/// A refused `--parent` is decided before anything is provisioned, so `-b` with a fresh
+/// worktree leaves no worktree, branch or session behind.
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let (project, repo) = crate::git::test_support::init_repo();
+    let root = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.worktree.path_template = root.path().join("{branch}").to_string_lossy().into_owned();
+    })
+    .unwrap();
+    let seeded = |id: &str| {
+        let mut row = Instance::new(id, project.path().to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = "test".into();
+        row
+    };
+    let mut trashed = seeded("trashed-id");
+    trashed.trashed_at = Some(chrono::Utc::now());
+    let mut child = seeded("child-id");
+    child.parent_session_id = Some("top-id".into());
+    support::seed_instances_on_disk_for_test("test", vec![trashed.clone(), child.clone()]);
+    let state = support::build_test_app_state(vec![trashed, child]);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let base = repo.head().unwrap().shorthand().unwrap().to_string();
+
+    // (parent, branch the create would have made, HTTP's code, message contains)
+    let cases = [
+        (
+            "trashed-id",
+            "feat/under-trashed",
+            "parent_not_found",
+            "in the trash",
+        ),
+        (
+            "child-id",
+            "feat/under-child",
+            "parent_is_sub_session",
+            "sub-session of a sub-session",
+        ),
+        (
+            "missing-id",
+            "feat/under-missing",
+            "parent_not_found",
+            "missing-id",
+        ),
+    ];
+    for (parent, branch, code, message) in cases {
+        let (status, refused) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "child", "path": project.path(), "tool": "", "profile": "test",
+                "worktree_branch": branch, "create_new_branch": true, "base_branch": base,
+                "cli": {"parent": parent, "no_submodules": true},
+            }),
+        )
+        .await;
+        // What was provisioned is checked first, so a late refusal fails on what it left behind.
+        assert!(
+            repo.find_branch(branch, git2::BranchType::Local).is_err(),
+            "{parent}: branch {branch} was created"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "{parent}: a worktree was created"
+        );
+        assert_eq!(
+            state.instances.read().await.len(),
+            2,
+            "{parent}: a session was written"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent}: {refused}");
+        assert_eq!(refused["error"], code, "{parent}");
+        assert!(
+            refused["message"].as_str().unwrap().contains(message),
+            "{parent}: {refused}"
+        );
+    }
+}

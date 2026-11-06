@@ -292,6 +292,9 @@ describe("recent-first paging", () => {
     const filled = reducer(empty(), { kind: "handshake", frames: [caps] });
     expect(filled.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true, steering: false });
     expect(filled.activity).toHaveLength(0);
+    expect(filled.sessionAssigned).toBe(false);
+    const assigned: AcpFrame = { session_id: "s", seq: 2, event: { AcpSessionAssigned: { acp_session_id: "acp-1" } } };
+    expect(reducer(empty(), { kind: "handshake", frames: [caps, assigned] }).sessionAssigned).toBe(true);
   });
 });
 
@@ -333,5 +336,79 @@ describe("prepend seam dedupe (#2711)", () => {
     const next = reducer(tail(), { kind: "prepend", rows: [other], oldestSeq: 5 });
     expect(starts(next.activity, "call_Y")).toHaveLength(1);
     expect(starts(next.activity, "call_X")).toHaveLength(1);
+  });
+});
+
+describe("a restart of a start in progress", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
+  // Acknowledges a restart requested before any of these frames.
+  const restarted: Action = { kind: "restart_started", epoch: 0, stoppedSent: false };
+  const assigned = (seq: number) => frame(seq, { AcpSessionAssigned: { acp_session_id: "acp-2" } });
+  it.each<[string, Action[], boolean, boolean]>([
+    ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
+    ["its stop applied after doesn't either", [restarted, stop(1)], false, true],
+    [
+      "a real Stop after the replacement is assigned latches again",
+      [stop(1), restarted, assigned(2), stop(3)],
+      true,
+      false,
+    ],
+    [
+      "an acknowledgement landing after the assignment doesn't re-arm it",
+      [stop(1), assigned(2), restarted, stop(3)],
+      true,
+      false,
+    ],
+    [
+      "an acknowledgement landing after a startup error doesn't re-arm it",
+      [frame(1, { AgentStartupError: { message: "boom" } }), restarted, stop(2)],
+      true,
+      false,
+    ],
+    [
+      "a startup error ends it",
+      [restarted, frame(1, { AgentStartupError: { message: "boom" } }), stop(2)],
+      true,
+      false,
+    ],
+    ["another stop ends it", [restarted, stop(1, "idle_auto_stop"), stop(2)], true, false],
+  ])("%s", (_label, actions, workerStopped, restartInFlight) => {
+    const state = run(empty(), ...actions);
+    expect([state.workerStopped, state.restartInFlight]).toEqual([workerStopped, restartInFlight]);
+  });
+
+  const stoppedSent: Action = { kind: "restart_started", epoch: 0, stoppedSent: true };
+  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500.", stoppedSent: true };
+  it.each<[string, Action[], boolean]>([
+    ["a restart that stopped the sent prompt remembers it", [stop(1), stoppedSent], true],
+    ["a later restart that stopped nothing keeps it", [stoppedSent, restarted], true],
+    ["sending again clears it", [stoppedSent, frame(1, { UserPromptSent: { text: "hi" } })], false],
+    [
+      "an acknowledgement after a startup error still records it",
+      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), stoppedSent],
+      true,
+    ],
+    [
+      "a failure after a startup error still records it",
+      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), failed],
+      true,
+    ],
+  ])("%s", (_label, actions, expected) => {
+    expect(run(empty(), ...actions).restartStoppedSent).toBe(expected);
+  });
+
+  it.each<[string, Action[], string | null, boolean]>([
+    ["a failure after its stop keeps the stop and names the reason", [stop(1), failed], "Server returned 500.", true],
+    ["a failure after the restart already ended is ignored", [stop(1), assigned(2), failed], null, false],
+    ["the replacement's assignment clears it", [stop(1), failed, assigned(2)], null, false],
+    ["the next restart clears it", [stop(1), failed, restarted], null, false],
+    ["sending again clears it", [stop(1), failed, { kind: "user_prompt", text: "hi" }], null, true],
+  ])("%s", (_label, actions, restartFailure, workerStopped) => {
+    const state = run(empty(), ...actions);
+    expect([state.restartFailure, state.workerStopped]).toEqual([restartFailure, workerStopped]);
   });
 });
