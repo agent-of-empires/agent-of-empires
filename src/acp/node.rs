@@ -380,8 +380,7 @@ mod tests {
         let node = temp.path().join("node");
         let pid_file = temp.path().join("descendant.pid");
         let script = format!(
-            "#!/bin/sh\nsleep 30 &\necho $! > {}\necho {PINNED_NODE_VERSION}\n",
-            pid_file.display()
+            "#!/bin/sh\nsleep 30 &\necho $! > \"${{0%/*}}/descendant.pid\"\necho {PINNED_NODE_VERSION}\n"
         );
         std::fs::write(&node, script).unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
