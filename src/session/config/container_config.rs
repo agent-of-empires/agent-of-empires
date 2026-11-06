@@ -5770,8 +5770,11 @@ volume_ignores = ["node_modules"]
                 .unwrap();
                 // OMP reaches the mount table through its plugin now, and the
                 // raw config write above clears any earlier grant.
-                let _omp =
-                    (tool == "omp").then(crate::session::install_omp_test_plugin_in_current_app);
+                let _omp = (tool == "omp").then(|| {
+                    crate::session::install_omp_test_plugin_in_current_app(
+                        crate::session::test_support::isolate_app_dir_at(home.path()),
+                    )
+                });
                 for history in histories {
                     let path = host.join(history);
                     fs::create_dir_all(path.parent().unwrap()).unwrap();
