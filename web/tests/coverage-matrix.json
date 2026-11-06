@@ -5456,6 +5456,8 @@
         "src/components/setup/__tests__/SetupBanner.test.tsx",
         "src/components/setup/__tests__/SetupWizardPage.test.tsx",
         "src/components/setup/__tests__/SandboxStep.test.tsx",
+        "src/components/setup/__tests__/AgentsStep.test.tsx",
+        "src/components/setup/__tests__/ThemeTelemetryStep.test.tsx",
         "src/hooks/__tests__/useInlineMachineSave.test.ts",
         "src/hooks/__tests__/useSetupStatus.test.ts"
       ],
