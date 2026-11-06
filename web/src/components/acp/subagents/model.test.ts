@@ -28,6 +28,13 @@ describe("fromBackground", () => {
     expect(fromBackground(stalled).tools[0]!.status).toBe("running");
   });
 
+  it("keeps every line of a title for expansion and only the first on the row", () => {
+    const tool = { name: "Bash", title: "cd repo\ncargo test", ok: true };
+    const [t] = fromBackground(agent({ tools: [tool] })).tools;
+    expect(t!.target).toBe("cd repo");
+    expect(t!.detail).toBe("cd repo\ncargo test");
+  });
+
   it("keeps the total and newest call when the list is capped", () => {
     const record = fromBackground(agent({ toolCount: 300, lastTool: "Bash" }));
     expect(record.toolCount).toBe(300);

@@ -14,6 +14,8 @@ export interface ActivityTool {
   kind: string;
   name: string;
   target: string | null;
+  /** The whole title, which a row shows only the first line of. */
+  detail?: string;
   status: ToolStatus;
   startedAt?: string;
   endedAt?: string;
@@ -119,6 +121,7 @@ function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): Acti
     kind: kindForName(t.name),
     name: t.name,
     target: t.title ? firstLine(t.title) : null,
+    detail: t.title || undefined,
     status: t.ok === undefined || t.ok === null ? (ended ? "stopped" : "running") : t.ok ? "ok" : "err",
     startedAt: t.started_at ?? undefined,
     endedAt: t.ended_at ?? undefined,

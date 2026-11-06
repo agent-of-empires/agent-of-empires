@@ -79,7 +79,9 @@ function Row({ tool }: { tool: ActivityTool }) {
           {tool.call ? (
             <ToolCard tool={tool.call.tool} result={tool.call.result} nested />
           ) : (
-            <p className="break-all px-2 py-1 font-mono text-[11px] text-text-dim">{tool.target ?? tool.name}</p>
+            <p className="whitespace-pre-wrap break-all px-2 py-1 font-mono text-[11px] text-text-dim">
+              {tool.detail ?? tool.target ?? tool.name}
+            </p>
           )}
         </div>
       )}
