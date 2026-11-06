@@ -279,6 +279,16 @@ describe("installFetchErrorToasts", () => {
       await window.fetch("/api/sessions");
       expect(onElevation).toHaveBeenCalledTimes(calls);
     });
+
+    it("a 403 on an inline-elevation request leaves the global prompt alone", async () => {
+      await install();
+      const onElevation = listen(mod.ELEVATION_REQUIRED_EVENT);
+      const marked = { [mod.INLINE_ELEVATION_HEADER]: "1" };
+      original.mockImplementation(async () => json(403, { error: "elevation_required" }));
+      await window.fetch("/api/settings", { method: "PATCH", headers: marked });
+      await window.fetch(new Request("http://localhost/api/settings", { method: "PATCH", headers: marked }));
+      expect(onElevation).not.toHaveBeenCalled();
+    });
   });
 
   it.each<[string, Response, string, RequestInit | undefined, boolean, string | null]>([

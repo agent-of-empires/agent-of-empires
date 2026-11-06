@@ -102,7 +102,9 @@ export function installFetchErrorToasts(): void {
           handleTokenAuthFailure();
         }
       }
-      if (res.status === 403 && isApi && !new Headers(init?.headers).has(INLINE_ELEVATION_HEADER)) {
+      // `init.headers` replaces a Request's own headers, as in fetch.
+      const sent = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      if (res.status === 403 && isApi && !sent.has(INLINE_ELEVATION_HEADER)) {
         try {
           const data = (await res.clone().json()) as { error?: unknown };
           if (data && data.error === "elevation_required") {
