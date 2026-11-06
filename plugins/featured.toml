@@ -47,10 +47,3 @@ versions = {"1.0.0" = "sha256:b98ab9304a9906bd33acdcc5b4c1f5e9d6eb44db442d7409f8
 [plugins."agent-of-empires.kanban"]
 source = "gh:agent-of-empires/plugin-kanban"
 versions = {"1.0.0" = "sha256:1c4ed57deca62072ff0ebd061e4c849028f3a2ed25b35c25a4886a45733cc866"}
-
-[plugins."agent-of-empires.omp"]
-source = "gh:agent-of-empires/plugin-omp"
-# 0.4.0 targets API 19 with bounded provider_versions and native replies. It
-# depends on the host launch/discovery and report/reply work merged on main; do
-# not pin it on a branch that lacks both.
-versions = {"0.4.0" = "sha256:c979570ed48d3c926c5a5942abd1c52462314897807f2f69b84ffa7887065e59"}
