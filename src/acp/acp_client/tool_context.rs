@@ -201,6 +201,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn shell_command_reads_the_cached_bash_input_and_caps_it() {
+        let cache: ToolContextCache = Default::default();
+        let long = "é".repeat(TOOL_CONTEXT_CACHE_LIMIT * 100);
+        let mut guard = cache.lock().unwrap();
+        guard.record("tc-1".into(), json!({"command": "npm run dev"}));
+        guard.record("tc-2".into(), json!({"command": long}));
+        guard.record("tc-3".into(), json!({"path": "/x"}));
+        drop(guard);
+        assert_eq!(
+            shell_command(&cache, "tc-1").as_deref(),
+            Some("npm run dev")
+        );
+        let capped = shell_command(&cache, "tc-2").unwrap();
+        assert!(capped.len() <= 16 * 1024 && capped.chars().all(|c| c == 'é'));
+        assert_eq!(shell_command(&cache, "tc-3"), None);
+        assert_eq!(shell_command(&cache, "missing"), None);
+    }
+
+    #[test]
     fn wake_title_restored_on_untitled_updates() {
         let cache: ToolContextCache = Default::default();
         let untitled = |status| {
