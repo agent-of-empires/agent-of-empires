@@ -1260,6 +1260,8 @@ pub(crate) fn web_daemon_pid() -> Option<u32> {
     (!managed_launch(pid).is_ok_and(|launch| launch.core_only)).then_some(pid)
 }
 
+/// Validate exposure and prerequisites before stopping a predecessor.
+/// Replacement callers retain the lifecycle transaction through successor startup.
 async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMode> {
     crate::session::require_known_profile(profile)?;
     if !args.core_only

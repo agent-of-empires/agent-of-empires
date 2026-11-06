@@ -2865,6 +2865,8 @@ fn cli_serve_restart_replays_launch_state() {
     );
 }
 
+/// Refusing a disabled TCP replay must preserve the current owner and credentials.
+/// A retained launch remains recoverable after the policy permits TCP again.
 #[cfg(feature = "web")]
 #[test]
 #[parallel]

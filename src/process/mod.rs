@@ -2331,6 +2331,8 @@ mod tests {
         }
     }
 
+    /// Freeze logical time for real TERM acknowledgements, so OS scheduling cannot
+    /// consume the grace budget whose escalation ordering is under test.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn process_group_timeout_and_cancellation_preserve_deadlines() {
@@ -2346,6 +2348,8 @@ mod tests {
         }
 
         impl Drop for ProcessGroupFixture {
+            /// Reaping ends the leader's PID reservation. Subsequent cleanup uses
+            /// the captured descendant identity, not the former process-group ID.
             fn drop(&mut self) {
                 if self.group_armed {
                     platform::kill_process_group(&self.child);
@@ -2439,7 +2443,6 @@ mod tests {
                         "{name}: waiting must not extend the interruption deadline"
                     );
                     if expect_ack && current >= expected_term && acknowledged_at.is_none() {
-                        // Logical time stays frozen until the real trap acknowledges TERM.
                         let mut acknowledgement = String::new();
                         events.read_line(&mut acknowledgement).unwrap();
                         assert_eq!(

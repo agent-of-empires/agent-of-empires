@@ -4848,6 +4848,8 @@ mod tests {
         );
     }
 
+    /// Missing Web entries mean enabled. Refuse effective state changes atomically,
+    /// without blocking unrelated writes or writes that preserve that state.
     #[cfg(feature = "web")]
     #[test]
     #[serial_test::serial]

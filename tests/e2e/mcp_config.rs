@@ -254,6 +254,8 @@ fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
     assert_eq!(body["error"], "login_required", "{body}");
 }
 
+/// One daemon spans profiles, so profile-local overrides must not change global
+/// listener opt-ins, including after a fresh acquisition replaces a lost owner.
 #[test]
 #[parallel]
 fn configured_services_survive_tui_autostart() {
@@ -328,6 +330,8 @@ fn configured_services_survive_tui_autostart() {
     }
 }
 
+/// A printed URL is not readiness: require tokenless rejection, initialization,
+/// and session-tool discovery using the CLI-provided endpoint and credentials.
 fn assert_mcp_connects(h: &TuiTestHarness) {
     let out = h.run_cli(&["mcp", "config"]);
     assert!(out.status.success(), "{out:?}");
@@ -363,6 +367,8 @@ fn assert_mcp_connects(h: &TuiTestHarness) {
     });
 }
 
+/// A missing configured default is not permission to create a profile for readers.
+/// Administrative replay has a separate native-profile admission path.
 #[test]
 #[parallel]
 fn configured_read_acquisition_preserves_profiles_and_one_owner() {
@@ -402,6 +408,8 @@ fn configured_read_acquisition_preserves_profiles_and_one_owner() {
     }
 }
 
+/// Keep the port occupied through both failures; private recovery requires an
+/// explicit request before repaired TCP acquisition may expose MCP again.
 #[test]
 #[parallel]
 fn configured_autostart_reports_tcp_bind_failure_without_private_fallback() {

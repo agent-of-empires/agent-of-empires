@@ -362,6 +362,8 @@ fn watch_termination_signals() -> CancellationToken {
     token
 }
 
+/// Retain lifecycle ownership until runtime publication, then release it before
+/// processing configuration mutations that need the same transaction.
 pub(crate) async fn start_server(
     config: ServerConfig<'_>,
     transaction: crate::daemon::lifecycle::Transaction,
