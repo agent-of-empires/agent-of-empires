@@ -1035,6 +1035,9 @@ pub struct AppStateConfig {
     /// Web setup wizard steps the user chose to skip. See `GET /api/setup`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub setup_skipped_steps: Vec<String>,
+    /// Optional web setup steps whose defaults the user kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_confirmed_steps: Vec<String>,
     /// The user finished the web setup wizard.
     #[serde(default)]
     pub setup_finished: bool,

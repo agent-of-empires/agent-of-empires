@@ -1,6 +1,6 @@
 //! Web setup wizard state. Step progress is derived from real configuration on
-//! every read; `state.toml` only records which steps were skipped and whether
-//! the wizard was finished, deferred, or its dashboard banner dismissed.
+//! every read; `state.toml` only records which steps were skipped or confirmed
+//! and whether the wizard was finished, deferred, or its banner dismissed.
 
 use std::sync::Arc;
 
@@ -20,8 +20,9 @@ const STEPS: [(&str, bool); 6] = [
     ("notifications", false),
 ];
 
-/// Keys in the global `config.toml` that mark a step as configured. Typed
-/// config can't tell an explicit value from a default, so presence is read raw.
+/// Global `config.toml` keys that configure a step. Every config write saves
+/// the whole file, so a step counts as configured only when one of these
+/// differs from its default; keeping a default is recorded by confirming it.
 const CONFIG_KEYS: [(&str, &str, &[&str]); 3] = [
     (
         "worktrees",
@@ -36,11 +37,7 @@ const CONFIG_KEYS: [(&str, &str, &[&str]); 3] = [
     (
         "sandbox",
         "sandbox",
-        &[
-            "enabled_by_default",
-            "container_runtime",
-            "allow_image_pull",
-        ],
+        &["enabled_by_default", "container_runtime", "default_image"],
     ),
     (
         "notifications",
@@ -60,6 +57,7 @@ struct SetupInputs {
     agent_installed: bool,
     project_exists: bool,
     config: toml::Table,
+    defaults: toml::Table,
 }
 
 fn step_configured(key: &str, inputs: &SetupInputs) -> bool {
@@ -71,11 +69,15 @@ fn step_configured(key: &str, inputs: &SetupInputs) -> bool {
             .iter()
             .find(|(step, _, _)| *step == key)
             .is_some_and(|(_, section, keys)| {
-                inputs
-                    .config
-                    .get(*section)
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|table| keys.iter().any(|k| table.contains_key(*k)))
+                let table =
+                    |t: &toml::Table| t.get(*section).and_then(toml::Value::as_table).cloned();
+                let (set, defaults) = (table(&inputs.config), table(&inputs.defaults));
+                set.is_some_and(|set| {
+                    keys.iter().any(|k| {
+                        set.get(*k)
+                            .is_some_and(|v| defaults.as_ref().and_then(|d| d.get(*k)) != Some(v))
+                    })
+                })
             }),
     }
 }
@@ -84,7 +86,10 @@ fn step_configured(key: &str, inputs: &SetupInputs) -> bool {
 pub struct SetupStep {
     pub key: String,
     pub required: bool,
+    /// Set up, from config or by keeping the defaults in the wizard.
     pub configured: bool,
+    /// The user kept this optional step's defaults in the wizard.
+    pub confirmed: bool,
     pub skipped: bool,
 }
 
@@ -108,13 +113,19 @@ pub struct SetupStatus {
 
 fn build_steps(inputs: &SetupInputs, app: &AppStateConfig) -> Vec<SetupStep> {
     let skipped = known_steps(&app.setup_skipped_steps);
+    let confirmed = known_steps(&app.setup_confirmed_steps);
     STEPS
         .iter()
-        .map(|(key, required)| SetupStep {
-            key: key.to_string(),
-            required: *required,
-            configured: step_configured(key, inputs),
-            skipped: skipped.contains(key),
+        .map(|(key, required)| {
+            // A required step is only ever done by being configured.
+            let confirmed = !required && confirmed.contains(key);
+            SetupStep {
+                key: key.to_string(),
+                required: *required,
+                configured: confirmed || step_configured(key, inputs),
+                confirmed,
+                skipped: skipped.contains(key),
+            }
         })
         .collect()
 }
@@ -128,16 +139,12 @@ fn known_steps(stored: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Validate a client-sent skip set and return it in catalog order.
-fn canonical_skips(requested: &[String]) -> Result<Vec<String>, String> {
+/// Validate a client-sent set of optional steps and return it in catalog order.
+fn canonical_optional_steps(requested: &[String]) -> Result<Vec<String>, String> {
     for key in requested {
         match STEPS.iter().find(|(step, _)| step == key) {
             None => return Err(format!("unknown setup step '{key}'")),
-            Some((_, true)) => {
-                return Err(format!(
-                    "setup step '{key}' is required and cannot be skipped"
-                ))
-            }
+            Some((_, true)) => return Err(format!("setup step '{key}' is required")),
             Some(_) => {}
         }
     }
@@ -161,6 +168,10 @@ fn load_inputs(project_exists: bool) -> SetupInputs {
         agent_installed: !agents.available_list().is_empty(),
         project_exists,
         config: raw,
+        defaults: toml::from_str::<crate::session::Config>("")
+            .ok()
+            .and_then(|c| toml::Table::try_from(c).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -220,6 +231,7 @@ pub async fn get_setup(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 #[derive(Deserialize)]
 pub struct SetupPatch {
     skipped_steps: Option<Vec<String>>,
+    confirmed_steps: Option<Vec<String>>,
     finished: Option<bool>,
     deferred: Option<bool>,
     banner_dismissed: Option<bool>,
@@ -241,14 +253,16 @@ pub async fn patch_setup(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", e.body_text());
         }
     };
-    let skipped = match patch
-        .skipped_steps
-        .as_deref()
-        .map(canonical_skips)
-        .transpose()
-    {
-        Ok(skipped) => skipped,
-        Err(message) => return api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
+    let canonical =
+        |steps: &Option<Vec<String>>| steps.as_deref().map(canonical_optional_steps).transpose();
+    let (skipped, confirmed) = match (
+        canonical(&patch.skipped_steps),
+        canonical(&patch.confirmed_steps),
+    ) {
+        (Ok(skipped), Ok(confirmed)) => (skipped, confirmed),
+        (Err(message), _) | (_, Err(message)) => {
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", message)
+        }
     };
     let projects = project_exists(&state).await;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), String>> {
@@ -264,6 +278,11 @@ pub async fn patch_setup(
         crate::session::update_app_state(|app| {
             if let Some(skipped) = skipped {
                 app.setup_skipped_steps = skipped;
+            }
+            if let Some(confirmed) = confirmed {
+                // A confirmed step is no longer a skipped one.
+                app.setup_skipped_steps.retain(|k| !confirmed.contains(k));
+                app.setup_confirmed_steps = confirmed;
             }
             // Finishing is one-way; revisiting /setup doesn't reopen the redirect.
             app.setup_finished |= patch.finished.unwrap_or(false);
@@ -329,21 +348,33 @@ mod tests {
     fn inputs(config: &str) -> SetupInputs {
         SetupInputs {
             config: config.parse().unwrap(),
+            defaults: toml::Table::try_from(toml::from_str::<crate::session::Config>("").unwrap())
+                .unwrap(),
             ..Default::default()
         }
     }
 
     #[test]
-    fn config_steps_are_configured_only_by_recognized_keys() {
+    fn config_steps_are_configured_only_by_non_default_values() {
+        // Every config write saves every key, so a full default file configures nothing.
+        let full = toml::to_string(&inputs("").defaults).unwrap();
         for (config, step, expected) in [
             ("", "worktrees", false),
-            ("[worktree]\n", "worktrees", false),
+            (full.as_str(), "worktrees", false),
+            (full.as_str(), "sandbox", false),
+            (full.as_str(), "notifications", false),
+            ("[worktree]\nenabled = false\n", "worktrees", false),
+            ("[worktree]\nenabled = true\n", "worktrees", true),
             (
                 "[worktree]\nbare_repo_path_template = \"x\"\n",
                 "worktrees",
                 false,
             ),
-            ("[worktree]\nenabled = false\n", "worktrees", true),
+            (
+                "[worktree]\ndefault_base_branch = \"develop\"\n",
+                "worktrees",
+                true,
+            ),
             (
                 "[sandbox]\ncontainer_runtime = \"podman\"\n",
                 "sandbox",
@@ -361,14 +392,28 @@ mod tests {
     }
 
     #[test]
+    fn confirming_configures_only_optional_steps() {
+        let app = AppStateConfig {
+            setup_confirmed_steps: vec!["sandbox".into(), "agents".into()],
+            ..Default::default()
+        };
+        let configured: Vec<_> = build_steps(&inputs(""), &app)
+            .into_iter()
+            .filter(|s| s.configured)
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(configured, ["sandbox"]);
+    }
+
+    #[test]
     fn skips_are_validated_and_canonical() {
         let strings = |keys: &[&str]| keys.iter().map(|k| k.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            canonical_skips(&strings(&["sandbox", "project", "sandbox"])),
+            canonical_optional_steps(&strings(&["sandbox", "project", "sandbox"])),
             Ok(strings(&["project", "sandbox"]))
         );
         for bad in ["agents", "Sandbox", "", "bogus"] {
-            assert!(canonical_skips(&strings(&[bad])).is_err(), "{bad}");
+            assert!(canonical_optional_steps(&strings(&[bad])).is_err(), "{bad}");
         }
     }
 
@@ -425,5 +470,13 @@ mod tests {
             send(serde_json::json!({ "skipped_steps": ["agents"] })).await,
             StatusCode::BAD_REQUEST
         );
+
+        assert_eq!(
+            send(serde_json::json!({ "confirmed_steps": ["sandbox"] })).await,
+            StatusCode::NO_CONTENT
+        );
+        let app = AppStateConfig::load().unwrap();
+        assert_eq!(app.setup_confirmed_steps, ["sandbox"]);
+        assert!(app.setup_skipped_steps.is_empty());
     }
 }
