@@ -3,15 +3,18 @@
 import { Square } from "lucide-react";
 import { useState } from "react";
 
+import { reportError } from "../../../lib/toastBus";
+
 export function StopSession({ sessionId, running }: { sessionId: string; running: number }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const stop = async () => {
     setBusy(true);
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
+      if (!res.ok) reportError("Could not interrupt the session. Try again.");
     } catch {
-      // best-effort; the tailer marks idle agents stalled regardless
+      reportError("Could not interrupt the session. Try again.");
     } finally {
       setBusy(false);
       setConfirming(false);

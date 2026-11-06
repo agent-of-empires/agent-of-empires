@@ -43,10 +43,11 @@ function useElapsed(record: SubagentRecord): string | null {
 
 /** The one fact that changes with status, shown under the header. */
 function summaryLine(r: SubagentRecord): string | null {
-  const last = r.tools.at(-1);
+  const last = r.tools.length < r.toolCount ? undefined : r.tools.at(-1);
   const line = (t: string) => t.split("\n", 1)[0]!.trim();
   if (r.status === "running") {
     if (last) return `${last.name}${last.target ? ` ${last.target}` : ""}`;
+    if (r.lastTool) return r.lastTool;
     return r.latestNote ? line(r.latestNote) : null;
   }
   if (r.status === "failed") {
@@ -69,7 +70,7 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
   const [toggled, setOpen] = useToolCardExpansion(toCardStatus(record.status));
   const open = alwaysOpen || toggled;
   const uid = useId();
-  const { sessionId, agents } = useBackgroundAgentsContextValue();
+  const { sessionId, agents, readOnly } = useBackgroundAgentsContextValue();
   const elapsed = useElapsed(record);
   const st = STATUS[record.status];
   const errors = record.tools.filter((t) => t.status === "err").length;
@@ -101,9 +102,9 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
               background
             </span>
           )}
-          {record.tools.length > 0 && (
+          {record.toolCount > 0 && (
             <span className="hidden shrink-0 text-[11px] tabular-nums text-text-dim min-[480px]:inline">
-              {record.tools.length} {record.tools.length === 1 ? "tool" : "tools"}
+              {record.toolCount} {record.toolCount === 1 ? "tool" : "tools"}
             </span>
           )}
           {elapsed && <span className="shrink-0 text-[11px] tabular-nums text-text-dim">{elapsed}</span>}
@@ -119,7 +120,7 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
         </button>
         <div className="flex items-center gap-2 pr-2">
           {actions}
-          {record.background && record.status === "running" && sessionId && (
+          {record.background && record.status === "running" && sessionId && !readOnly && (
             <StopSession sessionId={sessionId} running={running} />
           )}
         </div>
@@ -132,8 +133,8 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
         <div id={`${uid}-body`} ref={bodyRef} className="border-t border-surface-800">
           {record.warning && <p className="px-3 py-1 text-[11px] text-status-error">{record.warning}</p>}
           <InputSection record={record} />
-          {(record.tools.length > 0 || record.status === "running") && (
-            <ActivitySection record={record} errors={errors} bodyRef={bodyRef} />
+          {(record.toolCount > 0 || record.status === "running") && (
+            <ActivitySection record={record} errors={errors} bodyRef={bodyRef} scrollToNewest={alwaysOpen} />
           )}
           <OutputSection record={record} />
         </div>
@@ -166,10 +167,13 @@ function ActivitySection({
   record,
   errors,
   bodyRef,
+  scrollToNewest,
 }: {
   record: SubagentRecord;
   errors: number;
   bodyRef: React.RefObject<HTMLDivElement | null>;
+  /** The pane and sheet scroll themselves; the thread follows its own transcript. */
+  scrollToNewest: boolean;
 }) {
   const running = record.status === "running";
   const [expanded, setExpanded] = useState<boolean | null>(null);
@@ -178,9 +182,22 @@ function ActivitySection({
   // Done agents keep Activity to its summary row; a running or failed one opens it.
   const open = expanded ?? (running || record.status === "failed");
   const { tools } = record;
-  const summary = [`${tools.length} ${tools.length === 1 ? "call" : "calls"}`, errors ? `${errors} errors` : null]
+  const { toolCount } = record;
+  const summary = [
+    `${toolCount} ${toolCount === 1 ? "call" : "calls"}`,
+    tools.length < toolCount ? `first ${tools.length} shown` : null,
+    errors ? `${errors} errors` : null,
+  ]
     .filter(Boolean)
     .join(" · ");
+  const followed = open && running && following && filter === "all";
+  const seenCount = useRef(tools.length);
+  // Runs on commit, so only a new call scrolls, not the elapsed-time tick.
+  const followNewest = (el: HTMLDivElement | null) => {
+    if (!el || seenCount.current === tools.length) return;
+    seenCount.current = tools.length;
+    if (scrollToNewest && followed) el.lastElementChild?.scrollIntoView?.({ block: "nearest" });
+  };
   const jump = () => {
     setExpanded(true);
     setFilter("all");
@@ -218,8 +235,8 @@ function ActivitySection({
         )}
       </div>
       {open && (
-        <div className="pb-1">
-          <ActivityRows tools={tools} filter={filter} following={running && following} />
+        <div ref={followNewest} className="pb-1">
+          <ActivityRows tools={tools} filter={filter} following={running && following} running={running} />
         </div>
       )}
     </div>
@@ -252,7 +269,13 @@ function OutputSection({ record }: { record: SubagentRecord }) {
   } else if (status === "stalled" || status === "detached") {
     body = <p className="text-text-dim">No activity; nothing to stop.</p>;
   } else {
-    body = <p className="text-text-dim">Finished without writing a report; its tool results are in Activity.</p>;
+    body = (
+      <p className="text-text-dim">
+        {record.tools.length > 0
+          ? "Finished without writing a report; its tool results are in Activity."
+          : "Finished without writing a report."}
+      </p>
+    );
   }
   return (
     <div className="bg-surface-800">

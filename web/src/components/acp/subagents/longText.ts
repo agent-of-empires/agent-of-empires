@@ -9,10 +9,16 @@ export interface Revealed {
   remaining: number;
 }
 
-/** Closes a code fence a cut left open, so the shown part renders as markdown. */
+/** Closes a code fence a cut left open, with the marker that opened it. */
 function closeFence(text: string): string {
-  const fences = text.split("\n").filter((l) => /^\s*(```|~~~)/.test(l)).length;
-  return fences % 2 === 1 ? `${text}\n\`\`\`` : text;
+  let open: string | null = null;
+  for (const line of text.split("\n")) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (!marker) continue;
+    if (!open) open = marker;
+    else if (marker[0] === open[0] && marker.length >= open.length && /^\s*[`~]+\s*$/.test(line)) open = null;
+  }
+  return open ? `${text}\n${open}` : text;
 }
 
 /** The first `limit` lines of `text`. */

@@ -32,6 +32,10 @@ export interface SubagentRecord {
   model?: string;
   prompt: string;
   tools: ActivityTool[];
+  /** Calls made in total; `tools` is capped, so this can be larger. */
+  toolCount: number;
+  /** Name of the newest call, which `tools` may not reach. */
+  lastTool: string | null;
   report: string;
   /** Latest assistant note while running; not the final report. */
   latestNote: string | null;
@@ -66,11 +70,30 @@ export function kindForName(name: string): string {
   return NAME_KINDS[name] ?? "other";
 }
 
+const TRUNCATED = "\u2026[truncated]";
+
+/** A Task's prompt from its args preview; one cut at the ingest cap is no valid JSON, so its prompt is recovered from the prefix. */
+export function taskPrompt(argsPreview: string): string {
+  const args = parseJsonObject(argsPreview);
+  if (args) return pickStr(args, "prompt") ?? "";
+  const body = /"prompt"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(argsPreview)?.[1];
+  if (!body) return "";
+  const text = (body.endsWith(TRUNCATED) ? body.slice(0, -TRUNCATED.length) : body).replace(
+    /\\u[0-9a-fA-F]{0,3}$|\\$/,
+    "",
+  );
+  try {
+    return `${JSON.parse(`"${text}"`) as string}\n\n${TRUNCATED}`;
+  } catch {
+    return "";
+  }
+}
+
 function firstLine(text: string): string {
   return text.split("\n", 1)[0]!.trim();
 }
 
-function inlineTool({ tool, result }: ToolCardProps): ActivityTool {
+function inlineTool({ tool, result }: ToolCardProps, taskDone: boolean): ActivityTool {
   const args = parseJsonObject(tool.args_preview);
   const target = args ? pickStr(args, ...TARGET_KEYS) : null;
   const known = tool.kind && tool.kind !== "other" ? tool.kind : kindForName(tool.name);
@@ -79,7 +102,7 @@ function inlineTool({ tool, result }: ToolCardProps): ActivityTool {
     kind: known,
     name: tool.name,
     target: target ? firstLine(target) : null,
-    status: statusFor(result),
+    status: !result && taskDone ? "stopped" : statusFor(result),
     startedAt: tool.started_at,
     endedAt: result?.at,
     call: { tool, result },
@@ -90,13 +113,13 @@ function bgStatus(s: BackgroundAgent["status"]): SubagentStatus {
   return s === "completed" ? "done" : s === "error" ? "failed" : s;
 }
 
-function backgroundTool(t: BackgroundAgentTool, i: number): ActivityTool {
+function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): ActivityTool {
   return {
     id: t.id ?? `#${i}`,
     kind: kindForName(t.name),
     name: t.name,
     target: t.title ? firstLine(t.title) : null,
-    status: t.ok === undefined || t.ok === null ? "running" : t.ok ? "ok" : "err",
+    status: t.ok === undefined || t.ok === null ? (ended ? "stopped" : "running") : t.ok ? "ok" : "err",
     startedAt: t.started_at ?? undefined,
     endedAt: t.ended_at ?? undefined,
   };
@@ -106,8 +129,8 @@ function backgroundTool(t: BackgroundAgentTool, i: number): ActivityTool {
 export function fromInline(tool: ToolCall, result: ActivityRow | undefined, children: ToolCardProps[]): SubagentRecord {
   const args = parseJsonObject(tool.args_preview);
   const failed = result?.kind === "tool_error";
-  const running = result === undefined || children.some((c) => !c.result);
-  const tools = children.map(inlineTool);
+  const running = result === undefined;
+  const tools = children.map((c) => inlineTool(c, !running));
   const lastEnd = tools
     .map((t) => t.endedAt)
     .filter((t): t is string => !!t)
@@ -120,8 +143,10 @@ export function fromInline(tool: ToolCall, result: ActivityRow | undefined, chil
     status: running ? "running" : failed ? "failed" : "done",
     startedAt: tool.started_at,
     endedAt: running ? undefined : (result?.at ?? lastEnd),
-    prompt: (args && pickStr(args, "prompt")) ?? "",
+    prompt: taskPrompt(tool.args_preview),
     tools,
+    toolCount: tools.length,
+    lastTool: tools.at(-1)?.name ?? null,
     report: failed || !result ? "" : extractTaskResult(result.text ?? ""),
     latestNote: null,
     warning: null,
@@ -141,7 +166,9 @@ export function fromBackground(agent: BackgroundAgent): SubagentRecord {
     endedAt: agent.endedAt ?? undefined,
     model: agent.model || undefined,
     prompt: agent.prompt,
-    tools: agent.tools.map(backgroundTool),
+    tools: agent.tools.map((t, i) => backgroundTool(t, i, agent.endedAt !== null)),
+    toolCount: Math.max(agent.toolCount, agent.tools.length),
+    lastTool: agent.lastTool,
     report: agent.result ?? "",
     latestNote: status === "running" ? agent.lastText : null,
     warning: status === "failed" ? null : agent.warning,

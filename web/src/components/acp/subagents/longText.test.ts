@@ -16,6 +16,12 @@ describe("revealLines", () => {
     const text = ["```", "a", "b", "c", "```"].join("\n");
     expect(revealLines(text, 3).text.endsWith("```")).toBe(true);
   });
+
+  it("closes with the marker that opened the fence", () => {
+    expect(revealLines(["~~~", "a", "b", "~~~"].join("\n"), 2).text.endsWith("\n~~~")).toBe(true);
+    const four = ["````", "```", "x", "````"].join("\n");
+    expect(revealLines(four, 3).text.endsWith("\n````")).toBe(true);
+  });
 });
 
 describe("previewParagraphs", () => {

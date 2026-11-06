@@ -4,22 +4,14 @@
 import { useMemo, useState } from "react";
 import { Layers } from "lucide-react";
 
-import { pickStr } from "../../lib/acpArgs";
 import type { ToolCall } from "../../lib/acpTypes";
 import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
-import {
-  CardChrome,
-  spanTimes,
-  useToolArgs,
-  useToolCardExpansion,
-  type Status,
-  type ToolCardProps,
-} from "./ToolCardChrome";
+import { CardChrome, spanTimes, useToolCardExpansion, type Status, type ToolCardProps } from "./ToolCardChrome";
 import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
 import { ToolOutputMedia } from "./ToolOutputMedia";
-import { fromBackground, fromInline } from "./subagents/model";
+import { fromBackground, fromInline, taskPrompt } from "./subagents/model";
 import { SubagentDetail } from "./subagents/SubagentDetail";
 
 export { extractTaskResult } from "./subagents/model";
@@ -106,7 +98,6 @@ export function ToolGroupCard({ items }: { items: (ToolCardProps & { kind: strin
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   const agent = useBackgroundAgentFor(tool.id);
   const openPane = useOpenBackgroundAgentsPane();
-  const args = useToolArgs(tool);
   const record = useMemo(
     () =>
       agent
@@ -114,16 +105,20 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
         : {
             ...fromInline(tool, undefined, []),
             background: true,
-            prompt: pickStr(args, "prompt") ?? "",
+            prompt: taskPrompt(tool.args_preview),
           },
-    [agent, tool, args],
+    [agent, tool],
   );
   return (
     <SubagentDetail
       record={record}
       actions={
         openPane && (
-          <button type="button" onClick={openPane} className="text-[11px] text-text-dim hover:text-text-secondary">
+          <button
+            type="button"
+            onClick={() => openPane(agent?.agentId)}
+            className="text-[11px] text-text-dim hover:text-text-secondary"
+          >
             Open in side pane
           </button>
         )

@@ -9,7 +9,10 @@ export interface BackgroundAgentsContextValue {
   agents: BackgroundAgent[];
   workflowRuns?: Record<string, WorkflowRun>;
   backgroundTasks?: string[];
-  openPane?: () => void;
+  /** Opens the Sub agents pane, on one agent's detail when given its id. */
+  openPane?: (agentId?: string) => void;
+  /** Cancel is unavailable: a read-only server or a trashed/archived session. */
+  readOnly?: boolean;
 }
 
 export const BackgroundAgentsContext = createContext<BackgroundAgentsContextValue>({ agents: [] });
@@ -51,7 +54,7 @@ export function workflowRunning(
   return run ? !run.finished && backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
 }
 
-export function useOpenBackgroundAgentsPane(): (() => void) | undefined {
+export function useOpenBackgroundAgentsPane(): ((agentId?: string) => void) | undefined {
   return useContext(BackgroundAgentsContext).openPane;
 }
 

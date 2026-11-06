@@ -32,11 +32,32 @@ function entries(sorted: BackgroundAgent[], all: BackgroundAgent[]): Entry[] {
   return out;
 }
 
-export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
+export interface AgentFocus {
+  agentId: string;
+  /** Distinguishes repeat requests for the same agent. */
+  nonce: number;
+}
+
+interface PanelProps {
+  sessionId: string | null;
+  /** Cancel is unavailable on a read-only server. */
+  readOnly?: boolean;
+  /** An agent to open on; set when an inline card asks for its detail. */
+  focus?: AgentFocus | null;
+  /** Reveals the transcript where the pane covers it, as on mobile. */
+  onShowThread?: () => void;
+}
+
+export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread }: PanelProps) {
   const agents = useBackgroundAgents(sessionId);
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(focus?.agentId ?? null);
+  const [seenFocus, setSeenFocus] = useState(focus);
+  if (focus !== seenFocus) {
+    setSeenFocus(focus);
+    if (focus) setSelected(focus.agentId);
+  }
 
   // Running first, then most-recently-started within each group.
   const sorted = useMemo(
@@ -49,7 +70,10 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
       }),
     [agents],
   );
-  const context = useMemo(() => ({ sessionId: sessionId ?? undefined, agents }), [sessionId, agents]);
+  const context = useMemo(
+    () => ({ sessionId: sessionId ?? undefined, agents, readOnly }),
+    [sessionId, agents, readOnly],
+  );
 
   if (agents.length === 0) {
     return (
@@ -65,7 +89,13 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   if (index >= 0) {
     return (
       <BackgroundAgentsContext.Provider value={context}>
-        <AgentDetailView agents={sorted} index={index} onSelect={setSelected} onBack={() => setSelected(null)} />
+        <AgentDetailView
+          agents={sorted}
+          index={index}
+          onSelect={setSelected}
+          onBack={() => setSelected(null)}
+          onShowThread={onShowThread}
+        />
       </BackgroundAgentsContext.Provider>
     );
   }
@@ -79,7 +109,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
         <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
           Background agents · {agents.length}
         </span>
-        {running > 0 && sessionId && <StopSession sessionId={sessionId} running={running} />}
+        {running > 0 && sessionId && !readOnly && <StopSession sessionId={sessionId} running={running} />}
       </div>
       <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
         Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
@@ -111,11 +141,13 @@ function AgentDetailView({
   index,
   onSelect,
   onBack,
+  onShowThread,
 }: {
   agents: BackgroundAgent[];
   index: number;
   onSelect: (id: string) => void;
   onBack: () => void;
+  onShowThread?: () => void;
 }) {
   const agent = agents[index]!;
   const record = useMemo(() => fromBackground(agent), [agent]);
@@ -163,11 +195,14 @@ function AgentDetailView({
             inThread && (
               <button
                 type="button"
-                onClick={() =>
-                  document
-                    .querySelector(`[data-tool-id="${CSS.escape(agent.toolCallId)}"]`)
-                    ?.scrollIntoView({ block: "center" })
-                }
+                onClick={() => {
+                  onShowThread?.();
+                  requestAnimationFrame(() =>
+                    document
+                      .querySelector(`[data-tool-id="${CSS.escape(agent.toolCallId)}"]`)
+                      ?.scrollIntoView({ block: "center" }),
+                  );
+                }}
                 className="text-[11px] text-text-dim hover:text-text-secondary"
               >
                 Show in thread

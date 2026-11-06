@@ -51,7 +51,9 @@ function duration(t: ActivityTool): string | null {
 }
 
 function Row({ tool }: { tool: ActivityTool }) {
-  const [open, setOpen] = useState(tool.status === "err" && !!tool.call);
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  // A call that fails while shown opens itself unless the reader chose otherwise.
+  const open = toggled ?? (tool.status === "err" && !!tool.call);
   const Icon = KIND_ICONS[tool.kind] ?? HelpCircle;
   const glyph = GLYPHS[tool.status];
   const time = duration(tool);
@@ -60,7 +62,7 @@ function Row({ tool }: { tool: ActivityTool }) {
       <button
         type="button"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setToggled(!open)}
         title={tool.target ? `${tool.name} ${tool.target}` : tool.name}
         className="flex h-7 w-full items-center gap-2 px-2 text-left text-xs hover:bg-surface-800"
       >
@@ -163,9 +165,11 @@ export function ActivityRows({
   tools,
   filter,
   following,
+  running,
 }: {
   tools: ActivityTool[];
   filter: ActivityFilter;
+  running: boolean;
   /** A running agent: only the newest rows, the earlier ones folded. */
   following: boolean;
 }) {
@@ -173,7 +177,10 @@ export function ActivityRows({
     const shown = applyFilter(tools, filter);
     return following && filter === "all" ? followTail(shown) : foldActivity(shown);
   }, [tools, filter, following]);
-  if (tools.length === 0) return <p className="px-2 py-1.5 text-xs text-text-dim">No tool calls yet.</p>;
+  if (tools.length === 0) {
+    const text = running ? "No tool calls yet." : "Tool calls were not retained.";
+    return <p className="px-2 py-1.5 text-xs text-text-dim">{text}</p>;
+  }
   if (nodes.length === 0) return <p className="px-2 py-1.5 text-xs text-text-dim">No calls match this filter.</p>;
   return <Nodes nodes={nodes} dashedFirstFold={following && filter === "all"} />;
 }

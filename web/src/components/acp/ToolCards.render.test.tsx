@@ -805,7 +805,7 @@ describe("AsyncSubagentCard", () => {
       status: "running",
       startedAt: new Date().toISOString(),
       endedAt: null,
-      toolCount: 3,
+      toolCount: 1,
       tools: [{ name: "Read", title: "a.ts", ok: true }],
       lastTool: "Read",
       lastText: "scanning files",
