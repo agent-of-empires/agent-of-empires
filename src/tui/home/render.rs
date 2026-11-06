@@ -2168,27 +2168,28 @@ impl HomeView {
         } else {
             String::new()
         };
-        let statuses = crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id);
-        let mut slot_width =
-            if self.show_activity_age && (!age.is_empty() || statuses.clone().next().is_some()) {
-                LAST_ACTIVITY_SLOT
-            } else {
-                0
-            };
+        let statuses: Vec<_> =
+            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id).collect();
+        let mut slot_width = if self.show_activity_age && (!age.is_empty() || !statuses.is_empty())
+        {
+            LAST_ACTIVITY_SLOT
+        } else {
+            0
+        };
 
         let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
         let mut fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
         let status_budget = room
             .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
             .min(MAX_PLUGIN_STATUS_WIDTH);
-        let mut plugin_status_plan = plan_plugin_statuses(statuses.clone(), status_budget);
+        let mut plugin_status_plan = plan_plugin_statuses(statuses.iter().copied(), status_budget);
         if plugin_status_plan.width == 0 && age.is_empty() && slot_width > 0 {
             slot_width = 0;
             fixed_trailing = badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
             let budget = room
                 .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
                 .min(MAX_PLUGIN_STATUS_WIDTH);
-            plugin_status_plan = plan_plugin_statuses(statuses, budget);
+            plugin_status_plan = plan_plugin_statuses(statuses.iter().copied(), budget);
         }
         let plugin_status_width = plugin_status_plan.width;
 

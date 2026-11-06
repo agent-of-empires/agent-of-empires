@@ -212,7 +212,8 @@ Press r to refresh, q to quit.",
             ];
             if plugin_width > 0 {
                 let (cells, width) = &plugin_cells[idx];
-                spans.push(Span::raw(" ".repeat(plugin_width - width)));
+                let available = usize::from(area.width).saturating_sub(54 + width);
+                spans.push(Span::raw(" ".repeat((plugin_width - width).min(available))));
                 for (text, tone, gap) in cells {
                     spans.push(Span::raw(" ".repeat(*gap)));
                     spans.push(Span::styled(
@@ -346,8 +347,12 @@ mod tests {
     /// selector) and the trailing cell of a wide glyph holds an empty symbol, so
     /// both are folded to a single representative character.
     fn rows(state: &RemoteHomeState) -> Vec<String> {
+        rows_with_width(state, 100)
+    }
+
+    fn rows_with_width(state: &RemoteHomeState, width: u16) -> Vec<String> {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let mut terminal = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(width, 10)).expect("terminal");
         terminal
             .draw(|f| render(f, f.area(), &theme, state))
             .expect("draw");
@@ -392,6 +397,22 @@ mod tests {
         assert_eq!(
             column_of(&painted, "long status") + "long status".len(),
             column_of(&painted, "short") + "short".len()
+        );
+    }
+
+    #[test]
+    fn narrow_rows_keep_short_status_visible() {
+        let state = state_with(
+            &["s1", "s2"],
+            json!([
+                row_column("s1", "a very long status label"),
+                row_column("s2", "X")
+            ]),
+        );
+        let painted = rows_with_width(&state, 60);
+        assert!(
+            painted.iter().any(|line| line.ends_with('X')),
+            "{painted:?}"
         );
     }
 
