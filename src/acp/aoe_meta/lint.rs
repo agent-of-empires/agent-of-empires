@@ -119,6 +119,10 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
                     EnvelopeError::Malformed(_) => "bad_envelope",
                 };
                 add(n, code, e.to_string());
+                // An invalid tailer frame still takes no adapter frame number.
+                if super::is_anchored(update) {
+                    continue;
+                }
                 None
             }
         };
@@ -341,6 +345,15 @@ mod tests {
                 ],
                 false,
                 vec!["key_conflict"],
+            ),
+            (
+                "an invalid anchored frame is not an adapter frame",
+                vec![
+                    update(r#"{"v":1,"key":"","after_adapter_sequence":1}"#),
+                    update(r#"{"v":1,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
+                ],
+                false,
+                vec!["empty_key", "sequence_beyond_stream"],
             ),
             (
                 "same envelope on a different tool call",

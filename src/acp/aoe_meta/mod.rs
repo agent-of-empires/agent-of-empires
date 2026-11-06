@@ -242,6 +242,15 @@ pub fn from_update_value(update: &serde_json::Value) -> Result<Option<Envelope>,
     }
 }
 
+/// Whether an update names an `after_adapter_sequence`, read without
+/// validating the rest of the envelope: a tailer frame that fails validation
+/// is still not an adapter frame.
+pub fn is_anchored(update: &serde_json::Value) -> bool {
+    update
+        .pointer("/_meta/aoe/after_adapter_sequence")
+        .is_some_and(|v| !v.is_null())
+}
+
 /// The envelope of an already-ingested update. A malformed one reads as
 /// absent here: `Shared` rejects it before mapping.
 pub fn envelope_of(meta: &Option<Meta>) -> Option<Envelope> {
