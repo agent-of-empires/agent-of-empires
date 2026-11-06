@@ -935,6 +935,7 @@ mod tests {
         let at = chrono::Utc::now();
         let started = |id: &str| Event::ToolCallStarted {
             tool_call: ToolCall {
+                prompt: None,
                 id: id.into(),
                 name: id.into(),
                 kind: "read".into(),
@@ -1323,6 +1324,7 @@ mod tests {
         for (seq, id) in [(1, "missed"), (2, "queued")] {
             let event = Event::ToolCallStarted {
                 tool_call: ToolCall {
+                    prompt: None,
                     id: id.into(),
                     name: id.into(),
                     kind: "read".into(),
