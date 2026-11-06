@@ -311,6 +311,19 @@ pub struct RuntimeStatus {
     pub kind: crate::session::config::ContainerRuntimeName,
     pub installed: bool,
     pub running: bool,
+    /// How to start it on the Daemon's platform.
+    pub start_command: &'static str,
+}
+
+fn start_command(kind: crate::session::config::ContainerRuntimeName, macos: bool) -> &'static str {
+    use crate::session::config::ContainerRuntimeName as Name;
+    match (kind, macos) {
+        (Name::Docker, true) => "docker desktop start",
+        (Name::Docker, false) => "sudo systemctl start docker",
+        (Name::Podman, true) => "podman machine start",
+        (Name::Podman, false) => "systemctl --user start podman.socket",
+        (Name::AppleContainer, _) => "container system start",
+    }
 }
 
 /// Every container runtime this platform supports, probed separately so the
@@ -332,6 +345,7 @@ pub async fn get_setup_runtimes() -> impl IntoResponse {
                     kind,
                     installed,
                     running: installed && runtime.is_daemon_running(),
+                    start_command: start_command(kind, cfg!(target_os = "macos")),
                 }
             })
             .collect::<Vec<_>>()
@@ -488,6 +502,20 @@ mod tests {
         let app = AppStateConfig::load().unwrap();
         assert_eq!(app.setup_skipped_steps, ["sandbox"]);
         assert!(app.setup_confirmed_steps.is_empty());
+    }
+
+    #[test]
+    fn start_commands_match_the_daemon_platform() {
+        use crate::session::config::ContainerRuntimeName as Name;
+        assert_eq!(
+            start_command(Name::Docker, false),
+            "sudo systemctl start docker"
+        );
+        assert_eq!(start_command(Name::Docker, true), "docker desktop start");
+        assert_eq!(
+            start_command(Name::Podman, false),
+            "systemctl --user start podman.socket"
+        );
     }
 
     #[test]

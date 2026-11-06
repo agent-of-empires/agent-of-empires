@@ -3328,6 +3328,8 @@ export interface RuntimeStatus {
   kind: ContainerRuntimeKind;
   installed: boolean;
   running: boolean;
+  /** How to start it on the Daemon's platform. */
+  start_command: string;
 }
 
 export function fetchSetup(): Promise<SetupStatus | null> {

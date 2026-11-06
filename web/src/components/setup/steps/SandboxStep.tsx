@@ -5,10 +5,10 @@ import type { SettingsFieldDescriptor } from "../../../lib/types";
 import { SchemaSection } from "../../settings/SchemaSection";
 import { GhostButton, PANEL, RadioRow, Section } from "../ui";
 
-const RUNTIMES: Record<ContainerRuntimeKind, { label: string; start: string }> = {
-  docker: { label: "Docker", start: "docker desktop start" },
-  podman: { label: "Podman", start: "podman machine start" },
-  apple_container: { label: "Apple Container", start: "container system start" },
+const LABELS: Record<ContainerRuntimeKind, string> = {
+  docker: "Docker",
+  podman: "Podman",
+  apple_container: "Apple Container",
 };
 
 interface Props {
@@ -26,12 +26,15 @@ function runtimeState(r: RuntimeStatus) {
 export function SandboxStep({ schema, values, onSaveField }: Props) {
   const [runtimes, setRuntimes] = useState<RuntimeStatus[] | null>(null);
   const [checking, setChecking] = useState(true);
+  const [failed, setFailed] = useState(false);
   const [checks, setChecks] = useState(0);
   useEffect(() => {
     let live = true;
     void fetchSetupRuntimes().then((result) => {
       if (!live) return;
-      setRuntimes(result ?? []);
+      // A failed probe isn't "no runtime installed".
+      setFailed(result === null);
+      if (result) setRuntimes(result);
       setChecking(false);
     });
     return () => {
@@ -52,7 +55,7 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
     if (!(await onSaveField("sandbox", "container_runtime", kind))) setSelected(previous);
   };
 
-  const none = runtimes !== null && !runtimes.some((r) => r.installed);
+  const none = !failed && runtimes !== null && !runtimes.some((r) => r.installed);
 
   return (
     <>
@@ -69,16 +72,23 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
         }
       >
         <div className={PANEL}>
-          {runtimes === null && <div className="px-4 py-3 text-sm text-text-dim">Checking container runtimes…</div>}
+          {failed && (
+            <div role="alert" className="px-4 py-3 text-sm text-status-error-text">
+              Couldn't check container runtimes. Check again.
+            </div>
+          )}
+          {!failed && runtimes === null && (
+            <div className="px-4 py-3 text-sm text-text-dim">Checking container runtimes…</div>
+          )}
           {runtimes?.map((r) => (
             <RadioRow key={r.kind} name="runtime" checked={selected === r.kind} onSelect={() => void pick(r.kind)}>
               <div className="flex items-center gap-6">
-                <span className="w-32 text-sm text-text-primary">{RUNTIMES[r.kind].label}</span>
+                <span className="w-32 text-sm text-text-primary">{LABELS[r.kind]}</span>
                 {runtimeState(r)}
               </div>
               {r.installed && !r.running && (
                 <p className="mt-1 text-xs text-text-dim">
-                  To start it: <span className="font-mono text-text-secondary">{RUNTIMES[r.kind].start}</span>
+                  To start it: <span className="font-mono text-text-secondary">{r.start_command}</span>
                 </p>
               )}
             </RadioRow>
