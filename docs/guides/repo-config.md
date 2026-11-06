@@ -21,7 +21,7 @@ Native starts release their API locks while pre-launch hooks run, so hooks can c
 - **`on_destroy`** runs before worktree and sandbox cleanup, while their resources remain available. Failures warn without preventing deletion.
 For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
 
-Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
+Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. In a [workspace](multi-repo-workspaces.md), repo hooks come from and run in the checkout of the repo the session started from, even after more projects are added; global and profile hooks run in the workspace directory. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
 
 ```toml
 [hooks]

@@ -1,6 +1,7 @@
 //! `aoe session add-project` (#3103) against real git repos, asserting on the
 //! worktrees on disk and the persisted `sessions.json`. No agent runs.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serial_test::parallel;
@@ -311,5 +312,86 @@ fn workspace_by_default_applies_on_the_daemon() {
             .canonicalize()
             .unwrap(),
         checkout.canonicalize().unwrap()
+    );
+}
+
+/// A workspace directory holds no repo config, so repo hooks come from and run in the
+/// launch repo's checkout, even after another project is added. Global hooks stay in
+/// the workspace directory.
+#[test]
+#[parallel]
+fn workspace_repo_hooks_run_in_the_launch_repo_checkout() {
+    crate::harness::require_tmux!();
+    let h = TuiTestHarness::new("workspace_repo_hooks");
+    let agent = h.home_path().join("held-agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = h.home_path().join("hooks.log");
+    let record = |kind: &str| format!("echo {kind} $PWD $AOE_PROJECT_PATH >> {}", log.display());
+    h.append_config(&format!(
+        "[session]\ndefault_tool = \"held-agent\"\ncustom_agents = {{ held-agent = {:?} }}\n\
+         [hooks]\non_destroy = [{:?}]",
+        agent.to_str().unwrap(),
+        record("destroy"),
+    ));
+    let backend = h.home_path().join("backend");
+    let frontend = h.home_path().join("frontend");
+    init_repo(&backend);
+    init_repo(&frontend);
+    std::fs::create_dir(backend.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        backend.join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_create = [{:?}]\non_launch = [{:?}]\n",
+            record("create"),
+            record("launch"),
+        ),
+    )
+    .unwrap();
+
+    h.run_cli_ok(&[
+        "add",
+        backend.to_str().unwrap(),
+        "-t",
+        "Solo",
+        "-w",
+        "feat/solo",
+        "-b",
+        "--workspace",
+        "--trust-hooks",
+        "--launch",
+    ]);
+    let sessions = h.read_sessions();
+    let workspace = &session_by_title(&sessions, "Solo")["workspace_info"];
+    let workspace_dir = workspace["workspace_dir"].as_str().unwrap().to_string();
+    let checkout = workspace["repos"][0]["worktree_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lines = |kinds: &[&str]| {
+        kinds
+            .iter()
+            .map(|kind| format!("{kind} {checkout} {workspace_dir}\n"))
+            .collect::<String>()
+    };
+    let take_log = || {
+        let content = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        content
+    };
+    assert_eq!(take_log(), lines(&["create", "launch"]));
+
+    h.run_cli_ok(&["session", "restart", "Solo"]);
+    assert_eq!(take_log(), lines(&["launch"]));
+
+    h.run_cli_ok(&["session", "stop", "Solo"]);
+    h.run_cli_ok(&["session", "add-project", "Solo", frontend.to_str().unwrap()]);
+    h.run_cli_ok(&["session", "start", "Solo"]);
+    assert_eq!(take_log(), lines(&["launch"]));
+
+    h.run_cli_ok(&["remove", "Solo", "--purge", "--force"]);
+    assert_eq!(
+        take_log(),
+        format!("destroy {workspace_dir} {workspace_dir}\n")
     );
 }

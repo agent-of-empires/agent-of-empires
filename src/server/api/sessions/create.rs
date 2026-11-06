@@ -658,7 +658,7 @@ pub(crate) fn run_create_hooks(
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
         instance.ensure_container_in(store)?;
-        let workdir = instance.container_workdir();
+        let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
                 plan.on_create(),
@@ -671,7 +671,7 @@ pub(crate) fn run_create_hooks(
     } else {
         repo_config::execute_hooks_streamed(
             plan.on_create(),
-            std::path::Path::new(&instance.project_path),
+            instance.hook_workdir(plan.on_create_from_repo),
             progress,
             &hook_env,
         )?;
