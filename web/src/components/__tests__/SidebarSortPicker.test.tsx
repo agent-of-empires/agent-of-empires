@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
+import type { Workspace } from "../../lib/types";
+import { useSidebarSelection } from "../sidebar/useSidebarSelection";
+import { useKeyboardShortcuts, type ShortcutActions } from "../../hooks/useKeyboardShortcuts";
 
 function setup(sortMode: SidebarSortMode = "manual") {
   const onSortModeChange = vi.fn();
@@ -67,5 +70,39 @@ describe("SidebarSortPicker", () => {
     cleanup();
     setup("bogus" as SidebarSortMode);
     expect(trigger().getAttribute("aria-label")).toBe("Sort sessions, current: Manual");
+  });
+
+  // #5345: the window listener that clears the sidebar selection on Escape ran after Sort's dismissal.
+  it("Escape closes Sort and keeps the sidebar selection; the next Escape clears it", () => {
+    const workspaces = [{ id: "a" }, { id: "b" }, { id: "c" }] as Workspace[];
+    const { result } = renderHook(() =>
+      useSidebarSelection({
+        allWorkspaces: workspaces,
+        orderedIds: ["a", "b", "c"],
+        triage: {} as Parameters<typeof useSidebarSelection>[0]["triage"],
+        activeId: null,
+        onSelect: vi.fn(),
+      }),
+    );
+    const ctrlClick = { metaKey: false, ctrlKey: true, shiftKey: false } as React.MouseEvent;
+    act(() => result.current.handleRowActivate("a", ctrlClick, null));
+    act(() => result.current.handleRowActivate("b", ctrlClick, null));
+    const selected = () => ["a", "b", "c"].filter((id) => result.current.isSelected(id));
+    expect(selected()).toEqual(["a", "b"]);
+
+    // The global Escape shortcut still sees both presses.
+    const onEscape = vi.fn();
+    renderHook(() => useKeyboardShortcuts(() => ({ onEscape }) as unknown as ShortcutActions));
+
+    setup();
+    fireEvent.click(trigger());
+    fireEvent.keyDown(option("manual"), { key: "Escape" });
+    expect(menu()).toBeNull();
+    expect(selected()).toEqual(["a", "b"]);
+    expect(onEscape).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(selected()).toEqual([]);
+    expect(onEscape).toHaveBeenCalledTimes(2);
   });
 });
