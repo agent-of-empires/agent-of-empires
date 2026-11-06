@@ -224,6 +224,19 @@ fn resolve_host_creation(
             names.join(", ")
         )
     };
+    let custom_names: Vec<&str> = config
+        .session
+        .custom_agents
+        .iter()
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    // A plugin-declared tool is owned by the plugin, so it carries the same
+    // --cmd-override rejection whichever resolution path found it.
+    let plugin_owned = |name: &str| {
+        crate::plugin::agent_integration::agent_command(name, custom_names.iter().copied())
+            .is_some()
+    };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
@@ -260,21 +273,15 @@ fn resolve_host_creation(
             }
             body.tool = name.to_owned();
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
+            anyhow::ensure!(
+                !plugin_owned(tool) || body.command_override.is_empty(),
+                "--cmd-override cannot be used with plugin-provided agent --tool selections"
+            );
             body.tool = tool.to_owned();
-        } else if crate::plugin::agent_integration::agent_command(
-            name,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
-        )
-        .is_some()
-        {
+        } else if plugin_owned(name) {
             anyhow::ensure!(
                 body.command_override.is_empty(),
-                "--cmd-override cannot be used with configured custom agent --tool selections"
+                "--cmd-override cannot be used with plugin-provided agent --tool selections"
             );
             body.tool = name.to_owned();
         } else {
