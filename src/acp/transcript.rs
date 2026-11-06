@@ -329,12 +329,14 @@ impl TranscriptModel {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => self.on_tool_updated(
                 tool_call_id,
                 title.as_deref(),
                 args_preview.as_deref(),
+                prompt.as_deref(),
                 *started_at,
                 diffs.as_deref(),
             ),
@@ -519,6 +521,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         title: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -547,6 +550,7 @@ impl TranscriptModel {
             }
             if let Some(args_preview) = args_preview {
                 tool.args_preview = args_preview.to_string();
+                tool.prompt = prompt.map(str::to_string);
             }
             if let Some(started_at) = started_at {
                 tool.started_at = started_at;
@@ -572,6 +576,7 @@ impl TranscriptModel {
         }
         self.turn_has_output = true;
         let tool = ToolCall {
+            prompt: None,
             id: tool_call_id.to_string(),
             name: name
                 .filter(|n| !n.is_empty())
@@ -780,6 +785,7 @@ pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall
             &incoming.args_preview,
             &prev.args_preview,
         ),
+        prompt: incoming.prompt.clone().or_else(|| prev.prompt.clone()),
         started_at: incoming.started_at.max(prev.started_at),
         parent_tool_call_id: incoming
             .parent_tool_call_id
@@ -842,6 +848,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),
@@ -875,6 +882,7 @@ mod tests {
         diffs: Option<Vec<DiffPreview>>,
     ) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: id.into(),
             title: title.map(Into::into),
             args_preview: args.map(Into::into),

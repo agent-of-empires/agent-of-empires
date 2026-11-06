@@ -55,6 +55,9 @@ pub struct ToolCall {
     pub kind: String,
     /// Capped at 16 KB at ingest, control chars stripped.
     pub args_preview: String,
+    /// The `prompt` argument in full, set only when `args_preview` was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub started_at: DateTime<Utc>,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +635,9 @@ pub enum Event {
         title: Option<String>,
         #[serde(default)]
         args_preview: Option<String>,
+        /// The `prompt` argument in full when `args_preview` was cut.
+        #[serde(default)]
+        prompt: Option<String>,
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
         /// Replaces the call's diffs when present (Codex sends them on updates).
@@ -973,6 +979,7 @@ impl AcpState {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => {
@@ -986,6 +993,7 @@ impl AcpState {
                     }
                     if let Some(args_preview) = args_preview {
                         tool.args_preview = args_preview;
+                        tool.prompt = prompt;
                     }
                     if let Some(started_at) = started_at {
                         tool.started_at = started_at;
@@ -1415,6 +1423,7 @@ mod tests {
         use super::test_support::chunk;
         use crate::acp::permissions::build_approval;
         let tool = || ToolCall {
+            prompt: None,
             id: "t".into(),
             name: "shell".into(),
             kind: "execute".into(),
@@ -1764,6 +1773,7 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Read".into(),
             kind: "read".into(),
@@ -1786,6 +1796,7 @@ mod tests {
 
     fn tool_update(title: Option<&str>, diffs: Option<Vec<DiffPreview>>) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-1".into(),
             title: title.map(Into::into),
             args_preview: None,
@@ -1924,6 +1935,7 @@ mod tests {
             "another tool's completion leaves it set"
         );
         let retitle = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-compact".into(),
             title: Some("Compacting context".into()),
             args_preview: None,

@@ -727,6 +727,7 @@ mod tests {
         let approval = crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce("n-1".into()),
             tool_call: crate::acp::state::ToolCall {
+                prompt: None,
                 id: "t-1".into(),
                 name: "Edit".into(),
                 kind: "edit".into(),
@@ -1067,6 +1068,7 @@ mod tests {
         let approval = |nonce: &str| crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce(nonce.into()),
             tool_call: crate::acp::state::ToolCall {
+                prompt: None,
                 id: "t-1".into(),
                 name: "Edit".into(),
                 kind: "edit".into(),

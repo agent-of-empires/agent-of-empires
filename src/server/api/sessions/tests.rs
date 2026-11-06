@@ -6412,6 +6412,7 @@ mod open_file {
         std::fs::write(&page, "<script>alert(1)</script>").unwrap();
         let state = state_for(single_repo(dir.path()), false);
         let tool_call = crate::acp::state::ToolCall {
+            prompt: None,
             id: "t1".to_string(),
             name: "Write".to_string(),
             kind: "edit".to_string(),
@@ -8292,6 +8293,7 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let approval = build_approval(
         ToolCall {
+            prompt: None,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             kind: "execute".to_string(),

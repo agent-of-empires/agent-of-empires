@@ -176,6 +176,7 @@ pub(super) async fn handle_permission_request(
     );
     let args_preview = preview_optional_args(enriched_raw_input.as_ref());
     let tool_call = ToolCall {
+        prompt: None,
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
         kind: request

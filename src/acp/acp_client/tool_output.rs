@@ -45,6 +45,12 @@ pub(super) fn preview_args(raw: &serde_json::Value) -> String {
     out
 }
 
+/// The `prompt` argument in full, only when `preview_args` cut the call.
+pub(super) fn full_prompt(raw: &serde_json::Value) -> Option<String> {
+    let prompt = raw.get("prompt")?.as_str()?;
+    (serde_json::to_string(raw).ok()?.len() > 16 * 1024).then(|| prompt.to_string())
+}
+
 /// A missing field and an explicit JSON `null` both mean "no args", so the UI
 /// renders an empty state rather than the literal "null" `preview_args` would
 /// produce for `Value::Null`. Gemini ships argless tool calls this way (#1713).
@@ -281,6 +287,19 @@ mod tests {
         EmbeddedResourceResource, ImageContent, ResourceLink, TextResourceContents,
         ToolCallContent,
     };
+
+    #[test]
+    fn full_prompt_is_kept_only_when_the_preview_was_cut() {
+        let short = serde_json::json!({ "prompt": "do it" });
+        assert_eq!(full_prompt(&short), None);
+        let long = "p".repeat(20_000);
+        let big = serde_json::json!({ "description": "d", "prompt": long });
+        assert_eq!(full_prompt(&big).as_deref(), Some(long.as_str()));
+        assert_eq!(
+            full_prompt(&serde_json::json!({ "command": "x".repeat(20_000) })),
+            None
+        );
+    }
 
     /// #1713: a missing or null raw_input previews as empty, not "null".
     #[test]

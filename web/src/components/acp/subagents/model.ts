@@ -143,7 +143,7 @@ export function fromInline(tool: ToolCall, result: ActivityRow | undefined, chil
     status: running ? "running" : failed ? "failed" : "done",
     startedAt: tool.started_at,
     endedAt: running ? undefined : (result?.at ?? lastEnd),
-    prompt: taskPrompt(tool.args_preview),
+    prompt: tool.prompt ?? taskPrompt(tool.args_preview),
     tools,
     toolCount: tools.length,
     lastTool: tools.at(-1)?.name ?? null,

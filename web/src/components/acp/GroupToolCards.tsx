@@ -105,7 +105,7 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
         : {
             ...fromInline(tool, undefined, []),
             background: true,
-            prompt: taskPrompt(tool.args_preview),
+            prompt: tool.prompt ?? taskPrompt(tool.args_preview),
           },
     [agent, tool],
   );
