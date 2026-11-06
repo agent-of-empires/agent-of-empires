@@ -827,7 +827,7 @@ impl Instance {
         } else {
             None
         };
-        let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
+        let scope = crate::process::systemd::scope_prefix_for(&self.id, &self.id, profile);
         let recorded_scopes = self.terminal_scopes.clone();
         let resolved_scopes = match recorded_scopes.as_deref() {
             Some(scopes)
