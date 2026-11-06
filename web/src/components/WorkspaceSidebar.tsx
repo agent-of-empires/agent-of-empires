@@ -4,7 +4,7 @@ import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
-import type { SidebarAxis } from "../lib/sidebarAxis";
+import { axisDrawsRepoHeaders, type SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
   type NestedSidebarGroup,
@@ -358,6 +358,7 @@ export function WorkspaceSidebar(props: Props) {
           {(props.canManageProjects ?? true) && (
             <ProjectsSection
               projects={props.savedProjects}
+              drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
               query={q}
               readOnly={readOnly}
               offline={offline}

@@ -67,11 +67,12 @@ A sort picker next to the filter button offers three modes:
 
 Drag-to-reorder is disabled in the computed modes. The picker's state is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
-## Sidebar grouping: by repo, by group, or both
+## Sidebar grouping: by repo, organization, group, or repo and group
 
-A grouping toggle (layers icon) next to the sort toggle cycles the axis. Each click advances **By repo** to **By group** to **By repo and group** and back:
+A grouping toggle (layers icon) next to the sort toggle cycles the axis. Each click advances **By repo** to **By organization** to **By group** to **By repo and group** and back:
 
 - **By repo** (default): groups by git repository.
+- **By organization**: groups repositories by the owner in their git remote (any hosted remote, not only GitHub), with each repository's header inside its owner.
 - **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 
@@ -113,12 +114,17 @@ With more than one row selected, right-click (long-press on touch) any selected 
 
 ## Projects
 
-A **Projects, no sessions** section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆. The section is expanded by default; its collapsed state persists per-browser.
+A Projects section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. The section is expanded by default; its collapsed state persists per-browser.
 
-Pinned projects always render above as their own headers, with or without sessions. Projects with live sessions also render above as normal groups.
+What it lists depends on whether the grouping draws repository headers:
+
+- **By repo**, **By organization** and **By repo and group** draw them, so the section is **Projects, no sessions**: registered Projects that are not pinned and have no live session. A pinned Project renders above as its own header, with or without sessions, and a Project with live sessions renders above as a normal group. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆.
+- **By group** draws user groups instead, so the section is **Projects** and lists every registered Project once, pinned or not, with or without live sessions.
+
+The compact sidebar labels it **Projects** in every mode.
 
 - **Add** with the **+** on the section header: browse for a path or type one, optionally set a name and a default base branch, choose global or profile scope, then save. The project appears in the section, ready to start work in.
-- **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list.
+- **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list, except **By group**, where it stays in the section.
 - **Project settings** and **Remove** live in the row's right-click (long-press on touch) menu. Project settings control the default base branch plus worktree-by-default, smart-rename and start-in-container overrides. Remove targets that row's registrations; see [project registry scope](../multi-repo-workspaces.md#web-dashboard). The add, edit, and remove controls are hidden in read-only mode.
 
 ## Settings

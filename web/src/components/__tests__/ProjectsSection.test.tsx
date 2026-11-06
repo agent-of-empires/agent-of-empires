@@ -148,6 +148,36 @@ describe("ProjectsSection", () => {
     expect([label.textContent, label.getAttribute("title")]).toEqual(["Projects", "Projects, no sessions"]);
   });
 
+  // #5065: an axis without repository headers lists every Project, so the label drops "no sessions".
+  it("labels the section by whether the axis draws repository headers; compact stays Projects", () => {
+    // (draws repository headers, compact, label, title)
+    const cases: [boolean, boolean, string, string][] = [
+      [true, false, "Projects, no sessions", "Projects, no sessions"],
+      [false, false, "Projects", "Projects"],
+      [true, true, "Projects", "Projects, no sessions"],
+      [false, true, "Projects", "Projects"],
+    ];
+    for (const [drawsRepoHeaders, compact, text, title] of cases) {
+      render(
+        <SidebarCompactContext.Provider value={compact}>
+          <ProjectsSection
+            projects={[emptyProject("/work/alpha")]}
+            query=""
+            offline={false}
+            drawsRepoHeaders={drawsRepoHeaders}
+            onCreateSession={vi.fn()}
+            onAddProject={vi.fn()}
+            onEditProject={vi.fn()}
+            onRemoveProject={vi.fn()}
+          />
+        </SidebarCompactContext.Provider>,
+      );
+      const label = screen.getByTestId("sidebar-projects-toggle").querySelector("span[title]")!;
+      expect([label.textContent, label.getAttribute("title")], `${drawsRepoHeaders} ${compact}`).toEqual([text, title]);
+      cleanup();
+    }
+  });
+
   it("shows the no-match and empty hints, and nothing when there is no way to add", () => {
     renderSection({ query: "zzz" });
     expect(screen.queryByTestId("sidebar-project-row")).toBeNull();

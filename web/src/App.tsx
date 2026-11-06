@@ -42,6 +42,7 @@ import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
+import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -539,7 +540,15 @@ function AppContent({
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort, pluginAttention);
+  } = useRepoGroups(
+    workspaces,
+    workspaceOrdering,
+    sidebarSortMode,
+    projects,
+    pluginSort,
+    pluginAttention,
+    axisDrawsRepoHeaders(sidebarAxis),
+  );
   const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
     workspaces,
     sidebarSortMode,
