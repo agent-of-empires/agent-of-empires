@@ -93,7 +93,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 fn probe_version(path: &Path, timeout: Duration) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new(path);
     cmd.arg("--version").stdin(Stdio::null());
-    crate::process::run_with_timeout(&mut cmd, timeout)?.ok_or_else(|| {
+    crate::process::run_with_timeout_process_group(&mut cmd, timeout)?.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, "node --version timed out")
     })
 }
@@ -372,6 +372,52 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct KillDescendant(std::path::PathBuf);
+    impl Drop for KillDescendant {
+        fn drop(&mut self) {
+            let pid = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|s| s.trim().parse::<libc::pid_t>().ok());
+            if let Some(pid) = pid {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_probe_kills_its_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("node");
+        let pid_file = temp.path().join("descendant.pid");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nsleep 30 &\necho $! > \"${0%/*}/descendant.pid\"\nwait\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _cleanup = KillDescendant(pid_file.clone());
+
+        verify_path_within(&node, NodeSource::Env, Duration::from_millis(500))
+            .expect_err("a hanging probe must fail");
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant {pid} outlived the probe"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_descendant_holding_stdout_does_not_block_the_node_probe() {
         use std::os::unix::fs::PermissionsExt;
@@ -385,17 +431,6 @@ mod tests {
         std::fs::write(&node, script).unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        struct KillDescendant(std::path::PathBuf);
-        impl Drop for KillDescendant {
-            fn drop(&mut self) {
-                let pid = std::fs::read_to_string(&self.0)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<libc::pid_t>().ok());
-                if let Some(pid) = pid {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-            }
-        }
         let _cleanup = KillDescendant(pid_file);
 
         let started = Instant::now();
