@@ -876,9 +876,12 @@ fn publish_with_next_seq<R>(
     publish: impl FnOnce(u64) -> R,
 ) -> R {
     let counter = session_seq(next_seqs, session_id);
-    let mut last = lock_recover(&counter);
-    *last = last.saturating_add(1);
-    publish(*last)
+    // A holder blocks on store I/O, so waiters and the holder both run off the async worker.
+    sink::blocking_io(|| {
+        let mut last = lock_recover(&counter);
+        *last = last.saturating_add(1);
+        publish(*last)
+    })
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

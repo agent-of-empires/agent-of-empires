@@ -34,19 +34,21 @@ impl<S: BroadcastSink> Supervisor<S> {
         expected_seq: u64,
     ) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
-        let mut last = super::lock_recover(&counter);
-        if *last != expected_seq {
-            return false;
-        }
-        *last = last.saturating_add(1);
-        self.sink.publish(
-            session_id,
-            *last,
-            &Event::Stopped {
-                reason: reason.to_string(),
-            },
-        );
-        true
+        super::sink::blocking_io(|| {
+            let mut last = super::lock_recover(&counter);
+            if *last != expected_seq {
+                return false;
+            }
+            *last = last.saturating_add(1);
+            self.sink.publish(
+                session_id,
+                *last,
+                &Event::Stopped {
+                    reason: reason.to_string(),
+                },
+            );
+            true
+        })
     }
 
     pub fn publish_agent_switched(
