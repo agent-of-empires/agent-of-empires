@@ -274,7 +274,15 @@ describe("ToolCard headers", () => {
       makeToolCall({ name: "SendMessage" }),
       undefined,
       { toolKey: "claude" },
-      ["send message"],
+      ["send message", "agent"],
+      [],
+    ],
+    [
+      "send message error",
+      fixtures.sendMessage,
+      makeError({ text: "agent not found" }),
+      { toolKey: "claude" },
+      ["tool failed", "agent not found"],
       [],
     ],
     // Harness names are Claude-only; a coincidental Monitor elsewhere is generic.
@@ -327,6 +335,14 @@ describe("ToolCard expanded bodies", () => {
       makeCompletion({ text: "build ok" }),
       { toolKey: "claude" },
       ["1m 30s", "npm run build", "build ok"],
+      [],
+    ],
+    [
+      "send message input and result",
+      fixtures.sendMessage,
+      makeCompletion({ text: '{"success":true,"resumedAgentId":"ace246fde7e3ac073"}' }),
+      { toolKey: "claude" },
+      ["Follow-up fix details", "Fix graph diff bug", "resumedAgentId"],
       [],
     ],
     [

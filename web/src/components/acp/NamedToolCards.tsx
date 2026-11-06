@@ -473,7 +473,7 @@ const SPECIAL_TOOLS = {
   SendMessage: (_tool: ToolCall, args: Args): SpecialHeader => ({
     icon: <Send className={ICON} />,
     label: "send message",
-    primary: withReason(mono(pickStr(args, "to"), "send message"), pickStr(args, "summary")),
+    primary: withReason(mono(pickStr(args, "to"), "agent"), pickStr(args, "summary")),
   }),
 };
 
