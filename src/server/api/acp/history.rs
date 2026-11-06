@@ -157,14 +157,15 @@ pub(crate) fn read_log_tail(
     path: &std::path::Path,
     tail: usize,
 ) -> std::io::Result<(Vec<String>, bool, bool)> {
+    match std::fs::File::open(path) {
+        Ok(file) => read_tail(file, tail),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), false, false)),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_tail(mut file: std::fs::File, tail: usize) -> std::io::Result<(Vec<String>, bool, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false, false));
-        }
-        Err(e) => return Err(e),
-    };
     let len = file.metadata()?.len();
     let read_from = len.saturating_sub(WORKER_LOG_MAX_READ_BYTES);
     let truncated = len > WORKER_LOG_MAX_READ_BYTES;
@@ -219,10 +220,10 @@ pub async fn acp_task_output(
     let claude_session = inst.agent_session_id.unwrap_or_default();
     let found = tokio::task::spawn_blocking(move || {
         let root = PathBuf::from("/tmp").join(format!("claude-{}", nix::unistd::getuid().as_raw()));
-        let Some(path) = claude_task_output_path(&root, &claude_session, &task_id) else {
-            return Ok((Vec::new(), false, false));
-        };
-        read_log_tail(&path, TASK_OUTPUT_TAIL_LINES)
+        match open_task_output(&root, &claude_session, &task_id) {
+            Some(file) => read_tail(file, TASK_OUTPUT_TAIL_LINES),
+            None => Ok((Vec::new(), false, false)),
+        }
     })
     .await;
     match found {
@@ -245,28 +246,44 @@ fn is_plain_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// `<root>/<project>/<session>/tasks/<task>.output`, where Claude Code writes
-/// a backgrounded command's output under `/tmp/claude-<uid>`. Only a regular
-/// file counts, so a symlink planted in the directory is never followed.
-fn claude_task_output_path(
+/// Opens `<root>/<project>/<session>/tasks/<task>.output`, where Claude Code
+/// writes a backgrounded command's output under `/tmp/claude-<uid>`. Every
+/// component is opened relative to its parent without following symlinks, and
+/// the opened file must be a regular one, so a swapped path can neither
+/// escape the tree nor block the read on a FIFO.
+fn open_task_output(
     root: &std::path::Path,
     session_id: &str,
     task_id: &str,
-) -> Option<PathBuf> {
+) -> Option<std::fs::File> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fstat, Mode, SFlag};
     if !is_plain_id(session_id) || !is_plain_id(task_id) {
         return None;
     }
-    std::fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .map(|project| {
-            project
-                .path()
-                .join(session_id)
-                .join("tasks")
-                .join(format!("{task_id}.output"))
-        })
-        .find(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()))
+    let dir_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+    let root_fd = open(root, dir_flags, Mode::empty()).ok()?;
+    let file_name = format!("{task_id}.output");
+    std::fs::read_dir(root).ok()?.flatten().find_map(|project| {
+        let project_fd = openat(
+            &root_fd,
+            project.file_name().as_os_str(),
+            dir_flags,
+            Mode::empty(),
+        )
+        .ok()?;
+        let session_fd = openat(&project_fd, session_id, dir_flags, Mode::empty()).ok()?;
+        let tasks_fd = openat(&session_fd, "tasks", dir_flags, Mode::empty()).ok()?;
+        let file_fd = openat(
+            &tasks_fd,
+            file_name.as_str(),
+            OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .ok()?;
+        let kind = SFlag::from_bits_truncate(fstat(&file_fd).ok()?.st_mode as _) & SFlag::S_IFMT;
+        (kind == SFlag::S_IFREG).then(|| std::fs::File::from(file_fd))
+    })
 }
 
 /// A markdown recap of the persisted transcript, offered after a failed
@@ -512,20 +529,43 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn task_output_path_is_rebuilt_from_plain_ids_only() {
+    fn task_output_is_opened_beneath_the_tree_as_a_regular_file() {
+        use std::io::Read;
         let root = tempfile::tempdir().unwrap();
         let tasks = root.path().join("-proj").join("sess-1").join("tasks");
         std::fs::create_dir_all(&tasks).unwrap();
         std::fs::write(tasks.join("abc123.output"), "hi").unwrap();
         std::os::unix::fs::symlink("/etc/hosts", tasks.join("link.output")).unwrap();
+        nix::unistd::mkfifo(&tasks.join("fifo.output"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_tasks = outside.path().join("sess-2").join("tasks");
+        std::fs::create_dir_all(&outside_tasks).unwrap();
+        std::fs::write(outside_tasks.join("abc123.output"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("-linked")).unwrap();
 
-        let find = |session: &str, task: &str| claude_task_output_path(root.path(), session, task);
-        assert_eq!(find("sess-1", "abc123"), Some(tasks.join("abc123.output")));
-        assert_eq!(find("sess-1", "missing"), None);
-        assert_eq!(find("sess-1", "link"), None, "symlinks are not followed");
+        let open = |session: &str, task: &str| open_task_output(root.path(), session, task);
+        let mut text = String::new();
+        open("sess-1", "abc123")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "hi");
+        assert!(open("sess-1", "missing").is_none());
+        assert!(
+            open("sess-1", "link").is_none(),
+            "symlinks are not followed"
+        );
+        assert!(
+            open("sess-1", "fifo").is_none(),
+            "a FIFO is not a regular file"
+        );
+        assert!(
+            open("sess-2", "abc123").is_none(),
+            "a symlinked project directory is not followed"
+        );
         for bad in ["", "../x", "a/b", "..", "a.b"] {
-            assert_eq!(find("sess-1", bad), None, "task id {bad:?}");
-            assert_eq!(find(bad, "abc123"), None, "session id {bad:?}");
+            assert!(open("sess-1", bad).is_none(), "task id {bad:?}");
+            assert!(open(bad, "abc123").is_none(), "session id {bad:?}");
         }
     }
 
