@@ -13,29 +13,40 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
     const MAX_BANNER_LINES: usize = 3;
 
     let cleaned = crate::tmux::utils::strip_ansi(pane_content);
+    // Callers pass the captured tail, so keep every nonempty row: a provider
+    // footer can sit above plugin rows and wrap across several lines.
     let tail: Vec<&str> = cleaned
         .lines()
         .rev()
         .map(|l| l.trim_end())
         .filter(|l| !l.is_empty())
-        .take(12)
         .collect();
 
     // omp pins an error banner whose dismissal footer is the anchor.
-    let anchor_idx = tail
-        .iter()
-        .position(|l| l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR));
+    let anchor = (1..=3).find_map(|span| {
+        tail.windows(span)
+            .position(|window| {
+                let joined = window
+                    .iter()
+                    .rev()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                joined.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
+            })
+            .map(|index| (index, span))
+    });
     let terminal_idx = tail.iter().position(|l| {
         let lower = l.to_lowercase();
         OMP_TERMINAL_RETRY_MARKERS
             .iter()
             .any(|marker| lower.contains(marker))
     });
-    if let Some(anchor_idx) = anchor_idx
-        .filter(|anchor_idx| terminal_idx.is_none_or(|terminal_idx| *anchor_idx <= terminal_idx))
-    {
+    if let Some((anchor_idx, anchor_span)) = anchor.filter(|(anchor_idx, _)| {
+        terminal_idx.is_none_or(|terminal_idx| *anchor_idx <= terminal_idx)
+    }) {
         let mut msg_lines: Vec<&str> = Vec::new();
-        for line in tail.iter().skip(anchor_idx + 1) {
+        for line in tail.iter().skip(anchor_idx + anchor_span) {
             // Border line: the banner's DynamicBorder (U+2500 by default,
             // `-` under omp's ascii theme).
             let trimmed = line.trim();
@@ -285,6 +296,23 @@ mod tests {
         for (name, pane, expected) in cases {
             assert_eq!(summarize_error_from_pane(pane), expected, "{name}");
         }
+
+        let wrapped_footer = format!(
+            "--------------------\n\
+             AOE failure\n\
+             Dismissed when you\n\
+             send your next\n\
+             message.\n\
+             --------------------\n\n\
+             ╭── π  > model ──╮\n\
+             ╰────────────────╯\n{}",
+            "PLUGIN\n".repeat(12)
+        );
+        assert_eq!(
+            summarize_error_from_pane(&wrapped_footer),
+            "AOE failure",
+            "wrapped footer above plugin rows"
+        );
     }
 
     #[test]

@@ -222,7 +222,6 @@ pub fn agent_command<'a>(
 fn eligible(instance: &Instance) -> bool {
     !instance.is_structured()
         && !instance.is_archived()
-        && !instance.is_sandboxed()
         && !matches!(
             instance.status,
             crate::session::Status::Stopped

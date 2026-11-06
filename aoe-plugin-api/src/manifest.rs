@@ -714,12 +714,37 @@ fn agent_id_ok(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
+/// One argv token the host appends verbatim to a shell launch command.
 fn flag_token_ok(value: &str) -> bool {
     value.starts_with('-')
         && value.len() <= 128
-        && !value
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '{' | '}'))
+        && !value.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(
+                    c,
+                    '{' | '}'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '$'
+                        | '`'
+                        | '\\'
+                        | '"'
+                        | '\''
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '!'
+                        | '~'
+                )
+        })
 }
 
 fn instruction_flag_ok(value: &str) -> bool {
@@ -815,7 +840,7 @@ fn validate_agent_declarations(
             check(
                 flag_token_ok(flag),
                 format!(
-                    "agent_integrations[{i}].launch.oneshot_flag must be one argv token starting with `-` and containing no braces"
+                    "agent_integrations[{i}].launch.oneshot_flag must be one argv token starting with `-` and free of shell syntax and braces"
                 ),
             );
         }
@@ -831,7 +856,7 @@ fn validate_agent_declarations(
             check(
                 flag_token_ok(flag),
                 format!(
-                    "agent_integrations[{i}].launch.model_flag must be one argv token starting with `-` and containing no braces"
+                    "agent_integrations[{i}].launch.model_flag must be one argv token starting with `-` and free of shell syntax and braces"
                 ),
             );
         }
@@ -840,7 +865,7 @@ fn validate_agent_declarations(
                 AgentYoloDeclaration::Flag { flag } => check(
                     flag_token_ok(flag),
                     format!(
-                        "agent_integrations[{i}].launch.yolo.flag must be one argv token starting with `-` and containing no braces"
+                        "agent_integrations[{i}].launch.yolo.flag must be one argv token starting with `-` and free of shell syntax and braces"
                     ),
                 ),
                 AgentYoloDeclaration::Env { key, value } => {
@@ -885,7 +910,7 @@ fn validate_agent_declarations(
                 AgentResumeDeclaration::Flag { flag } => check(
                     flag_token_ok(flag),
                     format!(
-                        "agent_integrations[{i}].launch.resume.flag must be one argv token starting with `-` and containing no braces"
+                        "agent_integrations[{i}].launch.resume.flag must be one argv token starting with `-` and free of shell syntax and braces"
                     ),
                 ),
                 AgentResumeDeclaration::FlagPair {
