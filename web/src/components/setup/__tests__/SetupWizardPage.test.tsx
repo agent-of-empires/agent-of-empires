@@ -216,6 +216,6 @@ it("a failed settings read offers a retry instead of showing defaults as the sav
   expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
   fail = false;
   fireEvent.click(screen.getByRole("button", { name: "Check again" }));
-  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
-  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false);
+  await enabled("Next");
+  expect(screen.queryByRole("alert")).toBeNull();
 });
