@@ -18,6 +18,7 @@ interface Props {
 export function AgentsStep({ profile, defaultTool, structuredView, save, onAgentsChecked }: Props) {
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [checking, setChecking] = useState(true);
+  const [failed, setFailed] = useState(false);
 
   const [checks, setChecks] = useState(0);
 
@@ -25,7 +26,9 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
     let live = true;
     void fetchProfileAgents(profile || undefined).then((result) => {
       if (!live) return;
-      setAgents(Array.isArray(result) ? result : []);
+      // A failed check isn't "no Agents installed".
+      setFailed(!Array.isArray(result));
+      if (Array.isArray(result)) setAgents(result);
       setChecking(false);
       onAgentsChecked();
     });
@@ -42,7 +45,8 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
   const missing = (agents ?? []).filter((a) => !a.installed && SUGGESTED.includes(a.name));
   const [tool, setTool] = useState(defaultTool);
   const [view, setView] = useState(structuredView === "terminal" ? "terminal" : "structured");
-  const chosen = tool && installed.some((a) => a.name === tool) ? tool : installed[0]?.name;
+  // No fallback pick: an unsaved selection would read as the default without being one.
+  const chosen = tool && installed.some((a) => a.name === tool) ? tool : undefined;
 
   const pickTool = async (name: string) => {
     setTool(name);
@@ -68,7 +72,12 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
         }
       >
         <div className={PANEL}>
-          {agents === null && <div className="px-4 py-3 text-sm text-text-dim">Checking for Agents…</div>}
+          {failed && (
+            <div role="alert" className="px-4 py-3 text-sm text-status-error-text">
+              Couldn't check for Agents. Check again.
+            </div>
+          )}
+          {!failed && agents === null && <div className="px-4 py-3 text-sm text-text-dim">Checking for Agents…</div>}
           {agents !== null && installed.length === 0 && (
             <div className="px-4 py-3 text-sm text-status-warning">No Agents found. Install one, then check again.</div>
           )}
@@ -80,7 +89,11 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
                 <span className="text-sm text-text-secondary">{agent.display_name}</span>
                 {agent.path && <span className="font-mono text-xs text-text-dim ml-auto truncate">{agent.path}</span>}
                 {agent.acp_capable &&
-                  (agent.acp_installed ? (
+                  (agent.acp_installed && agent.acp_allowed === false ? (
+                    <span className="text-xs rounded border border-surface-700 text-text-dim px-1.5 py-0.5">
+                      Structured view not allowed
+                    </span>
+                  ) : agent.acp_installed ? (
                     <span className="text-xs rounded border border-status-running/50 text-status-running px-1.5 py-0.5">
                       Structured view ready
                     </span>

@@ -85,17 +85,16 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
           ))}
         </div>
       </Section>
-      {!none && (
-        <div className="rounded-lg border border-surface-700 bg-surface-900 p-4">
-          <SchemaSection
-            section="sandbox"
-            schema={schema}
-            values={values}
-            onSaveField={onSaveField}
-            onlyFields={["enabled_by_default", "default_image"]}
-          />
-        </div>
-      )}
+      {/* Kept without a runtime, so a stored "on" default can still be turned off. */}
+      <div className="rounded-lg border border-surface-700 bg-surface-900 p-4">
+        <SchemaSection
+          section="sandbox"
+          schema={schema}
+          values={values}
+          onSaveField={onSaveField}
+          onlyFields={none ? ["enabled_by_default"] : ["enabled_by_default", "default_image"]}
+        />
+      </div>
     </>
   );
 }
