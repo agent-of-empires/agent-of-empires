@@ -148,6 +148,9 @@ pub(crate) enum LocalRuntimeError {
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     match code {
         ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
+        ApiErrorCode::LaunchIndeterminate => {
+            crate::session::LaunchIndeterminateCause::ObservationFailed.message()
+        }
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
         ApiErrorCode::ResumeFailed => {
             "Resume failed after start committed; the conversation is preserved for explicit retry"
@@ -161,10 +164,11 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::AgentHooksNotApproved) =>
             "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
+        Some(ApiErrorCode::LaunchIndeterminate) => crate::session::LaunchIndeterminateCause::ObservationFailed.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
-            "Auto-name is unavailable for this session; check its repository and tool configuration"
-                .into()
-        }
+        "Auto-name is unavailable for this session; check its repository and tool configuration"
+            .into()
+    }
         Some(ApiErrorCode::SmartRenameFailed) => {
             "Auto-name failed; the daemon could not obtain a title from the agent".into()
         }
@@ -981,6 +985,7 @@ impl DaemonClient {
                 Some(
                     ApiErrorCode::StartFailed
                         | ApiErrorCode::ResumeFailed
+                        | ApiErrorCode::LaunchIndeterminate
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
                 )
@@ -1963,6 +1968,16 @@ mod tests {
         for (status, code, epoch, revision, committed, invalid) in [
             (500, "start_failed", "epoch-1", "3", true, false),
             (409, "resume_failed", "epoch-1", "3", true, false),
+            (409, "launch_indeterminate", "epoch-1", "3", true, false),
+            (409, "launch_indeterminate", "foreign", "3", false, true),
+            (
+                409,
+                "launch_indeterminate",
+                "absent",
+                "absent",
+                false,
+                false,
+            ),
             (409, "purge_failed", "epoch-1", "3", true, false),
             (409, "managed_resume_refused", "epoch-1", "3", true, false),
             (409, "managed_resume_refused", "foreign", "3", false, true),
@@ -2238,6 +2253,27 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    #[test]
+    fn indeterminate_launch_never_reflects_private_probe_diagnostics() {
+        let error = DaemonClientError::Status {
+            status: StatusCode::CONFLICT,
+            code: Some(ApiErrorCode::LaunchIndeterminate),
+            body: "private-path=/secret/store credential=secret-token".into(),
+            truncated: false,
+        };
+        let public = error.to_string();
+        assert!(public.contains("preserved"));
+        assert!(!public.contains("secret"));
+        let committed = DaemonClientError::Committed {
+            cursor: RuntimeCursor {
+                epoch: "epoch-1".into(),
+                revision: 3,
+            },
+            code: ApiErrorCode::LaunchIndeterminate,
+        };
+        assert_eq!(committed.to_string(), public);
     }
 
     #[test]

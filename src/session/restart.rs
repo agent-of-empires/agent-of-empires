@@ -106,6 +106,16 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static WAKE_DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn wake_dispatches_for_test() -> u64 {
+    WAKE_DISPATCHES.with(std::cell::Cell::get)
+}
+
 /// Wait for the restarted pane to become live and past its boot shell, then
 /// send the wake-up message. Best-effort: a failure to spawn or send is logged,
 /// never fatal.
@@ -116,6 +126,8 @@ pub(crate) fn spawn_wake_worker(
     wake_message: String,
     identity: Option<(String, u64)>,
 ) {
+    #[cfg(test)]
+    WAKE_DISPATCHES.with(|count| count.set(count.get() + 1));
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
         .stack_size(128 * 1024)
@@ -272,6 +284,9 @@ mod tests {
         let sid = "11111111-2222-3333-4444-555555555555".to_string();
         assert!(!launched_agent(&Ok(StartOutcome::ResumeFailed {
             sid: sid.clone(),
+        })));
+        assert!(!launched_agent(&Ok(StartOutcome::Indeterminate {
+            cause: crate::session::LaunchIndeterminateCause::CommandTimedOut,
         })));
         assert!(launched_agent(&Ok(StartOutcome::FreshAfterFailedResume {
             sid,

@@ -16,6 +16,12 @@ async function userScroll(viewport: Locator, top: number) {
   }, top);
 }
 
+async function waitForInitialPin(viewport: Locator) {
+  await expect
+    .poll(() => viewport.evaluate((el) => el.scrollTop > 0 && el.scrollHeight - el.clientHeight - el.scrollTop <= 1))
+    .toBe(true);
+}
+
 // On a coarse pointer a jump-to-latest button appears while scrolled up.
 test.use({ ...devices["iPhone 13"] });
 
@@ -35,6 +41,7 @@ test.describe("mobile jump-to-bottom", () => {
     await expect(button).toBeHidden();
 
     const readingTop = 240;
+    await waitForInitialPin(viewport);
     await userScroll(viewport, readingTop);
     await expect(button).toBeVisible();
     await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBe(readingTop);
@@ -66,6 +73,7 @@ test.describe("mobile jump-to-bottom", () => {
     const viewport = page.getByTestId("acp-viewport");
     const button = page.getByTestId("acp-jump-to-bottom");
     const distanceToBottom = () => viewport.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+    await waitForInitialPin(viewport);
     await userScroll(viewport, 0);
     await expect(button).toBeVisible();
     await observeFor(page, 300, async () => {
