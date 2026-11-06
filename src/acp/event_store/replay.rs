@@ -20,6 +20,9 @@ pub struct ReplayPage {
     pub lowest_seq: Option<u64>,
 }
 
+/// Rows per page of a paged replay: the connection is held for one page at a time.
+const REPLAY_PAGE_ROWS: usize = 2000;
+
 impl EventStore {
     /// All events with `seq < before`, oldest first.
     pub fn replay_before(&self, session_id: &str, before: u64) -> Vec<(u64, Event)> {
@@ -37,6 +40,34 @@ impl EventStore {
     /// All events with `seq > since`, oldest first.
     pub fn replay_from(&self, session_id: &str, since: u64) -> Vec<(u64, Event)> {
         self.replay_page(session_id, since, None).events
+    }
+
+    /// Hand every event with `seq > since` to `visit`, oldest first, one page at a time.
+    ///
+    /// The connection mutex is released between pages, so a long history never blocks other
+    /// sessions' reads and writes for the whole scan the way `replay_from` does. Returns the
+    /// last seq visited, or `since` when there was nothing to visit.
+    pub fn replay_each_paged(
+        &self,
+        session_id: &str,
+        since: u64,
+        mut visit: impl FnMut(u64, Event),
+    ) -> u64 {
+        let mut cursor = since;
+        let mut last = since;
+        loop {
+            let page = self.replay_page(session_id, cursor, Some(REPLAY_PAGE_ROWS));
+            for (seq, event) in page.events {
+                last = seq;
+                visit(seq, event);
+            }
+            match page.last_scanned_seq {
+                Some(next) if page.has_more => cursor = next,
+                _ => return last,
+            }
+            // Let a waiting writer take the connection before the next page.
+            std::thread::yield_now();
+        }
     }
 
     /// Up to `limit` events with `seq > since`, oldest first.
@@ -460,6 +491,32 @@ mod tests {
         let page2 = store.replay_page("bad", 2, Some(2));
         assert_eq!(seqs(&page2.events), [3]);
         assert!(!page2.has_more);
+    }
+
+    /// The scan must take the connection one page at a time: a row recorded while the first
+    /// page is visited is picked up by a later page, which one long scan could not see.
+    #[test]
+    fn paged_replay_reads_each_page_under_its_own_connection() {
+        let (_tmp, store) = open_store(100_000);
+        let total = (REPLAY_PAGE_ROWS * 3 + 5) as u64;
+        record_from(
+            &store,
+            "cold",
+            1,
+            (0..total).map(|_| Event::ThinkingStarted),
+        );
+        let mut seen = Vec::new();
+        let last = store.replay_each_paged("cold", 0, |seq, _| {
+            seen.push(seq);
+            if seq == 1 {
+                store
+                    .record("cold", total + 1, &Event::ThinkingStarted)
+                    .unwrap();
+            }
+        });
+        assert_eq!(seen, (1..=total + 1).collect::<Vec<_>>());
+        assert_eq!(last, total + 1);
+        assert_eq!(store.replay_each_paged("empty", 7, |_, _| {}), 7);
     }
 
     #[test]

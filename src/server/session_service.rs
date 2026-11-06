@@ -1762,8 +1762,9 @@ impl SessionService {
     /// afterwards, one serial task behind every session's event stream.
     ///
     /// The fold is cached because rebuilding it per call measured 68ms at 20k
-    /// events and 342ms at 100k, holding the event store's connection mutex
-    /// for the whole scan, which stalls event recording daemon-wide.
+    /// events and 342ms at 100k. A cold hydrate reads the log in pages, so the
+    /// event store's connection mutex is free between them; lag recovery hydrates
+    /// every cold session and must not stall prompts to the others.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let (agent, model) = {
@@ -1787,11 +1788,9 @@ impl SessionService {
         tokio::task::spawn_blocking(move || {
             cache.get_or_hydrate(&sid.clone(), || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
-                let mut last_seq = 0;
-                for (seq, event) in store.replay_from(&sid, 0) {
+                let last_seq = store.replay_each_paged(&sid, 0, |seq, event| {
                     let _ = reduced.apply_event(seq, event);
-                    last_seq = seq;
-                }
+                });
                 (reduced, last_seq)
             })
         })
