@@ -28,9 +28,34 @@ use crate::{hooks::dir_guard, session::Instance};
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(15);
 
+/// The program a launch command runs, by basename so an absolute path and a
+/// bare command name compare equal.
+fn program(command: &str) -> Option<String> {
+    let executable = launch_executable(command)?;
+    Some(
+        std::path::Path::new(&executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&executable)
+            .to_string(),
+    )
+}
+
+/// Whether this session launches the program the declaration names. A
+/// configured custom agent can share a declared tool's name while running
+/// another command, and the declaration does not describe it.
+fn launches_declared(instance: &Instance, entry: &AgentIntegrationContribution) -> bool {
+    let declared = entry
+        .command
+        .as_deref()
+        .and_then(program)
+        .unwrap_or_else(|| entry.tool.clone());
+    program(instance.get_tool_command()).is_some_and(|launched| launched == declared)
+}
+
 fn provider<'a>(
     registry: &'a super::PluginRegistry,
-    tool: &str,
+    instance: &Instance,
 ) -> Result<Option<&'a super::LoadedPlugin>> {
     let mut matches = registry.active().filter(|plugin| {
         plugin
@@ -42,12 +67,13 @@ fn provider<'a>(
                 .manifest
                 .agent_integrations
                 .iter()
-                .any(|entry| entry.tool == tool)
+                .any(|entry| entry.tool == instance.tool && launches_declared(instance, entry))
     });
     let selected = matches.next();
     ensure!(
         matches.next().is_none(),
-        "multiple approved integrations claim {tool}"
+        "multiple approved integrations claim {}",
+        instance.tool
     );
     Ok(selected)
 }
@@ -267,11 +293,11 @@ fn configured_for(instance: &Instance, replies: bool) -> bool {
                 .capabilities
                 .iter()
                 .any(|c| c.as_str() == "session.integration")
-                && plugin
-                    .manifest
-                    .agent_integrations
-                    .iter()
-                    .any(|entry| entry.tool == instance.tool && (!replies || entry.replies))
+                && plugin.manifest.agent_integrations.iter().any(|entry| {
+                    entry.tool == instance.tool
+                        && (!replies || entry.replies)
+                        && launches_declared(instance, entry)
+                })
         })
 }
 
@@ -281,7 +307,7 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
         return None;
     }
     let registry = super::registry();
-    let plugin = provider(&registry, &instance.tool).ok()??;
+    let plugin = provider(&registry, instance).ok()??;
     read_report(&instance.id, &instance.tool, plugin)
         .ok()
         .flatten()
@@ -323,6 +349,11 @@ struct DeclaredAgent {
 
 fn declared_for(tool: &str) -> Option<DeclaredAgent> {
     let registry = super::registry();
+    // A configured custom agent owns its name, so a declaration of the same
+    // name must not describe its launch or replies.
+    if registry.custom_agents().contains(tool) {
+        return None;
+    }
     let mut candidates = registry.active().flat_map(|plugin| {
         plugin
             .manifest
@@ -946,7 +977,7 @@ pub fn respond(
         "session does not support provider integration replies"
     );
     let registry = super::registry();
-    let plugin = provider(&registry, &instance.tool)?
+    let plugin = provider(&registry, instance)?
         .context("provider integration is not enabled and approved")?;
     let current = read_report(&instance.id, &instance.tool, plugin)?
         .context("provider integration report is unavailable")?;
@@ -1389,6 +1420,69 @@ SHADOW_ONLY = "1"
 
     #[test]
     #[serial_test::serial]
+    fn configured_custom_agent_name_resolves_no_plugin_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.shadowed", "acme-shared", true, true, "");
+        install_declared_integration("acme.unguarded", "acme-declared", true, true, "");
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "acme-shared".to_string(),
+                "acme-wrapper --serve".to_string(),
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        // Negative case: the configured custom command keeps its own name.
+        assert!(declared_agent("acme-shared").is_none());
+        let mut shadowed = Instance::new("acme-shadowed-session", "/tmp/acme-shadowed");
+        shadowed.tool = "acme-shared".into();
+        shadowed.command = "acme-wrapper --serve".into();
+        shadowed.status = crate::session::Status::Running;
+        assert!(!configured(&shadowed));
+        assert!(!replies_configured(&shadowed));
+        assert!(super::snapshot(&shadowed).is_none());
+
+        // Positive control: the declared tool still resolves its declarations.
+        assert!(declared_agent("acme-declared").is_some());
+        let mut declared = Instance::new("acme-declared-session", "/tmp/acme-declared");
+        declared.tool = "acme-declared".into();
+        declared.status = crate::session::Status::Running;
+        assert!(configured(&declared));
+        assert!(replies_configured(&declared));
+
+        // A profile or repo config can name a custom agent the global plugin
+        // registry never saw; the session's own config still excludes it.
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .custom_agents
+            .insert("acme-declared".into(), "acme-wrapper --serve".to_string());
+        assert!(
+            crate::session::config::container_config::resolve_active_agent(
+                "acme-declared",
+                None,
+                &session
+            )
+            .is_none()
+        );
+        let resolved = crate::session::config::container_config::resolve_active_agent(
+            "acme-declared",
+            None,
+            &crate::session::config::SessionConfig::default(),
+        )
+        .expect("the declared tool keeps its declaration");
+        assert_eq!(resolved.name, "acme-declared");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn reply_fallback_resolves_when_the_integration_does_not_own_replies() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
@@ -1482,7 +1576,10 @@ deny = [{ kind = "literal", value = "n" }]
         install_test_integration("acme.integration-two", "shared-agent");
 
         let registry = super::super::PluginRegistry::load(&crate::session::Config::load_or_warn());
-        let error = match provider(&registry, "shared-agent") {
+        let mut instance = Instance::new("shared-agent-claim", "/tmp");
+        instance.tool = "shared-agent".into();
+        instance.command = "shared-agent".into();
+        let error = match provider(&registry, &instance) {
             Err(error) => error,
             Ok(_) => panic!("duplicate integration claims must be rejected"),
         };
