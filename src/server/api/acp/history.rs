@@ -217,11 +217,16 @@ pub async fn acp_task_output(
     let Some(inst) = find_instance(&state, &id).await else {
         return session_not_found();
     };
-    let claude_session = inst.agent_session_id.unwrap_or_default();
+    let claude_session = current_conversation_id(
+        inst.acp_session_id.as_deref(),
+        inst.agent_session_id.as_deref(),
+    )
+    .unwrap_or_default()
+    .to_owned();
     let found = tokio::task::spawn_blocking(move || {
         let root = PathBuf::from("/tmp").join(format!("claude-{}", nix::unistd::getuid().as_raw()));
         match open_task_output(&root, &claude_session, &task_id) {
-            Some(file) => read_tail(file, TASK_OUTPUT_TAIL_LINES),
+            Some(file) => read_task_tail(file),
             None => Ok((Vec::new(), false, false)),
         }
     })
@@ -236,6 +241,27 @@ pub async fn acp_task_output(
         Ok(Err(e)) => blocking_failed("task output read failed", e),
         Err(e) => blocking_failed("blocking task failed", e),
     }
+}
+
+/// The task output tail; `truncated` also covers the line cap, not only the
+/// byte window.
+fn read_task_tail(file: std::fs::File) -> std::io::Result<(Vec<String>, bool, bool)> {
+    // One extra line tells whether the line cap cut the output too.
+    let (mut lines, truncated, exists) = read_tail(file, TASK_OUTPUT_TAIL_LINES + 1)?;
+    let cut = lines.len() > TASK_OUTPUT_TAIL_LINES;
+    if cut {
+        lines.remove(0);
+    }
+    Ok((lines, truncated || cut, exists))
+}
+
+/// The live structured conversation: the ACP assignment wins over a legacy
+/// terminal id, which is unset on a fresh session and stale after a new one.
+fn current_conversation_id<'a>(acp: Option<&'a str>, legacy: Option<&'a str>) -> Option<&'a str> {
+    [acp, legacy]
+        .into_iter()
+        .flatten()
+        .find(|id| !id.is_empty())
 }
 
 fn is_plain_id(id: &str) -> bool {
@@ -532,6 +558,39 @@ mod tests {
     use super::*;
     use crate::acp::state::Event;
     use std::io::Write;
+
+    #[test]
+    fn conversation_id_prefers_the_acp_assignment_over_a_stale_or_absent_legacy_id() {
+        assert_eq!(
+            current_conversation_id(Some("acp"), Some("old")),
+            Some("acp")
+        );
+        assert_eq!(current_conversation_id(Some("acp"), None), Some("acp"));
+        assert_eq!(
+            current_conversation_id(None, Some("legacy")),
+            Some("legacy")
+        );
+        assert_eq!(
+            current_conversation_id(Some(""), Some("legacy")),
+            Some("legacy")
+        );
+        assert_eq!(current_conversation_id(None, None), None);
+    }
+
+    #[test]
+    fn task_output_tail_flags_a_line_cut_below_the_byte_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.output");
+        let body: String = (0..TASK_OUTPUT_TAIL_LINES + 1000)
+            .map(|i| format!("l{i}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let (lines, truncated, _) = read_task_tail(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(truncated, "the line cap cut the output");
+        assert_eq!(lines.len(), TASK_OUTPUT_TAIL_LINES);
+        assert_eq!(lines.first().map(String::as_str), Some("l1000"));
+    }
 
     #[test]
     fn task_output_is_opened_beneath_the_tree_as_a_regular_file() {
