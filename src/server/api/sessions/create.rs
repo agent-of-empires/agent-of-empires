@@ -828,7 +828,7 @@ pub(crate) async fn create_session_with(
     local_owner: bool,
     reference: &str,
     wait_ready: bool,
-    mut body: CreateSessionBody,
+    body: CreateSessionBody,
     initial_turn: Option<String>,
 ) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
