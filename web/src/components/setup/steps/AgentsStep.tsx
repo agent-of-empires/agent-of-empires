@@ -44,7 +44,9 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
   const installed = (agents ?? []).filter((a) => a.installed);
   const missing = (agents ?? []).filter((a) => !a.installed && SUGGESTED.includes(a.name));
   const [tool, setTool] = useState(defaultTool);
-  const [view, setView] = useState(structuredView === "terminal" ? "terminal" : "structured");
+  const [view, setView] = useState(
+    structuredView === "terminal" || structuredView === "off" ? structuredView : "structured",
+  );
   // No fallback pick: an unsaved selection would read as the default without being one.
   const chosen = tool && installed.some((a) => a.name === tool) ? tool : undefined;
 
@@ -156,6 +158,10 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
               <RadioRow name="default-view" checked={view === "terminal"} onSelect={() => void pickView("terminal")}>
                 <div className="text-sm text-text-primary">Terminal view</div>
                 <div className="text-xs text-text-dim">The Agent in its raw terminal, as in tmux.</div>
+              </RadioRow>
+              <RadioRow name="default-view" checked={view === "off"} onSelect={() => void pickView("off")}>
+                <div className="text-sm text-text-primary">Terminal only</div>
+                <div className="text-xs text-text-dim">Structured view isn't offered for new Sessions.</div>
               </RadioRow>
             </div>
           </Section>
