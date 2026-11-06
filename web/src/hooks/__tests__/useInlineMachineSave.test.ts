@@ -55,14 +55,29 @@ it("asks for the passphrase inline, then retries the same write once", async () 
   expect(headers).toEqual(["1", "1"]);
 });
 
-it("cancel resolves the save as not saved", async () => {
+it("a newer write cancels the pending prompt, and cancel resolves as not saved", async () => {
   server.use(http.patch("*/api/settings", () => HttpResponse.json({ error: "elevation_required" }, { status: 403 })));
   const { result } = renderHook(() => useInlineMachineSave());
-  let saved: Promise<boolean> | undefined;
+  let first: Promise<boolean> | undefined;
   act(() => {
-    saved = result.current.save({ sandbox: { enabled_by_default: true } });
+    first = result.current.save({ sandbox: { enabled_by_default: true } });
   });
   await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  const firstPrompt = result.current.elevation;
+  let second: Promise<boolean> | undefined;
+  act(() => {
+    second = result.current.save({ sandbox: { default_image: "x" } });
+  });
+  await expect(first).resolves.toBe(false);
+  await waitFor(() => expect(result.current.elevation).not.toBe(firstPrompt));
+  expect(result.current.elevation).not.toBeNull();
   act(() => result.current.elevation!.cancel());
-  await expect(saved).resolves.toBe(false);
+  await expect(second).resolves.toBe(false);
+  expect(result.current.elevation).toBeNull();
+});
+
+it("a save that may not have landed is not reported as saved", async () => {
+  server.use(http.patch("*/api/settings", () => new HttpResponse(null, { status: 502 })));
+  const { result } = renderHook(() => useInlineMachineSave());
+  await expect(result.current.save({ worktree: { enabled: true } })).resolves.toBe(false);
 });
