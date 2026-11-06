@@ -17,6 +17,7 @@ import { configuredCount, firstOpenIndex, openRequiredStep, SETUP_STEP_INFO } fr
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SetupElevationBar } from "./SetupElevationBar";
 import { SetupRail } from "./SetupRail";
+import { GhostButton } from "./ui";
 import { AccessStep } from "./steps/AccessStep";
 import { AgentsStep } from "./steps/AgentsStep";
 import { ProjectStep } from "./steps/ProjectStep";
@@ -48,6 +49,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   // `null` until loaded, so steps seed their selections from saved values.
   const [machine, setMachine] = useState<MachineValues | null>(null);
+  const [machineFailed, setMachineFailed] = useState(false);
+  const [machineChecks, setMachineChecks] = useState(0);
   const [share, setShare] = useState(false);
   const [doNotTrack, setDoNotTrack] = useState(false);
   const [telemetry, setTelemetry] = useState<TelemetryLoad>("loading");
@@ -60,8 +63,24 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
 
   useEffect(() => {
     void getSettingsSchema().then((s) => setSchema(s ?? []));
-    void fetchMachineSettings().then((s: SettingsResponse | null) => setMachine((s ?? {}) as MachineValues));
   }, []);
+
+  useEffect(() => {
+    let live = true;
+    void fetchMachineSettings().then((s: SettingsResponse | null) => {
+      if (!live) return;
+      // A failed read isn't empty settings: defaults would stand in for the saved choices.
+      setMachineFailed(s === null);
+      if (s) setMachine(s as MachineValues);
+    });
+    return () => {
+      live = false;
+    };
+  }, [machineChecks]);
+  const retryMachine = () => {
+    setMachineFailed(false);
+    setMachineChecks((n) => n + 1);
+  };
 
   useEffect(() => {
     let live = true;
@@ -208,7 +227,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
 
   const done = configuredCount(steps);
   const percent = Math.round((done / steps.length) * 100);
-  const blocked = (step.required && !step.configured) || (step.key === "theme_telemetry" && telemetry !== "loaded");
+  const needsMachine = step.key !== "theme_telemetry" && step.key !== "project";
+  const blocked =
+    (step.required && !step.configured) ||
+    (step.key === "theme_telemetry" && telemetry !== "loaded") ||
+    (needsMachine && machine === null);
   const info = SETUP_STEP_INFO[step.key];
   const values = (section: string) => machine?.[section] ?? {};
 
@@ -283,8 +306,16 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
                 onRetryTelemetry={retryTelemetry}
               />
             )}
-            {machine === null && step.key !== "theme_telemetry" && step.key !== "project" && (
+            {machine === null && needsMachine && !machineFailed && (
               <p className="text-sm text-text-dim">Loading settings…</p>
+            )}
+            {machine === null && needsMachine && machineFailed && (
+              <div className="flex items-center gap-3">
+                <p role="alert" className="text-sm text-status-error-text">
+                  Couldn't load your settings.
+                </p>
+                <GhostButton onClick={retryMachine}>Check again</GhostButton>
+              </div>
             )}
             {machine !== null && step.key === "agents" && (
               <AgentsStep

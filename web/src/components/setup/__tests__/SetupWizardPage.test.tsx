@@ -51,6 +51,13 @@ const status = (configured: SetupStepKey[] = []): SetupStatus => ({
   })),
 });
 
+/** Settings-backed steps keep Next disabled until saved settings load. */
+async function enabled(name: string) {
+  const button = screen.getByRole("button", { name }) as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  return button;
+}
+
 function renderPage(current: SetupStatus, entry = "/setup") {
   const onLeave = vi.fn();
   render(
@@ -78,7 +85,7 @@ it("Skip records the step and moves on", async () => {
 
 it("Finish sends the user back to the open required step instead of finishing", async () => {
   const { onLeave } = renderPage(status(), "/setup?step=notifications");
-  fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
+  fireEvent.click(await enabled("Finish setup"));
   expect(await screen.findByRole("alert")).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
   expect(patches).not.toContainEqual({ finished: true });
@@ -87,7 +94,7 @@ it("Finish sends the user back to the open required step instead of finishing", 
 
 it("Finish keeps the last step's defaults and marks setup finished once Agents is configured", async () => {
   const { onLeave } = renderPage(status(["agents"]), "/setup?step=notifications");
-  fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
+  fireEvent.click(await enabled("Finish setup"));
   await waitFor(() => expect(onLeave).toHaveBeenCalled());
   expect(patches).toEqual([{ confirmed_steps: ["notifications"] }, { finished: true }]);
 });
@@ -196,5 +203,19 @@ it("a failed telemetry read offers a retry and keeps Next disabled", async () =>
   fail = false;
   fireEvent.click(screen.getByRole("button", { name: "Check again" }));
   expect(await screen.findByRole("radio", { name: /Not now/ })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("a failed settings read offers a retry instead of showing defaults as the saved choices", async () => {
+  let fail = true;
+  server.use(
+    http.get("*/api/settings", () => (fail ? new HttpResponse(null, { status: 500 }) : HttpResponse.json({}))),
+  );
+  renderPage(status(["agents"]), "/setup?step=worktrees");
+  expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load your settings");
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false);
 });
