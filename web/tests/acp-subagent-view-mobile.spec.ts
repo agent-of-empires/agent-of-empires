@@ -24,7 +24,10 @@ test.describe("mobile sub-agent view", () => {
 
     await page.getByRole("button", { name: "Toggle panels" }).click();
     await page.getByText("Sub agents", { exact: true }).first().click();
-    await page.getByRole("button", { name: /agent number/ }).first().click();
+    await page
+      .getByRole("button", { name: /agent number/ })
+      .first()
+      .click();
 
     await expect(page.getByText("Subagent 1 of 2")).toBeVisible();
     for (const section of ["Input", "Activity", "Output"]) {
