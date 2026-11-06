@@ -217,15 +217,18 @@ enum LaunchMode {
 
 impl ServeArgs {
     /// Fresh acquisition uses global service opt-ins; explicit serve and replay retain their mode.
-    fn resolve_launch(&mut self, requested: Option<LaunchMode>) {
-        let mode = requested.unwrap_or_else(|| {
-            let config = crate::session::config::Config::load_or_warn();
-            if config.web.mcp_enabled && !crate::cli::graft::web_disabled(&config) {
-                LaunchMode::Tcp
-            } else {
-                LaunchMode::CoreOnly
+    fn resolve_launch(&mut self, requested: Option<LaunchMode>) -> Result<()> {
+        let mode = match requested {
+            Some(mode) => mode,
+            None => {
+                let config = crate::session::config::Config::load()?;
+                if config.web.mcp_enabled && !crate::cli::graft::web_disabled(&config) {
+                    LaunchMode::Tcp
+                } else {
+                    LaunchMode::CoreOnly
+                }
             }
-        });
+        };
         self.core_only = matches!(mode, LaunchMode::CoreOnly);
         if !self.core_only {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
@@ -233,6 +236,7 @@ impl ServeArgs {
             });
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
+        Ok(())
     }
 
     /// Resolve the port: explicit `--port` wins; otherwise 8081 in debug
@@ -552,7 +556,7 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
     } else {
         LaunchMode::Tcp
     };
-    args.resolve_launch(Some(requested));
+    args.resolve_launch(Some(requested))?;
     match daemon_status() {
         DaemonStatus::Verified(pid) if pid != std::process::id() => {
             transaction = migrate_managed_launch(transaction, false).await?;
@@ -1264,8 +1268,7 @@ pub(crate) fn web_daemon_pid() -> Option<u32> {
 /// Replacement callers retain the lifecycle transaction through successor startup.
 async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMode> {
     crate::session::require_known_profile(profile)?;
-    if !args.core_only
-        && crate::cli::graft::web_disabled(&crate::session::config::Config::load_or_warn())
+    if !args.core_only && crate::cli::graft::web_disabled(&crate::session::config::Config::load()?)
     {
         bail!(
             "Web serving is disabled; run `aoe plugin enable aoe.web` before starting a TCP daemon"
@@ -1644,7 +1647,7 @@ pub(crate) async fn ensure_local_daemon(
             unreachable!()
         };
         args.read_acquisition = native_profile.is_none();
-        args.resolve_launch(None);
+        args.resolve_launch(None)?;
         validate_launch_args(profile, &args).await?;
         start_daemon(profile, &args, &transaction, false).await?;
         daemon_pid()
