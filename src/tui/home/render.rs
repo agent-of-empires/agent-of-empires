@@ -697,15 +697,21 @@ fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     } else {
         inst.worktree_info
             .as_ref()
-            .and_then(|w| branch_tag_content(&w.branch, BRANCH_TAG_WIDTH))
-            .map(|content| RowTag {
-                content,
-                max_width: BRANCH_TAG_WIDTH,
-            })
+            .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
 
+fn plain_branch_row_tag(branch: &str) -> Option<RowTag> {
+    branch_tag_content(branch, BRANCH_TAG_WIDTH).map(|content| RowTag {
+        content,
+        max_width: BRANCH_TAG_WIDTH,
+    })
+}
+
 fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
+    if repo_count <= 1 {
+        return plain_branch_row_tag(branch);
+    }
     let suffix = format!("+{repo_count}");
     let suffix_width = rendered_width(&suffix);
     if suffix_width >= BRANCH_TAG_WIDTH {
@@ -5434,7 +5440,11 @@ mod tests {
     /// The repository count is what the workspace tag exists to carry, so the branch is
     /// cut in cells to leave room rather than filling the cap and pushing it off.
     #[test]
-    fn workspace_branch_row_tag_keeps_the_repository_count() {
+    fn workspace_branch_row_tag_counts_only_multiple_repositories() {
+        let one = workspace_branch_row_tag("feat/solo", 1)
+            .expect("branch tag")
+            .rendered();
+        assert!(one.starts_with("[solo") && !one.contains('+'), "{one:?}");
         let rendered = workspace_branch_row_tag(&"界".repeat(10), 2)
             .expect("a wide branch still yields a tag")
             .rendered();

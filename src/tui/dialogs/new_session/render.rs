@@ -1018,7 +1018,7 @@ impl NewSessionDialog {
             let text = if self.workspace_forced() {
                 " Workspace directory (required by extra repos)"
             } else {
-                " Workspace directory (attach projects later)"
+                " Workspace directory"
             };
             let line = Line::from(vec![
                 Span::styled("Workspace:", label_style),
