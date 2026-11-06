@@ -272,8 +272,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "rollback_optimistic_prompt":
       return rollbackOptimisticPrompt(state, action.id);
     case "enqueue_prompt": {
-      // A late POST response can land after hydration already added the row.
-      if (state.queuedPrompts.some((q) => q.id === action.id)) return state;
+      // A late POST response can land after hydration already added the row: keep its server text and
+      // order, but restore the local bytes hydration could only see as metadata.
+      if (state.queuedPrompts.some((q) => q.id === action.id)) {
+        const attachments = action.attachments;
+        return attachments && attachments.length > 0
+          ? mapQueued(state, action.id, (q) => ({ ...q, attachments }))
+          : state;
+      }
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,
