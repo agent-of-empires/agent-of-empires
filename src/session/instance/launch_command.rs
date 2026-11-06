@@ -920,6 +920,14 @@ impl Instance {
         stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
+        // Without the plugin the tool has no agent entry, and the command
+        // fallback would quietly start a shell instead of OMP.
+        anyhow::ensure!(
+            !(self.command.is_empty()
+                && self.tool == "omp"
+                && crate::agents::get_agent("omp").is_none()),
+            "OMP now runs through the plugin-omp plugin; install and approve it before launching this session"
+        );
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
                 crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(

@@ -637,6 +637,19 @@ capabilities = ["session.integration"]
 tool = "acme-helper"
 provider_versions = ["^1"]
 command = "acme-helper"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--approve;id>/tmp/plugin-output"
+"#,
+            "free of shell syntax",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
 [agent_integrations.launch]
 instruction_flag = "--append-system-prompt"
 "#,

@@ -1902,12 +1902,15 @@ impl Instance {
             )
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let mut words = shell_words::split(self.get_tool_command())
-            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        let command = self.get_tool_command();
+        let assignments = aoe_plugin_api::agent_integration::launch_prefix(command)
+            .map_or(0, |(_, assignments)| assignments);
+        let mut words =
+            shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
         words.extend(
             shell_words::split(&extra).context(ManagedResumeCause::UnsupportedManagedArguments)?,
         );
-        validate_managed_arguments(agent, &words[1..])
+        validate_managed_arguments(agent, words.get(1 + assignments..).unwrap_or_default())
             .context(ManagedResumeCause::UnsupportedManagedArguments)
     }
 
@@ -1936,9 +1939,15 @@ impl Instance {
             }),
             "managed conversation requires an immutable container execution identity"
         );
-        let words = shell_words::split(self.get_tool_command())?;
-        let program =
-            inputs.resolve_program(words.first().context("native program is missing")?)?;
+        let command = self.get_tool_command();
+        let (_, assignments) = aoe_plugin_api::agent_integration::launch_prefix(command)
+            .context("native launch must start with a literal executable")?;
+        let words = shell_words::split(command)?;
+        let program = inputs.resolve_program(
+            words
+                .get(assignments)
+                .context("native program is missing")?,
+        )?;
         anyhow::ensure!(
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
@@ -1988,7 +1997,16 @@ impl Instance {
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
         let mut store_override = None;
-        let mut roots = match agent.name {
+        // A plugin names its own tool, so OMP preparation follows the declared
+        // capture backend rather than the core agent name.
+        let capture_backend = agent
+            .session_support
+            .and_then(|support| support.capture)
+            .map(|capture| capture.backend);
+        let mut roots = if capture_backend == Some(crate::agents::SessionCaptureBackend::Omp) {
+            Vec::new()
+        } else {
+            match agent.name {
             "claude" => {
                 let recorded_execution = (inputs.container.is_none())
                     .then(|| {
@@ -2330,8 +2348,10 @@ impl Instance {
                 vec![base.join(".gemini")]
             }
             _ => bail!("the effective {} conversation namespace is not attested; managed resume and fork are refused", agent.name),
+            }
         };
-        if agent.name != "omp" {
+        if agent.name != "omp" && capture_backend != Some(crate::agents::SessionCaptureBackend::Omp)
+        {
             for (key, path) in [
                 ("HOME", home),
                 ("XDG_CONFIG_HOME", config_home),
@@ -3786,6 +3806,25 @@ mod tests {
         ));
         assert_eq!(execution.target_session_id.as_deref(), Some(sid));
         assert_eq!(instance.agent_session_binding, Some(original));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_launch_skips_leading_environment_assignments() {
+        use crate::session::instance::test_helpers::{install_omp_test_plugin, tool_instance};
+        let _plugin = install_omp_test_plugin();
+        let temp = tempfile::tempdir().unwrap();
+        let mut instance = tool_instance("omp", temp.path().to_str().unwrap());
+        instance.command = "TOKEN=local omp".into();
+        let agent = crate::agents::get_agent("omp").expect("declared agent resolves");
+        let resolved = Instance::execution_agent_for(
+            "omp",
+            "TOKEN=local omp",
+            &crate::session::config::SessionConfig::default(),
+        )
+        .expect("the executable follows its assignments");
+        assert_eq!(resolved.name, "omp");
+        assert_eq!(instance.managed_user_argv(agent).unwrap(), None);
     }
 
     #[test]
