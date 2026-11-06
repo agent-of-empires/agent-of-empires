@@ -925,11 +925,11 @@ fn plan_plugin_statuses<'a>(
     let mut contributors = [None; MAX_PLUGIN_STATUS_COUNT];
     let mut contributor_count = 0;
     for (plugin, _, _) in statuses.clone() {
-        if contributors[..contributor_count].contains(&Some(plugin)) {
-            continue;
-        }
         if contributor_count == MAX_PLUGIN_STATUS_COUNT || contributor_count == budget / 2 {
             break;
+        }
+        if contributors[..contributor_count].contains(&Some(plugin)) {
+            continue;
         }
         contributors[contributor_count] = Some(plugin);
         contributor_count += 1;
@@ -943,7 +943,7 @@ fn plan_plugin_statuses<'a>(
             let index = seen
                 .iter()
                 .position(|entry| entry.is_none_or(|(id, _)| id == plugin));
-            let Some(index) = index else { break };
+            let Some(index) = index else { continue };
             let (_, count) = seen[index].get_or_insert((plugin, 0usize));
             let current = *count;
             *count += 1;
