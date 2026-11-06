@@ -248,3 +248,36 @@ fn a_workspace_session_attaches_a_project_without_moving() {
     assert_eq!(names, vec!["backend", "frontend"]);
     assert!(Path::new(&workspace_dir).join("frontend/.git").exists());
 }
+
+/// `worktree.workspace_by_default` is resolved by the Daemon, and only worktree
+/// sessions that did not pass `--no-workspace` follow it.
+#[test]
+#[parallel]
+fn workspace_by_default_applies_on_the_daemon() {
+    let h = TuiTestHarness::new("add_workspace_by_default");
+    h.append_config("[worktree]\nworkspace_by_default = true");
+    let repo = h.home_path().join("backend");
+    init_repo(&repo);
+    let add = |title: &str, branch: &str, extra: &[&str]| {
+        let mut args = vec![
+            "add",
+            repo.to_str().unwrap(),
+            "--cmd",
+            "claude",
+            "-t",
+            title,
+            "-w",
+            branch,
+            "-b",
+        ];
+        args.extend_from_slice(extra);
+        h.run_cli_ok(&args);
+    };
+    add("Default", "feat/default", &[]);
+    add("Opted", "feat/opted", &["--no-workspace"]);
+    let sessions = h.read_sessions();
+    assert!(!session_by_title(&sessions, "Default")["workspace_info"].is_null());
+    let opted = session_by_title(&sessions, "Opted");
+    assert!(opted["workspace_info"].is_null());
+    assert!(!opted["worktree_info"].is_null());
+}
