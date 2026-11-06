@@ -1494,7 +1494,7 @@ pub(crate) async fn create_session_with(
             if let Err(error) = state.runtime.publish(&state).await {
                 tracing::debug!(target: "server.runtime", %error, "publish after failed create failed");
             }
-            let failure = create_failure(&e, progress.stage(), &reference);
+            let failure = create_failure(&e, progress.stage(), reference);
             let failure = match failure {
                 Some(failure)
                     if failure.code

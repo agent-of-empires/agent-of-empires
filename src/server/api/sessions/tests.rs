@@ -11833,12 +11833,7 @@ async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent}: {refused}");
-        assert_eq!(refused["error"], code, "{parent}");
-        assert!(
-            refused["message"].as_str().unwrap().contains(message),
-            "{parent}: {refused}"
-        );
+        // What was provisioned is checked first, so a late refusal fails on what it left behind.
         assert!(
             repo.find_branch(branch, git2::BranchType::Local).is_err(),
             "{parent}: branch {branch} was created"
@@ -11852,6 +11847,12 @@ async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
             state.instances.read().await.len(),
             2,
             "{parent}: a session was written"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent}: {refused}");
+        assert_eq!(refused["error"], code, "{parent}");
+        assert!(
+            refused["message"].as_str().unwrap().contains(message),
+            "{parent}: {refused}"
         );
     }
 }

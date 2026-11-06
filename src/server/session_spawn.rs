@@ -280,6 +280,8 @@ pub(crate) async fn spawn_structured_session(
         )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        // HTTP's `parent_session_id`, checked by the handler; a CLI create names its parent below.
+        instance.parent_session_id = parent_session_id;
         if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
             let rows = worker_state.instances.blocking_read();
             let parent = super::api::sessions::resolve_cli_parent(&rows, &profile, parent)?;
@@ -296,7 +298,6 @@ pub(crate) async fn spawn_structured_session(
                 attachments: Vec::new(),
                 synthesized: false,
             });
-        instance.parent_session_id = parent_session_id;
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
