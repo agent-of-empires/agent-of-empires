@@ -1,2 +1,0 @@
-{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":9,"primitive_schema_version":1}}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1}}}}}
