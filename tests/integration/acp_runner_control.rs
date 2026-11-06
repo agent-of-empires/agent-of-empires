@@ -1570,10 +1570,11 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
-    wait_for(&control, "control socket");
 
     // First daemon: establish the native session, then detach.
-    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    let first = connect_ready(&control);
+    first.set_nonblocking(true).unwrap();
+    let mut first = tokio::net::UnixStream::from_std(first).unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Hello { .. })
@@ -1958,11 +1959,11 @@ for line in sys.stdin:
     let mut elicitation = read_frame(&mut second);
     assert_eq!(elicitation["kind"], "server_call");
     assert_eq!(elicitation["method"], "elicitation/create");
-    let request: agent_client_protocol::schema::v1::CreateElicitationRequest =
+    let request: agent_client_protocol::v1::schema::CreateElicitationRequest =
         serde_json::from_value(elicitation["params"].take()).unwrap();
     assert!(matches!(
         request.scope(),
-        agent_client_protocol::schema::v1::ElicitationScope::Request(_)
+        agent_client_protocol::v1::schema::ElicitationScope::Request(_)
     ));
     write_frame(
         &mut second,

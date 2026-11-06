@@ -999,6 +999,12 @@ pub const AGENTS: &[AgentDef] = &[
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
         )
     },
+    // Neutral stand-in for core tests; keep last so settings indices stay stable.
+    #[cfg(feature = "e2e-tests")]
+    AgentDef {
+        host_only: true,
+        ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
+    },
 ];
 
 impl AgentDef {
@@ -1793,6 +1799,34 @@ mod tests {
     #[test]
     fn naming_reprobes_success_without_losing_context_failure_cooldown() {
         use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AOE_NAMING_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!(
+                        "{module}::naming_reprobes_success_without_losing_context_failure_cooldown"
+                    ),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap()
+            .expect("naming probe test child timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("claude");
         let response = directory.path().join("help");
@@ -2562,6 +2596,17 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         ];
         for (cmd, expected) in cases {
             assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn fake_agent_exists_only_in_e2e_builds_and_is_last() {
+        assert_eq!(
+            get_agent("fake-agent").is_some(),
+            cfg!(feature = "e2e-tests")
+        );
+        if cfg!(feature = "e2e-tests") {
+            assert_eq!(AGENTS.last().map(|a| a.name), Some("fake-agent"));
         }
     }
 

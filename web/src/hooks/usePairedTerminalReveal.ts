@@ -34,8 +34,8 @@ export function usePairedTerminalReveal({
         // commits the switch. The paired shell mounts lazily, so its PTY may not be
         // ready when the dispatch fires; latch the intent too.
         setRightPanelView("paired");
-        setPendingTerminalFocus("paired");
-        requestAnimationFrame(() => dispatchFocusTerminal("paired"));
+        setPendingTerminalFocus("paired", 0);
+        requestAnimationFrame(() => dispatchFocusTerminal("paired", 0));
         return 0;
       }
       // The paired shell only mounts while a terminal tab is its group's active tab
@@ -56,12 +56,12 @@ export function usePairedTerminalReveal({
       const remounts = prepare?.(index) ?? false;
       if (shown(termTab) && !remounts) {
         // Mounted and staying: focus synchronously so rapid agent/paired toggles stay deterministic.
-        dispatchFocusTerminal("paired");
+        dispatchFocusTerminal("paired", index);
         return index;
       }
       // Unmounted, hidden or about to remount: latch the intent for the shell to take once
       // ready, and reveal its tab (activateTab also opens a collapsed dock).
-      setPendingTerminalFocus("paired");
+      setPendingTerminalFocus("paired", index);
       const termDock = dockOf(layout, termTab);
       if (termDock) activateTab(termDock, termTab);
       else openTab(termTab, "right");

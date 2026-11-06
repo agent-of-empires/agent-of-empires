@@ -3,7 +3,7 @@
 
 use crate::acp::acp_client::update_events::is_wake_tool_title;
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+use agent_client_protocol::v1::schema::{SessionUpdate, ToolCallStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -183,7 +183,7 @@ pub(super) fn raw_input_for_tool_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ToolCall, ToolCallUpdate, ToolCallUpdateFields};
+    use agent_client_protocol::v1::schema::{ToolCall, ToolCallUpdate, ToolCallUpdateFields};
     use serde_json::json;
 
     #[test]

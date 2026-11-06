@@ -109,7 +109,7 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `split_terminal_min_height` | `30` | Minimum whole-window height in rows for the paired-terminal split. Range `0` to `1000`. Global only. |
-| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view; shortcuts, `?` help, dialog controls, and temporary notifications still work. |
+| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view and suppresses the repeated Ctrl+C reminder in Live mode without changing interrupt forwarding. Shortcuts, `?` help, dialog controls, the leader menu, and other temporary notifications still work. |
 | `preview_link_prefixes` | `[]` | Link targets beyond http and https that a click in the preview may open, as case-insensitive `scheme://authority/` prefixes, for example `["vscode://file/"]` to open file links in VS Code. Entries not in that form, including a missing `/` after the authority, are ignored, and `file:`, `javascript:`, `data:` and `vbscript:` never open. Unlisted targets are neither opened nor passed to the terminal; a new entry applies to links printed after it. Global only and not editable from the web dashboard; under Settings > Global > Interaction (advanced). |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
@@ -558,6 +558,15 @@ aoe profile create client-xyz
 aoe profile list
 aoe profile default work
 ```
+
+Profile writes and global project registration use the Daemon even when the
+profile catalogue is empty or the configured default is missing. Create a
+profile and select it with `aoe profile default NAME` to restore the default.
+These commands do not create the missing profile implicitly. An explicit `-p`
+still selects the profile used for cross-scope project conflict checks.
+Unreadable or malformed configuration remains an error; session operations
+still require a valid default. `--no-autostart` refuses writes when no Daemon
+is available.
 
 ## Repo config
 

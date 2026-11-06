@@ -627,6 +627,17 @@ pub struct UiContribution {
     /// Plugin-relative path to the page's self-contained HTML file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// `page` only: the dashboard hands the page the `?link=` value of its URL.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deep_link: bool,
+}
+
+/// An opaque page deep-link value: 1 to 128 URL-safe characters, so it never needs escaping.
+pub fn deep_link_value_ok(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
 }
 
 /// How the plugin's worker is launched.
@@ -737,6 +748,13 @@ impl PluginManifest {
             .iter()
             .find(|u| u.slot == UiSlot::Page && u.id == id)
             .and_then(|u| u.entry.as_deref())
+    }
+
+    /// Whether page `id` opted in to receive deep-link values.
+    pub fn page_deep_link(&self, id: &str) -> bool {
+        self.ui
+            .iter()
+            .any(|u| u.slot == UiSlot::Page && u.id == id && u.deep_link)
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -1189,6 +1207,12 @@ impl PluginManifest {
                 "the session.integration capability requires api_version >= 19".into(),
             );
         }
+        if self.api_version < 20 {
+            check(
+                self.ui.iter().all(|u| !u.deep_link),
+                "deep_link requires api_version >= 20".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1200,8 +1224,10 @@ impl PluginManifest {
             check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
             if u.slot != UiSlot::Page {
                 check(
-                    u.title.is_none() && u.icon.is_none() && u.entry.is_none(),
-                    format!("ui[{i}]: title, icon and entry are only valid on a page slot"),
+                    u.title.is_none() && u.icon.is_none() && u.entry.is_none() && !u.deep_link,
+                    format!(
+                        "ui[{i}]: title, icon, entry and deep_link are only valid on a page slot"
+                    ),
                 );
                 continue;
             }
@@ -1495,6 +1521,48 @@ mod tests {
                 "only valid on a page slot",
             ),
         ]);
+    }
+
+    #[test]
+    fn page_deep_link_is_a_page_only_opt_in_and_values_are_checked() {
+        let page = |extra: &str| {
+            format!(
+                "{HEAD}20\n\n[[ui]]\nslot = \"page\"\nid = \"b\"\ntitle = \"B\"\nentry = \"x.html\"\n{extra}"
+            )
+        };
+        let m = PluginManifest::from_toml_str(&page("deep_link = true\n")).expect("parses");
+        assert!(m.page_deep_link("b"));
+        let m = PluginManifest::from_toml_str(&page("")).expect("parses");
+        assert!(!m.page_deep_link("b"));
+        assert!(!m.page_deep_link("other"));
+        rejects(&[(
+            "deep_link on another slot",
+            format!("{HEAD}20\n\n[[ui]]\nslot = \"card\"\nid = \"c\"\ndeep_link = true\n"),
+            "only valid on a page slot",
+        )]);
+        rejects(&[(
+            "deep_link before api_version 20",
+            format!(
+                "{HEAD}19\n\n[[ui]]\nslot = \"page\"\nid = \"b\"\ntitle = \"B\"\nentry = \"x.html\"\ndeep_link = true\n"
+            ),
+            "deep_link requires api_version >= 20",
+        )]);
+
+        for ok in ["a", "abc-123_.~X", &"a".repeat(128)] {
+            assert!(deep_link_value_ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "a b",
+            "a/b",
+            "a?b",
+            "a&b",
+            "a%20b",
+            "é",
+            &"a".repeat(129),
+        ] {
+            assert!(!deep_link_value_ok(bad), "{bad:?}");
+        }
     }
 
     #[test]

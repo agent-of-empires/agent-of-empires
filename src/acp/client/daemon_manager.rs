@@ -85,6 +85,14 @@ pub(crate) async fn require_local_read_daemon() -> Result<DaemonEndpoint, Manage
     Ok(endpoint)
 }
 
+/// Acquire configuration authority without requiring an existing session profile.
+pub(crate) async fn require_config_daemon() -> Result<DaemonEndpoint, ManagerError> {
+    if discover_env().is_some() {
+        return require_daemon().await;
+    }
+    require_local_read_daemon().await
+}
+
 fn announce_start(started: Option<u32>) {
     if let Some(pid) = started {
         eprintln!("Started aoe daemon (pid {pid})");

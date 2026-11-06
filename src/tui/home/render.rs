@@ -1094,8 +1094,7 @@ impl HomeView {
         // Keep temporary feedback and the leader menu available with the bar hidden.
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
-            || (self.live_send.is_some()
-                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()));
+            || (self.live_send.is_some() && self.live_send_pending_leader);
         let has_update_bar =
             update_info.is_some() || update_status.is_some() || image_update.is_some();
         let mut constraints = vec![Constraint::Min(0)];
@@ -4167,13 +4166,10 @@ impl HomeView {
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
-        if !self.show_shortcut_bar
-            && !(self.live_send.is_some()
-                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()))
-        {
+        if !self.show_shortcut_bar && !(self.live_send.is_some() && self.live_send_pending_leader) {
             return;
         }
-        // LIVE shares the shortcut row; its temporary menu and feedback can restore it.
+        // The leader menu can temporarily restore the hidden shortcut row.
         if let Some(state) = &self.live_send {
             let base_title = if state.title.is_empty() {
                 "session"
