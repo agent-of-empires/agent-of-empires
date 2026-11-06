@@ -91,7 +91,7 @@ sidebar_position = "left" # left | right; TUI session list
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
-It waits until the home screen is free, respects **Show tips**, and never changes the setting.
+It waits until the home screen is free, respects **Tips**, and never changes the setting.
 You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 
 | Option | Default | Description |

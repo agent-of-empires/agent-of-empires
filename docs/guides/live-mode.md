@@ -4,11 +4,11 @@ Live mode is a "feels attached" alternative to a full tmux attach: the home view
 
 ## Entering and leaving
 
-Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **New Session Mode** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
+Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **Open a new Session with** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
 
 Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE, and the banner flashes a brief reminder on each press. To quit AoE, leave live mode first.
 
-Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Auto Live-Send On View Switch** (Interaction settings, off by default) starts the relay as soon as you switch views.
+Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Live-send when switching view** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
 A foreground pane preparation may wait behind that session's accepted access
 stamp or unread clearing. It is submitted once after the write is acknowledged
@@ -52,7 +52,7 @@ The TUI's agent preview and the dashboard's agent terminal render through a pers
 
 The channel needs tmux 3.4 or newer. A pane that cannot arm one, a grid that could not be seeded or is catching up with a resize, an older tmux, or a non-Unix host falls back to polling automatically: everything still works, with more latency and no synchronized-output hold. A split window is composited from `capture-pane` snapshots, with the TUI preview keeping pane 0 on its VT grid. The paired host and container shells always poll.
 
-To rule the transport in or out while troubleshooting, toggle **VT Live Transport** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
+To rule the transport in or out while troubleshooting, toggle **Live terminal stream** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
 
 ## Configuration
 

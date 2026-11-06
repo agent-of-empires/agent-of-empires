@@ -205,6 +205,42 @@ mod tests {
         }
     }
 
+    /// The schema row for `section.field`, as `GET /api/settings/schema` serves it.
+    fn served_row(path: &str) -> serde_json::Value {
+        let json = serde_json::to_value(schema()).expect("schema serializes");
+        json.as_array()
+            .expect("schema is a JSON array")
+            .iter()
+            .find(|d| {
+                format!(
+                    "{}.{}",
+                    d["section"].as_str().unwrap(),
+                    d["field"].as_str().unwrap()
+                ) == path
+            })
+            .unwrap_or_else(|| panic!("no schema row for {path}"))
+            .clone()
+    }
+
+    #[test]
+    fn a_declared_summary_is_served_beside_the_description() {
+        let row = served_row("session.delete_to_trash");
+        assert_eq!(
+            row["summary"],
+            "Trashed Sessions can be restored until they're purged. Turn off to erase them immediately."
+        );
+        assert_eq!(row["label"], "Use Trash");
+        // The doc comment stays the description, for developers and the docs site.
+        assert_ne!(row["description"], row["summary"]);
+    }
+
+    #[test]
+    fn a_field_without_a_summary_serializes_without_the_key() {
+        let row = served_row("session.sidebar_position");
+        assert!(row.as_object().unwrap().get("summary").is_none(), "{row}");
+        assert_eq!(row["label"], "Sidebar position");
+    }
+
     #[test]
     fn field_declared_repo_and_write_policies() {
         use super::super::{RepoPolicy, ValidationKind, WebWritePolicy};

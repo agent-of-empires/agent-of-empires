@@ -98,7 +98,7 @@ static CATALOG: &[Tip] = &[
         id: SHORTCUT_BAR_TIP_ID,
         title: "More room for your sessions",
         body: "Already know your shortcuts? Open Settings ({settings}) > Global > \
-               Interaction and turn off Show shortcut bar to hide the bottom row, \
+               Interaction and turn off Shortcut bar to hide the bottom row, \
                including the LIVE banner.\n\n\
                All shortcuts still work. Press {help} for help, or Ctrl+K > Show tips \
                to browse tips again. You can turn the bar back on in the same setting.",

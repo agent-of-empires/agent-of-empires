@@ -379,7 +379,10 @@ describe("StartupErrorBanner install", () => {
     ["npm_missing", "npm isn't on the Daemon's PATH"],
     ["not_npm_installable", "The Daemon can't install this ACP adapter with npm"],
     ["container_not_running", "The Session's sandbox container isn't running"],
-    ["install_disabled", 'Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced)'],
+    [
+      "install_disabled",
+      'Turn on "Let the Web dashboard install Agents" in the aoe TUI settings (Global, Acp tab, Advanced)',
+    ],
     ["install_timeout", "`npm install -g` did not finish within 180s."],
   ])("a %s refusal shows its own message and doesn't respawn", async (code, text) => {
     const spy = stubApi({
