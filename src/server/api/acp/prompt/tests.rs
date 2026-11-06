@@ -1062,6 +1062,38 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     assert_eq!(again.status(), StatusCode::CONFLICT);
 }
 
+/// Another tab's optimistic row carries the queued row id, so it must settle too.
+#[tokio::test]
+async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-ids";
+    let state = state_with_queued_plugin_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        Ok(Json(PromptRequest {
+            text: "PR #7 was merged".to_string(),
+            attachments: Vec::new(),
+            prompt_id: Some("req-1".to_string()),
+            no_revive: false,
+            queued_prompt_id: Some("q1".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "req-1" && merged_prompt_ids == &["q1".to_string()]
+    )));
+}
+
 async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
     let state = structured_state(id, idle).await;
     state
