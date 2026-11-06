@@ -999,6 +999,12 @@ pub const AGENTS: &[AgentDef] = &[
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
         )
     },
+    // Neutral stand-in for core tests; keep last so settings indices stay stable.
+    #[cfg(feature = "e2e-tests")]
+    AgentDef {
+        host_only: true,
+        ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
+    },
 ];
 
 impl AgentDef {
@@ -2562,6 +2568,17 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         ];
         for (cmd, expected) in cases {
             assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn fake_agent_exists_only_in_e2e_builds_and_is_last() {
+        assert_eq!(
+            get_agent("fake-agent").is_some(),
+            cfg!(feature = "e2e-tests")
+        );
+        if cfg!(feature = "e2e-tests") {
+            assert_eq!(AGENTS.last().map(|a| a.name), Some("fake-agent"));
         }
     }
 
