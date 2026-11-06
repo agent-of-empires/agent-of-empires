@@ -15,28 +15,31 @@ export const SETUP_READ_DEADLINE_MS = 10_000;
 export function useSetupStatus(enabled: boolean | null) {
   const [status, setStatus] = useState<SetupStatus | null | undefined>(undefined);
 
-  // Every read takes a number; only the newest one may set status.
-  const seq = useRef({ latest: 0 });
+  // Every read takes a number; only the newest one may set status or end the first-read deadline.
+  const seq = useRef<{ latest: number; deadline?: ReturnType<typeof setTimeout> }>({ latest: 0 });
 
   const refresh = useCallback(async () => {
     const id = ++seq.current.latest;
     const next = await fetchSetup();
-    if (id === seq.current.latest) setStatus((prev) => next ?? prev ?? null);
+    if (id === seq.current.latest) {
+      clearTimeout(seq.current.deadline);
+      setStatus((prev) => next ?? prev ?? null);
+    }
     return next;
   }, []);
 
   useEffect(() => {
     if (!enabled) return;
     const reads = seq.current;
-    const deadline = setTimeout(() => {
+    reads.deadline = setTimeout(() => {
       reads.latest++;
       setStatus((prev) => (prev === undefined ? null : prev));
     }, SETUP_READ_DEADLINE_MS);
-    void refresh().finally(() => clearTimeout(deadline));
+    void refresh();
     // Steps derive from config, so a save made in Settings can change them.
     const unsubscribe = onSettingsChanged(() => void refresh());
     return () => {
-      clearTimeout(deadline);
+      clearTimeout(reads.deadline);
       reads.latest++;
       unsubscribe();
     };
