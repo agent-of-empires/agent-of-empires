@@ -42,8 +42,8 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
           className="basis-full rounded-md border border-rose-700/50 bg-rose-950/20 px-3 py-2 text-xs text-text-secondary"
         >
           <p>
-            This interrupts the main agent and all {running} running sub-agent{running === 1 ? "" : "s"}. Work already
-            written to disk stays.
+            This interrupts the main agent and all {running > 0 ? `${running} ` : ""}running sub-agent
+            {running === 1 ? "" : "s"}. Work already written to disk stays.
           </p>
           <div className="mt-2 flex gap-2">
             <button
