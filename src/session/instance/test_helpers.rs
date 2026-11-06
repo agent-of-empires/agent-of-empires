@@ -314,6 +314,35 @@ pub(crate) fn install_omp_test_plugin() -> OmpTestPlugin {
 pub(crate) fn install_omp_test_plugin_in_current_app(
     app: crate::session::test_support::AppDirGuard,
 ) -> OmpTestPlugin {
+    install_omp_test_plugin_config();
+    crate::plugin::reload_registry();
+    OmpTestPlugin {
+        app: Some(app),
+        reload: Some(crate::plugin::ReloadRegistryOnDrop),
+    }
+}
+
+/// Install the OMP declaration into an app dir the caller already isolated.
+/// The caller owns restoration, so it owns the reload that must follow it.
+pub(crate) fn install_omp_test_plugin_in_caller_app() -> OmpTestPluginDeclaration {
+    install_omp_test_plugin_config();
+    crate::plugin::reload_registry();
+    OmpTestPluginDeclaration
+}
+
+pub(crate) struct OmpTestPluginDeclaration;
+
+impl Drop for OmpTestPluginDeclaration {
+    fn drop(&mut self) {
+        let _lock = crate::session::test_support::EnvGuard::unset(&[]);
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-test");
+        })
+        .ok();
+    }
+}
+
+fn install_omp_test_plugin_config() {
     use crate::session::{CapabilityGrant, PluginConfig};
 
     let plugin_id = "acme.omp-test";
@@ -336,11 +365,6 @@ pub(crate) fn install_omp_test_plugin_in_current_app(
         );
     })
     .unwrap();
-    crate::plugin::reload_registry();
-    OmpTestPlugin {
-        app: Some(app),
-        reload: Some(crate::plugin::ReloadRegistryOnDrop),
-    }
 }
 
 pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {
