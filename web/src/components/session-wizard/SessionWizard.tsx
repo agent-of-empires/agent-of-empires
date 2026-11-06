@@ -440,9 +440,9 @@ export function SessionWizard({
     };
   }, [probePath]);
 
-  const directEdits = useRef({ sandboxEnabled: 0, useWorktree: 0 });
+  const directEdits = useRef({ sandboxEnabled: 0, useWorktree: 0, useWorkspace: 0 });
   const handleChange = useCallback((field: string, value: unknown) => {
-    if (field === "sandboxEnabled" || field === "useWorktree") directEdits.current[field]++;
+    if (field === "sandboxEnabled" || field === "useWorktree" || field === "useWorkspace") directEdits.current[field]++;
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
@@ -524,7 +524,7 @@ export function SessionWizard({
           commandMaps: commandMapsFromSettings(settings),
         });
         // The confirmation resets earlier edits, not choices made while this read was pending.
-        for (const field of ["sandboxEnabled", "useWorktree"] as const) {
+        for (const field of ["sandboxEnabled", "useWorktree", "useWorkspace"] as const) {
           if (directEdits.current[field] !== editsAtSelection[field]) {
             dispatch({ type: "SET_FIELD", field, value: latest[field] });
           }
