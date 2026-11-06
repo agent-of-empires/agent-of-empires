@@ -66,6 +66,16 @@ fn absolute_node_path(
     }
 }
 
+/// Whether installing or launching `manifest` runs a build step or a non-system worker.
+pub(crate) fn needs_node(manifest: &aoe_plugin_api::PluginManifest) -> bool {
+    match &manifest.runtime {
+        Some(aoe_plugin_api::RuntimeSpec::Command { build, system, .. }) => {
+            !build.is_empty() || !system
+        }
+        _ => false,
+    }
+}
+
 /// `AOE_NODE` plus a `PATH` led by that node's directory, for build steps and
 /// workers. Empty when no Node resolves.
 pub(crate) fn node_env() -> NodeEnv {

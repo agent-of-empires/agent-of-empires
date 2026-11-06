@@ -661,7 +661,11 @@ impl PluginHost {
             .map(|u| (u.slot, u.id.clone()))
             .collect();
 
-        let node_env = tokio::task::spawn_blocking(crate::plugin::node_env).await?;
+        let node_env = if crate::plugin::needs_node(&plugin.manifest) {
+            tokio::task::spawn_blocking(crate::plugin::node_env).await?
+        } else {
+            crate::plugin::NodeEnv::new()
+        };
         let launch = resolve_launch(plugin, &OsLaunchResolver::new(node_env.clone()))?;
         let prepared = self.sandbox.prepare(&launch)?;
 

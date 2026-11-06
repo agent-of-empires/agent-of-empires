@@ -1329,17 +1329,9 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     }
 }
 
-/// Whether installing `manifest` runs a build step or launches a non-system worker.
-fn needs_node(manifest: &PluginManifest) -> bool {
-    match &manifest.runtime {
-        Some(RuntimeSpec::Command { build, system, .. }) => !build.is_empty() || !system,
-        _ => false,
-    }
-}
-
 /// Resolve Node once, off the runtime threads, for the sync apply step.
 async fn apply_node_env(manifest: &PluginManifest) -> NodeEnv {
-    if !needs_node(manifest) {
+    if !super::needs_node(manifest) {
         return NodeEnv::new();
     }
     super::ensure_node().await;
@@ -1584,7 +1576,7 @@ mod tests {
                 "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{runtime}"
             ))
             .unwrap();
-            assert_eq!(needs_node(&manifest), expected, "{runtime}");
+            assert_eq!(crate::plugin::needs_node(&manifest), expected, "{runtime}");
         }
     }
 
