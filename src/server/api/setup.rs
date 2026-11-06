@@ -154,20 +154,24 @@ fn canonical_optional_steps(requested: &[String]) -> Result<Vec<String>, String>
         .collect())
 }
 
+/// The first required step that isn't set up, which blocks finishing.
+fn open_required_step(inputs: &SetupInputs) -> Option<&'static str> {
+    STEPS
+        .iter()
+        .find(|(key, required)| *required && !step_configured(key, inputs))
+        .map(|(key, _)| *key)
+}
+
 fn load_inputs(project_exists: bool) -> SetupInputs {
+    // Typed, so a value `Config` rejects counts as unset rather than configured.
     let config = crate::session::Config::load_or_warn();
-    let raw = crate::session::config::config_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|content| content.parse::<toml::Table>().ok())
-        .unwrap_or_default();
     let agents = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
     SetupInputs {
         telemetry_answered: config.app_state.has_responded_to_telemetry
             || crate::telemetry::do_not_track(),
         agent_installed: !agents.available_list().is_empty(),
         project_exists,
-        config: raw,
+        config: toml::Table::try_from(&config).unwrap_or_default(),
         defaults: toml::from_str::<crate::session::Config>("")
             .ok()
             .and_then(|c| toml::Table::try_from(c).ok())
@@ -267,16 +271,14 @@ pub async fn patch_setup(
     let projects = project_exists(&state).await;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), String>> {
         if patch.finished == Some(true) {
-            let inputs = load_inputs(projects);
-            if let Some((key, _)) = STEPS
-                .iter()
-                .find(|(key, required)| *required && !step_configured(key, &inputs))
-            {
+            if let Some(key) = open_required_step(&load_inputs(projects)) {
                 return Ok(Err(format!("setup step '{key}' is required")));
             }
         }
         crate::session::update_app_state(|app| {
             if let Some(skipped) = skipped {
+                // A skipped step is no longer a confirmed one.
+                app.setup_confirmed_steps.retain(|k| !skipped.contains(k));
                 app.setup_skipped_steps = skipped;
             }
             if let Some(confirmed) = confirmed {
@@ -478,5 +480,21 @@ mod tests {
         let app = AppStateConfig::load().unwrap();
         assert_eq!(app.setup_confirmed_steps, ["sandbox"]);
         assert!(app.setup_skipped_steps.is_empty());
+
+        assert_eq!(
+            send(serde_json::json!({ "skipped_steps": ["sandbox"] })).await,
+            StatusCode::NO_CONTENT
+        );
+        let app = AppStateConfig::load().unwrap();
+        assert_eq!(app.setup_skipped_steps, ["sandbox"]);
+        assert!(app.setup_confirmed_steps.is_empty());
+    }
+
+    #[test]
+    fn finishing_needs_an_installed_agent() {
+        let mut inputs = SetupInputs::default();
+        assert_eq!(open_required_step(&inputs), Some("agents"));
+        inputs.agent_installed = true;
+        assert_eq!(open_required_step(&inputs), None);
     }
 }
