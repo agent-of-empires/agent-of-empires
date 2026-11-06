@@ -161,8 +161,9 @@ describe("BackgroundAgentsPanel shell dialog", () => {
         .mockResolvedValue(reply("one\ntwo\nthree"));
       const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
       fireEvent.click(view.getByTitle("Open command and output"));
-      await vi.advanceTimersByTimeAsync(0);
+      await act(() => vi.advanceTimersByTimeAsync(0));
       const out = view.getByRole("region", { name: "Shell output" });
+      expect(out.textContent).toBe("one");
       Object.defineProperty(out, "scrollHeight", { value: 1000, configurable: true });
       Object.defineProperty(out, "clientHeight", { value: 100, configurable: true });
 
