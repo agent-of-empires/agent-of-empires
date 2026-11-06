@@ -23,19 +23,23 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
         .collect();
 
     // omp pins an error banner whose dismissal footer is the anchor.
-    let anchor = (1..=3).find_map(|span| {
-        tail.windows(span)
-            .position(|window| {
-                let joined = window
-                    .iter()
-                    .rev()
-                    .map(|line| line.trim())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                joined.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
-            })
-            .map(|index| (index, span))
-    });
+    let anchor = (1..=3)
+        .filter_map(|span| {
+            tail.windows(span)
+                .position(|window| {
+                    let joined = window
+                        .iter()
+                        .rev()
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    joined.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
+                })
+                .map(|index| (index, span))
+        })
+        // The smallest index is the footer nearest the pane bottom, even when a
+        // newer footer wraps and an older one fits on one row.
+        .min_by_key(|(index, _)| *index);
     let terminal_idx = tail.iter().position(|l| {
         let lower = l.to_lowercase();
         OMP_TERMINAL_RETRY_MARKERS
@@ -312,6 +316,26 @@ mod tests {
             summarize_error_from_pane(&wrapped_footer),
             "AOE failure",
             "wrapped footer above plugin rows"
+        );
+
+        let two_footers = format!(
+            "--------------------\n\
+             OLD failure\n\
+             Dismissed when you send your next message.\n\
+             --------------------\n\n\
+             pi > model\n\n\
+             --------------------\n\
+             NEW failure\n\
+             Dismissed when you\n\
+             send your next\n\
+             message.\n\
+             --------------------\n{}",
+            "PLUGIN\n".repeat(12)
+        );
+        assert_eq!(
+            summarize_error_from_pane(&two_footers),
+            "NEW failure",
+            "the newest footer wins across span lengths"
         );
     }
 
