@@ -359,7 +359,7 @@ impl TranscriptModel {
                 ) {
                     Vec::new()
                 } else {
-                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None)
+                    self.ensure_tool_start(tool_call_id, None, None, None, *completed_at, None)
                 };
                 self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, *is_error, content);
@@ -644,6 +644,7 @@ impl TranscriptModel {
             tool_call_id,
             title,
             args_preview,
+            prompt,
             started_at.unwrap_or_else(Utc::now),
             diffs,
         );
@@ -681,6 +682,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         name: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: DateTime<Utc>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -690,7 +692,7 @@ impl TranscriptModel {
         self.track_tool_start(tool_call_id, false);
         self.turn_has_output = true;
         let tool = ToolCall {
-            prompt: None,
+            prompt: prompt.map(str::to_string),
             id: tool_call_id.to_string(),
             name: name
                 .filter(|n| !n.is_empty())
@@ -897,7 +899,12 @@ pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall
             &incoming.args_preview,
             &prev.args_preview,
         ),
-        prompt: incoming.prompt.clone().or_else(|| prev.prompt.clone()),
+        // A sparse or unchanged repeat keeps the earlier prompt; changed arguments drop it.
+        prompt: incoming.prompt.clone().or_else(|| {
+            let unchanged = incoming.args_preview.trim().is_empty()
+                || incoming.args_preview == prev.args_preview;
+            prev.prompt.clone().filter(|_| unchanged)
+        }),
         started_at: incoming.started_at.max(prev.started_at),
         parent_tool_call_id: incoming
             .parent_tool_call_id
@@ -970,6 +977,22 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_repeated_start_keeps_the_full_prompt_only_while_the_arguments_match() {
+        let mut prev = tool("t", "Task");
+        prev.args_preview = r#"{"prompt":"cut"#.into();
+        prev.prompt = Some("full prompt".into());
+        let mut sparse = tool("t", "Task");
+        sparse.args_preview = String::new();
+        assert_eq!(
+            merge_tool_start(&prev, &sparse).prompt.as_deref(),
+            Some("full prompt")
+        );
+        let mut changed = tool("t", "Task");
+        changed.args_preview = r#"{"prompt":"other"}"#.into();
+        assert_eq!(merge_tool_start(&prev, &changed).prompt, None);
     }
 
     fn started(tool_call: ToolCall) -> Event {
