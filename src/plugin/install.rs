@@ -277,9 +277,6 @@ async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
-    if needs_node(&fetched.manifest) {
-        super::ensure_node().await;
-    }
 
     if super::plugins_dir()?.join(&id).exists() {
         bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
@@ -589,9 +586,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
-    if needs_node(&fetched.manifest) {
-        super::ensure_node().await;
-    }
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
@@ -1348,6 +1342,7 @@ async fn apply_node_env(manifest: &PluginManifest) -> NodeEnv {
     if !needs_node(manifest) {
         return NodeEnv::new();
     }
+    super::ensure_node().await;
     tokio::task::spawn_blocking(super::node_env)
         .await
         .unwrap_or_else(|error| {
