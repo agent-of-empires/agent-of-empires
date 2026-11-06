@@ -1078,6 +1078,64 @@ mod tests {
         assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
     }
 
+    /// Workflows share the task events but must not use up the shells' kept
+    /// slots, on replay or in the folded state.
+    #[test]
+    fn finished_workflows_do_not_displace_a_finished_shell() {
+        use crate::acp::state::{
+            AcpSessionId, AcpState, AgentName, WorkflowLaunch, MAX_FINISHED_BACKGROUND_SHELLS,
+        };
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let finish = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        record(Event::BackgroundTaskStarted {
+            task_id: "shell".into(),
+            tool_call_id: None,
+            description: "make build".into(),
+            workflow: None,
+            started_at: None,
+        });
+        record(finish("shell"));
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 5 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("wf{i}"),
+                tool_call_id: Some(format!("call-{i}")),
+                description: "drafts".into(),
+                workflow: Some(WorkflowLaunch {
+                    run_id: format!("wf_{i}"),
+                    name: "drafts".into(),
+                    summary: None,
+                    transcript_dir: String::new(),
+                }),
+                started_at: None,
+            });
+            record(finish(&format!("wf{i}")));
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (seq, event) in store.replay_from("s-1", 0) {
+            state.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(state.background_shells.len(), 1);
+        assert_eq!(state.background_shells[0].command, "make build");
+        assert!(state.background_shells[0].finished);
+        assert_eq!(state.workflow_runs.len(), MAX_FINISHED_BACKGROUND_SHELLS);
+    }
+
     /// Nothing guarantees an adapter task id stays unique for a session, so a
     /// finish only closes the starts before it.
     #[test]

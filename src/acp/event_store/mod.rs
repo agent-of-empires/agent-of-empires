@@ -34,23 +34,29 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AuthStatusUpdated",
 ];
 
-/// Background work as its (start, end, id field, recent starts kept) events.
-/// Teardown and cold folds find open work by pairing them, so the retention
-/// prune pins both halves, and [`prune_completed_background_work`] drops a pair
-/// once it ends, except the newest starts kept so the shell panel survives a
-/// reload.
-const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, usize)] = &[
+/// Selects the shell starts among task starts (`recent` is the start row).
+const SHELL_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NULL";
+const WORKFLOW_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NOT NULL";
+
+/// Background work as its (start, end, id field, kept groups) events. Teardown
+/// and cold folds find open work by pairing them, so the retention prune pins
+/// both halves, and [`prune_completed_background_work`] drops a pair once it
+/// ends, except the newest ended starts of each kept group, so the shell panel
+/// survives a reload and workflows cannot displace shells.
+const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, &[&str])] = &[
     (
         "BackgroundTaskStarted",
         "BackgroundTaskFinished",
         "task_id",
-        crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS,
+        &[SHELL_START, WORKFLOW_START],
     ),
     (
         "BackgroundAgentLaunched",
         "BackgroundAgentCompleted",
         "agent_id",
-        0,
+        &[],
     ),
 ];
 
@@ -317,7 +323,7 @@ fn prune_completed_background_work(
     let Some(cutoff) = cutoff else {
         return;
     };
-    for (start, end, id, keep) in BACKGROUND_WORK_EVENTS {
+    for (start, end, id, kept_groups) in BACKGROUND_WORK_EVENTS {
         // An end closes only the starts before it: ids may be reused.
         let closed = |started: &str| {
             format!(
@@ -330,17 +336,27 @@ fn prune_completed_background_work(
             )
         };
         // Open starts are pinned, so they do not count toward the kept ones.
+        let keep = crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+        let kept: String = kept_groups
+            .iter()
+            .map(|group| {
+                format!(
+                    "AND started.seq NOT IN (
+                       SELECT recent.seq FROM {events} AS recent
+                       WHERE recent.session_id = ?1 AND recent.discriminant = '{start}'
+                         AND {group} AND {}
+                       ORDER BY recent.seq DESC LIMIT {keep})",
+                    closed("recent")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n               ");
         let delete_started = format!(
             "DELETE FROM {events} AS started
              WHERE started.session_id = ?1 AND started.seq <= ?2
                AND started.discriminant = '{start}'
-               AND started.seq NOT IN (
-                   SELECT recent.seq FROM {events} AS recent
-                   WHERE recent.session_id = ?1 AND recent.discriminant = '{start}'
-                     AND {}
-                   ORDER BY recent.seq DESC LIMIT {keep})
+               {kept}
                AND {}",
-            closed("recent"),
             closed("started")
         );
         let delete_ended = format!(
