@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent, BackgroundShell, WorkflowRun } from "../../../lib/acpTypes";
@@ -146,6 +146,38 @@ describe("BackgroundAgentsPanel shell dialog", () => {
     expect(pre.className).toContain("whitespace-pre-wrap");
     fireEvent.click(document.querySelector("button[aria-pressed]") as HTMLElement);
     expect(pre.className).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("names the output region and leaves a reader who scrolled up where they are", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell()]);
+      taskOutputMock.mockReset();
+      const reply = (output: string) => ({ exists: true, output, truncated: false });
+      taskOutputMock
+        .mockResolvedValueOnce(reply("one"))
+        .mockResolvedValueOnce(reply("one\ntwo"))
+        .mockResolvedValue(reply("one\ntwo\nthree"));
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await vi.advanceTimersByTimeAsync(0);
+      const out = view.getByRole("region", { name: "Shell output" });
+      Object.defineProperty(out, "scrollHeight", { value: 1000, configurable: true });
+      Object.defineProperty(out, "clientHeight", { value: 100, configurable: true });
+
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(out.textContent).toContain("two");
+      expect(out.scrollTop).toBe(1000);
+
+      out.scrollTop = 0;
+      fireEvent.scroll(out);
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(out.textContent).toContain("three");
+      expect(out.scrollTop).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("polls a running shell one read at a time and stops once it finishes", async () => {

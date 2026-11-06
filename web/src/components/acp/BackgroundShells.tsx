@@ -127,10 +127,11 @@ function ShellDetailModal({
     };
   }, [sessionId, shell.taskId, shell.finished]);
 
-  // Follow the end of the output as it grows.
+  // Follow the end of the output while the reader stays at the bottom.
+  const pinned = useRef(true);
   useEffect(() => {
     const el = preRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
   }, [out?.output]);
 
   return (
@@ -195,7 +196,12 @@ function ShellDetailModal({
                 <pre
                   ref={preRef}
                   tabIndex={0}
+                  role="region"
                   aria-label="Shell output"
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+                  }}
                   className={`max-h-[50vh] overflow-auto rounded border border-surface-700 bg-surface-900/40 p-2 font-mono text-text-secondary ${wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre"}`}
                 >
                   {out.output || "(no output yet)"}
