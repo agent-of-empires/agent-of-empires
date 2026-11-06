@@ -4,7 +4,8 @@ import type { ShortcutActions } from "../lib/shortcuts";
 
 export type { ShortcutActions };
 
-export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
+/** `ready` is false while the actions can't act yet, for example before the server's read-only state is known. */
+export function useKeyboardShortcuts(getActions: () => ShortcutActions, ready = true) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const target = e.target instanceof Element ? e.target : null;
@@ -28,8 +29,8 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
 
     // Capture phase: xterm.js stops propagation of Cmd/Ctrl combos.
     document.addEventListener("keydown", handler, true);
-    // Lets browser tests wait for the listener instead of racing the effect flush.
-    document.documentElement.dataset.shortcutsReady = "true";
+    // Lets browser tests wait until a shortcut can act, instead of racing the effect flush or the load.
+    if (ready) document.documentElement.dataset.shortcutsReady = "true";
     return () => document.removeEventListener("keydown", handler, true);
-  }, [getActions]);
+  }, [getActions, ready]);
 }

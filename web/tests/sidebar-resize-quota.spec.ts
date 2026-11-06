@@ -40,7 +40,7 @@ async function enableThrow(page: Page, key: string) {
 
 async function mockApis(page: Page) {
   await mockStaticApis(page);
-  await page.route("**/api/sessions", (r) =>
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
     r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: { sessions: [], workspace_ordering: [] },

@@ -17,7 +17,7 @@ const TITLE = "acp-recall";
 async function setup(page: Page, includeSibling = false) {
   await mockStructuredSessionApis(page, { id: SESSION_ID, title: TITLE, projectPath: "/tmp/acp-recall" });
   if (includeSibling) {
-    await page.route("**/api/sessions", (r) => {
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

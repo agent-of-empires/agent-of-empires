@@ -19,7 +19,9 @@ export function hasStartedBefore(session: Pick<SessionResponse, "acp_session_id"
   return !!session.acp_session_id && !session.import_pending;
 }
 
-/** A new Session (no events yet) whose Worker or first connection is still coming up. */
+/** A new Session whose Agent session doesn't exist yet: its Worker, first connection, or
+ *  `session/new` is still coming up. Events persisted before `session/new` answers
+ *  (prompt capabilities, commands) don't end it; `AcpSessionAssigned` does. */
 export function isNewSessionStarting(
   state: AcpState,
   connection: ConnectionRetryState & Pick<AcpContext, "hasEverOpened">,
@@ -28,17 +30,16 @@ export function isNewSessionStarting(
 ): boolean {
   if (
     startedBefore ||
+    state.sessionAssigned ||
     state.startupError ||
     state.workerStopped ||
     state.workerRestarting ||
-    state.lastSeq > 0 ||
     connectionRetriesExhausted(connection)
   )
     return false;
   const { status, hasEverOpened, reconnecting } = connection;
-  // A running Worker is already up, so a cold connection to it is not a startup.
-  return (
-    acpWorkerState === "resuming" ||
-    (acpWorkerState !== "running" && !hasEverOpened && (reconnecting || status === "connecting" || status === "error"))
-  );
+  if (acpWorkerState === "resuming") return true;
+  // A running Worker's replay says whether its session was assigned, so wait for the connection.
+  if (acpWorkerState === "running") return hasEverOpened;
+  return !hasEverOpened && (reconnecting || status === "connecting" || status === "error");
 }

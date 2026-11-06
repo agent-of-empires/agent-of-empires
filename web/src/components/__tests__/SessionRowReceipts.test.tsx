@@ -147,7 +147,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string, init?: RequestInit) => {
-          if (url === "/api/sessions") {
+          if (url === "/api/sessions?state=untrashed") {
             return failPoll ? new Response("", { status: 503 }) : reply(snapshot, revision);
           }
           if (url === "/api/settings/schema")
@@ -252,7 +252,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        if (url === "/api/sessions") {
+        if (url === "/api/sessions?state=untrashed") {
           return failPoll ? new Response("", { status: 503 }) : reply({ sessions: [A], workspace_ordering: [] }, 10n);
         }
         if (url !== `/api/sessions/A/${setting.kind}`) throw new Error("Unexpected request " + url);
@@ -300,7 +300,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string, init?: RequestInit) => {
-          if (url === "/api/sessions") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
+          if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
           if (url !== `/api/sessions/A/${setting.kind}`) throw new Error("Unexpected request " + url);
           writes.push(init!);
           entered.resolve();
@@ -343,7 +343,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string) => {
-          if (url === "/api/sessions")
+          if (url === "/api/sessions?state=untrashed")
             return failPoll ? new Response("", { status: 503 }) : reply({ sessions: [A], workspace_ordering: [] }, 10n);
           if (url !== `/api/sessions/A/${setting.kind}`) throw new Error("Unexpected request " + url);
           writes++;
@@ -401,7 +401,7 @@ describe("SessionRow canonical settings receipts", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string, init?: RequestInit) => {
-          if (url === "/api/sessions") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
+          if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
           if (++calls === 1) {
             firstEntered.resolve();
             return first.promise;
@@ -450,7 +450,7 @@ describe("SessionRow canonical settings receipts", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string) => {
-          if (url === "/api/sessions") return reply(snapshot, 20n, epoch);
+          if (url === "/api/sessions?state=untrashed") return reply(snapshot, 20n, epoch);
           calls++;
           return held.promise;
         }),
@@ -489,7 +489,7 @@ describe("SessionRow canonical settings receipts", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
-        if (url === "/api/sessions") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
+        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
         return ++calls === 1 ? held.promise : reply({ ...A, color: "amber" }, 12n);
       }),
     );
@@ -524,7 +524,7 @@ describe("SessionRow canonical settings receipts", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string) => {
-          if (url === "/api/sessions") return reply(snapshot, revision);
+          if (url === "/api/sessions?state=untrashed") return reply(snapshot, revision);
           if (url === "/api/sessions/A/" + setting) return ++callsA === 1 ? first.promise : cancel.promise;
           if (url === "/api/sessions/B/color") return reply({ ...B, color: "green" }, 12n);
           throw new Error("Unexpected request " + url);
@@ -579,7 +579,7 @@ describe("SessionRow canonical settings receipts", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string) => {
-          if (url === "/api/sessions") return reply({ sessions: [A], workspace_ordering: [] }, 9n);
+          if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 9n);
           return ++calls === 1 ? held.promise : reply({ ...A, color: "red" }, 13n);
         }),
       );
@@ -616,7 +616,7 @@ describe("SessionRow canonical settings receipts", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
-        url === "/api/sessions"
+        url === "/api/sessions?state=untrashed"
           ? reply({ sessions: [A], workspace_ordering: [] }, 10n)
           : ++calls === 1
             ? first.promise
@@ -655,7 +655,7 @@ describe("SessionRow canonical settings receipts", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
-        if (url === "/api/sessions") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
+        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
         if (url === "/api/sessions/A/color") return reply({ ...A, color: null }, 11n);
         return new Response("", { status: 503 });
       }),
@@ -679,7 +679,7 @@ describe("SessionRow canonical settings receipts", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
-        if (url === "/api/sessions") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
+        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
         return url.includes("/A/") ? ackA.promise : ackB.promise;
       }),
     );

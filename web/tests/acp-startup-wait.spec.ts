@@ -71,7 +71,11 @@ test("a running Worker with no stored Agent session shows no startup line while 
   const mock = await mockAcpSession(page, {
     title: "story-running-cleared",
     workerState: "running",
-    initialEvents: [{ UserPromptSent: { text: "hi", prompt_id: "p1" } }, agentMessageChunk("hello")],
+    initialEvents: [
+      { AcpSessionAssigned: { acp_session_id: "acp-after-new" } },
+      { UserPromptSent: { text: "hi", prompt_id: "p1" } },
+      agentMessageChunk("hello"),
+    ],
   });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
@@ -89,6 +93,42 @@ test("a running Worker with no stored Agent session shows no startup line while 
   release();
   await expect(page.getByText("hello")).toBeVisible();
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+});
+
+test("a running Session assigned only before the replay tail shows no startup line and keeps Stop and run", async ({
+  page,
+}) => {
+  // Over 1,000 frames, so the assignment reaches the browser only through the seq-0 handshake prefix.
+  const turns = Array.from({ length: 400 }, (_, i) => [
+    { UserPromptSent: { text: `earlier ${i}`, prompt_id: `p${i}` } },
+    agentMessageChunk(`reply ${i}`),
+    stopped(),
+  ]).flat();
+  const mock = await mockAcpSession(page, {
+    title: "story-assigned-before-tail",
+    workerState: "running",
+    sessionFields: { clear_aliases: ["/clear"], compact_aliases: ["/compact"] },
+    initialEvents: [
+      { AcpSessionAssigned: { acp_session_id: "acp-after-new" } },
+      { PromptCapabilities: { image: true, audio: false, embedded_context: true, steering: true } },
+      ...turns,
+      { UserPromptSent: { text: "Refactor the parser" } },
+    ],
+  });
+  const at = new Date().toISOString();
+  await page.route("**/api/sessions/*/queue", (r) =>
+    r.fulfill({ json: [{ id: "q1", seq: 1, text: "/compact keep the parser notes", created_at: at }] }),
+  );
+  const prefix = page.waitForResponse((r) => {
+    const url = new URL(r.url());
+    return url.pathname.endsWith("/acp/replay") && url.searchParams.get("since") === "0";
+  });
+  await openStructuredSession(page, mock);
+  await prefix;
+  await expect(page.getByText("Refactor the parser")).toBeVisible();
+  await expect(page.getByTestId("queued-send-now")).toHaveText("Stop and run");
+  await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Restart" })).toHaveCount(0);
 });
 
 test.describe("at 375px", () => {

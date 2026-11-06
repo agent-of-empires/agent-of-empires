@@ -53,6 +53,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
+    /// The session this one is a sub-session of, already checked by the caller.
+    pub parent_session_id: Option<String>,
     /// Explicit ACP approval-mode id to persist on the instance; the
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
@@ -152,6 +154,7 @@ pub(crate) async fn spawn_structured_session(
             created_by_plugin,
             plugin_create_idempotency,
             pending_initial_turn,
+            parent_session_id,
             acp_mode_id,
             view,
             agent_name,
@@ -277,10 +280,11 @@ pub(crate) async fn spawn_structured_session(
         )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        // HTTP's `parent_session_id`, checked by the handler; a CLI create names its parent below.
+        instance.parent_session_id = parent_session_id;
         if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
             let rows = worker_state.instances.blocking_read();
-            let parent = super::api::sessions::resolve_cli_session(&rows, &profile, parent)?;
-            anyhow::ensure!(parent.parent_session_id.is_none(), "Cannot create a sub-session of a sub-session");
+            let parent = super::api::sessions::resolve_cli_parent(&rows, &profile, parent)?;
             instance.parent_session_id = Some(parent.id.clone());
             instance.group_path = parent.group_path.clone();
         }
@@ -492,6 +496,7 @@ pub(crate) async fn spawn_structured_session(
             };
             instance.yolo_mode |= crate::acp::runs_always_yolo(
                 runs,
+                instance.view,
                 &resolved_config.session.agent_acp_cmd,
                 &resolved_config.session.agent_detect_as,
             );
@@ -705,7 +710,7 @@ pub(crate) async fn spawn_structured_session(
         }
 
         creation_guard.phase(CreationPhase::LaunchHooks);
-        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));
+        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
         if let Err(error) = hooks {
             rollback(native, instance, false);
             return Err(error);
@@ -1163,6 +1168,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            parent_session_id: None,
             acp_mode_id: None,
             view: crate::session::View::Terminal,
             agent_name: Some("claude".into()),

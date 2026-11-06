@@ -1123,7 +1123,9 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
                             return entry.clone();
                         }
                     }
-                    RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
+                    RuntimeEvent::Snapshot(_)
+                    | RuntimeEvent::Sandbox(_)
+                    | RuntimeEvent::OwnerDiagnostics(_) => {}
                 }
             }
         })

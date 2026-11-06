@@ -148,22 +148,31 @@ pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>)
         .map(|_| base.clone())
 }
 
-/// Whether `agent` always runs in Yolo mode: a built-in that does, or a custom
-/// agent with no valid adapter of its own whose inherited base does.
+/// Whether `agent` always runs in Yolo mode in `view`: a built-in that does, or a custom agent
+/// whose base does. A terminal session runs the `agent_detect_as` base CLI; a structured one
+/// runs the agent's own valid adapter when it has one, else the base's.
 pub fn runs_always_yolo(
     agent: &str,
+    view: crate::session::View,
     agent_acp_cmd: &HashMap<String, String>,
     agent_detect_as: &HashMap<String, String>,
 ) -> bool {
     if crate::agents::get_agent(agent).is_some() {
         return crate::agents::is_always_yolo(agent);
     }
-    let own_adapter = agent_acp_cmd
-        .get(agent)
-        .is_some_and(|cmd| AgentSpec::from_acp_cmd(agent, cmd).is_ok());
-    !own_adapter
-        && inherited_acp_base(agent, agent_detect_as)
-            .is_some_and(|base| crate::agents::is_always_yolo(&base))
+    match view {
+        crate::session::View::Terminal => agent_detect_as
+            .get(agent)
+            .is_some_and(|base| crate::agents::is_always_yolo(base)),
+        crate::session::View::Structured => {
+            let own_adapter = agent_acp_cmd
+                .get(agent)
+                .is_some_and(|cmd| AgentSpec::from_acp_cmd(agent, cmd).is_ok());
+            !own_adapter
+                && inherited_acp_base(agent, agent_detect_as)
+                    .is_some_and(|base| crate::agents::is_always_yolo(&base))
+        }
+    }
 }
 
 /// The name users know a registry agent by, for headlines such as
@@ -188,6 +197,8 @@ pub fn display_name_for(agent: &str) -> Option<&'static str> {
         "kimi" => "Kimi Code",
         "prime-agent" => "Prime Agent",
         "aoe-agent" => "aoe-agent",
+        #[cfg(feature = "e2e-tests")]
+        "fake-agent" => "Fake Agent",
         _ => return None,
     })
 }
