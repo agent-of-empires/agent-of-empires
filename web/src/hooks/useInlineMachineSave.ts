@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { elevateLogin, updateMachineSettingsInline } from "../lib/api";
 
 export interface ElevationRequest {
@@ -10,6 +10,7 @@ export interface ElevationRequest {
 export function useInlineMachineSave() {
   const [elevation, setElevation] = useState<ElevationRequest | null>(null);
   const pending = useRef<ElevationRequest | null>(null);
+  useEffect(() => () => pending.current?.cancel(), []);
 
   const save = useCallback(async (updates: Record<string, unknown>): Promise<boolean> => {
     const outcome = await updateMachineSettingsInline(updates);
@@ -30,6 +31,8 @@ export function useInlineMachineSave() {
         submit: async (passphrase) => {
           const result = await elevateLogin(passphrase);
           if (!result.ok) return result.error ?? "That passphrase did not match.";
+          // Cancelled while elevating: its edit already reverted, so it must not write.
+          if (pending.current !== request) return null;
           const retried = await updateMachineSettingsInline(updates);
           finish(retried === "committed");
           return null;
