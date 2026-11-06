@@ -92,7 +92,7 @@ pub struct SoundConfig {
     #[setting(
         label = "Volume",
         widget = "custom:sound-volume",
-        summary = "From 0.1 to 1.0. Browsers cap it there."
+        summary = "From 0.1 to 1.5, but browsers play anything above 1.0 at 1.0."
     )]
     pub browser_volume: f64,
 
