@@ -29,6 +29,7 @@ mod custom_order_tui;
 mod daemon_config;
 mod diagnostics_strip;
 mod errors;
+mod fake_agent;
 mod filewatch_config_malformed;
 mod filewatch_config_profile_switch;
 mod filewatch_tui_dynamic_profile;

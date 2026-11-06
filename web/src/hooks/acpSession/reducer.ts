@@ -55,6 +55,8 @@ export type Action =
   | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
+  | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
+  | { kind: "restart_failed"; epoch: number; message: string; stoppedSent: boolean }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -183,6 +185,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
         currentModeId: state.currentModeId ?? hs.currentModeId,
         availableCommands: state.availableCommands.length > 0 ? state.availableCommands : hs.availableCommands,
         configOptions: state.configOptions.length > 0 ? state.configOptions : hs.configOptions,
+        // The assignment can sit only in the prefix, and a forwarded `/new` clears the stored id.
+        sessionAssigned: state.sessionAssigned || hs.sessionAssigned,
       };
     }
     case "lagged":
@@ -235,6 +239,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
         optimisticRows: state.optimisticRows.concat(row),
         startupError: null,
         lastError: null,
+        restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds
           : state.inflightPromptIds.concat(id),
@@ -276,6 +281,27 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return mapQueued(state, action.id, (q) => ({ ...q, pending: false }));
     case "dismiss_primer":
       return { ...state, contextPrimerAvailable: null };
+    case "restart_started":
+      // The restart already ended when `epoch` moved on; its replacement's stops are real, but its stop still stopped the sent prompt.
+      if (action.epoch !== state.restartEpoch)
+        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+      // The stop this restart caused may already be applied; it isn't the Worker stopping.
+      return {
+        ...state,
+        workerStopped: false,
+        workerRestarting: false,
+        restartInFlight: true,
+        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        restartFailure: null,
+      };
+    case "restart_failed":
+      if (action.epoch !== state.restartEpoch)
+        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+      return {
+        ...state,
+        restartFailure: action.message,
+        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+      };
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };
     case "dismiss_rejected_prompt":

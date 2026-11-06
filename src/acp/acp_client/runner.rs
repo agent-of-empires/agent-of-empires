@@ -274,7 +274,7 @@ pub(super) async fn spawn_runner_detached(
         let id = session_id.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            crate::process::systemd::scope_prefix_for(&id, &profile)
+            crate::process::systemd::scope_prefix_for(&id, &id, &profile)
         })
         .await
         .ok()

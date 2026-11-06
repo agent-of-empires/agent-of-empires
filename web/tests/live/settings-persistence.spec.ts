@@ -481,15 +481,15 @@ test("systemd settings save machine-wide and refuse an invalid slice", async ({ 
 
   await page.goto(`${serve.baseUrl}/settings/systemd`);
   await expect(enabled).not.toBeChecked();
-  await expect(slice).toHaveValue("background-aoe-{profile}.slice");
-  await slice.fill("aoe-{profile}.slice");
+  await expect(slice).toHaveValue("background-aoe-{profile}-{session}.slice");
+  await slice.fill("aoe-{profile}-{session}.slice");
   const [sliceSaved] = await Promise.all([savePatch(), slice.press("Enter")]);
   expect(sliceSaved.ok()).toBe(true);
   await expect(survive).toBeChecked();
   const [toggleSaved] = await Promise.all([savePatch(), survive.click()]);
   expect(toggleSaved.ok()).toBe(true);
   const saved = (await getJson(machineUrl)).systemd;
-  expect(saved.slice).toBe("aoe-{profile}.slice");
+  expect(saved.slice).toBe("aoe-{profile}-{session}.slice");
   expect(saved.survive_daemon_restart).toBe(false);
   expect(saved.enabled).toBe(false);
 
@@ -498,11 +498,11 @@ test("systemd settings save machine-wide and refuse an invalid slice", async ({ 
   expect(rejected.status()).toBe(400);
   expect((await rejected.json()).message).toContain("systemd.slice");
   await expect(page.getByTestId("settings-header-save-error")).toBeVisible();
-  await expect(slice).toHaveValue("aoe-{profile}.slice");
-  expect((await getJson(machineUrl)).systemd.slice).toBe("aoe-{profile}.slice");
+  await expect(slice).toHaveValue("aoe-{profile}-{session}.slice");
+  expect((await getJson(machineUrl)).systemd.slice).toBe("aoe-{profile}-{session}.slice");
 
   await serve.restart();
   await page.reload();
-  await expect(slice).toHaveValue("aoe-{profile}.slice");
+  await expect(slice).toHaveValue("aoe-{profile}-{session}.slice");
   await expect(survive).not.toBeChecked();
 });

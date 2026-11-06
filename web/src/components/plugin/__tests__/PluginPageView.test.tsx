@@ -238,6 +238,31 @@ describe("PluginPageView", () => {
     expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
   });
 
+  it("pushes context again when the modes change on an open page, with its current link", async () => {
+    h.pages = [{ ...board, deep_link: true }];
+    h.mint.mockResolvedValue(true);
+    // Opened before /api/about answered, so the page starts read-only.
+    const { rerender } = render(<Host readOnly link="one" />);
+    const frame = (await screen.findByTestId("plugin-page-frame")) as HTMLIFrameElement;
+    const { port } = fakePort();
+    const event = new MessageEvent("message", {
+      data: { aoeBridge: 1, id: "r", method: "ready", params: { nonce: new URL(frame.src).hash.slice(1) } },
+      source: frame.contentWindow,
+      origin: "null",
+    });
+    Object.defineProperty(event, "ports", { value: [port] });
+    act(() => window.dispatchEvent(event));
+    rerender(<Host readOnly link="two" />);
+    rerender(<Host readOnly={false} link="two" />);
+    // The same modes again: nothing new to tell the page.
+    rerender(<Host readOnly={false} link="two" />);
+    expect(pushes(port, "context").map((c) => [c.readOnly, c.link])).toEqual([
+      [true, "one"],
+      [false, "two"],
+    ]);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
+  });
+
   it("pushes context and theme after ready, and every later theme change", async () => {
     const { send, nonce } = await openFrame();
     const { port } = fakePort();

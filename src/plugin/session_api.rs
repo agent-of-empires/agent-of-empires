@@ -532,6 +532,7 @@ async fn admit_and_create(
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
         agent_name: None,
@@ -541,6 +542,7 @@ async fn admit_and_create(
         import_binding: None,
         fork_seed: None,
         progress: None,
+        cli: None,
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a

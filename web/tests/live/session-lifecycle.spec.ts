@@ -57,7 +57,12 @@ test.describe("ensure_session restart flow", () => {
       return result.status;
     };
 
-    // The status poller flips the seeded session to Error once it sees no tmux session.
+    expect(session!.status).toBe("Stopped");
+    expect(await ensure()).toBe("restarted");
+    expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(true);
+    expect(tmux(serve.tmuxSocket, "kill-session", "-t", tmuxName).status).toBe(0);
+
+    // Establish a real lost pane before checking Error recovery.
     await expect.poll(async () => (await listSessions(serve.baseUrl))[0]?.status, { timeout: 10_000 }).toBe("Error");
     expect(tmuxHasSession(serve.tmuxSocket, tmuxName)).toBe(false);
     expect(await ensure()).toBe("restarted");
@@ -117,7 +122,10 @@ test("SIGTERM surfaces the alert; restart() clears it and flashes reconnected", 
   const reconnectedBanner = page.getByRole("status").filter({ hasText: /reconnected/i });
   await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
   // The first successful sessions poll must land before the kill, or "Reconnected" fires early.
-  await page.waitForResponse((r) => r.url().endsWith("/api/sessions") && r.status() === 200, { timeout: 10_000 });
+  await page.waitForResponse(
+    (r) => new URL(r.url()).pathname === "/api/sessions" && r.request().method() === "GET" && r.status() === 200,
+    { timeout: 10_000 },
+  );
   await expect(alertBanner).toBeHidden();
   await expect(reconnectedBanner).toBeHidden();
 

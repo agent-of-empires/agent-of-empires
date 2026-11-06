@@ -481,6 +481,7 @@ pub(crate) const RENAME_DEADLINE: std::time::Duration =
 // container goes down.
 pub(crate) async fn run_oneshot(
     session_id: &str,
+    profile: &str,
     argv: &[String],
     cwd: &str,
     timeout: std::time::Duration,
@@ -494,6 +495,7 @@ pub(crate) async fn run_oneshot(
     // Host runs only: a container run's argv is the `docker exec` client's.
     let host = !cwd.is_empty();
     let (argv, launch_cwd) = (argv.to_vec(), cwd.to_string());
+    let (owner, profile) = (session_id.to_string(), profile.to_string());
     let prepared = tokio::task::spawn_blocking(move || {
         // Resolved once from the launch cwd; the capability probe, the scope check and the spawn
         // all use this program.
@@ -506,7 +508,7 @@ pub(crate) async fn run_oneshot(
             })
         });
         let scope = scope_if_startable(scope_id, program.as_deref(), |id| {
-            crate::process::systemd::scope_prefix_for(id, "")
+            crate::process::systemd::scope_prefix_for(id, &owner, &profile)
         });
         if let Some(program) = program {
             argv[0] = program.to_string_lossy().into_owned();
@@ -1276,7 +1278,15 @@ async fn compute_terminal_rename(
     else {
         return Ok(None);
     };
-    let Ok(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await else {
+    let Ok(raw) = run_oneshot(
+        session_id,
+        profile,
+        &target.argv,
+        &target.cwd,
+        ONESHOT_TIMEOUT,
+    )
+    .await
+    else {
         return Ok(None);
     };
     Ok(Some((reservation, sanitize_title(&raw, &baseline))))
@@ -1538,9 +1548,15 @@ mod serve {
                 .acquire()
                 .await
                 .map_err(|_| skipped("Server is shutting down"))?;
-            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT)
-                .await
-                .map_err(SmartRenameError::Failed)
+            run_oneshot(
+                &session_id,
+                &profile,
+                &target.argv,
+                &target.cwd,
+                ONESHOT_TIMEOUT,
+            )
+            .await
+            .map_err(SmartRenameError::Failed)
         })
         .await
         .map_err(|_| SmartRenameError::TimedOut)??;
@@ -1667,7 +1683,7 @@ mod serve {
         if let Err(error) = crate::server::reload::adopt_committed_profiles(
             state,
             [(profile, rows, groups)],
-            |_| false,
+            |_| None,
             &prepared.2,
             &publication,
         )
@@ -1930,7 +1946,7 @@ mod serve {
                 ),
             ];
             for (argv, want) in cases {
-                let err = run_oneshot("test-session", &argv, "", Duration::from_secs(60))
+                let err = run_oneshot("test-session", "", &argv, "", Duration::from_secs(60))
                     .await
                     .unwrap_err();
                 assert!(err.starts_with(want), "{err:?} should start with {want:?}");
@@ -3145,8 +3161,6 @@ claude = "repo-wrapper"
             None
         };
 
-        // Scoped: the injection is process-wide, so the guard must drop before
-        // the assertions that read storage back.
         {
             let _failing_writes = storage.fail_writes_for_test();
             let error = apply_terminal_title(

@@ -1233,7 +1233,7 @@
         "web/src/components/session-wizard/createFailureView.ts",
         "web/src/components/Toasts.tsx"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1252,7 +1252,7 @@
         "web/src/components/sidebar/sessionActionTargets.ts",
         "web/src/hooks/useSessions.ts"
       ],
-      "notes": "acp.structured_view = off hides the wizard toggle and the sidebar switch to structured view, including across profile changes, import exit and pin responses; terminal and structured preselect that view."
+      "notes": "acp.structured_view = auto or structured preselects structured in the wizard, while terminal preselects terminal; off hides the wizard toggle and sidebar switch to structured view, including across profile changes, import exit and pin responses."
     },
     {
       "id": "wizard.create-progress",
@@ -1949,6 +1949,27 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "sidebar.trash-on-demand",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useSessions.test.ts",
+        "src/hooks/__tests__/useOrphanSweep.test.tsx",
+        "src/hooks/useLastSessionRestore.test.tsx",
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useOrphanSweep.ts",
+        "web/src/hooks/useLastSessionRestore.ts",
+        "web/src/lib/api.ts",
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/TrashMenu.tsx"
+      ],
+      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
     },
     {
       "id": "sidebar.trash-row-context-menu",
@@ -3313,7 +3334,7 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive."
+      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive. Model search filters case-insensitively by display name and provider/model id with whitespace-separated terms. Unit tests cover empty results, pending choices, confirmed values, and reset on reopen; mocked browser tests cover search focus, Arrow/Enter selection without prompt submission, Escape/outside dismissal, and pinned search with scrollable results. Desktop and short viewports center the current model on open, reopen, and search clearing without moving the page or taking search focus. Before searching, Enter preserves the current model and arrows navigate from it; reopening after a switch reveals the newly confirmed model. Keyboard selection from the search field or from a result returns focus to the chip while pointer clicks are left alone, Escape during IME composition cancels the candidate without closing the menu, and an advertised list with no options reads as unavailable rather than as a failed search."
     },
     {
       "id": "acp.mode-switch",
@@ -3847,17 +3868,27 @@
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/QueuedPromptsStrip.test.tsx",
         "src/components/acp/SendButton.test.tsx",
-        "tests/acp-startup-wait.spec.ts"
+        "src/hooks/useRespawnSession.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "tests/acp-startup-wait.spec.ts",
+        "tests/live/acp-restart-start.spec.ts"
       ],
       "components": [
         "web/src/components/acp/startupWait.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useRespawnSession.ts",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/acp/SystemNotices.tsx",
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ],
-      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it. A running Worker never shows it while the first connection or replay loads; its disconnected Send, follow-up and queue strip copy say \"while disconnected\" instead of \"until session resumes\", and its queue strip says \"Queued\" unless a row is unconfirmed."
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it. A running Worker never shows it while the first connection or replay loads; its disconnected Send, follow-up and queue strip copy say \"while disconnected\" instead of \"until session resumes\", and its queue strip says \"Queued\" unless a row is unconfirmed. A running Worker whose session/new hasn't answered (no AcpSessionAssigned yet, even past initialize's events) keeps the line; one assigned only before the 1,000-frame replay tail (no stored id) shows no line and keeps Stop and run. Past the 30s handshake bound the line offers Restart <Agent>, which posts {} to /acp/restart and starts the count again; a failure while the line is up keeps the button and says why, and one after the restart's stop unmounted the line, or any server error, shows the reason and any stopped message on the stopped-worker banner until the next restart, assignment or prompt. While a prompt is sent, a caption under Restart says restarting stops it; while prompts are queued, it says they are sent once the Agent is ready. After Restart the line stays (the restart's own stop doesn't read as a stopped Worker) and offers Restart again if the replacement stalls too; its caption says the sent message was stopped until it is sent again, also when the restart's stop arrives before the restart answers and unmounts the line. A restart acknowledged after its replacement was assigned or failed to start doesn't hide a later Stop. Read-only and CityHall dashboards keep the elapsed line without Restart or the caption. Restart after a stalled start, and again after a stalled replacement; a prompt sent during the stall is stopped, and a resend is delivered once, counted after its turn completes."
     },
     {
       "id": "acp.queued-strip-reason",
@@ -3901,12 +3932,14 @@
       "id": "acp.startup-error-banner-actions",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-startup-error-banner.spec.ts"],
+      "specs": ["tests/acp-startup-error-banner.spec.ts", "src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
       "components": [
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/acp/adapterRecovery.ts",
         "web/src/App.tsx"
-      ]
+      ],
+      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. A retry failing with the same cause, after spawn failed: or restart spawn failed: and any reason code, reads as the same error. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -3924,6 +3957,25 @@
       "notes": "Live coverage checks authoritative /api/about policy, pre-extraction mutation refusal and dashboard shortcut suppression. Terminal policy transitions and passive consumers are exercised by terminal.live-split-composite; this live spec does not open an existing terminal."
     },
     {
+      "id": "read-only.unknown-about",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/clientCapabilities.test.ts",
+        "src/lib/__tests__/serverAbout.test.ts",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/lib/clientCapabilities.ts",
+        "web/src/lib/serverAbout.ts",
+        "web/src/components/ServerSettingsBanner.tsx",
+        "web/src/components/BannerStack.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "The dashboard asks /api/about three times before rendering its shell. With no answer, every write gate (Restart Agent, Switch to Terminal view, new-terminal buttons, new session, the readOnly props) stays hidden, a notice explains why with Retry, and the answer is asked for again on reconnect; any answer is followed. Shortcuts report ready only once the answer is in."
+    },
+    {
       "id": "ensure-session-restart",
       "kind": "live-playwright",
       "risk": "high",
@@ -3938,7 +3990,7 @@
         "src/tmux/session.rs",
         "src/tmux/mod.rs"
       ],
-      "notes": "The real daemon returns HTTP 200 and the expected restarted/alive status before and immediately after an acknowledged exact-session kill, without waiting for a cache or poller refresh. A live pane stays alive; the frontend's held ensure request keeps Starting visible until release."
+      "notes": "A deferred CLI creation starts Stopped. The real daemon starts its pane, observes Error after an acknowledged pane loss, and returns HTTP 200 with restarted/alive before and immediately after a subsequent exact-session kill without waiting for a cache or poller refresh. A live pane stays alive; the frontend's held ensure request keeps Starting visible until release."
     },
     {
       "id": "modals",

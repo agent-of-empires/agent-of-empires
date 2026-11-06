@@ -14,7 +14,8 @@ use crate::session::config::SystemdSettings;
 #[cfg(unix)]
 pub(crate) mod notify;
 
-pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}.slice";
+pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}-{session}.slice";
+const PROFILE_SLICE_TEMPLATE: &str = "background-aoe-{profile}.slice";
 const UNIT_PREFIX: &str = "aoe-session-";
 /// `systemd-run --scope` sets this for the command; wrappers restore the
 /// caller's value so the agent environment is unchanged.
@@ -140,11 +141,16 @@ fn first_time(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
-/// Expands `{profile}` in the configured template; an invalid result falls
-/// back to the default template. Warns once per process.
-pub(crate) fn resolve_slice(template: &str, profile: &str) -> String {
+/// Expands `{profile}` and `{session}` in the configured template; an invalid
+/// result falls back to the default template. Warns once per process.
+pub(crate) fn resolve_slice(template: &str, profile: &str, session_id: &str) -> String {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    let slice = template.replace("{profile}", &escape_profile(profile));
+    let expand = |template: &str| {
+        template
+            .replace("{profile}", &escape_profile(profile))
+            .replace("{session}", &escape(session_id))
+    };
+    let slice = expand(template);
     if valid_slice(&slice) {
         return slice;
     }
@@ -155,7 +161,12 @@ pub(crate) fn resolve_slice(template: &str, profile: &str) -> String {
             "invalid systemd.slice; using {DEFAULT_SLICE_TEMPLATE}"
         );
     }
-    DEFAULT_SLICE_TEMPLATE.replace("{profile}", &escape_profile(profile))
+    let default = expand(DEFAULT_SLICE_TEMPLATE);
+    if valid_slice(&default) {
+        return default;
+    }
+    // An id too long for a unit name: place the session under its profile instead.
+    expand(PROFILE_SLICE_TEMPLATE)
 }
 
 /// Parses exactly what the `memory_max` settings validator accepts: digits
@@ -296,6 +307,7 @@ pub(crate) fn scope_args(
     unit: &str,
     description: &str,
     profile: &str,
+    session_id: &str,
 ) -> Vec<String> {
     let mut a: Vec<String> = [
         "--user",
@@ -310,7 +322,7 @@ pub(crate) fn scope_args(
     .collect();
     a.push(format!(
         "--slice={}",
-        resolve_slice(&cfg.slice_template, profile)
+        resolve_slice(&cfg.slice_template, profile, session_id)
     ));
     a.push(format!("--unit={unit}"));
     a.push(format!("--description={description}"));
@@ -349,7 +361,13 @@ fn probe_with(
 ) -> Result<(), ProbeFailure> {
     let unit = format!("aoe-probe-{}-{}.scope", std::process::id(), now_ms());
     let mut argv = vec!["systemd-run".to_string()];
-    argv.extend(scope_args(cfg, &unit, "aoe capability probe", profile));
+    argv.extend(scope_args(
+        cfg,
+        &unit,
+        "aoe capability probe",
+        profile,
+        "probe",
+    ));
     argv.push("true".into());
     run(&argv)
 }
@@ -491,24 +509,49 @@ impl ScopePrefix {
     }
 }
 
-/// The prefix to run a session command in a fresh scope, or `None` when
-/// scopes are unavailable. An empty `profile` resolves to the effective
-/// profile. Blocking: the first call in a process runs the capability probe
-/// (one attempt, 5 s at most), so call it from `spawn_blocking` in async code.
-pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopePrefix> {
-    let cap = capability()?;
-    let profile = resolved_profile(profile);
-    let namespace = scope_namespace().ok()?;
-    let unit = unit_name(session_id, now_ms(), &namespace);
-    let mut argv = vec![cap.systemd_run.to_string_lossy().into_owned()];
+/// `unit_id` names and retires the scope; the slice comes from
+/// `owner_session_id`, so a helper with its own `unit_id` shares its session's slice.
+fn scope_prefix_argv(
+    systemd_run: &str,
+    cfg: &ScopeConfig,
+    unit_id: &str,
+    owner_session_id: &str,
+    profile: &str,
+    namespace: &str,
+) -> Vec<String> {
+    let mut argv = vec![systemd_run.to_string()];
     argv.extend(scope_args(
-        &cap.cfg,
-        &unit,
-        &description(session_id),
-        &profile,
+        cfg,
+        &unit_name(unit_id, now_ms(), namespace),
+        &description(unit_id),
+        &resolved_profile(profile),
+        owner_session_id,
     ));
+    argv
+}
+
+/// The prefix to run a command in a fresh scope, or `None` when scopes are
+/// unavailable. `unit_id` is the scope's own identity (a helper uses a
+/// synthetic one); the slice follows `owner_session_id` and `profile`, where an
+/// empty `profile` resolves to the effective profile. Blocking: the first call
+/// in a process runs the capability probe (one attempt, 5 s at most), so call
+/// it from `spawn_blocking` in async code.
+pub(crate) fn scope_prefix_for(
+    unit_id: &str,
+    owner_session_id: &str,
+    profile: &str,
+) -> Option<ScopePrefix> {
+    let cap = capability()?;
+    let namespace = scope_namespace().ok()?;
     Some(ScopePrefix {
-        argv,
+        argv: scope_prefix_argv(
+            &cap.systemd_run.to_string_lossy(),
+            &cap.cfg,
+            unit_id,
+            owner_session_id,
+            profile,
+            &namespace,
+        ),
         env_bin: cap.env_bin.to_string_lossy().into_owned(),
     })
 }
@@ -522,13 +565,14 @@ fn resolved_profile(profile: &str) -> String {
     }
 }
 
-/// The slice `scope_prefix_for` puts a session of `profile` in, or `None`
-/// when scopes are unavailable. Blocking on the first call.
-pub(crate) fn slice_for(profile: &str) -> Option<String> {
+/// The slice `scope_prefix_for` puts the session in, or `None` when scopes
+/// are unavailable. Blocking on the first call.
+pub(crate) fn slice_for(profile: &str, session_id: &str) -> Option<String> {
     let cap = capability()?;
     Some(resolve_slice(
         &cap.cfg.slice_template,
         &resolved_profile(profile),
+        session_id,
     ))
 }
 
@@ -1141,13 +1185,13 @@ esac
     #[test]
     fn slice_template_substitutes_escaped_profile() {
         let t = "background-aoe-{profile}.slice";
-        assert_eq!(resolve_slice(t, "main"), "background-aoe-main.slice");
+        assert_eq!(resolve_slice(t, "main", "abc"), "background-aoe-main.slice");
         assert_eq!(
-            resolve_slice(t, "my-profile"),
+            resolve_slice(t, "my-profile", "abc"),
             "background-aoe-my_2dprofile.slice"
         );
-        assert_eq!(resolve_slice(t, ""), "background-aoe-_.slice");
-        assert_eq!(resolve_slice("aoe.slice", "main"), "aoe.slice");
+        assert_eq!(resolve_slice(t, "", "abc"), "background-aoe-_.slice");
+        assert_eq!(resolve_slice("aoe.slice", "main", "abc"), "aoe.slice");
         for bad in [
             "",
             "foo",
@@ -1158,17 +1202,72 @@ esac
             "a--b.slice",
         ] {
             assert_eq!(
-                resolve_slice(bad, "main"),
-                "background-aoe-main.slice",
+                resolve_slice(bad, "main", "abc"),
+                "background-aoe-main-abc.slice",
                 "{bad:?}"
             );
         }
     }
 
     #[test]
+    fn a_helper_scope_has_its_own_unit_in_its_sessions_slice() {
+        let cfg = ScopeConfig {
+            slice_template: DEFAULT_SLICE_TEMPLATE.into(),
+            limits: Limits::default(),
+            part_of: None,
+        };
+        let argv =
+            |unit_id: &str| scope_prefix_argv("systemd-run", &cfg, unit_id, "sess", "main", "ns");
+        let flag = |argv: &[String], prefix: &str| {
+            argv.iter()
+                .find(|word| word.starts_with(prefix))
+                .cloned()
+                .unwrap()
+        };
+        let (main, helper) = (argv("sess"), argv("oneshot.sess.0"));
+        let slice = "--slice=background-aoe-main-sess.slice";
+        assert_eq!(flag(&main, "--slice="), slice);
+        assert_eq!(flag(&helper, "--slice="), slice);
+        assert!(flag(&main, "--unit=").starts_with("--unit=aoe-session-sess-ns-"));
+        assert!(flag(&helper, "--unit=").starts_with("--unit=aoe-session-oneshot."));
+    }
+
+    #[test]
+    fn an_id_too_long_for_a_unit_name_falls_back_to_the_profile_slice() {
+        let id = "a".repeat(300);
+        assert_eq!(
+            resolve_slice(DEFAULT_SLICE_TEMPLATE, "main", &id),
+            "background-aoe-main.slice"
+        );
+        assert_eq!(
+            resolve_slice("bogus", "main", &id),
+            "background-aoe-main.slice"
+        );
+    }
+
+    #[test]
+    fn default_slice_is_per_session_under_the_profile_slice() {
+        assert_eq!(
+            resolve_slice(DEFAULT_SLICE_TEMPLATE, "main", "3de822568e6d4d99"),
+            "background-aoe-main-3de822568e6d4d99.slice"
+        );
+        assert_eq!(
+            resolve_slice(DEFAULT_SLICE_TEMPLATE, "my-profile", "a-b"),
+            "background-aoe-my_2dprofile-a_2db.slice"
+        );
+        assert_eq!(
+            resolve_slice("aoe-{session}.slice", "main", "abc"),
+            "aoe-abc.slice"
+        );
+    }
+
+    #[test]
     fn bad_slice_falls_back_every_time_and_the_log_gate_fires_once() {
         for _ in 0..5 {
-            assert_eq!(resolve_slice("bogus", "main"), "background-aoe-main.slice");
+            assert_eq!(
+                resolve_slice("bogus", "main", "abc"),
+                "background-aoe-main-abc.slice"
+            );
         }
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
@@ -1238,6 +1337,7 @@ esac
             "aoe-session-abc123-1.scope",
             "aoe session abc123de",
             "main",
+            "abc123",
         );
         assert_eq!(args, want);
         let bare = ScopeConfig {
@@ -1245,7 +1345,7 @@ esac
             part_of: None,
             ..cfg
         };
-        assert_eq!(scope_args(&bare, "u.scope", "d", "main").len(), 10);
+        assert_eq!(scope_args(&bare, "u.scope", "d", "main", "abc").len(), 10);
     }
 
     #[test]
