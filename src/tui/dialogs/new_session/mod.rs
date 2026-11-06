@@ -644,6 +644,9 @@ impl NewSessionDialog {
         self.path = Input::new(path);
         if !self.extra_env_overridden {
             self.reload_config_defaults();
+        } else {
+            let config = self.resolve_config_for_path(self.selected_profile());
+            self.refresh_path_agent_config(&config);
         }
     }
 
@@ -853,12 +856,13 @@ impl NewSessionDialog {
             return;
         }
         let profile = self.selected_profile().to_string();
+        let config = self.resolve_config_for_path(&profile);
+        self.refresh_path_agent_config(&config);
         // Unknown overrides leave the toggles alone: a guess could disable a sandbox the project asks for.
         let ProjectOverridesLookup::Known(overrides) = self.resolve_overrides(&profile) else {
             return;
         };
         let host_only = self.selected_tool_host_only();
-        let config = self.resolve_config_for_path(&profile);
         if !self.worktree_dirty {
             let on = overrides
                 .as_ref()
@@ -935,6 +939,22 @@ impl NewSessionDialog {
                 profile,
                 std::path::Path::new(&path),
             )
+        }
+    }
+
+    /// A path's repo config changes the agent only through `agent_detect_as`. When it does,
+    /// re-read whether the agent can run structured and re-check the Yolo lock.
+    fn refresh_path_agent_config(&mut self, config: &crate::session::Config) {
+        if config.session.agent_detect_as == self.agent_detect_as {
+            return;
+        }
+        let was_locked = self.selected_tool_always_yolo();
+        self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.structured_capable = !self.terminal_fork()
+            && compute_structured_capable(&self.available_tools[self.tool_index], config);
+        self.apply_structured_default();
+        if self.selected_tool_always_yolo() != was_locked {
+            self.reset_yolo();
         }
     }
 
@@ -1504,6 +1524,7 @@ impl NewSessionDialog {
                 self.overrides_resolved_for = None;
                 let profile = self.selected_profile().to_string();
                 let config = self.resolve_config_for_path(&profile);
+                self.refresh_path_agent_config(&config);
                 self.seed_sandbox(&config, None);
             } else {
                 self.seed_defaults_for_path();
