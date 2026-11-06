@@ -51,10 +51,13 @@ impl AoeIngress {
     }
 
     /// A reset commit starts a new native session: its keys are fresh, frames
-    /// held for the old one are dropped, and a lost integration is restored,
-    /// matching the reducer clearing `integration_lost` on the new session.
+    /// held for the old one are dropped, its leases are released, and a lost
+    /// integration is restored, matching the reducer clearing
+    /// `integration_lost` on the new session. A lease acquired after the reset
+    /// gate checked and before the commit must not hold the new session.
     pub(super) fn session_reset(&self) {
         self.lost.store(false, Ordering::Relaxed);
+        self.leases.clear();
         self.order
             .lock()
             .expect("aoe ordering mutex poisoned")
@@ -328,5 +331,19 @@ mod tests {
             ids(i.ingest(frame("f2", json!(null)), true, 0, 0)),
             ["f2", "t"]
         );
+    }
+
+    #[test]
+    fn a_session_reset_releases_leases_taken_before_the_commit() {
+        let i = ingress(true);
+        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":60000}});
+        assert_eq!(ids(i.ingest(frame("t1", lease), true, 0, 0)), ["t1"]);
+        assert!(i.leases.working(1) && i.leases.any_live(1));
+        i.session_reset();
+        assert!(!i.leases.working(1) && !i.leases.any_live(1));
+        // The new session can still take its own.
+        let again = json!({"v":1,"key":"l2","lease":{"id":"bg2","kind":"task","ttl_ms":60000}});
+        ids(i.ingest(frame("t2", again), true, 0, 2));
+        assert!(i.leases.working(3));
     }
 }
