@@ -3041,6 +3041,7 @@
       ],
       "components": [
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
         "web/src/components/acp/backgroundAgentsContext.ts",
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
