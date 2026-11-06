@@ -186,6 +186,8 @@ export type SessionSettingOutcome =
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
+  /** Trashed rows in the whole snapshot; the list itself omits them. */
+  trashed_count?: number;
   cursor: RuntimeCursor;
 }
 
@@ -217,9 +219,11 @@ async function sessionSettingOutcome(res: Response, id: string, expectedEpoch: s
   return { outcome: "committed", mutation };
 }
 
-export async function fetchSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
+// The daemon marks these responses `no-cache` with an ETag, so the browser revalidates and an unchanged list costs
+// headers only.
+async function fetchScopedSessions(scope: "untrashed" | "trashed" | "all", signal?: AbortSignal) {
   try {
-    const res = await fetch("/api/sessions", { signal });
+    const res = await fetch(`/api/sessions?state=${scope}`, { signal });
     if (!res.ok) return null;
     const cursor = runtimeCursor(res);
     if (!cursor) return null;
@@ -227,6 +231,20 @@ export async function fetchSessions(signal?: AbortSignal): Promise<SessionsEnvel
   } catch {
     return null;
   }
+}
+
+/** The sidebar list: everything but the trash, which `fetchTrashedSessions` loads on demand. */
+export function fetchSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
+  return fetchScopedSessions("untrashed", signal);
+}
+
+export function fetchTrashedSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
+  return fetchScopedSessions("trashed", signal);
+}
+
+/** Every session in one snapshot, for callers that delete against the complete inventory. */
+export function fetchAllSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
+  return fetchScopedSessions("all", signal);
 }
 
 export interface ConversationSearchHit {
@@ -1016,6 +1034,8 @@ export interface PluginUiNotification {
    *  toast is rendered as click-to-open: a browser blocks `window.open` from an
    *  async push, so the open happens on the user's click. Always http/https. */
   href?: string;
+  /** A dashboard path to a deep-linked plugin page (`ui.notify` `link`). The toast keeps its tone and opens the path on click. */
+  link?: string;
 }
 
 /** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
@@ -1027,6 +1047,8 @@ export interface PluginPage {
   url: string;
   /** The plugin's granted capabilities; the page bridge gates on them. */
   capabilities: string[];
+  /** The page takes the `?link=` value of its dashboard URL over the bridge. Absent on older daemons. */
+  deep_link?: boolean;
 }
 
 export interface PluginUiState {

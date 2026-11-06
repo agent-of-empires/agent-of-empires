@@ -8,6 +8,7 @@ test("Stop and run on a queued /compact cancels a steerable turn; the message ro
     title: "story-stop-and-run",
     sessionFields: { clear_aliases: ["/clear"], compact_aliases: ["/compact"] },
     initialEvents: [
+      { AcpSessionAssigned: { acp_session_id: "acp-story" } },
       { PromptCapabilities: { image: true, audio: false, embedded_context: true, steering: true } },
       { UserPromptSent: { text: "Refactor the parser" } },
     ],

@@ -1,7 +1,7 @@
 //! `fs/read_text_file` and `fs/write_text_file`, which the agent delegates
 //! to aoe because aoe owns the disk.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 
@@ -105,7 +105,7 @@ pub(super) async fn handle_read_text_file(
             };
             Ok(ReadTextFileResponse::new(sliced))
         }
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -142,7 +142,7 @@ pub(super) async fn handle_write_text_file(
     .await;
     let result = match write_outcome {
         Ok(()) => Ok(WriteTextFileResponse::new()),
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",

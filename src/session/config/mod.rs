@@ -432,7 +432,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Structured view",
         widget = "select",
-        options = "off:Off,terminal:Terminal view,structured:Structured view"
+        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view"
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
@@ -1900,9 +1900,10 @@ pub enum NewSessionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredView {
+    #[default]
+    Auto,
     Off,
     Terminal,
-    #[default]
     Structured,
 }
 
@@ -3143,7 +3144,7 @@ pub struct SystemdSettings {
     #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` expands to the escaped profile name. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Systemd slice",
@@ -3910,20 +3911,8 @@ fn shell_quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
-/// string, leaving every other token exactly as the user wrote it.
-///
-/// `extra_args` is spliced into the launch command verbatim, so a model id
-/// carrying shell metacharacters aborts the whole line before the agent
-/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
-/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
-/// pane is dead at launch with nothing to show for it.
-///
-/// Quoting only the model value keeps the rest of `extra_args` usable as the
-/// caller's own argv, where shell syntax may well be intended. Untouched
-/// regions (including their original whitespace) are copied byte-for-byte
-/// rather than round-tripped through a tokenize/rejoin, which would collapse
-/// runs of whitespace elsewhere in the string.
+/// Quote model values without changing other shell words or their whitespace.
+/// Quoted text and escaped separators stay within their original argument.
 pub fn quote_model_value_in_args(args: &str) -> String {
     let mut out = String::with_capacity(args.len());
     let mut rest = args;
@@ -3935,7 +3924,36 @@ pub fn quote_model_value_in_args(args: &str) -> String {
         if rest.is_empty() {
             break;
         }
-        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut quote = None;
+        let mut escaped = false;
+        let tok_len = rest
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                if escaped {
+                    escaped = false;
+                    return None;
+                }
+                match quote {
+                    Some('\'') => {
+                        if ch == '\'' {
+                            quote = None;
+                        }
+                    }
+                    Some('"') => match ch {
+                        '"' => quote = None,
+                        '\\' => escaped = true,
+                        _ => {}
+                    },
+                    _ => match ch {
+                        '\'' | '"' => quote = Some(ch),
+                        '\\' => escaped = true,
+                        _ if ch.is_whitespace() => return Some(offset),
+                        _ => {}
+                    },
+                }
+                None
+            })
+            .unwrap_or(rest.len());
         let tok = &rest[..tok_len];
         let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
             if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
@@ -3965,7 +3983,7 @@ mod model_value_quoting_tests {
     use super::*;
 
     #[test]
-    fn only_an_unquoted_context_window_model_value_is_quoted() {
+    fn model_quoting_respects_shell_word_boundaries() {
         let cases = [
             ("--model claude-x[1m]", "--model 'claude-x[1m]'"),
             ("--model=claude-x[1m]", "--model='claude-x[1m]'"),
@@ -3984,6 +4002,18 @@ mod model_value_quoting_tests {
             ("--model \"gpt-5\"", "--model \"gpt-5\""),
             ("--flag1   --flag2", "--flag1   --flag2"),
             ("--model 'claude-x[1m]'", "--model 'claude-x[1m]'"),
+            (
+                "--append-system-prompt 'Use --model $(id) now'",
+                "--append-system-prompt 'Use --model $(id) now'",
+            ),
+            (
+                r#"--append-system-prompt "Use --model $(id) now""#,
+                r#"--append-system-prompt "Use --model $(id) now""#,
+            ),
+            (
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+            ),
             ("--model", "--model"),
             ("", ""),
         ];
@@ -4878,7 +4908,10 @@ mod tests {
     fn systemd_settings_defaults() {
         let cfg = Config::default();
         assert!(cfg.systemd.enabled);
-        assert_eq!(cfg.systemd.slice, "background-aoe-{profile}.slice");
+        assert_eq!(
+            cfg.systemd.slice,
+            "background-aoe-{profile}-{session}.slice"
+        );
         assert!(cfg.systemd.survive_daemon_restart);
         assert_eq!(cfg.systemd.memory_max, None);
         assert_eq!(cfg.systemd.tasks_max, 0);

@@ -101,28 +101,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Injected `sessions.json` write failure. Global rather than per-`Storage` so
-/// a test can arm it on a handle it still holds while the code under test
-/// writes through a backend it opened itself; every test that arms it runs
-/// serially and disarms it again.
 #[cfg(test)]
-static FAIL_WRITES_FOR_TEST: AtomicBool = AtomicBool::new(false);
+static WRITE_FAILURES_FOR_TEST: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Disarms [`FAIL_WRITES_FOR_TEST`] on drop, so an armed test can never leak
-/// the injection into the rest of the suite, since a panic unwinds through
-/// `Drop` and a bare `set(false)` after the failing call would not run.
 #[cfg(test)]
-pub(crate) struct WriteFailureGuard;
+pub(crate) struct WriteFailureGuard {
+    path: PathBuf,
+}
 
 #[cfg(test)]
 impl Drop for WriteFailureGuard {
     fn drop(&mut self) {
-        FAIL_WRITES_FOR_TEST.store(false, Ordering::SeqCst);
+        let mut failures = WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                failures.remove(&self.path);
+            }
+        }
     }
 }
 
@@ -1259,6 +1261,10 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Finalize initial readiness without replacing newer runtime activity.
+    fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,
@@ -1315,7 +1321,6 @@ pub(crate) trait SessionStore: Send + Sync {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()>;
 }
@@ -1484,10 +1489,14 @@ impl SessionStore for Storage {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
+        crate::migrations::migrate_sandbox_store_for_with(
+            id,
+            Some(crate::migrations::progress::tracing_reporter()),
+            self,
+            runtime,
+        )
     }
 
     fn managed_capture_store_is_exclusive(
@@ -1914,11 +1923,16 @@ impl Storage {
         .is_none()
     }
 
-    /// Inject `sessions.json` write failures until the guard drops; the flag is process-wide.
+    /// Fail writes through any handle for this sessions path until the guard drops.
     #[cfg(test)]
     pub(crate) fn fail_writes_for_test(&self) -> crate::session::storage::WriteFailureGuard {
-        FAIL_WRITES_FOR_TEST.store(true, Ordering::SeqCst);
-        crate::session::storage::WriteFailureGuard
+        let path = self.sessions_path.clone();
+        *WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(path.clone())
+            .or_default() += 1;
+        crate::session::storage::WriteFailureGuard { path }
     }
 
     pub fn profile(&self) -> &str {
@@ -2477,7 +2491,11 @@ impl Storage {
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if FAIL_WRITES_FOR_TEST.load(Ordering::SeqCst) {
+        if WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&self.sessions_path)
+        {
             anyhow::bail!("injected sessions write failure");
         }
 
@@ -4083,6 +4101,45 @@ mod tests {
     use crate::session::GroupTree;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn write_failure_is_scoped_to_path_across_handles_and_guards() -> Result<()> {
+        let root = tempdir()?;
+        let paths = [root.path().join("a"), root.path().join("b")];
+        for path in &paths {
+            fs::create_dir(path)?;
+        }
+        let stores = paths.map(|path| {
+            Storage::new_for_test_path("failure-isolation", path.join("sessions.json"))
+        });
+        let write = |storage: &Storage| {
+            storage.update(|rows, _| {
+                rows.push(Instance::new("persisted", "/tmp"));
+                Ok(())
+            })
+        };
+        let first = stores[0].fail_writes_for_test();
+        write(&stores[1])?;
+        let peer =
+            Storage::new_for_test_path("failure-isolation", stores[0].sessions_path().to_owned());
+        std::thread::scope(|scope| {
+            assert!(scope.spawn(|| write(&peer)).join().unwrap().is_err());
+        });
+        assert!(stores[0].load()?.is_empty());
+        let nested = peer.fail_writes_for_test();
+        let other = stores[1].fail_writes_for_test();
+        drop(first);
+        assert!(write(&peer).is_err());
+        drop(nested);
+        write(&peer)?;
+        assert!(write(&stores[1]).is_err());
+        drop(other);
+        write(&stores[1])?;
+        assert_eq!(stores[0].load()?[0].title, "persisted");
+        assert_eq!(stores[1].load()?.len(), 2);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

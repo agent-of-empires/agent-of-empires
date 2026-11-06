@@ -204,7 +204,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     }
     return r.fulfill({ status: 204 });
   });
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

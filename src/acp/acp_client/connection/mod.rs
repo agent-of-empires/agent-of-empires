@@ -16,7 +16,7 @@ mod tests;
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationScope, KillTerminalRequest, KillTerminalResponse, McpServer,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -24,7 +24,8 @@ use agent_client_protocol::schema::v1::{
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, ByteStreams, Client};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -198,7 +199,7 @@ pub(super) async fn run_connection_task<W, R>(
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
     let builder = Client
-        .builder()
+        .v1()
         .name("aoe-acp")
         .on_close({
             let control = control.clone();

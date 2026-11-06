@@ -1396,7 +1396,7 @@ pub(super) async fn resolve_mcp_servers(
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
     failure: &'static str,
-) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     let agent_key = agent_key.to_string();
     let session = session_id.to_string();
     tokio::task::spawn_blocking(move || {
@@ -1428,7 +1428,7 @@ fn resolve_mcp_layers(
     cwd: &std::path::Path,
     session_env: &[(String, String)],
     native_config_override: Option<&std::path::Path>,
-) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
     let merged = resolve_effective(agent_key, profile, cwd, session_env, native_config_override);
@@ -1610,8 +1610,8 @@ time.sleep(60)
         );
     }
 
-    fn mcp_names(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<&str> {
-        use agent_client_protocol::schema::v1::McpServer;
+    fn mcp_names(servers: &[agent_client_protocol::v1::schema::McpServer]) -> Vec<&str> {
+        use agent_client_protocol::v1::schema::McpServer;
         servers
             .iter()
             .map(|server| match server {

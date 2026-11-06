@@ -228,8 +228,8 @@ const ROWS_PRIOR_BATCH: usize = 256;
 /// Only an identified chunk before the page's first user turn can use an older marker.
 fn prior_message_marker_for_page(
     events: &[(u64, crate::acp::state::Event)],
-    lookup: impl FnOnce(u64) -> Option<crate::acp::state::Event>,
-) -> Option<crate::acp::state::Event> {
+    lookup: impl FnOnce(u64) -> Option<(u64, crate::acp::state::Event)>,
+) -> Option<(u64, crate::acp::state::Event)> {
     use crate::acp::state::Event;
     for (_, event) in events {
         match event {
@@ -252,7 +252,7 @@ fn prior_message_marker(
     session_id: &str,
     before: u64,
     batch: usize,
-) -> Option<crate::acp::state::Event> {
+) -> Option<(u64, crate::acp::state::Event)> {
     let mut cursor = before;
     loop {
         let page = store.replay_page_before(session_id, cursor, Some(batch));
@@ -266,8 +266,8 @@ fn prior_message_marker(
                     | crate::acp::state::Event::UserDiffCommentsPrompt { .. }
             )
         });
-        if let Some((_, event)) = marker {
-            return Some(event.clone());
+        if let Some((seq, event)) = marker {
+            return Some((*seq, event.clone()));
         }
         match page.last_scanned_seq {
             Some(next) if page.has_more && next < cursor => cursor = next,
@@ -308,10 +308,10 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        if let Some(prior) = prior_message_marker_for_page(&page.events, |lowest| {
+        if let Some((seq, prior)) = prior_message_marker_for_page(&page.events, |lowest| {
             prior_message_marker(&state.acp_event_store, &id, lowest, ROWS_PRIOR_BATCH)
         }) {
-            model.observe_prior(&prior);
+            model.observe_prior(seq, &prior);
         }
         for (seq, event) in &page.events {
             model.apply_event(*seq, event);
@@ -830,10 +830,13 @@ done
             let prior = prior_message_marker_for_page(&page, |before| {
                 calls += 1;
                 assert_eq!(before, 20, "{label}");
-                Some(Event::AgentMessageChunk {
-                    text: "earlier".into(),
-                    message_id: Some("m-a".into()),
-                })
+                Some((
+                    19,
+                    Event::AgentMessageChunk {
+                        text: "earlier".into(),
+                        message_id: Some("m-a".into()),
+                    },
+                ))
             });
             assert_eq!(calls, reads, "{label}");
             assert_eq!(prior.is_some(), reads == 1, "{label}");
@@ -867,11 +870,11 @@ done
         }
         assert!(matches!(
             prior_message_marker(&store, "s-chunk", 72, 8),
-            Some(Event::AgentMessageChunk { message_id: Some(id), .. }) if id == "m-a"
+            Some((1, Event::AgentMessageChunk { message_id: Some(id), .. })) if id == "m-a"
         ));
         assert!(matches!(
             prior_message_marker(&store, "s-prompt", 72, 8),
-            Some(Event::UserPromptSent { .. })
+            Some((1, Event::UserPromptSent { .. }))
         ));
         assert!(prior_message_marker(&store, "s-none", 72, 8).is_none());
     }
