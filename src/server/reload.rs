@@ -287,6 +287,11 @@ fn apply_tick_status_decision(
         // A fresh observation stamps against this generation, not the old pair.
         previous.map(|_| inst.status)
     };
+    if let Some((status, prior)) = previous.zip(tracking) {
+        if supplementary_status_can_be_reused(inst, status, prior.lifecycle_generation) {
+            inst.status = status;
+        }
+    }
     inst.live_status_baseline = baseline;
     if inst.is_trashed() {
         if let Some(live) = baseline {
@@ -317,7 +322,7 @@ fn supplementary_status_can_be_reused(row: &Instance, status: Status, generation
         && row.lifecycle_generation <= generation
         && !matches!(
             row.status,
-            Status::Stopped | Status::Creating | Status::Deleting
+            Status::Stopped | Status::Creating | Status::Deleting | Status::Error
         )
         && !matches!(
             status,
@@ -1222,6 +1227,98 @@ mod tests {
             fresh[1].detection,
             crate::session::DetectionState::default()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unchanged_screen_keeps_live_status_and_changed_screen_can_settle() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            return;
+        }
+        let mut disk = Instance::new("aoe_test_live_status", "/tmp");
+        disk.tool = "omp".into();
+        disk.status = Status::Idle;
+        let name = crate::tmux::Session::generate_name(&disk.id, &disk.title);
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &name, "sleep 300"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+        crate::tmux::test_helpers::wait_for_pane_command(&name, "sleep");
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[&name]);
+        let mut metadata = crate::tmux::PaneMetadata {
+            pane_dead: false,
+            pane_current_command: Some("sleep".into()),
+            pane_start_command_is_protected: false,
+            pane_pid: None,
+            pane_title: Some("π ⠋ Task".into()),
+            window_activity: Some(100),
+            window_size: None,
+        };
+        let plan = crate::tmux::DetectionPlan::for_manifest("", "omp", "omp").unwrap();
+        disk.detection.activity = Some(100);
+        disk.detection.captured_at = Some(101);
+        disk.detection.observation_key =
+            plan.observation_key(&crate::tmux::Observation::new("π ⠋ Task", None, true));
+        let tracking = PriorTickTracking::of(&disk);
+        let panes = std::collections::HashMap::from([(name.clone(), metadata.clone())]);
+        let mut row = disk.clone();
+        apply_tick_status_decision(
+            &mut row,
+            Some(Status::Running),
+            Some(&tracking),
+            false,
+            Some(&panes),
+        );
+        assert_eq!(row.status, Status::Running);
+        assert_eq!(row.detection.rule, Some("screen_unchanged"));
+
+        let mut failed = disk.clone();
+        failed.status = Status::Error;
+        failed.last_error = Some("launch failed".into());
+        apply_tick_status_decision(
+            &mut failed,
+            Some(Status::Running),
+            Some(&tracking),
+            false,
+            Some(&panes),
+        );
+        assert_eq!(failed.status, Status::Error);
+        assert_eq!(failed.last_error.as_deref(), Some("launch failed"));
+
+        metadata.pane_title = Some("π > Task".into());
+        let panes = std::collections::HashMap::from([(name, metadata)]);
+        let tracking = PriorTickTracking::of(&row);
+        let mut next = disk.clone();
+        next.detection = row.detection;
+        apply_tick_status_decision(
+            &mut next,
+            Some(Status::Running),
+            Some(&tracking),
+            false,
+            Some(&panes),
+        );
+        assert_eq!(next.status, Status::Running);
+        assert_eq!(next.detection.pending, Some(Status::Idle));
+        let tracking = PriorTickTracking::of(&next);
+        let mut settled = disk;
+        settled.detection = next.detection;
+        apply_tick_status_decision(
+            &mut settled,
+            Some(Status::Running),
+            Some(&tracking),
+            false,
+            Some(&panes),
+        );
+        assert_eq!(settled.status, Status::Idle);
     }
 
     fn tmux_available() -> bool {
