@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent, WorkflowRun } from "../../../lib/acpTypes";
+import type { BackgroundAgent, BackgroundShell, WorkflowRun } from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -12,8 +12,12 @@ vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedV
 const agentsMock = vi.fn<() => BackgroundAgent[]>(() => []);
 const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
+const shellsMock = vi.fn<() => BackgroundShell[]>(() => []);
+const taskOutputMock = vi.fn();
+vi.mock("../../../lib/api", () => ({ fetchTaskOutput: (...args: unknown[]) => taskOutputMock(...args) }));
 vi.mock("../../../hooks/useAcpSession", () => ({
   useBackgroundAgents: () => agentsMock(),
+  useBackgroundShells: () => shellsMock(),
   useBackgroundTasks: () => tasksMock(),
   useWorkflowRuns: () => runsMock(),
 }));
@@ -39,6 +43,57 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
     ...over,
   };
 }
+
+beforeEach(() => {
+  shellsMock.mockReturnValue([]);
+});
+
+function shell(over: Partial<BackgroundShell> = {}): BackgroundShell {
+  return { taskId: "bx1", command: "npm run dev", startedAt: null, endedAt: null, finished: false, ...over };
+}
+
+describe("BackgroundAgentsPanel shells", () => {
+  it("lists a running shell when there are no sub-agents, instead of the empty state", () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([
+      shell(),
+      shell({ taskId: "bx0", command: "make build", finished: true, endedAt: new Date().toISOString() }),
+    ]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("No background work yet");
+    expect(text).toContain("Running shells · 1");
+    expect(text).toContain("Recent shells · 1");
+    expect(text.indexOf("npm run dev")).toBeLessThan(text.indexOf("make build"));
+  });
+
+  it("shows the empty state with no agents and no shells", () => {
+    agentsMock.mockReturnValue([]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(container.textContent).toContain("No background work yet");
+  });
+
+  it("opens the command and its output", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "listening on 3000", truncated: false });
+    const { container, getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByTitle("Open command and output"));
+    await waitFor(() => expect(document.body.textContent).toContain("listening on 3000"));
+    expect(document.body.textContent).toContain("npm run dev");
+    expect(taskOutputMock).toHaveBeenCalledWith("s-1", "bx1");
+    expect(container).toBeTruthy();
+  });
+
+  it("says when the output is not available", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: false, output: "", truncated: false });
+    const { getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByTitle("Open command and output"));
+    await waitFor(() => expect(document.body.textContent).toContain("Output not available."));
+  });
+});
 
 describe("BackgroundAgentsPanel", () => {
   it("groups a workflow's agents under the run and its phases", () => {
