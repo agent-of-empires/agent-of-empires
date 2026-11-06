@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, waitForSessions } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 import { gitEnv, initWorkingRepo } from "../helpers/gitFixture";
 import { readVisibleSessionTitles, seedSessionsInRepo } from "../helpers/sidebar";
 
@@ -155,7 +155,14 @@ test("wizard starts a one-repo workspace from the setting, and attaching does no
   await wizard.getByRole("button", { name: "Back" }).click();
   await wizard.getByRole("button", { name: /Launch session/ }).click();
 
-  const [session] = await waitForSessions(serve.baseUrl);
+  // The attach refuses a session still being created.
+  let session: Awaited<ReturnType<typeof listSessions>>[number] | undefined;
+  await expect
+    .poll(async () => {
+      [session] = await listSessions(serve.baseUrl);
+      return session !== undefined && session.status !== "Creating" && !session.lifecycle_reservation;
+    })
+    .toBe(true);
   const workspaceDir = session!.project_path as string;
   expect(workspaceDir).toContain("-workspace-");
   expect(session!.workspace_repos).toHaveLength(1);
