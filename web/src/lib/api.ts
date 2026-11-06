@@ -25,6 +25,7 @@ import type {
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
+import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
 
 type Payload = Record<string, unknown>;
 
@@ -490,13 +491,16 @@ const POST_PERSIST_ERRORS = new Set(["partially_saved", "load_failed"]);
 const writeTab = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
 let writeSeq = 0;
 
+function saveOutcome({ ok, status, payload }: Reply): SaveOutcome {
+  if (ok) return "committed";
+  if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
+  return "rejected";
+}
+
 async function sendSave(url: string, init: RequestInit): Promise<SaveOutcome> {
   const headers = { ...(init.headers as Record<string, string>), "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
   try {
-    const { ok, status, payload } = await send(url, { ...init, headers });
-    if (ok) return "committed";
-    if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
-    return "rejected";
+    return saveOutcome(await send(url, { ...init, headers }));
   } catch {
     return "uncertain";
   }
@@ -1144,6 +1148,20 @@ export function updateSettings(updates: Record<string, unknown>, profile?: strin
  *  set the value a profile inherits. */
 export function updateMachineSettings(updates: Record<string, unknown>): Promise<SaveOutcome> {
   return announceOutcome(sendSave("/api/settings?layer=machine", jsonInit("PATCH", updates)));
+}
+
+/** Like `updateMachineSettings`, but reports a needed passphrase to the caller
+ *  instead of raising the global elevation prompt. */
+export async function updateMachineSettingsInline(
+  updates: Record<string, unknown>,
+): Promise<SaveOutcome | "elevation_required"> {
+  const headers = { [INLINE_ELEVATION_HEADER]: "1", "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
+  const reply = await send("/api/settings?layer=machine", jsonInit("PATCH", updates, headers)).catch(() => null);
+  if (reply?.status === 403 && stringField(reply.payload, "error") === "elevation_required")
+    return "elevation_required";
+  const outcome = reply ? saveOutcome(reply) : "uncertain";
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
 }
 
 /**
@@ -3269,4 +3287,54 @@ export async function syncSkills(options?: {
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
     };
   }
+}
+
+// --- Setup wizard ---
+
+export type SetupStepKey = "theme_telemetry" | "agents" | "project" | "worktrees" | "sandbox" | "notifications";
+
+export interface SetupStep {
+  key: SetupStepKey;
+  required: boolean;
+  /** The step's setting is actually set, wherever it was set from. */
+  configured: boolean;
+  skipped: boolean;
+}
+
+export interface SetupStatus {
+  finished: boolean;
+  /** The user left for the dashboard, so `/` stops redirecting to `/setup`. */
+  deferred: boolean;
+  banner_dismissed: boolean;
+  steps: SetupStep[];
+  tmux: boolean;
+  git: boolean;
+  access: { serve_mode: string; tunnel_url?: string };
+}
+
+export type SetupPatch = Partial<{
+  skipped_steps: SetupStepKey[];
+  finished: boolean;
+  deferred: boolean;
+  banner_dismissed: boolean;
+}>;
+
+export type ContainerRuntimeKind = "docker" | "podman" | "apple_container";
+
+export interface RuntimeStatus {
+  kind: ContainerRuntimeKind;
+  installed: boolean;
+  running: boolean;
+}
+
+export function fetchSetup(): Promise<SetupStatus | null> {
+  return fetchJson<SetupStatus>("/api/setup");
+}
+
+export function updateSetup(patch: SetupPatch): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage("/api/setup", jsonInit("PATCH", patch));
+}
+
+export function fetchSetupRuntimes(): Promise<RuntimeStatus[] | null> {
+  return fetchJson<RuntimeStatus[]>("/api/setup/runtimes");
 }
