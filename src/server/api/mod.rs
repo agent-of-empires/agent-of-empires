@@ -18,6 +18,7 @@ mod projects;
 mod queue;
 mod sandbox_image;
 pub(crate) mod sessions;
+mod setup;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
@@ -73,6 +74,7 @@ pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
     reconcile_worktree_paths, trash_sweep_interval,
 };
+pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
@@ -504,6 +506,7 @@ mod tests {
             include_str!("sandbox_image.rs"),
             &["sandbox_image_pull", "sandbox_image_dismiss"],
         ),
+        ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
         (
             "system.rs",
             include_str!("system.rs"),

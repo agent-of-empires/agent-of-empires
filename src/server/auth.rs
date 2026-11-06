@@ -1211,6 +1211,7 @@ mod tests {
             // Cosmetic UI state and the update banner grant no capability; the
             // handlers still enforce read_only.
             (Method::POST, "/api/app-state/web-tour-seen"),
+            (Method::PATCH, "/api/setup"),
             (Method::POST, "/api/app-state/dismiss-update"),
             (Method::PATCH, "/api/app-state/web-ui-state"),
             // Read-only GETs, even on settings and profile paths.
