@@ -1760,7 +1760,12 @@ impl SessionService {
                 },
                 None => SessionCaller::User,
             };
-            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            let agent_key = inst
+                .agent_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&inst.tool)
+                .to_string();
             (
                 caller,
                 agent_key,
@@ -2106,7 +2111,11 @@ impl SessionService {
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).map(|inst| {
                 (
-                    inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone()),
+                    inst.agent_name
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(&inst.tool)
+                        .to_string(),
                     inst.effective_profile(),
                     std::path::PathBuf::from(&inst.project_path),
                 )
