@@ -1448,30 +1448,23 @@ pub(crate) async fn create_session_with(
         let _idempotency_guard = _idempotency_guard;
         let _registration = registration;
         let _creation_profile = _creation_profile;
-        let result = task_state
-            .session_service
-            .create_structured_session(spec, None, None, initial_turn.as_deref())
-            .await;
-        // Logged here, not by the waiting request, which may be gone by now.
-        if let Err(e) = &result {
-            let stage = task_progress.stage();
-            if let Some(failure) = create_failure(e, stage, &task_reference) {
-                log_create_failure(e, stage, &task_reference);
-                if let Some(key) = &key {
-                    task_state.create_progress.record_failure(key, failure);
-                }
-            }
-        }
-        result
+        run_create_task(
+            task_state.session_service.create_structured_session(
+                spec,
+                None,
+                None,
+                initial_turn.as_deref(),
+            ),
+            &task_state.create_progress,
+            &task_progress,
+            key.as_deref(),
+            &task_reference,
+        )
+        .await
     })
     .await
-    .unwrap_or_else(|e| {
-        let e = anyhow::Error::new(crate::server::session_spawn::SessionBuildPanicked(
-            e.to_string(),
-        ));
-        log_create_failure(&e, progress.stage(), reference);
-        Err(e)
-    });
+    // Only a runtime shutdown cancels the task; a panic is caught inside it.
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("create task did not finish: {e}")));
 
     match created {
         Ok((outcome, _created)) => {
@@ -1563,7 +1556,42 @@ fn create_failure_response(
         failure.into_response()
     }
 }
-fn log_create_failure(
+/// Runs a create inside its detached task. A failure, a panic included, is logged and
+/// recorded here, not by the waiting request, which may be gone by now.
+pub(super) async fn run_create_task<T>(
+    create: impl std::future::Future<Output = anyhow::Result<T>>,
+    failures: &crate::server::create_progress::CreateProgressRegistry,
+    progress: &crate::server::create_progress::CreateProgress,
+    key: Option<&str>,
+    reference: &str,
+) -> anyhow::Result<T> {
+    use futures_util::FutureExt;
+    let result = match std::panic::AssertUnwindSafe(create).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            Err(anyhow::Error::new(
+                crate::server::session_spawn::SessionBuildPanicked(message.to_owned()),
+            ))
+        }
+    };
+    if let Err(e) = &result {
+        let stage = progress.stage();
+        if let Some(failure) = create_failure(e, stage, reference) {
+            log_create_failure(e, stage, reference);
+            if let Some(key) = key {
+                failures.record_failure(key, failure);
+            }
+        }
+    }
+    result
+}
+
+pub(super) fn log_create_failure(
     e: &anyhow::Error,
     stage: crate::server::create_progress::CreateStage,
     reference: &str,
@@ -1571,7 +1599,7 @@ fn log_create_failure(
     if let Some(panicked) = e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>() {
         tracing::error!(target: "http.api.sessions", %reference, ?stage, "Session creation panicked: {}", panicked.0);
     } else {
-        tracing::warn!(target: "http.api.sessions", %reference, ?stage, "Session creation failed: {}", e);
+        tracing::warn!(target: "http.api.sessions", %reference, ?stage, "Session creation failed: {:#}", e);
     }
 }
 
@@ -1585,39 +1613,35 @@ pub(super) fn create_failure(
     use crate::server::create_progress::CreateFailure;
     if e.is::<crate::server::session_spawn::CliCreationOutcomeUnknown>() {
         let code = crate::daemon::ApiErrorCode::CreateOutcomeUnknown;
-        return Some(CreateFailure {
-            status: code.status(),
-            code: code.as_str(),
-            message: "Creation finalization was not confirmed. Check the Daemon session state before creating again.".to_owned(),
+        return Some(CreateFailure::new(
+            code.status(),
+            code.as_str(),
+            "Creation finalization was not confirmed. Check the Daemon session state before creating again.",
             stage,
-            reference: reference.to_string(),
-        });
+            reference,
+        ));
     }
     if let Some(refusal) = e.downcast_ref::<crate::session::HostHookApprovalRequired>() {
         let code = crate::daemon::ApiErrorCode::AgentHooksNotApproved;
-        return Some(CreateFailure {
-            status: code.status(),
-            code: code.as_str(),
-            message: refusal.to_string(),
+        return Some(CreateFailure::new(
+            code.status(),
+            code.as_str(),
+            &refusal.to_string(),
             stage,
-            reference: reference.to_string(),
-        });
+            reference,
+        ));
     }
     if let Some(
         refusal @ crate::session::builder::structured::StructuredChoiceError::AdapterMissing(_),
     ) = e.downcast_ref::<crate::session::builder::structured::StructuredChoiceError>()
     {
-        return Some(CreateFailure {
-            status: StatusCode::BAD_REQUEST,
-            code: "acp_adapter_missing",
-            message: refusal
-                .to_string()
-                .chars()
-                .take(crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS)
-                .collect(),
+        return Some(CreateFailure::new(
+            StatusCode::BAD_REQUEST,
+            "acp_adapter_missing",
+            &refusal.to_string(),
             stage,
-            reference: reference.to_string(),
-        });
+            reference,
+        ));
     }
     // A refusal the caller corrects and resends under the same idempotency key must not
     // be frozen into the replay map: recording it would make every later attempt on that
@@ -1646,16 +1670,7 @@ pub(super) fn create_failure(
         let (code, message) = public_create_session_error(e);
         (StatusCode::BAD_REQUEST, code, message)
     };
-    Some(CreateFailure {
-        status,
-        code,
-        message: message
-            .chars()
-            .take(crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS)
-            .collect(),
-        stage,
-        reference: reference.to_string(),
-    })
+    Some(CreateFailure::new(status, code, &message, stage, reference))
 }
 
 /// `GET /api/sessions/create-progress/{key}`: stage and hook output of an
