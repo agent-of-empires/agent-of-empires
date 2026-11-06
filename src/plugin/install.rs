@@ -793,8 +793,25 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
-    ensure_approved(id, prepared.needs_consent, grant.as_ref())?;
-    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    finish_update(prepared, grant, |manifest| async move {
+        apply_node_env(&manifest).await
+    })
+    .await
+}
+
+/// Refuses an unapproved update before `provision` can fetch Node or any
+/// build runs.
+async fn finish_update<F, Fut>(
+    prepared: Prepared,
+    grant: Option<CapabilityGrant>,
+    provision: F,
+) -> Result<UpdateOutcome>
+where
+    F: FnOnce(PluginManifest) -> Fut,
+    Fut: std::future::Future<Output = NodeEnv>,
+{
+    ensure_approved(&prepared.id, prepared.needs_consent, grant.as_ref())?;
+    let node_env = provision(prepared.fetched.manifest.clone()).await;
     Ok(UpdateOutcome::Applied(apply_prepared(
         &prepared,
         grant,
@@ -1556,30 +1573,72 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn a_declined_update_is_refused_before_any_provisioning() {
+    /// Declining must neither provision Node nor build nor touch the installed
+    /// version; the approved control proves the observations are connected.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_declined_update_neither_provisions_nor_builds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = isolate_app_dir();
+        let src = tempfile::tempdir().unwrap();
+        let manifest = |version: &str, build: &str| {
+            format!(
+                "id = \"acme.upd\"\nname = \"Upd\"\nversion = \"{version}\"\napi_version = 2\n\
+                 capabilities = [\"runtime.worker\"]\n\n[runtime]\nkind = \"command\"\n\
+                 command = [\"sh\"]\nsystem = true\n{build}"
+            )
+        };
+        let manifest_path = src.path().join("aoe-plugin.toml");
+        std::fs::write(&manifest_path, manifest("0.1.0", "")).unwrap();
+        install(src.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let installed = super::super::plugins_dir().unwrap().join("acme.upd");
+        let installed_version = || {
+            Lockfile::load()
+                .unwrap()
+                .get("acme.upd")
+                .unwrap()
+                .version
+                .clone()
+        };
+
+        std::fs::write(
+            &manifest_path,
+            manifest(
+                "0.2.0",
+                "\n[[runtime.build]]\ncommand = [\"cp\", \"aoe-plugin.toml\", \"built\"]\n",
+            ),
+        )
+        .unwrap();
+        let provisioned = AtomicUsize::new(0);
+        let provision = |_: PluginManifest| {
+            provisioned.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(NodeEnv::new())
+        };
+
+        let declined = prepare_update("acme.upd").await.unwrap();
+        assert!(declined.needs_consent);
+        let err = finish_update(declined, None, provision).await.err();
+        assert!(err.is_some_and(|e| e.to_string().contains("update cancelled")));
+        assert_eq!(provisioned.load(Ordering::SeqCst), 0);
+        assert!(!installed.join("built").exists());
+        assert_eq!(installed_version(), "0.1.0");
+
+        let approved = prepare_update("acme.upd").await.unwrap();
         let grant = CapabilityGrant {
-            manifest_hash: "h".into(),
-            capabilities: vec![],
+            manifest_hash: approved.manifest_hash.clone(),
+            capabilities: approved.capabilities.clone(),
             granted_at: chrono::Utc::now(),
         };
-        let cases = [
-            (true, None, false),
-            (true, Some(&grant), true),
-            (false, None, true),
-        ];
-        for (needs_consent, grant, allowed) in cases {
-            let result = ensure_approved("acme.thing", needs_consent, grant);
-            assert_eq!(
-                result.is_ok(),
-                allowed,
-                "{needs_consent} {}",
-                grant.is_some()
-            );
-            if !allowed {
-                assert!(result.unwrap_err().to_string().contains("update cancelled"));
-            }
-        }
+        finish_update(approved, Some(grant), provision)
+            .await
+            .unwrap();
+        assert_eq!(provisioned.load(Ordering::SeqCst), 1);
+        assert!(installed.join("built").exists());
+        assert_eq!(installed_version(), "0.2.0");
     }
 
     #[test]
