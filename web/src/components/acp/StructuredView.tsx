@@ -119,6 +119,7 @@ export function StructuredView(props: Props) {
               {(ctx) => (
                 <BackgroundAgentsContext.Provider
                   value={{
+                    sessionId,
                     agents: ctx.state.backgroundAgents,
                     workflowRuns: ctx.state.workflowRuns,
                     backgroundTasks: ctx.state.backgroundTasks,

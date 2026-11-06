@@ -5,6 +5,7 @@ import { createContext, useContext, useMemo } from "react";
 import type { BackgroundAgent, WorkflowRun } from "../../lib/acpTypes";
 
 export interface BackgroundAgentsContextValue {
+  sessionId?: string;
   agents: BackgroundAgent[];
   workflowRuns?: Record<string, WorkflowRun>;
   backgroundTasks?: string[];
@@ -12,6 +13,10 @@ export interface BackgroundAgentsContextValue {
 }
 
 export const BackgroundAgentsContext = createContext<BackgroundAgentsContextValue>({ agents: [] });
+
+export function useBackgroundAgentsContextValue(): BackgroundAgentsContextValue {
+  return useContext(BackgroundAgentsContext);
+}
 
 export function useBackgroundAgentFor(toolCallId: string | undefined): BackgroundAgent | undefined {
   const { agents } = useContext(BackgroundAgentsContext);

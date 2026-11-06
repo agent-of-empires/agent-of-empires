@@ -1,16 +1,14 @@
 /* eslint-disable react-refresh/only-export-components */
 // Cards that fold several tool calls: action runs and sub-agent tasks.
 
-import { useState } from "react";
-import { Layers, Sparkles } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Layers } from "lucide-react";
 
 import { pickStr } from "../../lib/acpArgs";
-import type { BackgroundAgentStatus, ToolCall } from "../../lib/acpTypes";
+import type { ToolCall } from "../../lib/acpTypes";
 import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import {
   CardChrome,
-  HighlightedBlock,
-  PlaceholderLine,
   spanTimes,
   useToolArgs,
   useToolCardExpansion,
@@ -20,8 +18,11 @@ import {
 import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
-import { ToolErrorBody } from "./ToolErrorBody";
 import { ToolOutputMedia } from "./ToolOutputMedia";
+import { fromBackground, fromInline } from "./subagents/model";
+import { SubagentDetail } from "./subagents/SubagentDetail";
+
+export { extractTaskResult } from "./subagents/model";
 
 const ICON = "h-3.5 w-3.5";
 
@@ -100,105 +101,44 @@ export function ToolGroupCard({ items }: { items: (ToolCardProps & { kind: strin
   );
 }
 
-function useTaskDescription(tool: ToolCall) {
-  const args = useToolArgs(tool);
-  return { args, description: pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task" };
-}
-
-const ASYNC_STATUS: Record<BackgroundAgentStatus, [Status, string]> = {
-  running: ["running", "running in background"],
-  completed: ["ok", "finished in background"],
-  error: ["err", "background agent error"],
-  stalled: ["stopped", "stalled in background"],
-  detached: ["stopped", "detached"],
-};
-
 /** Async sub-agent launch, linked to its live Background agents record by
- *  tool-call id. Neutral until the first tailer event arrives. */
+ *  tool-call id. Running until the first tailer event arrives. */
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
-  const { description } = useTaskDescription(tool);
   const agent = useBackgroundAgentFor(tool.id);
   const openPane = useOpenBackgroundAgentsPane();
-
-  const [status, fallbackMeta] = agent ? ASYNC_STATUS[agent.status] : (["ok", "runs in background"] as const);
-  let metaText = fallbackMeta;
-  if (agent?.status === "running") {
-    const tools = agent.toolCount > 0 ? `${agent.toolCount} ${agent.toolCount === 1 ? "tool" : "tools"}` : null;
-    metaText = [tools, agent.lastTool].filter(Boolean).join(" · ") || fallbackMeta;
-  } else if (agent?.status === "error") {
-    metaText = agent.warning ?? fallbackMeta;
-  }
-
+  const args = useToolArgs(tool);
+  const record = useMemo(
+    () =>
+      agent
+        ? fromBackground(agent)
+        : {
+            ...fromInline(tool, undefined, []),
+            background: true,
+            prompt: pickStr(args, "prompt") ?? "",
+          },
+    [agent, tool, args],
+  );
   return (
-    <CardChrome
-      status={status}
-      neutralOnDone={!agent || agent.status === "stalled" || agent.status === "detached"}
-      icon={<Sparkles className={ICON} />}
-      label="subagent"
-      startedAt={agent?.startedAt ?? tool.started_at}
-      endedAt={agent?.endedAt ?? undefined}
-      primary={<span className="truncate">{description}</span>}
-      meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
-      expanded={false}
-      onToggle={openPane}
-      navigate={openPane !== undefined}
+    <SubagentDetail
+      record={record}
+      actions={
+        openPane && (
+          <button type="button" onClick={openPane} className="text-[11px] text-text-dim hover:text-text-secondary">
+            Open in side pane
+          </button>
+        )
+      }
     />
   );
-}
-
-/** Unwrap opencode's `<task><task_result>…</task_result></task>` report; anything else is returned verbatim. */
-export function extractTaskResult(text: string): string {
-  const match = text.trim().match(/^<task\b[^>]*>\s*<task_result\b[^>]*>([\s\S]*?)<\/task_result>\s*<\/task>$/);
-  return match ? match[1]!.trim() : text;
 }
 
 /** A sub-agent Task. With children it is Claude's linked Task; childless it is an
  *  off-protocol launch (opencode) that only reports a final result. */
 export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
-  const { args, description } = useTaskDescription(tool);
-  const hasChildren = children.length > 0;
-  const prompt = pickStr(args, "prompt");
-  const report = result ? extractTaskResult(result.text ?? "") : "";
-  // Only the parent's own error fails the header.
-  const status: Status =
-    result === undefined || children.some((c) => !c.result) ? "running" : result.kind === "tool_error" ? "err" : "ok";
-  const [open, setOpen] = useToolCardExpansion(status);
-
+  const record = useMemo(() => fromInline(tool, result, children), [tool, result, children]);
   return (
     <>
-      <CardChrome
-        status={status}
-        {...spanTimes([{ tool, result }, ...children])}
-        icon={<Sparkles className={ICON} />}
-        label="subagent"
-        primary={
-          <>
-            <span className="truncate">{description}</span>
-            {hasChildren && (
-              <span className="ml-2 text-text-dim">
-                · {children.length} {children.length === 1 ? "tool" : "tools"}
-              </span>
-            )}
-          </>
-        }
-        expanded={open}
-        onToggle={() => setOpen((v) => !v)}
-        body={
-          open &&
-          (hasChildren ? (
-            <ChildCards items={children} nested />
-          ) : (
-            <ToolErrorBody status={status} errorText={result?.text}>
-              {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
-              {status === "err" ? null : report ? (
-                <HighlightedBlock text={report} language="markdown" maxLines={20} />
-              ) : (
-                <PlaceholderLine>{status === "running" ? "Running…" : "(no result)"}</PlaceholderLine>
-              )}
-            </ToolErrorBody>
-          ))
-        }
-      />
+      <SubagentDetail record={record} />
       {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
     </>
   );

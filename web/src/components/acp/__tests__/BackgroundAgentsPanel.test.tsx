@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent, WorkflowRun } from "../../../lib/acpTypes";
@@ -120,14 +120,15 @@ describe("BackgroundAgentsPanel", () => {
         ],
       }),
     ]);
-    const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("done");
-    fireEvent.click(getAllByRole("button")[0]!);
+    fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+    fireEvent.click(getByRole("button", { name: "Activity" }));
     for (const text of [
       "do the thing",
       "claude-opus-4-8",
       "found 12 files",
-      "tools · 3",
+      "3 calls",
       "ls -la",
       "src/main.rs",
       "Grep",
@@ -156,7 +157,11 @@ describe("BackgroundAgentsPanel", () => {
     const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const stop = getByRole("button", { name: /stop/i });
     fireEvent.click(stop);
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" });
+    // ACP stops the whole session, so Stop asks first.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getByRole("alertdialog").textContent).toContain("interrupts the main agent and all 1 running sub-agent");
+    fireEvent.click(getByRole("button", { name: "Interrupt session" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" }));
     vi.unstubAllGlobals();
   });
 
@@ -169,25 +174,31 @@ describe("BackgroundAgentsPanel", () => {
     }
   });
 
-  it("opens a details modal showing the full prompt, result, and tools", () => {
+  it("opens the shared detail view with the full prompt and result, and steps between agents", () => {
     agentsMock.mockReturnValue([
       agent({
+        agentId: "a1",
+        toolCallId: "t1",
         status: "completed",
         endedAt: new Date().toISOString(),
         prompt: "a very long prompt that the narrow panel would clamp",
         result: "the complete final result text",
-        tools: [{ name: "Bash", title: "ls -la", ok: true }],
+        tools: [{ name: "Bash", title: "ls", ok: true }],
       }),
+      agent({ agentId: "a2", toolCallId: "t2", description: "Second one", status: "completed", endedAt: "2020-01-01" }),
     ]);
-    const { getByRole, getByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    fireEvent.click(getByRole("button", { name: /open full details/i }));
-    const dialog = getByRole("dialog");
-    expect(dialog.textContent).toContain("a very long prompt that the narrow panel would clamp");
-    expect(dialog.textContent).toContain("the complete final result text");
-    expect(dialog.textContent).toContain("ls -la");
-    // Closes on the X button.
-    fireEvent.click(getByRole("button", { name: /close/i }));
-    expect(() => getByText("the complete final result text")).toThrow();
+    const { getByRole, container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+    // The same Input, Activity and Output sections the inline card shows.
+    const text = container.textContent!;
+    for (const part of ["Input", "Activity", "Output", "a very long prompt", "the complete final result text"]) {
+      expect(text).toContain(part);
+    }
+    expect(text).toContain("Subagent 1 of 2");
+    fireEvent.click(getByRole("button", { name: "Next subagent" }));
+    expect(container.textContent).toContain("Subagent 2 of 2");
+    fireEvent.click(getByRole("button", { name: /All agents/ }));
+    expect(container.textContent).toContain("Background agents · 2");
   });
 });
 
@@ -201,7 +212,7 @@ describe("BackgroundAgentsPanel copy", () => {
     fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
     fireEvent.click(getByRole("button", { name: "Copy prompt" }));
     expect(writeClipboard).toHaveBeenLastCalledWith(prompt);
-    fireEvent.click(getByRole("button", { name: "Copy result" }));
+    fireEvent.click(getByRole("button", { name: "Copy report" }));
     expect(writeClipboard).toHaveBeenLastCalledWith("done");
   });
 });

@@ -745,7 +745,10 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("subagent");
     expect(container.textContent).toContain("investigate bug");
     expect(container.textContent).toContain("1 tool");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /investigate bug/ }));
+    // A done agent keeps Activity to its summary row until opened.
+    expect(container.textContent).not.toContain("x.ts");
+    fireEvent.click(getByRole("button", { name: "Activity" }));
     expect(container.textContent).toContain("x.ts");
   });
 
@@ -760,7 +763,7 @@ describe("SubagentCard", () => {
     const { container, getByRole } = render(<SubagentCard tool={tool} result={result} children={[]} />);
     expect(container.textContent).toContain("Trace clear session resets");
     expect(container.textContent).not.toContain("0 tools");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /Trace clear session resets/ }));
     expect(container.textContent).toContain("Research only, do not edit files.");
     expect(container.textContent).toContain("No files edited. Conclusion: safe.");
     expect(container.textContent).not.toContain("task_result");
@@ -787,7 +790,8 @@ describe("AsyncSubagentCard", () => {
   it("is a neutral background card before any tailer event, never leaking the launch marker", () => {
     const { container } = render(<AsyncSubagentCard tool={tool} />);
     expect(container.textContent).toContain("Map backend lifecycle");
-    expect(container.textContent).toContain("runs in background");
+    expect(container.textContent).toContain("background");
+    expect(container.textContent).toContain("running");
     expect(container.textContent).not.toMatch(/agentId|Async agent launched|internal ID/);
   });
 
@@ -802,7 +806,7 @@ describe("AsyncSubagentCard", () => {
       startedAt: new Date().toISOString(),
       endedAt: null,
       toolCount: 3,
-      tools: [],
+      tools: [{ name: "Read", title: "a.ts", ok: true }],
       lastTool: "Read",
       lastText: "scanning files",
       result: null,
@@ -813,7 +817,8 @@ describe("AsyncSubagentCard", () => {
         <AsyncSubagentCard tool={tool} />
       </BackgroundAgentsContext.Provider>,
     );
-    expect(container.textContent).toContain("3 tools · Read");
+    expect(container.textContent).toContain("1 tool");
+    expect(container.textContent).toContain("Read a.ts");
     expect(container.textContent).not.toContain("agentId");
   });
 
@@ -824,8 +829,56 @@ describe("AsyncSubagentCard", () => {
         <AsyncSubagentCard tool={tool} />
       </BackgroundAgentsContext.Provider>,
     );
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: "Open in side pane" }));
     expect(openPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SubagentCard reading", () => {
+  const manyCalls = (n: number, errorAt: number[]) =>
+    Array.from({ length: n }, (_, i) => ({
+      tool: makeToolCall({
+        id: `c${i}`,
+        kind: i % 2 ? "read" : "execute",
+        args_preview: args({ path: `f${i}.ts` }),
+      }),
+      result: errorAt.includes(i) ? makeError() : makeCompletion(),
+    }));
+
+  it("shows the whole prompt and report unclipped, each with a copy button", () => {
+    const prompt = Array.from({ length: 30 }, (_, i) => `prompt line ${i}`).join("\n\n");
+    const report = Array.from({ length: 30 }, (_, i) => `report line ${i}`).join("\n\n");
+    const tool = makeToolCall({ id: "t", name: "Task", args_preview: args({ description: "long", prompt }) });
+    const { container, getByRole } = render(
+      <SubagentCard tool={tool} result={makeCompletion({ text: report })} children={[]} />,
+    );
+    fireEvent.click(getByRole("button", { name: /long/ }));
+    expect(container.textContent).toContain("Input");
+    expect(container.textContent).toContain("Output");
+    // 59 lines: the first 40 show, the rest a step away, and the cut says how much is hidden.
+    expect(container.textContent).toContain("report line 10");
+    expect(container.textContent).not.toContain("report line 29");
+    fireEvent.click(getByRole("button", { name: /Show 19 more lines, 19 remaining/ }));
+    expect(container.textContent).toContain("report line 29");
+    fireEvent.click(getByRole("button", { name: /Show full prompt/ }));
+    expect(container.textContent).toContain("prompt line 29");
+    expect(getByRole("button", { name: "Copy prompt" })).toBeTruthy();
+    expect(getByRole("button", { name: "Copy report" })).toBeTruthy();
+  });
+
+  it("folds 54 calls but keeps both errors as rows, each fold saying no errors", () => {
+    const tool = makeToolCall({ id: "t", name: "Task", args_preview: args({ description: "big" }) });
+    const { container, getByRole } = render(
+      <SubagentCard tool={tool} result={makeCompletion()} children={manyCalls(54, [20, 40])} />,
+    );
+    fireEvent.click(getByRole("button", { name: /big/ }));
+    fireEvent.click(getByRole("button", { name: "Activity" }));
+    expect(container.querySelectorAll('[data-activity-status="err"]')).toHaveLength(2);
+    expect(container.textContent).toContain("2 errors");
+    const folds = [...container.querySelectorAll("button[aria-expanded]")].filter((b) =>
+      b.textContent?.includes("no errors"),
+    );
+    expect(folds.length).toBeGreaterThanOrEqual(3);
   });
 });
 

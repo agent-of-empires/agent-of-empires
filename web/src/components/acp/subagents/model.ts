@@ -108,7 +108,11 @@ export function fromInline(tool: ToolCall, result: ActivityRow | undefined, chil
   const failed = result?.kind === "tool_error";
   const running = result === undefined || children.some((c) => !c.result);
   const tools = children.map(inlineTool);
-  const lastEnd = tools.map((t) => t.endedAt).filter((t): t is string => !!t).sort().at(-1);
+  const lastEnd = tools
+    .map((t) => t.endedAt)
+    .filter((t): t is string => !!t)
+    .sort()
+    .at(-1);
   return {
     id: tool.id,
     description: (args && pickStr(args, "description", "_aoe_title")) ?? tool.name ?? "Subagent task",
