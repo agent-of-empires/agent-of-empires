@@ -8,7 +8,7 @@ Press `Tab` on a runnable session, or set live mode as your default so `Enter` a
 
 Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE, and the banner flashes a brief reminder on each press. To quit AoE, leave live mode first.
 
-Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Auto Live-Send On View Switch** (Interaction settings, off by default) starts the relay as soon as you switch views.
+Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Live-send when switching view** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
 A foreground pane preparation may wait behind that session's accepted access
 stamp or unread clearing. It is submitted once after the write is acknowledged
