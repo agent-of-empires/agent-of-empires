@@ -35,7 +35,7 @@ Frames are consumed in arrival order before they are mapped to events (`src/acp/
 
 ## Leases
 
-`lease: {id, kind: busy|task|compaction, op: acquire|renew|release, ttl_ms}` holds the session as working without further frames. `ttl_ms` is 1 to 3,600,000 and required for acquire and renew. A lease expires on its own, so a dead proxy drains. A live `busy` or `task` lease suppresses the silent-orphan and between-prompt watchdogs; any live lease refuses a conversation reset. Replayed history never grants a lease.
+`lease: {id, kind: busy|task|compaction, op: acquire|renew|release, ttl_ms}` holds the session as working without further frames. `ttl_ms` is 1 to 3,600,000 and required for acquire and renew. A lease expires on its own, so a dead proxy drains. A live `busy` or `task` lease suppresses the silent-orphan and between-prompt watchdogs; any live lease refuses a conversation reset. Replayed history never grants a lease, and a conversation reset releases every lease.
 
 ## Failure
 
