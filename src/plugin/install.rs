@@ -696,6 +696,13 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     })
 }
 
+fn ensure_approved(id: &str, needs_consent: bool, grant: Option<&CapabilityGrant>) -> Result<()> {
+    if needs_consent && grant.is_none() {
+        bail!("update cancelled for {id}; the previously trusted version was kept");
+    }
+    Ok(())
+}
+
 fn apply_prepared(
     prepared: &Prepared,
     grant: Option<CapabilityGrant>,
@@ -704,9 +711,7 @@ fn apply_prepared(
 ) -> Result<InstallReport> {
     let id = prepared.id.as_str();
     let final_dir = super::plugins_dir()?.join(id);
-    if prepared.needs_consent && grant.is_none() {
-        bail!("update cancelled for {id}; the previously trusted version was kept");
-    }
+    ensure_approved(id, prepared.needs_consent, grant.as_ref())?;
     log.line(&format!(
         "updating {id} to {}",
         prepared.fetched.manifest.version
@@ -788,6 +793,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
+    ensure_approved(id, prepared.needs_consent, grant.as_ref())?;
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     Ok(UpdateOutcome::Applied(apply_prepared(
         &prepared,
@@ -1548,6 +1554,32 @@ mod tests {
             "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{aoe}"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn a_declined_update_is_refused_before_any_provisioning() {
+        let grant = CapabilityGrant {
+            manifest_hash: "h".into(),
+            capabilities: vec![],
+            granted_at: chrono::Utc::now(),
+        };
+        let cases = [
+            (true, None, false),
+            (true, Some(&grant), true),
+            (false, None, true),
+        ];
+        for (needs_consent, grant, allowed) in cases {
+            let result = ensure_approved("acme.thing", needs_consent, grant);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{needs_consent} {}",
+                grant.is_some()
+            );
+            if !allowed {
+                assert!(result.unwrap_err().to_string().contains("update cancelled"));
+            }
+        }
     }
 
     #[test]
