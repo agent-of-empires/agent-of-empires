@@ -2670,6 +2670,24 @@ pub(super) fn validate_managed_arguments(
                     "-nc",
                 ],
             ),
+            "pi" => (
+                &[
+                    "--model",
+                    "--thinking",
+                    "-m",
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--agent",
+                    "--session-dir",
+                ],
+                &[
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "--allow-all-tools",
+                    "--trust-all-tools",
+                    "--verbose",
+                ],
+            ),
             _ => (
                 &[
                     "--model",
@@ -4148,6 +4166,24 @@ mod tests {
             assert!(
                 validate_managed_arguments(agent, &[String::from("--verbose=x")]).is_err(),
                 "{name} must refuse a valued verbosity override"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_thinking_option_is_accepted_for_pi_only() {
+        for (name, arguments, allowed) in [
+            ("pi", "--model x --thinking medium", true),
+            ("pi", "--thinking=medium", true),
+            ("pi", "--thinking", false),
+            ("kimi", "--thinking medium", false),
+        ] {
+            let agent = crate::agents::get_agent(name).unwrap();
+            let words = shell_words::split(arguments).unwrap();
+            assert_eq!(
+                validate_managed_arguments(agent, &words).is_ok(),
+                allowed,
+                "{name}: {arguments}"
             );
         }
     }
