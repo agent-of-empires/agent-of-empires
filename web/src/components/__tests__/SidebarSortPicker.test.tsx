@@ -3,6 +3,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 
+import { createRef } from "react";
+import { ContextMenu } from "../ContextMenu";
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import type { Workspace } from "../../lib/types";
@@ -73,36 +75,70 @@ describe("SidebarSortPicker", () => {
   });
 
   // #5345: the window listener that clears the sidebar selection on Escape ran after Sort's dismissal.
-  it("Escape closes Sort and keeps the sidebar selection; the next Escape clears it", () => {
-    const workspaces = [{ id: "a" }, { id: "b" }, { id: "c" }] as Workspace[];
-    const { result } = renderHook(() =>
-      useSidebarSelection({
-        allWorkspaces: workspaces,
-        orderedIds: ["a", "b", "c"],
-        triage: {} as Parameters<typeof useSidebarSelection>[0]["triage"],
-        activeId: null,
-        onSelect: vi.fn(),
-      }),
-    );
-    const ctrlClick = { metaKey: false, ctrlKey: true, shiftKey: false } as React.MouseEvent;
-    act(() => result.current.handleRowActivate("a", ctrlClick, null));
-    act(() => result.current.handleRowActivate("b", ctrlClick, null));
-    const selected = () => ["a", "b", "c"].filter((id) => result.current.isSelected(id));
-    expect(selected()).toEqual(["a", "b"]);
+  it("Escape that closes a popup keeps the sidebar selection; the next Escape clears it", () => {
+    let closedMenu = () => false;
+    // (popup, open it and return the element Escape is pressed on, whether it closed)
+    const cases: [string, () => HTMLElement, () => boolean][] = [
+      [
+        "Sort",
+        () => {
+          setup();
+          fireEvent.click(trigger());
+          return option("manual");
+        },
+        () => menu() === null,
+      ],
+      // The row context menu already marks its Escape handled (ContextMenu.tsx).
+      [
+        "row context menu",
+        () => {
+          const onClose = vi.fn();
+          const Menu = () => (
+            <ContextMenu
+              menu={{ x: 0, y: 0 }}
+              menuRef={createRef<HTMLDivElement>()}
+              testId="row-menu"
+              onClose={onClose}
+            >
+              <button type="button">Rename</button>
+            </ContextMenu>
+          );
+          render(<Menu />);
+          closedMenu = () => onClose.mock.calls.length === 1;
+          return screen.getByRole("button", { name: "Rename" });
+        },
+        () => closedMenu(),
+      ],
+    ];
+    for (const [popup, open, closed] of cases) {
+      const workspaces = [{ id: "a" }, { id: "b" }, { id: "c" }] as Workspace[];
+      const { result } = renderHook(() =>
+        useSidebarSelection({
+          allWorkspaces: workspaces,
+          orderedIds: ["a", "b", "c"],
+          triage: {} as Parameters<typeof useSidebarSelection>[0]["triage"],
+          activeId: null,
+          onSelect: vi.fn(),
+        }),
+      );
+      const ctrlClick = { metaKey: false, ctrlKey: true, shiftKey: false } as React.MouseEvent;
+      act(() => result.current.handleRowActivate("a", ctrlClick, null));
+      act(() => result.current.handleRowActivate("b", ctrlClick, null));
+      const selected = () => ["a", "b", "c"].filter((id) => result.current.isSelected(id));
+      expect(selected(), popup).toEqual(["a", "b"]);
+      // The global Escape shortcut still sees both presses.
+      const onEscape = vi.fn();
+      renderHook(() => useKeyboardShortcuts(() => ({ onEscape }) as unknown as ShortcutActions));
 
-    // The global Escape shortcut still sees both presses.
-    const onEscape = vi.fn();
-    renderHook(() => useKeyboardShortcuts(() => ({ onEscape }) as unknown as ShortcutActions));
+      fireEvent.keyDown(open(), { key: "Escape" });
+      expect(closed(), popup).toBe(true);
+      expect(selected(), popup).toEqual(["a", "b"]);
+      expect(onEscape, popup).toHaveBeenCalledTimes(1);
 
-    setup();
-    fireEvent.click(trigger());
-    fireEvent.keyDown(option("manual"), { key: "Escape" });
-    expect(menu()).toBeNull();
-    expect(selected()).toEqual(["a", "b"]);
-    expect(onEscape).toHaveBeenCalledTimes(1);
-
-    fireEvent.keyDown(document.body, { key: "Escape" });
-    expect(selected()).toEqual([]);
-    expect(onEscape).toHaveBeenCalledTimes(2);
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      expect(selected(), popup).toEqual([]);
+      expect(onEscape, popup).toHaveBeenCalledTimes(2);
+      cleanup();
+    }
   });
 });
