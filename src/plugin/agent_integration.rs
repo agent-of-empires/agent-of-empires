@@ -250,16 +250,15 @@ fn eligible(instance: &Instance) -> bool {
         )
 }
 
-pub fn configured(instance: &Instance) -> bool {
-    configured_for(instance, false)
+/// Whether an approved integration owns this session's status. Ownership is read
+/// through `tool`, the detection identity the poll derives for the pane, so a
+/// custom tool aliased to a provider tool reads that provider's report.
+pub fn status_configured(instance: &Instance, tool: &str) -> bool {
+    eligible(instance) && status_owned(tool)
 }
 
 /// Whether an approved integration owns replies, even when its report is unavailable.
 pub fn replies_configured(instance: &Instance) -> bool {
-    configured_for(instance, true)
-}
-
-fn configured_for(instance: &Instance, replies: bool) -> bool {
     eligible(instance)
         && super::registry().active().any(|plugin| {
             plugin
@@ -271,20 +270,28 @@ fn configured_for(instance: &Instance, replies: bool) -> bool {
                     .manifest
                     .agent_integrations
                     .iter()
-                    .any(|entry| entry.tool == instance.tool && (!replies || entry.replies))
+                    .any(|entry| entry.tool == instance.tool && entry.replies)
         })
 }
 
-/// Return a fresh verified provider snapshot when available.
+/// Return a fresh verified provider snapshot for the session's own tool.
 pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
+    provider_snapshot(instance, &instance.tool)
+}
+
+/// The provider snapshot that owns this session's status, read through the same
+/// detection identity as its configured rules and status ownership.
+pub fn status_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrationSnapshot> {
+    provider_snapshot(instance, tool)
+}
+
+fn provider_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrationSnapshot> {
     if !eligible(instance) {
         return None;
     }
     let registry = super::registry();
-    let plugin = provider(&registry, &instance.tool).ok()??;
-    read_report(&instance.id, &instance.tool, plugin)
-        .ok()
-        .flatten()
+    let plugin = provider(&registry, tool).ok()??;
+    read_report(&instance.id, tool, plugin).ok().flatten()
 }
 
 pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::Status {
@@ -402,7 +409,8 @@ fn declared_agent_in(
     resolved
 }
 
-/// Whether an approved provider integration owns status for `tool`.
+/// Whether an approved provider integration owns status for `tool`, the
+/// effective detection identity of the session.
 pub(crate) fn status_owned(tool: &str) -> bool {
     let registry = super::registry();
     let owned = registry.active().any(|plugin| {
@@ -1892,5 +1900,64 @@ deny = [{ kind = "literal", value = "n" }]
         let mut changed = snapshot();
         changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
+    }
+
+    /// A custom tool aliased to a provider-owned tool must read that provider's
+    /// report rather than fail closed on the missing report.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn aliased_custom_tool_reads_the_owning_provider_report() {
+        const PROFILE: &str = "alias-status-ownership";
+        let (_base, _base_path, _hook_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        install_test_integration("acme.alias-provider", "acme-provider");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("my-acme".into(), "acme-provider".into());
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+        let _registry = super::super::reload_registry();
+
+        let mut instance = Instance::new("alias-status-test", "/tmp");
+        instance.tool = "my-acme".into();
+        instance.source_profile = PROFILE.into();
+        instance.status = crate::session::Status::Running;
+
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        report.status = AgentIntegrationStatus::Waiting;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.alias-provider.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+
+        // Polling derives the detection identity from the alias, and that is the
+        // identity that owns status and selects the snapshot.
+        let identity = crate::tmux::status_rules::detection_tool(PROFILE, &instance.tool, "");
+        assert_eq!(identity, "acme-provider");
+        assert!(status_owned(&identity));
+        assert!(
+            !status_owned(&instance.tool),
+            "the custom name owns nothing"
+        );
+        assert!(status_configured(&instance, &identity));
+        assert_eq!(
+            status_snapshot(&instance, &identity).map(|snapshot| snapshot.status),
+            Some(AgentIntegrationStatus::Waiting)
+        );
+        assert!(!status_configured(&instance, &instance.tool));
+        assert!(status_snapshot(&instance, &instance.tool).is_none());
     }
 }
