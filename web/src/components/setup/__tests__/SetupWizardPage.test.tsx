@@ -41,7 +41,13 @@ const status = (configured: SetupStepKey[] = []): SetupStatus => ({
   tmux: true,
   git: true,
   access: { serve_mode: "local" },
-  steps: KEYS.map((key) => ({ key, required: key === "agents", configured: configured.includes(key), skipped: false })),
+  steps: KEYS.map((key) => ({
+    key,
+    required: key === "agents",
+    configured: configured.includes(key),
+    confirmed: false,
+    skipped: false,
+  })),
 });
 
 function renderPage(current: SetupStatus, entry = "/setup") {
@@ -74,15 +80,15 @@ it("Finish sends the user back to the open required step instead of finishing", 
   fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
   expect(await screen.findByRole("alert")).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
-  expect(patches).toEqual([]);
+  expect(patches).not.toContainEqual({ finished: true });
   expect(onLeave).not.toHaveBeenCalled();
 });
 
-it("Finish marks setup finished once Agents is configured", async () => {
+it("Finish keeps the last step's defaults and marks setup finished once Agents is configured", async () => {
   const { onLeave } = renderPage(status(["agents"]), "/setup?step=notifications");
   fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
   await waitFor(() => expect(onLeave).toHaveBeenCalled());
-  expect(patches).toEqual([{ finished: true }]);
+  expect(patches).toEqual([{ confirmed_steps: ["notifications"] }, { finished: true }]);
 });
 
 it("Go to dashboard defers setup so / stops redirecting", async () => {

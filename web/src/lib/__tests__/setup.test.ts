@@ -12,7 +12,14 @@ function status(over: Partial<SetupStatus> = {}, steps: Partial<Record<SetupStep
     tmux: true,
     git: true,
     access: { serve_mode: "local" },
-    steps: KEYS.map((key) => ({ key, required: key === "agents", configured: false, skipped: false, ...steps[key] })),
+    steps: KEYS.map((key) => ({
+      key,
+      required: key === "agents",
+      configured: false,
+      confirmed: false,
+      skipped: false,
+      ...steps[key],
+    })),
     ...over,
   } satisfies SetupStatus;
 }

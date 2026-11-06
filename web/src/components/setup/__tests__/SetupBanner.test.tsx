@@ -9,6 +9,7 @@ const step = (key: SetupStep["key"], over: Partial<SetupStep> = {}): SetupStep =
   key,
   required: false,
   configured: false,
+  confirmed: false,
   skipped: false,
   ...over,
 });
