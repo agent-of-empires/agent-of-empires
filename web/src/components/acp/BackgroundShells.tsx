@@ -194,6 +194,8 @@ function ShellDetailModal({
                 {out.truncated && <span className="text-text-dim">Showing the end of a long output.</span>}
                 <pre
                   ref={preRef}
+                  tabIndex={0}
+                  aria-label="Shell output"
                   className={`max-h-[50vh] overflow-auto rounded border border-surface-700 bg-surface-900/40 p-2 font-mono text-text-secondary ${wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre"}`}
                 >
                   {out.output || "(no output yet)"}
