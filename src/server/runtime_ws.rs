@@ -1209,6 +1209,7 @@ mod tests {
         let response = super::super::api::list_sessions(
             axum::extract::State(state.clone()),
             axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);

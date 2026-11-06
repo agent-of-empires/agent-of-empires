@@ -26,7 +26,7 @@ export async function mockStructuredSessionApis(page: Page, opts: { id: string; 
   for (const path of BOOT_PATHS) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: OBJECT_PATHS.has(path) ? {} : [] }));
   }
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

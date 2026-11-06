@@ -83,6 +83,8 @@ describe("SessionConfigControls", () => {
     ]);
     expect(screen.queryByRole("radiogroup")).toBeNull();
     expect(byId("effort")).toBeTruthy();
+    fireEvent.click(byId("effort")!);
+    expect(screen.queryByRole("textbox", { name: "Search models" })).toBeNull();
   });
 
   it("toggles the model menu aria state and sends the option value", () => {
@@ -99,10 +101,103 @@ describe("SessionConfigControls", () => {
   });
 
   it("disables only the pending option", () => {
-    mount([MODEL], { configId: "model", value: "claude-sonnet-4-6" });
+    const { onSetConfigOption } = mount([MODEL], { configId: "model", value: "claude-sonnet-4-6" });
     fireEvent.click(byId("model")!);
     expect((byId("model-value-claude-sonnet-4-6") as HTMLButtonElement).disabled).toBe(true);
     expect((byId("model-value-claude-opus-4-7") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), { target: { value: "Sonnet" } });
+    fireEvent.click(byId("model-value-claude-sonnet-4-6")!);
+    expect(onSetConfigOption).not.toHaveBeenCalled();
+    expect(byId("model")!.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("filters by model name and provider/model id, sends the advertised value, and resets on reopen", () => {
+    const models: ConfigOptionDescriptor = {
+      ...MODEL,
+      options: [
+        ...MODEL.options,
+        { value: "stepcode-openai/gpt-6.1-sol-sys-paygo", name: "GPT 6.1 Sol" },
+        { value: "stepcode/deepseek-v4-flash-wandb", name: "DeepSeek V4 Flash" },
+      ],
+    };
+    const { onSetConfigOption } = mount([models]);
+    fireEvent.click(byId("model")!);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    for (const [query, values] of [
+      ["sOnNeT", ["claude-sonnet-4-6"]],
+      ["  STEPCODE-OPENAI   sol  ", ["stepcode-openai/gpt-6.1-sol-sys-paygo"]],
+      ["deepseek-v4", ["stepcode/deepseek-v4-flash-wandb"]],
+      ["no-such-model", []],
+      ["   ", models.options.map((opt) => opt.value)],
+    ] as const) {
+      fireEvent.change(search, { target: { value: query } });
+      const items = screen.queryAllByRole("menuitem");
+      expect(items.map((item) => item.getAttribute("data-testid"))).toEqual(
+        values.map((value) => `config-option-model-value-${value}`),
+      );
+      expect(screen.queryByRole("status") !== null).toBe(values.length === 0);
+      expect(onSetConfigOption).not.toHaveBeenCalled();
+    }
+    fireEvent.change(search, { target: { value: "stepcode-openai" } });
+    fireEvent.click(byId("model-value-stepcode-openai/gpt-6.1-sol-sys-paygo")!);
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "stepcode-openai/gpt-6.1-sol-sys-paygo");
+    expect(byId("model")!.textContent).toContain("Claude Opus 4.7");
+    fireEvent.click(byId("model")!);
+    expect((screen.getByRole("textbox", { name: "Search models" }) as HTMLInputElement).value).toBe("");
+    expect(screen.getAllByRole("menuitem")).toHaveLength(models.options.length);
+  });
+
+  // Selecting unmounts whatever held focus, so keyboard paths hand it back to the chip (#4894).
+  it("returns focus to the chip after keyboard selection and leaves pointer clicks alone", () => {
+    const { onSetConfigOption } = mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: "sonnet" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
+    expect(document.activeElement).toBe(chip);
+    // A pointer click reports its click count; focus keeps following the browser's own rules.
+    fireEvent.click(chip);
+    const sonnet = byId("model-value-claude-sonnet-4-6") as HTMLButtonElement;
+    sonnet.focus();
+    fireEvent.click(sonnet, { detail: 1 });
+    expect(document.activeElement).not.toBe(chip);
+  });
+
+  it("keeps the picker open when Escape cancels an IME composition", () => {
+    mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.keyDown(search, { key: "Escape", isComposing: true });
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(chip);
+  });
+
+  // Safari ends the composition first, so the committing key arrives as keyCode 229 with isComposing false.
+  it("ignores a composition-committing key that only reports keyCode 229", () => {
+    const { onSetConfigOption } = mount([MODEL]);
+    const chip = byId("model")!;
+    fireEvent.click(chip);
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: "sonnet" } });
+    fireEvent.keyDown(search, { key: "Enter", keyCode: 229 });
+    expect(onSetConfigOption).not.toHaveBeenCalled();
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    // The real Enter that follows still selects.
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
+  });
+
+  it("distinguishes an advertised model list with no options from a search with no matches", () => {
+    mount([{ ...MODEL, options: [] }]);
+    fireEvent.click(byId("model")!);
+    expect(screen.getByRole("status").textContent).toBe("No models available.");
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), { target: { value: "opus" } });
+    expect(screen.getByRole("status").textContent).toBe("No models match your search.");
   });
 
   // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible (#3747).
@@ -217,6 +312,7 @@ describe("provider picker", () => {
     const onSet = vi.fn();
     mount([], null, vi.fn(), { current: "api", onSet });
     fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    expect(screen.queryByRole("textbox", { name: "Search models" })).toBeNull();
     fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
     expect(onSet).toHaveBeenCalledWith("vertex");
   });

@@ -4,6 +4,43 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.22.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.1) - 2026-11-06
+
+
+
+### Bug Fixes
+
+- **web:** Stop retrying an unknown profile's agent list and key the list by profile in [#5279](https://github.com/agent-of-empires/agent-of-empires/pull/5279) by [@klubrake](https://github.com/klubrake) ([`259bdfb`](https://github.com/agent-of-empires/agent-of-empires/commit/259bdfb5527b687c608bec3413716b8f3ec7c5de))
+- **tui:** Keep hidden shortcut bar stable on ctrl-c in [#5378](https://github.com/agent-of-empires/agent-of-empires/pull/5378) by [@a81x](https://github.com/a81x) ([`402e345`](https://github.com/agent-of-empires/agent-of-empires/commit/402e3459b2e9e3dc54bf0880b15d08b93c51c8c3))
+- **web:** Hide write actions until /api/about answers, with a Retry notice in [#5375](https://github.com/agent-of-empires/agent-of-empires/pull/5375) by [@klubrake](https://github.com/klubrake) ([`431387c`](https://github.com/agent-of-empires/agent-of-empires/commit/431387c0318e1421a3e5dd49449fc9c9c192da5a))
+- **acp:** Settle tools opened before cursor attachment in [#5182](https://github.com/agent-of-empires/agent-of-empires/pull/5182) by [@jerome-benoit](https://github.com/jerome-benoit) ([`eea79f9`](https://github.com/agent-of-empires/agent-of-empires/commit/eea79f97ae471b3240c8daae98cfe33fb684086f))
+- **server,web:** Classify always-Yolo by the view a session runs in in [#5367](https://github.com/agent-of-empires/agent-of-empires/pull/5367) by [@klubrake](https://github.com/klubrake) ([`64cd7b9`](https://github.com/agent-of-empires/agent-of-empires/commit/64cd7b914bf86859c529cbbed433972dfa36127e))
+
+
+### Features
+
+- **plugin:** Deep links into plugin pages via ?link= and notification link in [#5119](https://github.com/agent-of-empires/agent-of-empires/pull/5119) by [@cwrau](https://github.com/cwrau) ([`8c10201`](https://github.com/agent-of-empires/agent-of-empires/commit/8c10201e216466a07141abd60536cfdc58d3ecfb))
+- **cli:** Create sessions through the daemon in [#5165](https://github.com/agent-of-empires/agent-of-empires/pull/5165) by [@jerome-benoit](https://github.com/jerome-benoit) ([`ac8ff73`](https://github.com/agent-of-empires/agent-of-empires/commit/ac8ff731f1fcbd1af010bb52fa5aecb900d8fd86))
+- **web:** Search models and reveal the current selection in [#4894](https://github.com/agent-of-empires/agent-of-empires/pull/4894) by [@kaimo455](https://github.com/kaimo455) ([`2665f2e`](https://github.com/agent-of-empires/agent-of-empires/commit/2665f2e6c39fb0a10764b419845ad3cac4d622bc))
+- **web:** Restart a Structured view start in progress from the dashboard in [#5282](https://github.com/agent-of-empires/agent-of-empires/pull/5282) by [@klubrake](https://github.com/klubrake) ([`1006a3b`](https://github.com/agent-of-empires/agent-of-empires/commit/1006a3b3b52fdf84759c48e90f08d0340ac3f839))
+- **sessions:** Accept a parent on HTTP create, and expose the create and capture paths in [#5244](https://github.com/agent-of-empires/agent-of-empires/pull/5244) by [@klubrake](https://github.com/klubrake) ([`f1708c9`](https://github.com/agent-of-empires/agent-of-empires/commit/f1708c92d1c1ae4d663010b5679e9b469cf7b4d0))
+- **systemd:** Give every session its own slice under its profile slice in [#5124](https://github.com/agent-of-empires/agent-of-empires/pull/5124) by [@cwrau](https://github.com/cwrau) ([`bbe8e66`](https://github.com/agent-of-empires/agent-of-empires/commit/bbe8e66627a7023e67dc44f631f53d827f33e51a))
+- **acp:** Default structured_view to auto in [#5424](https://github.com/agent-of-empires/agent-of-empires/pull/5424) by [@Copilot](https://github.com/Copilot) ([`1241fda`](https://github.com/agent-of-empires/agent-of-empires/commit/1241fdadddcb8680642667c8a7e8bb99f545bd8b))
+
+
+### Performance
+
+- **server:** Compress /api JSON responses with gzip and zstd in [#5356](https://github.com/agent-of-empires/agent-of-empires/pull/5356) by [@cwrau](https://github.com/cwrau) ([`d64e705`](https://github.com/agent-of-empires/agent-of-empires/commit/d64e7058e3cc8cd2b2b9a135c0c9003f8d1c44d7))
+- **web:** Revalidate session and plugin polls and load trash on demand in [#5355](https://github.com/agent-of-empires/agent-of-empires/pull/5355) by [@cwrau](https://github.com/cwrau) ([`9a187af`](https://github.com/agent-of-empires/agent-of-empires/commit/9a187af0091280ba90c8f6b695ee49983d194c80))
+
+
+
+### New Contributors
+
+- [@Copilot](https://github.com/Copilot) made their first contribution in [#5424](https://github.com/agent-of-empires/agent-of-empires/pull/5424)
+- [@kaimo455](https://github.com/kaimo455) made their first contribution in [#4894](https://github.com/agent-of-empires/agent-of-empires/pull/4894)
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.22.0...v1.22.1
 ## [1.22.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.0) - 2026-11-05
 
 

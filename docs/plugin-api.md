@@ -475,7 +475,7 @@ Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.lis
 
 The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
 
-- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion", "link" }`. `link` is the page's [deep link](#deep-links) value, or `null`; hosts without deep links omit it.
+- `context`, after `ready`, and again whenever `readOnly` or `cityhall` changes while the page is open (for example once the dashboard learns the server is writable): `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion", "link" }`. `link` is the page's [deep link](#deep-links) value, or `null`; hosts without deep links omit it.
 - `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
 - `selection`, after `ready` and whenever it changes: `{ "sessionId" }`, the session split view shows below the page, or `null`.
 - `link`, whenever the deep link changes while the page is open: `{ "link" }`, the new value or `null`.

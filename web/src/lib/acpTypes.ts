@@ -562,6 +562,17 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** `session/new` or `session/load` answered, so the Agent's session exists. */
+  sessionAssigned: boolean;
+  /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
+  restartInFlight: boolean;
+  /** Counts restarts ended by assignment, startup error or another stop, so a late acknowledgement is ignored. */
+  restartEpoch: number;
+  /** A restart stopped the sent prompt and it hasn't been sent again. Kept here because the restart's stop
+   *  unmounts the startup line before the restart answers. Not persisted. */
+  restartStoppedSent: boolean;
+  /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
+  restartFailure: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -903,6 +914,11 @@ export function emptyAcpState(): AcpState {
     activity: [],
     optimisticRows: [],
     lastSeq: 0,
+    sessionAssigned: false,
+    restartInFlight: false,
+    restartEpoch: 0,
+    restartStoppedSent: false,
+    restartFailure: null,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1119,8 +1135,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
       next.rateLimit = null;
     }
+    // A restart stops the old Worker as `user_stopped`; any other stop ends the restart.
+    if (event.Stopped.reason !== "user_stopped") endRestart(next);
     if (event.Stopped.reason === "user_stopped") {
-      next.workerStopped = true;
+      next.workerStopped = !state.restartInFlight;
       next.workerRestarting = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = false;
@@ -1157,6 +1175,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
+    endRestart(next);
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1177,6 +1196,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("UserPromptSent" in event) {
+    next.restartStoppedSent = false;
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
@@ -1202,6 +1222,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("AcpSessionAssigned" in event) {
+    next.sessionAssigned = true;
+    endRestart(next);
     next.startupError = null;
     next.lastError = null;
     next.incompatibleAgent = null;
@@ -1375,6 +1397,12 @@ function closeWorkflowRun(
 ): Record<string, WorkflowRun> {
   const key = Object.keys(runs).find((k) => runs[k]!.taskId === taskId && !runs[k]!.finished);
   return key ? { ...runs, [key]: { ...runs[key]!, finished: true, endedAt } } : runs;
+}
+
+function endRestart(next: AcpState): void {
+  next.restartInFlight = false;
+  next.restartEpoch += 1;
+  next.restartFailure = null;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */

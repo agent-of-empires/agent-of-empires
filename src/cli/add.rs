@@ -368,6 +368,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         callback_url: None,
         idempotency_key: Some(key.clone()),
         retry_origin: None,
+        // The CLI names its parent by selector in `cli.parent`, resolved on the Daemon host.
+        parent_session_id: None,
         cli: Some(CliCreationOptions {
             parent: args.parent,
             projects: args.projects,

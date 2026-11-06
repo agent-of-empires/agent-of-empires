@@ -48,7 +48,7 @@ test.describe("Command palette", () => {
 
   test("opens from within a focused input", async ({ page }) => {
     // The wizard needs a reachable server and a known project scope.
-    await page.route("**/api/sessions", (r) =>
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
       r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: { sessions: [], workspace_ordering: [] },

@@ -150,6 +150,11 @@ pub async fn ensure_tool(
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            if let Some(response) =
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
+            {
+                return response;
+            }
             if error.is::<crate::tmux::LegacyToolUnavailable>() {
                 return (StatusCode::CONFLICT,
                     Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
@@ -546,6 +551,11 @@ pub async fn ensure_container_terminal(
             }
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(response) =
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
+            {
+                return response;
             }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "container terminal ensure failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
