@@ -116,6 +116,23 @@ function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => Que
   return { ...state, queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)) };
 }
 
+// The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
+function rollbackOptimisticPrompt(state: AcpState, id: string): AcpState {
+  const idx = state.optimisticRows.findIndex((r) => r.id === id);
+  if (idx === -1) return settleInflightPrompt(state, id);
+  const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
+  return settleInflightPrompt({ ...state, optimisticRows }, id);
+}
+
+// A queue row proves the daemon accepted the prompt even when the POST response never reached this tab.
+// Absence proves nothing (it may have been dispatched), so rows are only ever retired on a match.
+function retireQueuedOptimistics(state: AcpState, serverIds: ReadonlySet<string>): AcpState {
+  const queued = state.inflightPromptIds
+    .concat(state.optimisticRows.map((r) => r.id))
+    .filter((id) => serverIds.has(id));
+  return queued.reduce(rollbackOptimisticPrompt, state);
+}
+
 // Keeps local attachment bytes for rows queued here, builds metadata-only views for the rest,
 // and keeps optimistic rows whose enqueue POST has not landed yet.
 function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): AcpState {
@@ -137,7 +154,7 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
     };
   });
   const stillPending = state.queuedPrompts.filter((q) => q.pending && !serverIds.has(q.id));
-  return { ...state, queuedPrompts: merged.concat(stillPending) };
+  return retireQueuedOptimistics({ ...state, queuedPrompts: merged.concat(stillPending) }, serverIds);
 }
 
 export function reducer(state: AcpState, action: Action): AcpState {
@@ -252,14 +269,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return settleInflightPrompt({ ...state, inFlightTool: null }, action.id);
     case "settle_inflight_prompt":
       return settleInflightPrompt(state, action.id);
-    case "rollback_optimistic_prompt": {
-      // The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
-      const idx = state.optimisticRows.findIndex((r) => r.id === action.id);
-      if (idx === -1) return settleInflightPrompt(state, action.id);
-      const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
-      return settleInflightPrompt({ ...state, optimisticRows }, action.id);
-    }
+    case "rollback_optimistic_prompt":
+      return rollbackOptimisticPrompt(state, action.id);
     case "enqueue_prompt": {
+      // A late POST response can land after hydration already added the row.
+      if (state.queuedPrompts.some((q) => q.id === action.id)) return state;
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,

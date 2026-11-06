@@ -145,6 +145,22 @@ describe("in-flight prompt settlement", () => {
     });
     expect(reducer(echoed, { kind: "settle_inflight_prompt", id: "p1" }).turnActive).toBe(true);
   });
+
+  it("a drained batch echo settles every merged id and their overlay rows (#5401)", () => {
+    const three = run(
+      sent("p1"),
+      { kind: "user_prompt", id: "p2", text: "second" },
+      { kind: "user_prompt", id: "p3", text: "third" },
+      { kind: "user_prompt", id: "other", text: "still sending" },
+    );
+    const drained = applyEvent(three, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "hi\n\nsecond\n\nthird", prompt_id: "p1", merged_prompt_ids: ["p2", "p3"] } },
+    });
+    expect(drained.inflightPromptIds).toEqual(["other"]);
+    expect(drained.optimisticRows.map((r) => r.id)).toEqual(["p1", "other"]);
+  });
 });
 
 describe("prompt queue", () => {
@@ -191,6 +207,35 @@ describe("prompt queue", () => {
       rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
     });
     expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two", "just typed"]);
+  });
+
+  it("hydrate retires the optimistic row and spinner of a prompt the queue holds, and only those (#5401)", () => {
+    const local = run(
+      empty(),
+      { kind: "user_prompt", id: "lost-response", text: "queued during compact" },
+      { kind: "user_prompt", id: "direct", text: "dispatched, echo not here yet" },
+    );
+    const next = reducer(local, { kind: "hydrate_server_queue", rows: [serverRow("lost-response", 0, "queued")] });
+    expect(next.inflightPromptIds).toEqual(["direct"]);
+    expect(next.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+    expect(next.turnActive).toBe(true);
+
+    const idle = reducer(run(empty(), { kind: "user_prompt", id: "lost-response", text: "x" }), {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("lost-response", 0, "x")],
+    });
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+  });
+
+  it("a late queued response does not duplicate a row hydration already added", () => {
+    const hydrated = reducer(empty(), { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "one")] });
+    const late = run(
+      hydrated,
+      { kind: "enqueue_prompt", id: "q1", text: "one" },
+      { kind: "confirm_queued_prompt", id: "q1" },
+    );
+    expect(late.queuedPrompts.map((q) => q.id)).toEqual(["q1"]);
   });
 
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {
