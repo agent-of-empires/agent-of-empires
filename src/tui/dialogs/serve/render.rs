@@ -417,6 +417,11 @@ fn render_confirm(
             TransportStatus::NotInstalled => {
                 ("\u{26A0}", not_installed, Style::default().fg(theme.dimmed))
             }
+            TransportStatus::TimedOut => (
+                "\u{26A0}",
+                "Timed out, press R to retry",
+                Style::default().fg(theme.waiting).bold(),
+            ),
             TransportStatus::FunnelNotEnabled => (
                 "\u{26A0}",
                 "Funnel not enabled for this node",
