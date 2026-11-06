@@ -5,11 +5,12 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { notifySettingsChanged } from "../../lib/settingsEvents";
 import { toastBus } from "../../lib/toastBus";
-import { useSetupStatus } from "../useSetupStatus";
+import { SETUP_READ_DEADLINE_MS, useSetupStatus } from "../useSetupStatus";
 
 const server = setupServer();
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => {
+  vi.useRealTimers();
   server.resetHandlers();
   toastBus.handler = null;
 });
@@ -45,4 +46,48 @@ it("reports a failed update with the server's message", async () => {
   const { result } = renderHook(() => useSetupStatus(true));
   await act(() => result.current.update({ banner_dismissed: true }));
   expect(error).toHaveBeenCalledWith("Disk full");
+});
+
+it("a failed reload keeps the last status", async () => {
+  let fail = false;
+  server.use(
+    http.get("*/api/setup", () => (fail ? new HttpResponse(null, { status: 502 }) : HttpResponse.json(status(true)))),
+  );
+  const { result } = renderHook(() => useSetupStatus(true));
+  await waitFor(() => expect(result.current.status).toBeTruthy());
+  fail = true;
+  await act(() => result.current.refresh());
+  expect(result.current.status?.steps[0]?.configured).toBe(true);
+});
+
+it("an older read that answers late can't replace a newer one", async () => {
+  const replies: ((configured: boolean) => void)[] = [];
+  server.use(
+    http.get(
+      "*/api/setup",
+      () => new Promise<Response>((resolve) => replies.push((c) => resolve(HttpResponse.json(status(c))))),
+    ),
+  );
+  const { result } = renderHook(() => useSetupStatus(true));
+  await waitFor(() => expect(replies).toHaveLength(1));
+  let newer: Promise<unknown> | undefined;
+  act(() => {
+    newer = result.current.refresh();
+  });
+  await waitFor(() => expect(replies).toHaveLength(2));
+  await act(async () => {
+    replies[1]!(true);
+    await newer;
+  });
+  await act(async () => replies[0]!(false));
+  expect(result.current.status?.steps[0]?.configured).toBe(true);
+});
+
+it("a first read that never answers counts as failed after the deadline", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  server.use(http.get("*/api/setup", () => new Promise<Response>(() => {})));
+  const { result } = renderHook(() => useSetupStatus(true));
+  expect(result.current.status).toBeUndefined();
+  act(() => vi.advanceTimersByTime(SETUP_READ_DEADLINE_MS));
+  expect(result.current.status).toBeNull();
 });
