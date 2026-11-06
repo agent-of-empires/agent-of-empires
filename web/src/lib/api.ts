@@ -1016,6 +1016,8 @@ export interface PluginUiNotification {
    *  toast is rendered as click-to-open: a browser blocks `window.open` from an
    *  async push, so the open happens on the user's click. Always http/https. */
   href?: string;
+  /** A dashboard path to a deep-linked plugin page (`ui.notify` `link`). The toast keeps its tone and opens the path on click. */
+  link?: string;
 }
 
 /** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
@@ -1027,6 +1029,8 @@ export interface PluginPage {
   url: string;
   /** The plugin's granted capabilities; the page bridge gates on them. */
   capabilities: string[];
+  /** The page takes the `?link=` value of its dashboard URL over the bridge. Absent on older daemons. */
+  deep_link?: boolean;
 }
 
 export interface PluginUiState {
@@ -1969,8 +1973,22 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 /** Null when the request failed, so callers can tell "no agents" from "unknown". */
 export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const agents = await fetchProfileAgents(profile);
+  return Array.isArray(agents) ? agents : null;
+}
+
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
+export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
   const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
+  try {
+    const res = await fetch(`/api/agents${query}`);
+    if (res.ok) return (await res.json()) as AgentInfo[];
+    if (res.status !== 404) return null;
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+    return body?.error === "profile_not_found" ? "profile_not_found" : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

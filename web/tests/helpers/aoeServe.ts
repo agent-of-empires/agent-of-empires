@@ -681,6 +681,16 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   let proc: ChildProcess | null = null;
   let port = 0;
   let baseUrl = "";
+  let seedDaemonOwned = opts.seedFn !== undefined;
+
+  function stopSeedDaemon(): void {
+    const stop = spawnSync(aoeBinary, ["serve", "--stop"], { env: seedEnv, encoding: "utf8" });
+    if (stop.error) throw stop.error;
+    if (stop.status !== 0 && !stop.stderr.includes("No running daemon found")) {
+      throw new Error(`aoe serve --stop failed: ${stop.stderr}`);
+    }
+    seedDaemonOwned = false;
+  }
 
   async function killProc(child: ChildProcess): Promise<void> {
     if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
@@ -702,6 +712,13 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
 
   async function cleanup(): Promise<void> {
     const errors: unknown[] = [];
+    if (seedDaemonOwned) {
+      try {
+        stopSeedDaemon();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
     // Stop the daemon before its runners, so reconciliation cannot respawn them.
     for (const child of pendingChildren) {
       try {
@@ -728,12 +745,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
 
   try {
     if (opts.seedFn) await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
-    // Seeding through migrated CLI commands auto-starts a Daemon; the server under test must own its own.
-    const stop = spawnSync(aoeBinary, ["serve", "--stop"], { env: seedEnv, encoding: "utf8" });
-    if (stop.error) throw stop.error;
-    if (stop.status !== 0 && !stop.stderr.includes("No running daemon found")) {
-      throw new Error(`aoe serve --stop failed: ${stop.stderr}`);
-    }
+    if (seedDaemonOwned) stopSeedDaemon();
     for (let attempt = 0; attempt < 5; attempt++) {
       port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
       baseUrl = `http://127.0.0.1:${port}`;

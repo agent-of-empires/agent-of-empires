@@ -4,6 +4,7 @@
 //! connection task (see `connection`) that owns the session; this module holds
 //! the public surface, and each concern lives in a submodule.
 
+mod batch;
 mod between_prompt;
 mod close;
 mod commands;
@@ -61,7 +62,7 @@ use crate::acp::fs_handler::{FsPolicy, SandboxPathMap};
 use crate::acp::state::{AcpSessionId, Event};
 use crate::acp::terminal_handler::TerminalManager;
 use crate::daemon::PromptAttachmentKind;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, McpServer, TextContent,
 };
@@ -553,7 +554,8 @@ impl AcpClient {
         let child = Arc::new(Mutex::new(child));
         let launch = launch(sandbox, &native_store);
         let (label, install_binary) = (launch.session_id.0.clone(), launch.install_binary.clone());
-        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let (read_half, write_half) = tokio::io::split(batch::wrap(stdout, stdin));
+        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
         let events = mpsc::channel(64);
         let (mut client, ready_rx) = launch.start(events, transport, Some(child.clone()), None);
         client._prime_runtime = prime_runtime.map(|mut guard| {

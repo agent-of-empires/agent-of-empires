@@ -600,6 +600,7 @@ fn wizard_create_body(
         idempotency_key: None,
         retry_origin: None,
         parent_session_id: None,
+        cli: None,
     }
 }
 

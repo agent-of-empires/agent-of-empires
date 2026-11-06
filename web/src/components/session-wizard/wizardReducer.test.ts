@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CreateStage } from "../../lib/types";
-import { initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
+import { agentsView, initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
 
 function makeState(data: Partial<WizardData> = {}): WizardState {
   return {
@@ -11,6 +11,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     failure: null,
     agents: [],
     agentsStatus: "ready",
+    agentsFor: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -395,6 +396,28 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
     expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
     const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
+  });
+});
+
+describe("agent list per profile", () => {
+  const claude = { name: "claude" } as WizardState["agents"][number];
+  const failed = (agentsFor: string, missing = false): Action => ({ type: "AGENTS_FAILED", agentsFor, missing });
+  // Each row starts from a list loaded for alpha.
+  it.each([
+    ["alpha's list reads as itself for alpha", [], "alpha", "ready", 1],
+    ["alpha's list is still loading for beta", [], "beta", "loading", 0],
+    ["a failed load for beta drops alpha's list", [failed("beta")], "beta", "failed", 0],
+    ["a missing beta drops alpha's list", [failed("beta", true)], "beta", "missing", 0],
+    ["a failed retry for alpha keeps alpha's list", [failed("alpha")], "alpha", "failed", 1],
+    ["a missing alpha keeps alpha's list", [failed("alpha", true)], "alpha", "missing", 1],
+  ] as const)("%s", (_label, actions, profile, status, count) => {
+    const loaded = reducer(
+      { ...makeState(), agentsStatus: "loading" },
+      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
+    );
+    const view = agentsView(actions.reduce<WizardState>(reducer, loaded), profile);
+    expect(view.agentsStatus).toBe(status);
+    expect(view.agents).toHaveLength(count);
   });
 });
 

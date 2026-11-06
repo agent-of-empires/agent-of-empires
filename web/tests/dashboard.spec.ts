@@ -63,6 +63,13 @@ test.describe("Create session from home screen", () => {
 
   test("opens with keyboard shortcut n", async ({ page }) => {
     await page.route("**/api/about", (r) => r.fulfill({ json: { profile: "default" } }));
+    // Answer the session poll, or its failure marks the server unreachable and disables New session before `n`.
+    await page.route("**/api/sessions", (r) =>
+      r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: { sessions: [], workspace_ordering: [] },
+      }),
+    );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await pressShortcut(page, "n");

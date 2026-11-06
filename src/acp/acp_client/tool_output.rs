@@ -2,7 +2,7 @@
 //! recalls, and diffs, each under a size cap.
 
 use crate::acp::state::{DiffPreview, Event, MemoryRecall, ToolOutputBlock};
-use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::v1::schema::ContentBlock;
 
 pub(super) fn raw_event<T: serde::Serialize>(value: &T) -> Event {
     Event::RawAgentUpdate {
@@ -11,8 +11,8 @@ pub(super) fn raw_event<T: serde::Serialize>(value: &T) -> Event {
 }
 
 /// Drives the per-tool renderer dispatch on the web side.
-pub(super) fn tool_kind_str(kind: &agent_client_protocol::schema::v1::ToolKind) -> String {
-    use agent_client_protocol::schema::v1::ToolKind;
+pub(super) fn tool_kind_str(kind: &agent_client_protocol::v1::schema::ToolKind) -> String {
+    use agent_client_protocol::v1::schema::ToolKind;
     match kind {
         ToolKind::Read => "read",
         ToolKind::Edit => "edit",
@@ -58,9 +58,9 @@ pub(super) fn preview_optional_args(raw: Option<&serde_json::Value>) -> String {
 /// The textual portion of a tool call's `content`, which is all the renderer
 /// fallback can display. Diffs are bridged by `extract_diffs_from_content`.
 pub(super) fn extract_tool_content_text(
-    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
+    blocks: &[agent_client_protocol::v1::schema::ToolCallContent],
 ) -> String {
-    use agent_client_protocol::schema::v1::ToolCallContent;
+    use agent_client_protocol::v1::schema::ToolCallContent;
     let mut out = String::new();
     for block in blocks {
         if let ToolCallContent::Content(c) = block {
@@ -86,9 +86,9 @@ pub(super) const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
 /// every block is text or diff, which the `content` text path already renders
 /// (#1818).
 pub(super) fn extract_tool_output_blocks(
-    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
+    blocks: &[agent_client_protocol::v1::schema::ToolCallContent],
 ) -> Vec<ToolOutputBlock> {
-    use agent_client_protocol::schema::v1::{EmbeddedResourceResource, ToolCallContent};
+    use agent_client_protocol::v1::schema::{EmbeddedResourceResource, ToolCallContent};
     let mut out: Vec<ToolOutputBlock> = Vec::new();
     let mut has_media = false;
     let cap =
@@ -173,8 +173,8 @@ pub(super) fn extract_tool_output_blocks(
 /// the field shapes cannot trip the classifier.
 pub(super) fn extract_memory_recall(
     meta: &Option<serde_json::Map<String, serde_json::Value>>,
-    locations: &[agent_client_protocol::schema::v1::ToolCallLocation],
-    content: &[agent_client_protocol::schema::v1::ToolCallContent],
+    locations: &[agent_client_protocol::v1::schema::ToolCallLocation],
+    content: &[agent_client_protocol::v1::schema::ToolCallContent],
 ) -> Option<MemoryRecall> {
     let map = meta.as_ref()?;
     let claude_code = map.get("claudeCode")?;
@@ -228,9 +228,9 @@ pub(super) fn cap_diff_text(text: &str) -> String {
 /// per touched file, instead of the legacy `old_string`/`new_string` raw_input
 /// keys, so the edit card reads its path and preview from here (#1721).
 pub(super) fn extract_diffs_from_content(
-    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
+    blocks: &[agent_client_protocol::v1::schema::ToolCallContent],
 ) -> Vec<DiffPreview> {
-    use agent_client_protocol::schema::v1::ToolCallContent;
+    use agent_client_protocol::v1::schema::ToolCallContent;
     let created_at = chrono::Utc::now();
     blocks
         .iter()
@@ -276,7 +276,7 @@ pub(super) fn write_diff_from_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         AudioContent, BlobResourceContents, Content, ContentBlock, Diff, EmbeddedResource,
         EmbeddedResourceResource, ImageContent, ResourceLink, TextResourceContents,
         ToolCallContent,

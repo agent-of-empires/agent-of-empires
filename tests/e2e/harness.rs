@@ -490,6 +490,11 @@ last_seen_version = "{}"
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![
                 ("AOE_TMUX_SOCKET".into(), tmux_socket_env.into()),
+                // Discard port: tests that opt in to telemetry must never reach production.
+                (
+                    "AOE_TELEMETRY_ENDPOINT".into(),
+                    "http://127.0.0.1:9/ingest".into(),
+                ),
                 (
                     "XDG_RUNTIME_DIR".into(),
                     config_dir.join("runtime").into_os_string(),

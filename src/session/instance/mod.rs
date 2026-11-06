@@ -45,6 +45,7 @@ pub use execution::{
 };
 mod flags;
 mod hooks;
+pub(crate) use hooks::HostHookApprovalRequired;
 mod identity_sidecar;
 mod kill;
 mod launch_command;

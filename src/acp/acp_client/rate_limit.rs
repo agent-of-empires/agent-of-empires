@@ -46,7 +46,7 @@ pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -
         "session does not exist",
     ];
     // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
-    if err.code == agent_client_protocol::ErrorCode::ResourceNotFound
+    if err.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
         && err
             .data
             .as_ref()
@@ -78,7 +78,7 @@ fn overage_covers(info: &serde_json::Value) -> bool {
 /// Only rejections are retained: a warning's epoch cannot be tied to the
 /// window that later rejects (#3152).
 pub(super) fn rate_limit_rejection_from_meta(
-    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+    meta: &Option<agent_client_protocol::v1::schema::Meta>,
 ) -> Option<RateLimitRejection> {
     let info = meta.as_ref()?.get("_claude/rateLimit")?;
     if info.get("status")?.as_str()? != "rejected" || overage_covers(info) {
@@ -109,7 +109,7 @@ pub(super) fn rate_limit_rejection_from_meta(
 /// so a stale rejection cannot park a turn. Returns whether a rejection was kept.
 pub(super) fn record_rate_limit_report(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
-    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+    meta: &Option<agent_client_protocol::v1::schema::Meta>,
 ) -> bool {
     let Some(info) = meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) else {
         return false;
@@ -381,7 +381,7 @@ mod tests {
         // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
         let not_found = |data| {
             let mut e = err("Resource not found", data);
-            e.code = agent_client_protocol::ErrorCode::ResourceNotFound;
+            e.code = agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND;
             e
         };
         assert!(is_unsupported_session_error(&not_found(Some(

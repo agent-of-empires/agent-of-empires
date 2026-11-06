@@ -69,7 +69,7 @@ fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
     let bin = h.install_path_command("claude");
     std::fs::write(
         bin.join("claude"),
-        "#!/bin/sh\nstty -echo -icanon min 1 time 0\nprintf 'agent-ready\\n'\nexec cat\n",
+        "#!/bin/sh\nstty -echo\ncount=0\ntrap 'count=$((count + 1)); printf \"interrupt-%s-reached-agent\\n\" \"$count\"' INT\nprintf 'agent-ready\\n'\nwhile :; do IFS= read -r line && printf '%s\\n' \"$line\"; done\n",
     )
     .unwrap();
     let project = h.project_path();
@@ -113,6 +113,7 @@ fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
     h.assert_screen_not_contains("LIVE");
     h.assert_screen_not_contains("Cmds");
     h.type_text("input-reached-agent");
+    h.send_keys("Enter");
     crate::harness::wait_until(
         std::time::Duration::from_secs(10),
         std::time::Duration::from_millis(20),
@@ -132,6 +133,15 @@ fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
         },
     );
     h.wait_for("input-reached-agent");
+    let bottom_row = |screen: &str| screen.lines().last().unwrap().to_string();
+    let before = bottom_row(&h.capture_screen());
+    for count in 1..=3 {
+        h.send_keys("C-c");
+        h.wait_for(&format!("interrupt-{count}-reached-agent"));
+        h.assert_screen_not_contains("Ctrl+C sent to agent");
+        h.assert_screen_not_contains("LIVE");
+        assert_eq!(bottom_row(&h.capture_screen()), before);
+    }
     h.send_keys("C-q");
     h.send_keys("?");
     h.wait_for("Keyboard Shortcuts");
