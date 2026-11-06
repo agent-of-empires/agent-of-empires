@@ -1819,6 +1819,21 @@ impl SessionService {
             return;
         }
 
+        // The batch was cut with the profile read above, and publishing reads it again. If a clear
+        // command became recognised in between (a settings change), publishing would merge it
+        // into this turn as text. Leave the rows queued so the next pass cuts the batch again.
+        if sub.len() > 1 {
+            let current = crate::acp::supervisor::profile_for_agent(
+                &agent_key,
+                &source_profile,
+                &project_path,
+            )
+            .await;
+            if sub.iter().any(|row| current.is_solo_command(&row.text)) {
+                return;
+            }
+        }
+
         // Deliver as a fresh turn on the live worker.
         if let Err(e) = self
             .send_turn(

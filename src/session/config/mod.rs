@@ -2192,13 +2192,17 @@ impl SessionConfig {
         }
     }
 
-    /// The `agent_clear_alias` entries that apply: only an agent launched through its own
-    /// `agent_acp_cmd`. An agent inheriting a built-in adapter through `agent_detect_as` runs as
+    /// The `agent_clear_alias` entries that apply: only an agent launched through its own valid
+    /// `agent_acp_cmd`, the check that makes it ACP-capable. An agent inheriting a built-in adapter through `agent_detect_as` runs as
     /// that built-in, whose profile already decides its reset command.
     pub fn declared_clear_aliases(&self) -> HashMap<String, String> {
         self.agent_clear_alias
             .iter()
-            .filter(|(name, _)| self.agent_acp_cmd.contains_key(*name))
+            .filter(|(name, _)| {
+                self.agent_acp_cmd
+                    .get(*name)
+                    .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
+            })
             .map(|(name, alias)| (name.clone(), alias.clone()))
             .collect()
     }
@@ -4074,11 +4078,13 @@ mod tests {
 
     #[test]
     fn declared_clear_aliases_apply_only_to_an_agent_with_its_own_acp_command() {
-        let mut config = SessionConfig::default();
-        config.agent_clear_alias = [("own", "/clear"), ("inherits", "/new")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut config = SessionConfig {
+            agent_clear_alias: [("own", "/clear"), ("inherits", "/new")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..SessionConfig::default()
+        };
         config
             .agent_acp_cmd
             .insert("own".into(), "own-bridge acp".into());
@@ -4086,8 +4092,19 @@ mod tests {
         config
             .agent_detect_as
             .insert("inherits".into(), "claude".into());
+        // An empty or malformed command leaves the agent ACP-incapable, so it advertises nothing.
+        config
+            .agent_clear_alias
+            .insert("empty".into(), "/clear".into());
+        config.agent_acp_cmd.insert("empty".into(), String::new());
+        config
+            .agent_clear_alias
+            .insert("malformed".into(), "/clear".into());
+        config
+            .agent_acp_cmd
+            .insert("malformed".into(), "bridge \"unterminated".into());
         let declared = config.declared_clear_aliases();
-        assert_eq!(declared.len(), 1);
+        assert_eq!(declared.len(), 1, "{declared:?}");
         assert_eq!(declared.get("own").map(String::as_str), Some("/clear"));
     }
 

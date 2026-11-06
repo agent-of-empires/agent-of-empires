@@ -125,7 +125,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
-        let profile = self.profile_for_session(session_id).await;
+        let profile = self.profile_for_session(session_id, &text).await;
         let is_clear = profile.is_clear_command(&text);
         let disposition = if is_clear && profile.clear_requires_driven_reset {
             PromptDisposition::ResetContext
@@ -200,6 +200,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) async fn profile_for_session(
         &self,
         session_id: &str,
+        text: &str,
     ) -> &'static crate::acp::agent_profiles::AgentProfile {
         use crate::acp::agent_profiles::resolve;
         let (agent_key, source_profile, cwd) = {
@@ -226,6 +227,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 },
             }
         };
+        // Only a `/clear` or `/new` can match a declared alias, so every other prompt skips the
+        // configuration read. Settings changes are read fresh each time one of those arrives.
+        if !crate::acp::agent_profiles::could_be_declared_alias(text) {
+            return resolve(&agent_key);
+        }
         super::agents::profile_for_agent(&agent_key, &source_profile.unwrap_or_default(), &cwd)
             .await
     }

@@ -198,6 +198,12 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     ..DEFAULT
 };
 
+/// True when `text` could be a declared reset command (`/clear` or `/new`). A prompt that is
+/// neither never needs the session configuration to be read to classify it.
+pub fn could_be_declared_alias(text: &str) -> bool {
+    matches_alias(&["/clear", "/new"], text)
+}
+
 /// True when `key` names an agent with its own built-in profile.
 pub fn is_builtin(key: &str) -> bool {
     resolve(key).key != DEFAULT.key
@@ -333,6 +339,23 @@ mod tests {
                 resets,
                 "{agent} {text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_clear_or_new_command_can_match_a_declared_alias() {
+        // (text, could match)
+        let cases = [
+            ("/clear", true),
+            ("  /new  ", true),
+            ("/clear --hard", true),
+            ("/compact", false),
+            ("clear the cache", false),
+            ("please /clear", false),
+            ("", false),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(could_be_declared_alias(text), expected, "{text:?}");
         }
     }
 
