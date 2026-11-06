@@ -299,7 +299,7 @@ pub struct LoggingConfig {
     /// effect.
     #[serde(default)]
     #[setting(
-        label = "Write to",
+        label = "Write to (restart req.)",
         widget = "select",
         options = "file:file,stdout:stdout",
         global_only,
@@ -312,7 +312,7 @@ pub struct LoggingConfig {
     /// absolute paths are used verbatim. Restart aoe for changes.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File",
+        label = "File (restart req.)",
         widget = "text",
         global_only,
         advanced,
@@ -346,7 +346,7 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep",
+        label = "Keep (restart req.)",
         widget = "number",
         min = 0,
         global_only,
@@ -362,7 +362,7 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show where each line came from",
+        label = "Show where each line came from (restart req.)",
         widget = "toggle",
         global_only,
         advanced,
@@ -1523,7 +1523,7 @@ pub struct SessionConfig {
     /// start. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Conversation lookup threads",
+        label = "Conversation lookup threads (restart req.)",
         widget = "number",
         min = 0,
         global_only,
