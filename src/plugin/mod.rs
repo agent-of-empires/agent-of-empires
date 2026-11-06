@@ -79,8 +79,12 @@ fn node_env_for(node: &std::path::Path) -> NodeEnv {
     if let Some(bin_dir) = node.parent() {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let dirs = std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&inherited));
-        if let Ok(path) = std::env::join_paths(dirs) {
-            env.push(("PATH", path));
+        match std::env::join_paths(dirs) {
+            Ok(path) => env.push(("PATH", path)),
+            Err(error) => {
+                tracing::warn!(target: "plugin", %error, node = %node.display(), "cannot put the Node directory on PATH");
+                return NodeEnv::new();
+            }
         }
     }
     env
@@ -237,5 +241,11 @@ mod node_env_tests {
         let path = get("PATH").expect("PATH");
         let first = std::env::split_paths(&path).next().unwrap();
         assert_eq!(first, Path::new("/opt/aoe/node/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_node_dir_that_cannot_join_path_yields_no_env() {
+        assert!(node_env_for(Path::new("/opt/a:b/bin/node")).is_empty());
     }
 }
