@@ -898,6 +898,7 @@ struct PluginStatusSpan<'a> {
     text: &'a str,
     tone: Option<crate::plugin::ui_state::Tone>,
     width: usize,
+    separator: usize,
 }
 
 struct PluginStatusPlan<'a> {
@@ -913,7 +914,14 @@ impl<'a> PluginStatusPlan<'a> {
 }
 
 fn plan_plugin_statuses<'a>(
-    statuses: impl Iterator<Item = (&'a str, &'a str, Option<crate::plugin::ui_state::Tone>)> + Clone,
+    statuses: impl Iterator<
+            Item = (
+                &'a str,
+                &'a str,
+                Option<crate::plugin::ui_state::Tone>,
+                crate::plugin::ui_state::BadgePresentation,
+            ),
+        > + Clone,
     budget: usize,
 ) -> PluginStatusPlan<'a> {
     let mut plan = PluginStatusPlan {
@@ -924,22 +932,47 @@ fn plan_plugin_statuses<'a>(
     let budget = budget.min(MAX_PLUGIN_STATUS_WIDTH);
     let mut contributors = [None; MAX_PLUGIN_STATUS_COUNT];
     let mut contributor_count = 0;
-    for (plugin, _, _) in statuses.clone() {
-        if contributor_count == MAX_PLUGIN_STATUS_COUNT || contributor_count == budget / 2 {
+    let mut reserved = 0;
+    for (position, (plugin, _, _, presentation)) in statuses.clone().enumerate() {
+        if contributor_count == MAX_PLUGIN_STATUS_COUNT {
             break;
         }
-        if contributors[..contributor_count].contains(&Some(plugin)) {
+        if contributors[..contributor_count]
+            .iter()
+            .flatten()
+            .any(|(id, _)| *id == plugin)
+        {
             continue;
         }
-        contributors[contributor_count] = Some(plugin);
+        let cost = presentation.separator_width() + 1;
+        if reserved + cost > budget {
+            continue;
+        }
+        if reserved + 3 > budget
+            && statuses
+                .clone()
+                .take(position)
+                .any(|(earlier, _, _, _)| earlier == plugin)
+        {
+            continue;
+        }
+        contributors[contributor_count] = Some((plugin, cost));
         contributor_count += 1;
+        reserved += cost;
     }
     let mut truncated = false;
 
     for round in 0..MAX_PLUGIN_STATUS_COUNT {
         let mut seen = [None; MAX_PLUGIN_STATUS_COUNT];
         let mut added = false;
-        for (plugin, text, tone) in statuses.clone() {
+        for (plugin, text, tone, presentation) in statuses.clone() {
+            if !contributors[..contributor_count]
+                .iter()
+                .flatten()
+                .any(|(id, _)| *id == plugin)
+            {
+                continue;
+            }
             let index = seen
                 .iter()
                 .position(|entry| entry.is_none_or(|(id, _)| id == plugin));
@@ -953,14 +986,14 @@ fn plan_plugin_statuses<'a>(
             if plan.len == MAX_PLUGIN_STATUS_COUNT {
                 return plan;
             }
-            let reserve = if round == 0 {
-                contributor_count.saturating_sub(plan.len + 1) * 2
-            } else {
-                0
-            };
+            let separator = presentation.separator_width();
+            if round == 0 {
+                reserved -= separator + 1;
+            }
+            let reserve = if round == 0 { reserved } else { 0 };
             let available = budget
                 .saturating_sub(plan.width + reserve)
-                .saturating_sub(1);
+                .saturating_sub(separator);
             if available == 0 {
                 return plan;
             }
@@ -970,9 +1003,10 @@ fn plan_plugin_statuses<'a>(
                 text,
                 tone,
                 width: visible_width,
+                separator,
             });
             plan.len += 1;
-            plan.width += 1 + visible_width;
+            plan.width += separator + visible_width;
             added = true;
             if visible_width < text_width {
                 truncated = true;
@@ -2219,7 +2253,7 @@ impl HomeView {
             ));
         }
         for status in plugin_status_plan.iter() {
-            line_spans.push(Span::raw(" "));
+            line_spans.push(Span::raw(" ".repeat(status.separator)));
             let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
             let mut text = truncate_to_width(status.text, status.width);
             text.extend(std::iter::repeat_n(
@@ -5575,7 +5609,7 @@ mod tests {
 #[cfg(test)]
 mod plugin_status_plan_tests {
     use super::plan_plugin_statuses;
-    use crate::plugin::ui_state::Tone;
+    use crate::plugin::ui_state::{BadgePresentation, Tone};
 
     /// (name, budget, count, expected span list, expected width).
     type StatusPlanCase = (
@@ -5628,7 +5662,13 @@ mod plugin_status_plan_tests {
         ];
 
         for (name, budget, count, expected, expected_width) in cases {
-            let plan = plan_plugin_statuses(statuses[..*count].iter().copied(), *budget);
+            let plan = plan_plugin_statuses(
+                statuses[..*count]
+                    .iter()
+                    .copied()
+                    .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+                *budget,
+            );
             let actual: Vec<_> = plan
                 .iter()
                 .map(|span| (span.text, span.tone, span.width))
@@ -5645,7 +5685,12 @@ mod plugin_status_plan_tests {
             ("github", "second pull request", None),
             ("linear", "ISSUE", None),
         ];
-        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let plan = plan_plugin_statuses(
+            statuses
+                .into_iter()
+                .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+            32,
+        );
         let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
         assert_eq!(
             actual,
@@ -5665,12 +5710,70 @@ mod plugin_status_plan_tests {
             ("github", "second", None),
             ("linear", "L", None),
         ];
-        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let plan = plan_plugin_statuses(
+            statuses
+                .into_iter()
+                .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+            32,
+        );
         let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
         assert_eq!(
             actual,
             [("a very long pull request status label", 29), ("L", 1)]
         );
+        assert_eq!(plan.width, 32);
+    }
+
+    #[test]
+    fn status_plan_reserves_mixed_contributor_gaps() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "a long label", None, Text),
+            ("a", "extra", None, Text),
+            ("b", "✓", None, Glyph),
+            ("c", "issue", None, Text),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 9);
+        let actual: Vec<_> = plan
+            .iter()
+            .map(|s| (s.text, s.separator, s.width))
+            .collect();
+        assert_eq!(
+            actual,
+            [("a long label", 2, 2), ("✓", 1, 1), ("issue", 2, 1)]
+        );
+        assert_eq!(plan.width, 9);
+    }
+
+    #[test]
+    fn status_plan_admits_glyph_after_unaffordable_text() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "✓", None, Glyph),
+            ("b", "Open", None, Text),
+            ("b", "✉", None, Glyph),
+            ("c", "◐", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 4);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓", "◐"]);
+        assert_eq!(plan.width, 4);
+    }
+
+    #[test]
+    fn status_plan_skips_unaffordable_contributor_at_span_cap() {
+        use BadgePresentation::{Glyph, Text};
+        let ids = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+        ];
+        let statuses = ids.into_iter().map(|id| (id, "✓", None, Glyph)).chain([
+            ("rejected", "Open", None, Text),
+            ("rejected", "✉", None, Glyph),
+            ("last", "◐", None, Glyph),
+        ]);
+        let plan = plan_plugin_statuses(statuses, 32);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, [&["✓"; 15][..], &["◐"]].concat());
         assert_eq!(plan.width, 32);
     }
 }

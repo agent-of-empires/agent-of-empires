@@ -142,8 +142,8 @@ rl.on('line', (line) => {
         id: resource.id,
         session_id: session.id,
         payload: process.argv[2] === 'github'
-          ? { items: [{ text: '⇄', tone: 'success' }, { text: '✓', tone: 'success' }, { text: '✉', tone: 'warn' }] }
-          : { text: resource.text, tone: resource.tone },
+          ? { items: [{ text: '⇄', presentation: 'glyph', tone: 'success' }, { text: '✓', presentation: 'glyph', tone: 'success' }, { text: '✉', presentation: 'glyph', tone: 'warn' }, { text: 'OPEN' }] }
+          : { text: resource.text, presentation: 'glyph', tone: resource.tone },
       });
     }
   }
@@ -377,6 +377,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
             line.contains("PR")
                 && line.contains("⇄") == include_github
                 && line.contains("◐") == include_linear
+                && (!include_github || line.contains("✓ ✉  OPEN"))
         }) {
             break row.to_string();
         }

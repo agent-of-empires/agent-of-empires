@@ -454,6 +454,8 @@ request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => p
 
 `row-badge` items on terminal session rows render items with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links. The status strip is right-aligned. In the local session list, it appears before the activity age when enabled, and its bounded lane considers one item per plugin before considering a second item from any plugin. Items may be truncated or omitted when space runs out.
 
+For a row badge or its individual items, set `presentation` to `"glyph"` when the TUI `text` is a glyph. The default is `"text"`; both values are accepted explicitly. A glyph uses one separator cell and text uses two. Tooltip fallback always uses text spacing. The `icon` field is web-only and does not determine terminal spacing. In remote home, the gap between the status strip and project path remains two cells.
+
 In the web dashboard, give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 
 ```json

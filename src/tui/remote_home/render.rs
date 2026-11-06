@@ -24,11 +24,8 @@ const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
 /// budget.
 const ROW_COLUMN_MAX_WIDTH: usize = 24;
 
-/// Gap between two plugins' cells inside the same column.
-const ROW_COLUMN_GAP: &str = " ";
-
 /// One plugin's `row-column` text plus the tone to paint it in.
-type RowColumnCell = (String, Option<Tone>);
+type RowColumnCell = (String, Option<Tone>, usize);
 
 /// A session's cells and the display width they occupy together.
 type MeasuredCells = (Vec<RowColumnCell>, usize);
@@ -48,11 +45,13 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
     let mut budget = ROW_COLUMN_MAX_WIDTH;
     let mut width = 0;
     let mut cells = Vec::new();
-    for (_, text, tone) in plugin_ui::session_row_statuses(&state.plugin_ui, session_id) {
+    for (_, text, tone, presentation) in
+        plugin_ui::session_row_statuses(&state.plugin_ui, session_id)
+    {
         let gap = if cells.is_empty() {
             0
         } else {
-            UnicodeWidthStr::width(ROW_COLUMN_GAP)
+            presentation.separator_width()
         };
         // Needs room for the gap plus at least one cell of text, else the
         // remaining plugins are dropped rather than rendered as a bare gap.
@@ -67,7 +66,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
         let len = UnicodeWidthStr::width(text.as_str()).min(budget - gap);
         width += gap + len;
         budget -= gap + len;
-        cells.push((text, tone));
+        cells.push((text, tone, gap));
     }
     (cells, width)
 }
@@ -214,10 +213,8 @@ Press r to refresh, q to quit.",
             if plugin_width > 0 {
                 let (cells, width) = &plugin_cells[idx];
                 spans.push(Span::raw(" ".repeat(plugin_width - width)));
-                for (i, (text, tone)) in cells.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::raw(ROW_COLUMN_GAP));
-                    }
+                for (text, tone, gap) in cells {
+                    spans.push(Span::raw(" ".repeat(*gap)));
                     spans.push(Span::styled(
                         text.clone(),
                         readable(plugin_ui::tone_style(*tone, theme)),
@@ -399,6 +396,29 @@ mod tests {
     }
 
     #[test]
+    fn row_badges_use_presentation_gaps_and_keep_path_gap() {
+        let state = state_with(
+            &["s1"],
+            json!([row_badge(
+                "s1",
+                json!({"items": [
+                    {"text": "A", "presentation": "glyph"},
+                    {"text": "B", "presentation": "glyph"},
+                    {"text": "Open", "icon": "git"},
+                    {"tooltip": "fallback", "presentation": "glyph"}
+                ]})
+            )]),
+        );
+        let painted = rows(&state);
+        assert!(
+            painted
+                .iter()
+                .any(|line| line.contains("A B  Open  fallback  /tmp/s1")),
+            "{painted:?}"
+        );
+    }
+
+    #[test]
     fn plugin_cells_are_capped_to_the_budget() {
         let long = "x".repeat(ROW_COLUMN_MAX_WIDTH + 20);
         let state = state_with(&["s1"], json!([row_column("s1", &long)]));
@@ -438,7 +458,7 @@ mod tests {
         );
         let (cells, width) = row_column_cells(&state, "s1");
         assert!(width <= ROW_COLUMN_MAX_WIDTH, "{width} cells");
-        let texts: Vec<&str> = cells.iter().map(|(t, _)| t.as_str()).collect();
+        let texts: Vec<&str> = cells.iter().map(|(t, _, _)| t.as_str()).collect();
         // Itemized badge: each item's text (tooltip when text is absent).
         assert_eq!(&texts[..2], &["CI", "ico"], "{texts:?}");
         // Badge without an items list: the top-level tooltip is the fallback.
@@ -519,9 +539,8 @@ mod tests {
             assert!(width <= ROW_COLUMN_MAX_WIDTH, "{id}: {width} cells");
             let painted: usize = cells
                 .iter()
-                .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
-                .sum::<usize>()
-                + ROW_COLUMN_GAP.len() * cells.len().saturating_sub(1);
+                .map(|(t, _, gap)| UnicodeWidthStr::width(t.as_str()) + gap)
+                .sum::<usize>();
             assert_eq!(painted, width, "{id}: measured width must match painted");
         }
         // The cap holds, so the path still renders and stays aligned.
