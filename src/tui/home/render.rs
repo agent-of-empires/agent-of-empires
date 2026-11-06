@@ -915,13 +915,13 @@ impl<'a> PluginStatusPlan<'a> {
 
 fn plan_plugin_statuses<'a>(
     statuses: impl Iterator<
-            Item = (
-                &'a str,
-                &'a str,
-                Option<crate::plugin::ui_state::Tone>,
-                crate::plugin::ui_state::BadgePresentation,
-            ),
-        > + Clone,
+        Item = (
+            &'a str,
+            &'a str,
+            Option<crate::plugin::ui_state::Tone>,
+            crate::plugin::ui_state::BadgePresentation,
+        ),
+    >,
     budget: usize,
 ) -> PluginStatusPlan<'a> {
     let mut plan = PluginStatusPlan {
@@ -931,61 +931,57 @@ fn plan_plugin_statuses<'a>(
     };
     let budget = budget.min(MAX_PLUGIN_STATUS_WIDTH);
     let mut contributors = [None; MAX_PLUGIN_STATUS_COUNT];
+    let mut candidates = [[None; MAX_PLUGIN_STATUS_COUNT]; MAX_PLUGIN_STATUS_COUNT];
+    let mut counts = [0; MAX_PLUGIN_STATUS_COUNT];
     let mut contributor_count = 0;
+    let mut rejected = std::collections::HashSet::new();
     let mut reserved = 0;
-    for (position, (plugin, _, _, presentation)) in statuses.clone().enumerate() {
-        if contributor_count == MAX_PLUGIN_STATUS_COUNT {
-            break;
-        }
-        if contributors[..contributor_count]
+    for (position, (plugin, text, tone, presentation)) in statuses.enumerate() {
+        let index = if let Some(index) = contributors[..contributor_count]
             .iter()
-            .flatten()
-            .any(|(id, _)| *id == plugin)
+            .position(|id| *id == Some(plugin))
         {
-            continue;
+            index
+        } else {
+            if contributor_count == MAX_PLUGIN_STATUS_COUNT || rejected.contains(plugin) {
+                continue;
+            }
+            let cost = presentation.separator_width() + 1;
+            if reserved + cost > budget {
+                rejected.insert(plugin);
+                continue;
+            }
+            let index = contributor_count;
+            contributors[index] = Some(plugin);
+            contributor_count += 1;
+            reserved += cost;
+            index
+        };
+        if counts[index] < MAX_PLUGIN_STATUS_COUNT {
+            candidates[index][counts[index]] = Some((position, text, tone, presentation));
+            counts[index] += 1;
         }
-        let cost = presentation.separator_width() + 1;
-        if reserved + cost > budget {
-            continue;
-        }
-        if reserved + 3 > budget
-            && statuses
-                .clone()
-                .take(position)
-                .any(|(earlier, _, _, _)| earlier == plugin)
-        {
-            continue;
-        }
-        contributors[contributor_count] = Some((plugin, cost));
-        contributor_count += 1;
-        reserved += cost;
     }
     let mut truncated = false;
 
     for round in 0..MAX_PLUGIN_STATUS_COUNT {
-        let mut seen = [None; MAX_PLUGIN_STATUS_COUNT];
-        let mut added = false;
-        for (plugin, text, tone, presentation) in statuses.clone() {
-            if !contributors[..contributor_count]
-                .iter()
-                .flatten()
-                .any(|(id, _)| *id == plugin)
-            {
-                continue;
+        let mut order = [(usize::MAX, 0); MAX_PLUGIN_STATUS_COUNT];
+        let mut count = 0;
+        for (index, queue) in candidates[..contributor_count].iter().enumerate() {
+            if let Some((position, _, _, _)) = queue[round] {
+                order[count] = (position, index);
+                count += 1;
             }
-            let index = seen
-                .iter()
-                .position(|entry| entry.is_none_or(|(id, _)| id == plugin));
-            let Some(index) = index else { continue };
-            let (_, count) = seen[index].get_or_insert((plugin, 0usize));
-            let current = *count;
-            *count += 1;
-            if current != round {
-                continue;
-            }
+        }
+        if count == 0 {
+            break;
+        }
+        order[..count].sort_unstable_by_key(|&(position, _)| position);
+        for &(_, index) in &order[..count] {
             if plan.len == MAX_PLUGIN_STATUS_COUNT {
                 return plan;
             }
+            let (_, text, tone, presentation) = candidates[index][round].unwrap();
             let separator = presentation.separator_width();
             if round == 0 {
                 reserved -= separator + 1;
@@ -1007,7 +1003,6 @@ fn plan_plugin_statuses<'a>(
             });
             plan.len += 1;
             plan.width += separator + visible_width;
-            added = true;
             if visible_width < text_width {
                 truncated = true;
                 if round != 0 {
@@ -1015,7 +1010,7 @@ fn plan_plugin_statuses<'a>(
                 }
             }
         }
-        if !added || truncated {
+        if truncated {
             break;
         }
     }
@@ -5702,6 +5697,20 @@ mod plugin_status_plan_tests {
             ]
         );
         assert_eq!(plan.width, 32);
+    }
+
+    #[test]
+    fn status_plan_keeps_snapshot_order_within_each_round() {
+        use BadgePresentation::Glyph;
+        let statuses = [
+            ("a", "a1", None, Glyph),
+            ("b", "b1", None, Glyph),
+            ("b", "b2", None, Glyph),
+            ("a", "a2", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["a1", "b1", "b2", "a2"]);
     }
 
     #[test]
