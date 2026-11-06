@@ -2429,10 +2429,20 @@ function AppContent({
 
   // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
   // an in-flight session route defers it (the flag stays unset until then).
+  const onSetup =
+    !!setupMatch ||
+    shouldRedirectToSetup({
+      status: setup.status ?? null,
+      readOnly: caps.readOnly,
+      cityhall: caps.cityhall,
+      automated: isAutomatedSession(),
+      pathname: location.pathname,
+    });
   const tourAutoLaunchReady =
     serverAboutLoaded &&
-    // The shell stays behind a placeholder until setup status answers.
+    // The shell stays behind a placeholder until setup status answers, and the tour needs the dashboard.
     setup.status !== undefined &&
+    !onSetup &&
     sessionsLoaded &&
     !activeSessionId &&
     !fullPageView &&
@@ -2505,8 +2515,9 @@ function AppContent({
     automated: isAutomatedSession(),
   };
   const setupBannerSteps = bannerSteps(setupViewer);
-  // Also hold it until setup status answers, so a fresh install never sees the dashboard flash before /setup.
-  if (!serverAboutLoaded || setup.status === undefined) {
+  // On / and /setup, also hold it until setup status answers, so a fresh install never sees the dashboard
+  // flash before /setup. Deep links render without it, so a stalled /api/setup can't blank them.
+  if (!serverAboutLoaded || (setup.status === undefined && (location.pathname === "/" || setupMatch))) {
     return <div className="h-(--app-height) bg-surface-900 safe-area-inset" />;
   }
   if (setupMatch) {
