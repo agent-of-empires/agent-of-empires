@@ -1,5 +1,5 @@
 import { ArrowRight, ChevronUp, X } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useInlineMachineSave } from "../../hooks/useInlineMachineSave";
 import {
@@ -46,12 +46,15 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     return requested >= 0 ? requested : firstOpenIndex(steps);
   });
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
-  const [machine, setMachine] = useState<MachineValues>({});
+  // `null` until loaded, so steps seed their selections from saved values.
+  const [machine, setMachine] = useState<MachineValues | null>(null);
   const [share, setShare] = useState(false);
   const [doNotTrack, setDoNotTrack] = useState(false);
+  const [telemetryLoaded, setTelemetryLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
+  const sheetRef = useRef<HTMLDialogElement>(null);
   const { save, elevation } = useInlineMachineSave();
 
   useEffect(() => {
@@ -61,8 +64,16 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
       if (!t) return;
       setShare(t.enabled);
       setDoNotTrack(t.do_not_track);
+      setTelemetryLoaded(true);
     });
   }, []);
+
+  // A modal <dialog> traps focus, makes the page inert, closes on Escape and restores focus.
+  useEffect(() => {
+    const sheet = sheetRef.current;
+    if (sheetOpen) sheet?.showModal();
+    else if (sheet?.open) sheet.close();
+  }, [sheetOpen]);
 
   // Stable, so the Agents step's detection doesn't re-run on every status refresh.
   const onAgentsChecked = useCallback(() => void refresh(), [refresh]);
@@ -89,8 +100,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const saveField = async (section: string, field: string, value: unknown): Promise<boolean> => {
     const ok = await save({ [section]: { [field]: value } });
     if (ok) {
-      setMachine((m) => ({ ...m, [section]: { ...m[section], [field]: value } }));
+      setMachine((m) => ({ ...m, [section]: { ...m?.[section], [field]: value } }));
       await markConfigured(step.key);
+    } else {
+      // The write may still have landed; show what the Daemon holds.
+      void fetchMachineSettings().then((s) => s && setMachine(s as MachineValues));
     }
     return ok;
   };
@@ -130,13 +144,21 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const next = () =>
     run(async () => {
       let current = status;
-      if (step.key === "theme_telemetry" && !doNotTrack) {
-        await setTelemetryConsent(share);
+      // Without a loaded status, `share` is a placeholder that would overwrite the saved choice.
+      if (step.key === "theme_telemetry" && telemetryLoaded && !doNotTrack) {
+        if (!(await setTelemetryConsent(share))) {
+          setError("Couldn't save your telemetry choice. Try again.");
+          return;
+        }
         current = (await refresh()) ?? status;
       }
       // Next on an optional step keeps its defaults, which counts as set up.
       if (!step.required && !current.steps.find((s) => s.key === step.key)?.configured) {
-        await updateSetup({ confirmed_steps: [...confirmedKeys, step.key] });
+        const result = await updateSetup({ confirmed_steps: [...confirmedKeys, step.key] });
+        if (!result.ok) {
+          setError(result.message ?? "Couldn't save this step.");
+          return;
+        }
         current = (await refresh()) ?? current;
       }
       if (last) await finish(current);
@@ -157,7 +179,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
 
   const leave = () =>
     run(async () => {
-      await updateSetup({ deferred: true });
+      const result = await updateSetup({ deferred: true });
+      if (!result.ok) {
+        setError(result.message ?? "Couldn't leave setup.");
+        return;
+      }
       await refresh();
       onLeave();
     });
@@ -166,7 +192,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const percent = Math.round((done / steps.length) * 100);
   const blocked = step.required && !step.configured;
   const info = SETUP_STEP_INFO[step.key];
-  const values = (section: string) => machine[section] ?? {};
+  const values = (section: string) => machine?.[section] ?? {};
 
   const rail = <SetupRail steps={steps} current={index} onSelect={goTo} />;
   const leaveLink = (
@@ -233,7 +259,10 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
             {step.key === "theme_telemetry" && (
               <ThemeTelemetryStep share={share} onShareChange={setShare} doNotTrack={doNotTrack} />
             )}
-            {step.key === "agents" && (
+            {machine === null && step.key !== "theme_telemetry" && step.key !== "project" && (
+              <p className="text-sm text-text-dim">Loading settings…</p>
+            )}
+            {machine !== null && step.key === "agents" && (
               <AgentsStep
                 profile={profile}
                 defaultTool={values("session").default_tool as string | undefined}
@@ -243,13 +272,13 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
               />
             )}
             {step.key === "project" && <ProjectStep profile={profile} onAdded={() => void markConfigured("project")} />}
-            {step.key === "worktrees" && (
+            {machine !== null && step.key === "worktrees" && (
               <WorktreesStep schema={schema} values={values("worktree")} onSaveField={saveField} />
             )}
-            {step.key === "sandbox" && (
+            {machine !== null && step.key === "sandbox" && (
               <SandboxStep schema={schema} values={values("sandbox")} onSaveField={saveField} />
             )}
-            {step.key === "notifications" && (
+            {machine !== null && step.key === "notifications" && (
               <AccessStep
                 status={status}
                 about={about}
@@ -304,13 +333,13 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
         )}
       </main>
 
-      {sheetOpen && (
-        <div
-          className="md:hidden fixed inset-0 z-40 flex flex-col justify-end bg-black/60"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Setup steps"
-        >
+      <dialog
+        ref={sheetRef}
+        aria-label="Setup steps"
+        onClose={() => setSheetOpen(false)}
+        className="md:hidden m-0 mt-auto w-full max-w-none bg-transparent p-0 text-text-primary backdrop:bg-black/60"
+      >
+        {sheetOpen && (
           <div className="rounded-t-lg border-t border-surface-700 bg-surface-900 p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold">Setup steps</span>
@@ -330,8 +359,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
             <p className="text-sm text-text-secondary">{LEAVE_NOTE}</p>
             {leaveLink}
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </div>
   );
 }

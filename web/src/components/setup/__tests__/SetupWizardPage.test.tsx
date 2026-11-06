@@ -2,6 +2,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
+import { useState } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { resetSettingsSchemaCache, type SetupStatus, type SetupStepKey } from "../../../lib/api";
@@ -96,4 +97,55 @@ it("Go to dashboard defers setup so / stops redirecting", async () => {
   fireEvent.click(screen.getAllByRole("button", { name: /Go to dashboard/ })[0]!);
   await waitFor(() => expect(onLeave).toHaveBeenCalled());
   expect(patches).toEqual([{ deferred: true }]);
+});
+
+it("keeps earlier skips and confirmations as later steps are saved", async () => {
+  let serverStatus = status(["agents"]);
+  server.use(
+    http.patch("*/api/setup", async ({ request }) => {
+      const body = (await request.json()) as { skipped_steps?: string[]; confirmed_steps?: string[] };
+      patches.push(body);
+      serverStatus = {
+        ...serverStatus,
+        steps: serverStatus.steps.map((s) => {
+          const confirmed = body.confirmed_steps ? body.confirmed_steps.includes(s.key) : s.confirmed;
+          const skipped = body.skipped_steps ? body.skipped_steps.includes(s.key) : s.skipped && !confirmed;
+          return { ...s, confirmed, skipped, configured: s.key === "agents" || confirmed };
+        }),
+      };
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  function Harness() {
+    const [current, setCurrent] = useState(serverStatus);
+    const refresh = async () => {
+      setCurrent(serverStatus);
+      return serverStatus;
+    };
+    return <SetupWizardPage status={current} about={null} profile="" refresh={refresh} onLeave={() => {}} />;
+  }
+  render(
+    <MemoryRouter initialEntries={["/setup?step=project"]}>
+      <Harness />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Worktrees" });
+  fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+  await screen.findByRole("heading", { name: "Sandbox" });
+  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Notifications and access" });
+  expect(patches).toEqual([
+    { confirmed_steps: ["project"] },
+    { skipped_steps: ["worktrees"] },
+    { confirmed_steps: ["project", "sandbox"] },
+  ]);
+});
+
+it("stays on the step and reports it when keeping the defaults fails to save", async () => {
+  server.use(http.patch("*/api/setup", () => HttpResponse.json({ message: "Disk full" }, { status: 500 })));
+  renderPage(status(["agents"]), "/setup?step=sandbox");
+  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  expect((await screen.findByRole("alert")).textContent).toBe("Disk full");
+  expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
 });
