@@ -399,8 +399,10 @@ fn run_migrations_inner(
     // both before the first schema write; standalone callers include the TUI.
     let owned_transaction;
     let transaction = if (current < CURRENT_VERSION || announce) && transaction.is_none() {
+        // A concurrent migrator holds this through its migration and the daemon
+        // start it hands off to; match the async acquire bound.
         owned_transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
         )?;
         Some(&owned_transaction)
     } else {
