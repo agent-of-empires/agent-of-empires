@@ -14,6 +14,9 @@ export const LOGIN_REQUIRED_EVENT = "aoe:login-required";
 /** A sensitive route needs a fresh passphrase (`403 elevation_required`). */
 export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
 
+/** Marks a request whose caller asks for the passphrase itself, so no global prompt opens. */
+export const INLINE_ELEVATION_HEADER = "X-Aoe-Inline-Elevation";
+
 /** Classify a 401 body without consuming it. Non-401 returns null. */
 export async function classifyAuthError(res: Response): Promise<"login_required" | "unauthorized" | null> {
   if (res.status !== 401) return null;
@@ -99,7 +102,7 @@ export function installFetchErrorToasts(): void {
           handleTokenAuthFailure();
         }
       }
-      if (res.status === 403 && isApi) {
+      if (res.status === 403 && isApi && !new Headers(init?.headers).has(INLINE_ELEVATION_HEADER)) {
         try {
           const data = (await res.clone().json()) as { error?: unknown };
           if (data && data.error === "elevation_required") {
