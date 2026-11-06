@@ -263,6 +263,11 @@ fn open_task_output(
     }
     let dir_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
     let root_fd = open(root, dir_flags, Mode::empty()).ok()?;
+    // Another user's or a shared-writable root could serve forged output.
+    let root_stat = fstat(&root_fd).ok()?;
+    if root_stat.st_uid != nix::unistd::getuid().as_raw() || root_stat.st_mode & 0o022 != 0 {
+        return None;
+    }
     let file_name = format!("{task_id}.output");
     std::fs::read_dir(root).ok()?.flatten().find_map(|project| {
         let project_fd = openat(
@@ -549,6 +554,7 @@ mod tests {
     #[test]
     fn task_output_is_opened_beneath_the_tree_as_a_regular_file() {
         use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let tasks = root.path().join("-proj").join("sess-1").join("tasks");
         std::fs::create_dir_all(&tasks).unwrap();
@@ -581,6 +587,12 @@ mod tests {
             open("sess-2", "abc123").is_none(),
             "a symlinked project directory is not followed"
         );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            open("sess-1", "abc123").is_none(),
+            "a writable root is rejected"
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for bad in ["", "../x", "a/b", "..", "a.b"] {
             assert!(open("sess-1", bad).is_none(), "task id {bad:?}");
             assert!(open(bad, "abc123").is_none(), "session id {bad:?}");
