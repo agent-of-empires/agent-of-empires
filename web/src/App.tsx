@@ -2011,7 +2011,13 @@ function AppContent({
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
-        return <BackgroundAgentsPanel sessionId={activeSessionId} readOnly={caps.readOnly} focus={agentFocus} />;
+        return (
+          <BackgroundAgentsPanel
+            sessionId={activeSessionId}
+            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+            focus={agentFocus}
+          />
+        );
       }
       if (id === "files") {
         // Remount on session switch so the selected file (and any in-flight

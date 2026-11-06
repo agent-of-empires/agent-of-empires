@@ -274,7 +274,7 @@ export function MobileMainPane({
           >
             <BackgroundAgentsPanel
               sessionId={activeSessionId}
-              readOnly={readOnly}
+              readOnly={readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
               focus={agentFocus}
               onShowThread={onBackToAgent}
             />
