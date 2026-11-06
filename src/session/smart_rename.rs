@@ -328,6 +328,24 @@ pub fn resolve_title_model_args(
     vec![flag.to_string(), model]
 }
 
+/// The launch words before the one-shot token. A declared command keeps its
+/// `NAME=value` assignments and fixed arguments by spawning `env`, so a
+/// one-shot starts the same command the managed launch does.
+fn oneshot_prefix(agent: &agents::AgentDef) -> Vec<String> {
+    let Some((words, assignments)) =
+        crate::plugin::agent_integration::declared_launch_words(agent.name)
+    else {
+        return vec![agent.binary.to_string()];
+    };
+    let mut argv = Vec::with_capacity(words.len() + 1);
+    if assignments > 0 {
+        argv.push("env".to_string());
+        argv.extend(words[..assignments].iter().cloned());
+    }
+    argv.extend(words[assignments..].iter().cloned());
+    argv
+}
+
 /// Build the argv for a one-shot title or summary call, or `None` when the
 /// agent has no known one-shot mode. Shape is `[binary, oneshot_token, model..,
 /// extra.., prompt, trailing..]`, where `model..` (for a `Title`) sits before
@@ -345,7 +363,8 @@ pub fn build_oneshot_argv(
     model: OneshotModel,
 ) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
-    let mut argv = vec![agent.binary.to_string(), token.to_string()];
+    let mut argv = oneshot_prefix(agent);
+    argv.push(token.to_string());
     let model_args = match model {
         OneshotModel::Title(args) => args,
         OneshotModel::CliDefault => Vec::new(),

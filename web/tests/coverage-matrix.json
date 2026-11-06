@@ -5302,7 +5302,8 @@
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx",
-        "src/components/settings/__tests__/agentIntegrationDetails.test.ts"
+        "src/components/settings/__tests__/agentIntegrationDetails.test.ts",
+        "src/components/settings/__tests__/PluginConsentModals.test.tsx"
       ],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",

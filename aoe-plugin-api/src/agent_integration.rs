@@ -279,6 +279,38 @@ pub struct AgentIntegrationReply<'a> {
 /// and command separators therefore cannot make discovery disagree with the
 /// launch. Only the prefix is inspected: arguments after the executable are
 /// never parsed.
+/// Every word of a launch command, or `None` when any word would need a shell.
+/// `assignments` counts the leading `NAME=value` words, exactly as `env` reads
+/// them, so a caller can keep a declared command's environment and fixed
+/// arguments instead of only its executable.
+pub fn literal_command_words(command: &str) -> Option<(Vec<&str>, usize)> {
+    let mut words: Vec<&str> = Vec::new();
+    let mut assignments = None;
+    for word in command.split([' ', '\t']) {
+        if word.is_empty() {
+            continue;
+        }
+        if !literal_word(word) {
+            return None;
+        }
+        if assignments.is_none() {
+            if let Some((key, _)) = word.split_once('=') {
+                if !valid_env_key(key) {
+                    return None;
+                }
+                words.push(word);
+                continue;
+            }
+            if word.starts_with('-') {
+                return None;
+            }
+            assignments = Some(words.len());
+        }
+        words.push(word);
+    }
+    Some((words, assignments.unwrap_or(0)))
+}
+
 pub fn launch_prefix(command: &str) -> Option<(Vec<&str>, usize)> {
     let mut words: Vec<&str> = Vec::new();
     for word in command.split([' ', '\t']) {
