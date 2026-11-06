@@ -35,15 +35,23 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AuthStatusUpdated",
 ];
 
-/// Background work as its (start, end, id field) events. Teardown and cold
-/// folds find open work by pairing them, so the retention prune pins both
-/// halves, and [`prune_completed_background_work`] drops a pair once it ends.
-const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str)] = &[
-    ("BackgroundTaskStarted", "BackgroundTaskFinished", "task_id"),
+/// Background work as its (start, end, id field, recent starts kept) events.
+/// Teardown and cold folds find open work by pairing them, so the retention
+/// prune pins both halves, and [`prune_completed_background_work`] drops a pair
+/// once it ends, except the newest starts kept so the shell panel survives a
+/// reload.
+const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, usize)] = &[
+    (
+        "BackgroundTaskStarted",
+        "BackgroundTaskFinished",
+        "task_id",
+        crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS,
+    ),
     (
         "BackgroundAgentLaunched",
         "BackgroundAgentCompleted",
         "agent_id",
+        0,
     ),
 ];
 
@@ -418,12 +426,16 @@ fn prune_completed_background_work(
     let Some(cutoff) = cutoff else {
         return;
     };
-    for (start, end, id) in BACKGROUND_WORK_EVENTS {
+    for (start, end, id, keep) in BACKGROUND_WORK_EVENTS {
         // An end closes only the starts before it: ids may be reused.
         let delete_started = format!(
             "DELETE FROM {events} AS started
              WHERE started.session_id = ?1 AND started.seq <= ?2
                AND started.discriminant = '{start}'
+               AND started.seq NOT IN (
+                   SELECT seq FROM {events}
+                   WHERE session_id = ?1 AND discriminant = '{start}'
+                   ORDER BY seq DESC LIMIT {keep})
                AND EXISTS (
                    SELECT 1 FROM {events} AS ended
                    WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
@@ -432,8 +444,15 @@ fn prune_completed_background_work(
                          json_extract(started.event_json, '$.{start}.{id}'))"
         );
         let delete_ended = format!(
-            "DELETE FROM {events}
-             WHERE session_id = ?1 AND seq <= ?2 AND discriminant = '{end}'"
+            "DELETE FROM {events} AS ended
+             WHERE ended.session_id = ?1 AND ended.seq <= ?2
+               AND ended.discriminant = '{end}'
+               AND NOT EXISTS (
+                   SELECT 1 FROM {events} AS started
+                   WHERE started.session_id = ?1 AND started.discriminant = '{start}'
+                     AND started.seq < ended.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract(started.event_json, '$.{start}.{id}'))"
         );
         for sql in [delete_started, delete_ended] {
             if let Err(e) = conn.execute(&sql, rusqlite::params![session_id, cutoff]) {

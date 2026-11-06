@@ -1229,8 +1229,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            lifecycle_rows, 3,
-            "completed pairs age out; only the open starts stay"
+            lifecycle_rows, 7,
+            "completed agents age out; recent task pairs stay for the shell panel"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         for (seq, event) in store.replay_from("s-1", 0) {
@@ -1240,6 +1240,54 @@ mod tests {
             state.background_tasks,
             ["open".to_string(), "reused".to_string()]
         );
+    }
+
+    /// A finished shell stays replayable until it falls out of the newest
+    /// `MAX_FINISHED_BACKGROUND_SHELLS`, even past the retention cap.
+    #[test]
+    fn finished_shells_beyond_the_keep_count_age_out_of_the_log() {
+        use crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
+        for i in 0..total {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("t{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+            record(Event::BackgroundTaskFinished {
+                task_id: format!("t{i}"),
+                ended_at: None,
+            });
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let kept: Vec<String> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
+            .map(|i| format!("t{i}"))
+            .collect();
+        assert_eq!(kept, expected);
+        assert!(store.unresolved_background_task_ids("s-1").is_empty());
     }
 
     /// Nothing guarantees an adapter task id stays unique for a session, so a
