@@ -22,6 +22,22 @@ fn isolate() -> crate::common::TestHome {
     home.env = home.env.and_set("AOE_UPDATE_API_BASE", "");
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
     std::env::remove_var("AOE_UPDATE_API_BASE");
+    // Build-step fixtures resolve Node; a local stub keeps them off the download.
+    let node = home.path().join("fake-node");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\necho {}\n",
+            agent_of_empires::acp::node::PINNED_NODE_VERSION
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    home.env = home.env.and_set("AOE_ACP_NODE", &node);
     home
 }
 
