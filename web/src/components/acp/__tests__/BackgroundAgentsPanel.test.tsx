@@ -123,7 +123,13 @@ describe("BackgroundAgentsPanel shell dialog", () => {
 
   it("keeps Tab inside the dialog", async () => {
     await openShell({ finished: true });
-    const buttons = [...(document.querySelector('[role="dialog"]') as HTMLElement).querySelectorAll("button")];
+    const stops = [
+      ...(document.querySelector('[role="dialog"]') as HTMLElement).querySelectorAll<HTMLElement>(
+        "button, pre[tabindex]",
+      ),
+    ];
+    expect(stops.some((el) => el.getAttribute("aria-label") === "Shell output")).toBe(true);
+    const buttons = stops;
     const last = buttons[buttons.length - 1]!;
     last.focus();
     fireEvent.keyDown(window, { key: "Tab" });
