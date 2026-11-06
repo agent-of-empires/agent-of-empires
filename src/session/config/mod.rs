@@ -196,6 +196,11 @@ pub struct PluginConfig {
     /// when no update has been dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update: Option<String>,
+
+    /// Installed with `--dev` from a local directory: may claim a reserved
+    /// namespace, is never featured, and is refused under remote exposure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dev: bool,
 }
 
 /// A user's approval of an external plugin's requested capabilities, pinned to
@@ -230,6 +235,7 @@ impl Default for PluginConfig {
             settings: toml::Table::new(),
             grant: None,
             dismissed_update: None,
+            dev: false,
         }
     }
 }

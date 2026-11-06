@@ -18,6 +18,7 @@ use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
 use super::registry::ValidationState;
 use super::source::PluginSource;
+use super::NodeEnv;
 
 pub enum OperationLog {
     Inherit,
@@ -156,13 +157,25 @@ pub struct InstallReport {
     pub validation: ValidationState,
 }
 
-fn install_validation(featured_verified: bool, source: &str) -> ValidationState {
-    if featured_verified {
+fn install_validation(featured_verified: bool, dev: bool, source: &str) -> ValidationState {
+    if dev {
+        ValidationState::Dev
+    } else if featured_verified {
         ValidationState::Featured
     } else if source.starts_with("gh:") {
         ValidationState::Community
     } else {
         ValidationState::Local
+    }
+}
+
+fn trust_label(featured_verified: bool, dev: bool) -> &'static str {
+    if dev {
+        "dev"
+    } else if featured_verified {
+        "featured"
+    } else {
+        "community"
     }
 }
 
@@ -229,6 +242,7 @@ struct PreparedInstall {
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
+    dev: bool,
     id: String,
     capabilities: Vec<String>,
     manifest_hash: String,
@@ -251,14 +265,17 @@ pub struct InstallConsent {
     pub fingerprint: String,
 }
 
-async fn prepare_install(input: &str) -> Result<PreparedInstall> {
+async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     let source = PluginSource::parse(input)?;
+    if dev && !matches!(source, PluginSource::Local(_)) {
+        bail!("--dev requires a local plugin directory");
+    }
     let resolved = resolve_source(source, true).await?;
     let fetched = fetch::fetch(&resolved.source).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
-    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
 
     if super::plugins_dir()?.join(&id).exists() {
@@ -267,14 +284,10 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let trust = if featured_verified {
-        "featured"
-    } else {
-        "community"
-    };
+    let trust = trust_label(featured_verified, dev);
     let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
     let persisted_source = persisted_source(&resolved.source, input);
-    let validation = install_validation(featured_verified, &persisted_source);
+    let validation = install_validation(featured_verified, dev, &persisted_source);
 
     Ok(PreparedInstall {
         persisted_source,
@@ -282,6 +295,7 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
         notice: resolved.notice,
         fetched,
         featured_verified,
+        dev,
         id,
         capabilities,
         manifest_hash,
@@ -290,7 +304,11 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
     })
 }
 
-fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<InstallReport> {
+fn apply_prepared_install(
+    p: &PreparedInstall,
+    node_env: &NodeEnv,
+    log: &OperationLog,
+) -> Result<InstallReport> {
     let final_dir = super::plugins_dir()?.join(&p.id);
     if final_dir.exists() {
         bail!(
@@ -305,7 +323,7 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         p.id, p.fetched.manifest.version
     ));
     move_into_place(&p.fetched, &final_dir)?;
-    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, log) {
+    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, node_env, log) {
         let _ = std::fs::remove_dir_all(&final_dir);
         return Err(e);
     }
@@ -316,8 +334,14 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
             &p.id,
             &p.capabilities,
             &p.manifest_hash,
+            p.dev,
         )?;
-        write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)
+        write_lock(
+            &p.id,
+            &p.fetched,
+            &p.manifest_hash,
+            trust_label(p.featured_verified, p.dev),
+        )
     })();
     if let Err(e) = persisted {
         // Not `uninstall`: nothing finished installing, so nothing is announced as uninstalled.
@@ -354,8 +378,8 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
     })
 }
 
-pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
-    let prepared = prepare_install(input).await?;
+pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<InstallReport> {
+    let prepared = prepare_install(input, dev).await?;
     eprintln!("{}", prepared.notice);
     if prepared.unverified && !assume_yes && !confirm_unverified()? {
         bail!("install cancelled; the unverified source was not approved");
@@ -381,14 +405,15 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     if !granted {
         bail!("install cancelled; no capabilities were granted");
     }
-    apply_prepared_install(&prepared, &OperationLog::Inherit)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
 }
 
 pub async fn preview_install(input: &str) -> Result<InstallConsent> {
     if !input.starts_with("gh:") {
         bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
     }
-    let p = prepare_install(input).await?;
+    let p = prepare_install(input, false).await?;
     Ok(InstallConsent {
         id: p.id.clone(),
         version: p.fetched.manifest.version.clone(),
@@ -424,13 +449,14 @@ pub async fn apply_install(
     if !input.starts_with("gh:") {
         bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
     }
-    let prepared = prepare_install(input).await?;
+    let prepared = prepare_install(input, false).await?;
     if prepared.fingerprint != expected_fingerprint {
         bail!(
             "the plugin at {input} changed since it was shown; review it again before installing"
         );
     }
-    apply_prepared_install(&prepared, log)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared_install(&prepared, &node_env, log)
 }
 
 pub async fn update(id: &str, assume_yes: bool) -> Result<InstallReport> {
@@ -457,6 +483,7 @@ struct Prepared {
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
+    dev: bool,
     prior_grant: Option<CapabilityGrant>,
     capabilities: Vec<String>,
     manifest_hash: String,
@@ -545,6 +572,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         .clone()
         .ok_or_else(|| anyhow!("{id} is a builtin plugin; there is nothing to update"))?;
     let prior_grant = plugin_config.grant.clone();
+    let dev = plugin_config.dev;
 
     let source = PluginSource::parse(&source_str)?;
     let resolved = resolve_source(source, false).await?;
@@ -555,8 +583,8 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
             fetched.manifest.id.as_str()
         );
     }
-    let featured_verified = verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified)?;
+    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
+    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
 
     let capabilities = capability_strings(&fetched)?;
@@ -583,11 +611,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let target_requested_ref = fetched.requested_ref.clone();
     let target_resolved_commit = fetched.resolved_commit.clone();
 
-    let trust = if featured_verified {
-        "featured"
-    } else {
-        "community"
-    };
+    let trust = trust_label(featured_verified, dev);
     let prior_fingerprint =
         prior_locked.map(|l| fingerprint(&l.tree_hash, l.asset_sha256.as_deref(), &l.trust));
     let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
@@ -649,6 +673,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         notice: resolved.notice,
         fetched,
         featured_verified,
+        dev,
         prior_grant,
         capabilities,
         manifest_hash,
@@ -671,21 +696,27 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     })
 }
 
+fn ensure_approved(id: &str, needs_consent: bool, grant: Option<&CapabilityGrant>) -> Result<()> {
+    if needs_consent && grant.is_none() {
+        bail!("update cancelled for {id}; the previously trusted version was kept");
+    }
+    Ok(())
+}
+
 fn apply_prepared(
     prepared: &Prepared,
     grant: Option<CapabilityGrant>,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<InstallReport> {
     let id = prepared.id.as_str();
     let final_dir = super::plugins_dir()?.join(id);
-    if prepared.needs_consent && grant.is_none() {
-        bail!("update cancelled for {id}; the previously trusted version was kept");
-    }
+    ensure_approved(id, prepared.needs_consent, grant.as_ref())?;
     log.line(&format!(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
-    replace_and_build(id, &prepared.fetched, &final_dir, log)?;
+    replace_and_build(id, &prepared.fetched, &final_dir, node_env, log)?;
 
     let granted = grant.is_some();
     persist_update(id, &prepared.source_str, grant)?;
@@ -693,7 +724,7 @@ fn apply_prepared(
         id,
         &prepared.fetched,
         &prepared.manifest_hash,
-        prepared.featured_verified,
+        trust_label(prepared.featured_verified, prepared.dev),
     )?;
     super::reload_registry();
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -709,7 +740,11 @@ fn apply_prepared(
         version: prepared.fetched.manifest.version.clone(),
         capabilities: prepared.capabilities.clone(),
         granted,
-        validation: install_validation(prepared.featured_verified, &prepared.source_str),
+        validation: install_validation(
+            prepared.featured_verified,
+            prepared.dev,
+            &prepared.source_str,
+        ),
     })
 }
 
@@ -758,9 +793,29 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
+    finish_update(prepared, grant, |manifest| async move {
+        apply_node_env(&manifest).await
+    })
+    .await
+}
+
+/// Refuses an unapproved update before `provision` can fetch Node or any
+/// build runs.
+async fn finish_update<F, Fut>(
+    prepared: Prepared,
+    grant: Option<CapabilityGrant>,
+    provision: F,
+) -> Result<UpdateOutcome>
+where
+    F: FnOnce(PluginManifest) -> Fut,
+    Fut: std::future::Future<Output = NodeEnv>,
+{
+    ensure_approved(&prepared.id, prepared.needs_consent, grant.as_ref())?;
+    let node_env = provision(prepared.fetched.manifest.clone()).await;
     Ok(UpdateOutcome::Applied(apply_prepared(
         &prepared,
         grant,
+        &node_env,
         &OperationLog::Inherit,
     )?))
 }
@@ -861,7 +916,8 @@ pub async fn apply_update(
         capabilities: prepared.capabilities.clone(),
         granted_at: chrono::Utc::now(),
     });
-    apply_prepared(&prepared, grant, log)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared(&prepared, grant, &node_env, log)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1296,21 +1352,36 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     }
 }
 
+/// Resolve Node once, off the runtime threads, for the sync apply step.
+async fn apply_node_env(manifest: &PluginManifest) -> NodeEnv {
+    if !super::needs_node(manifest) {
+        return NodeEnv::new();
+    }
+    super::ensure_node().await;
+    tokio::task::spawn_blocking(super::node_env)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(target: "plugin.install", %error, "Node resolution task failed");
+            NodeEnv::new()
+        })
+}
+
 fn build_in_place(
     plugin_id: &str,
     dir: &Path,
     manifest: &PluginManifest,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<()> {
-    run_build(plugin_id, dir, build_steps(manifest), log)?;
+    run_build(plugin_id, dir, build_steps(manifest), node_env, log)?;
     if let Some(RuntimeSpec::Command {
         command,
         system: false,
         ..
     }) = &manifest.runtime
     {
-        super::launch::resolve_command(plugin_id, dir, command, &super::launch::OsLaunchResolver)
-            .with_context(|| {
+        let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
+        super::launch::resolve_command(plugin_id, dir, command, &resolver).with_context(|| {
             format!(
                 "plugin {plugin_id}: worker command is not runnable after install \
                      (a build step may have been skipped on this platform, or did not produce it)"
@@ -1320,26 +1391,30 @@ fn build_in_place(
     Ok(())
 }
 
-fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLog) -> Result<()> {
+fn run_build(
+    plugin_id: &str,
+    dir: &Path,
+    steps: &[BuildStep],
+    node_env: &NodeEnv,
+    log: &OperationLog,
+) -> Result<()> {
     let os = std::env::consts::OS;
+    let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
     for (i, step) in steps.iter().enumerate() {
         if !step.platforms.is_empty() && !step.platforms.iter().any(|p| p == os) {
             continue;
         }
         let pretty = step.command.join(" ");
-        let (program, args) = super::launch::resolve_command(
-            plugin_id,
-            dir,
-            &step.command,
-            &super::launch::OsLaunchResolver,
-        )
-        .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
+        let (program, args) =
+            super::launch::resolve_command(plugin_id, dir, &step.command, &resolver)
+                .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
         log.line(&format!("  building {plugin_id}: {pretty}"));
         let (stdout, stderr) = log.child_stdio()?;
         let status = std::process::Command::new(&program)
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
+            .envs(node_env.iter().map(|(k, v)| (*k, v)))
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
@@ -1356,6 +1431,7 @@ fn replace_and_build(
     plugin_id: &str,
     fetched: &FetchedPlugin,
     final_dir: &Path,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<()> {
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
@@ -1381,7 +1457,7 @@ fn replace_and_build(
                 final_dir.display()
             )
         })?;
-        build_in_place(plugin_id, final_dir, &fetched.manifest, log)
+        build_in_place(plugin_id, final_dir, &fetched.manifest, node_env, log)
     })();
 
     match place_and_build {
@@ -1421,6 +1497,7 @@ fn persist_install(
     id: &str,
     capabilities: &[String],
     manifest_hash: &str,
+    dev: bool,
 ) -> Result<()> {
     update_config(|config| {
         let entry = config
@@ -1428,6 +1505,7 @@ fn persist_install(
             .entry(id.to_string())
             .or_insert_with(PluginConfig::default);
         entry.source = Some(source.to_string());
+        entry.dev = dev;
         entry.grant = Some(CapabilityGrant {
             manifest_hash: manifest_hash.to_string(),
             capabilities: capabilities.to_vec(),
@@ -1448,12 +1526,7 @@ fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Res
     })
 }
 
-fn write_lock(
-    id: &str,
-    fetched: &FetchedPlugin,
-    manifest_hash: &str,
-    featured_verified: bool,
-) -> Result<()> {
+fn write_lock(id: &str, fetched: &FetchedPlugin, manifest_hash: &str, trust: &str) -> Result<()> {
     let mut lock = Lockfile::load()?;
     lock.upsert(
         id,
@@ -1464,12 +1537,7 @@ fn write_lock(
             version: fetched.manifest.version.clone(),
             manifest_hash: manifest_hash.to_string(),
             tree_hash: fetched.tree_hash.clone(),
-            trust: if featured_verified {
-                "featured"
-            } else {
-                "community"
-            }
-            .to_string(),
+            trust: trust.to_string(),
             release_tag: fetched.release_tag.clone(),
             asset_name: fetched.asset_name.clone(),
             asset_sha256: fetched.asset_sha256.clone(),
@@ -1504,6 +1572,104 @@ mod tests {
             "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{aoe}"
         ))
         .unwrap()
+    }
+
+    /// Declining must neither provision Node nor build nor touch the installed
+    /// version; the approved control proves the observations are connected.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_declined_update_neither_provisions_nor_builds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = isolate_app_dir();
+        let src = tempfile::tempdir().unwrap();
+        let manifest = |version: &str, build: &str| {
+            format!(
+                "id = \"acme.upd\"\nname = \"Upd\"\nversion = \"{version}\"\napi_version = 2\n\
+                 capabilities = [\"runtime.worker\"]\n\n[runtime]\nkind = \"command\"\n\
+                 command = [\"sh\"]\nsystem = true\n{build}"
+            )
+        };
+        let manifest_path = src.path().join("aoe-plugin.toml");
+        std::fs::write(&manifest_path, manifest("0.1.0", "")).unwrap();
+        install(src.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let installed = super::super::plugins_dir().unwrap().join("acme.upd");
+        let installed_version = || {
+            Lockfile::load()
+                .unwrap()
+                .get("acme.upd")
+                .unwrap()
+                .version
+                .clone()
+        };
+
+        std::fs::write(
+            &manifest_path,
+            manifest(
+                "0.2.0",
+                "\n[[runtime.build]]\ncommand = [\"cp\", \"aoe-plugin.toml\", \"built\"]\n",
+            ),
+        )
+        .unwrap();
+        let provisioned = AtomicUsize::new(0);
+        let provision = |_: PluginManifest| {
+            provisioned.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(NodeEnv::new())
+        };
+
+        let declined = prepare_update("acme.upd").await.unwrap();
+        assert!(declined.needs_consent);
+        let err = finish_update(declined, None, provision).await.err();
+        assert!(err.is_some_and(|e| e.to_string().contains("update cancelled")));
+        assert_eq!(provisioned.load(Ordering::SeqCst), 0);
+        assert!(!installed.join("built").exists());
+        assert_eq!(installed_version(), "0.1.0");
+
+        let approved = prepare_update("acme.upd").await.unwrap();
+        let grant = CapabilityGrant {
+            manifest_hash: approved.manifest_hash.clone(),
+            capabilities: approved.capabilities.clone(),
+            granted_at: chrono::Utc::now(),
+        };
+        finish_update(approved, Some(grant), provision)
+            .await
+            .unwrap();
+        assert_eq!(provisioned.load(Ordering::SeqCst), 1);
+        assert!(installed.join("built").exists());
+        assert_eq!(installed_version(), "0.2.0");
+    }
+
+    #[test]
+    fn only_manifests_that_build_or_run_a_non_system_worker_need_node() {
+        let cases = [
+            (None, false),
+            (Some("kind = \"release-binary\"\nasset = \"w\""), false),
+            (
+                Some("kind = \"command\"\ncommand = [\"w\"]\nsystem = true"),
+                false,
+            ),
+            (Some("kind = \"command\"\ncommand = [\"bin/w\"]"), true),
+            (
+                Some(
+                    "kind = \"command\"\ncommand = [\"w\"]\nsystem = true\n\
+                     build = [{ command = [\"npm\", \"ci\"] }]",
+                ),
+                true,
+            ),
+        ];
+        for (runtime, expected) in cases {
+            let runtime = runtime
+                .map(|r| format!("capabilities = [\"runtime.worker\"]\n[runtime]\n{r}"))
+                .unwrap_or_default();
+            let manifest = PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{runtime}"
+            ))
+            .unwrap();
+            assert_eq!(crate::plugin::needs_node(&manifest), expected, "{runtime}");
+        }
     }
 
     #[test]

@@ -596,7 +596,7 @@ export interface PluginView {
   icon_asset_url: string | null;
   enabled: boolean;
   builtin: boolean;
-  /** Validation provenance: "builtin" | "featured" | "community" | "local". */
+  /** Validation provenance: "builtin" | "featured" | "community" | "local" | "dev". */
   validation: string;
   source: string | null;
   capabilities: string[];

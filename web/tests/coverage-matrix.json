@@ -5255,6 +5255,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
+      "description": "Plugin cards show validation, including a warning-styled dev badge.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"

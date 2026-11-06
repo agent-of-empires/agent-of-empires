@@ -38,6 +38,11 @@ pub enum PluginCommands {
         /// Grant all requested capabilities without prompting
         #[arg(long)]
         yes: bool,
+        /// Install a local directory as a dev plugin: it may claim a reserved
+        /// `aoe.*` / `agent-of-empires.*` id, is never featured, and is refused
+        /// under `aoe serve --remote`
+        #[arg(long)]
+        dev: bool,
     },
     /// Update an installed external plugin from its recorded source and restart
     /// its worker in a running daemon. Prompts to re-approve capabilities if the
@@ -76,7 +81,7 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Logs { id } => run_logs(&id),
         PluginCommands::Enable { id } => run_set_enabled(&id, true).await,
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
-        PluginCommands::Install { source, yes } => run_install(&source, yes).await,
+        PluginCommands::Install { source, yes, dev } => run_install(&source, yes, dev).await,
         PluginCommands::Update { id, yes } => run_update(&id, yes).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
         PluginCommands::Hash { path } => run_hash(&path),
@@ -212,8 +217,8 @@ fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
     println!("{}", format_report(report, verb));
 }
 
-async fn run_install(source: &str, yes: bool) -> Result<()> {
-    let report = crate::plugin::install::install(source, yes).await?;
+async fn run_install(source: &str, yes: bool, dev: bool) -> Result<()> {
+    let report = crate::plugin::install::install(source, yes, dev).await?;
     print_report(&report, "Installed");
     Ok(())
 }
