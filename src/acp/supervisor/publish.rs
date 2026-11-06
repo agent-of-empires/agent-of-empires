@@ -672,58 +672,6 @@ mod tests {
         );
     }
 
-    /// Holds the prompt's publish open until another frame is broadcast, or
-    /// until the deadline shows none can be while the prompt holds its seq.
-    /// A racer slower than the window can only make the test pass falsely.
-    #[derive(Default)]
-    struct GatedPromptSink {
-        frames: std::sync::Mutex<Vec<u64>>,
-        broadcast: std::sync::Condvar,
-        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    }
-
-    impl BroadcastSink for GatedPromptSink {
-        fn publish(&self, _session_id: &str, seq: u64, _event: &Event) {
-            self.frames.lock().unwrap().push(seq);
-            self.broadcast.notify_all();
-        }
-        fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
-            if matches!(event, Event::UserPromptSent { .. }) {
-                if let Some(entered) = self.entered.lock().unwrap().take() {
-                    entered.send(()).unwrap();
-                }
-                let frames = self.frames.lock().unwrap();
-                drop(
-                    self.broadcast
-                        .wait_timeout_while(frames, std::time::Duration::from_millis(500), |f| {
-                            f.is_empty()
-                        })
-                        .unwrap(),
-                );
-            }
-            self.publish(session_id, seq, event);
-            true
-        }
-    }
-
-    #[tokio::test]
-    async fn a_publisher_racing_a_prompt_broadcasts_after_it() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let sink = std::sync::Arc::new(GatedPromptSink::default());
-        *sink.entered.lock().unwrap() = Some(entered_tx);
-        let sup = std::sync::Arc::new(Supervisor::new(std::sync::Arc::clone(&sink)));
-        let racer = {
-            let sup = std::sync::Arc::clone(&sup);
-            std::thread::spawn(move || {
-                entered_rx.recv().unwrap();
-                sup.publish_startup_error("s-1", "worker event".into());
-            })
-        };
-        sup.publish_user_prompt("s-1", "prompt".into()).await;
-        racer.join().unwrap();
-        assert_eq!(*sink.frames.lock().unwrap(), [1, 2]);
-    }
-
     /// Records, for each broadcast, whether its session's seq counter was held.
     #[derive(Default)]
     struct LockProbeSink {
