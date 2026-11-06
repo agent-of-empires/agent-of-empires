@@ -2631,7 +2631,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Workspace by Default",
         widget = "toggle",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        repo = "deny"
     )]
     pub workspace_by_default: bool,
 
