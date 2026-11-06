@@ -445,6 +445,7 @@ export type AcpEvent =
         tool_call_id?: string;
         description: string;
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
+        started_at?: string | null;
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
@@ -528,6 +529,14 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  /** Background shells, running and recently finished; omitted when there are none. */
+  background_shells?: {
+    task_id: string;
+    command: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    finished?: boolean;
+  }[];
   /** The session's workflow runs; omitted when there are none. */
   workflow_runs?: {
     task_id: string;
@@ -647,6 +656,8 @@ export interface AcpState {
   backgroundAgents: BackgroundAgent[];
   /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Backgrounded shell commands, running and recently finished, oldest first. */
+  backgroundShells: BackgroundShell[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
   /** Agent-pushed advisories for the current turn, oldest first. */
@@ -678,6 +689,23 @@ export interface WorkflowRef {
   run_id: string;
   name: string;
   phase: string;
+}
+
+/** Mirrors the daemon's cap on finished shells kept per session. */
+export const MAX_FINISHED_BACKGROUND_SHELLS = 20;
+
+export interface BackgroundShell {
+  taskId: string;
+  command: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  finished: boolean;
+}
+
+/** Drops the oldest finished shells beyond the cap. */
+function capFinishedShells(shells: BackgroundShell[]): BackgroundShell[] {
+  let drop = shells.filter((s) => s.finished).length - MAX_FINISHED_BACKGROUND_SHELLS;
+  return drop > 0 ? shells.filter((s) => !(s.finished && drop-- > 0)) : shells;
 }
 
 export interface WorkflowRun {
@@ -950,6 +978,7 @@ export function emptyAcpState(): AcpState {
     agentOrphaned: false,
     backgroundAgents: [],
     backgroundTasks: [],
+    backgroundShells: [],
     workflowRuns: {},
     modeSwitchFailed: null,
     lastAgentSwitch: null,
@@ -1368,8 +1397,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
-    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
+    const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
+    if (!workflow) {
+      next.backgroundShells = [
+        ...next.backgroundShells,
+        { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },
+      ];
+    }
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
     if (workflow && toolCallId) {
       next.workflowRuns = {
@@ -1382,6 +1418,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("BackgroundTaskFinished" in event) {
     const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    next.backgroundShells = capFinishedShells(
+      next.backgroundShells.map((s) => (s.taskId === id ? { ...s, finished: true, endedAt: endedAt ?? null } : s)),
+    );
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
@@ -1449,6 +1488,13 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    backgroundShells: (reduced.background_shells ?? []).map((s) => ({
+      taskId: s.task_id,
+      command: s.command,
+      startedAt: s.started_at ?? null,
+      endedAt: s.ended_at ?? null,
+      finished: s.finished ?? false,
+    })),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     locallyResolved,
   };

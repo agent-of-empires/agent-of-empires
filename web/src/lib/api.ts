@@ -3270,3 +3270,16 @@ export async function syncSkills(options?: {
     };
   }
 }
+
+export interface TaskOutput {
+  exists: boolean;
+  output: string;
+  truncated: boolean;
+}
+
+/** Tail of a background shell's output; null when the request fails. */
+export async function fetchTaskOutput(sessionId: string, taskId: string): Promise<TaskOutput | null> {
+  return fetchJson<TaskOutput>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/tasks/${encodeURIComponent(taskId)}/output`,
+  );
+}

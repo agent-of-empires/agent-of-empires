@@ -9,6 +9,7 @@ import {
   isVisiblyBusy,
   mergeServerRows,
   patchServerRow,
+  MAX_FINISHED_BACKGROUND_SHELLS,
   summarizeAnswers,
   transcriptRowToActivity,
   type AcpEvent,
@@ -310,6 +311,35 @@ describe("applyEvent / background agents", () => {
     // own abort timeout), so the endedAt guard, not the status list, has to stop it.
     const late = agent(launched, stalledTerminal, lateProgress)[0];
     expect(late).toMatchObject({ status: "stalled", toolCount: 0, endedAt: "2026-06-27T00:00:10Z" });
+  });
+});
+
+describe("applyEvent / background shells", () => {
+  it("keeps a shell's command after it ends and caps the finished ones", () => {
+    const start = (id: string, workflow?: { run_id: string; name: string }) =>
+      ({
+        BackgroundTaskStarted: { task_id: id, description: `cmd ${id}`, workflow, started_at: "2026-11-06T10:00:00Z" },
+      }) as AcpEvent;
+    const end = (id: string) =>
+      ({ BackgroundTaskFinished: { task_id: id, ended_at: "2026-11-06T10:01:00Z" } }) as AcpEvent;
+    let seq = 0;
+    let state = [start("a"), start("wf", { run_id: "wf_1", name: "drafts" })].reduce(
+      (s, e) => ev(s, ++seq, e),
+      emptyAcpState(),
+    );
+    expect(state.backgroundShells).toEqual([
+      { taskId: "a", command: "cmd a", startedAt: "2026-11-06T10:00:00Z", endedAt: null, finished: false },
+    ]);
+    state = ev(state, ++seq, end("a"));
+    expect(state.backgroundTasks).toEqual(["wf"]);
+    expect(state.backgroundShells[0]).toMatchObject({ finished: true, endedAt: "2026-11-06T10:01:00Z" });
+
+    for (let i = 0; i < MAX_FINISHED_BACKGROUND_SHELLS + 3; i++) {
+      state = ev(state, ++seq, start(`t${i}`));
+      state = ev(state, ++seq, end(`t${i}`));
+    }
+    expect(state.backgroundShells).toHaveLength(MAX_FINISHED_BACKGROUND_SHELLS);
+    expect(state.backgroundShells[0]!.taskId).toBe("t3");
   });
 });
 
