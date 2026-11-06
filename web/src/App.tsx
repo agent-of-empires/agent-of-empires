@@ -2510,6 +2510,8 @@ function AppContent({
   // an in-flight session route defers it (the flag stays unset until then).
   const tourAutoLaunchReady =
     serverAboutLoaded &&
+    // The shell stays behind a placeholder until setup status answers.
+    setup.status !== undefined &&
     sessionsLoaded &&
     !activeSessionId &&
     !fullPageView &&
