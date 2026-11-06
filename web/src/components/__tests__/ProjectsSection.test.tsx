@@ -76,12 +76,23 @@ describe("ProjectsSection", () => {
     expect(h.onCreateSession).toHaveBeenCalledWith("/work/alpha");
   });
 
-  it("explains the ◇ marker with the shared Project tooltip, not a native title", () => {
-    renderSection();
-    const mark = screen.getByText("◇");
-    expect(mark.hasAttribute("title")).toBe(false);
-    fireEvent.mouseEnter(mark.parentElement!);
-    expect(screen.getByRole("tooltip").textContent).toBe(meaningText(MARK_MEANING.project));
+  it("explains the row's marker with the shared tooltip, not a native title", () => {
+    const pinned: ProjectInfo = { name: "alpha", path: "/work/alpha", scope: "global", pinned: true };
+    // (registrations, marker, meaning); a pinned Project is listed here when the axis draws no ◆ header (#5065).
+    const cases: [ProjectInfo[] | undefined, string, (typeof MARK_MEANING)[keyof typeof MARK_MEANING]][] = [
+      [undefined, "◇", MARK_MEANING.project],
+      [[pinned], "◆", MARK_MEANING.pinnedProject],
+    ];
+    for (const [registeredProjects, marker, meaning] of cases) {
+      renderSection({
+        projects: [emptyProject("/work/alpha", registeredProjects ? { registeredProjects } : {})],
+      });
+      const mark = screen.getByText(marker);
+      expect(mark.hasAttribute("title"), marker).toBe(false);
+      fireEvent.mouseEnter(mark.parentElement!);
+      expect(screen.getByRole("tooltip").textContent, marker).toBe(meaningText(meaning));
+      cleanup();
+    }
   });
 
   it("hides add and disables create for read-only viewers", () => {

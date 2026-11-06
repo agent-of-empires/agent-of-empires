@@ -4027,7 +4027,7 @@
         "web/src/lib/registeredProjects.ts",
         "web/src/lib/sidebarAxis.ts"
       ],
-      "notes": "Where the grouping draws repository headers (By repo, By organization, By repo and group) the section is \"Projects, no sessions\" and lists unpinned Projects without a live group; By group draws none, so it is \"Projects\" and lists every registered Project once, pinned or with live sessions included (#5065). Compact is \"Projects\" on every axis. The per-axis rule is axisDrawsRepoHeaders, a Record over SidebarAxis."
+      "notes": "Where the grouping draws repository headers (By repo, By organization, By repo and group) the section is \"Projects, no sessions\" and lists unpinned Projects without a live group; By group draws none, so it is \"Projects\" and lists every registered Project once, pinned or with live sessions included, a pinned row marked ◆ (#5065). Compact is \"Projects\" on every axis. The per-axis rule is axisDrawsRepoHeaders, a Record over SidebarAxis."
     },
     {
       "id": "story.settings-tmux-select",

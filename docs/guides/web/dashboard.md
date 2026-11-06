@@ -119,7 +119,7 @@ A Projects section near the bottom of the sidebar (above "Snoozed & archived") l
 What it lists depends on whether the grouping draws repository headers:
 
 - **By repo**, **By organization** and **By repo and group** draw them, so the section is **Projects, no sessions**: registered Projects that are not pinned and have no live session. A pinned Project renders above as its own header, with or without sessions, and a Project with live sessions renders above as a normal group. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆.
-- **By group** draws user groups instead, so the section is **Projects** and lists every registered Project once, pinned or not, with or without live sessions.
+- **By group** draws Groups instead, so the section is **Projects** and lists every registered Project once, with or without live sessions; a pinned one is marked ◆.
 
 The compact sidebar labels it **Projects** in every mode.
 
