@@ -710,6 +710,7 @@ impl HomeView {
         if matches!(self.view_mode, ViewMode::Terminal)
             && self.live_send.is_none()
             && self.preview_scroll_offset == 0
+            && !self.preview_explicit_tail
             && self.preview_selection.is_none()
         {
             let view = self.preview_text_view;
@@ -3192,12 +3193,14 @@ impl HomeView {
             ActionId::PreviewScrollUp => {
                 self.preview_click_seed = None;
                 self.seed_preview_scroll_from_view();
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP);
+                self.preview_explicit_tail = false;
             }
             ActionId::PreviewScrollDown => {
                 self.preview_click_seed = None;
                 self.seed_preview_scroll_from_view();
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP);
+                self.preview_explicit_tail = self.preview_scroll_offset == 0;
             }
             // `App` handles the chord before the home view sees it.
             ActionId::DismissUpdateBanner => {}
@@ -4869,6 +4872,7 @@ impl HomeView {
             return false;
         }
         self.preview_scroll_offset = clamped;
+        self.preview_explicit_tail = false;
         true
     }
 
@@ -6173,9 +6177,12 @@ impl HomeView {
         self.seed_preview_scroll_from_view();
         self.preview_click_seed = None;
         if self.preview_scroll_offset == 0 {
-            return false;
+            let changed = !self.preview_explicit_tail;
+            self.preview_explicit_tail = true;
+            return changed;
         }
         self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(STEP);
+        self.preview_explicit_tail = self.preview_scroll_offset == 0;
         true
     }
 

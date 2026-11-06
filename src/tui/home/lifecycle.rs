@@ -274,6 +274,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             tool_preview_cache: PreviewCache::default(),
             preview_scroll_offset: 0,
+            preview_explicit_tail: false,
             preview_text_view: PreviewTextView::default(),
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),

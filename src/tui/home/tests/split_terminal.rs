@@ -196,6 +196,57 @@ fn split_focus_swap_keeps_the_other_half_cached() {
 
 #[test]
 #[serial]
+fn terminal_scroll_to_tail_survives_redraw_and_target_change() {
+    let present = crate::tmux::SessionCacheGuard::capture();
+    let (mut env, agent, _) = split_env(false, true);
+    present.force_present(&[agent.as_str()]);
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 120, 40);
+    let worker = env.view.preview_capture_worker.as_mut().unwrap();
+    worker.stop_for_test();
+    let cursor = crate::tmux::PaneCursor {
+        x: 0,
+        y: 2,
+        visible: true,
+        pane_height: 26,
+        history_size: 2,
+        pane_width: 61,
+        alternate_on: false,
+        mouse_tracking: false,
+        mouse_sgr: false,
+        mouse_all: false,
+        position_reliable: true,
+        composite_pane0: None,
+    };
+    let mut lines = [""; 28];
+    lines[2] = "CURSOR_TOP";
+    lines[27] = "NEWEST_TAIL";
+    worker.inject_frame_with_cursor_for_test(2000, &(lines.join("\n") + "\n"), Some(cursor));
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("CURSOR_TOP"), "{screen}");
+    assert!(!screen.contains("NEWEST_TAIL"), "{screen}");
+    let pane = env.view.preview_area;
+    for _ in 0..20 {
+        env.view.handle_scroll_down(pane.x + 1, pane.y + 1);
+    }
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("NEWEST_TAIL"), "{screen}");
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("NEWEST_TAIL"), "{screen}");
+    env.view.sync_preview_capture_worker(None);
+    render_home_to_string(&mut env.view, 120, 40);
+    env.view
+        .preview_capture_worker
+        .as_ref()
+        .unwrap()
+        .inject_frame_with_cursor_for_test(2001, &(lines.join("\n") + "\n"), Some(cursor));
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("CURSOR_TOP"), "{screen}");
+    assert!(!screen.contains("NEWEST_TAIL"), "{screen}");
+}
+
+#[test]
+#[serial]
 fn passive_split_follows_captured_cursor_without_discarding_history_or_clear_frames() {
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;

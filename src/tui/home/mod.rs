@@ -417,6 +417,7 @@ pub struct HomeView {
 
     pub(super) preview_timings: PreviewTimings,
     pub(super) preview_scroll_offset: u16,
+    pub(super) preview_explicit_tail: bool,
     pub(super) preview_area: Rect,
     /// Output sub-rect of `preview_area` (minus the info header); tmux panes are sized to it.
     pub(super) preview_pane_area: Rect,

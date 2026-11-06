@@ -2526,6 +2526,9 @@ impl HomeView {
     /// and retargeted in place; an empty target idles it. Idempotent and cheap when the
     /// target is unchanged, so render calls it every frame.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        if self.preview_capture_target != desired {
+            self.preview_explicit_tail = false;
+        }
         if desired.is_some() && self.preview_worker_stalled_at(std::time::Instant::now()) {
             self.preview_capture_worker = None;
             self.preview_capture_target = None;
@@ -3563,6 +3566,7 @@ impl HomeView {
                     };
                     let total_lines = cache.parsed_text.as_ref().map_or(0, |t| t.lines.len());
                     let scroll_offset = if self.preview_scroll_offset == 0
+                        && !self.preview_explicit_tail
                         && self.preview_selection.is_none()
                         && self.live_send.is_none()
                     {
