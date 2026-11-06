@@ -6,7 +6,7 @@ import { SchemaSection } from "../../settings/SchemaSection";
 import { GhostButton, PANEL, RadioRow, Section } from "../ui";
 
 const RUNTIMES: Record<ContainerRuntimeKind, { label: string; start: string }> = {
-  docker: { label: "Docker", start: "Start Docker Desktop, or run `sudo systemctl start docker`." },
+  docker: { label: "Docker", start: "docker desktop start" },
   podman: { label: "Podman", start: "podman machine start" },
   apple_container: { label: "Apple Container", start: "container system start" },
 };
@@ -92,7 +92,7 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
             schema={schema}
             values={values}
             onSaveField={onSaveField}
-            onlyFields={["enabled_by_default", "allow_image_pull"]}
+            onlyFields={["enabled_by_default", "default_image"]}
           />
         </div>
       )}

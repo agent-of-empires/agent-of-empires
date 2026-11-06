@@ -84,6 +84,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   if (!step) return null;
   const last = index === steps.length - 1;
   const skippedKeys = steps.filter((s) => s.skipped).map((s) => s.key);
+  const confirmedKeys = steps.filter((s) => s.confirmed).map((s) => s.key);
 
   const saveField = async (section: string, field: string, value: unknown): Promise<boolean> => {
     const ok = await save({ [section]: { [field]: value } });
@@ -132,6 +133,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
       if (step.key === "theme_telemetry" && !doNotTrack) {
         await setTelemetryConsent(share);
         current = (await refresh()) ?? status;
+      }
+      // Next on an optional step keeps its defaults, which counts as set up.
+      if (!step.required && !current.steps.find((s) => s.key === step.key)?.configured) {
+        await updateSetup({ confirmed_steps: [...confirmedKeys, step.key] });
+        current = (await refresh()) ?? current;
       }
       if (last) await finish(current);
       else goTo(index + 1);

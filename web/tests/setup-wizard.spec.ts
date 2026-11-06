@@ -57,6 +57,7 @@ async function installSetupMocks(page: Page, opts: { finished?: boolean; readOnl
             key,
             required: key === "agents",
             configured: key === "agents",
+            confirmed: false,
             skipped: key === "sandbox",
           })),
         },
@@ -111,7 +112,10 @@ test("a fresh install lands on /setup without the dashboard flashing first", asy
   await expect.poll(() => handle.themePatches).toEqual([{ name: "dracula" }]);
 
   // The rail jumps to any step; Skip is hidden on the required one.
-  await page.getByRole("navigation", { name: "Setup steps" }).getByRole("button", { name: /Agents/ }).click();
+  await page
+    .getByRole("navigation", { name: "Setup steps" })
+    .getByRole("button", { name: /Agents/ })
+    .click();
   await expect(page.getByRole("heading", { name: "Agents" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Skip for now" })).toHaveCount(0);
 });

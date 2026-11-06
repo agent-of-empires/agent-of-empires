@@ -3296,8 +3296,10 @@ export type SetupStepKey = "theme_telemetry" | "agents" | "project" | "worktrees
 export interface SetupStep {
   key: SetupStepKey;
   required: boolean;
-  /** The step's setting is actually set, wherever it was set from. */
+  /** Set up: a setting differs from its default wherever it was set, or the defaults were confirmed here. */
   configured: boolean;
+  /** The user kept this optional step's defaults in the wizard. */
+  confirmed: boolean;
   skipped: boolean;
 }
 
@@ -3314,6 +3316,7 @@ export interface SetupStatus {
 
 export type SetupPatch = Partial<{
   skipped_steps: SetupStepKey[];
+  confirmed_steps: SetupStepKey[];
   finished: boolean;
   deferred: boolean;
   banner_dismissed: boolean;
