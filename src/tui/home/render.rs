@@ -3332,10 +3332,9 @@ impl HomeView {
         };
         self.sync_split_capture_worker(passive);
 
-        // Pre-size every other open session's detached pane to the rect it would be shown
-        // at (and adopt worker completions), in every view mode. The selected session is
-        // excluded exactly when the Structured branch runs its own per-frame sync.
-        let selected_owns_sync = matches!(self.view_mode, ViewMode::Structured)
+        // The selected agent is observed, not resized, when Terminal view is split.
+        let selected_owns_sync = (matches!(self.view_mode, ViewMode::Structured)
+            || (matches!(self.view_mode, ViewMode::Terminal) && split.is_some()))
             && !selected_archived
             && !selected_trashed
             && !selected_stopped

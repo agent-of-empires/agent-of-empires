@@ -2365,5 +2365,9 @@ for line in sys.stdin:
     assert!(worker_registry::is_pid_alive(agent_pid));
     detaching.store(true, std::sync::atomic::Ordering::Release);
     supervisor.detach_all().await;
+    assert!(runner.0.try_wait().unwrap().is_none());
+    assert!(worker_registry::is_pid_alive(agent_pid));
+    let retained = worker_registry::load(id).unwrap().unwrap();
+    assert_eq!(RunnerIdentity::from_record(&retained), identity);
     proxy.join_next().await.unwrap().unwrap();
 }

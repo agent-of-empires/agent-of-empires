@@ -481,6 +481,7 @@ pub struct HomeView {
     pub(super) preview_autoscroll_at: Option<std::time::Instant>,
 
     pub(super) preview_selection: Option<PreviewSelection>,
+    pub(super) preview_click_seed: Option<u16>,
 
     /// Copy text is read from the next frame's buffer; after `draw` returns the buffers are swapped.
     pub(super) preview_copy_pending: bool,

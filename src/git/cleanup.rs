@@ -1081,9 +1081,9 @@ mod tests {
         let excludes = dir.path().join(".git/empty-excludes");
         std::fs::write(&excludes, "").unwrap();
         assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(["config", "--local", "core.excludesfile"])
+            .args(["config", "--file"])
+            .arg(dir.path().join(".git/config"))
+            .arg("core.excludesfile")
             .arg(&excludes)
             .status()
             .unwrap()

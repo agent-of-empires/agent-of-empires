@@ -681,6 +681,10 @@ pub(super) mod tests {
     #[test]
     fn create_worktree_turns_fetch_and_hook_failures_into_warnings() {
         use std::os::unix::fs::PermissionsExt;
+        let _git_env = crate::session::test_support::EnvGuard::unset(&[
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ]);
         let (dir, repo) = init_repo();
         let bogus = dir.path().join("does-not-exist.git");
         run_git(

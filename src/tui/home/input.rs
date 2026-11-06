@@ -749,7 +749,10 @@ impl HomeView {
         // empty pane is a no-op rather than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
+            let previous_offset = self.preview_scroll_offset;
             self.seed_preview_scroll_from_view();
+            self.preview_click_seed = (previous_offset != self.preview_scroll_offset)
+                .then_some(self.preview_scroll_offset);
             let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
                 anchor: cell,
@@ -906,6 +909,7 @@ impl HomeView {
                 self.scroll_preview_offset(-1)
             };
             if scrolled {
+                self.preview_click_seed = None;
                 self.preview_autoscroll_at = Some(now);
                 let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
                 // Pin the extent to the revealed edge line in `from_bottom` terms, which
@@ -985,12 +989,16 @@ impl HomeView {
                 // loop can write them to the clipboard.
                 if let Some(sel) = self.preview_selection {
                     if sel.anchor == sel.extent {
+                        if self.preview_click_seed == Some(self.preview_scroll_offset) {
+                            self.preview_scroll_offset = 0;
+                        }
                         self.preview_selection = None;
                     } else if let Some(s) = self.preview_selection.as_mut() {
                         s.finalized = true;
                         self.preview_copy_pending = true;
                     }
                 }
+                self.preview_click_seed = None;
             }
             // The offset was applied live on each move; the release just
             // ends the gesture. Nothing to persist (scroll is view state).
@@ -3182,10 +3190,12 @@ impl HomeView {
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
+                self.preview_click_seed = None;
                 self.seed_preview_scroll_from_view();
                 self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
             }
             ActionId::PreviewScrollDown => {
+                self.preview_click_seed = None;
                 self.seed_preview_scroll_from_view();
                 self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
             }
@@ -4851,6 +4861,7 @@ impl HomeView {
         let visible_height = active_cache.dimensions.1.saturating_sub(1) as usize;
         let real_max = active_cache.captured_lines.saturating_sub(visible_height) as u16;
         self.seed_preview_scroll_from_view();
+        self.preview_click_seed = None;
 
         let new_offset = self.preview_scroll_offset.saturating_add(STEP);
         let clamped = new_offset.min(real_max);
@@ -6160,6 +6171,7 @@ impl HomeView {
             return true;
         }
         self.seed_preview_scroll_from_view();
+        self.preview_click_seed = None;
         if self.preview_scroll_offset == 0 {
             return false;
         }

@@ -43,6 +43,7 @@ The paired terminal split also toggles with `|` outside live mode. In `[session]
 `split_terminal_min_width` and `split_terminal_min_height` set the minimum whole
 window size (0 to 1000, defaults 100 columns and 30 rows). Below either threshold
 the split is hidden without changing the toggle; Terminal view remains available.
+The unfocused split pane is observed without resizing its shared tmux pane.
 
 `Shift+PageUp` and `Shift+PageDown` scroll the preview through the agent's history without leaving live mode; bare `PageUp` and `PageDown` still pass through for agents that page their own UI.
 

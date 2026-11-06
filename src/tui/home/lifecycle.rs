@@ -321,6 +321,7 @@ impl HomeView {
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
+            preview_click_seed: None,
             preview_copy_pending: false,
             preview_copy_text: None,
             show_preview_info: user_config
