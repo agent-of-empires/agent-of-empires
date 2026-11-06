@@ -1,0 +1,93 @@
+// @vitest-environment jsdom
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { MemoryRouter } from "react-router-dom";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { resetSettingsSchemaCache, type SetupStatus, type SetupStepKey } from "../../../lib/api";
+import { SetupWizardPage } from "../SetupWizardPage";
+
+const server = setupServer();
+beforeAll(() => server.listen({ onUnhandledRequest: "bypass" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+let patches: unknown[];
+beforeEach(() => {
+  resetSettingsSchemaCache();
+  patches = [];
+  server.use(
+    http.get("*/api/settings/schema", () => HttpResponse.json([])),
+    http.get("*/api/settings", () => HttpResponse.json({})),
+    http.get("*/api/telemetry/status", () =>
+      HttpResponse.json({ enabled: false, responded: false, do_not_track: false }),
+    ),
+    http.get("*/api/themes", () => HttpResponse.json(["empire"])),
+    http.get("*/api/agents", () => HttpResponse.json([])),
+    http.get("*/api/setup/runtimes", () => HttpResponse.json([])),
+    http.get("*/api/projects", () => HttpResponse.json([])),
+    http.patch("*/api/setup", async ({ request }) => {
+      patches.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+});
+
+const KEYS: SetupStepKey[] = ["theme_telemetry", "agents", "project", "worktrees", "sandbox", "notifications"];
+const status = (configured: SetupStepKey[] = []): SetupStatus => ({
+  finished: false,
+  deferred: false,
+  banner_dismissed: false,
+  tmux: true,
+  git: true,
+  access: { serve_mode: "local" },
+  steps: KEYS.map((key) => ({ key, required: key === "agents", configured: configured.includes(key), skipped: false })),
+});
+
+function renderPage(current: SetupStatus, entry = "/setup") {
+  const onLeave = vi.fn();
+  render(
+    <MemoryRouter initialEntries={[entry]}>
+      <SetupWizardPage status={current} about={null} profile="" refresh={async () => current} onLeave={onLeave} />
+    </MemoryRouter>,
+  );
+  return { onLeave };
+}
+
+it("opens on the first open step and never offers Skip on the required Agents step", () => {
+  renderPage(status(["theme_telemetry"]));
+  expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Skip for now" })).toBeNull();
+  expect(screen.getByText("Required to start Sessions")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("Skip records the step and moves on", async () => {
+  renderPage(status(["agents"]), "/setup?step=sandbox");
+  fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+  await waitFor(() => expect(patches).toEqual([{ skipped_steps: ["sandbox"] }]));
+  expect(await screen.findByRole("heading", { name: "Notifications and access" })).toBeTruthy();
+});
+
+it("Finish sends the user back to the open required step instead of finishing", async () => {
+  const { onLeave } = renderPage(status(), "/setup?step=notifications");
+  fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
+  expect(patches).toEqual([]);
+  expect(onLeave).not.toHaveBeenCalled();
+});
+
+it("Finish marks setup finished once Agents is configured", async () => {
+  const { onLeave } = renderPage(status(["agents"]), "/setup?step=notifications");
+  fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
+  await waitFor(() => expect(onLeave).toHaveBeenCalled());
+  expect(patches).toEqual([{ finished: true }]);
+});
+
+it("Go to dashboard defers setup so / stops redirecting", async () => {
+  const { onLeave } = renderPage(status());
+  fireEvent.click(screen.getAllByRole("button", { name: /Go to dashboard/ })[0]!);
+  await waitFor(() => expect(onLeave).toHaveBeenCalled());
+  expect(patches).toEqual([{ deferred: true }]);
+});

@@ -99,7 +99,6 @@ describe("shouldAutoPopTips", () => {
     hasUnseen: true,
     tourSeenAtLoad: true,
     onboardingReady: true,
-    telemetryPending: false,
     tourActive: false,
     automated: false,
   };
@@ -114,7 +113,6 @@ describe("shouldAutoPopTips", () => {
     expect(shouldAutoPopTips({ ...ready, tourSeenAtLoad: false })).toBe(false);
     expect(shouldAutoPopTips({ ...ready, tourSeenAtLoad: null })).toBe(false);
     expect(shouldAutoPopTips({ ...ready, onboardingReady: false })).toBe(false);
-    expect(shouldAutoPopTips({ ...ready, telemetryPending: true })).toBe(false);
     expect(shouldAutoPopTips({ ...ready, tourActive: true })).toBe(false);
     expect(shouldAutoPopTips({ ...ready, automated: true })).toBe(false);
   });
