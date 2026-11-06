@@ -359,7 +359,7 @@ pub(crate) async fn submit_prompt(
                 text: req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
-                prompt_id: req.prompt_id.clone(),
+                prompt_ids: req.prompt_id.clone().into_iter().collect(),
                 synthesized: false,
                 no_revive: req.no_revive,
             },

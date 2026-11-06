@@ -336,6 +336,7 @@ pub(super) fn map_update_to_events(
         // Import replay only (#2276); `Shared` drops live echoes, which duplicate UserPromptSent.
         SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: text.text,
                 attachments: Vec::new(),
                 prompt_id: None,

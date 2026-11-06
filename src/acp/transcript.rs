@@ -366,6 +366,7 @@ impl TranscriptModel {
                 prompt_id,
                 synthesized,
                 origin_plugin,
+                ..
             } => {
                 self.begin_turn();
                 // A rate-limit resume continuation replays a prompt the user
@@ -1496,6 +1497,7 @@ mod tests {
         assert_eq!((m.rows().len(), m.last_seq()), (1, 1));
 
         let with_attachment = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "look".into(),
             attachments: vec![PromptAttachmentRef {
                 id: "att-1".into(),
@@ -1524,6 +1526,7 @@ mod tests {
             m.apply_event(
                 7,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "hi".into(),
                     attachments: Vec::new(),
                     prompt_id: prompt_id.map(Into::into),
@@ -1569,6 +1572,7 @@ mod tests {
         // A synthesized resume prompt (#3028, #4040) renders no row but still
         // opens the turn.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -1584,6 +1588,7 @@ mod tests {
 
         // A plugin-sent message keeps its sender on the row.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "PR #7 was merged".into(),
             attachments: Vec::new(),
             prompt_id: None,

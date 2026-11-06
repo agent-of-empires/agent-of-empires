@@ -780,7 +780,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
             &id,
             "the winning turn".into(),
             &[],
-            None,
+            Vec::new(),
             false,
             None,
         )
@@ -809,6 +809,7 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     let at = long_ago.timestamp_millis();
     let mut events = vec![
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "interrupted prompt A".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -1362,7 +1363,14 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
         .await;
     state
         .acp_supervisor
-        .publish_user_prompt_with_attachments(id, "the user's turn".into(), &[], None, false, None)
+        .publish_user_prompt_with_attachments(
+            id,
+            "the user's turn".into(),
+            &[],
+            Vec::new(),
+            false,
+            None,
+        )
         .await;
 
     let response = acp_prompt(
@@ -1391,6 +1399,7 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
         steering,
     };
     let earlier_turn = || Event::UserPromptSent {
+        merged_prompt_ids: Vec::new(),
         text: "an earlier turn".into(),
         attachments: Vec::new(),
         prompt_id: None,
