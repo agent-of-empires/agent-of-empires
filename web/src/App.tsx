@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
-import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
@@ -83,8 +83,6 @@ import {
   acpDisable,
   fetchAbout,
   fetchSettings,
-  fetchTelemetryStatus,
-  setTelemetryConsent,
   reportTelemetrySeen,
   isDebugBuild,
   markWebTourSeen,
@@ -171,8 +169,10 @@ import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
-import { useWelcomePhase } from "./hooks/useWelcomePhase";
-import { ThemeIntro } from "./components/onboarding/ThemeIntro";
+import { useSetupStatus } from "./hooks/useSetupStatus";
+import { bannerSteps, shouldRedirectToSetup } from "./lib/setup";
+import { SetupWizardPage } from "./components/setup/SetupWizardPage";
+import { SetupBanner } from "./components/setup/SetupBanner";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill, WizardRestore } from "./components/session-wizard/SessionWizard";
@@ -182,7 +182,6 @@ import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
-import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
@@ -373,6 +372,7 @@ function AppContent({
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  const setupMatch = useMatch("/setup");
   // A focus-mode window shows one session only: no sidebar, no switching, and notifications for that session alone.
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
@@ -849,12 +849,6 @@ function AppContent({
   // drives the shared SnoozeModal. Null when no snooze is in flight.
   const [snoozeTargetId, setSnoozeTargetId] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
-  const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
-  // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
-  // starts false, so before this is true "no consent needed" and "not resolved
-  // yet" look the same; the tips auto-pop waits on this so it can't slip in
-  // before a pending consent modal.
-  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
   const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
@@ -1184,11 +1178,13 @@ function AppContent({
     }),
   );
   const refreshServerAbout = aboutRequests.refresh;
+  // The setup wizard applies to writable, non-CityHall dashboards; unknown until /api/about settles.
+  const setup = useSetupStatus(serverAboutLoaded ? !caps.readOnly && !caps.cityhall : null);
   const recoverServerAbout = aboutRequests.recover;
 
   // Kick off the initial server-about fetch on mount. The effect body only
-  // calls fetchAbout and schedules the telemetry consent check; neither runs
-  // setState synchronously, so set-state-in-effect is not triggered.
+  // calls fetchAbout, which doesn't setState synchronously, so
+  // set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
     const generation = aboutRequests.begin();
@@ -1209,16 +1205,6 @@ function AppContent({
       // placeholder; it then renders read-only with a Retry notice.
       .finally(() => {
         if (active && aboutRequests.isCurrent(generation)) setServerAboutLoaded(true);
-      });
-    void fetchTelemetryStatus()
-      .then((status) => {
-        if (!active || !status) return;
-        if (!status.responded && !status.do_not_track) {
-          setTelemetryConsentNeeded(true);
-        }
-      })
-      .finally(() => {
-        if (active) setTelemetryConsentKnown(true);
       });
     return () => {
       active = false;
@@ -1246,11 +1232,6 @@ function AppContent({
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");
   }, [serverAboutLoaded, caps.readOnly, activeSession?.view]);
-
-  const handleTelemetryConsent = useCallback((enabled: boolean) => {
-    setTelemetryConsentNeeded(false);
-    void setTelemetryConsent(enabled);
-  }, []);
 
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingSessions[0] ?? null;
@@ -2302,6 +2283,16 @@ function AppContent({
           onToggleSidebar={handleToggleSidebar}
           readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
+          banner={
+            setupBannerSteps.length > 0 &&
+            setup.status && (
+              <SetupBanner
+                steps={setup.status.steps}
+                open={setupBannerSteps}
+                onDismiss={() => void setup.update({ banner_dismissed: true })}
+              />
+            )
+          }
         />
       );
     }
@@ -2448,21 +2439,11 @@ function AppContent({
     !showAbout &&
     !showPalette &&
     !projectForm;
-  // First-run theme choice is phase one of onboarding. It decides on the same
-  // settled-dashboard gate as the tour, then the tour follows once the modal
-  // resolves so the two never overlap on first load.
-  const welcome = useWelcomePhase({
-    scope: tourScope,
-    readOnly: caps.readOnly,
-    autoLaunchReady: tourAutoLaunchReady,
-    tourSeen,
-    tourSeenKnown,
-  });
   const tour = useTour({
     scope: tourScope,
     readOnly: caps.readOnly,
     isDesktop: !isCoarse,
-    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
+    autoLaunchReady: tourAutoLaunchReady,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
@@ -2481,10 +2462,7 @@ function AppContent({
       loaded: tips.loaded,
       hasUnseen: tips.hasUnseen,
       tourSeenAtLoad: tourSeenAtLoadRef.current,
-      onboardingReady: tourAutoLaunchReady && welcome.resolved,
-      // Treat "not resolved yet" as pending so tips can't pop ahead of a consent
-      // modal that the in-flight status fetch is about to raise.
-      telemetryPending: !telemetryConsentKnown || telemetryConsentNeeded,
+      onboardingReady: tourAutoLaunchReady,
       tourActive: tour.isTourActive,
       automated: isAutomatedSession(),
     });
@@ -2501,15 +2479,7 @@ function AppContent({
     // appeared for that load. The ref already makes the pop one-shot, so the
     // only cleanup needed is on unmount (below).
     tipsAutoPopFrameRef.current = requestAnimationFrame(() => tips.open());
-  }, [
-    tips,
-    tourSeenKnown,
-    tourAutoLaunchReady,
-    welcome.resolved,
-    telemetryConsentKnown,
-    telemetryConsentNeeded,
-    tour.isTourActive,
-  ]);
+  }, [tips, tourSeenKnown, tourAutoLaunchReady, tour.isTourActive]);
 
   // Drop a still-pending auto-pop frame on unmount only, so a committed open is
   // never cancelled by an unrelated re-render (see the effect above).
@@ -2526,8 +2496,31 @@ function AppContent({
   // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
   // before caps.cityhall settles. Early return (matching the other loading
   // gates) rather than a wrapper so the shell markup stays unindented. See #7.
-  if (!serverAboutLoaded) {
+  const setupViewer = {
+    status: setup.status ?? null,
+    readOnly: caps.readOnly,
+    cityhall: caps.cityhall,
+    automated: isAutomatedSession(),
+  };
+  const setupBannerSteps = bannerSteps(setupViewer);
+  // Also hold it until setup status answers, so a fresh install never sees the dashboard flash before /setup.
+  if (!serverAboutLoaded || setup.status === undefined) {
     return <div className="h-(--app-height) bg-surface-900 safe-area-inset" />;
+  }
+  if (setupMatch) {
+    if (!setup.status) return <Navigate to="/" replace />;
+    return (
+      <SetupWizardPage
+        status={setup.status}
+        about={serverAbout}
+        profile={serverAbout?.profile ?? ""}
+        refresh={setup.refresh}
+        onLeave={() => navigate("/")}
+      />
+    );
+  }
+  if (shouldRedirectToSetup({ ...setupViewer, pathname: location.pathname })) {
+    return <Navigate to="/setup" replace />;
   }
 
   // The header collapse is a phone affordance for the conversation view only:
@@ -2712,17 +2705,6 @@ function AppContent({
             <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
           )}
 
-          {welcome.showWelcome && (
-            <ThemeIntro
-              onDone={welcome.dismissWelcome}
-              tourFollows={!isCoarse}
-              onSkipTour={() => {
-                handleTourSeen();
-                welcome.dismissWelcome();
-              }}
-            />
-          )}
-
           {tour.tourElement}
 
           {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
@@ -2739,7 +2721,6 @@ function AppContent({
           )}
 
           {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-          {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
           {deletingSession && deletingCleanupDefaults && (
             <DeleteSessionDialog

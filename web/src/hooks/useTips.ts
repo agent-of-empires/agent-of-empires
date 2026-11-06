@@ -6,21 +6,12 @@ export interface TipsAutoPopGate {
   hasUnseen: boolean;
   tourSeenAtLoad: boolean | null;
   onboardingReady: boolean;
-  telemetryPending: boolean;
   tourActive: boolean;
   automated: boolean;
 }
 
 export function shouldAutoPopTips(g: TipsAutoPopGate): boolean {
-  return (
-    g.loaded &&
-    g.hasUnseen &&
-    g.tourSeenAtLoad === true &&
-    g.onboardingReady &&
-    !g.telemetryPending &&
-    !g.tourActive &&
-    !g.automated
-  );
+  return g.loaded && g.hasUnseen && g.tourSeenAtLoad === true && g.onboardingReady && !g.tourActive && !g.automated;
 }
 
 export interface UseTipsResult {

@@ -650,14 +650,8 @@
       "id": "settings.telemetry-consent",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/TelemetrySettings.test.tsx",
-        "src/components/__tests__/TelemetryConsentModal.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/TelemetrySettings.tsx",
-        "web/src/components/TelemetryConsentModal.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/TelemetrySettings.test.tsx"],
+      "components": ["web/src/components/settings/TelemetrySettings.tsx"]
     },
     {
       "id": "settings.logs-tab",
@@ -5189,25 +5183,46 @@
       ]
     },
     {
-      "id": "onboarding.theme-welcome",
+      "id": "onboarding.setup-wizard",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/theme-onboarding.spec.ts"],
+      "specs": ["tests/setup-wizard.spec.ts"],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/App.tsx",
+        "web/src/components/Dashboard.tsx",
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupRail.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/ui.tsx",
+        "web/src/components/setup/steps/ThemeTelemetryStep.tsx",
+        "web/src/components/setup/steps/AgentsStep.tsx",
+        "web/src/hooks/useSetupStatus.ts",
         "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/setup.ts",
         "web/src/lib/api.ts"
       ]
     },
     {
-      "id": "onboarding.theme-welcome-unit",
+      "id": "onboarding.setup-unit",
       "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/onboarding/__tests__/ThemeIntro.test.tsx", "src/lib/__tests__/onboarding.test.ts"],
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/setup.test.ts",
+        "src/components/setup/__tests__/SetupBanner.test.tsx",
+        "src/components/setup/__tests__/SetupWizardPage.test.tsx",
+        "src/hooks/__tests__/useInlineMachineSave.test.ts"
+      ],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
-        "web/src/hooks/useThemeMutation.ts",
-        "web/src/lib/themeWrites.ts"
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/SetupElevationBar.tsx",
+        "web/src/components/setup/steps/ProjectStep.tsx",
+        "web/src/components/setup/steps/WorktreesStep.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx",
+        "web/src/components/setup/steps/AccessStep.tsx",
+        "web/src/hooks/useInlineMachineSave.ts",
+        "web/src/lib/fetchInterceptor.ts",
+        "web/src/lib/setup.ts"
       ]
     },
     {
