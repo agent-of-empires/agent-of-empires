@@ -68,34 +68,29 @@ impl AoeIngress {
         epoch: u64,
         now_ms: i64,
     ) -> Ingested {
+        let update = serde_json::to_value(&notification.update);
+        // A tailer frame carries an anchor even when its envelope is invalid,
+        // and takes no adapter frame number.
+        let is_adapter_frame = !update.as_ref().is_ok_and(aoe_meta::is_anchored);
         if self.lost.load(Ordering::Relaxed) {
             // Nothing is delivered, but the proxy keeps numbering adapter
             // frames, so the count must too or anchors lag after recovery.
-            let anchored = serde_json::to_value(&notification.update)
-                .ok()
-                .and_then(|v| aoe_meta::from_update_value(&v).ok().flatten())
-                .is_some_and(|e| e.after_adapter_sequence.is_some());
-            if !anchored {
-                self.order
-                    .lock()
-                    .expect("aoe ordering mutex poisoned")
-                    .count_frame();
+            if is_adapter_frame {
+                self.count_adapter_frame();
             }
             return Ingested::Deliver(Vec::new());
         }
         let proxied = self.proxied.load(Ordering::Relaxed);
-        let envelope = match serde_json::to_value(&notification.update)
+        let envelope = match update
+            .as_ref()
             .map_err(|e| e.to_string())
-            .and_then(|v| aoe_meta::from_update_value(&v).map_err(|e| e.to_string()))
+            .and_then(|v| aoe_meta::from_update_value(v).map_err(|e| e.to_string()))
         {
             Ok(envelope) => envelope,
             Err(detail) if proxied => {
-                // A malformed envelope cannot be anchored, so it was an
-                // adapter frame the proxy numbered.
-                self.order
-                    .lock()
-                    .expect("aoe ordering mutex poisoned")
-                    .count_frame();
+                if is_adapter_frame {
+                    self.count_adapter_frame();
+                }
                 return self.lose(IntegrationLostReason::ContractViolation { detail });
             }
             Err(_) => None,
@@ -148,6 +143,13 @@ impl AoeIngress {
             });
         }
         Ingested::Deliver(deliver)
+    }
+
+    fn count_adapter_frame(&self) {
+        self.order
+            .lock()
+            .expect("aoe ordering mutex poisoned")
+            .count_frame();
     }
 
     fn lose(&self, reason: IntegrationLostReason) -> Ingested {
@@ -302,5 +304,29 @@ mod tests {
         i.session_reset();
         let anchored = json!({"v":1,"key":"t","after_adapter_sequence":3});
         assert_eq!(ids(i.ingest(frame("t", anchored), true, 0, 0)), ["t"]);
+    }
+
+    #[test]
+    fn an_invalid_anchored_frame_takes_no_adapter_frame_number() {
+        let i = ingress(true);
+        assert_eq!(ids(i.ingest(frame("f1", json!(null)), true, 0, 0)), ["f1"]);
+        // Anchored but with an empty key: invalid, yet still a tailer frame.
+        let bad = json!({"v":1,"key":"","after_adapter_sequence":9});
+        assert!(matches!(
+            i.ingest(frame("bad", bad.clone()), true, 0, 0),
+            Ingested::Lost(_)
+        ));
+        // Swallowed while lost: also uncounted.
+        assert!(ids(i.ingest(frame("bad2", bad), true, 0, 0)).is_empty());
+        i.session_reset();
+        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":2});
+        assert!(
+            ids(i.ingest(frame("t", anchored), true, 0, 0)).is_empty(),
+            "held for frame 2"
+        );
+        assert_eq!(
+            ids(i.ingest(frame("f2", json!(null)), true, 0, 0)),
+            ["f2", "t"]
+        );
     }
 }
