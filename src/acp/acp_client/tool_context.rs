@@ -94,6 +94,20 @@ pub(super) fn raw_input_has_no_user_context(raw_input: &serde_json::Value) -> bo
     }
 }
 
+/// The `command` a Bash call was launched with, capped to a readable length.
+pub(super) fn shell_command(cache: &ToolContextCache, tool_call_id: &str) -> Option<String> {
+    const MAX_COMMAND_BYTES: usize = 16 * 1024;
+    let raw = cache
+        .lock()
+        .expect("tool context cache mutex poisoned")
+        .get(tool_call_id)?;
+    let command = raw.get("command")?.as_str()?;
+    let end = (0..=MAX_COMMAND_BYTES.min(command.len()))
+        .rev()
+        .find(|&i| command.is_char_boundary(i))?;
+    Some(command[..end].to_string())
+}
+
 pub(super) fn update_tool_context_cache(
     cache: &ToolContextCache,
     event: &Event,

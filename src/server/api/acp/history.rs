@@ -193,6 +193,82 @@ pub(crate) fn read_log_tail(
     Ok((lines[start..].to_vec(), truncated, true))
 }
 
+const TASK_OUTPUT_TAIL_LINES: usize = 5000;
+
+#[derive(Debug, Serialize)]
+pub struct TaskOutputResponse {
+    /// False when the file is gone or lives off this host (sandboxed session).
+    pub exists: bool,
+    pub output: String,
+    /// The file exceeded the read window, so the output starts mid-file.
+    pub truncated: bool,
+}
+
+/// Tail of a background shell's output file. The path is rebuilt from the
+/// session and task ids, never taken from the client or the agent.
+pub async fn acp_task_output(
+    State(state): State<Arc<AppState>>,
+    Path((id, task_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    let Some(inst) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let claude_session = inst.agent_session_id.unwrap_or_default();
+    let found = tokio::task::spawn_blocking(move || {
+        let root = PathBuf::from("/tmp").join(format!("claude-{}", nix::unistd::getuid().as_raw()));
+        let Some(path) = claude_task_output_path(&root, &claude_session, &task_id) else {
+            return Ok((Vec::new(), false, false));
+        };
+        read_log_tail(&path, TASK_OUTPUT_TAIL_LINES)
+    })
+    .await;
+    match found {
+        Ok(Ok((lines, truncated, exists))) => Json(TaskOutputResponse {
+            exists,
+            output: lines.join("\n"),
+            truncated,
+        })
+        .into_response(),
+        Ok(Err(e)) => blocking_failed("task output read failed", e),
+        Err(e) => blocking_failed("blocking task failed", e),
+    }
+}
+
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `<root>/<project>/<session>/tasks/<task>.output`, where Claude Code writes
+/// a backgrounded command's output under `/tmp/claude-<uid>`. Only a regular
+/// file counts, so a symlink planted in the directory is never followed.
+fn claude_task_output_path(
+    root: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Option<PathBuf> {
+    if !is_plain_id(session_id) || !is_plain_id(task_id) {
+        return None;
+    }
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|project| {
+            project
+                .path()
+                .join(session_id)
+                .join("tasks")
+                .join(format!("{task_id}.output"))
+        })
+        .find(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()))
+}
+
 /// A markdown recap of the persisted transcript, offered after a failed
 /// `session/load` left the agent without context (#1004).
 pub async fn acp_context_primer(
@@ -434,6 +510,24 @@ mod tests {
     use super::*;
     use crate::acp::state::Event;
     use std::io::Write;
+
+    #[test]
+    fn task_output_path_is_rebuilt_from_plain_ids_only() {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("-proj").join("sess-1").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("abc123.output"), "hi").unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", tasks.join("link.output")).unwrap();
+
+        let find = |session: &str, task: &str| claude_task_output_path(root.path(), session, task);
+        assert_eq!(find("sess-1", "abc123"), Some(tasks.join("abc123.output")));
+        assert_eq!(find("sess-1", "missing"), None);
+        assert_eq!(find("sess-1", "link"), None, "symlinks are not followed");
+        for bad in ["", "../x", "a/b", "..", "a.b"] {
+            assert_eq!(find("sess-1", bad), None, "task id {bad:?}");
+            assert_eq!(find(bad, "abc123"), None, "session id {bad:?}");
+        }
+    }
 
     #[test]
     fn read_log_tail_windows_and_partial_lines() {

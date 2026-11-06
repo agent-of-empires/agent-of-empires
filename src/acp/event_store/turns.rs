@@ -947,6 +947,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let chunk = || Event::AgentMessageChunk {
             text: "x".into(),
@@ -1028,6 +1029,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -1065,6 +1067,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         store.record("s-1", 1, &started("t-1")).unwrap();
         store.record("s-1", 2, &started("t-2")).unwrap();
@@ -1120,6 +1123,7 @@ mod tests {
                     tool_call_id: Some("toolu_wf".into()),
                     description: "drafts".into(),
                     workflow: Some(launch.clone()),
+                    started_at: None,
                 },
                 workflow_agent("a1", "wf_1"),
                 workflow_agent("a2", "wf_1"),
