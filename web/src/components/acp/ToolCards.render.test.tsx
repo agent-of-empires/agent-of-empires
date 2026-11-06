@@ -258,11 +258,35 @@ describe("ToolCard headers", () => {
       [],
     ],
     ["task stop", fixtures.taskStop, undefined, { toolKey: "claude" }, ["task stop", "task-abc123"], []],
+    [
+      "send message",
+      fixtures.sendMessage,
+      undefined,
+      { toolKey: "claude" },
+      ["send message", "ace246fde7e3ac073", "Fix graph diff bug"],
+      ["Follow-up fix details"],
+    ],
     ["empty tool search", makeToolCall({ name: "ToolSearch" }), undefined, { toolKey: "claude" }, ["search tools"], []],
     ["empty monitor", makeToolCall({ name: "Monitor" }), undefined, { toolKey: "claude" }, ["background watch"], []],
     ["empty task stop", makeToolCall({ name: "TaskStop" }), undefined, { toolKey: "claude" }, ["stop task"], []],
+    [
+      "empty send message",
+      makeToolCall({ name: "SendMessage" }),
+      undefined,
+      { toolKey: "claude" },
+      ["send message"],
+      [],
+    ],
     // Harness names are Claude-only; a coincidental Monitor elsewhere is generic.
     ["codex Monitor", fixtures.monitor, undefined, { toolKey: "codex" }, ["Monitor"], ["errors in deploy.log"]],
+    [
+      "codex SendMessage",
+      fixtures.sendMessage,
+      undefined,
+      { toolKey: "codex" },
+      ["SendMessage"],
+      ["Fix graph diff bug"],
+    ],
   ])("%s", (_label, tool, result, opts, contains, excludes) => {
     const { text } = renderCard(tool, result, opts);
     for (const s of contains) expect(text()).toContain(s);
