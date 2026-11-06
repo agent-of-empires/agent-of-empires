@@ -432,7 +432,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Structured view",
         widget = "select",
-        options = "off:Off,terminal:Terminal view,structured:Structured view"
+        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view"
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
@@ -1900,9 +1900,10 @@ pub enum NewSessionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredView {
+    #[default]
+    Auto,
     Off,
     Terminal,
-    #[default]
     Structured,
 }
 

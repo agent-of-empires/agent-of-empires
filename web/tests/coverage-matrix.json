@@ -1252,7 +1252,7 @@
         "web/src/components/sidebar/sessionActionTargets.ts",
         "web/src/hooks/useSessions.ts"
       ],
-      "notes": "acp.structured_view = off hides the wizard toggle and the sidebar switch to structured view, including across profile changes, import exit and pin responses; terminal and structured preselect that view."
+      "notes": "acp.structured_view = auto or structured preselects structured in the wizard, while terminal preselects terminal; off hides the wizard toggle and sidebar switch to structured view, including across profile changes, import exit and pin responses."
     },
     {
       "id": "wizard.create-progress",
