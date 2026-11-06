@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { useState } from "react";
@@ -148,4 +148,53 @@ it("stays on the step and reports it when keeping the defaults fails to save", a
   fireEvent.click(await screen.findByRole("button", { name: "Next" }));
   expect((await screen.findByRole("alert")).textContent).toBe("Disk full");
   expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
+});
+
+it("telemetry waits for the saved choice, then Next saves it instead of confirming the step", async () => {
+  let answer!: () => void;
+  const consent: unknown[] = [];
+  server.use(
+    http.get(
+      "*/api/telemetry/status",
+      () =>
+        new Promise<Response>(
+          (resolve) =>
+            (answer = () => resolve(HttpResponse.json({ enabled: true, responded: true, do_not_track: false }))),
+        ),
+    ),
+    http.post("*/api/telemetry/consent", async ({ request }) => {
+      consent.push(await request.json());
+      return HttpResponse.json({ enabled: true, responded: true, do_not_track: false });
+    }),
+  );
+  renderPage(status(["agents"]), "/setup?step=theme_telemetry");
+  await waitFor(() => expect(answer).toBeDefined());
+  expect(screen.getByText("Loading your current choice…")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+
+  await act(async () => answer());
+  const sharing = await screen.findByRole("radio", { name: /Share anonymous usage counts/ });
+  expect((sharing as HTMLInputElement).checked).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Agents" });
+  expect(consent).toEqual([{ enabled: true }]);
+  expect(patches).toEqual([]);
+});
+
+it("a failed telemetry read offers a retry and keeps Next disabled", async () => {
+  let fail = true;
+  server.use(
+    http.get("*/api/telemetry/status", () =>
+      fail
+        ? new HttpResponse(null, { status: 500 })
+        : HttpResponse.json({ enabled: false, responded: true, do_not_track: false }),
+    ),
+  );
+  renderPage(status(["agents"]), "/setup?step=theme_telemetry");
+  expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load your current choice");
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  expect(await screen.findByRole("radio", { name: /Not now/ })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false);
 });
