@@ -22,7 +22,7 @@ async function consume(page: Page, route: Route, json: unknown, revision: bigint
 }
 async function polls(page: Page) {
   const held: Route[] = [];
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     held.push(r);
   });
   return async () => {

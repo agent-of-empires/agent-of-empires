@@ -17,7 +17,7 @@ test.describe("Sidebar", () => {
   test("sidebar Projects section lists a no-session saved project with an add button", async ({ page }) => {
     // A saved project needs served-profile authority and an online session list.
     await page.route("**/api/about", (r) => r.fulfill({ json: { profile: "default" } }));
-    await page.route("**/api/sessions", (r) =>
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
       r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: { sessions: [], workspace_ordering: [] },
@@ -88,7 +88,7 @@ test.describe("Create session from home screen", () => {
     // Ported from the live wizard-open-close story. Stub /api/sessions
     // so useSessions reports the server reachable; otherwise the
     // offline-state UI disables the sidebar "New session" trigger.
-    await page.route("**/api/sessions", (r) =>
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
       r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: { sessions: [], workspace_ordering: [] },
@@ -175,7 +175,7 @@ test.describe("Mobile responsive", () => {
         trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
       }),
     );
-    await page.route("**/api/sessions", (route) =>
+    await page.route(/\/api\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: { sessions, workspace_ordering: [] },

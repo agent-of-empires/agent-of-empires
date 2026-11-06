@@ -599,6 +599,7 @@ fn wizard_create_body(
         callback_url: None,
         idempotency_key: None,
         retry_origin: None,
+        parent_session_id: None,
         cli: None,
     }
 }
