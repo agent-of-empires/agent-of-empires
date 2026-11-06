@@ -27,6 +27,7 @@ const defaults = (over: Partial<Extract<Action, { type: "APPLY_PROFILE_DEFAULTS"
   yoloMode: false,
   sandboxEnabled: false,
   worktreeEnabled: false,
+  workspaceByDefault: false,
   tool: "claude",
   extraEnv: [],
   skipIfDirty: true,
@@ -35,6 +36,17 @@ const defaults = (over: Partial<Extract<Action, { type: "APPLY_PROFILE_DEFAULTS"
 const run = (state: WizardState, ...actions: Action[]) => actions.reduce(reducer, state);
 
 describe("APPLY_PROFILE_DEFAULTS", () => {
+  it("seeds the workspace toggle until it is edited, and a profile pick resets the edit", () => {
+    const seed = defaults({ workspaceByDefault: true });
+    expect(reducer(makeState(), seed).data.useWorkspace).toBe(true);
+    const edited = reducer(reducer(makeState(), seed), { type: "SET_FIELD", field: "useWorkspace", value: false });
+    expect(reducer(edited, seed).data.useWorkspace).toBe(false);
+    expect(reducer(edited, { ...seed, skipIfDirty: false }).data).toMatchObject({
+      useWorkspace: true,
+      workspaceDirty: false,
+    });
+  });
+
   it("seeds profile defaults and clears profileDirty", () => {
     const next = reducer(
       makeState(),

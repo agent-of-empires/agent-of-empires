@@ -167,7 +167,8 @@ function waitUntilVisible(): Promise<void> {
 function worktreeSummary(data: WizardData): string {
   const name = data.worktreeBranch.trim() || "auto";
   if (data.attachExisting) return `${name}, existing branch`;
-  return data.baseBranch.trim() ? `${name}, new from ${data.baseBranch.trim()}` : `${name}, new branch`;
+  const branch = data.baseBranch.trim() ? `${name}, new from ${data.baseBranch.trim()}` : `${name}, new branch`;
+  return data.useWorkspace || data.extraRepoPaths.length > 0 ? `${branch}, workspace` : branch;
 }
 
 const basename = (path: string) => path.replace(/\/+$/, "").split("/").pop() || path;

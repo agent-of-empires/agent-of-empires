@@ -22,6 +22,9 @@ export interface WizardData {
   /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
    *  a project override seed. */
   worktreeDirty: boolean;
+  /** Start in a workspace directory even with one repo. Attaching to an existing branch overrides it. */
+  useWorkspace: boolean;
+  workspaceDirty: boolean;
   /** Attach to an existing branch's worktree (`create_new_branch: false`). */
   attachExisting: boolean;
   /** Empty means the project's default branch. */
@@ -99,6 +102,7 @@ export type Action =
       yoloMode: boolean;
       sandboxEnabled: boolean;
       worktreeEnabled: boolean;
+      workspaceByDefault: boolean;
       tool: string;
       extraEnv: string[];
       agentModel?: string;
@@ -126,6 +130,8 @@ export const initialData: WizardData = {
   projectSandboxOverride: undefined,
   sandboxDirty: false,
   worktreeDirty: false,
+  useWorkspace: false,
+  workspaceDirty: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -153,7 +159,16 @@ export const initialData: WizardData = {
 };
 
 // Tracked even without a profile so mount-time seeding does not stomp early edits.
-const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"];
+const PROFILE_FIELDS = [
+  "yoloMode",
+  "sandboxEnabled",
+  "useWorktree",
+  "useWorkspace",
+  "tool",
+  "extraEnv",
+  "agentModel",
+  "agentEffort",
+];
 
 function setField(data: WizardData, field: string, value: unknown): WizardData {
   const next = { ...data, [field]: value };
@@ -212,6 +227,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
   if (field === "useWorktree") next.worktreeDirty = true;
+  if (field === "useWorkspace") next.workspaceDirty = true;
   if (field === "sandboxEnabled") next.sandboxDirty = true;
   if (field === "useStructuredView") next.structuredViewDirty = true;
   // An import is the one thing that outranks `off`, so the choice it forced ends with it.
@@ -335,6 +351,7 @@ function reduce(state: WizardState, action: Action): WizardState {
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
+            useWorkspace: state.data.workspaceDirty ? state.data.useWorkspace : action.workspaceByDefault,
             sandboxEnabled: state.data.sandboxDirty ? state.data.sandboxEnabled : resolvedSandbox,
           },
         };
@@ -348,6 +365,8 @@ function reduce(state: WizardState, action: Action): WizardState {
           profileSandboxDefault: action.sandboxEnabled,
           useWorktree: resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
+          useWorkspace: action.workspaceByDefault,
+          workspaceDirty: false,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",

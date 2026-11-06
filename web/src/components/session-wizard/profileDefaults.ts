@@ -24,6 +24,7 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
     yoloMode: (session?.yolo_mode_default as boolean) ?? false,
     sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
     worktreeEnabled: (worktree?.enabled as boolean) ?? false,
+    workspaceByDefault: (worktree?.workspace_by_default as boolean) ?? false,
     tool,
     // Without the profile env, an empty extra_env makes the backend use the wrong profile's env.
     extraEnv: Array.isArray(sandbox?.environment)

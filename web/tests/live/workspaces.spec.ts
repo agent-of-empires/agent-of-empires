@@ -1,10 +1,10 @@
 // Workspace and project structure against a real server: ordering, project pins, attaching repos.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, waitForSessions } from "../helpers/aoeServe";
 import { gitEnv, initWorkingRepo } from "../helpers/gitFixture";
 import { readVisibleSessionTitles, seedSessionsInRepo } from "../helpers/sidebar";
 
@@ -126,6 +126,51 @@ test("saved-unpinned hidden; pin POSTs; unpin keeps the saved project", async ({
   // Still a registered Project, so ◆ gives way to ◇.
   await expect(headerA.locator("[data-testid='sidebar-group-project-marker']")).toBeVisible();
   expect((await savedProjects()).some((p) => p.path === repoA)).toBe(true);
+});
+
+test("wizard starts a one-repo workspace from the setting, and attaching does not move it", async ({
+  page,
+  spawnServe,
+}) => {
+  const serve = await spawnServe({
+    seedFn: ({ home, xdg, env }) => {
+      initWorkingRepo(join(home, "backend"), env);
+      initWorkingRepo(join(home, "frontend"), env);
+      appendFileSync(
+        join(appDirFor(home, xdg, resolveAoeBinary()), "config.toml"),
+        "\n[worktree]\nworkspace_by_default = true\n",
+      );
+    },
+  });
+  await page.goto(serve.baseUrl);
+  await page.getByRole("button", { name: "New session", exact: true }).first().click();
+  const wizard = page.getByTestId("session-wizard");
+  await wizard.getByRole("option").filter({ hasText: "backend" }).click();
+  await wizard.getByPlaceholder("Auto-generated if empty").fill("solo");
+  await wizard.getByRole("switch", { name: "Create a worktree" }).click();
+  const summary = wizard.getByRole("button", { name: "Configure worktree" });
+  await expect(summary).toContainText("workspace");
+  await summary.click();
+  await expect(wizard.getByRole("switch", { name: "Workspace directory" })).toBeChecked();
+  await wizard.getByRole("button", { name: "Back" }).click();
+  await wizard.getByRole("button", { name: /Launch session/ }).click();
+
+  const [session] = await waitForSessions(serve.baseUrl);
+  const workspaceDir = session!.project_path as string;
+  expect(workspaceDir).toContain("-workspace-");
+  expect(session!.workspace_repos).toHaveLength(1);
+
+  const attached = await fetch(`${serve.baseUrl}/api/sessions/${session!.id}/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: join(serve.home, "frontend") }),
+  });
+  expect(attached.status, await attached.clone().text()).toBe(200);
+  const body = (await attached.json()) as { outcome: { attached: { moved_to: string | null } } };
+  expect(body.outcome.attached.moved_to).toBeNull();
+  const [after] = await listSessions(serve.baseUrl);
+  expect(after!.project_path).toBe(workspaceDir);
+  expect(after!.workspace_repos).toHaveLength(2);
 });
 
 test("attaching a project over the daemon converts the session into a workspace", async ({ spawnServe }) => {

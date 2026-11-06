@@ -401,6 +401,8 @@ export interface CreateSessionRequest {
   worktree_enabled?: boolean;
   worktree_branch?: string;
   create_new_branch?: boolean;
+  /** Start in a workspace directory even with no `extra_repo_paths`. Requires worktree mode. */
+  workspace?: boolean;
   /** Only honored when `create_new_branch` is true; empty means repo default. */
   base_branch?: string;
   sandbox?: boolean;
