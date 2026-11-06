@@ -706,6 +706,21 @@ impl HomeView {
         row >= list_y && row < list_bottom
     }
 
+    fn seed_preview_scroll_from_view(&mut self) {
+        if matches!(self.view_mode, ViewMode::Terminal)
+            && self.live_send.is_none()
+            && self.preview_scroll_offset == 0
+            && self.preview_selection.is_none()
+        {
+            let view = self.preview_text_view;
+            self.preview_scroll_offset = view
+                .total_lines
+                .saturating_sub(view.pane.height as usize)
+                .saturating_sub(view.first_line)
+                .min(u16::MAX as usize) as u16;
+        }
+    }
+
     /// Begin a drag if `(col, row)` is on the divider or inside the preview pane, in or
     /// out of live mode. True when a drag started, so the caller marks the event handled
     /// and skips the row-click path.
@@ -734,6 +749,7 @@ impl HomeView {
         // empty pane is a no-op rather than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
+            self.seed_preview_scroll_from_view();
             let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
                 anchor: cell,
@@ -3166,9 +3182,11 @@ impl HomeView {
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
+                self.seed_preview_scroll_from_view();
                 self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
             }
             ActionId::PreviewScrollDown => {
+                self.seed_preview_scroll_from_view();
                 self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
             }
             // `App` handles the chord before the home view sees it.
@@ -4832,6 +4850,7 @@ impl HomeView {
 
         let visible_height = active_cache.dimensions.1.saturating_sub(1) as usize;
         let real_max = active_cache.captured_lines.saturating_sub(visible_height) as u16;
+        self.seed_preview_scroll_from_view();
 
         let new_offset = self.preview_scroll_offset.saturating_add(STEP);
         let clamped = new_offset.min(real_max);
@@ -6140,6 +6159,7 @@ impl HomeView {
             self.preview_scroll_offset = 0;
             return true;
         }
+        self.seed_preview_scroll_from_view();
         if self.preview_scroll_offset == 0 {
             return false;
         }
