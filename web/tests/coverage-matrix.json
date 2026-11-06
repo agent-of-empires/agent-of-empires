@@ -974,6 +974,14 @@
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
+      "id": "notifications.linked-toasts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/Toasts.test.tsx"],
+      "components": ["web/src/components/Toasts.tsx"],
+      "notes": "A toast that opens a session (in-app push) or a validated URL (plugin ui.open_url) renders its message as a native button before Dismiss in tab order: activating it opens the target once and dismisses the toast, a click elsewhere on the toast still opens it, and Dismiss closes it without navigating. Plain toasts keep a non-interactive message; status and alert roles are unchanged."
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",

@@ -184,6 +184,53 @@ describe("click-to-open (ui.open_url) toast", () => {
   });
 });
 
+// #5344: a linked toast opened only through the outer div's pointer handler.
+describe("linked toasts from the keyboard", () => {
+  it("open through a focusable button once, before Dismiss in tab order; Dismiss never navigates", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the toast arrives, its message, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "Done", session_id: "sess-1" } }),
+        "Done",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+      [
+        () => act(() => toastBus.handler?.openLink("Review PR", "https://example.com/pr/1")),
+        "Review PR",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+    ];
+    for (const [arrive, message, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const toast = screen.getByText(message).closest("[role]") as HTMLElement;
+      const buttons = within(toast).getAllByRole("button");
+      const opener = within(toast).getByRole("button", { name: message });
+      expect(buttons.indexOf(opener), message).toBe(0);
+      expect(buttons.at(-1)?.getAttribute("aria-label"), message).toBe("Dismiss");
+      opener.focus();
+      expect(document.activeElement, message).toBe(opener);
+      // Enter or Space on a native button is a click.
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, message).toBe(1);
+      opened();
+      expect(screen.queryByText(message), message).toBeNull();
+
+      arrive();
+      const again = screen.getByText(message).closest("[role]") as HTMLElement;
+      act(() => fireEvent.click(within(again).getByRole("button", { name: "Dismiss" })));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, `${message}: Dismiss`).toBe(1);
+      expect(screen.queryByText(message), message).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
+});
+
 describe("ToastBusBridge", () => {
   it("wires the bus only inside a provider and unwires on unmount", () => {
     const outside = render(<ToastBusBridge />);

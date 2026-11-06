@@ -157,7 +157,22 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : "bg-surface-800 border-surface-700 text-text-primary"
               } ${clickable ? "cursor-pointer hover:bg-surface-700 transition-colors" : ""}`}
             >
-              <span className="flex-1 break-words">{t.message}</span>
+              {clickable ? (
+                // The message is the toast's own control, so the keyboard can follow its link; a click on the
+                // rest of the toast still opens it through the outer handler.
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToastClick();
+                  }}
+                  className="flex-1 break-words text-left cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
+                >
+                  {t.message}
+                </button>
+              ) : (
+                <span className="flex-1 break-words">{t.message}</span>
+              )}
               {t.action && (
                 <button
                   type="button"
