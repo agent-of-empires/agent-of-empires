@@ -81,3 +81,39 @@ it("a save that may not have landed is not reported as saved", async () => {
   const { result } = renderHook(() => useInlineMachineSave());
   await expect(result.current.save({ worktree: { enabled: true } })).resolves.toBe(false);
 });
+
+it("a request cancelled while elevating never retries its write", async () => {
+  const bodies: unknown[] = [];
+  let elevate!: () => void;
+  server.use(
+    http.patch("*/api/settings", async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json({ error: "elevation_required" }, { status: 403 });
+    }),
+    http.post(
+      "*/api/login/elevate",
+      () =>
+        new Promise<Response>((resolve) => (elevate = () => resolve(HttpResponse.json({ elevated_until_secs: 900 })))),
+    ),
+  );
+  const { result } = renderHook(() => useInlineMachineSave());
+  let first: Promise<boolean> | undefined;
+  act(() => {
+    first = result.current.save({ worktree: { enabled: true } });
+  });
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  let submitted: Promise<string | null> | undefined;
+  act(() => {
+    submitted = result.current.elevation!.submit("right");
+  });
+  await waitFor(() => expect(elevate).toBeDefined());
+  act(() => {
+    void result.current.save({ sandbox: { enabled_by_default: true } });
+  });
+  await expect(first).resolves.toBe(false);
+  await act(async () => {
+    elevate();
+    await submitted;
+  });
+  expect(bodies).toEqual([{ worktree: { enabled: true } }, { sandbox: { enabled_by_default: true } }]);
+});
