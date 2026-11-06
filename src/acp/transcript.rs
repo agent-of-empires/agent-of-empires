@@ -899,11 +899,11 @@ pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall
             &incoming.args_preview,
             &prev.args_preview,
         ),
-        // A sparse or unchanged repeat keeps the earlier prompt; changed arguments drop it.
+        // A repeat that carries no `prompt` of its own (sparse, or bookkeeping-only
+        // args) keeps the earlier one; a repeat with its own prompt replaces it.
         prompt: incoming.prompt.clone().or_else(|| {
-            let unchanged = incoming.args_preview.trim().is_empty()
-                || incoming.args_preview == prev.args_preview;
-            prev.prompt.clone().filter(|_| unchanged)
+            let restates = incoming.args_preview.contains(r#""prompt""#);
+            prev.prompt.clone().filter(|_| !restates)
         }),
         started_at: incoming.started_at.max(prev.started_at),
         parent_tool_call_id: incoming
@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_start_keeps_the_full_prompt_only_while_the_arguments_match() {
+    fn a_repeated_start_keeps_the_full_prompt_unless_it_restates_a_prompt() {
         let mut prev = tool("t", "Task");
         prev.args_preview = r#"{"prompt":"cut"#.into();
         prev.prompt = Some("full prompt".into());
@@ -993,6 +993,12 @@ mod tests {
         let mut changed = tool("t", "Task");
         changed.args_preview = r#"{"prompt":"other"}"#.into();
         assert_eq!(merge_tool_start(&prev, &changed).prompt, None);
+        let mut bookkeeping = tool("t", "Task");
+        bookkeeping.args_preview = r#"{"_aoe_title":"external_directory"}"#.into();
+        assert_eq!(
+            merge_tool_start(&prev, &bookkeeping).prompt.as_deref(),
+            Some("full prompt")
+        );
     }
 
     fn started(tool_call: ToolCall) -> Event {
