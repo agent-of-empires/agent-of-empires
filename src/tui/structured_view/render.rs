@@ -2810,6 +2810,7 @@ mod tests {
         });
         state.transcript.server_rows = server_rows(&[
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "Hello.".into(),
                 attachments: Vec::new(),
@@ -2848,6 +2849,7 @@ mod tests {
 
         // A plugin-sent message names its sender; a typed one does not.
         state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "PR merged".into(),
             attachments: Vec::new(),

@@ -410,6 +410,7 @@ mod tests {
         }
         fn prompt(text: &str) -> Event {
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: text.to_string(),
                 attachments: Vec::new(),

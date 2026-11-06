@@ -379,6 +379,7 @@ mod tests {
 
     fn user(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
@@ -388,6 +389,7 @@ mod tests {
     }
     fn synthesized_user(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
@@ -438,6 +440,7 @@ mod tests {
     #[test]
     fn extract_labels_a_plugin_message_with_its_sender_not_as_the_user() {
         let plugin = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "PR #7 was merged".into(),
             attachments: vec![],

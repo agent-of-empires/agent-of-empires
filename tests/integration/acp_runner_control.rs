@@ -2237,6 +2237,7 @@ for line in sys.stdin:
         id,
         1,
         &Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "keep going".into(),
             attachments: vec![],
             prompt_id: None,
