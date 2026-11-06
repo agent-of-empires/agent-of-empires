@@ -383,6 +383,16 @@ mod tests {
                 vec!["sequence_beyond_stream"],
             ),
             (
+                "a retransmitted adapter frame still takes its number",
+                vec![
+                    update(r#"{"v":1,"key":"k","ephemeral":true}"#),
+                    update(r#"{"v":1,"key":"k","ephemeral":true}"#),
+                    update(r#"{"v":1,"key":"t","after_adapter_sequence":2,"ephemeral":true}"#),
+                ],
+                false,
+                vec![],
+            ),
+            (
                 "anchor reached",
                 vec![
                     update(r#"{"v":1,"key":"a","after_adapter_sequence":1,"ephemeral":true}"#),

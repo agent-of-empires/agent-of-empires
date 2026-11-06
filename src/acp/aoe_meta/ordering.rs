@@ -77,16 +77,14 @@ impl<T> ArrivalOrder<T> {
         self.held_len >= MAX_HELD
     }
 
-    /// The frames to deliver now, in order: a duplicate yields none, a frame
-    /// whose anchor has not arrived is held, and an adapter frame is followed
-    /// by every held frame its number releases.
+    /// The frames to deliver now, in order: a duplicate delivers nothing, a
+    /// frame whose anchor has not arrived is held, and an adapter frame is
+    /// followed by every held frame its number releases. A duplicate adapter
+    /// frame still takes its number; a duplicate anchored frame takes none.
     pub fn arrive(&mut self, arrival: Arrival<'_>, item: T) -> Result<Vec<T>, HoldOverflow> {
-        if let Some(key) = arrival.key {
-            if !self.remember(key) {
-                return Ok(Vec::new());
-            }
-        }
+        let duplicate = arrival.key.is_some_and(|key| !self.remember(key));
         match arrival.after_adapter_sequence {
+            Some(_) if duplicate => Ok(Vec::new()),
             Some(anchor) if anchor > self.adapter_frames => {
                 if self.held_len >= MAX_HELD {
                     return Err(HoldOverflow);
@@ -98,7 +96,7 @@ impl<T> ArrivalOrder<T> {
             Some(_) => Ok(vec![item]),
             None => {
                 self.adapter_frames += 1;
-                let mut out = vec![item];
+                let mut out = if duplicate { Vec::new() } else { vec![item] };
                 let due: Vec<u64> = self
                     .held
                     .range(..=self.adapter_frames)
@@ -174,6 +172,31 @@ mod tests {
         // The anchor has passed, so it delivers at once and takes no number.
         assert_eq!(o.arrive(after("t3", 1), "t3").unwrap(), ["t3"]);
         assert_eq!(o.arrive(plain(), "f4").unwrap(), ["f4"]);
+    }
+
+    #[test]
+    fn a_duplicate_adapter_frame_still_takes_its_number() {
+        let mut o = ArrivalOrder::default();
+        assert_eq!(o.arrive(keyed("k"), "f1").unwrap(), ["f1"]);
+        assert!(o.arrive(keyed("k"), "dup").unwrap().is_empty());
+        // The duplicate was frame 2, so a tailer anchored there is not held.
+        assert_eq!(o.arrive(after("t", 2), "t").unwrap(), ["t"]);
+
+        // A tailer held for the duplicate's number is released by it.
+        let mut o = ArrivalOrder::default();
+        o.arrive(keyed("k"), "f1").unwrap();
+        assert!(o.arrive(after("t", 2), "t").unwrap().is_empty());
+        assert_eq!(o.arrive(keyed("k"), "dup").unwrap(), ["t"]);
+
+        // An anchored duplicate takes no number.
+        let mut o = ArrivalOrder::default();
+        o.arrive(plain(), "f1").unwrap();
+        o.arrive(after("t", 1), "t").unwrap();
+        assert!(o.arrive(after("t", 1), "again").unwrap().is_empty());
+        assert!(
+            o.arrive(after("n", 2), "n").unwrap().is_empty(),
+            "still frame 1"
+        );
     }
 
     #[test]
