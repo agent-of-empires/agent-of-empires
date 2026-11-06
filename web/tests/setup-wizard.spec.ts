@@ -9,12 +9,13 @@ const KEYS = ["theme_telemetry", "agents", "project", "worktrees", "sandbox", "n
 
 interface Handle {
   finished: boolean;
+  dismissed: boolean;
   patches: unknown[];
   themePatches: unknown[];
 }
 
 async function installSetupMocks(page: Page, opts: { finished?: boolean; readOnly?: boolean } = {}): Promise<Handle> {
-  const handle: Handle = { finished: opts.finished ?? false, patches: [], themePatches: [] };
+  const handle: Handle = { finished: opts.finished ?? false, dismissed: false, patches: [], themePatches: [] };
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     // Records whether the dashboard ever rendered, to prove the redirect never flashes it.
@@ -40,16 +41,17 @@ async function installSetupMocks(page: Page, opts: { finished?: boolean; readOnl
     (url) => url.pathname === "/api/setup",
     async (route) => {
       if (route.request().method() === "PATCH") {
-        const body = route.request().postDataJSON() as { finished?: boolean };
+        const body = route.request().postDataJSON() as { finished?: boolean; banner_dismissed?: boolean };
         handle.patches.push(body);
         if (body.finished) handle.finished = true;
+        if (body.banner_dismissed) handle.dismissed = true;
         return route.fulfill({ status: 204 });
       }
       return route.fulfill({
         json: {
           finished: handle.finished,
           deferred: false,
-          banner_dismissed: false,
+          banner_dismissed: handle.dismissed,
           tmux: true,
           git: true,
           access: { serve_mode: "local" },
@@ -132,6 +134,7 @@ test("a finished setup shows the leftover steps on the dashboard, and the banner
   await expect(banner.getByRole("link", { name: "Settings › Sandbox" })).toBeVisible();
   await banner.getByRole("button", { name: "Dismiss setup checklist" }).click();
   await expect.poll(() => handle.patches).toEqual([{ banner_dismissed: true }]);
+  await expect(banner).toHaveCount(0);
 });
 
 test("a read-only viewer is never redirected and sees no setup banner", async ({ page }) => {
@@ -147,8 +150,15 @@ test("on a phone the rail folds into a step sheet", async ({ page }) => {
   await installSetupMocks(page);
   await page.goto("/setup");
   await expect(page.getByText("Step 1 of 6", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Steps" }).click();
+  const stepsButton = page.getByRole("button", { name: "Steps" });
   const sheet = page.getByRole("dialog", { name: "Setup steps" });
+  // Escape closes the sheet and focus returns to its opener.
+  await stepsButton.click();
+  await expect(sheet).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(sheet).toHaveCount(0);
+  await expect(stepsButton).toBeFocused();
+  await stepsButton.click();
   await sheet.getByRole("button", { name: /Worktrees/ }).click();
   await expect(sheet).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Worktrees" })).toBeVisible();
