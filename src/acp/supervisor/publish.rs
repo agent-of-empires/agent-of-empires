@@ -672,6 +672,7 @@ mod tests {
 
     /// Holds the prompt's publish open until another frame is broadcast, or
     /// until the deadline shows none can be while the prompt holds its seq.
+    /// A racer slower than the window can only make the test pass falsely.
     #[derive(Default)]
     struct GatedPromptSink {
         frames: std::sync::Mutex<Vec<u64>>,
@@ -719,5 +720,38 @@ mod tests {
         sup.publish_user_prompt("s-1", "prompt".into()).await;
         racer.join().unwrap();
         assert_eq!(*sink.frames.lock().unwrap(), [1, 2]);
+    }
+
+    /// Records, for each broadcast, whether its session's seq counter was held.
+    #[derive(Default)]
+    struct LockProbeSink {
+        seqs: std::sync::OnceLock<std::sync::Arc<SeqMap>>,
+        held: std::sync::Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl BroadcastSink for LockProbeSink {
+        fn publish(&self, session_id: &str, seq: u64, _event: &Event) {
+            let counter = super::super::session_seq(self.seqs.get().unwrap(), session_id);
+            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            self.held.lock().unwrap().push((seq, held));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_publish_runs_under_its_sessions_seq_lock() {
+        let sink = std::sync::Arc::new(LockProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        sink.seqs
+            .set(std::sync::Arc::clone(&sup.next_seqs))
+            .unwrap();
+
+        sup.publish_startup_error("s-1", "boom".into());
+        sup.publish_user_prompt("s-1", "prompt".into()).await;
+        assert!(sup.publish_stopped_if_seq("s-1", "user_stopped", 2));
+
+        assert_eq!(
+            *sink.held.lock().unwrap(),
+            [(1, true), (2, true), (3, true)]
+        );
     }
 }
