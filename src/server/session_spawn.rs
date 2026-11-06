@@ -496,6 +496,7 @@ pub(crate) async fn spawn_structured_session(
             };
             instance.yolo_mode |= crate::acp::runs_always_yolo(
                 runs,
+                instance.view,
                 &resolved_config.session.agent_acp_cmd,
                 &resolved_config.session.agent_detect_as,
             );

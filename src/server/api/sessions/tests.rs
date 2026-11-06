@@ -898,15 +898,22 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     })?;
     let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    crate::session::test_support::write_stub_adapter(adapters.path(), "own-pi-acp");
     crate::session::config::update_config(|config| {
+        for (name, base) in [("my-pi", "pi"), ("own-pi", "pi")] {
+            config
+                .session
+                .custom_agents
+                .insert(name.into(), base.into());
+            config
+                .session
+                .agent_detect_as
+                .insert(name.into(), base.into());
+        }
         config
             .session
-            .custom_agents
-            .insert("my-pi".into(), "pi".into());
-        config
-            .session
-            .agent_detect_as
-            .insert("my-pi".into(), "pi".into());
+            .agent_acp_cmd
+            .insert("own-pi".into(), "own-pi-acp".into());
     })?;
     let project = tempfile::tempdir()?;
     let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
@@ -922,11 +929,14 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     let structured = |agent: &str| serde_json::json!({ "view": "structured", "agent_name": agent });
     for (tool, extra, expected) in [
         ("pi", terminal.clone(), true),
-        ("claude", terminal, false),
+        ("claude", terminal.clone(), false),
         ("pi", structured("claude"), false),
         ("claude", structured("pi"), true),
         // A custom agent without its own adapter runs the base it inherits.
         ("claude", structured("my-pi"), true),
+        // One with its own adapter runs that in a structured session, and the base CLI in a terminal.
+        ("claude", structured("own-pi"), false),
+        ("own-pi", terminal, true),
     ] {
         let label = format!("{tool} {extra}");
         let mut body = serde_json::json!({
