@@ -382,6 +382,21 @@ pub(super) fn map_update_to_events(
                 diffs,
             };
             let mut events = vec![Event::ToolCallStarted { tool_call }];
+            // History replay reports a final status on the initial call (#5206).
+            use agent_client_protocol::v1::schema::ToolCallStatus;
+            if matches!(
+                tc.status,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            ) {
+                events.push(Event::ToolCallCompleted {
+                    tool_call_id: tc.tool_call_id.0.to_string(),
+                    is_error: matches!(tc.status, ToolCallStatus::Failed),
+                    content: extract_tool_content_text(&tc.content),
+                    output: extract_tool_output_blocks(&tc.content),
+                    completed_at: chrono::Utc::now(),
+                    async_subagent: false,
+                });
+            }
             if is_destructive(&tc.title, &args_preview) {
                 debug!(target: "acp.protocol", "tool {} flagged destructive on tool_call ingest", tc.title);
             }
@@ -1254,6 +1269,42 @@ mod tests {
         for (event, expected) in cases {
             let kind = transcript_event_kind(&event);
             assert_eq!(is_transcript_event(&event), expected, "{kind}");
+        }
+    }
+
+    /// #5206: replay reports the final status on the initial `tool_call`.
+    #[test]
+    fn initial_tool_call_with_final_status_is_closed() {
+        for (status, want_kinds, want_error) in [
+            (
+                ToolCallStatus::Completed,
+                vec!["tool_call_started", "tool_call_completed"],
+                false,
+            ),
+            (
+                ToolCallStatus::Failed,
+                vec!["tool_call_started", "tool_call_completed"],
+                true,
+            ),
+            (ToolCallStatus::Pending, vec!["tool_call_started"], false),
+            (ToolCallStatus::InProgress, vec!["tool_call_started"], false),
+        ] {
+            let mut tc = AcpToolCall::new("tc-replay", "Read");
+            tc.status = status;
+            tc.content = vec![ToolCallContent::Content(Content::new("file body"))];
+            let events = claude(SessionUpdate::ToolCall(tc));
+            assert_eq!(kinds(&events), want_kinds, "{status:?}");
+            if let Some(Event::ToolCallCompleted {
+                tool_call_id,
+                is_error,
+                content,
+                ..
+            }) = events.get(1)
+            {
+                assert_eq!(tool_call_id, "tc-replay");
+                assert_eq!(*is_error, want_error);
+                assert_eq!(content, "file body");
+            }
         }
     }
 
