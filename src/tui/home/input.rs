@@ -6177,9 +6177,12 @@ impl HomeView {
         self.seed_preview_scroll_from_view();
         self.preview_click_seed = None;
         if self.preview_scroll_offset == 0 {
-            let changed = !self.preview_explicit_tail;
-            self.preview_explicit_tail = true;
-            return changed;
+            if matches!(self.view_mode, ViewMode::Terminal) && self.live_send.is_none() {
+                let changed = !self.preview_explicit_tail;
+                self.preview_explicit_tail = true;
+                return changed;
+            }
+            return false;
         }
         self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(STEP);
         self.preview_explicit_tail = self.preview_scroll_offset == 0;
