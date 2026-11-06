@@ -5780,9 +5780,11 @@ volume_ignores = ["node_modules"]
                 )
                 .unwrap();
                 // OMP reaches the mount table through its plugin now, and the
-                // raw config write above clears any earlier grant.
+                // raw config write above clears any earlier grant. The outer
+                // guard owns this app dir, so the install must not snapshot it
+                // again and the final reload waits for that guard's teardown.
                 let _omp =
-                    (tool == "omp").then(crate::session::install_omp_test_plugin_in_current_app);
+                    (tool == "omp").then(crate::session::install_omp_test_plugin_in_caller_app);
                 for history in histories {
                     let path = host.join(history);
                     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -5839,6 +5841,26 @@ volume_ignores = ["node_modules"]
             violations.is_empty(),
             "native history crossed config seeding: {violations:#?}"
         );
+        // Reload only once the caller's guard has restored the original app
+        // dir; a reload before that re-caches the fixture the loop just dropped.
+        drop(_env);
+        crate::plugin::reload_registry();
+        assert!(crate::plugin::registry().get("acme.omp-test").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_test_plugin_reload_follows_the_callers_restored_app_dir() {
+        let home = TempDir::new().unwrap();
+        let _env = crate::session::test_support::isolate_app_dir_at(home.path());
+        {
+            let _omp = crate::session::install_omp_test_plugin_in_caller_app();
+            assert!(crate::plugin::registry().get("acme.omp-test").is_some());
+        }
+        assert!(crate::plugin::registry().get("acme.omp-test").is_some());
+        drop(_env);
+        crate::plugin::reload_registry();
+        assert!(crate::plugin::registry().get("acme.omp-test").is_none());
     }
 
     #[serial_test::serial]
