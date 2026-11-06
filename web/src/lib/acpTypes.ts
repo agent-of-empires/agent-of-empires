@@ -667,10 +667,15 @@ export interface SessionNotice {
 export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
 
 export interface BackgroundAgentTool {
+  /** The transcript's tool_use id; absent on events from before it was recorded. */
+  id?: string;
   name: string;
   title?: string | null;
   /** Undefined while running. */
   ok?: boolean | null;
+  /** Transcript timestamps; absent when the transcript line carried none. */
+  started_at?: string | null;
+  ended_at?: string | null;
 }
 
 /** The workflow run and phase a background sub-agent belongs to. */
