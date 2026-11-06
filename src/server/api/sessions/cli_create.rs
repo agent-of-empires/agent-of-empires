@@ -117,6 +117,15 @@ fn resolve_host_creation(
                 .map(|project| project.path),
         );
     }
+    body.workspace = wants_workspace(
+        options.workspace,
+        options.generated_name,
+        body.worktree_branch
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty()),
+        body.create_new_branch,
+        config.worktree.workspace_by_default,
+    );
     if !original_repos.is_empty() {
         original_repos.extend(body.extra_repo_paths.iter().map(std::path::PathBuf::from));
         let mut pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
@@ -145,7 +154,10 @@ fn resolve_host_creation(
             crate::session::builder::resolve_repo_base_selectors(&original_repos, &pairs)?
                 .into_iter()
                 .map(|(path, base_branch)| {
-                    let path = if mono_repo {
+                    // A workspace plans from the launch path, which may be a linked worktree.
+                    let path = if mono_repo && body.workspace {
+                        std::path::PathBuf::from(&body.path)
+                    } else if mono_repo {
                         path
                     } else {
                         path.canonicalize().context(
@@ -181,15 +193,6 @@ fn resolve_host_creation(
     anyhow::ensure!(
         !options.generated_name || options.workspace != Some(true),
         "--generated-name does not apply to a workspace"
-    );
-    body.workspace = wants_workspace(
-        options.workspace,
-        options.generated_name,
-        body.worktree_branch
-            .as_deref()
-            .is_some_and(|b| !b.trim().is_empty()),
-        body.create_new_branch,
-        config.worktree.workspace_by_default,
     );
     let unknown_tool = |description: &str| {
         let mut names = crate::agents::agent_names();
