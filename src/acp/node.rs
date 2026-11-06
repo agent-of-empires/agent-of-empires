@@ -399,11 +399,13 @@ mod tests {
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _cleanup = KillDescendant(pid_file.clone());
 
-        verify_path_within(&node, NodeSource::Env, Duration::from_millis(500))
+        // The timeout must outlast the script's first two lines, or the group is
+        // killed before the pid is recorded.
+        verify_path_within(&node, NodeSource::Env, Duration::from_secs(3))
             .expect_err("a hanging probe must fail");
 
         let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .unwrap()
+            .expect("the script records the descendant before the probe times out")
             .trim()
             .parse()
             .unwrap();
