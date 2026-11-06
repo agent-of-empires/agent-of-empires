@@ -167,9 +167,12 @@ impl TranscriptModel {
         self.last_seq
     }
 
-    /// Observe the prefix without allocating rows. Tool lifecycle and streamed
-    /// output still belong to the fold; message and elicitation context survives.
-    pub fn observe_prior(&mut self, event: &Event) {
+    /// Observe prefix lifecycle and context without rows, advancing the replay watermark.
+    pub fn observe_prior(&mut self, seq: u64, event: &Event) {
+        if seq <= self.last_seq {
+            return;
+        }
+        self.last_seq = seq;
         match event {
             Event::ToolCallStarted { tool_call }
                 if !self.elicitation_tool_ids.contains(&tool_call.id) =>
@@ -214,7 +217,7 @@ impl TranscriptModel {
             | Event::IncompatibleAgent { .. }
             | Event::AgentSwitched { .. } => {
                 for tool in self.tools.values_mut() {
-                    if matches!(tool, ToolLifecycle::Open(_)) {
+                    if matches!(tool, ToolLifecycle::Buffered(_) | ToolLifecycle::Open(_)) {
                         drop(tool.finish());
                     }
                 }
@@ -624,7 +627,12 @@ impl TranscriptModel {
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
-        if self.elicitation_tool_ids.contains(tool_call_id) {
+        if self.elicitation_tool_ids.contains(tool_call_id)
+            || (matches!(
+                self.tools.get(tool_call_id),
+                Some(ToolLifecycle::Terminal(_))
+            ) && self.find_tool_start(tool_call_id).is_none())
+        {
             return Vec::new();
         }
         // A non-empty diff list replaces wholesale; none or empty keeps earlier diffs.
@@ -736,6 +744,9 @@ impl TranscriptModel {
         for index in 0..self.tools.len() {
             let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
             if !matches!(tool, ToolLifecycle::Open(_)) {
+                if matches!(tool, ToolLifecycle::Buffered(_)) {
+                    drop(tool.finish());
+                }
                 continue;
             }
             let buffered = tool.finish();
@@ -1658,8 +1669,8 @@ mod tests {
             ]
         );
         let mut m = TranscriptModel::new();
-        m.observe_prior(&thought("earlier", a));
-        m.apply_event(1, &thought("later", b));
+        m.observe_prior(1, &thought("earlier", a));
+        m.apply_event(2, &thought("later", b));
         assert!(m.rows()[0].message_start);
     }
 
@@ -1678,8 +1689,8 @@ mod tests {
             (vec![], false),
         ] {
             let mut m = TranscriptModel::new();
-            for event in &prior {
-                m.observe_prior(event);
+            for (index, event) in prior.iter().enumerate() {
+                m.observe_prior(index as u64 + 1, event);
             }
             m.apply_event(10, &chunk("", "m-b"));
             assert!(m.rows().len() == 1, "{prior:?}");
@@ -1706,7 +1717,7 @@ mod tests {
             let mut m = TranscriptModel::new();
             for (i, e) in events.iter().enumerate() {
                 if i < split {
-                    m.observe_prior(e);
+                    m.observe_prior(i as u64 + 1, e);
                 } else {
                     m.apply_event(i as u64 + 1, e);
                 }
@@ -1757,15 +1768,6 @@ mod tests {
                 vec![content("t", "buffered")],
                 vec![stopped("cancelled")],
                 vec![],
-            ),
-            (
-                "closed metadata update",
-                vec![started(tool("t", "T")), completed("t", false, "done")],
-                vec![
-                    updated("t", Some("Renamed"), None, None),
-                    stopped("cancelled"),
-                ],
-                vec![(K::ToolStart, "t", "Renamed")],
             ),
             (
                 "ordered reuse",
@@ -1828,8 +1830,8 @@ mod tests {
             ),
         ] {
             let mut model = TranscriptModel::new();
-            for event in &prefix {
-                model.observe_prior(event);
+            for (index, event) in prefix.iter().enumerate() {
+                model.observe_prior(index as u64 + 1, event);
                 assert!(model.rows().is_empty(), "{label}: prefix stays unrendered");
             }
             for (index, event) in suffix.iter().enumerate() {
@@ -1878,12 +1880,15 @@ mod tests {
             (true, "final result", "final result"),
         ] {
             let mut model = TranscriptModel::new();
-            for event in [
+            for (index, event) in [
                 started(tool("t", "Bash")),
                 content("t", "old snapshot"),
                 content("t", "latest streamed output"),
-            ] {
-                model.observe_prior(&event);
+            ]
+            .iter()
+            .enumerate()
+            {
+                model.observe_prior(index as u64 + 1, event);
             }
             assert!(model.rows().is_empty());
             let output = vec![ToolOutputBlock::Text {
@@ -1918,6 +1923,171 @@ mod tests {
             assert!(model
                 .apply_event(11, &stopped("prompt_complete"))
                 .is_empty());
+        }
+    }
+
+    #[test]
+    fn observed_prefix_advances_watermark_for_every_event() {
+        let mut model = TranscriptModel::new();
+        for (index, event) in [
+            chunk("prior message"),
+            Event::AgentThoughtChunk {
+                text: "prior thought".into(),
+                message_id: Some("thought".into()),
+            },
+            prompt("next turn"),
+            Event::ThinkingStarted,
+            started(tool("prior", "Prior tool")),
+            updated("prior", Some("Prior title"), None, None),
+            content("prior", "prior output"),
+            elicitation_requested("prior"),
+            completed("prior", false, "answered"),
+            stopped("prompt_complete"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seq = index as u64 + 1;
+            model.observe_prior(seq, event);
+            assert_eq!(model.last_seq(), seq, "{event:?}");
+            assert!(model.rows().is_empty(), "{event:?}");
+            assert!(model.apply_event(seq, event).is_empty(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn observed_prefix_rejects_stale_stop_before_later_tool() {
+        let mut model = TranscriptModel::new();
+        model.observe_prior(1, &stopped("prompt_complete"));
+        model.observe_prior(2, &started(tool("later", "Later tool")));
+        model.observe_prior(1, &stopped("prompt_complete"));
+        assert_eq!(model.last_seq(), 2, "stale observation keeps the watermark");
+        assert!(model.rows().is_empty());
+        assert!(
+            model.apply_event(1, &stopped("prompt_complete")).is_empty(),
+            "a queued prefix stop must not close a tool opened later in the prefix"
+        );
+        model.apply_event(3, &stopped("cancelled"));
+        assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
+        assert_eq!(
+            row(&model, "stopped-later-3").tool_call_id.as_deref(),
+            Some("later")
+        );
+        assert!(model.apply_event(4, &stopped("cancelled")).is_empty());
+    }
+
+    #[test]
+    fn orphan_output_clears_at_observed_turn_endings_without_stopped_rows() {
+        for closer in [
+            stopped("cancelled"),
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::IncompatibleAgent {
+                detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
+                    expected: "1".into(),
+                    received: "2".into(),
+                },
+            },
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "rate_limit".into(),
+            },
+        ] {
+            let mut model = TranscriptModel::new();
+            model.observe_prior(1, &content("reused", "old orphan output"));
+            model.observe_prior(2, &closer);
+            assert!(model.rows().is_empty(), "{closer:?}: prefix stays hidden");
+            model.apply_event(10, &started(tool("reused", "New call")));
+            model.apply_event(11, &stopped("cancelled"));
+            assert_eq!(
+                count(&model, TranscriptRowKind::ToolStopped),
+                1,
+                "{closer:?}"
+            );
+            assert_eq!(
+                row(&model, "stopped-reused-11").text,
+                "",
+                "{closer:?}: a reused ID must not inherit orphan output"
+            );
+            assert!(model.apply_event(12, &stopped("cancelled")).is_empty());
+        }
+    }
+
+    #[test]
+    fn orphan_output_clears_at_live_turn_endings_without_stopped_rows() {
+        for closer in [
+            stopped("cancelled"),
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::IncompatibleAgent {
+                detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
+                    expected: "1".into(),
+                    received: "2".into(),
+                },
+            },
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "rate_limit".into(),
+            },
+        ] {
+            for observed_content in [false, true] {
+                let mut model = TranscriptModel::new();
+                if observed_content {
+                    model.observe_prior(1, &content("reused", "old orphan output"));
+                } else {
+                    model.apply_event(1, &content("reused", "old orphan output"));
+                }
+                model.apply_event(2, &closer);
+                assert_eq!(
+                    count(&model, TranscriptRowKind::ToolStopped),
+                    0,
+                    "{closer:?}: content alone must not invent a stopped tool"
+                );
+                model.apply_event(3, &started(tool("reused", "New call")));
+                model.apply_event(4, &stopped("cancelled"));
+                assert_eq!(
+                    count(&model, TranscriptRowKind::ToolStopped),
+                    1,
+                    "{closer:?}"
+                );
+                assert_eq!(
+                    row(&model, "stopped-reused-4").text,
+                    "",
+                    "{closer:?}: a reused ID must not inherit orphan output"
+                );
+                assert!(model.apply_event(5, &stopped("cancelled")).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_after_prefix_completion_does_not_create_unpaired_start() {
+        for observed_start in [false, true] {
+            let mut model = TranscriptModel::new();
+            if observed_start {
+                model.observe_prior(1, &started(tool("done", "Old call")));
+            }
+            model.observe_prior(2, &completed("done", false, "finished before cursor"));
+            assert!(
+                model
+                    .apply_event(
+                        10,
+                        &updated("done", Some("Late title"), Some("new args"), None)
+                    )
+                    .is_empty(),
+                "metadata alone must not render a running card for a terminal prefix tool"
+            );
+            assert!(model.rows().is_empty());
+            assert!(model.apply_event(11, &stopped("cancelled")).is_empty());
+            model.apply_event(12, &started(tool("done", "New call")));
+            model.apply_event(13, &stopped("cancelled"));
+            assert_eq!(count(&model, TranscriptRowKind::ToolStart), 1);
+            assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
+            assert_eq!(row(&model, "start-done").text, "New call");
         }
     }
 
@@ -2074,8 +2244,8 @@ mod tests {
             let m = fold([started(tool("t1", "T")), closer.clone()]);
             assert_eq!(count(&m, TranscriptRowKind::ToolStopped), 1, "{label}");
             let mut partial = TranscriptModel::new();
-            partial.observe_prior(&started(tool("t1", "T")));
-            partial.observe_prior(&content("t1", "buffered before cursor"));
+            partial.observe_prior(1, &started(tool("t1", "T")));
+            partial.observe_prior(2, &content("t1", "buffered before cursor"));
             assert!(partial.rows().is_empty(), "{label}");
             partial.apply_event(10, &closer);
             let stopped_rows = partial
@@ -2091,8 +2261,8 @@ mod tests {
             );
             assert_eq!(stopped_rows[0].text, "buffered before cursor", "{label}");
             let mut closed_prefix = TranscriptModel::new();
-            closed_prefix.observe_prior(&started(tool("t1", "T")));
-            closed_prefix.observe_prior(&closer);
+            closed_prefix.observe_prior(1, &started(tool("t1", "T")));
+            closed_prefix.observe_prior(2, &closer);
             assert!(closed_prefix.rows().is_empty(), "{label}");
             assert!(
                 closed_prefix

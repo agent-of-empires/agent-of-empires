@@ -247,8 +247,7 @@ async fn handle(
                         let _ = socket
                             .send(Message::Text(gap.to_string().into()))
                             .await;
-                        // The skipped events never reached this connection's control fold,
-                        // and nothing else would ever repair it.
+                        // Rebuild both folds before a later Stop reaches missed terminals.
                         let mut rebuilt = AcpState::new(
                             AcpSessionId(session_id.clone()),
                             seed.0.clone(),
@@ -264,12 +263,17 @@ async fn handle(
                             warn!(target: "acp.ws", %error, "replay rebuild task failed");
                             Vec::new()
                         });
-                        let mut highest = 0;
-                        for (seq, event) in entries {
-                            let _ = rebuilt.apply_event(seq, event);
-                            highest = seq;
-                        }
+                        let mut rebuilt_transcript = TranscriptModel::new();
+                        let mut folds = ConnectionFolds {
+                            reduced: &mut rebuilt,
+                            transcript: &mut rebuilt_transcript,
+                            cold: &mut cold,
+                            last_applied_seq: 0,
+                        };
+                        fold_connect_history(entries, since, &mut folds, false);
+                        let highest = folds.last_applied_seq;
                         reduced = rebuilt;
+                        transcript = rebuilt_transcript;
                         last_applied_seq = highest;
                         // The cold-field cache still describes what this socket
                         // holds, so an unchanged command list stays omitted.
@@ -279,6 +283,16 @@ async fn handle(
                             highest,
                             &reduced,
                             &mut cold,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if !send_transcript_snapshot(
+                            &mut socket,
+                            &session_id,
+                            highest.max(since),
+                            &transcript,
                         )
                         .await
                         {
@@ -333,12 +347,9 @@ async fn drain_replay_into_socket(
             }
         };
     let mut sent = 0usize;
-    let to_forward = fold_connect_history(entries, since, folds);
+    let to_forward = fold_connect_history(entries, since, folds, forward_frames);
     let snapshot_seq = folds.last_applied_seq.max(since);
     for (seq, event) in to_forward {
-        if !forward_frames {
-            continue;
-        }
         let frame = AcpBroadcastFrame {
             session_id: session_id.to_string(),
             seq,
@@ -396,17 +407,22 @@ fn fold_connect_history(
     entries: Vec<(u64, Event)>,
     since: u64,
     folds: &mut ConnectionFolds<'_>,
+    forward_frames: bool,
 ) -> Vec<(u64, Event)> {
     let mut to_forward = Vec::new();
     for (seq, event) in entries {
-        let _ = folds.reduced.apply_event(seq, event.clone());
         folds.last_applied_seq = seq;
         if seq <= since {
-            folds.transcript.observe_prior(&event);
-            continue;
+            folds.transcript.observe_prior(seq, &event);
+        } else {
+            folds.transcript.apply_event(seq, &event);
         }
-        folds.transcript.apply_event(seq, &event);
-        to_forward.push((seq, event));
+        if seq > since && forward_frames {
+            let _ = folds.reduced.apply_event(seq, event.clone());
+            to_forward.push((seq, event));
+        } else {
+            let _ = folds.reduced.apply_event(seq, event);
+        }
     }
     to_forward
 }
@@ -786,7 +802,7 @@ mod tests {
             cold: &mut cold,
             last_applied_seq: 0,
         };
-        let forwarded = fold_connect_history(history.clone(), 4, &mut folds);
+        let forwarded = fold_connect_history(history.clone(), 4, &mut folds, true);
 
         assert!(forwarded.is_empty(), "nothing new to forward");
         assert_eq!(folds.last_applied_seq, 4);
@@ -820,7 +836,7 @@ mod tests {
             cold: &mut cold_cache,
             last_applied_seq: 0,
         };
-        let forwarded = fold_connect_history(history, 0, &mut cold_folds);
+        let forwarded = fold_connect_history(history, 0, &mut cold_folds, true);
         assert_eq!(forwarded.len(), 4);
         assert!(!cold_folds.transcript.rows().is_empty());
         assert_eq!(cold_folds.reduced.available_commands.len(), 1);
@@ -881,7 +897,7 @@ mod tests {
             cold: &mut cold,
             last_applied_seq: 0,
         };
-        fold_connect_history(retained, 5, &mut folds);
+        fold_connect_history(retained, 5, &mut folds, true);
         assert_eq!(folds.reduced.session_notices[0].id, "notice-5");
     }
 
@@ -904,7 +920,7 @@ mod tests {
             cold: &mut cold,
             last_applied_seq: 0,
         };
-        fold_connect_history(history, 1, &mut folds);
+        fold_connect_history(history, 1, &mut folds, true);
         let rows = folds.transcript.rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].message_start);
@@ -983,7 +999,7 @@ mod tests {
             if stored_terminal {
                 history.extend(suffix.clone());
             }
-            let forwarded = fold_connect_history(history, 6, &mut folds);
+            let forwarded = fold_connect_history(history, 6, &mut folds, true);
             assert_eq!(
                 forwarded.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
                 if stored_terminal { vec![7, 8] } else { vec![] }
@@ -1145,6 +1161,13 @@ mod tests {
     async fn connect_test_socket(
         state: Arc<AppState>,
     ) -> (TestSocket, tokio::task::JoinHandle<()>) {
+        connect_test_socket_since(state, 0).await
+    }
+
+    async fn connect_test_socket_since(
+        state: Arc<AppState>,
+        since: u64,
+    ) -> (TestSocket, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = axum::Router::new()
@@ -1153,9 +1176,10 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/s-1?frames=0"))
-            .await
-            .unwrap();
+        let (socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/s-1?frames=0&since={since}"))
+                .await
+                .unwrap();
         (socket, server)
     }
 
@@ -1279,6 +1303,122 @@ mod tests {
             rebuilt["state"]["turn_active"], false,
             "missed Stop must be recovered from durable history"
         );
+        state.shutdown.cancel();
+        drop(socket);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn lagged_broadcast_repairs_prefix_tool_lifecycle_without_replaying_starts_or_terminals()
+    {
+        use crate::acp::state::ToolCall;
+        use futures_util::StreamExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let at = chrono::Utc::now();
+        for (seq, id) in [(1, "missed"), (2, "queued")] {
+            let event = Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: id.into(),
+                    name: id.into(),
+                    kind: "read".into(),
+                    args_preview: String::new(),
+                    started_at: at,
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            };
+            state.acp_event_store.record("s-1", seq, &event).unwrap();
+        }
+        let (mut socket, server) = connect_test_socket_since(state.clone(), 2).await;
+        receive_kind(&mut socket, "reduced_state").await;
+        let initial = receive_kind(&mut socket, "transcript_snapshot").await;
+        assert!(initial["rows"].as_array().unwrap().is_empty());
+
+        // No await: both completions enter durable history before the receiver handles lag.
+        // The first completion is dropped; the second remains queued for delivery.
+        for seq in 3..=18 {
+            let event = if seq == 3 || seq == 18 {
+                Event::ToolCallCompleted {
+                    tool_call_id: if seq == 3 { "missed" } else { "queued" }.into(),
+                    is_error: false,
+                    content: "finished".into(),
+                    output: Vec::new(),
+                    completed_at: at,
+                    async_subagent: false,
+                }
+            } else {
+                Event::ThinkingEnded
+            };
+            state.acp_event_store.record("s-1", seq, &event).unwrap();
+            publish(
+                &state,
+                AcpBroadcastFrame {
+                    session_id: "s-1".into(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                    sidebar_status: None,
+                },
+            );
+        }
+        let gap = receive_kind(&mut socket, "lagged").await;
+        assert_eq!(gap["skipped"], 8);
+        let rebuilt = receive_kind(&mut socket, "transcript_snapshot").await;
+        assert_eq!(rebuilt["seq"], 18);
+        let rows = rebuilt["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "historical starts must stay behind the cursor"
+        );
+        for (row, id) in rows.iter().zip(["missed", "queued"]) {
+            assert_eq!(row["tool_call_id"], id);
+            assert_eq!(row["kind"], "tool_complete");
+            assert_eq!(row["text"], "finished");
+        }
+
+        for (seq, event) in [
+            (
+                19,
+                Event::Stopped {
+                    reason: "cancelled".into(),
+                },
+            ),
+            (20, Event::ThinkingEnded),
+        ] {
+            state.acp_event_store.record("s-1", seq, &event).unwrap();
+            publish(
+                &state,
+                AcpBroadcastFrame {
+                    session_id: "s-1".into(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                    sidebar_status: None,
+                },
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.expect("socket remains open").unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(
+                        frame["kind"], "transcript_delta",
+                        "queued completion must not duplicate; Stop must not stop completed tools"
+                    );
+                    if frame["kind"] == "reduced_state" && frame["seq"] == 20 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("stop and queued broadcasts drain");
         state.shutdown.cancel();
         drop(socket);
         server.abort();
