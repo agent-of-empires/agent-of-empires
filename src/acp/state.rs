@@ -420,6 +420,9 @@ pub struct WorkflowRef {
 /// One tool call a background sub-agent made, parsed from its transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentTool {
+    /// The transcript's `tool_use` id, a stable key while the list grows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     /// Short label from the tool input (command, file path, pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,6 +430,12 @@ pub struct BackgroundAgentTool {
     /// `None` while running, then whether it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// Transcript timestamp of the call; `None` when the line carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Transcript timestamp of the matching result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// One async background sub-agent, built up from `BackgroundAgent*` events.
@@ -2108,9 +2117,12 @@ mod tests {
             progress(
                 3,
                 vec![BackgroundAgentTool {
+                    id: None,
                     name: "Read".into(),
                     title: Some("x.rs".into()),
                     ok: Some(true),
+                    started_at: None,
+                    ended_at: None,
                 }],
             ),
         ]);
