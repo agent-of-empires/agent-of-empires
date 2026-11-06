@@ -1048,11 +1048,13 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "worker_not_ready",
             format!("worker resume failed: {e}"),
         ),
-        SendTurnError::WorkerNotReady => DispatchError::with_kind(
-            codes::SERVICE_UNAVAILABLE,
-            "worker_not_ready",
-            "worker not ready; retry",
-        ),
+        SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
+            DispatchError::with_kind(
+                codes::SERVICE_UNAVAILABLE,
+                "worker_not_ready",
+                "worker not ready; retry",
+            )
+        }
         // Unreachable: this plugin surface never sets `no_revive`.
         SendTurnError::RevivalRefused => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,

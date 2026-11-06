@@ -174,6 +174,13 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
 
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false).await;
+    state.instances.write().await[0].pending_initial_turn =
+        Some(crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+    seed_native_row(&state).await;
     let reservation = match state
         .acp_supervisor
         .begin_resume(
@@ -224,6 +231,12 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
         e,
         Event::UserPromptSent { .. }
     )));
+    assert!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .is_some(),
+        "a prompt refused before publication must keep the pending initial turn (#5253)"
+    );
 }
 
 /// A Stop pressed right after Enter must wait out the prompt submission rather
