@@ -68,4 +68,24 @@ describe("agentIntegrationDetails", () => {
       }),
     ).toEqual(["launch flags: yolo always", "resume: subcommand resume"]);
   });
+
+  it("escapes control and bidi characters and names permanent approvals", () => {
+    const details = agentIntegrationDetails({
+      tool: "tool",
+      launch: {
+        container_env: { TOOL_HOME: "/tmp\u001b[2J" },
+        install_hint: "install \u202enow",
+      },
+      reply_fallback: {
+        allow: [{ kind: "named", value: "Enter" }],
+        allow_always: [{ kind: "named", value: "Down" }],
+        deny: [{ kind: "named", value: "Escape" }],
+      },
+    });
+    expect(details).toEqual([
+      "sandbox environment: TOOL_HOME=/tmp\\u{1b}[2J",
+      "install: install \\u{202e}now",
+      "reply fallback: allow [Enter], deny [Escape], allow always [Down]",
+    ]);
+  });
 });

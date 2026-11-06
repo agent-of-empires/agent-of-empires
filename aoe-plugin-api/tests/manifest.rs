@@ -599,6 +599,81 @@ deny = [{ kind = "literal", value = "n" }]
 }
 
 #[test]
+fn declaration_values_reject_controls_and_noncanonical_function_keys() {
+    let cases = [
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch.container_env]
+ACME_HOME = "/tmp\u001b[2J"
+"#,
+            "container_env",
+        ),
+        (
+            r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.launch.container_env]
+ACME_HOME = "/tmp\u202e"
+"#,
+            "container_env",
+        ),
+        (
+            r#"
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "F01" }]
+deny = [{ kind = "literal", value = "n" }]
+"#,
+            "must be a literal key or a named key",
+        ),
+        (
+            r#"
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+allow_always = []
+deny = [{ kind = "literal", value = "n" }]
+"#,
+            "allow_always must not be empty",
+        ),
+    ];
+    for (body, expected) in cases {
+        let errors = invalid(20, body);
+        assert!(
+            errors.iter().any(|error| error.contains(expected)),
+            "expected {expected:?}, got {errors:?}"
+        );
+    }
+
+    let body = r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "acme-helper"
+provider_versions = ["^1"]
+command = "acme-helper"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "F12" }]
+allow_always = [{ kind = "named", value = "Down" }]
+deny = [{ kind = "literal", value = "n" }]
+"#;
+    assert_eq!(parse(20, body).agent_integrations.len(), 1);
+}
+
+#[test]
 fn agent_launch_declarations_reject_unknown_keys() {
     let body = r#"
 capabilities = ["session.integration"]

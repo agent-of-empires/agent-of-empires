@@ -1,5 +1,20 @@
 import type { PluginAgentIntegration } from "../../lib/api";
 
+const DANGEROUS = /[\p{Cc}\p{Cf}]/u;
+
+/**
+ * Manifest strings are untrusted. Control and format characters would let
+ * them rewrite the consent prompt, so render them as visible escapes.
+ */
+function display(value: string): string {
+  if (!DANGEROUS.test(value)) return value;
+  let out = "";
+  for (const character of value) {
+    out += DANGEROUS.test(character) ? `\\u{${character.codePointAt(0)!.toString(16)}}` : character;
+  }
+  return out;
+}
+
 /** One line per non-command declaration so consent names every behavior change. */
 export function agentIntegrationDetails(agent: PluginAgentIntegration): string[] {
   const details: string[] = [];
@@ -44,11 +59,14 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
   if (agent.reply_fallback) {
     const label = (key: { kind: string; value: string }) =>
       key.kind === "named" ? key.value : JSON.stringify(key.value);
+    const always = agent.reply_fallback.allow_always?.length
+      ? `, allow always [${agent.reply_fallback.allow_always.map(label).join(", ")}]`
+      : "";
     details.push(
       `reply fallback: allow [${agent.reply_fallback.allow.map(label).join(", ")}], deny [${agent.reply_fallback.deny
         .map(label)
-        .join(", ")}]`,
+        .join(", ")}]${always}`,
     );
   }
-  return details;
+  return details.map(display);
 }

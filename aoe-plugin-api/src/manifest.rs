@@ -768,8 +768,16 @@ fn reserved_container_env(name: &str) -> bool {
         || name.starts_with("DYLD_")
 }
 
+/// Controls and Unicode format characters would let a manifest rewrite the
+/// consent prompt that prints declared values.
+fn declaration_character_ok(c: char) -> bool {
+    !c.is_control()
+        && unicode_general_category::get_general_category(c)
+            != unicode_general_category::GeneralCategory::Format
+}
+
 fn env_value_ok(value: &str) -> bool {
-    value.len() <= 4096 && !value.chars().any(|c| c == '\0' || c == '\n' || c == '\r')
+    value.len() <= 4096 && value.chars().all(declaration_character_ok)
 }
 
 fn subcommand_ok(value: &str) -> bool {
@@ -789,10 +797,20 @@ fn agent_key_ok(key: &crate::agent_integration::AgentKeyDeclaration) -> bool {
         }
         AgentKeyDeclaration::Named { value } => {
             AGENT_KEY_NAMES.contains(&value.as_str())
-                || value
-                    .strip_prefix('F')
-                    .and_then(|number| number.parse::<u8>().ok())
-                    .is_some_and(|number| (1..=12).contains(&number))
+                || matches!(
+                    value.as_str(),
+                    "F1" | "F2"
+                        | "F3"
+                        | "F4"
+                        | "F5"
+                        | "F6"
+                        | "F7"
+                        | "F8"
+                        | "F9"
+                        | "F10"
+                        | "F11"
+                        | "F12"
+                )
         }
     }
 }
@@ -893,7 +911,7 @@ fn validate_agent_declarations(
             check(
                 env_value_ok(value),
                 format!(
-                    "agent_integrations[{i}].launch.container_env[{key:?}] must be a single line"
+                    "agent_integrations[{i}].launch.container_env[{key:?}] must be a single line without control or format characters"
                 ),
             );
         }
@@ -957,6 +975,12 @@ fn validate_agent_declarations(
         check(
             !replies.allow.is_empty() && !replies.deny.is_empty(),
             format!("agent_integrations[{i}].reply_fallback allow and deny must not be empty"),
+        );
+        check(
+            replies.allow_always.as_ref().is_none_or(|keys| !keys.is_empty()),
+            format!(
+                "agent_integrations[{i}].reply_fallback.allow_always must not be empty when declared"
+            ),
         );
         for (field, keys) in [
             ("allow", Some(&replies.allow)),

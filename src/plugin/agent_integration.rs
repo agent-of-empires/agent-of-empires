@@ -557,7 +557,7 @@ fn build_declared_agent(declared: DeclaredAgent) -> &'static AgentDef {
 fn key_label(key: &AgentKeyDeclaration) -> String {
     match key {
         AgentKeyDeclaration::Literal { value } => format!("literal {value:?}"),
-        AgentKeyDeclaration::Named { value } => format!("key {value}"),
+        AgentKeyDeclaration::Named { value } => format!("key {}", display_command(value)),
     }
 }
 
@@ -576,19 +576,23 @@ pub fn declaration_summary(integration: &AgentIntegrationContribution) -> Vec<St
     if let Some(launch) = &integration.launch {
         let mut flags = Vec::new();
         if let Some(flag) = &launch.oneshot_flag {
-            flags.push(format!("oneshot {flag}"));
+            flags.push(format!("oneshot {}", display_command(flag)));
         }
         if let Some(flag) = &launch.instruction_flag {
-            flags.push(format!("instruction {flag}"));
+            flags.push(format!("instruction {}", display_command(flag)));
         }
         if let Some(flag) = &launch.model_flag {
-            flags.push(format!("model {flag}"));
+            flags.push(format!("model {}", display_command(flag)));
         }
         if let Some(yolo) = &launch.yolo {
             flags.push(match yolo {
-                AgentYoloDeclaration::Flag { flag } => format!("yolo {flag}"),
+                AgentYoloDeclaration::Flag { flag } => {
+                    format!("yolo {}", display_command(flag))
+                }
                 AgentYoloDeclaration::Always => "yolo always".to_string(),
-                AgentYoloDeclaration::Env { key, value } => format!("yolo {key}={value}"),
+                AgentYoloDeclaration::Env { key, value } => {
+                    format!("yolo {}={}", display_command(key), display_command(value))
+                }
             });
         }
         if !flags.is_empty() {
@@ -598,23 +602,37 @@ pub fn declaration_summary(integration: &AgentIntegrationContribution) -> Vec<St
             let env = launch
                 .container_env
                 .iter()
-                .map(|(key, value)| format!("{key}={value}"))
+                .map(|(key, value)| format!("{}={}", display_command(key), display_command(value)))
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!("  sandbox environment: {env}"));
         }
         if !launch.aliases.is_empty() {
-            lines.push(format!("  aliases: {}", launch.aliases.join(", ")));
+            lines.push(format!(
+                "  aliases: {}",
+                launch
+                    .aliases
+                    .iter()
+                    .map(|alias| display_command(alias))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if let Some(resume) = &launch.resume {
             let resume = match resume {
-                AgentResumeDeclaration::Flag { flag } => format!("flag {flag}"),
+                AgentResumeDeclaration::Flag { flag } => {
+                    format!("flag {}", display_command(flag))
+                }
                 AgentResumeDeclaration::FlagPair {
                     existing,
                     new_session,
-                } => format!("flags {existing} / {new_session}"),
+                } => format!(
+                    "flags {} / {}",
+                    display_command(existing),
+                    display_command(new_session)
+                ),
                 AgentResumeDeclaration::Subcommand { command } => {
-                    format!("subcommand {command}")
+                    format!("subcommand {}", display_command(command))
                 }
             };
             let capture = launch.capture.as_ref().map_or_else(
@@ -632,7 +650,7 @@ pub fn declaration_summary(integration: &AgentIntegrationContribution) -> Vec<St
             lines.push("  host only: yes".to_string());
         }
         if let Some(hint) = &launch.install_hint {
-            lines.push(format!("  install: {hint}"));
+            lines.push(format!("  install: {}", display_command(hint)));
         }
     }
     if integration.detection.is_some() {
@@ -1465,6 +1483,26 @@ deny = [{ kind = "literal", value = "n" }]
                 allow_always: false,
             }),
         }
+    }
+
+    #[test]
+    fn declaration_summary_escapes_declared_values() {
+        let integration = AgentIntegrationContribution {
+            tool: "acme-helper".into(),
+            command: Some("acme-helper".into()),
+            launch: Some(AgentLaunchDeclaration {
+                container_env: [("ACME_HOME".to_string(), "/tmp\u{1b}[2J".to_string())]
+                    .into_iter()
+                    .collect(),
+                install_hint: Some("install \u{202e}now".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let summary = declaration_summary(&integration).join("\n");
+        assert!(!summary.contains('\u{1b}'), "{summary}");
+        assert!(!summary.contains('\u{202e}'), "{summary}");
+        assert!(summary.contains("\\u{1b}"), "{summary}");
     }
 
     #[test]

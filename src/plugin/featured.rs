@@ -56,6 +56,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_index_keeps_the_curated_entries() {
+        let index =
+            FeaturedIndex::from_toml_str(EMBEDDED).expect("embedded featured.toml must parse");
+        for id in [
+            "agent-of-empires.github",
+            "agent-of-empires.cron",
+            "agent-of-empires.kanban",
+        ] {
+            assert!(index.get(id).is_some(), "embedded index is missing {id}");
+        }
+    }
+
+    #[test]
     fn looks_up_by_id_and_verifies_any_vetted_hash() {
         FeaturedIndex::from_toml_str(EMBEDDED).expect("embedded featured.toml must parse");
         let index = FeaturedIndex::from_toml_str(
