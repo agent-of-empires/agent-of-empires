@@ -18,6 +18,7 @@ use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
 use super::registry::ValidationState;
 use super::source::PluginSource;
+use super::NodeEnv;
 
 pub enum OperationLog {
     Inherit,
@@ -306,7 +307,11 @@ async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     })
 }
 
-fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<InstallReport> {
+fn apply_prepared_install(
+    p: &PreparedInstall,
+    node_env: &NodeEnv,
+    log: &OperationLog,
+) -> Result<InstallReport> {
     let final_dir = super::plugins_dir()?.join(&p.id);
     if final_dir.exists() {
         bail!(
@@ -321,7 +326,7 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         p.id, p.fetched.manifest.version
     ));
     move_into_place(&p.fetched, &final_dir)?;
-    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, log) {
+    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, node_env, log) {
         let _ = std::fs::remove_dir_all(&final_dir);
         return Err(e);
     }
@@ -403,7 +408,8 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
     if !granted {
         bail!("install cancelled; no capabilities were granted");
     }
-    apply_prepared_install(&prepared, &OperationLog::Inherit)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
 }
 
 pub async fn preview_install(input: &str) -> Result<InstallConsent> {
@@ -452,7 +458,8 @@ pub async fn apply_install(
             "the plugin at {input} changed since it was shown; review it again before installing"
         );
     }
-    apply_prepared_install(&prepared, log)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared_install(&prepared, &node_env, log)
 }
 
 pub async fn update(id: &str, assume_yes: bool) -> Result<InstallReport> {
@@ -698,6 +705,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 fn apply_prepared(
     prepared: &Prepared,
     grant: Option<CapabilityGrant>,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<InstallReport> {
     let id = prepared.id.as_str();
@@ -709,7 +717,7 @@ fn apply_prepared(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
-    replace_and_build(id, &prepared.fetched, &final_dir, log)?;
+    replace_and_build(id, &prepared.fetched, &final_dir, node_env, log)?;
 
     let granted = grant.is_some();
     persist_update(id, &prepared.source_str, grant)?;
@@ -786,9 +794,11 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
     Ok(UpdateOutcome::Applied(apply_prepared(
         &prepared,
         grant,
+        &node_env,
         &OperationLog::Inherit,
     )?))
 }
@@ -889,7 +899,8 @@ pub async fn apply_update(
         capabilities: prepared.capabilities.clone(),
         granted_at: chrono::Utc::now(),
     });
-    apply_prepared(&prepared, grant, log)
+    let node_env = apply_node_env(&prepared.fetched.manifest).await;
+    apply_prepared(&prepared, grant, &node_env, log)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1324,20 +1335,39 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     }
 }
 
+/// Whether applying `manifest` runs a build step or validates a non-system worker.
+fn needs_node(manifest: &PluginManifest) -> bool {
+    match &manifest.runtime {
+        Some(RuntimeSpec::Command { build, system, .. }) => !build.is_empty() || !system,
+        _ => false,
+    }
+}
+
+/// Resolve Node once, off the runtime threads, for the sync apply step.
+async fn apply_node_env(manifest: &PluginManifest) -> NodeEnv {
+    if !needs_node(manifest) {
+        return NodeEnv::new();
+    }
+    tokio::task::spawn_blocking(super::node_env)
+        .await
+        .unwrap_or_default()
+}
+
 fn build_in_place(
     plugin_id: &str,
     dir: &Path,
     manifest: &PluginManifest,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<()> {
-    run_build(plugin_id, dir, build_steps(manifest), log)?;
+    run_build(plugin_id, dir, build_steps(manifest), node_env, log)?;
     if let Some(RuntimeSpec::Command {
         command,
         system: false,
         ..
     }) = &manifest.runtime
     {
-        let resolver = super::launch::OsLaunchResolver::new(super::node_env());
+        let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
         super::launch::resolve_command(plugin_id, dir, command, &resolver).with_context(|| {
             format!(
                 "plugin {plugin_id}: worker command is not runnable after install \
@@ -1348,9 +1378,14 @@ fn build_in_place(
     Ok(())
 }
 
-fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLog) -> Result<()> {
+fn run_build(
+    plugin_id: &str,
+    dir: &Path,
+    steps: &[BuildStep],
+    node_env: &NodeEnv,
+    log: &OperationLog,
+) -> Result<()> {
     let os = std::env::consts::OS;
-    let node_env = super::node_env();
     let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
     for (i, step) in steps.iter().enumerate() {
         if !step.platforms.is_empty() && !step.platforms.iter().any(|p| p == os) {
@@ -1366,7 +1401,7 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLo
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
-            .envs(node_env.clone())
+            .envs(node_env.iter().map(|(k, v)| (*k, v)))
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
@@ -1383,6 +1418,7 @@ fn replace_and_build(
     plugin_id: &str,
     fetched: &FetchedPlugin,
     final_dir: &Path,
+    node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<()> {
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
@@ -1408,7 +1444,7 @@ fn replace_and_build(
                 final_dir.display()
             )
         })?;
-        build_in_place(plugin_id, final_dir, &fetched.manifest, log)
+        build_in_place(plugin_id, final_dir, &fetched.manifest, node_env, log)
     })();
 
     match place_and_build {
@@ -1522,6 +1558,36 @@ mod tests {
             "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{aoe}"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn only_manifests_that_build_or_run_a_non_system_worker_need_node() {
+        let cases = [
+            (None, false),
+            (Some("kind = \"release-binary\"\nasset = \"w\""), false),
+            (
+                Some("kind = \"command\"\ncommand = [\"w\"]\nsystem = true"),
+                false,
+            ),
+            (Some("kind = \"command\"\ncommand = [\"bin/w\"]"), true),
+            (
+                Some(
+                    "kind = \"command\"\ncommand = [\"w\"]\nsystem = true\n\
+                     build = [{ command = [\"npm\", \"ci\"] }]",
+                ),
+                true,
+            ),
+        ];
+        for (runtime, expected) in cases {
+            let runtime = runtime
+                .map(|r| format!("capabilities = [\"runtime.worker\"]\n[runtime]\n{r}"))
+                .unwrap_or_default();
+            let manifest = PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n{runtime}"
+            ))
+            .unwrap();
+            assert_eq!(needs_node(&manifest), expected, "{runtime}");
+        }
     }
 
     #[test]
