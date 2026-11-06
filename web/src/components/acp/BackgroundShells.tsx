@@ -1,7 +1,7 @@
 // Backgrounded shell commands of the active session: what is running, what
 // ran, and each one's command and output.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Maximize2, Terminal, X } from "lucide-react";
 
 import { useBackgroundShells } from "../../hooks/useAcpSession";
@@ -14,6 +14,7 @@ const OUTPUT_POLL_MS = 2000;
 export function BackgroundShells({ sessionId }: { sessionId: string }) {
   const shells = useBackgroundShells(sessionId);
   const [open, setOpen] = useState<string | null>(null);
+  const close = useCallback(() => setOpen(null), []);
   if (shells.length === 0) return null;
   const running = shells.filter((s) => !s.finished).reverse();
   const recent = shells.filter((s) => s.finished).reverse();
@@ -22,7 +23,9 @@ export function BackgroundShells({ sessionId }: { sessionId: string }) {
     <div className="border-b border-surface-700">
       <ShellGroup label="Running shells" shells={running} onOpen={setOpen} />
       <ShellGroup label="Recent shells" shells={recent} onOpen={setOpen} />
-      {opened && <ShellDetailModal sessionId={sessionId} shell={opened} onClose={() => setOpen(null)} />}
+      {opened && (
+        <ShellDetailModal key={`${sessionId}:${opened.taskId}`} sessionId={sessionId} shell={opened} onClose={close} />
+      )}
     </div>
   );
 }
@@ -75,28 +78,52 @@ function ShellDetailModal({
   const [out, setOut] = useState<TaskOutput | null | undefined>(undefined);
   const [wrap, setWrap] = useState(true);
   const preRef = useRef<HTMLPreElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
+  // Focus moves into the dialog, Tab stays inside it, and closing returns focus.
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const panel = panelRef.current;
+    panel?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") return onClose();
+      if (e.key !== "Tab" || !panel) return;
+      const items = [...panel.querySelectorAll<HTMLElement>("button, [href], pre[tabindex]")];
+      if (items.length === 0) return e.preventDefault();
+      const first = items[0]!;
+      const last = items[items.length - 1]!;
+      if (
+        !panel.contains(document.activeElement) ||
+        (e.shiftKey && (document.activeElement === first || document.activeElement === panel))
+      ) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      previous?.focus();
+    };
   }, [onClose]);
 
   // Poll while the shell runs; one last read after it ends.
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
       const next = await fetchTaskOutput(sessionId, shell.taskId);
-      if (!cancelled) setOut(next);
+      if (cancelled) return;
+      setOut(next);
+      if (!shell.finished) timer = setTimeout(read, OUTPUT_POLL_MS);
     };
     void read();
-    if (shell.finished) return () => void (cancelled = true);
-    const id = setInterval(read, OUTPUT_POLL_MS);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      clearTimeout(timer);
     };
   }, [sessionId, shell.taskId, shell.finished]);
 
@@ -115,6 +142,8 @@ function ShellDetailModal({
       aria-label="Background shell"
     >
       <div
+        ref={panelRef}
+        tabIndex={-1}
         className="flex max-h-[85vh] w-[680px] max-w-[92vw] flex-col rounded-lg border border-surface-700/50 bg-surface-800 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
