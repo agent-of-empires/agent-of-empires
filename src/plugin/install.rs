@@ -277,7 +277,7 @@ async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
-    if !build_steps(&fetched.manifest).is_empty() {
+    if needs_node(&fetched.manifest) {
         super::ensure_node().await;
     }
 
@@ -589,7 +589,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
     reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
     reject_incompatible_host(&fetched.manifest)?;
-    if !build_steps(&fetched.manifest).is_empty() {
+    if needs_node(&fetched.manifest) {
         super::ensure_node().await;
     }
 
@@ -1335,7 +1335,7 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     }
 }
 
-/// Whether applying `manifest` runs a build step or validates a non-system worker.
+/// Whether installing `manifest` runs a build step or launches a non-system worker.
 fn needs_node(manifest: &PluginManifest) -> bool {
     match &manifest.runtime {
         Some(RuntimeSpec::Command { build, system, .. }) => !build.is_empty() || !system,
@@ -1350,7 +1350,10 @@ async fn apply_node_env(manifest: &PluginManifest) -> NodeEnv {
     }
     tokio::task::spawn_blocking(super::node_env)
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            tracing::warn!(target: "plugin.install", %error, "Node resolution task failed");
+            NodeEnv::new()
+        })
 }
 
 fn build_in_place(
