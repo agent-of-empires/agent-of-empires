@@ -401,6 +401,9 @@ before provisioning begins. Failure to persist approval aborts creation.
 The optional `cli` object carries CLI selection intent: `parent`, `projects`,
 `command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
 Selectors, project registries, configuration and paths are resolved on the Daemon host.
+A `cli.parent` follows `parent_session_id`'s rules and codes: a missing or trashed parent is
+`400 parent_not_found` and a sub-session is `400 parent_is_sub_session`. The parent is checked
+before anything is provisioned, so a refusal leaves no worktree, branch or workspace behind.
 CLI agent selection also resolves approved plugin agents on the Daemon host.
 Nonblank configured custom commands take precedence over plugin commands; blank
 custom commands allow built-in or plugin fallback. Plugin `--tool` selections
@@ -546,6 +549,7 @@ rollback.
 | Field | Notes |
 | --- | --- |
 | `callback_url` | An HTTP POST fires here when the session transitions to `Waiting`, `Idle`, or `Error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time, and re-resolved and re-checked before every dispatch; the approved address is then pinned for the request, so a DNS answer that changes in between cannot redirect it). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
+| `parent_session_id` | Make the new session a sub-session of this one. The parent must be a live (not trashed) top-level session in the profile the new session is created in, as `aoe add --parent` resolves it. The new session joins the parent's group, which replaces any `group` in the request. Otherwise the request is refused with `400 parent_not_found` (no such session, another profile's, or a trashed one) or `400 parent_is_sub_session` (sessions nest one level deep). In CityHall mode a Terminal view parent is answered with `parent_not_found` too, so the mode doesn't reveal which ids exist. These checks apply to a new creation; a replay of a known `idempotency_key` returns its session as before. |
 | `idempotency_key` | A retry using the same key (even across a daemon restart, since the key is persisted on the created session) returns the existing session as `200` instead of creating a duplicate. Max 200 characters. If the originally-created session was later hard-deleted (not just trashed), the key is no longer found and a fresh session is created. |
 
 `callback_url` is persisted with the session in the session store on disk, so

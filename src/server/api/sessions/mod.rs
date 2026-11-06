@@ -48,7 +48,7 @@ mod send;
 mod update;
 
 pub use artifacts::*;
-pub(crate) use cli_create::resolve_cli_session;
+pub(crate) use cli_create::resolve_cli_parent;
 pub use create::*;
 pub use delete::*;
 pub use diff::*;
