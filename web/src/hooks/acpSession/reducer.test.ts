@@ -238,6 +238,21 @@ describe("prompt queue", () => {
     expect(late.queuedPrompts.map((q) => q.id)).toEqual(["q1"]);
   });
 
+  it("a late queued response restores local attachment bytes on a hydrated row", () => {
+    const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
+    const hydrated = reducer(empty(), { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])] });
+    expect(hydrated.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("");
+
+    const late = reducer(hydrated, { kind: "enqueue_prompt", id: "q1", text: "local", attachments: [image] });
+    expect(late.queuedPrompts).toHaveLength(1);
+    expect(late.queuedPrompts[0]).toMatchObject({ id: "q1", text: "srv" });
+    expect(late.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
+
+    const again = reducer(late, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])] });
+    expect(again.queuedPrompts).toHaveLength(1);
+    expect(again.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
+  });
+
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {
     const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
     const local = run(empty(), { kind: "enqueue_prompt", id: "q1", text: "img", attachments: [image] });
