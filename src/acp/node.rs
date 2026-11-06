@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// The Node major floor for every adapter.
@@ -90,24 +91,29 @@ pub fn resolve_for(
 /// How long `node --version` may run before the probe is killed.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn probe_version(path: &Path, timeout: Duration) -> std::io::Result<std::process::Output> {
+fn probe_version(
+    path: &Path,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new(path);
     cmd.arg("--version").stdin(Stdio::null());
-    crate::process::run_with_timeout_process_group(&mut cmd, timeout)?.ok_or_else(|| {
+    crate::process::run_until_cancelled_process_group(&mut cmd, timeout, cancel)?.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, "node --version timed out")
     })
 }
 
 fn verify_path(path: &Path, source: NodeSource) -> Result<ResolvedNode, NodeError> {
-    verify_path_within(path, source, PROBE_TIMEOUT)
+    verify_path_within(path, source, PROBE_TIMEOUT, &CancellationToken::new())
 }
 
 fn verify_path_within(
     path: &Path,
     source: NodeSource,
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> Result<ResolvedNode, NodeError> {
-    let output = probe_version(path, timeout)?;
+    let output = probe_version(path, timeout, cancel)?;
     if !output.status.success() {
         return Err(NodeError::TooOld {
             path: path.to_path_buf(),
@@ -362,8 +368,13 @@ mod tests {
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = Instant::now();
-        let err = verify_path_within(&node, NodeSource::Env, Duration::from_millis(200))
-            .expect_err("a hanging probe must fail");
+        let err = verify_path_within(
+            &node,
+            NodeSource::Env,
+            Duration::from_millis(200),
+            &CancellationToken::new(),
+        )
+        .expect_err("a hanging probe must fail");
         assert!(
             matches!(&err, NodeError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
             "{err}"
@@ -386,7 +397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_timed_out_probe_kills_its_descendants() {
+    fn an_interrupted_probe_kills_its_descendants() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let node = temp.path().join("node");
@@ -399,18 +410,42 @@ mod tests {
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _cleanup = KillDescendant(pid_file.clone());
 
-        // The timeout must outlast the script's first two lines, or the group is
-        // killed before the pid is recorded.
-        verify_path_within(&node, NodeSource::Env, Duration::from_secs(3))
-            .expect_err("a hanging probe must fail");
+        // Cancel once the script has published the descendant, so the group is
+        // never killed before the pid exists.
+        let cancel = CancellationToken::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < deadline
+                    && !std::fs::read_to_string(&pid_file)
+                        .is_ok_and(|s| s.trim().parse::<u32>().is_ok())
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                cancel.cancel();
+            });
+            verify_path_within(&node, NodeSource::Env, Duration::from_secs(30), &cancel)
+                .expect_err("a cancelled probe must fail");
+        });
 
         let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .expect("the script records the descendant before the probe times out")
+            .expect("the script records the descendant before the probe is cancelled")
             .trim()
             .parse()
             .unwrap();
+        // `kill(pid, 0)` also succeeds for a zombie that a non-reaping PID 1 never collects.
+        let is_running = |pid: libc::pid_t| {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps should inspect descendant state");
+            let state = String::from_utf8_lossy(&output.stdout);
+            output.status.success()
+                && !state.trim().is_empty()
+                && !state.trim_start().starts_with('Z')
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while unsafe { libc::kill(pid, 0) } == 0 {
+        while is_running(pid) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "descendant {pid} outlived the probe"
@@ -436,8 +471,13 @@ mod tests {
         let _cleanup = KillDescendant(pid_file);
 
         let started = Instant::now();
-        let resolved = verify_path_within(&node, NodeSource::Env, Duration::from_secs(5))
-            .expect("the version printed before exit is read without waiting for the descendant");
+        let resolved = verify_path_within(
+            &node,
+            NodeSource::Env,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .expect("the version printed before exit is read without waiting for the descendant");
         assert_eq!(resolved.version, PINNED_NODE_VERSION);
         assert!(started.elapsed() < Duration::from_secs(4));
     }
