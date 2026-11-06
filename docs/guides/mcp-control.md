@@ -23,7 +23,7 @@ A configured TCP startup failure is reported without automatically starting a co
 
 Free the port or repair the reported startup failure, then retry the CLI command or press `r` in the TUI to reconnect.
 
-Invalid global settings or application state also block fresh acquisition and TCP replacement. AoE reports the loading error before creating a daemon or stopping its predecessor, rather than selecting defaults.
+If global settings or application state cannot be loaded, fresh automatic acquisition fails instead of choosing default service settings. Explicit serving and restart retain their selected launch mode and existing configuration-recovery behavior.
 
 To work intentionally without TCP, run `aoe serve --core-only --daemon`, then retry the command or reconnect the TUI. MCP remains unavailable on that daemon. Restart preserves core-only mode; after freeing the port, run `aoe serve --daemon` to explicitly promote it back to TCP.
 

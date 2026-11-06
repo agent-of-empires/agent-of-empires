@@ -446,56 +446,26 @@ fn configured_autostart_reports_tcp_bind_failure_without_private_fallback() {
     assert_mcp_connects(&h);
 }
 
-/// Broken launch policy must not create or replace an owner. Explicit private
-/// recovery remains available, but cannot promote itself using fallback settings.
+/// Invalid configuration cannot establish an automatic service-selection policy.
 #[test]
 #[parallel]
-fn configured_invalid_settings_refuse_acquisition_and_replay() {
+fn configured_invalid_settings_refuse_fresh_acquisition() {
     if !crate::serve::isolated_local_network() {
         return;
     }
-    for replay in [false, true] {
-        let mut h = TuiTestHarness::new_in_tmp("configured_invalid_settings");
-        h.stop_daemon_on_drop();
-        h.remove_env("AOE_SERVE_PASSPHRASE");
-        h.append_config("[web]\nmcp_enabled = true");
-        h.run_cli_ok(&["migrate"]);
-        let app = app_dir_in(h.home_path());
-        let config = app.join("config.toml");
-        let passphrase = "invalid-config-retained-passphrase";
-        let predecessor = if replay {
-            h.start_daemon_with(&["--passphrase", passphrase]);
-            Some((
-                std::fs::read(app.join("serve.pid")).unwrap(),
-                std::fs::read(app.join("serve.launch")).unwrap(),
-            ))
-        } else {
-            None
-        };
-        let broken = "[web]\nmcp_enabled = true\nbroken = [\n";
-        std::fs::write(&config, broken).unwrap();
-        let error = h.run_cli_err(if replay {
-            &["serve", "--restart"]
-        } else {
-            &["profile", "list"]
-        });
-        assert!(error.contains(config.to_str().unwrap()), "{error}");
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
-        if let Some((pid, launch)) = predecessor {
-            assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
-            assert_eq!(std::fs::read(app.join("serve.launch")).unwrap(), launch);
-            crate::serve::assert_original_passphrase_login(&h, passphrase);
-        } else {
-            assert!(!app.join("serve.pid").exists());
-            assert!(!app.join("serve.launch").exists());
-            h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
-            let pid = std::fs::read(app.join("serve.pid")).unwrap();
-            let launch = std::fs::read(app.join("serve.launch")).unwrap();
-            h.run_cli_err(&["serve", "--daemon"]);
-            assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
-            assert_eq!(std::fs::read(app.join("serve.launch")).unwrap(), launch);
-        }
-    }
+    let mut h = TuiTestHarness::new_in_tmp("configured_invalid_settings");
+    h.stop_daemon_on_drop();
+    h.append_config("[web]\nmcp_enabled = true");
+    h.run_cli_ok(&["migrate"]);
+    let app = app_dir_in(h.home_path());
+    let config = app.join("config.toml");
+    let broken = "[web]\nmcp_enabled = true\nbroken = [\n";
+    std::fs::write(&config, broken).unwrap();
+    let error = h.run_cli_err(&["profile", "list"]);
+    assert!(error.contains(config.to_str().unwrap()), "{error}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
+    assert!(!app.join("serve.pid").exists());
+    assert!(!app.join("serve.launch").exists());
 }
 
 #[test]
