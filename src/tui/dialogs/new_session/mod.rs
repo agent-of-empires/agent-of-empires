@@ -1893,11 +1893,11 @@ impl NewSessionDialog {
     }
 
     pub(super) fn workspace_effective(&self) -> bool {
-        self.workspace || self.workspace_forced()
+        self.workspace_forced() || (self.workspace && self.create_new_branch)
     }
 
     fn toggle_workspace(&mut self) {
-        if !self.workspace_forced() {
+        if !self.workspace_forced() && self.create_new_branch {
             self.workspace = !self.workspace;
         }
     }

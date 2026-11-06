@@ -326,7 +326,7 @@ impl NewSessionDialog {
                     "existing"
                 };
                 let layout = match self.workspace_repos.len() {
-                    0 if self.workspace => Some("workspace".to_string()),
+                    0 if self.workspace_effective() => Some("workspace".to_string()),
                     0 => None,
                     n => Some(format!("{} repos", n)),
                 };
@@ -1017,6 +1017,8 @@ impl NewSessionDialog {
             };
             let text = if self.workspace_forced() {
                 " Workspace directory (required by extra repos)"
+            } else if !self.create_new_branch {
+                " Workspace directory (new branches only)"
             } else {
                 " Workspace directory"
             };

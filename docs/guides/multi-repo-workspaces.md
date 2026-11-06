@@ -53,7 +53,7 @@ A workspace can hold just one repo. Starting that way puts the session in the wo
 aoe add /path/to/backend -w feat/auth-rewrite -b --workspace
 ```
 
-TUI: in the worktree configuration (`Ctrl+P` on **Worktree**), tick **Workspace**. Web: turn on **Workspace directory** in the wizard's Worktree panel. Either way it is on and locked whenever extra repos are listed. To make this the default for new worktree sessions, set `workspace_by_default = true` under `[worktree]` (Settings, Worktree tab); `aoe add --no-workspace` opts one session out.
+TUI: in the worktree configuration (`Ctrl+P` on **Worktree**), tick **Workspace**. Web: turn on **Workspace directory** in the wizard's Worktree panel. Either way it is on and locked whenever extra repos are listed. To make this the default for new worktree sessions, set `workspace_by_default = true` under `[worktree]` (Settings, Worktree tab); `aoe add --no-workspace` opts one session out. The default only applies when the session creates its branch: attaching to an existing branch stays a plain worktree.
 
 ### Adding a repo to an existing session
 

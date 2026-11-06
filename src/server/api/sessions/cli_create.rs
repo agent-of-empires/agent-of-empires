@@ -188,6 +188,7 @@ fn resolve_host_creation(
         body.worktree_branch
             .as_deref()
             .is_some_and(|b| !b.trim().is_empty()),
+        body.create_new_branch,
         config.worktree.workspace_by_default,
     );
     let unknown_tool = |description: &str| {
@@ -410,15 +411,17 @@ fn resolve_host_creation(
 }
 
 /// An explicit flag wins over the setting. The setting only applies to a
-/// worktree session, and `--generated-name` opts out because a workspace
-/// directory ignores the title.
+/// worktree session creating its branch: attaching reuses the branch's existing
+/// checkout, which a workspace cannot. `--generated-name` opts out because a
+/// workspace directory ignores the title.
 fn wants_workspace(
     flag: Option<bool>,
     generated_name: bool,
     has_worktree: bool,
+    create_new_branch: bool,
     workspace_by_default: bool,
 ) -> bool {
-    flag.unwrap_or(workspace_by_default && has_worktree && !generated_name)
+    flag.unwrap_or(workspace_by_default && has_worktree && create_new_branch && !generated_name)
 }
 
 #[cfg(test)]
@@ -428,18 +431,20 @@ mod workspace_tests {
     #[test]
     fn workspace_flag_overrides_the_setting() {
         let cases = [
-            (None, false, true, false, false),
-            (None, false, true, true, true),
-            (None, false, false, true, false),
-            (None, true, true, true, false),
-            (Some(true), false, true, false, true),
-            (Some(false), false, true, true, false),
+            (None, false, true, true, false, false),
+            (None, false, true, true, true, true),
+            (None, false, true, false, true, false),
+            (None, false, false, true, true, false),
+            (None, true, true, true, true, false),
+            (Some(true), false, true, true, false, true),
+            (Some(true), false, true, false, false, true),
+            (Some(false), false, true, true, true, false),
         ];
-        for (flag, generated, worktree, default, want) in cases {
+        for (flag, generated, worktree, new_branch, default, want) in cases {
             assert_eq!(
-                wants_workspace(flag, generated, worktree, default),
+                wants_workspace(flag, generated, worktree, new_branch, default),
                 want,
-                "{flag:?} generated={generated} worktree={worktree} default={default}"
+                "{flag:?} generated={generated} worktree={worktree} new_branch={new_branch} default={default}"
             );
         }
     }

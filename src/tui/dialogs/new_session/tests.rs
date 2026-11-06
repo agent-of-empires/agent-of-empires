@@ -2044,3 +2044,39 @@ fn workspace_toggle_follows_config_and_is_forced_by_extra_repos() {
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(!data.workspace);
 }
+
+#[test]
+fn workspace_is_unavailable_when_attaching_an_existing_branch() {
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.workspace = true;
+    dialog.create_new_branch = false;
+    dialog.worktree_config_focused_field = WT_WORKSPACE_FIELD;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.workspace, "the toggle ignores input while attaching");
+    let screen = screen_text(&draw(&mut dialog));
+    assert!(screen.contains("Workspace: [ ]"), "{screen}");
+    assert!(screen.contains("new branches only"), "{screen}");
+    dialog.handle_key(key(KeyCode::Esc));
+    assert!(!screen_text(&draw(&mut dialog)).contains("workspace)"));
+    dialog.worktree_branch = Input::new("feat/existing".to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(!data.workspace);
+
+    // Extra repos make a fresh worktree per repo, so they still need one.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.create_new_branch = false;
+    dialog.workspace_repos = vec!["/repo/one".into()];
+    dialog.worktree_branch = Input::new("feat/existing".to_string());
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+
+    // The choice comes back with New Branch.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.workspace = true;
+    dialog.create_new_branch = false;
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [ ]"));
+    dialog.create_new_branch = true;
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+}

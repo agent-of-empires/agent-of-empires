@@ -280,4 +280,36 @@ fn workspace_by_default_applies_on_the_daemon() {
     let opted = session_by_title(&sessions, "Opted");
     assert!(opted["workspace_info"].is_null());
     assert!(!opted["worktree_info"].is_null());
+
+    // Attaching a branch checked out in a worktree reuses that directory.
+    let checkout = h.home_path().join("existing-checkout");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/existing",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    h.run_cli_ok(&[
+        "add",
+        repo.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "Attached",
+        "-w",
+        "feat/existing",
+    ]);
+    let sessions = h.read_sessions();
+    let attached = session_by_title(&sessions, "Attached");
+    assert!(attached["workspace_info"].is_null());
+    assert_eq!(
+        Path::new(attached["project_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        checkout.canonicalize().unwrap()
+    );
 }
