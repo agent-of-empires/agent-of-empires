@@ -171,28 +171,44 @@ pub(crate) fn resolve_declared_tool(cmd: &str) -> Option<&'static str> {
     if cmd_lower.is_empty() {
         return None;
     }
-    let mut best: Option<(usize, &'static str)> = None;
+    let mut best: HashMap<&'static str, usize> = HashMap::new();
     for plugin in super::registry().active() {
         for entry in &plugin.manifest.agent_integrations {
             let Some(agent) = declared_agent(&entry.tool) else {
                 continue;
             };
+            // An absolute command is matched by its basename: the token scan
+            // below splits on `/`, so the stored path itself never compares equal.
+            let executable = std::path::Path::new(agent.binary)
+                .file_name()
+                .and_then(|name| name.to_str());
             for token in std::iter::once(agent.name)
                 .chain(std::iter::once(agent.binary))
+                .chain(executable)
                 .chain(agent.aliases.iter().copied())
             {
                 let token_lower = token.to_lowercase();
+                if token_lower.is_empty() {
+                    continue;
+                }
                 let matches = cmd_lower
                     .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.')));
-                if matches.into_iter().any(|part| part == token_lower)
-                    && best.is_none_or(|(len, _)| token_lower.len() > len)
-                {
-                    best = Some((token_lower.len(), agent.name));
+                if matches.into_iter().any(|part| part == token_lower) {
+                    let length = best.entry(agent.name).or_default();
+                    *length = (*length).max(token_lower.len());
                 }
             }
         }
     }
-    best.map(|(_, name)| name)
+    // Equally long matches are indistinguishable here, so refuse rather than
+    // pick whichever declaration the registry happened to yield first.
+    let longest = best.values().copied().max()?;
+    let mut names = best
+        .iter()
+        .filter(|(_, length)| **length == longest)
+        .map(|(name, _)| *name);
+    let name = names.next()?;
+    names.next().is_none().then_some(name)
 }
 
 /// Resolve a unique plugin-provided agent launch command.
@@ -329,7 +345,7 @@ fn declared_for(tool: &str) -> Option<DeclaredAgent> {
     })
 }
 
-static DECLARED_AGENT_CACHE: LazyLock<Mutex<HashMap<String, Option<&'static AgentDef>>>> =
+static DECLARED_AGENT_CACHE: LazyLock<Mutex<HashMap<String, (u64, Option<&'static AgentDef>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn clear_declared_agent_cache() {
@@ -343,24 +359,24 @@ pub(crate) fn clear_declared_agent_cache() {
 /// entries win in [`crate::agents::get_agent`], so a declaration only takes
 /// effect once the matching core entry is deleted.
 pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
-    if let Some(cached) = DECLARED_AGENT_CACHE
+    let generation = super::registry_generation();
+    if let Some((cached_generation, cached)) = DECLARED_AGENT_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(tool)
         .copied()
     {
-        return cached;
+        if cached_generation == generation {
+            return cached;
+        }
     }
-    let resolved = declared_for(tool).and_then(|declared| {
-        let declares_agent = declared.launch.is_some()
-            || declared.detection.is_some()
-            || declared.reply_fallback.is_some();
-        declares_agent.then(|| build_declared_agent(declared))
-    });
+    let resolved = declared_for(tool).map(build_declared_agent);
+    // A lookup that raced a reload stays tagged with the snapshot it read, so
+    // the next call after the swap resolves against the new registry.
     DECLARED_AGENT_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(tool.to_string(), resolved);
+        .insert(tool.to_string(), (generation, resolved));
     resolved
 }
 
@@ -656,6 +672,21 @@ pub fn declaration_summary(integration: &AgentIntegrationContribution) -> Vec<St
     if integration.detection.is_some() {
         lines.push("  detection: native_only".to_string());
     }
+    if !integration.provider_versions.is_empty() {
+        lines.push(format!(
+            "  provider versions: {}",
+            integration
+                .provider_versions
+                .iter()
+                .map(|requirement| display_command(requirement))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
+        "  native replies: {}",
+        if integration.replies { "yes" } else { "no" }
+    ));
     if let Some(replies) = &integration.reply_fallback {
         let allow = replies
             .allow
@@ -1301,6 +1332,7 @@ deny = [{ kind = "literal", value = "n" }]
         let integration = AgentIntegrationContribution {
             tool: "acme-helper".into(),
             command: Some("acme-helper --serve".into()),
+            provider_versions: vec!["^18".into()],
             launch: Some(AgentLaunchDeclaration {
                 container_env: [(
                     "PI_CODING_AGENT_DIR".to_string(),
@@ -1333,6 +1365,12 @@ deny = [{ kind = "literal", value = "n" }]
             "{summary:?}"
         );
         assert!(summary.iter().any(|line| line.contains("native_only")));
+        assert!(summary
+            .iter()
+            .any(|line| line.contains("provider versions: ^18")));
+        assert!(summary
+            .iter()
+            .any(|line| line.contains("native replies: no")));
         assert!(summary.iter().any(|line| line.contains("reply fallback")));
     }
 

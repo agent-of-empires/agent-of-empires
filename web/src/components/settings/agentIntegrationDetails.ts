@@ -56,6 +56,10 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
     if (launch.install_hint) details.push(`install: ${launch.install_hint}`);
   }
   if (agent.detection) details.push(`detection: ${agent.detection.mode}`);
+  if (agent.provider_versions?.length) {
+    details.push(`provider versions: ${agent.provider_versions.join(", ")}`);
+  }
+  details.push(`native replies: ${agent.replies ? "yes" : "no"}`);
   if (agent.reply_fallback) {
     const label = (key: { kind: string; value: string }) =>
       key.kind === "named" ? key.value : JSON.stringify(key.value);

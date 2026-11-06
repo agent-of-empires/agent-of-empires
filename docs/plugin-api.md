@@ -70,6 +70,9 @@ replies = true
 An integration can also declare the launch behavior the host previously kept in its built-in agent registry. Built-in agents keep precedence, so a declaration for a built-in name takes effect only after the core entry is removed.
 
 ```toml
+[agent_integrations]
+replies = false
+
 [agent_integrations.launch]
 oneshot_flag = "-p"
 instruction_flag = "--append-system-prompt {}"
@@ -100,7 +103,7 @@ allow = [{ kind = "named", value = "Enter" }]
 deny = [{ kind = "literal", value = "n" }]
 ```
 
-- `launch.oneshot_flag`, `instruction_flag`, and `model_flag` are single argv tokens. `instruction_flag` contains exactly one `{}` placeholder. `launch.aliases` are lowercase agent ids that must not repeat the tool.
+- `launch.oneshot_flag` and `model_flag` are single argv tokens. `instruction_flag` is a shell template containing exactly one `{}`, replaced with the shell-escaped instruction and appended to the launch command, so it can expand to several argv tokens. `launch.aliases` are lowercase agent ids that must not repeat the tool.
 - `launch.yolo` is `kind = "flag"` with one argv token, `kind = "always"`, or `kind = "env"` with a settable `key` and `value`.
 - `launch.container_env` holds literal `NAME=value` entries merged into sandbox launches only. `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, `PWD`, `AOE_*`, `LD_*`, and `DYLD_*` are rejected.
 - `launch.resume` is `kind = "flag"`, `kind = "flag_pair"`, or `kind = "subcommand"`. `launch.capture` names a core backend and the host/sandbox contexts `pane_scoped`, `preassigned`, `managed_exclusive_store`, or `unsupported`. Capture requires resume.

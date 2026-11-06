@@ -138,6 +138,14 @@ impl<T> RwLockSafe<T> for RwLock<T> {
 
 static REGISTRY: RwLock<Option<Arc<PluginRegistry>>> = RwLock::new(None);
 
+/// Bumped on every registry replacement so a declaration cached from an older
+/// snapshot is never served against the active one.
+static REGISTRY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn registry_generation() -> u64 {
+    REGISTRY_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn registry() -> Arc<PluginRegistry> {
     if let Some(reg) = REGISTRY.read_safe().as_ref() {
         return reg.clone();
@@ -161,6 +169,7 @@ pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
 pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
+    REGISTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     agent_integration::clear_declared_agent_cache();
     *REGISTRY.write_safe() = Some(reg.clone());
     reg
