@@ -428,20 +428,29 @@ fn prune_completed_background_work(
     };
     for (start, end, id, keep) in BACKGROUND_WORK_EVENTS {
         // An end closes only the starts before it: ids may be reused.
+        let closed = |started: &str| {
+            format!(
+                "EXISTS (
+                   SELECT 1 FROM {events} AS ended
+                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
+                     AND ended.seq > {started}.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract({started}.event_json, '$.{start}.{id}'))"
+            )
+        };
+        // Open starts are pinned, so they do not count toward the kept ones.
         let delete_started = format!(
             "DELETE FROM {events} AS started
              WHERE started.session_id = ?1 AND started.seq <= ?2
                AND started.discriminant = '{start}'
                AND started.seq NOT IN (
-                   SELECT seq FROM {events}
-                   WHERE session_id = ?1 AND discriminant = '{start}'
-                   ORDER BY seq DESC LIMIT {keep})
-               AND EXISTS (
-                   SELECT 1 FROM {events} AS ended
-                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
-                     AND ended.seq > started.seq
-                     AND json_extract(ended.event_json, '$.{end}.{id}') =
-                         json_extract(started.event_json, '$.{start}.{id}'))"
+                   SELECT recent.seq FROM {events} AS recent
+                   WHERE recent.session_id = ?1 AND recent.discriminant = '{start}'
+                     AND {}
+                   ORDER BY recent.seq DESC LIMIT {keep})
+               AND {}",
+            closed("recent"),
+            closed("started")
         );
         let delete_ended = format!(
             "DELETE FROM {events} AS ended

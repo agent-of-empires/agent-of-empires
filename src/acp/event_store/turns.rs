@@ -1268,6 +1268,16 @@ mod tests {
                 ended_at: None,
             });
         }
+        // Open shells newer than every finished one must not use up kept slots.
+        for i in 0..3 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("open{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+        }
         for _ in 0..150 {
             record(Event::AgentMessageChunk {
                 text: "x".into(),
@@ -1285,9 +1295,10 @@ mod tests {
             .collect();
         let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
             .map(|i| format!("t{i}"))
+            .chain((0..3).map(|i| format!("open{i}")))
             .collect();
         assert_eq!(kept, expected);
-        assert!(store.unresolved_background_task_ids("s-1").is_empty());
+        assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
     }
 
     /// Nothing guarantees an adapter task id stays unique for a session, so a
