@@ -95,6 +95,84 @@ describe("BackgroundAgentsPanel shells", () => {
   });
 });
 
+describe("BackgroundAgentsPanel shell dialog", () => {
+  const openShell = async (over: Partial<BackgroundShell> = {}, out = {}) => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell(over)]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "line one", truncated: false, ...out });
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const launcher = view.getByTitle("Open command and output");
+    launcher.focus();
+    fireEvent.click(launcher);
+    await waitFor(() => expect(document.body.textContent).toContain("line one"));
+    return { ...view, launcher };
+  };
+
+  it("closes on Escape and on a backdrop click, returning focus to the launcher", async () => {
+    const { launcher } = await openShell({ finished: true });
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+    expect(document.activeElement).toBe(dialog.firstElementChild);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(launcher);
+
+    fireEvent.click(launcher);
+    fireEvent.click(document.querySelector('[role="dialog"]') as HTMLElement);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("keeps Tab inside the dialog", async () => {
+    await openShell({ finished: true });
+    const buttons = [...(document.querySelector('[role="dialog"]') as HTMLElement).querySelectorAll("button")];
+    const last = buttons[buttons.length - 1]!;
+    last.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("toggles wrapping, flags a truncated tail and says when the command is unknown", async () => {
+    await openShell({ command: "", finished: true }, { truncated: true });
+    expect(document.body.textContent).toContain("(command unavailable)");
+    expect(document.body.textContent).toContain("Showing the end of a long output.");
+    const pre = document.querySelector("pre[class*='max-h']") as HTMLElement;
+    expect(pre.className).toContain("whitespace-pre-wrap");
+    fireEvent.click(document.querySelector("button[aria-pressed]") as HTMLElement);
+    expect(pre.className).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("polls a running shell one read at a time and stops once it finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell()]);
+      let release: (v: unknown) => void = () => {};
+      taskOutputMock.mockReset();
+      taskOutputMock
+        .mockImplementationOnce(() => new Promise((r) => (release = r)))
+        .mockResolvedValue({ exists: true, output: "later", truncated: false });
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(1);
+
+      release({ exists: true, output: "first", truncated: false });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(2);
+
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+      await vi.advanceTimersByTimeAsync(0);
+      const afterFinish = taskOutputMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(afterFinish);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("BackgroundAgentsPanel", () => {
   it("groups a workflow's agents under the run and its phases", () => {
     const wf = (phase: string) => ({ run_id: "wf_1", name: "issue-drafts", phase });

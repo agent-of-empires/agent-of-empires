@@ -341,6 +341,25 @@ describe("applyEvent / background shells", () => {
     expect(state.backgroundShells).toHaveLength(MAX_FINISHED_BACKGROUND_SHELLS);
     expect(state.backgroundShells[0]!.taskId).toBe("t3");
   });
+
+  it("keeps a finish a stale snapshot would reopen, but lets a reused task id restart", () => {
+    const run = (startedAt: string, finished: boolean) =>
+      reducedState({
+        background_shells: [{ task_id: "a", command: "cmd", started_at: startedAt, finished }],
+      });
+    let state = ev(emptyAcpState(), 1, {
+      BackgroundTaskStarted: { task_id: "a", description: "cmd", started_at: "2026-11-06T10:00:00Z" },
+    } as AcpEvent);
+    state = ev(state, 2, {
+      BackgroundTaskFinished: { task_id: "a", ended_at: "2026-11-06T10:01:00Z" },
+    } as AcpEvent);
+
+    const stale = applyReducedState(state, run("2026-11-06T10:00:00Z", false));
+    expect(stale.backgroundShells[0]).toMatchObject({ finished: true, endedAt: "2026-11-06T10:01:00Z" });
+
+    const reused = applyReducedState(state, run("2026-11-06T11:00:00Z", false));
+    expect(reused.backgroundShells[0]).toMatchObject({ finished: false, startedAt: "2026-11-06T11:00:00Z" });
+  });
 });
 
 describe("applyEvent / workflow runs", () => {

@@ -10,6 +10,7 @@ import {
   type AcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type BackgroundShell,
 } from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
@@ -20,6 +21,7 @@ import {
   loadPersistedState,
   persistState,
   useBackgroundAgents,
+  useBackgroundShells,
 } from "./stateCache";
 
 const key = (id: string) => STORAGE_KEY_PREFIX + id;
@@ -238,5 +240,19 @@ describe("useBackgroundAgents", () => {
     expect(result.current).toBe(agents);
     unmount();
     clearAcpCache("sess-bg");
+  });
+});
+
+describe("useBackgroundShells", () => {
+  it("follows cache writes for its session without a socket", () => {
+    const { result, unmount } = renderHook(() => useBackgroundShells("sess-sh"));
+    expect(result.current).toEqual([]);
+    const shells: BackgroundShell[] = [
+      { taskId: "t1", command: "sleep 9", startedAt: null, endedAt: null, finished: false },
+    ];
+    act(() => cacheSet("sess-sh", { ...emptyAcpState(), backgroundShells: shells }));
+    expect(result.current).toBe(shells);
+    unmount();
+    clearAcpCache("sess-sh");
   });
 });
