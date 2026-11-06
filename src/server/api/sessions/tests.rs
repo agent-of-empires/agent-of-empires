@@ -3527,6 +3527,7 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
@@ -3565,6 +3566,7 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -3608,6 +3610,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -3655,6 +3658,7 @@ async fn list_sessions_state_filter() {
     let all = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -3667,6 +3671,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Live),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(live_only).await, ["scope-live"]);
@@ -3676,6 +3681,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Trashed),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(trashed_only).await, ["scope-trashed"]);
@@ -3685,6 +3691,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::All),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -8390,6 +8397,7 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -8475,6 +8483,7 @@ async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();

@@ -288,11 +288,15 @@ The response is an object, not a bare array:
 ```json
 {
   "sessions": [ { "id": "…", "status": "Running" } ],
-  "workspace_ordering": ["/path/to/repo::main"]
+  "workspace_ordering": ["/path/to/repo::main"],
+  "trashed_count": 0
 }
 ```
 
 - `sessions`: the session rows, in the daemon's canonical order.
+- `trashed_count`: the trashed rows in the whole snapshot, whatever `state`
+  filtered out, so a client that lists without the trash can still show its
+  size.
 - `workspace_ordering`: the user's persisted manual workspace order, so a
   client can render workspaces in place without a second request. Unknown
   workspaces (present in `sessions`, absent from this list) follow the
@@ -312,7 +316,15 @@ at a higher revision cannot satisfy that receipt.
 
 | Name | Default | Notes |
 | --- | --- | --- |
-| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
+| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `untrashed` excludes only trashed sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
+
+The response carries a strong `ETag` built from the runtime epoch, revision and
+`state`, and `Cache-Control: private, no-cache`. A request whose
+`If-None-Match` names it (weak comparison, `*` included) gets `304 Not Modified`
+with no body and the same `aoe-runtime-*` headers. A snapshot's revision changes
+exactly when its contents do, so polling an unchanged list costs headers only.
+`GET /api/plugins/ui-state` follows the same scheme, with an `ETag` derived from
+the response body.
 
 Each session row includes `context_resume`, the request-invariant availability
 of preserving that agent's context across a later lifecycle transition. It is
