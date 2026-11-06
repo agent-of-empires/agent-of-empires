@@ -1292,6 +1292,9 @@ pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
     pub workspace_ordering: Vec<String>,
+    /// Trashed rows in the whole snapshot, whatever the scope filtered out.
+    #[serde(default)]
+    pub trashed_count: usize,
 }
 
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with

@@ -56,6 +56,10 @@ interface Props {
   orgGroups: OrgNestedGroup[];
   /** Workspaces whose every session is trashed, computed by the parent from the unsliced list. */
   trashedWorkspaces?: Workspace[];
+  /** Trashed sessions the daemon holds; the rows load on demand, so this keeps the Trash control visible before then. */
+  trashedCount?: number;
+  trashLoaded?: boolean;
+  onLoadTrash?: () => void;
   onToggleSubgroup: (repoId: string, groupPath: string) => void;
   onToggleOrg: (orgId: string) => void;
   onToggleOrgRepo: (orgId: string, repoId: string) => void;
@@ -389,9 +393,12 @@ export function WorkspaceSidebar(props: Props) {
         <SidebarSystemHealth />
 
         <div className="border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center gap-1">
-          {trashedWorkspaces.length > 0 && (
+          {(trashedWorkspaces.length > 0 || (props.trashedCount ?? 0) > 0) && (
             <TrashMenu
               trashedWorkspaces={trashedWorkspaces}
+              trashedCount={props.trashedCount ?? 0}
+              loaded={props.trashLoaded ?? true}
+              onLoad={() => props.onLoadTrash?.()}
               readOnly={readOnly}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}

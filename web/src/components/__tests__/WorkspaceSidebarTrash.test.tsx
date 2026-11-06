@@ -91,6 +91,18 @@ const follows = (a: Node, b: Node) => !!(a.compareDocumentPosition(b) & Node.DOC
 afterEach(cleanup);
 
 describe("WorkspaceSidebar Trash control", () => {
+  it("shows the daemon's trash count before the rows exist and loads them when opened", () => {
+    const onLoadTrash = vi.fn();
+    renderSidebar([], { trashedWorkspaces: [], trashedCount: 4, trashLoaded: false, onLoadTrash });
+    expect(screen.getByTestId("sidebar-trash-count").textContent).toBe("4");
+    expect(onLoadTrash).not.toHaveBeenCalled();
+
+    click("sidebar-trash-toggle");
+    expect(onLoadTrash).toHaveBeenCalledTimes(1);
+    click("sidebar-trash-toggle");
+    expect(onLoadTrash).toHaveBeenCalledTimes(1);
+  });
+
   it("opens from the footer and exposes Open, Restore, and Delete", () => {
     const props = withTrash();
     expect(query("sidebar-trash-menu")).toBeNull();
@@ -219,6 +231,9 @@ describe("WorkspaceSidebar Trash control", () => {
     const menu = (workspaces: Workspace[]) => (
       <TrashMenu
         trashedWorkspaces={workspaces}
+        trashedCount={workspaces.length}
+        loaded
+        onLoad={noop}
         onOpen={noop}
         onRestore={noop}
         onDelete={noop}
