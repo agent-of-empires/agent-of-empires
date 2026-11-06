@@ -991,7 +991,8 @@ fn plan_plugin_statuses<'a>(
                 .saturating_sub(plan.width + reserve)
                 .saturating_sub(separator);
             if available == 0 {
-                return plan;
+                truncated = true;
+                continue;
             }
             let text_width = rendered_width(text);
             let visible_width = text_width.min(available);
@@ -5753,6 +5754,21 @@ mod plugin_status_plan_tests {
             [("a long label", 2, 2), ("✓", 1, 1), ("issue", 2, 1)]
         );
         assert_eq!(plan.width, 9);
+    }
+
+    #[test]
+    fn status_plan_admits_later_glyph_in_same_round() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "✓", None, Glyph),
+            ("a", "text", None, Text),
+            ("b", "◐", None, Glyph),
+            ("b", "✉", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 6);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓", "◐", "✉"]);
+        assert_eq!(plan.width, 6);
     }
 
     #[test]
