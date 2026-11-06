@@ -5210,7 +5210,8 @@
         "src/lib/__tests__/setup.test.ts",
         "src/components/setup/__tests__/SetupBanner.test.tsx",
         "src/components/setup/__tests__/SetupWizardPage.test.tsx",
-        "src/hooks/__tests__/useInlineMachineSave.test.ts"
+        "src/hooks/__tests__/useInlineMachineSave.test.ts",
+        "src/hooks/__tests__/useSetupStatus.test.ts"
       ],
       "components": [
         "web/src/components/setup/SetupWizardPage.tsx",
