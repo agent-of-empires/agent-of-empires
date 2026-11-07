@@ -1,6 +1,7 @@
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
+import { reportError } from "./logger";
 import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
   SessionResponse,
@@ -2735,6 +2736,27 @@ export async function restartSession(id: string): Promise<{ ok: boolean; message
   } catch {
     return { ok: false };
   }
+}
+
+/** Tool names this session can swap to without losing its conversation; null when they can't be listed. */
+export async function fetchAccountTargets(id: string): Promise<string[] | null> {
+  const body = await fetchJson<{ targets?: string[] }>(`/api/sessions/${encodeURIComponent(id)}/account-targets`);
+  if (!body?.targets) {
+    reportError("could not list the accounts a session can switch to", {
+      level: "warn",
+      target: "web.client.api",
+      sessionId: id,
+    });
+  }
+  return body?.targets ?? null;
+}
+
+/** Restarts the session as another account of the same agent. The server refuses with a message, changing nothing, when the conversation would not carry over. */
+export async function switchSessionAccount(id: string, tool: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(
+    `/api/sessions/${encodeURIComponent(id)}/restart`,
+    jsonInit("POST", { tool, require_account_carry: true }),
+  );
 }
 
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */

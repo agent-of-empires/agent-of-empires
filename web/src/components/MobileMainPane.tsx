@@ -164,6 +164,7 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
+                    rateLimitFailoverTo={session.rate_limit_failover_to}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}

@@ -52,6 +52,8 @@ interface Props {
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
   rateLimitAutoResume?: boolean;
+  /** `SessionResponse.rate_limit_failover_to`: the account the daemon is moving this limited session to. */
+  rateLimitFailoverTo?: string;
   /** The profile's Structured view settings; null where Settings can't be edited. */
   settingsHref?: string | null;
   /** Session `tool` registry key; selects the AgentProfile. */
@@ -437,9 +439,12 @@ function ComposerDock({
     <>
       <UsageLimitSection
         sessionId={sessionId}
+        currentTool={view.tool ?? ""}
+        authStatus={state.authStatus}
         agent={state.agent ?? acpAgent}
         rateLimit={state.rateLimit}
         autoResume={view.rateLimitAutoResume}
+        failoverTo={view.rateLimitFailoverTo}
         retriesExhausted={state.rateLimitRetriesExhausted}
         settingsHref={view.settingsHref ?? null}
         onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}

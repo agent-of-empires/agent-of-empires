@@ -1,11 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Link } from "react-router-dom";
 
 import { type RespawnState, useRespawnSession } from "../../hooks/useRespawnSession";
-import type { AcpState } from "../../lib/acpTypes";
+import type { AcpState, AuthStatus } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { fetchAgents } from "../../lib/api";
+import { fetchAccountTargets, fetchAgents } from "../../lib/api";
+import {
+  clearPendingSwitchAccount,
+  getPendingSwitchAccount,
+  subscribePendingSwitchAccount,
+} from "../../lib/switchAccountTrigger";
 import { formatDurationSecondsShort } from "../sidebar/format";
+import { SwitchAccountModal } from "./SwitchAccountModal";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
 /** The agent's rate-limit wording without transport prefixes or the trailing
@@ -30,7 +36,10 @@ export function UsageLimitBanner({
   resumeError,
   onResume,
   onSwitchAgent,
+  onSwitchAccount,
+  failoverTo,
   switchListFailed = false,
+  accountListFailed = false,
   settingsHref,
 }: {
   agent: string | null;
@@ -43,8 +52,14 @@ export function UsageLimitBanner({
   onResume: () => void;
   /** Omitted when no other installed Agent could take over. */
   onSwitchAgent?: () => void;
+  /** Omitted when no other account could keep the conversation. */
+  onSwitchAccount?: () => void;
+  /** The account the daemon is already moving this Session to; replaces every manual action, which would race it. */
+  failoverTo?: string;
   /** Why the Agents to switch to couldn't be listed. */
   switchListFailed?: boolean;
+  /** Why the accounts to switch to couldn't be listed. */
+  accountListFailed?: boolean;
   /** Where the auto-resume toggle lives; null where Settings can't be edited. */
   settingsHref: string | null;
 }) {
@@ -106,14 +121,29 @@ export function UsageLimitBanner({
               )}
             </p>
           ) : null}
-          {!resumeNow && !busy && (
+          {failoverTo && (
+            <p className="mt-1 text-xs text-text-secondary" data-testid="usage-limit-failover">
+              Switching to {failoverTo}…
+            </p>
+          )}
+          {!resumeNow && !busy && !failoverTo && (
             <p className="mt-1 text-xs text-text-dim">
               Added more usage? Try again now.{reset && !lifted ? ` Otherwise the limit lifts at ${time}.` : ""}
             </p>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {onSwitchAgent && (
+          {onSwitchAccount && !failoverTo && (
+            <button
+              type="button"
+              data-testid="usage-limit-switch-account"
+              onClick={onSwitchAccount}
+              className={`${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`}
+            >
+              Switch account
+            </button>
+          )}
+          {onSwitchAgent && !failoverTo && (
             <button
               type="button"
               onClick={onSwitchAgent}
@@ -122,30 +152,37 @@ export function UsageLimitBanner({
               Switch Agent
             </button>
           )}
-          <button
-            type="button"
-            data-testid="usage-limit-resume"
-            onClick={onResume}
-            disabled={busy}
-            className={
-              resumeNow
-                ? `${BUTTON} bg-brand-600 text-text-on-brand hover:ring-2 hover:ring-brand-600/50`
-                : `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`
-            }
-          >
-            {resumeState === "retrying"
-              ? "Resuming…"
-              : resumeState === "ok"
-                ? "Resume requested"
-                : resumeNow
-                  ? "Resume now"
-                  : "Try again"}
-          </button>
+          {!failoverTo && (
+            <button
+              type="button"
+              data-testid="usage-limit-resume"
+              onClick={onResume}
+              disabled={busy}
+              className={
+                resumeNow
+                  ? `${BUTTON} bg-brand-600 text-text-on-brand hover:ring-2 hover:ring-brand-600/50`
+                  : `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`
+              }
+            >
+              {resumeState === "retrying"
+                ? "Resuming…"
+                : resumeState === "ok"
+                  ? "Resume requested"
+                  : resumeNow
+                    ? "Resume now"
+                    : "Try again"}
+            </button>
+          )}
         </div>
       </div>
       {switchListFailed && (
         <p className="mt-2 text-xs text-status-error-text">
           Couldn't list the other Agents, so Switch Agent isn't offered. Reload to try again.
+        </p>
+      )}
+      {accountListFailed && (
+        <p className="mt-2 text-xs text-status-error-text">
+          Couldn't list the other accounts, so Switch account isn't offered. Reload to try again.
         </p>
       )}
       {resumeState === "ok" && <p className="mt-2 text-xs text-text-dim">New events should start streaming shortly.</p>}
@@ -180,6 +217,25 @@ function useSwitchTargets(current: string | null, limited: boolean): { targets: 
   return { targets, listFailed };
 }
 
+/** Accounts a limited Session could swap to; empty until loaded, and read only while `limited`. */
+function useAccountTargets(sessionId: string, limited: boolean): { targets: string[]; listFailed: boolean } {
+  const [targets, setTargets] = useState<string[]>([]);
+  const [listFailed, setListFailed] = useState(false);
+  useEffect(() => {
+    if (!limited) return;
+    let cancelled = false;
+    void fetchAccountTargets(sessionId).then((names) => {
+      if (cancelled) return;
+      setListFailed(names === null);
+      setTargets(names ?? []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, limited]);
+  return { targets, listFailed };
+}
+
 /** The usage-limit banner wired to resume and to the Agent handoff. Mounted whether or not
  *  the Session is limited: a handoff clears the limit before its recap arrives, and its
  *  modal must stay until it settles. */
@@ -188,14 +244,20 @@ export function UsageLimitSection({
   agent,
   rateLimit,
   autoResume,
+  failoverTo,
   retriesExhausted,
   settingsHref,
   onPrefill,
+  currentTool,
+  authStatus,
 }: {
   sessionId: string;
+  currentTool: string;
+  authStatus: AuthStatus | null;
   agent: string | null;
   rateLimit: AcpState["rateLimit"];
   autoResume: boolean | undefined;
+  failoverTo?: string;
   retriesExhausted: boolean;
   settingsHref: string | null;
   onPrefill: (text: string) => void;
@@ -203,6 +265,14 @@ export function UsageLimitSection({
   // A limit with no reported reset still needs a key, and a cleared limit ends the incident.
   const resume = useRespawnSession(sessionId, rateLimit ? (rateLimit.resets_at ?? "unknown") : null);
   const { targets, listFailed } = useSwitchTargets(agent, rateLimit !== null);
+  const { targets: accountTargets, listFailed: accountListFailed } = useAccountTargets(sessionId, rateLimit !== null);
+  // Also opened from the sidebar row's "Switch account" item, limited or not.
+  const [accountOpen, setAccountOpen] = useState(false);
+  const pendingAccount = useSyncExternalStore(subscribePendingSwitchAccount, getPendingSwitchAccount, () => null);
+  const closeAccount = () => {
+    setAccountOpen(false);
+    clearPendingSwitchAccount();
+  };
   // Taken when the modal opens, so the switch's own Agent change doesn't reload it mid-handoff.
   const [handoff, setHandoff] = useState<{ from: string | null; eligible: string[] } | null>(null);
   return (
@@ -212,15 +282,28 @@ export function UsageLimitSection({
           agent={agent}
           rateLimit={rateLimit}
           autoResume={autoResume}
+          failoverTo={failoverTo}
           retriesExhausted={retriesExhausted}
           resumeState={resume.state}
           resumeError={resume.error}
           onResume={() => void resume.respawn()}
           onSwitchAgent={targets.length > 0 ? () => setHandoff({ from: agent, eligible: targets }) : undefined}
+          onSwitchAccount={accountTargets.length > 0 ? () => setAccountOpen(true) : undefined}
           switchListFailed={listFailed}
+          accountListFailed={accountListFailed}
           settingsHref={settingsHref}
         />
       )}
+      <SwitchAccountModal
+        open={accountOpen || pendingAccount === sessionId}
+        sessionId={sessionId}
+        currentTool={currentTool}
+        authStatus={authStatus}
+        targets={accountOpen ? accountTargets : undefined}
+        failoverTo={failoverTo}
+        onClose={closeAccount}
+      />
+
       <SwitchAgentModal
         open={handoff !== null}
         sessionId={sessionId}

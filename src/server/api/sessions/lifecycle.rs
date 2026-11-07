@@ -2207,6 +2207,59 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
+/// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
+pub async fn session_account_targets(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let Some(row) = crate::server::api::find_instance(&state, &id).await else {
+        return crate::server::api::session_not_found();
+    };
+    match tokio::task::spawn_blocking(move || account_targets(&row)).await {
+        Ok(targets) => Json(serde_json::json!({ "targets": targets })).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub(super) fn account_targets(row: &Instance) -> Vec<String> {
+    if !row.is_structured() {
+        return Vec::new();
+    }
+    let profile = row.effective_profile();
+    let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let mut names: Vec<&str> = crate::agents::agent_names();
+    names.extend(config.session.custom_agents.keys().map(String::as_str));
+    names.extend(
+        config
+            .session
+            .agent_config_dir
+            .iter()
+            .filter(|(_, dir)| crate::session::config::is_resolvable_agent_config_dir(dir))
+            .map(|(name, _)| name.as_str()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| *name != row.tool)
+        .filter(|name| {
+            let body = crate::daemon::RestartSessionBody {
+                tool: Some((*name).to_owned()),
+                require_account_carry: true,
+                ..Default::default()
+            };
+            account_swap_refusal(row, &body).is_none()
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Why a restart that demands an account swap (`require_account_carry`) is malformed: the
 /// tool to switch to, or what makes the swap impossible whatever the configuration says.
 fn account_swap_precondition<'a>(

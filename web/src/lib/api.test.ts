@@ -3,13 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./api";
 import type { ServerAbout } from "./api";
+import { reportError } from "./logger";
 import { onSettingsChanged } from "./settingsEvents";
 import type { CreateSessionRequest, SettingsFieldDescriptor } from "./types";
+
+vi.mock("./logger", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./logger")>()),
+  reportError: vi.fn(),
+}));
 
 const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
   fetchSpy.mockReset();
+  vi.mocked(reportError).mockClear();
   vi.stubGlobal("fetch", fetchSpy);
 });
 
@@ -1845,6 +1852,41 @@ describe("restartSession", () => {
 
     offline();
     expect(await api.restartSession("s1")).toEqual({ ok: false });
+  });
+});
+
+describe("account switching", () => {
+  it("lists target names and null when they can't be read", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ targets: ["claude-b"] }));
+    expect(await api.fetchAccountTargets("s 1")).toEqual(["claude-b"]);
+    expect(lastCall().url).toBe("/api/sessions/s%201/account-targets");
+
+    expect(reportError).not.toHaveBeenCalled();
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "read_only" }, 403));
+    expect(await api.fetchAccountTargets("s1")).toBeNull();
+    expect(reportError).toHaveBeenCalledWith(expect.any(String), {
+      level: "warn",
+      target: "web.client.api",
+      sessionId: "s1",
+    });
+  });
+
+  it("restarts with the tool and demands the conversation carry, surfacing a 409 reason", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({ ok: true });
+    const { url, init } = lastCall();
+    expect(url).toBe("/api/sessions/s1/restart");
+    expect(init?.method).toBe("POST");
+    expect(bodyOf(init)).toEqual({ tool: "claude-b", require_account_carry: true });
+
+    fetchSpy.mockResolvedValueOnce(
+      json({ error: "account_swap_unavailable", message: "Cannot switch. Nothing changed." }, 409),
+    );
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({
+      ok: false,
+      message: "Cannot switch. Nothing changed.",
+    });
   });
 });
 
