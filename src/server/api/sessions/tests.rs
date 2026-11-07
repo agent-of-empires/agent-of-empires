@@ -12091,3 +12091,60 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     );
     assert_eq!(breadcrumbs("nothing-to-replay"), 1);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_swap_refuses_once_the_park_moved_on() {
+    use crate::acp::Event;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut row = Instance::new("failover-cas", project.path().to_str().unwrap());
+    row.id = "failover-cas".into();
+    row.source_profile = "default".into();
+    row.view = crate::session::View::Structured;
+    row.tool = "claude".into();
+    row.status = Status::Idle;
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    for (seq, event) in [
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                kind: "usage".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        state
+            .acp_event_store
+            .record("failover-cas", u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    let head = state.acp_event_store.highest_seq("failover-cas");
+
+    // The decision was made on an older head: a prompt landed since.
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1)
+        .await
+        .unwrap_err();
+    assert!(error.contains("moved on"), "{error}");
+
+    // On the current head the guard passes and the swap's own refusal answers
+    // (no recorded conversation), still before anything stops.
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head)
+        .await
+        .unwrap_err();
+    assert!(error.contains("without losing the conversation"), "{error}");
+    let rows = state.instances.read().await;
+    assert_eq!(
+        (rows[0].tool.as_str(), rows[0].status),
+        ("claude", Status::Idle)
+    );
+}

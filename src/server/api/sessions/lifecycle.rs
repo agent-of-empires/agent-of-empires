@@ -2442,6 +2442,10 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
+    /// An automatic account failover decided on this event-log head.
+    Failover {
+        park_seq: u64,
+    },
 }
 
 fn restart_reason(
@@ -2493,6 +2497,48 @@ pub(super) async fn prepare_agent_session(
         RestartOrigin::Explicit,
     )
     .await
+}
+
+/// Switch a rate-limit-parked structured session to another account of the same agent,
+/// continuing the interrupted prompt. `expected_seq` is the event-log head the failover
+/// decision read: under the submission authority and the instance lock, the swap proceeds only
+/// if the session is still parked on that head with no worker, so a prompt, a manual resume or
+/// the timed auto-resume that landed meanwhile wins and nothing is sent twice.
+pub(crate) async fn failover_account_swap(
+    state: &Arc<AppState>,
+    id: &str,
+    tool: &str,
+    expected_seq: u64,
+) -> Result<(), String> {
+    let response = prepare_agent_session_inner(
+        state.clone(),
+        id.to_owned(),
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            tool: Some(tool.to_owned()),
+            require_account_carry: true,
+            ..Default::default()
+        })),
+        None,
+        RestartOrigin::Failover {
+            park_seq: expected_seq,
+        },
+    )
+    .await;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let message = body
+        .as_ref()
+        .and_then(|body| body["message"].as_str())
+        .unwrap_or("no detail");
+    Err(format!("{status}: {message}"))
 }
 
 pub(crate) async fn recovery_restart(
@@ -2567,6 +2613,26 @@ async fn prepare_agent_session_inner(
     if preparation == AgentPreparation::Ensure && instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if let RestartOrigin::Failover {
+        park_seq: expected_seq,
+    } = restart_origin
+    {
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.clone();
+        let still_parked = tokio::task::spawn_blocking(move || {
+            store.rate_limit_park(&probe_id).is_some()
+                && store.highest_seq(&probe_id) == expected_seq
+        })
+        .await
+        .unwrap_or(false);
+        if !still_parked || state.acp_supervisor.is_running(&id).await {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session moved on since the failover was decided".to_string(),
+            );
+        }
+    }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
     }
@@ -2609,7 +2675,10 @@ async fn prepare_agent_session_inner(
         }
     }
     if instance.is_structured()
-        && matches!(restart_origin, RestartOrigin::Explicit)
+        && matches!(
+            restart_origin,
+            RestartOrigin::Explicit | RestartOrigin::Failover { .. }
+        )
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {

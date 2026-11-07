@@ -43,6 +43,34 @@ impl EventStore {
         }
     }
 
+    /// The newest startup error and its recorded time (epoch ms), unless a session
+    /// assignment followed it: an assigned worker got past login.
+    pub fn unassigned_startup_error(&self, session_id: &str) -> Option<(String, i64)> {
+        let (json, created_at, assigned): (String, i64, bool) = self
+            .conn()
+            .query_row(
+                "SELECT event_json, created_at, EXISTS(
+                     SELECT 1 FROM acp_events a
+                     WHERE a.session_id = ?1 AND a.seq > e.seq
+                       AND a.discriminant = 'AcpSessionAssigned')
+                 FROM acp_events e
+                 WHERE e.session_id = ?1 AND e.discriminant = 'AgentStartupError'
+                 ORDER BY e.seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if assigned {
+            return None;
+        }
+        match decode_logged(&json, session_id, "unassigned_startup_error")? {
+            Event::AgentStartupError { message } => Some((message, created_at)),
+            _ => None,
+        }
+    }
+
     /// The session's current rate-limit park, unless a real continuation
     /// (a prompt, an agent switch, a new session, or an organic stop) superseded it.
     pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {

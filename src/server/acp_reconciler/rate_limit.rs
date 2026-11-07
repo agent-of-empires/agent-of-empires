@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use super::{is_resumable, query_store, resolve_per_profile, AppState};
 use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
 
+mod failover;
+
 pub(super) const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Added to the reported `resets_at` to absorb clock skew and adapter jitter.
@@ -39,6 +41,21 @@ fn rate_limit_resume_at(
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
+    }
+}
+
+/// When a park's window is expected to end: the reported reset plus grace, else the
+/// unknown-reset schedule for the redeliveries spent.
+fn scheduled_resume_at(
+    info: &crate::acp::state::RateLimitInfo,
+    recorded_at_ms: i64,
+    streak: i64,
+) -> DateTime<Utc> {
+    match info.resets_at {
+        Some(resets_at) => {
+            rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
+        }
+        None => rate_limit_unknown_reset_retry_at(recorded_at_ms, streak),
     }
 }
 
@@ -201,46 +218,44 @@ pub(super) async fn reap_rate_limit_resumes(
     parked: &HashSet<String>,
 ) -> HashSet<String> {
     let mut released = HashSet::new();
-    let candidates: Vec<(String, String, bool)> = {
+    let candidates: Vec<crate::session::Instance> = {
         let instances = state.instances.read().await;
         instances
             .iter()
             .filter(|i| is_resumable(i) && attempted.contains(&i.id))
-            .map(|i| {
-                (
-                    i.id.clone(),
-                    i.source_profile.clone(),
-                    !i.queued_prompts.is_empty(),
-                )
-            })
+            .cloned()
             .collect()
     };
     // Only a workerless session is parked; a crash-loop park waits for a manual retry.
     let mut workerless = Vec::new();
     for candidate in candidates {
-        if parked.contains(&candidate.0) {
-            tracing::trace!(target: "acp.supervisor", session = %candidate.0, "rate-limit auto-resume: skipped, session is crash-loop parked");
-        } else if !state.acp_supervisor.is_running(&candidate.0).await {
+        if parked.contains(&candidate.id) {
+            tracing::trace!(target: "acp.supervisor", session = %candidate.id, "rate-limit auto-resume: skipped, session is crash-loop parked");
+        } else if !state.acp_supervisor.is_running(&candidate.id).await {
             workerless.push(candidate);
         }
     }
     if workerless.is_empty() {
         return released;
     }
-    let enabled_by_profile = resolve_per_profile(workerless.iter().map(|c| c.1.clone()), |c| {
-        c.acp.rate_limit_auto_resume
-    })
+    let settings_by_profile = resolve_per_profile(
+        workerless.iter().map(|row| row.source_profile.clone()),
+        |c| (c.acp.rate_limit_auto_resume, failover::Settings::of(c)),
+    )
     .await;
 
     let now = Utc::now();
-    for (id, profile, has_queued_prompts) in workerless {
+    for row in workerless {
+        let id = row.id.clone();
+        let has_queued_prompts = !row.queued_prompts.is_empty();
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
-        if !enabled_by_profile.get(&profile).copied().unwrap_or(false) {
-            skip("not enabled for this profile");
-            continue;
-        }
+        let (auto_resume, failover_settings) = settings_by_profile
+            .get(&row.source_profile)
+            .cloned()
+            .unwrap_or_default();
+        failover::note_auth_failure(state, &row).await;
         let Some(park) = query_store(
             &state.acp_event_store,
             &id,
@@ -256,6 +271,10 @@ pub(super) async fn reap_rate_limit_resumes(
             continue;
         };
         if park.cap_reached {
+            if !auto_resume {
+                skip("not enabled for this profile");
+                continue;
+            }
             // The held slot keeps the resume pass off; a queued prompt has no other route to a worker.
             if has_queued_prompts {
                 tracing::info!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: releasing the redelivery-cap park for a queued prompt");
@@ -281,14 +300,37 @@ pub(super) async fn reap_rate_limit_resumes(
         else {
             continue;
         };
-        let mut resume_at = match info.resets_at {
-            Some(resets_at) => rate_limit_resume_at(
-                resets_at,
-                park.recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            ),
-            None => rate_limit_unknown_reset_retry_at(park.recorded_at_ms, streak),
+        let scheduled_at = scheduled_resume_at(&info, park.recorded_at_ms, streak);
+        // A park a swap or resume already touched belongs to the account it ran on then.
+        let first_sight = park.last_resume_attempt_ms.is_none();
+        if first_sight {
+            failover::record_limit(state, &row, &info, scheduled_at, park.recorded_at_ms).await;
+        }
+        let Some(latest_seq) = query_store(
+            &state.acp_event_store,
+            &id,
+            "rate-limit latest-seq",
+            |s, id| s.highest_seq(id),
+        )
+        .await
+        else {
+            continue;
         };
+        // Below the redelivery cap only: an entirely limited pool finds no target and
+        // falls through to the timed resume, whose budget ends in the terminal park.
+        if failover_settings.enabled
+            && first_sight
+            && streak < RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES
+            && failover::maybe_fail_over(state, &row, &failover_settings.accounts, latest_seq).await
+        {
+            skip("an account failover owns this park");
+            continue;
+        }
+        if !auto_resume {
+            skip("not enabled for this profile");
+            continue;
+        }
+        let mut resume_at = scheduled_at;
         // A resume that fired but got no worker retries on the minimum park window.
         if let Some(last_attempt) = park
             .last_resume_attempt_ms
@@ -305,16 +347,6 @@ pub(super) async fn reap_rate_limit_resumes(
             skip("worker is already live");
             continue;
         }
-        let Some(latest_seq) = query_store(
-            &state.acp_event_store,
-            &id,
-            "rate-limit latest-seq",
-            |s, id| s.highest_seq(id),
-        )
-        .await
-        else {
-            continue;
-        };
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
             // `/acp/spawn` holds this lock through its continuation install, so
             // the CAS plus clear cannot interleave with it. `try_lock` because
@@ -922,5 +954,118 @@ mod tests {
         );
         assert_eq!(pending_turn(&state, id).await, None);
         assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
+    }
+
+    /// Two accounts of one agent, failover on with `claude-b` in the pool, and the
+    /// session's row on `claude-a`.
+    async fn failover_session(
+        id: &str,
+        redeliveries: usize,
+    ) -> (
+        crate::session::test_support::AppDirGuard,
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::tmux::status_rules::ProfileRegistryGuard,
+    ) {
+        let (home, state, project) = parked(id, redeliveries).await;
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[acp]\nrate_limit_auto_resume = true\nrate_limit_failover = true\n\
+             rate_limit_failover_accounts = [\"claude-a\", \"claude-b\"]\n\
+             [session.agent_detect_as]\nclaude-a = \"claude\"\nclaude-b = \"claude\"\n\
+             [session.agent_config_dir]\nclaude-a = \"~/.claude-a\"\nclaude-b = \"~/.claude-b\"\n",
+        )
+        .unwrap();
+        let profile = crate::session::config::effective_profile("default");
+        let registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        {
+            let mut rows = state.instances.write().await;
+            rows[0].tool = "claude-a".into();
+            rows[0].detect_as = "claude".into();
+        }
+        (home, state, project, registry)
+    }
+
+    fn account_key_of(tool: &str) -> String {
+        dirs::home_dir()
+            .unwrap()
+            .join(format!(".{tool}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Waits for the detached failover task to finish.
+    async fn failover_settled(id: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while failover::in_flight(id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failover task must finish");
+    }
+
+    /// A park records its account's limit, and a failover the swap refuses (this row has
+    /// no recorded conversation) leaves the park to the timed resume: one redelivery, never
+    /// a second failover for the same park.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_failover_falls_back_to_the_timed_resume() {
+        let id = "sess-failover-refused";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(
+            released.is_empty(),
+            "the failover owns the park while it runs"
+        );
+        failover_settled(id).await;
+
+        let key = account_key_of("claude-a");
+        let limit = state.acp_event_store.account_state(&key);
+        assert!(
+            limit.is_some_and(|s| s.window_kind == "usage"),
+            "limit recorded under {key}"
+        );
+        assert_eq!(state.instances.read().await[0].tool, "claude-a");
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(released.contains(id), "the timed resume takes over");
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
+        assert_eq!(pending_turn(&state, id).await, Some(true));
+    }
+
+    /// With every pool account limited there is no target: the park runs the timed
+    /// resume under its budget, and at the cap it still ends in the terminal park.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_entirely_limited_pool_keeps_the_redelivery_budget() {
+        let max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize;
+        for (streak, released, reason) in [
+            (0, true, "rate_limited"),
+            (max, false, RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+        ] {
+            let id = "sess-failover-pool-limited";
+            let (_home, state, _project, _registry) = failover_session(id, streak).await;
+            for tool in ["claude-a", "claude-b"] {
+                state.acp_event_store.record_account_limit(
+                    &account_key_of(tool),
+                    Utc::now().timestamp_millis() + 3_600_000,
+                    "usage",
+                    Utc::now().timestamp_millis(),
+                );
+            }
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+
+            let out = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+            assert!(!failover::in_flight(id), "no failover was started");
+            assert_eq!(out.contains(id), released, "streak={streak}");
+            assert_eq!(latest_stop_reason(&state, id).as_deref(), Some(reason));
+        }
     }
 }
