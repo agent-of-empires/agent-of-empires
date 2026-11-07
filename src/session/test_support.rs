@@ -88,13 +88,19 @@ impl EnvGuard {
     fn snapshot(&mut self, key: &'static str) {
         self.prev.push((key, std::env::var_os(key)));
     }
+
+    /// Restore the snapshotted values while still holding the env lock, so a
+    /// caller can finish process-global work before another test mutates env.
+    pub(crate) fn restore(&mut self) {
+        for (key, prev) in self.prev.drain(..).rev() {
+            restore_or_remove(key, prev);
+        }
+    }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for (key, prev) in self.prev.drain(..).rev() {
-            restore_or_remove(key, prev);
-        }
+        self.restore();
         release_env_lock(self._lock.is_some());
     }
 }
@@ -273,6 +279,14 @@ pub(crate) struct AppDirGuard {
 impl AppDirGuard {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Restore the caller's environment, run `f` while still holding the env
+    /// lock, then release it. A registry reload reads `HOME`, so a peer test
+    /// must not be able to swap the app dir between the two.
+    pub(crate) fn restore_then<R>(mut self, f: impl FnOnce() -> R) -> R {
+        self._env.restore();
+        f()
     }
 }
 
