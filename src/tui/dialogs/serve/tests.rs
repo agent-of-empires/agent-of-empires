@@ -116,7 +116,7 @@ fn operation(job: &Job) -> Held {
         Job::Restart(..) => Held::Restart,
         Job::LaunchContext { .. } => Held::LaunchContext,
         Job::LaunchOutcome { .. } => Held::LaunchOutcome,
-        Job::ObserveStarting => Held::Starting,
+        Job::ObserveStarting(_) => Held::Starting,
         Job::Passphrase => Held::Passphrase,
         Job::ErrorContext => Held::ErrorContext,
         Job::ObserveActive => Held::ActiveLog,
@@ -237,7 +237,7 @@ fn r_g_and_help_reread_persist_sessions() {
 
 #[test]
 #[serial_test::serial]
-fn new_passphrase_is_saved_only_after_the_restart_succeeds() {
+fn requesting_a_new_passphrase_does_not_overwrite_saved_credentials() {
     let _home = crate::session::test_support::isolate_app_dir();
     save_passphrase_to_disk("running daemon phrase");
     let mut jobs = ServeJobs::default();
@@ -249,8 +249,13 @@ fn new_passphrase_is_saved_only_after_the_restart_succeeds() {
     assert!(view.take_launch().is_some_and(|request| request.restart));
     assert_ne!(view.pending_passphrase, "running daemon phrase");
     assert_eq!(
-        recall_passphrase().as_deref(),
-        Some("running daemon phrase")
+        std::fs::read_to_string(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("serve.saved_passphrase")
+        )
+        .unwrap(),
+        "running daemon phrase"
     );
 }
 
@@ -537,20 +542,21 @@ fn a_timely_confirmation_survives_a_slow_second_assessment() {
 #[serial_test::serial]
 fn every_pending_state_leaves_a_closed_worker() {
     let _home = crate::session::test_support::isolate_app_dir();
-    for held in [
-        Held::Open,
-        Held::Picker,
-        Held::Providers,
-        Held::Retry,
-        Held::Reset,
-        Held::Restart,
-        Held::LaunchContext,
-        Held::LaunchOutcome,
-        Held::Starting,
-        Held::Passphrase,
-        Held::ErrorContext,
-        Held::ActiveLog,
-        Held::Copy,
+    for (held, retry_context) in [
+        (Held::Open, false),
+        (Held::Picker, false),
+        (Held::Providers, false),
+        (Held::Retry, false),
+        (Held::Reset, false),
+        (Held::Restart, false),
+        (Held::LaunchContext, false),
+        (Held::LaunchOutcome, false),
+        (Held::Starting, false),
+        (Held::Passphrase, false),
+        (Held::ErrorContext, false),
+        (Held::ErrorContext, true),
+        (Held::ActiveLog, false),
+        (Held::Copy, false),
     ] {
         let mut view = ServeView::for_test(if held == Held::ErrorContext {
             error_state()
@@ -569,7 +575,13 @@ fn every_pending_state_leaves_a_closed_worker() {
                     refreshed: true,
                 },
             ),
-            Held::Retry => (Job::Retry(target), PendingJob::Retry { failed: None }),
+            Held::Retry => (
+                Job::Retry(target.clone()),
+                PendingJob::Retry {
+                    failed: None,
+                    target,
+                },
+            ),
             Held::Reset => (Job::Reset(target), PendingJob::Reset),
             Held::Restart => (
                 Job::Restart(ServeMode::Tunnel, None),
@@ -591,6 +603,7 @@ fn every_pending_state_leaves_a_closed_worker() {
             ),
             Held::LaunchOutcome => (
                 Job::LaunchOutcome {
+                    target,
                     mode: ServeMode::Local,
                     transport: None,
                     passphrase: None,
@@ -598,9 +611,16 @@ fn every_pending_state_leaves_a_closed_worker() {
                 },
                 PendingJob::LaunchOutcome,
             ),
-            Held::Starting => (Job::ObserveStarting, PendingJob::Starting),
+            Held::Starting => (Job::ObserveStarting(target), PendingJob::Starting),
             Held::Passphrase => (Job::Passphrase, PendingJob::Passphrase),
-            Held::ErrorContext => (Job::ErrorContext, PendingJob::ErrorContext),
+            Held::ErrorContext => (
+                Job::ErrorContext,
+                if retry_context {
+                    PendingJob::RetryContext { failed: None }
+                } else {
+                    PendingJob::ErrorContext
+                },
+            ),
             Held::ActiveLog => (Job::ObserveActive, PendingJob::ActiveLog),
             Held::Copy => (Job::Copy("URL", "fixture".to_owned()), PendingJob::Copy),
         };
@@ -627,6 +647,7 @@ fn a_liveness_result_cannot_beat_a_published_url() {
         let mut jobs = ServeJobs::default();
         let (submitter, gate) = gated(&mut jobs, Held::Starting);
         let mut view = ServeView::with_state(starting(), submitter);
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
         view.tick();
         gate.entered(Held::Starting);
         for _ in 0..5 {
@@ -688,7 +709,7 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
         let (_submitter, gate) = gated(&mut jobs, held);
         let mut view =
             ServeView::for_launch(DashboardLaunch::tunnel_for_test(Instant::now()), &mut jobs);
-        assert!(matches!(view.handle_key(key('S')), ServeAction::Stop));
+        assert!(matches!(view.handle_key(key('S')), ServeAction::Stop(_)));
         view.begin_stop();
         view.finish_stop(Err("tailscale funnel failed".to_owned()));
         wait_for(&mut view, |view| view.pending.is_none());
@@ -740,7 +761,7 @@ async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(action, ServeAction::Stop));
+    assert!(matches!(action, ServeAction::Stop(_)));
     let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
         view.render(frame, frame.area(), theme)
     });
@@ -1042,4 +1063,236 @@ fn provider_retry_and_refresh_use_fresh_assessments_before_launch() {
     ));
     assert!(view.take_launch().is_none());
     assert!(!view.launch_in_flight);
+}
+
+#[test]
+#[serial_test::serial]
+fn provider_retry_rediscovers_identity_after_metadata_is_repaired() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let fixture = FunnelFixture::new();
+    let pid = crate::session::get_app_dir().unwrap().join("serve.pid");
+    for repaired in [false, true] {
+        std::fs::create_dir(&pid).unwrap();
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::with_state(error_state(), jobs.submitter());
+        view.request(Job::ErrorContext, PendingJob::ErrorContext);
+        wait_for(&mut view, |view| view.pending.is_none());
+        assert!(view.target.is_none());
+        assert!(view.control_error.is_some());
+        if repaired {
+            std::fs::remove_dir(&pid).unwrap();
+        }
+        view.handle_key(key('P'));
+        wait_for(&mut view, |view| view.pending.is_none());
+        if repaired {
+            assert!(matches!(view.state, ServeViewState::Confirm { .. }));
+        } else {
+            assert!(matches!(&view.state, ServeViewState::Error { message, .. }
+                if message == "tailscale funnel failed"));
+            assert!(view.target.is_none());
+            assert!(view.control_error.is_some());
+            assert!(!fixture.root.path().join("calls").exists());
+            std::fs::remove_dir(&pid).unwrap();
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn quiet_startup_repaints_when_the_elapsed_second_changes() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for owned_launch in [false, true] {
+        let mut jobs = ServeJobs::default();
+        let (submitter, gate) = gated(&mut jobs, Held::Starting);
+        let mut view = ServeView::with_state(starting(), submitter);
+        view.launch_in_flight = owned_launch;
+        if !owned_launch {
+            view.request(
+                Job::ObserveStarting(crate::cli::serve::tui_control_target().unwrap()),
+                PendingJob::Starting,
+            );
+            gate.entered(Held::Starting);
+        }
+        view.tick();
+        let screen = |view: &ServeView| {
+            crate::tui::dialogs::test_render::text(&crate::tui::dialogs::test_render::draw(
+                110,
+                40,
+                |frame, theme| view.render(frame, frame.area(), theme),
+            ))
+        };
+        let seconds = |text: String| {
+            text.split("Elapsed: ")
+                .nth(1)
+                .unwrap()
+                .split('s')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let before = seconds(screen(&view));
+        if let ServeViewState::Starting { started_at, .. } = &mut view.state {
+            *started_at -= Duration::from_secs(2);
+        }
+        let repaint = view.tick();
+        let after = seconds(screen(&view));
+        drop(view);
+        if !owned_launch {
+            gate.release(JobResult::Failed(
+                "released cancelled observation".to_owned(),
+            ));
+        }
+        drop(gate);
+        jobs.shutdown();
+        assert!(after > before);
+        assert!(
+            repaint,
+            "elapsed clock must repaint; owned_launch={owned_launch}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn launch_observations_never_mix_a_replacement_with_prior_credentials() {
+    use std::os::unix::process::CommandExt;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    forget_stopped_passphrase();
+    for hold_starting in [false, true] {
+        for replaced in [false, true] {
+            remove_app_file("serve.url");
+            std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+            std::fs::write(app.join("serve.passphrase"), "launch A credential").unwrap();
+            let fixture = tempfile::tempdir().unwrap();
+            nix::unistd::mkfifo(
+                &fixture.path().join("serve"),
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+            let spawn = || {
+                ChildGuard(
+                    std::process::Command::new("cat")
+                        .arg0("aoe")
+                        .arg("serve")
+                        .current_dir(fixture.path())
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            };
+            let mut original = spawn();
+            std::fs::write(app.join("serve.pid"), original.0.id().to_string()).unwrap();
+            let target = crate::cli::serve::wait_for_test_daemon(&mut original.0);
+            let (entered, received) = mpsc::sync_channel(1);
+            let (release, retained) = mpsc::sync_channel(1);
+            let mut jobs = ServeJobs::default();
+            let submitter = jobs.with_handler(move |job, control, runtime| {
+                let held = if hold_starting {
+                    Held::Starting
+                } else {
+                    Held::LaunchOutcome
+                };
+                if operation(&job) == held {
+                    entered.send(()).unwrap();
+                    retained.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                run_job(job, control, runtime)
+            });
+            let mut view = ServeView::with_state(
+                ServeViewState::Starting {
+                    mode: ServeMode::Tunnel,
+                    transport: Some(TunnelTransport::Tailscale),
+                    passphrase: Some("launch A credential".to_owned()),
+                    started_at: Instant::now(),
+                    log_offset: 0,
+                },
+                submitter,
+            );
+            view.launch_in_flight = true;
+            view.finish_launch(Ok(target));
+            if hold_starting {
+                wait_for(&mut view, |view| !view.launch_in_flight);
+                if let ServeViewState::Error { message, .. } = &view.state {
+                    panic!(
+                        "launch failed before Starting observation; replaced={replaced}: {message}"
+                    );
+                }
+            }
+            received.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut replacement = None;
+            let url = if replaced {
+                original.0.kill().unwrap();
+                original.0.wait().unwrap();
+                replacement = Some(spawn());
+                std::fs::write(
+                    app.join("serve.pid"),
+                    replacement.as_ref().unwrap().0.id().to_string(),
+                )
+                .unwrap();
+                crate::cli::serve::wait_for_test_daemon(&mut replacement.as_mut().unwrap().0);
+                std::fs::write(app.join("serve.mode"), "local").unwrap();
+                std::fs::write(app.join("serve.passphrase"), "replacement B credential").unwrap();
+                "https://replacement.invalid/?token=b"
+            } else {
+                "https://original.invalid/?token=a"
+            };
+            std::fs::write(app.join("serve.url"), url).unwrap();
+            release.send(()).unwrap();
+            wait_for(&mut view, |view| {
+                matches!(
+                    view.state,
+                    ServeViewState::Active { .. } | ServeViewState::Error { .. }
+                )
+            });
+            if replaced {
+                assert!(replacement
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .try_wait()
+                    .unwrap()
+                    .is_none());
+                assert!(
+                    matches!(view.state, ServeViewState::Error { .. }),
+                    "must reject the replacement; hold_starting={hold_starting}"
+                );
+            } else {
+                let ServeViewState::Active {
+                    urls,
+                    passphrase,
+                    mode,
+                    ..
+                } = &view.state
+                else {
+                    let message = match &view.state {
+                        ServeViewState::Error { message, .. } => message.as_str(),
+                        _ => "view did not settle",
+                    };
+                    panic!("unchanged launch failed; hold_starting={hold_starting}: {message}");
+                };
+                assert_eq!(*mode, ServeMode::Tunnel, "hold_starting={hold_starting}");
+                assert_eq!(urls[0].url, url, "hold_starting={hold_starting}");
+                assert_eq!(
+                    passphrase.as_deref(),
+                    Some("launch A credential"),
+                    "hold_starting={hold_starting}"
+                );
+            }
+        }
+    }
 }

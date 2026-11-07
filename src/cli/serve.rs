@@ -1659,15 +1659,20 @@ pub(crate) async fn ensure_local_daemon(
     }
     Ok((endpoint, started))
 }
+pub(crate) struct TuiDashboardLaunch {
+    pub(crate) runtime: (
+        crate::daemon::RuntimeConnection,
+        crate::daemon::DaemonClient,
+    ),
+    pub(crate) target: TuiControlTarget,
+}
+
 pub(crate) async fn start_dashboard_for_tui(
     profile: &str,
     mut args: ServeArgs,
     predecessor_epoch: Option<&str>,
     restart: bool,
-) -> Result<(
-    crate::daemon::RuntimeConnection,
-    crate::daemon::DaemonClient,
-)> {
+) -> Result<TuiDashboardLaunch> {
     let launch = if restart {
         restart_daemon_with_receipt(Some(args), false).await?
     } else {
@@ -1706,7 +1711,18 @@ pub(crate) async fn start_dashboard_for_tui(
         "Dashboard successor reused the predecessor epoch"
     );
     let client = endpoint.daemon_client()?;
-    Ok((connection, client))
+    let target = tui_control_target()?;
+    anyhow::ensure!(
+        target
+            .process
+            .as_ref()
+            .is_some_and(|(_, _, owner)| { owner.as_deref() == Some(instance.as_str()) }),
+        "Dashboard successor identity changed before observation"
+    );
+    Ok(TuiDashboardLaunch {
+        runtime: (connection, client),
+        target,
+    })
 }
 
 async fn start_daemon(
@@ -2066,7 +2082,7 @@ fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
     })
 }
 /// Opaque Daemon incarnation observed before a TUI control request is queued.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiControlTarget {
     process: Option<(u32, crate::process::ProcessBirthIdentity, Option<String>)>,
 }
@@ -2104,7 +2120,31 @@ pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
     Ok(TuiControlTarget { process })
 }
 
-/// Holds lifecycle exclusion from identity validation through the mutation's outcome.
+#[cfg(test)]
+pub(crate) fn wait_for_test_daemon(child: &mut std::process::Child) -> TuiControlTarget {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = child.try_wait().expect("fixture process status");
+        assert!(status.is_none(), "Daemon fixture exited: {status:?}");
+        match tui_control_target() {
+            Ok(target)
+                if target
+                    .process
+                    .as_ref()
+                    .is_some_and(|(pid, ..)| *pid == child.id()) =>
+            {
+                return target;
+            }
+            observed => assert!(
+                std::time::Instant::now() < deadline,
+                "Daemon fixture identity did not become observable: {observed:?}"
+            ),
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Holds lifecycle exclusion through guarded mutation or observation.
 pub(crate) struct TuiControlLease {
     transaction: crate::daemon::lifecycle::Transaction,
     target: TuiControlTarget,
@@ -2138,6 +2178,10 @@ impl TuiControlLease {
             return Ok(());
         }
         stop_daemon_locked(&self.transaction, false).await
+    }
+
+    pub(crate) fn into_target(self) -> TuiControlTarget {
+        self.target
     }
 }
 

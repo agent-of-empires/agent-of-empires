@@ -20,12 +20,13 @@ pub(super) enum Job {
         needs_passphrase: bool,
     },
     LaunchOutcome {
+        target: TuiControlTarget,
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
         log_offset: u64,
     },
-    ObserveStarting,
+    ObserveStarting(TuiControlTarget),
     ObserveActive,
     Copy(&'static str, String),
 }
@@ -164,36 +165,46 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
             passphrase: needs_passphrase.then(load_or_generate_passphrase),
         },
         Job::LaunchOutcome {
+            target,
             mode,
             transport,
             passphrase,
             log_offset,
-        } => snapshot(
-            ServeViewState::running(mode, transport, passphrase, log_offset),
-            None,
-            None,
-        ),
-        Job::ObserveStarting => {
-            let target = match crate::cli::serve::tui_control_target() {
-                Ok(target) => target,
-                Err(error) => return JobResult::Failed(error.to_string()),
-            };
-            let running = target.is_running();
-            let urls = crate::cli::serve::read_serve_urls();
-            let passphrase = (!urls.is_empty()).then(recall_passphrase).flatten();
-            let tail = if !running && urls.is_empty() {
-                crate::acp::client::autostart::initial_log_tail()
-            } else {
-                Vec::new()
-            };
-            JobResult::Starting(StartingObservation {
-                running,
-                target,
-                urls,
-                passphrase,
-                log_offset: log_file_size(),
-                tail,
+        } => runtime
+            .block_on(async {
+                let lease = TuiControlLease::prepare(target, cancel).await?;
+                let state = ServeViewState::running(mode, transport, passphrase, log_offset);
+                Ok::<_, anyhow::Error>(JobResult::Snapshot(Snapshot {
+                    state,
+                    target: lease.into_target(),
+                    passphrase: None,
+                    local_primary: None,
+                }))
             })
+            .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
+        Job::ObserveStarting(target) => {
+            let running = target.is_running();
+            runtime
+                .block_on(async {
+                    let lease = TuiControlLease::prepare(target, cancel).await?;
+                    let urls = crate::cli::serve::read_serve_urls();
+                    let passphrase = (!urls.is_empty()).then(recall_passphrase).flatten();
+                    let log_offset = log_file_size();
+                    let tail = if !running && urls.is_empty() {
+                        crate::acp::client::autostart::initial_log_tail()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, anyhow::Error>(JobResult::Starting(StartingObservation {
+                        running,
+                        urls,
+                        passphrase,
+                        log_offset,
+                        tail,
+                        target: lease.into_target(),
+                    }))
+                })
+                .unwrap_or_else(|error| JobResult::Failed(error.to_string()))
         }
         Job::ObserveActive => JobResult::ActiveLog(log_file_size()),
         Job::Copy(label, value) => {

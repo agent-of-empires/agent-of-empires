@@ -200,7 +200,7 @@ mod tests {
                     "sh",
                     &[
                         "-c",
-                        ": > \"$1\"; read -r line < \"$2\"",
+                        "printf '%s\\n' \"$$\" > \"$1\"; read -r line < \"$2\"",
                         "sh",
                         marker.to_str().unwrap(),
                         path.to_str().unwrap(),
@@ -210,16 +210,36 @@ mod tests {
                 assert!(finished.send(result).is_ok());
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !entered.exists() {
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&entered)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "clipboard fixture did not enter"
                 );
                 std::thread::yield_now();
-            }
+            };
             let result = received.recv_timeout(std::time::Duration::from_secs(2));
+            let reaped_before_release =
+                nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            if matches!(
+                reaped_before_release,
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            ) {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(pid, None);
+            }
             drop(release);
             worker.join().unwrap();
+            assert!(
+                matches!(reaped_before_release, Err(nix::errno::Errno::ECHILD)),
+                "helper must exit and be reaped before FIFO release: {reaped_before_release:?}"
+            );
             assert!(result
                 .expect("stdin write outlived the helper deadline")
                 .is_err());

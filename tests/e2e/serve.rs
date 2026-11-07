@@ -4169,3 +4169,99 @@ fn remote_serve_with_a_wedged_tailscale_says_to_skip_tailscale_not_to_install_cl
     );
     assert!(!stderr.contains("cloudflared"), "{stderr}");
 }
+
+#[test]
+#[parallel]
+fn tui_new_passphrase_is_saved_only_for_the_running_successor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    require_tmux!();
+    for replacement_succeeds in [true, false] {
+        let mut h = TuiTestHarness::new_in_tmp("serve_new_passphrase_outcome");
+        h.remove_env("AOE_DAEMON_URL");
+        h.stop_daemon_on_drop();
+        let bin = h.home_path().join("fake-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::harness::write_executable(
+            &bin.join("tailscale"),
+            r#"#!/bin/sh
+case "$*" in
+  "status --json")
+    printf '%s\n' '{"Self":{"DNSName":"fixture.tailnet.ts.net.","CapMap":{"https://tailscale.com/cap/funnel-ports?ports=443":null}}}'
+    ;;
+  "funnel status --json")
+    if test -f "$AOE_TEST_FUNNEL_STATE"; then
+      cat "$AOE_TEST_FUNNEL_STATE"
+    else
+      printf '{}\n'
+    fi
+    ;;
+  "funnel --bg --yes "*)
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    ;;
+  "funnel "*off)
+    printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
+    ;;
+esac
+exit 0
+"#,
+        );
+        crate::harness::write_executable(&bin.join("cloudflared"), "#!/bin/sh\nexit 1\n");
+        h.add_path_dir(&bin);
+        h.set_env("AOE_TEST_FUNNEL_STATE", h.home_path().join("funnel.json"));
+        let original = "original e2e remote credential";
+        let started = h.run_cli(&[
+            "serve",
+            "--remote",
+            "--daemon",
+            "--port",
+            &pick_free_port().to_string(),
+            "--passphrase",
+            original,
+        ]);
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let app = app_dir_in(h.home_path());
+        let saved = app.join("serve.saved_passphrase");
+        std::fs::write(&saved, original).unwrap();
+        std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let predecessor = daemon_pid(&h).unwrap();
+        h.spawn_tui_sized(120, 40);
+        h.wait_for_ready();
+        h.send_keys("R");
+        h.wait_for("Connections");
+        h.send_keys("Enter");
+        h.wait_for("R: restart");
+        if !replacement_succeeds {
+            std::fs::write(app.join(".schema_version"), "39").unwrap();
+            block_workers_dir(&app.join("acp-workers"));
+        }
+        h.send_keys_unfenced("G");
+        h.wait_for("Press G again for a new passphrase.");
+        h.send_keys_unfenced("G");
+        if replacement_succeeds {
+            let running = wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
+                let successor = daemon_pid(&h).ok_or("replacement PID not published")?;
+                let running = std::fs::read_to_string(app.join("serve.passphrase"))
+                    .map_err(|error| error.to_string())?;
+                if successor != predecessor && pid_alive(successor as i32) && running != original {
+                    Ok(running)
+                } else {
+                    Err("replacement has not published its credential".to_owned())
+                }
+            });
+            h.wait_for(&running);
+            h.wait_for("R: restart");
+            assert_eq!(std::fs::read_to_string(&saved).unwrap(), running);
+        } else {
+            h.wait_for("Serve failed");
+            h.run_cli_err(&["serve", "--status"]);
+            assert!(!pid_alive(predecessor as i32));
+            assert!(daemon_pid(&h).is_none_or(|pid| !pid_alive(pid as i32)));
+            assert_eq!(std::fs::read_to_string(&saved).unwrap(), original);
+        }
+    }
+}

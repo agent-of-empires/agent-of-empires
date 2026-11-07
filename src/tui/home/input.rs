@@ -1893,7 +1893,7 @@ impl HomeView {
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
-                ServeAction::Stop => return Some(Action::StopDashboard),
+                ServeAction::Stop(request) => return Some(Action::StopDashboard(request)),
                 ServeAction::Launch(request) => {
                     self.pending_dashboard_launch = Some(request);
                     return Some(Action::StartDashboard);

@@ -13,7 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
 use crate::acp::client::autostart::initial_log_tail;
-use crate::cli::serve::{read_serve_urls, ServeLaunch, ServeUrl};
+use crate::cli::serve::{
+    read_serve_urls, ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget,
+};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
@@ -27,10 +29,28 @@ const CONFIRM_TTL: Duration = Duration::from_secs(3);
 
 pub enum ServeAction {
     Launch(ServeLaunchRequest),
-    Stop,
+    Stop(ServeStopRequest),
     Continue,
     Close,
 }
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServeStopRequest {
+    target: Option<TuiControlTarget>,
+}
+
+impl ServeStopRequest {
+    pub(crate) async fn run(self) -> anyhow::Result<()> {
+        match self.target {
+            Some(target) => {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let lease = TuiControlLease::prepare(target, &cancel).await?;
+                lease.stop().await
+            }
+            None => crate::cli::serve::stop_daemon().await,
+        }
+    }
+}
+
 pub struct ServeLaunchRequest {
     restart: bool,
     mode: ServeMode,
@@ -102,13 +122,7 @@ impl ServeLaunchRequest {
         self,
         profile: String,
         predecessor_epoch: Option<String>,
-    ) -> Result<
-        (
-            crate::daemon::RuntimeConnection,
-            crate::daemon::DaemonClient,
-        ),
-        ServeLaunchFailure,
-    > {
+    ) -> Result<crate::cli::serve::TuiDashboardLaunch, ServeLaunchFailure> {
         use clap::Parser;
         let port = crate::acp::client::autostart::load_or_generate_port().to_string();
         let mut argv = vec!["aoe", "serve", "--daemon", "--port", port.as_str()];
@@ -637,6 +651,9 @@ enum PendingJob {
     Open,
     Passphrase,
     ErrorContext,
+    RetryContext {
+        failed: Option<TunnelTransport>,
+    },
     Picker {
         selected: Option<ServeMode>,
     },
@@ -647,6 +664,7 @@ enum PendingJob {
     },
     Retry {
         failed: Option<TunnelTransport>,
+        target: TuiControlTarget,
     },
     Reset,
     Restart {
@@ -664,6 +682,7 @@ impl PendingJob {
     fn banner(&self) -> Option<&'static str> {
         match self {
             Self::Open => Some("Looking for a running daemon"),
+            Self::RetryContext { .. } => Some("Checking Daemon identity for provider retry"),
             Self::Picker { .. } => Some("Checking access options"),
             Self::Providers { .. } => Some("Checking tunnel providers"),
             Self::Retry { .. } => Some("Stopping the observed daemon before provider retry"),
@@ -700,6 +719,7 @@ pub struct ServeView {
     target: Option<crate::cli::serve::TuiControlTarget>,
     control_error: Option<String>,
     local_primary: String,
+    elapsed_second: Option<u64>,
 }
 
 impl ServeView {
@@ -775,6 +795,7 @@ impl ServeView {
             target: None,
             control_error: None,
             local_primary: String::new(),
+            elapsed_second: None,
         }
     }
 
@@ -863,8 +884,18 @@ impl ServeView {
             if self.stop_requested {
                 return ServeAction::Continue;
             }
+            let target = match self.pending.take() {
+                Some(PendingWork {
+                    kind: PendingJob::Retry { target, .. },
+                    ..
+                }) => {
+                    self.target = Some(target.clone());
+                    Some(target)
+                }
+                _ => None,
+            };
             self.begin_stop();
-            return ServeAction::Stop;
+            return ServeAction::Stop(ServeStopRequest { target });
         }
         if self.stop_requested {
             return if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -945,6 +976,7 @@ impl ServeView {
             }
             PendingJob::Open
             | PendingJob::ErrorContext
+            | PendingJob::RetryContext { .. }
             | PendingJob::Retry { .. }
             | PendingJob::Reset
             | PendingJob::LaunchContext(_)
@@ -1136,7 +1168,7 @@ impl ServeView {
         self.pending_launch.take()
     }
 
-    pub(crate) fn finish_launch(&mut self, result: Result<(), ServeLaunchFailure>) {
+    pub(crate) fn finish_launch(&mut self, result: Result<TuiControlTarget, ServeLaunchFailure>) {
         if self.stop_requested || !self.launch_in_flight {
             return;
         }
@@ -1152,8 +1184,10 @@ impl ServeView {
         };
         let (mode, transport) = (*mode, *transport);
         match result {
-            Ok(()) => {
+            Ok(target) => {
+                self.target = Some(target.clone());
                 let job = Job::LaunchOutcome {
+                    target,
                     mode,
                     transport,
                     passphrase: passphrase.take(),
@@ -1251,6 +1285,16 @@ impl ServeView {
         ServeAction::Continue
     }
 
+    fn request_provider_retry(&mut self, failed: Option<TunnelTransport>) {
+        match self.target.take() {
+            Some(target) => self.request(
+                Job::Retry(target.clone()),
+                PendingJob::Retry { failed, target },
+            ),
+            None => self.request(Job::ErrorContext, PendingJob::RetryContext { failed }),
+        }
+    }
+
     fn error_key(&mut self, code: KeyCode) -> ServeAction {
         let ServeViewState::Error {
             message,
@@ -1264,9 +1308,7 @@ impl ServeView {
         let failed = *transport;
         match code {
             KeyCode::Char('p' | 'P') if *mode == ServeMode::Tunnel => {
-                if let Some(target) = &self.target {
-                    self.request(Job::Retry(target.clone()), PendingJob::Retry { failed });
-                }
+                self.request_provider_retry(failed);
             }
             KeyCode::Char('r' | 'R') if reset => {
                 if let Some(target) = &self.target {
@@ -1375,8 +1417,20 @@ impl ServeView {
         }
         if self.pending.is_none() && !self.launch_in_flight && !self.stop_requested {
             match self.state {
-                ServeViewState::Starting { .. } => {
-                    self.request(Job::ObserveStarting, PendingJob::Starting)
+                ServeViewState::Starting {
+                    mode, transport, ..
+                } => {
+                    if let Some(target) = self.target.clone() {
+                        self.request(Job::ObserveStarting(target), PendingJob::Starting);
+                    } else {
+                        self.fail_work(
+                            mode,
+                            transport,
+                            "The starting Daemon has no verified identity; reopen Remote Access before retrying."
+                                .to_owned(),
+                        );
+                        changed = true;
+                    }
                 }
                 ServeViewState::Active { .. } => {
                     self.request(Job::ObserveActive, PendingJob::ActiveLog)
@@ -1384,6 +1438,20 @@ impl ServeView {
                 _ => {}
             }
         }
+        let elapsed = match &self.state {
+            ServeViewState::Starting { started_at, .. }
+                if !self.stop_requested
+                    && self
+                        .pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.kind.banner().is_none()) =>
+            {
+                Some(started_at.elapsed().as_secs())
+            }
+            _ => None,
+        };
+        changed |= self.elapsed_second != elapsed;
+        self.elapsed_second = elapsed;
         changed
     }
 
@@ -1394,8 +1462,15 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         message: String,
     ) {
-        if matches!(kind, PendingJob::ErrorContext)
-            && matches!(self.state, ServeViewState::Error { .. })
+        if let PendingJob::Retry { target, .. } = kind {
+            self.target = Some(target);
+            self.fail_work(mode, transport, message);
+            return;
+        }
+        if matches!(
+            kind,
+            PendingJob::ErrorContext | PendingJob::RetryContext { .. }
+        ) && matches!(self.state, ServeViewState::Error { .. })
         {
             self.target = None;
             self.control_error = Some(message);
@@ -1450,9 +1525,15 @@ impl ServeView {
                 }
                 self.launch_in_flight = false;
             }
-            (PendingJob::ErrorContext, JobResult::ErrorContext(target)) => {
+            (
+                kind @ (PendingJob::ErrorContext | PendingJob::RetryContext { .. }),
+                JobResult::ErrorContext(target),
+            ) => {
                 self.target = Some(target);
                 self.control_error = None;
+                if let PendingJob::RetryContext { failed } = kind {
+                    self.request_provider_retry(failed);
+                }
             }
             (PendingJob::Passphrase, JobResult::Passphrase(passphrase)) => {
                 self.pending_passphrase = passphrase
@@ -1481,7 +1562,7 @@ impl ServeView {
                 }
             }
             (
-                PendingJob::Retry { failed },
+                PendingJob::Retry { failed, .. },
                 JobResult::Retried {
                     tailscale,
                     cloudflare,
@@ -1593,7 +1674,8 @@ impl ServeView {
             (PendingJob::Copy, JobResult::Copied(label)) => {
                 self.copied = Some((label, Instant::now()))
             }
-            _ => self.fail_work(
+            (kind, _) => self.fail_pending(
+                kind,
                 pending.mode,
                 pending.transport,
                 "Unexpected Serve worker result; reopen the view before retrying.".to_owned(),
