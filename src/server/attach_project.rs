@@ -71,15 +71,8 @@ pub(crate) async fn attach_project(
         state.acp_supervisor.worker_state(id).await,
         crate::daemon::AcpWorkerState::Running
     );
-    if was_running {
-        let store = state.acp_event_store.clone();
-        let probe_id = id.to_owned();
-        let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&probe_id))
-            .await
-            .map_err(|error| AttachError::Rejected(error.into()))?;
-        if in_flight {
-            return Err(AttachError::TurnInFlight);
-        }
+    if was_running && turn_in_flight(state, id).await? {
+        return Err(AttachError::TurnInFlight);
     }
     // Plan through the bound native store. Validation happens before stopping
     // workers or touching git; attach_planned repeats it under lifecycle exclusion.
@@ -185,6 +178,15 @@ pub(crate) async fn attach_project(
         WorkerOutcome::NotRunning
     };
     Ok((outcome, worker))
+}
+
+/// Include queued worker events before deciding whether attachment is safe.
+async fn turn_in_flight(state: &Arc<AppState>, id: &str) -> Result<bool, AttachError> {
+    let supervisor = Arc::clone(&state.acp_supervisor);
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || supervisor.has_in_flight_turn(&id))
+        .await
+        .map_err(|error| AttachError::Rejected(error.into()))
 }
 
 async fn run_blocking<T, F>(
@@ -309,6 +311,54 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
 mod tests {
     use super::*;
     use crate::server::test_support as support;
+
+    /// A queued stop must reach disk before attachment checks turn state.
+    #[tokio::test]
+    async fn attachment_probe_waits_for_a_queued_stop() {
+        use crate::acp::state::Event;
+        use std::time::Duration;
+
+        let state = support::build_test_app_state(vec![]);
+        let id = "queued-stop";
+        state
+            .acp_supervisor
+            .publish_user_prompt(id, "work".into())
+            .await;
+        assert!(state.acp_event_store.has_in_flight_turn(id));
+
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let store = Arc::clone(&state.acp_event_store);
+        state.acp_supervisor.test_run_on_writer(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            store
+                .record(
+                    id,
+                    2,
+                    &Event::Stopped {
+                        reason: "prompt_complete".into(),
+                    },
+                )
+                .unwrap();
+        });
+        ready.await.unwrap();
+        let mut probe = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { turn_in_flight(&state, id).await }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut probe).await;
+        release.send(()).unwrap();
+        assert!(
+            early.is_err(),
+            "the probe returned before the queued stop was written: {early:?}"
+        );
+        assert!(!tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+    }
 
     /// #4116: an archive committed while the restarted worker's `before_session` hook runs
     /// refuses the respawn instead of launching the archived row.

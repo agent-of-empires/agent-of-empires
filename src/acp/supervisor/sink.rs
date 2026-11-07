@@ -89,6 +89,8 @@ struct Publication {
 enum Job {
     Publish(Box<Publication>),
     Flush(std::sync::mpsc::SyncSender<()>),
+    #[cfg(test)]
+    Test(Box<dyn FnOnce() + Send>),
 }
 
 impl ChannelSink {
@@ -108,7 +110,11 @@ impl ChannelSink {
             .name("acp-event-writer".into())
             .spawn(move || {
                 for job in queue {
-                    worker.run(job);
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(job)))
+                        .is_err()
+                    {
+                        tracing::error!(target: "acp.event_store", "event writer job panicked; publication may be incomplete, continuing queued jobs");
+                    }
                 }
             })
             .map_err(|e| {
@@ -157,6 +163,19 @@ impl ChannelSink {
     fn flushed_store(&self) -> &EventStore {
         self.flush();
         self.store()
+    }
+}
+
+impl super::Supervisor<ChannelSink> {
+    /// Probe turn state after this sink's queued publications reach the store.
+    pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
+        self.sink.flushed_store().has_in_flight_turn(session_id)
+    }
+
+    /// Queue a gate or fault for deterministic writer tests.
+    #[cfg(test)]
+    pub(crate) fn test_run_on_writer(&self, run: impl FnOnce() + Send + 'static) {
+        self.sink.submit(Job::Test(Box::new(run)));
     }
 }
 
@@ -280,6 +299,8 @@ impl Persister {
             Job::Flush(done) => {
                 let _ = done.send(());
             }
+            #[cfg(test)]
+            Job::Test(run) => run(),
         }
     }
 
@@ -347,6 +368,46 @@ impl Persister {
 mod tests {
     use super::super::test_support::channel_sink;
     use super::*;
+
+    /// A failed writer job must not discard the publications queued behind it.
+    #[test]
+    fn writer_panic_preserves_later_queued_publications() {
+        use std::time::Duration;
+
+        let (sink, store, mut rx, _tmp) = channel_sink();
+        let (entered, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        sink.submit(Job::Test(Box::new(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            panic!("injected writer failure");
+        })));
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        for seq in 1..=2 {
+            sink.publish_from_worker("writer-panic", seq, &Event::ThinkingStarted, 7);
+        }
+        // This barrier is also queued before the panic, so a later inline
+        // fallback cannot hide the loss of buffered publications.
+        let (done, flushed) = std::sync::mpsc::sync_channel(1);
+        sink.submit(Job::Flush(done));
+        release.send(()).unwrap();
+        flushed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer must continue after a panic");
+        let seqs: Vec<_> = store
+            .replay_from("writer-panic", 0)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(seqs, [1, 2]);
+        for seq in 1..=2 {
+            let frame = rx.try_recv().unwrap();
+            assert_eq!(frame.seq, seq);
+            assert_eq!(frame.worker_generation, Some(7));
+        }
+        assert!(sink.publish_persisted("writer-panic", 3, &Event::ThinkingStarted));
+        assert_eq!(store.highest_seq("writer-panic"), 3);
+    }
 
     #[test]
     fn inheritable_reset_takes_only_a_future_previous_reset() {
