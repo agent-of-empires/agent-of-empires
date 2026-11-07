@@ -356,6 +356,8 @@ export function useLiveTerminal(
     connect();
 
     const tryAutoReconnect = () => {
+      // A pending redial reconnects from its socket's onclose, after the server releases the old claim.
+      if (redialRef.current) return;
       const readyState = wsRef.current?.readyState;
       if (readyState === WebSocket.OPEN || readyState === WebSocket.CONNECTING) return;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);

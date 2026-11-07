@@ -513,7 +513,7 @@ describe("size owner", () => {
     }
   });
 
-  it("drops a pending redial when an automatic reconnect replaces its socket first", () => {
+  it("holds automatic reconnects until a pending redial's socket closes", () => {
     vi.useFakeTimers();
     try {
       const { result, ws } = mount();
@@ -521,7 +521,11 @@ describe("size owner", () => {
       act(() => {
         window.dispatchEvent(new Event("online"));
       });
+      expect(FakeWS.sockets).toHaveLength(1);
+
       act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
       const next = FakeWS.sockets[1]!;
       next.open();
 
