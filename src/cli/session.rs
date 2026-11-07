@@ -505,6 +505,9 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         !inst.has_pending_trash(),
         crate::session::LifecycleReservationError::Busy(crate::session::LifecycleOperation::Trash)
     );
+    if inst.is_trashed() {
+        return Err(crate::session::StartBlocked::Trashed.into());
+    }
     if !args.no_kill {
         inst.kill_all_tmux_sessions_locked()?;
     }
@@ -541,6 +544,9 @@ fn archive_row(storage: &Storage, id: &str) -> Result<Option<bool>> {
                 crate::session::LifecycleOperation::Trash
             )
         );
+        if stored.is_trashed() {
+            return Err(crate::session::StartBlocked::Trashed.into());
+        }
         stored.archive();
         stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
         Ok(Some(stored.is_structured()))
@@ -3305,7 +3311,10 @@ mod target_filter_tests {
 /// #4116: CLI start and restart refuse an archived or trashed session.
 #[cfg(test)]
 mod start_blocked_tests {
-    use super::{restart_session, send_restart_wake, start_session, SessionIdArgs};
+    use super::{
+        archive_session, restart_session, send_restart_wake, start_session, ArchiveArgs,
+        SessionIdArgs,
+    };
     use crate::session::{Instance, Storage};
     use serial_test::serial;
 
@@ -3395,6 +3404,48 @@ mod start_blocked_tests {
                 let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
                 assert!(!tmux.exists());
             }
+        }
+    }
+
+    /// #5346: CLI archive refuses a trashed row, leaving the flags Trash preserves for restore.
+    #[tokio::test]
+    #[serial]
+    async fn archive_refuses_trashed_session_and_keeps_preserved_flags() {
+        for no_kill in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "archive-trashed";
+            let project = temp.path().join("project");
+            let mut inst = Instance::new("trashed", project.to_str().unwrap());
+            inst.pinned_at = Some(chrono::Utc::now());
+            inst.trash();
+            let id = inst.id.clone();
+            let storage = Storage::new_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+
+            let err = archive_session(
+                profile,
+                ArchiveArgs {
+                    identifier: id,
+                    no_kill,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "session is in trash; restore it first",
+                "no_kill={no_kill}"
+            );
+            let row = &storage.load().unwrap()[0];
+            assert!(row.is_trashed());
+            assert!(!row.is_archived());
+            assert!(row.pinned_at.is_some());
         }
     }
 }
