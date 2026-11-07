@@ -285,6 +285,32 @@ pub fn status_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrati
     provider_snapshot(instance, tool)
 }
 
+/// The integration status a poll applies. Carrying the detection identity it
+/// derived keeps the poll and its test on one identity: a custom tool aliased to
+/// a provider tool reads that provider's report.
+pub(crate) struct IntegrationStatus {
+    pub(crate) tool: String,
+    pub(crate) configured: bool,
+    pub(crate) snapshot: Option<AgentIntegrationSnapshot>,
+}
+
+pub(crate) fn integration_status(instance: &Instance) -> IntegrationStatus {
+    let tool = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let configured = status_configured(instance, &tool);
+    let snapshot = configured
+        .then(|| status_snapshot(instance, &tool))
+        .flatten();
+    IntegrationStatus {
+        tool: tool.into_owned(),
+        configured,
+        snapshot,
+    }
+}
+
 fn provider_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrationSnapshot> {
     if !eligible(instance) {
         return None;
@@ -1943,21 +1969,35 @@ deny = [{ kind = "literal", value = "n" }]
         )
         .unwrap();
 
-        // Polling derives the detection identity from the alias, and that is the
-        // identity that owns status and selects the snapshot.
-        let identity = crate::tmux::status_rules::detection_tool(PROFILE, &instance.tool, "");
-        assert_eq!(identity, "acme-provider");
-        assert!(status_owned(&identity));
+        // The poll applies this same derivation, so the aliased identity is what
+        // owns status and selects the snapshot.
+        let integration = integration_status(&instance);
+        assert!(integration.configured);
+        assert_eq!(
+            integration.snapshot.map(|snapshot| snapshot.status),
+            Some(AgentIntegrationStatus::Waiting)
+        );
+        assert!(status_owned("acme-provider"));
         assert!(
             !status_owned(&instance.tool),
             "the custom name owns nothing"
         );
-        assert!(status_configured(&instance, &identity));
+
+        // The alias still owns status with no report, so the poll reads Unknown
+        // rather than falling back to the custom name.
+        let mut unreported = Instance::new("alias-status-unreported", "/tmp");
+        unreported.tool = "my-acme".into();
+        unreported.source_profile = PROFILE.into();
+        let absent = integration_status(&unreported);
+        assert!(absent.configured);
+        assert!(absent.snapshot.is_none());
         assert_eq!(
-            status_snapshot(&instance, &identity).map(|snapshot| snapshot.status),
-            Some(AgentIntegrationStatus::Waiting)
+            session_status_override(
+                absent.configured,
+                false,
+                absent.snapshot.map(|snapshot| snapshot.status)
+            ),
+            Some(crate::session::Status::Unknown)
         );
-        assert!(!status_configured(&instance, &instance.tool));
-        assert!(status_snapshot(&instance, &instance.tool).is_none());
     }
 }

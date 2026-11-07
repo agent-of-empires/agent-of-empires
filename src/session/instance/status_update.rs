@@ -260,13 +260,10 @@ impl Instance {
         );
         // Ownership is keyed on the detection identity, so a custom tool aliased
         // to a provider tool still reads that provider's report.
-        let pane_tool =
-            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
-        let integration_configured =
-            crate::plugin::agent_integration::status_configured(self, &pane_tool);
-        let integration_snapshot = integration_configured
-            .then(|| crate::plugin::agent_integration::status_snapshot(self, &pane_tool))
-            .flatten();
+        let integration = crate::plugin::agent_integration::integration_status(self);
+        let integration_configured = integration.configured;
+        let integration_snapshot = integration.snapshot;
+        let pane_tool = integration.tool;
         if let Some(status) = crate::plugin::agent_integration::session_status_override(
             integration_configured,
             is_dead,
