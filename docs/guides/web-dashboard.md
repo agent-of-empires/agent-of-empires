@@ -49,7 +49,7 @@ Fresh CLI and TUI acquisitions, including explicit reconnects, resolve global se
 
 Configured TCP startup failures are reported without automatically starting core-only. See [configured startup recovery](mcp-control.md#when-configured-tcp-cannot-start).
 
-`aoe plugin enable aoe.web` can acquire a private daemon while the plugin is disabled. Re-enabling the plugin does not promote that daemon; the next fresh acquisition may enable configured TCP serving. Explicit TCP starts remain rejected while the plugin is disabled.
+`aoe plugin enable aoe.web` can acquire a private daemon while the plugin is disabled. Re-enabling the plugin does not promote that daemon; the next fresh acquisition may enable configured TCP serving. Readable global configuration that disables the plugin blocks explicit TCP starts. See [configuration recovery](mcp-control.md#when-configured-tcp-cannot-start) for unreadable settings.
 
 AoE-managed writes to the registered Web plugin's enable state use the daemon's namespace transaction. A save cannot commit during an active start, restart, or rollback; it reports a busy error rather than waiting inside the daemon. Retry rejected saves explicitly after the transition finishes. A save committed first is honored by launch validation. Disabling the plugin does not stop an existing TCP daemon. Hand edits do not participate in this coordination.
 
@@ -57,7 +57,7 @@ See [Web plugin errors](../plugins.md#web-plugin-errors) for the command-palette
 
 An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 
-`aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop`. When `aoe.web` is disabled, replaying a TCP launch refuses before stopping the current daemon; core-only replay remains available. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.
+`aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop`. When readable global configuration disables `aoe.web`, replaying a TCP launch refuses before stopping the current daemon; core-only replay remains available. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.
 
 An absent daemon is different from a restart: the next autostart resolves current configuration, not the vanished daemon's recorded exposure flags. It does not restore a previous LAN bind or tunnel. Persisted Web serving and Tunnel settings remain tracked separately in [#4476](https://github.com/agent-of-empires/agent-of-empires/issues/4476).
 
