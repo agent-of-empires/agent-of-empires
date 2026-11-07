@@ -2974,6 +2974,7 @@ time.sleep(60)
                     tool_call_id: Some("toolu_task".into()),
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             );
         }

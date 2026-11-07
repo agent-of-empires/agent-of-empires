@@ -4,9 +4,15 @@
 import { useEffect, useState } from "react";
 import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 
-import { useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "../../hooks/useAcpSession";
+import {
+  useBackgroundAgents,
+  useBackgroundShells,
+  useBackgroundTasks,
+  useWorkflowRuns,
+} from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
 import { isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
+import { BackgroundShells } from "./BackgroundShells";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 type Entry =
@@ -34,13 +40,20 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   const agents = useBackgroundAgents(sessionId);
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
+  const shells = useBackgroundShells(sessionId);
 
-  if (agents.length === 0) {
+  if (agents.length === 0 && shells.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
-        No background sub-agents launched yet. When the agent dispatches an async{" "}
-        <span className="font-mono">Task</span> or runs a <span className="font-mono">Workflow</span>, its agents show
-        up here with live progress.
+        No background work yet. Async <span className="font-mono">Task</span> sub-agents,{" "}
+        <span className="font-mono">Workflow</span> runs and background shell commands show up here.
+      </div>
+    );
+  }
+  if (agents.length === 0) {
+    return (
+      <div className="flex h-full flex-col overflow-y-auto">
+        {sessionId && <BackgroundShells sessionId={sessionId} />}
       </div>
     );
   }
@@ -63,6 +76,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
         </span>
         {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
       </div>
+      {sessionId && <BackgroundShells sessionId={sessionId} />}
       <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
         Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
         <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the

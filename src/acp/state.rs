@@ -409,6 +409,22 @@ pub struct WorkflowRunRecord {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// Finished shells kept for the Background panel's Recent group.
+pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
+
+/// A Bash `run_in_background` task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellRecord {
+    pub task_id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished: bool,
+}
+
 /// The workflow run and phase a background sub-agent belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRef {
@@ -520,6 +536,9 @@ pub struct AcpState {
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
+    /// Background shells, running and recently finished, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_shells: Vec<BackgroundShellRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
 
@@ -759,9 +778,12 @@ pub enum Event {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        /// The Bash command, or the workflow's name.
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<DateTime<Utc>>,
     },
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
@@ -1209,11 +1231,22 @@ impl AcpState {
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
+                description,
                 workflow,
-                ..
+                started_at,
             } => {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(&task_id, None);
+                self.background_shells.retain(|s| s.task_id != task_id);
+                if workflow.is_none() {
+                    self.background_shells.push(BackgroundShellRecord {
+                        task_id: task_id.clone(),
+                        command: description,
+                        started_at,
+                        ended_at: None,
+                        finished: false,
+                    });
+                }
                 if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
                     self.workflow_runs.push(WorkflowRunRecord {
                         task_id: task_id.clone(),
@@ -1231,6 +1264,20 @@ impl AcpState {
             Event::BackgroundTaskFinished { task_id, ended_at } => {
                 self.close_workflow_run(&task_id, ended_at);
                 self.background_tasks.retain(|id| *id != task_id);
+                if let Some(shell) = self
+                    .background_shells
+                    .iter_mut()
+                    .find(|s| s.task_id == task_id)
+                {
+                    shell.finished = true;
+                    shell.ended_at = ended_at;
+                }
+                let finished = self.background_shells.iter().filter(|s| s.finished).count();
+                for _ in MAX_FINISHED_BACKGROUND_SHELLS..finished {
+                    if let Some(i) = self.background_shells.iter().position(|s| s.finished) {
+                        self.background_shells.remove(i);
+                    }
+                }
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
@@ -1563,6 +1610,7 @@ mod tests {
                         tool_call_id: None,
                         description: "sleep".into(),
                         workflow: None,
+                        started_at: None,
                     },
                     stopped("end_turn"),
                 ],
@@ -2240,6 +2288,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = |id: &str| Event::BackgroundTaskFinished {
             task_id: id.into(),
@@ -2258,6 +2307,49 @@ mod tests {
     }
 
     #[test]
+    fn background_shells_keep_command_and_outlive_their_task() {
+        let started = |id: &str, workflow: Option<WorkflowLaunch>| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: format!("cmd {id}"),
+            workflow,
+            started_at: None,
+        };
+        let finished = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        let wf = WorkflowLaunch {
+            run_id: "wf_1".into(),
+            name: "drafts".into(),
+            summary: None,
+            transcript_dir: String::new(),
+        };
+        let mut s = applied([started("a", None), started("wf", Some(wf))]);
+        assert_eq!(s.background_shells.len(), 1, "workflows are not shells");
+        assert_eq!(s.background_shells[0].command, "cmd a");
+        assert!(!s.background_shells[0].finished);
+
+        s.apply_event(s.last_seq + 1, finished("a")).unwrap();
+        assert!(s.background_tasks.iter().all(|id| id != "a"));
+        assert!(
+            s.background_shells[0].finished,
+            "finished shell stays listed"
+        );
+
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 3 {
+            let id = format!("t{i}");
+            s.apply_event(s.last_seq + 1, started(&id, None)).unwrap();
+            s.apply_event(s.last_seq + 1, finished(&id)).unwrap();
+        }
+        assert_eq!(s.background_shells.len(), MAX_FINISHED_BACKGROUND_SHELLS);
+        assert_eq!(
+            s.background_shells[0].task_id, "t3",
+            "oldest finished dropped first"
+        );
+    }
+
+    #[test]
     fn workflow_runs_keep_their_end_after_their_task() {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
@@ -2269,6 +2361,7 @@ mod tests {
                 summary: None,
                 transcript_dir: "/home/u/.claude/wf".into(),
             }),
+            started_at: None,
         };
         let runs = |s: &AcpState| {
             s.workflow_runs
@@ -2297,6 +2390,7 @@ mod tests {
                 tool_call_id: Some("toolu_bash".into()),
                 description: "sleep".into(),
                 workflow: None,
+                started_at: None,
             },
             Event::BackgroundTaskFinished {
                 task_id: "wfy".into(),
