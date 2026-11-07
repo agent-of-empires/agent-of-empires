@@ -281,6 +281,11 @@ fn resolve_host_creation(
             }
         }
     }
+    // Implicit selection (default_tool) is a --tool choice too, so it owns the
+    // same rejection as the explicit paths above.
+    if !body.command_override.is_empty() && plugin_owned(&body.tool) {
+        anyhow::bail!("--cmd-override cannot be used with plugin-provided agent --tool selections");
+    }
     if explicit_tool {
         let configured = config.session.resolve_tool_command(&body.tool);
         if options.command.is_some() && !configured.is_empty() {
