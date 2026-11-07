@@ -3475,8 +3475,13 @@
       "id": "acp.reduced-state-channel",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/acpTypes.reducer.test.ts"],
-      "components": ["web/src/lib/acpTypes.ts", "web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/lib/acpTypes.reducer.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts"
+      ],
+      "notes": "Web negotiates projection=web on initial and reconnect sockets, omitting only the duplicate reduced_state.background_agents field without an unchanged marker. Default and explicit full snapshots preserve native busy state. Raw launch, progress and completion events retain complete prompt, tools and result for browser panels and Copy. The hook reconnects from the last lifecycle seq with an empty raw replay and an agent-free Web snapshot, preserving the existing agent details. Rust query, projection and WebSocket tests cover connect, live updates, reconnect and lag rebuilds."
     },
     {
       "id": "acp.drafts",
