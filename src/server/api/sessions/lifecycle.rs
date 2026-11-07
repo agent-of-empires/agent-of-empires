@@ -1128,6 +1128,9 @@ pub(super) enum LifecycleTargetError {
     Busy,
     #[error("session is not in structured view")]
     NotStructured,
+    /// A requested account swap that would not keep the conversation.
+    #[error("{0}")]
+    AccountSwapRefused(String),
     /// An archived or trashed session refuses to launch or resume (#4116).
     #[error(transparent)]
     Blocked(#[from] crate::session::StartBlocked),
@@ -1153,6 +1156,13 @@ pub(crate) fn lifecycle_rejection(
                 StatusCode::CONFLICT,
                 "not_structured",
                 "Switch the session to structured view before stopping an ACP worker",
+            ))
+        }
+        Some(LifecycleTargetError::AccountSwapRefused(message)) => {
+            return Some(api_error(
+                StatusCode::CONFLICT,
+                "account_swap_unavailable",
+                message.clone(),
             ))
         }
         _ => {}
@@ -1976,6 +1986,35 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// Why a restart that demands an account swap (`require_account_carry`) cannot keep the
+/// conversation. A plain tool swap would park the ids and start a fresh conversation instead.
+pub(super) fn account_swap_refusal(
+    row: &Instance,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<String> {
+    if !body.require_account_carry {
+        return None;
+    }
+    let Some(tool) = body.tool.as_deref() else {
+        return Some("An account swap needs the tool to switch to".to_owned());
+    };
+    if tool == row.tool {
+        return Some(format!("Session already runs as '{tool}'"));
+    }
+    if body.command_override.is_some() {
+        return Some("An account swap cannot also change the launch command".to_owned());
+    }
+    let target_profile = body.profile.as_deref().unwrap_or(&row.source_profile);
+    match crate::session::conversation_carry::classify(row, target_profile, tool) {
+        crate::session::conversation_carry::ToolSwap::KeepConversation(_) => None,
+        crate::session::conversation_carry::ToolSwap::Park => Some(format!(
+            "Cannot switch to '{tool}' without losing the conversation. Both tools must run the \
+             same agent with a known transcript layout (Claude), the session needs a recorded \
+             conversation, and a sandboxed session must not have a store move pending. Nothing changed."
+        )),
+    }
+}
+
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
@@ -2051,6 +2090,10 @@ fn reserve_structured_restart(
             && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
+    // Decided on the durable row, before the reservation and before the worker stops.
+    if let Some(message) = account_swap_refusal(&probe, body) {
+        return Err(LifecycleTargetError::AccountSwapRefused(message).into());
+    }
     if matches!(restart_origin, RestartOrigin::StartupRecovery) {
         // Preserve archived/trashed refusals.
         probe
@@ -2112,11 +2155,52 @@ struct StructuredRestartLaunch {
     started: Instance,
     native: crate::server::session_store::NativeSessionStore,
     hooks: anyhow::Result<()>,
+    /// The restart changed only the account, so the conversation continues where it stopped.
+    account_swap: bool,
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
     wake: Option<String>,
     reason: &'static str,
 }
 
+/// After an account swap out of a rate-limit park: same sequence as `/acp/spawn`, with the
+/// submission authority covering the checks and the install. Returns whether the interrupted
+/// prompt (or a queued one) is now the next turn, so the default wake message can give way.
+///
+/// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
+/// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
+/// disarms the auto-resume budget exactly once.
+pub(super) async fn continue_interrupted_prompt(
+    state: &Arc<AppState>,
+    id: &str,
+    generation: u64,
+    resets_at: chrono::DateTime<chrono::Utc>,
+    explicit_wake: bool,
+) -> bool {
+    let submission = state.session_service.prompt_submission(id).await;
+    let current = state.instances.read().await.iter().any(|row| {
+        row.id == id
+            && row.lifecycle_generation == generation
+            && row.launch_is_finalized()
+            && row.ensure_startable().is_ok()
+    });
+    if !current {
+        return false;
+    }
+    if explicit_wake {
+        drop(submission);
+    } else {
+        let _ =
+            crate::server::acp_reconciler::install_rate_limit_continuation(state, id, submission)
+                .await;
+    }
+    state
+        .acp_supervisor
+        .publish_rate_limit_auto_resumed(id, resets_at, true);
+    !explicit_wake
+        && state.instances.read().await.iter().any(|row| {
+            row.id == id && (row.pending_initial_turn.is_some() || !row.queued_prompts.is_empty())
+        })
+}
 async fn finish_structured_restart(
     state: &Arc<AppState>,
     id: &str,
@@ -2135,10 +2219,18 @@ async fn finish_structured_restart(
             mut started,
             native,
             hooks,
+            account_swap,
             carry,
             wake,
             reason: _,
         } = launch;
+        // Read before the spawn: the new worker's session assignment retires the park.
+        let resumes_rate_limit = if account_swap {
+            crate::server::api::acp::rate_limit_resume_probe(state, id).await
+        } else {
+            None
+        };
+        let wake_requested = wake.is_some();
         let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
             let sandbox_info = started.sandbox_info.take();
             let ownership =
@@ -2248,6 +2340,13 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
+        let continued = match resumes_rate_limit {
+            Some(resets_at) => {
+                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
+            }
+            None => false,
+        };
+        let wake = if continued { String::new() } else { wake };
         if !wake.is_empty() {
             let state = state.clone();
             let id = id.to_owned();
@@ -2642,6 +2741,12 @@ async fn prepare_agent_session_inner(
                 );
             }
         }
+        if let Some(message) = worker_restart
+            .as_ref()
+            .and_then(|body| account_swap_refusal(&outgoing, body))
+        {
+            return Err(LifecycleTargetError::AccountSwapRefused(message).into());
+        }
         let (account_swap, mut conversation_carry) = match worker_restart
             .as_ref()
             .and_then(|body| body.tool.as_deref())
@@ -2800,7 +2905,12 @@ async fn prepare_agent_session_inner(
             },
         )?;
         drop(identity);
-        Ok(Some((generation, started, native, conversation_carry)))
+        Ok(Some((
+            generation,
+            started,
+            native,
+            (account_swap, conversation_carry),
+        )))
     })
     .await;
     drop(guard);
@@ -2846,7 +2956,8 @@ async fn prepare_agent_session_inner(
                     started,
                     native,
                     hooks,
-                    carry,
+                    account_swap: carry.0,
+                    carry: carry.1,
                     wake: requested_wake_message,
                     reason,
                 },
@@ -2876,7 +2987,7 @@ async fn prepare_agent_session_inner(
                             crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
                         },
                         restart: true,
-                        conversation_carry,
+                        conversation_carry: conversation_carry.1,
                     },
                     generation,
                     hooks,
