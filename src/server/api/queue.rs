@@ -102,11 +102,14 @@ pub async fn queue_enqueue(
     match buffer_and_enqueue(
         &state,
         &id,
-        &req.id,
-        req.text,
-        &blobs,
-        req.origin_device,
-        None,
+        QueuedPrompt {
+            prompt_id: &req.id,
+            text: req.text,
+            blobs: &blobs,
+            origin_device: req.origin_device,
+            origin_plugin: None,
+            supersede_pending_turn: false,
+        },
     )
     .await
     {
@@ -128,6 +131,17 @@ fn validate_queued_text(text: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// A prompt for [`buffer_and_enqueue`].
+pub(super) struct QueuedPrompt<'a> {
+    pub prompt_id: &'a str,
+    pub text: String,
+    pub blobs: &'a [crate::acp::event_store::AttachmentBlob],
+    pub origin_device: Option<String>,
+    pub origin_plugin: Option<String>,
+    /// Drops a queued rate-limit continuation in the same durable write (#3028).
+    pub supersede_pending_turn: bool,
+}
+
 /// Buffer already-validated attachment blobs under `prompt_id` and append the
 /// prompt to the session's server-owned queue.
 ///
@@ -137,12 +151,16 @@ fn validate_queued_text(text: &str) -> Result<(), (StatusCode, String)> {
 pub(super) async fn buffer_and_enqueue(
     state: &Arc<AppState>,
     id: &str,
-    prompt_id: &str,
-    text: String,
-    blobs: &[crate::acp::event_store::AttachmentBlob],
-    origin_device: Option<String>,
-    origin_plugin: Option<String>,
+    prompt: QueuedPrompt<'_>,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
+    let QueuedPrompt {
+        prompt_id,
+        text,
+        blobs,
+        origin_device,
+        origin_plugin,
+        supersede_pending_turn,
+    } = prompt;
     validate_queued_text(&text)?;
     let queue = state.session_service.queued_prompts_snapshot(id).await;
     if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|row| row.id == prompt_id)
@@ -202,18 +220,31 @@ pub(super) async fn buffer_and_enqueue(
             .record_pending_attachment(id, prompt_id, blob);
     }
 
-    match state
-        .session_service
-        .enqueue_prompt(
-            id,
-            prompt_id.to_string(),
-            text,
-            refs,
-            origin_device,
-            origin_plugin,
-        )
-        .await
-    {
+    let service = &state.session_service;
+    let entry = if supersede_pending_turn {
+        service
+            .enqueue_prompt_superseding_continuation(
+                id,
+                prompt_id.to_string(),
+                text,
+                refs,
+                origin_device,
+                origin_plugin,
+            )
+            .await
+    } else {
+        service
+            .enqueue_prompt(
+                id,
+                prompt_id.to_string(),
+                text,
+                refs,
+                origin_device,
+                origin_plugin,
+            )
+            .await
+    };
+    match entry {
         Some(entry) => Ok(entry),
         None => {
             // Session vanished between the existence check and the enqueue;

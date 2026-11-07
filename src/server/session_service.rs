@@ -85,6 +85,8 @@ enum IdempotentMatch {
 /// disk. Deliberately explicit: the disk write no longer re-runs the caller's
 /// closure, so a field that is not listed here is simply not persisted.
 struct MirroredFields {
+    /// The mutation cleared `pending_initial_turn`, so the disk row must drop it in the same write.
+    pending_turn_cleared: bool,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -105,6 +107,62 @@ struct MirroredFields {
     /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
     /// as `touch_last_accessed()` would.
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Append `text` to the instance's queue, or update the row already holding `prompt_id`.
+fn enqueue_row(
+    inst: &mut crate::session::Instance,
+    prompt_id: String,
+    text: String,
+    attachments: Vec<crate::daemon::PromptAttachmentRef>,
+    origin_device: Option<String>,
+    origin_plugin: Option<String>,
+) -> crate::daemon::QueuedPromptEntry {
+    inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
+    if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+        // A repost of unchanged content (a client restoring its cache) keeps the
+        // sender; other content is the poster's.
+        if existing.text != text || existing.attachments != attachments {
+            existing.origin_plugin = origin_plugin.clone();
+        }
+        existing.text = text.clone();
+        existing.attachments = attachments.clone();
+        tracing::info!(
+            target: "acp.queue",
+            session = %inst.id,
+            prompt_id = %existing.id,
+            seq = existing.seq,
+            origin_plugin = ?existing.origin_plugin,
+            repost = true,
+            "prompt enqueued"
+        );
+        return existing.clone();
+    }
+    let seq = inst.queued_prompt_next_seq;
+    inst.queued_prompt_next_seq = seq.saturating_add(1);
+    let entry = crate::daemon::QueuedPromptEntry {
+        id: prompt_id.clone(),
+        seq,
+        text: text.clone(),
+        attachments: attachments.clone(),
+        // The server's clock, drawn in the same critical section that
+        // assigns `seq`, so row order and stamp order agree and the
+        // resume admission can order rows against the park (#4092).
+        created_at: chrono::Utc::now().to_rfc3339(),
+        origin_device: origin_device.clone(),
+        origin_plugin: origin_plugin.clone(),
+    };
+    tracing::info!(
+        target: "acp.queue",
+        session = %inst.id,
+        prompt_id = %entry.id,
+        seq,
+        origin_plugin = ?entry.origin_plugin,
+        repost = false,
+        "prompt enqueued"
+    );
+    inst.queued_prompts.push(entry.clone());
+    entry
 }
 
 /// The blocking writer owns completion and ordering even if its caller is cancelled.
@@ -1346,12 +1404,14 @@ impl SessionService {
                 _ordered: ordered,
                 _reload: reload,
             };
+            let had_pending_turn = inst.pending_initial_turn.is_some();
             let r = mutate(inst);
             self.invalidate_disk_snapshots();
             (
                 inst.source_profile.clone(),
                 r,
                 MirroredFields {
+                    pending_turn_cleared: had_pending_turn && inst.pending_initial_turn.is_none(),
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
                     idle_dormant_since: inst.idle_dormant_since,
@@ -1367,6 +1427,9 @@ impl SessionService {
                     let _transaction = transaction;
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            if mirrored.pending_turn_cleared {
+                                inst.pending_initial_turn = None;
+                            }
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
                             inst.idle_dormant_since = mirrored.idle_dormant_since;
@@ -1424,51 +1487,40 @@ impl SessionService {
         origin_plugin: Option<String>,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
-            inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
-            if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
-                // A repost of unchanged content (a client restoring its cache) keeps the
-                // sender; other content is the poster's.
-                if existing.text != text || existing.attachments != attachments {
-                    existing.origin_plugin = origin_plugin.clone();
-                }
-                existing.text = text.clone();
-                existing.attachments = attachments.clone();
-                tracing::info!(
-                    target: "acp.queue",
-                    session = %inst.id,
-                    prompt_id = %existing.id,
-                    seq = existing.seq,
-                    origin_plugin = ?existing.origin_plugin,
-                    repost = true,
-                    "prompt enqueued"
-                );
-                return existing.clone();
-            }
-            let seq = inst.queued_prompt_next_seq;
-            inst.queued_prompt_next_seq = seq.saturating_add(1);
-            let entry = crate::daemon::QueuedPromptEntry {
-                id: prompt_id.clone(),
-                seq,
-                text: text.clone(),
-                attachments: attachments.clone(),
-                // The server's clock, drawn in the same critical section that
-                // assigns `seq`, so row order and stamp order agree and the
-                // resume admission can order rows against the park (#4092).
-                created_at: chrono::Utc::now().to_rfc3339(),
-                origin_device: origin_device.clone(),
-                origin_plugin: origin_plugin.clone(),
-            };
-            tracing::info!(
-                target: "acp.queue",
-                session = %inst.id,
-                prompt_id = %entry.id,
-                seq,
-                origin_plugin = ?entry.origin_plugin,
-                repost = false,
-                "prompt enqueued"
-            );
-            inst.queued_prompts.push(entry.clone());
-            entry
+            enqueue_row(
+                inst,
+                prompt_id,
+                text,
+                attachments,
+                origin_device,
+                origin_plugin,
+            )
+        })
+        .await
+    }
+
+    /// [`Self::enqueue_prompt`] for a fresh prompt that supersedes a queued rate-limit
+    /// continuation (#3028). The row and the continuation's removal land in one durable
+    /// write, so a restart cannot recover both.
+    pub(crate) async fn enqueue_prompt_superseding_continuation(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<crate::daemon::PromptAttachmentRef>,
+        origin_device: Option<String>,
+        origin_plugin: Option<String>,
+    ) -> Option<crate::daemon::QueuedPromptEntry> {
+        self.mutate_instance_persisted(id, move |inst| {
+            inst.pending_initial_turn = None;
+            enqueue_row(
+                inst,
+                prompt_id,
+                text,
+                attachments,
+                origin_device,
+                origin_plugin,
+            )
         })
         .await
     }
@@ -4212,6 +4264,62 @@ mod tests {
         );
         assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
         assert!(status_rx.try_recv().is_err());
+    }
+
+    /// #5253: the row and the continuation's removal reach disk in one write, so a restart
+    /// cannot recover both. A plain enqueue leaves the continuation alone.
+    #[tokio::test]
+    async fn superseding_enqueue_drops_the_continuation_in_the_same_write() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-supersede".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        let on_disk = || {
+            crate::server::test_support::load_instances_from_disk_for_test(&profile)
+                .into_iter()
+                .find(|i| i.id == "sess-supersede")
+                .expect("row on disk")
+        };
+
+        service
+            .enqueue_prompt(
+                "sess-supersede",
+                "a".into(),
+                "plain".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("session exists");
+        assert!(on_disk().pending_initial_turn.is_some());
+
+        service
+            .enqueue_prompt_superseding_continuation(
+                "sess-supersede",
+                "b".into(),
+                "fresh".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("session exists");
+        let row = on_disk();
+        assert!(row.pending_initial_turn.is_none());
+        assert_eq!(row.queued_prompts.len(), 2);
     }
 
     #[tokio::test]

@@ -293,6 +293,14 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
     assert!(state.instances.read().await[0]
         .pending_initial_turn
         .is_none());
+    // One durable write: the row and the continuation's removal are never seen apart.
+    let profile = state.instances.read().await[0].source_profile.clone();
+    let on_disk = crate::server::test_support::load_instances_from_disk_for_test(&profile)
+        .into_iter()
+        .find(|i| i.id == id)
+        .expect("the session row must be on disk");
+    assert_eq!(on_disk.queued_prompts.len(), 1);
+    assert!(on_disk.pending_initial_turn.is_none());
 }
 
 /// A Stop pressed right after Enter must wait out the prompt submission rather

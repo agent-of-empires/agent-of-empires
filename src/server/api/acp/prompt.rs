@@ -286,16 +286,18 @@ pub(crate) async fn submit_prompt(
         return match super::super::queue::buffer_and_enqueue(
             state,
             id,
-            &prompt_id,
-            req.text.to_string(),
-            &attachments,
-            None,
-            origin_plugin.clone(),
+            super::super::queue::QueuedPrompt {
+                prompt_id: &prompt_id,
+                text: req.text.to_string(),
+                blobs: &attachments,
+                origin_device: None,
+                origin_plugin: origin_plugin.clone(),
+                supersede_pending_turn: true,
+            },
         )
         .await
         {
             Ok(entry) => {
-                state.session_service.clear_pending_initial_turn(id).await;
                 tracing::debug!(
                     target: "acp.queue",
                     session = %id,

@@ -938,9 +938,8 @@ async fn deliver_structured(
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
-            service.clear_pending_initial_turn(id).await;
             service
-                .enqueue_prompt(
+                .enqueue_prompt_superseding_continuation(
                     id,
                     uuid::Uuid::new_v4().to_string(),
                     req.message.clone(),
