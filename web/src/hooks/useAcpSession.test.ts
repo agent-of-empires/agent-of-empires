@@ -255,6 +255,11 @@ describe("reconnect (#1130)", () => {
     await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
     await flushAsync();
     expect(sockets).toHaveLength(2);
+    for (const socket of sockets) {
+      const params = new URL(socket.url).searchParams;
+      expect(params.get("projection")).toBe("web");
+      expect(params.has("frames")).toBe(false);
+    }
     expect(calls.some((c) => new URL(c.url, "http://x").searchParams.has("since"))).toBe(true);
     expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
   });
@@ -317,7 +322,96 @@ describe("persisted state hydration", () => {
     render("sess");
     await flushAsync();
     expect(sockets).toHaveLength(1);
-    expect(sockets[0]!.url).toContain(`/acp/ws?since=${since}`);
+    const params = new URL(sockets[0]!.url).searchParams;
+    expect(params.get("since")).toBe(String(since));
+    expect(params.get("projection")).toBe("web");
+    expect(params.has("frames")).toBe(false);
+  });
+});
+
+describe("lightweight control projection", () => {
+  it("keeps full background-agent details from raw lifecycle events without the duplicate snapshot field", async () => {
+    const sid = "sess-web-agents";
+    const { result } = await openSession(sid);
+    expect(new URL(lastSocket().url).searchParams.get("projection")).toBe("web");
+    lastSocket().message({
+      session_id: sid,
+      seq: 10,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "agent-1",
+          tool_call_id: "tool-1",
+          description: "inspect code",
+          prompt: "complete original instructions",
+          model: "test-model",
+          started_at: "2026-01-01T00:00:00Z",
+        },
+      },
+    });
+    const tools = [{ name: "Read", title: "complete/file/path", ok: true }];
+    lastSocket().message({
+      session_id: sid,
+      seq: 11,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "agent-1",
+          status: "running",
+          tool_count: 1,
+          tools,
+          last_tool: "Read",
+          last_text: "latest preview",
+        },
+      },
+    });
+    await flushAsync();
+    expect(result.current.state.backgroundAgents[0]).toMatchObject({
+      prompt: "complete original instructions",
+      tools,
+      lastText: "latest preview",
+      endedAt: null,
+    });
+    lastSocket().message({
+      session_id: sid,
+      seq: 12,
+      event: {
+        BackgroundAgentCompleted: {
+          agent_id: "agent-1",
+          status: "completed",
+          tools,
+          result: "complete final report",
+          ended_at: "2026-01-01T00:00:01Z",
+        },
+      },
+    });
+    lastSocket().message({
+      kind: "reduced_state",
+      seq: 12,
+      state: {
+        agent: "claude",
+        model: "test-model",
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+      },
+    });
+    await flushAsync();
+    expect(result.current.state.backgroundAgents[0]).toMatchObject({
+      prompt: "complete original instructions",
+      tools,
+      status: "completed",
+      result: "complete final report",
+      endedAt: "2026-01-01T00:00:01Z",
+    });
   });
 });
 
