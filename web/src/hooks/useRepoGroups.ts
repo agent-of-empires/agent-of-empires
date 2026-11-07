@@ -42,6 +42,8 @@ export function useRepoGroups(
   projects: readonly ProjectInfo[] = [],
   pluginSort?: PluginSortContext,
   pluginAttention?: ReadonlySet<string>,
+  // From `axisDrawsRepoHeaders`: false lists every registered Project in `savedProjects` (#5065).
+  drawsRepoHeaders = true,
 ): {
   groups: RepoGroup[];
   savedProjects: RepoGroup[];
@@ -195,10 +197,15 @@ export function useRepoGroups(
       return a.repoPath.localeCompare(b.repoPath);
     });
 
-    const savedProjects = unpinnedSavedProjects(repoGroups, [...projects], {
-      alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
-      color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
-    });
+    const savedProjects = unpinnedSavedProjects(
+      repoGroups,
+      [...projects],
+      {
+        alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
+        color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
+      },
+      { drawsRepoHeaders },
+    );
 
     return { groups: merged, savedProjects };
   }, [
@@ -211,6 +218,7 @@ export function useRepoGroups(
     isCollapsed,
     appearanceMap,
     groupOrder,
+    drawsRepoHeaders,
   ]);
 
   const updateRepoAppearance = useCallback((repoId: string, update: RepoAppearanceUpdate) => {

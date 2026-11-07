@@ -4023,8 +4023,13 @@
       "id": "projects-section-unit",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ProjectsSection.test.tsx"],
-      "components": ["web/src/components/ProjectsSection.tsx"]
+      "specs": ["src/components/__tests__/ProjectsSection.test.tsx", "src/lib/__tests__/registeredProjects.test.ts"],
+      "components": [
+        "web/src/components/ProjectsSection.tsx",
+        "web/src/lib/registeredProjects.ts",
+        "web/src/lib/sidebarAxis.ts"
+      ],
+      "notes": "Where the grouping draws repository headers (By repo, By organization, By repo and group) the section is \"Projects, no sessions\" and lists unpinned Projects without a live group; By group draws none, so it is \"Projects\" and lists every registered Project once, pinned or with live sessions included, a pinned row marked ◆ (#5065). Compact is \"Projects\" on every axis. The per-axis rule is axisDrawsRepoHeaders, a Record over SidebarAxis."
     },
     {
       "id": "story.settings-tmux-select",
