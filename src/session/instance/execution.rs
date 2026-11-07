@@ -1981,12 +1981,14 @@ impl Instance {
                     configuration.push(file);
                 }
                 let mut sqlite = value("CODEX_SQLITE_HOME").filter(|value| !value.trim().is_empty()).map(|value| absolute(PathBuf::from(value.trim()))).unwrap_or_else(|| root.clone());
+                // Reported after the routing checks, which it must not pre-empt.
+                let mut external_auth = false;
                 let user_config = root.join("config.toml");
                 for file in [PathBuf::from("/etc/codex/config.toml"), user_config.clone()] {
                     if let Some(bytes) = inputs.read_native_file(&file)? {
                         let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
                         anyhow::ensure!(!settings.contains_key("profile"), unverifiable("managed Codex does not support a selected configuration profile".into()));
-                        anyhow::ensure!(settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file")), unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
+                        external_auth |= !settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file"));
                         anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), unverifiable("managed Codex requires its durable local thread store".into()));
                         if let Some(path) = settings.get("sqlite_home") {
                             let path = PathBuf::from(path.as_str().context("Codex sqlite_home must be a path")?);
@@ -2004,6 +2006,7 @@ impl Instance {
                     }
                     configuration.push(file);
                 }
+                anyhow::ensure!(!external_auth, unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
                 // A host single-shot launch is deliberately left unmanaged: this
                 // only governs managed resume and fork.
                 if inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES {

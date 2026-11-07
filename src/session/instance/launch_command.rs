@@ -3529,18 +3529,35 @@ mod tests {
             .unwrap()
             .is_none());
         std::fs::write(&auth, chatgpt).unwrap();
-        for routing in [
-            "profile = \"work\"\n",
-            "[experimental_thread_store]\ntype = \"remote\"\n",
+        let project_config = project.join(".codex/config.toml");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        let keyring = "cli_auth_credentials_store = \"keyring\"\n";
+        let remote = "[experimental_thread_store]\ntype = \"remote\"\n";
+        for (user, in_project) in [
+            ("profile = \"work\"\n".to_string(), ""),
+            (remote.to_string(), ""),
+            (format!("{keyring}{remote}"), ""),
+            (keyring.to_string(), "profile = \"work\"\n"),
+            (keyring.to_string(), remote),
         ] {
-            std::fs::write(&config, routing).unwrap();
+            std::fs::write(&config, &user).unwrap();
+            std::fs::write(&project_config, in_project).unwrap();
             assert_eq!(
                 refused_cause(instance(local)),
                 ManagedResumeCause::CodexConversationUnverified,
-                "{routing}"
+                "{user}{in_project}"
+            );
+            let error = instance(local)
+                .resolve_native_execution(None)
+                .err()
+                .unwrap();
+            assert!(
+                !format!("{error:#}").contains("keyring"),
+                "routing must be what refuses: {error:#}"
             );
         }
         std::fs::remove_file(&config).unwrap();
+        std::fs::remove_file(&project_config).unwrap();
 
         // A wrapper's lookup is its own, whatever the rollout says.
         let mut wrapper = instance(local);

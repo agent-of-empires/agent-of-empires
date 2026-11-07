@@ -99,6 +99,7 @@ impl ManagedResumeCause {
                 "Managed resume refused: cannot verify this Codex conversation here.\n",
                 "It needs a rollout recording this ID and project, on a host session with no\n",
                 "session.agent_config_dir, Codex profile, or alternate store routing.\n",
+                "A sandboxed session instead needs a local OpenAI API key.\n",
                 "Conversation preserved. Restore that context, then retry.\n",
                 "Or copy agent_session_id from aoe session show <session> --json and\n",
                 "continue inside Codex (AoE drops this association):\n",
