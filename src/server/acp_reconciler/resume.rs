@@ -28,6 +28,8 @@ pub(super) struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     pub(super) source_profile: String,
     pub(super) in_flight_turn: bool,
+    /// In-flight work, or a background finish the agent has not yet answered.
+    pub(super) holds_live_work: bool,
     yolo_mode: bool,
     /// The resolved launch command, honored like tmux does (#1766).
     command: String,
@@ -44,6 +46,7 @@ impl ResumeTarget {
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
             in_flight_turn: false,
+            holds_live_work: false,
             yolo_mode: inst.yolo_mode,
             command: inst.command.clone(),
         }
@@ -80,9 +83,9 @@ fn adopt_decision(
     live: bool,
     build_current: bool,
     runner_current: bool,
-    in_flight_turn: bool,
+    holds_live_work: bool,
 ) -> AdoptDecision {
-    match (live, runner_current, build_current, in_flight_turn) {
+    match (live, runner_current, build_current, holds_live_work) {
         (false, ..) => AdoptDecision::FreshSpawn,
         (true, false, ..) => AdoptDecision::ReplaceIncompatibleRunner,
         (true, true, true, _) => AdoptDecision::Attach,
@@ -163,7 +166,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
             worker_registry::is_record_live(r),
             worker_registry::is_build_current(r),
             worker_registry::is_runner_current(r),
-            in_flight_turn,
+            target.holds_live_work,
         )
     });
     let kind = match decision {
@@ -631,15 +634,15 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         // A failed probe counts as busy so a live turn is never killed.
-        let in_flight = query_store(
+        let busy = query_store(
             &state.acp_event_store,
             &id,
-            "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "draining stale worker live work",
+            |s, id| s.holds_live_work(id),
         )
         .await
         .unwrap_or(true);
-        if in_flight {
+        if busy {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -816,11 +819,11 @@ mod tests {
             ((true, false, false, false), ReplaceIncompatibleRunner),
             ((true, false, false, true), ReplaceIncompatibleRunner),
         ];
-        for ((live, build, runner, in_flight), expected) in cases {
+        for ((live, build, runner, holds_live_work), expected) in cases {
             assert_eq!(
-                adopt_decision(live, build, runner, in_flight),
+                adopt_decision(live, build, runner, holds_live_work),
                 expected,
-                "live={live} build={build} runner={runner} in_flight={in_flight}"
+                "live={live} build={build} runner={runner} holds_live_work={holds_live_work}"
             );
         }
     }

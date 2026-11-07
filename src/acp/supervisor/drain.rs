@@ -274,6 +274,12 @@ impl<S: BroadcastSink> Drain<S> {
                 }
                 _ => {}
             }
+            // A runner stopped on purpose closes its connection with an error that is no failure.
+            if matches!(event, Event::AgentStartupError { .. })
+                && worker_registry::peek_restart_marker(&self.session_id).is_some()
+            {
+                continue;
+            }
             let seq = next_seq(&self.next_seqs, &self.session_id);
             // Tagged so a frame queued by a replaced worker cannot mutate runtime state.
             self.sink
@@ -1302,6 +1308,60 @@ mod tests {
                 "{id}: a registry-gone attached crash is a user stop"
             );
         }
+    }
+
+    /// A runner the reconciler stopped on purpose (restart marker pending)
+    /// closes its connection with an error that is not a startup failure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_deliberate_restart_publishes_no_startup_error() {
+        let (_home, tmp) = isolate_home();
+        let id = "s-deliberate";
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        worker_registry::save(&worker_record(
+            id,
+            std::process::id(),
+            tmp.path().join("attach.sock"),
+        ))
+        .unwrap();
+        worker_registry::mark_restart_pending(id, 1);
+        let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
+            crate::acp::state::AcpSessionId(id.into()),
+        );
+        let lease = sup
+            .test_install_handle(id, client, WorkerKind::Attached, None)
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        for event in [
+            Event::AcpSessionAssigned {
+                acp_session_id: "acp-1".into(),
+            },
+            Event::AgentStartupError {
+                message: "ACP connection failed: agent transport closed".into(),
+            },
+        ] {
+            inbound_tx.send(event).await.unwrap();
+        }
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain task should exit within 2s of inbound close")
+            .unwrap();
+
+        let published_errors: Vec<Event> = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }))
+            .map(|(_, _, ev)| ev.clone())
+            .collect();
+        assert!(
+            published_errors.is_empty(),
+            "a deliberate restart is not a failure: {published_errors:?}"
+        );
     }
 
     /// A worker that goes away with no respawn behind it takes its
