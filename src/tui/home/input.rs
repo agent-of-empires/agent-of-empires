@@ -706,6 +706,22 @@ impl HomeView {
         row >= list_y && row < list_bottom
     }
 
+    fn seed_preview_scroll_from_view(&mut self) {
+        if matches!(self.view_mode, ViewMode::Terminal)
+            && self.live_send.is_none()
+            && self.preview_scroll_offset == 0
+            && !self.preview_explicit_tail
+            && self.preview_selection.is_none()
+        {
+            let view = self.preview_text_view;
+            self.preview_scroll_offset = view
+                .total_lines
+                .saturating_sub(view.pane.height as usize)
+                .saturating_sub(view.first_line)
+                .min(u16::MAX as usize) as u16;
+        }
+    }
+
     /// Begin a drag if `(col, row)` is on the divider or inside the preview pane, in or
     /// out of live mode. True when a drag started, so the caller marks the event handled
     /// and skips the row-click path.
@@ -734,6 +750,10 @@ impl HomeView {
         // empty pane is a no-op rather than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
+            let previous_offset = self.preview_scroll_offset;
+            self.seed_preview_scroll_from_view();
+            self.preview_click_seed = (previous_offset != self.preview_scroll_offset)
+                .then_some(self.preview_scroll_offset);
             let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
                 anchor: cell,
@@ -890,6 +910,7 @@ impl HomeView {
                 self.scroll_preview_offset(-1)
             };
             if scrolled {
+                self.preview_click_seed = None;
                 self.preview_autoscroll_at = Some(now);
                 let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
                 // Pin the extent to the revealed edge line in `from_bottom` terms, which
@@ -969,12 +990,16 @@ impl HomeView {
                 // loop can write them to the clipboard.
                 if let Some(sel) = self.preview_selection {
                     if sel.anchor == sel.extent {
+                        if self.preview_click_seed == Some(self.preview_scroll_offset) {
+                            self.preview_scroll_offset = 0;
+                        }
                         self.preview_selection = None;
                     } else if let Some(s) = self.preview_selection.as_mut() {
                         s.finalized = true;
                         self.preview_copy_pending = true;
                     }
                 }
+                self.preview_click_seed = None;
             }
             // The offset was applied live on each move; the release just
             // ends the gesture. Nothing to persist (scroll is view state).
@@ -3166,10 +3191,16 @@ impl HomeView {
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+                self.preview_click_seed = None;
+                self.seed_preview_scroll_from_view();
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP);
+                self.preview_explicit_tail = false;
             }
             ActionId::PreviewScrollDown => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+                self.preview_click_seed = None;
+                self.seed_preview_scroll_from_view();
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP);
+                self.preview_explicit_tail = self.preview_scroll_offset == 0;
             }
             // `App` handles the chord before the home view sees it.
             ActionId::DismissUpdateBanner => {}
@@ -4832,6 +4863,8 @@ impl HomeView {
 
         let visible_height = active_cache.dimensions.1.saturating_sub(1) as usize;
         let real_max = active_cache.captured_lines.saturating_sub(visible_height) as u16;
+        self.seed_preview_scroll_from_view();
+        self.preview_click_seed = None;
 
         let new_offset = self.preview_scroll_offset.saturating_add(STEP);
         let clamped = new_offset.min(real_max);
@@ -4839,6 +4872,7 @@ impl HomeView {
             return false;
         }
         self.preview_scroll_offset = clamped;
+        self.preview_explicit_tail = false;
         true
     }
 
@@ -6140,10 +6174,18 @@ impl HomeView {
             self.preview_scroll_offset = 0;
             return true;
         }
+        self.seed_preview_scroll_from_view();
+        self.preview_click_seed = None;
         if self.preview_scroll_offset == 0 {
+            if matches!(self.view_mode, ViewMode::Terminal) && self.live_send.is_none() {
+                let changed = !self.preview_explicit_tail;
+                self.preview_explicit_tail = true;
+                return changed;
+            }
             return false;
         }
         self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(STEP);
+        self.preview_explicit_tail = self.preview_scroll_offset == 0;
         true
     }
 
