@@ -1,6 +1,6 @@
 //! Bounded execution owned by Home, independent of a dialog's lifetime.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -11,12 +11,11 @@ use super::{Job, JobResult};
 
 const PENDING: u8 = 0;
 const ADMITTED: u8 = 1;
-const CANCELLED: u8 = 2;
-const OBSERVING: u8 = 3;
+const OBSERVING: u8 = 2;
+const CANCEL_REQUESTED: u8 = 1 << 2;
 
 pub(super) struct Control {
     admission: AtomicU8,
-    cancel_requested: AtomicBool,
     pub(super) cancel: CancellationToken,
 }
 
@@ -24,12 +23,10 @@ impl Control {
     fn new() -> Self {
         Self {
             admission: AtomicU8::new(PENDING),
-            cancel_requested: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         }
     }
 
-    /// Serialize cancellation with the final authorization before mutation effects.
     pub(super) fn admit(&self) -> bool {
         self.admission
             .compare_exchange(PENDING, ADMITTED, Ordering::AcqRel, Ordering::Acquire)
@@ -37,22 +34,16 @@ impl Control {
     }
 
     fn cancel(&self) {
-        self.cancel_requested.store(true, Ordering::Release);
-        match self.admission.compare_exchange(
-            PENDING,
-            CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) | Err(OBSERVING) => self.cancel.cancel(),
-            _ => {}
+        let previous = self.admission.fetch_or(CANCEL_REQUESTED, Ordering::AcqRel);
+        if previous & !CANCEL_REQUESTED != ADMITTED {
+            self.cancel.cancel();
         }
     }
 
     pub(super) fn finish_mutation(&self) {
-        self.admission.store(OBSERVING, Ordering::Release);
-        if self.cancel_requested.load(Ordering::Acquire) {
-            self.cancel();
+        // Consume deferred cancellation when mutation ownership ends.
+        if self.admission.swap(OBSERVING, Ordering::AcqRel) & CANCEL_REQUESTED != 0 {
+            self.cancel.cancel();
         }
     }
 }
@@ -248,5 +239,37 @@ impl ServeJobs {
 impl Drop for ServeJobs {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_is_deferred_only_while_mutation_is_admitted() {
+        for admitted in [false, true] {
+            for observing in [false, true] {
+                let control = Control::new();
+                if admitted {
+                    assert!(control.admit());
+                    assert!(!control.admit(), "admission cannot be repeated");
+                }
+                if observing {
+                    control.finish_mutation();
+                    assert!(!control.cancel.is_cancelled());
+                }
+                control.cancel();
+                control.cancel();
+                assert_eq!(
+                    control.cancel.is_cancelled(),
+                    !admitted || observing,
+                    "admitted={admitted}, observing={observing}"
+                );
+                assert!(!control.admit(), "cancellation cannot reopen admission");
+                control.finish_mutation();
+                assert!(control.cancel.is_cancelled());
+            }
+        }
     }
 }
