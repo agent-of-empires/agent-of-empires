@@ -1022,12 +1022,37 @@ fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_vi
             d.handle_key(key(KeyCode::Enter));
             assert!(!d.dir_picker.is_active());
         }),
+        ("clicked away", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            let worktree = d.field_indices().worktree;
+            d.focusable_rects
+                .push((worktree, ratatui::layout::Rect::new(0, 9, 30, 1)));
+            d.handle_click(10, 9);
+            assert!(d.worktree_enabled, "the click must toggle the row it hit");
+        }),
         ("sandbox env edited", |d, path| {
             d.extra_env_overridden = true;
             d.set_path(path);
         }),
+        ("back-tabbed", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            d.handle_key(key(KeyCode::BackTab));
+            assert_eq!(
+                d.focused_field,
+                d.field_indices().group,
+                "BackTab wraps to Group"
+            );
+        }),
         ("scratch", |d, _| {
+            d.focused_field = d.field_indices().worktree;
             d.handle_key(ctrl_key(KeyCode::Char('t')));
+            assert_eq!(
+                d.focused_field,
+                d.field_indices().worktree,
+                "focus stays on Worktree"
+            );
         }),
     ];
     let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
@@ -1057,6 +1082,20 @@ fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_vi
             );
         }
     }
+
+    // A clicked row the move hides activates nothing in its place.
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["wrap"], TEST_PATH.to_string());
+    dialog.set_path(claude.path().to_string_lossy().to_string());
+    dialog.focused_field = dialog.path_field();
+    dialog.path = Input::new(pi.path().to_string_lossy().to_string());
+    let (yolo, worktree) = (dialog.field_indices().yolo, dialog.worktree_enabled);
+    dialog
+        .focusable_rects
+        .push((yolo, ratatui::layout::Rect::new(0, 9, 30, 1)));
+    dialog.handle_click(10, 9);
+    assert!(locked(&dialog));
+    assert_eq!(dialog.focused_field, dialog.path_field());
+    assert_eq!(dialog.worktree_enabled, worktree);
 }
 
 #[test]

@@ -469,6 +469,25 @@ pub(super) struct FieldIndices {
 impl FieldIndices {
     /// Stands in for a field the current layout hides.
     pub const ABSENT: usize = usize::MAX;
+
+    /// Where the row at `index` in the `before` layout sits now, or `None` if it is hidden.
+    fn follow(&self, before: &FieldIndices, index: usize) -> Option<usize> {
+        [
+            (before.profile, self.profile),
+            (before.path, self.path),
+            (before.title, self.title),
+            (before.tool, self.tool),
+            (before.structured, self.structured),
+            (before.yolo, self.yolo),
+            (before.worktree, self.worktree),
+            (before.sandbox, self.sandbox),
+            (before.group, self.group),
+        ]
+        .into_iter()
+        .find(|(old, _)| *old == index)
+        .map(|(_, new)| new)
+        .filter(|new| *new != Self::ABSENT)
+    }
 }
 
 impl NewSessionDialog {
@@ -949,6 +968,7 @@ impl NewSessionDialog {
             return;
         }
         let was_locked = self.selected_tool_always_yolo();
+        let before = self.field_indices();
         self.agent_detect_as = config.session.agent_detect_as.clone();
         self.structured_capable = !self.terminal_fork()
             && compute_structured_capable(&self.available_tools[self.tool_index], config);
@@ -956,6 +976,11 @@ impl NewSessionDialog {
         if self.selected_tool_always_yolo() != was_locked {
             self.reset_yolo();
         }
+        // Rows above focus can appear or vanish, so keep focus on its row, or its slot if hidden.
+        let after = self.field_indices();
+        self.focused_field = after
+            .follow(&before, self.focused_field)
+            .unwrap_or(self.focused_field.min(after.count - 1));
     }
 
     fn refresh_inherited_sandbox_settings(&mut self) {
@@ -1346,9 +1371,15 @@ impl NewSessionDialog {
             return Some(self.handle_confirm_create_dir_key(KeyEvent::from(KeyCode::Char(key))));
         }
 
-        let hit_field = super::hit(&self.focusable_rects, col, row)?;
+        let mut hit_field = super::hit(&self.focusable_rects, col, row)?;
         if self.focused_field == self.path_field() && hit_field != self.focused_field {
+            let before = self.field_indices();
             self.seed_defaults_for_path();
+            // The refresh can show or hide rows, so act on the clicked row, not its old index.
+            let Some(moved) = self.field_indices().follow(&before, hit_field) else {
+                return Some(DialogResult::Continue);
+            };
+            hit_field = moved;
         }
         self.focused_field = hit_field;
         self.activate_focused_field();
@@ -1628,6 +1659,8 @@ impl NewSessionDialog {
                     self.clear_path_ghost();
                     self.seed_defaults_for_path();
                 }
+                // The path refresh can show or hide rows, so wrap over the current layout.
+                let fields = self.field_indices();
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
                 }
