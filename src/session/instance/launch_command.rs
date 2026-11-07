@@ -867,6 +867,14 @@ impl Instance {
         stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
+        // Without the plugin the tool has no agent entry, and the command
+        // fallback would quietly start a shell instead of OMP.
+        anyhow::ensure!(
+            !(self.command.is_empty()
+                && self.tool == "omp"
+                && crate::agents::get_agent("omp").is_none()),
+            "OMP now runs through the plugin-omp plugin; install and approve it before launching this session"
+        );
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
                 crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(
@@ -2784,12 +2792,19 @@ mod tests {
     fn managed_resume_refuses_unattestable_execution_without_changing_identity() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _omp = crate::session::install_omp_test_plugin();
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("HOME", root.path().to_path_buf()),
-            ("CODEX_HOME", codex_home),
-        ]);
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "PI_CODING_AGENT_DIR",
+            "OMP_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "XDG_STATE_HOME",
+            "OMP_PROFILE",
+            "PI_PROFILE",
+        ])
+        .and_set("HOME", root.path())
+        .and_set("CODEX_HOME", codex_home);
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";

@@ -4,7 +4,6 @@
 
 mod adapter;
 mod manifest;
-mod omp;
 mod region;
 
 use std::collections::HashMap;
@@ -12,7 +11,7 @@ use std::sync::LazyLock;
 
 use crate::session::Status;
 use adapter::Adapter;
-pub use adapter::{CapturePolicy, CaptureScope};
+pub use adapter::CapturePolicy;
 pub use manifest::HookObservation;
 use manifest::Manifest;
 use region::Rows;
@@ -66,7 +65,6 @@ const MANIFEST_SOURCES: &[(&str, &str, &Adapter)] = &[
         include_str!("manifests/codex.toml"),
         &adapter::PLAIN,
     ),
-    ("omp", include_str!("manifests/omp.toml"), &omp::ADAPTER),
 ];
 
 /// What one capture says about a session.
@@ -96,16 +94,11 @@ impl Detection<'_> {
 pub struct Observation<'a> {
     title: &'a str,
     hook: Option<HookObservation>,
-    live_owned: bool,
 }
 
 impl<'a> Observation<'a> {
-    pub fn new(title: &'a str, hook: Option<HookObservation>, live_owned: bool) -> Self {
-        Self {
-            title,
-            hook,
-            live_owned,
-        }
+    pub fn new(title: &'a str, hook: Option<HookObservation>) -> Self {
+        Self { title, hook }
     }
 }
 
@@ -205,7 +198,7 @@ pub(crate) fn rule_matches(
     hook: Option<HookObservation>,
 ) -> bool {
     let detector = detector(agent).expect("agent has a manifest");
-    let observation = Observation::new(osc_title, hook, true);
+    let observation = Observation::new(osc_title, hook);
     (detector.adapter.rule_matches)(&detector.manifest, rule_id, Rows::new(screen), &observation)
 }
 
@@ -221,6 +214,7 @@ pub(crate) fn rule_max_age(agent: &str, rule_id: &str) -> Option<std::time::Dura
 
 #[cfg(test)]
 mod tests {
+    use super::adapter::CaptureScope;
     use super::*;
 
     #[test]
@@ -238,7 +232,6 @@ mod tests {
             capture: CapturePolicy {
                 scope: CaptureScope::Visible,
                 fetch_missing_title: false,
-                observe_ownership: false,
             },
             evidence_names: &["primary", "secondary"],
             observation_token: |_| None,
@@ -326,7 +319,7 @@ contains = ["viewer"]
             ("first error\nother error", Some(Status::Error), None),
             ("first error\nviewer", None, None),
         ] {
-            let detection = DETECTOR.detect(pane, &Observation::new("", None, true));
+            let detection = DETECTOR.detect(pane, &Observation::new("", None));
             assert_eq!(detection.status, status, "{pane}");
             assert_eq!(detection.diagnostic, diagnostic, "{pane}");
         }

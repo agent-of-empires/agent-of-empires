@@ -5459,48 +5459,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn omp_cached_poll_only_fetches_unobserved_titles() {
-        let mut instance = crate::session::Instance::new("empty-title-cache", "/tmp");
-        instance.tool = "omp".to_owned();
-        instance.source_profile = format!("empty-title-{}", instance.id);
-        instance.status = crate::session::Status::Idle;
-        let name = Session::generate_name(&instance.id, &instance.title);
-        let cache = SessionCacheGuard::capture();
-
-        for (tail, expected_title, expected_forks) in [
-            (format!("{TAIL_SEP}1{TAIL_SEP}{TAIL_SEP}"), Some(""), 0),
-            (format!("{TAIL_SEP}1{TAIL_SEP}"), None, 1),
-        ] {
-            let metadata =
-                parse_pane_metadata(&format!("{name}|$42|%42||0|0|100|40|omp|omp|42{tail}\n"))
-                    .remove(&name)
-                    .unwrap();
-            assert_eq!(metadata.pane_title.as_deref(), expected_title);
-            instance.detection = crate::session::DetectionState {
-                activity: Some(1),
-                captured_at: Some(2),
-                observation_key: DetectionPlan::for_manifest(
-                    &instance.source_profile,
-                    "omp",
-                    "omp",
-                )
-                .unwrap()
-                .observation_key(&Observation::new("", None, true)),
-                ..Default::default()
-            };
-            cache.force_present(&[&name]);
-            let _ = fork_probe::take();
-            let probe = fork_probe::arm();
-            instance.update_status_once(Some(&metadata), Some(&name));
-            let forks = fork_probe::take();
-            drop(probe);
-            assert_eq!(instance.status, crate::session::Status::Idle);
-            assert_eq!(forks, expected_forks, "metadata tail: {tail:?}");
-        }
-    }
-
-    #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
             "{P}protected_abc12345|$42|%42||0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'|4242\n\

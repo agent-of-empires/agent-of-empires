@@ -36,13 +36,13 @@ capabilities = ["runtime.worker"]
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; launch, detection, and reply fallback declarations require `api_version >= 20`. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
 Provider-native integrations connect a plugin to status and prompt replies for a terminal agent, separately from ACP and worker RPCs. The host owns session creation, approvals, and lifecycle. The user chooses each response; declaring an integration does not approve tools automatically.
 
-An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when its name is unique across plugin declarations and does not match a configured custom agent. Built-in names and aliases retain precedence under AoE's case-insensitive substring resolver, so a plugin tool containing any such token is omitted from the catalog and a warning names the plugin ID and tool.
+An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when its name is unique across plugin declarations and does not match a configured custom agent. `aoe add -c` also resolves the declared command to its tool name. Built-in names and aliases retain precedence under AoE's case-insensitive substring resolver, so a plugin tool containing any such token is omitted from the catalog and a warning names the plugin ID and tool.
 
 Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
 
@@ -65,10 +65,55 @@ replies = true
 | `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
-Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
+### Launch, detection, and capture declarations (API v20)
+
+An integration can also declare the launch behavior the host previously kept in its built-in agent registry. Built-in agents keep precedence, so a declaration for a built-in name takes effect only after the core entry is removed.
+
+```toml
+[agent_integrations]
+replies = false
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+model_flag = "--model"
+host_only = false
+
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+
+[agent_integrations.detection]
+mode = "native_only"
+
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+```
+
+- `launch.oneshot_flag` and `model_flag` are single argv tokens. `instruction_flag` is a shell template containing exactly one `{}`, replaced with the shell-escaped instruction and appended to the launch command, so it can expand to several argv tokens. `launch.aliases` are lowercase agent ids that must not repeat the tool.
+- `launch.yolo` is `kind = "flag"` with one argv token, `kind = "always"`, or `kind = "env"` with a settable `key` and `value`.
+- `launch.container_env` holds literal `NAME=value` entries merged into sandbox launches only. `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, `PWD`, `AOE_*`, `LD_*`, and `DYLD_*` are rejected.
+- `launch.resume` is `kind = "flag"`, `kind = "flag_pair"`, or `kind = "subcommand"`. `launch.capture` names a core backend and the host/sandbox contexts `pane_scoped`, `preassigned`, `managed_exclusive_store`, or `unsupported`. Capture requires resume.
+- `detection.mode = "native_only"` requires `session.integration`. Pane detection rules remain in core; an approved integration owns status and a missing or invalid report is unknown rather than a pane fallback.
+- `reply_fallback` holds literal or named keys (`Enter`, `Tab`, `Escape`, `Space`, `Backspace`, arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `F1` through `F12`). It is only for integrations with `replies = false`; a reply-enabled integration never falls back to these keys.
+
+Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI/web prompts show each tool, its exact command, and every launch, environment, detection, capture, and reply fallback declaration it adds. Updates require approval when any agent declaration changes, including its command, launch flags, sandbox environment, detection, capture, resume, or reply fallback; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
-For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
+For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for an approved integration never fall back to terminal approval keystrokes or pane status parsing; the session reports unknown status until a valid report returns.
 
 ### Report and reply files
 

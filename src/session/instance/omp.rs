@@ -501,7 +501,9 @@ mod tests {
     use crate::session::instance::test_helpers::*;
 
     #[test]
+    #[serial_test::serial]
     fn omp_capture_accepts_benign_args_and_rejects_opaque_launches() {
+        let _omp = install_omp_test_plugin();
         let mut inst = tool_instance("omp", "/tmp/test");
         inst.extra_args =
             "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
@@ -548,7 +550,7 @@ mod tests {
     #[serial_test::serial]
     fn omp_alias_without_capture_plan_tombstones_generation() {
         const PROFILE: &str = "omp-alias-generation-test";
-        let _home = crate::session::test_support::isolate_app_dir();
+        let _omp = install_omp_test_plugin();
         let storage = crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
         let mut inst = Instance::new("alias", "/tmp/test");
         inst.source_profile = PROFILE.to_string();

@@ -691,6 +691,316 @@ pub enum ManifestError {
     Invalid(Vec<String>),
 }
 
+const AGENT_KEY_NAMES: &[&str] = &[
+    "Enter",
+    "Tab",
+    "Escape",
+    "Space",
+    "Backspace",
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+];
+
+fn agent_id_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
+/// One argv token the host appends verbatim to a shell launch command.
+fn flag_token_ok(value: &str) -> bool {
+    value.starts_with('-')
+        && value.len() <= 128
+        && !value.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(
+                    c,
+                    '{' | '}'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '$'
+                        | '`'
+                        | '\\'
+                        | '"'
+                        | '\''
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '!'
+                        | '~'
+                )
+        })
+}
+
+fn instruction_flag_ok(value: &str) -> bool {
+    if !value.starts_with('-') || value.len() > 256 || value.matches("{}").count() != 1 {
+        return false;
+    }
+    let rest = value.replacen("{}", "", 1);
+    !rest.contains('{') && !rest.contains('}') && !rest.chars().any(char::is_control)
+}
+
+fn env_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn reserved_container_env(name: &str) -> bool {
+    matches!(name, "HOME" | "PATH" | "SHELL" | "USER" | "LOGNAME" | "PWD")
+        || name.starts_with("AOE_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+}
+
+/// Controls and Unicode format characters would let a manifest rewrite the
+/// consent prompt that prints declared values.
+fn declaration_character_ok(c: char) -> bool {
+    !c.is_control()
+        && unicode_general_category::get_general_category(c)
+            != unicode_general_category::GeneralCategory::Format
+}
+
+fn env_value_ok(value: &str) -> bool {
+    value.len() <= 4096 && value.chars().all(declaration_character_ok)
+}
+
+fn subcommand_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
+fn agent_key_ok(key: &crate::agent_integration::AgentKeyDeclaration) -> bool {
+    use crate::agent_integration::AgentKeyDeclaration;
+    match key {
+        AgentKeyDeclaration::Literal { value } => {
+            !value.is_empty() && value.len() <= 32 && !value.chars().any(char::is_control)
+        }
+        AgentKeyDeclaration::Named { value } => {
+            AGENT_KEY_NAMES.contains(&value.as_str())
+                || matches!(
+                    value.as_str(),
+                    "F1" | "F2"
+                        | "F3"
+                        | "F4"
+                        | "F5"
+                        | "F6"
+                        | "F7"
+                        | "F8"
+                        | "F9"
+                        | "F10"
+                        | "F11"
+                        | "F12"
+                )
+        }
+    }
+}
+
+fn validate_agent_declarations(
+    i: usize,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    status_integration: bool,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{AgentResumeDeclaration, AgentYoloDeclaration};
+
+    let declares_new = integration.launch.is_some()
+        || integration.detection.is_some()
+        || integration.reply_fallback.is_some();
+    if !declares_new {
+        return;
+    }
+    check(
+        integration
+            .command
+            .as_ref()
+            .is_some_and(|command| !command.trim().is_empty()),
+        format!(
+            "agent_integrations[{i}]: launch, detection, and reply fallback declarations require a non-blank command"
+        ),
+    );
+
+    if let Some(launch) = &integration.launch {
+        for (j, alias) in launch.aliases.iter().enumerate() {
+            check(
+                agent_id_ok(alias),
+                format!("agent_integrations[{i}].launch.aliases[{j}] must be a lowercase agent id"),
+            );
+            check(
+                alias != &integration.tool,
+                format!("agent_integrations[{i}].launch.aliases[{j}] must not repeat the tool"),
+            );
+            check(
+                !launch.aliases[..j].contains(alias),
+                format!("agent_integrations[{i}].launch.aliases[{j}] is duplicated"),
+            );
+        }
+        if let Some(flag) = &launch.oneshot_flag {
+            check(
+                flag_token_ok(flag),
+                format!(
+                    "agent_integrations[{i}].launch.oneshot_flag must be one argv token starting with `-` and free of shell syntax and braces"
+                ),
+            );
+        }
+        if let Some(flag) = &launch.instruction_flag {
+            check(
+                instruction_flag_ok(flag),
+                format!(
+                    "agent_integrations[{i}].launch.instruction_flag must be one argv token starting with `-` and containing exactly one `{{}}` placeholder"
+                ),
+            );
+        }
+        if let Some(flag) = &launch.model_flag {
+            check(
+                flag_token_ok(flag),
+                format!(
+                    "agent_integrations[{i}].launch.model_flag must be one argv token starting with `-` and free of shell syntax and braces"
+                ),
+            );
+        }
+        if let Some(yolo) = &launch.yolo {
+            match yolo {
+                AgentYoloDeclaration::Flag { flag } => check(
+                    flag_token_ok(flag),
+                    format!(
+                        "agent_integrations[{i}].launch.yolo.flag must be one argv token starting with `-` and free of shell syntax and braces"
+                    ),
+                ),
+                AgentYoloDeclaration::Env { key, value } => {
+                    check(
+                        env_name_ok(key) && !reserved_container_env(key),
+                        format!(
+                            "agent_integrations[{i}].launch.yolo.key must be a settable, non-reserved environment name"
+                        ),
+                    );
+                    check(
+                        env_value_ok(value),
+                        format!("agent_integrations[{i}].launch.yolo.value must be one line"),
+                    );
+                }
+                AgentYoloDeclaration::Always => {}
+            }
+        }
+        for (key, value) in &launch.container_env {
+            check(
+                env_name_ok(key) && !reserved_container_env(key),
+                format!(
+                    "agent_integrations[{i}].launch.container_env key {key:?} must be a settable, non-reserved environment name"
+                ),
+            );
+            check(
+                env_value_ok(value),
+                format!(
+                    "agent_integrations[{i}].launch.container_env[{key:?}] must be a single line without control or format characters"
+                ),
+            );
+        }
+        if let Some(hint) = &launch.install_hint {
+            check(
+                !hint.trim().is_empty()
+                    && hint.len() <= 512
+                    && !hint.chars().any(char::is_control),
+                format!("agent_integrations[{i}].launch.install_hint must be nonempty, bounded, and single-line"),
+            );
+        }
+        if let Some(resume) = &launch.resume {
+            match resume {
+                AgentResumeDeclaration::Flag { flag } => check(
+                    flag_token_ok(flag),
+                    format!(
+                        "agent_integrations[{i}].launch.resume.flag must be one argv token starting with `-` and free of shell syntax and braces"
+                    ),
+                ),
+                AgentResumeDeclaration::FlagPair {
+                    existing,
+                    new_session,
+                } => {
+                    check(
+                        flag_token_ok(existing) && flag_token_ok(new_session),
+                        format!(
+                            "agent_integrations[{i}].launch.resume existing/new_session flags must be argv tokens starting with `-`"
+                        ),
+                    );
+                }
+                AgentResumeDeclaration::Subcommand { command } => check(
+                    subcommand_ok(command),
+                    format!(
+                        "agent_integrations[{i}].launch.resume.command must be a lowercase subcommand without a leading `-`"
+                    ),
+                ),
+            }
+        }
+        check(
+            launch.capture.is_none() || launch.resume.is_some(),
+            format!("agent_integrations[{i}].launch.capture requires launch.resume"),
+        );
+    }
+
+    if integration.detection.is_some() {
+        check(
+            status_integration,
+            format!(
+                "agent_integrations[{i}].detection requires the session.integration capability"
+            ),
+        );
+    }
+
+    if let Some(replies) = &integration.reply_fallback {
+        check(
+            !integration.replies,
+            format!(
+                "agent_integrations[{i}].reply_fallback is only for launch metadata; reply-enabled integrations own replies"
+            ),
+        );
+        check(
+            !replies.allow.is_empty() && !replies.deny.is_empty(),
+            format!("agent_integrations[{i}].reply_fallback allow and deny must not be empty"),
+        );
+        check(
+            replies.allow_always.as_ref().is_none_or(|keys| !keys.is_empty()),
+            format!(
+                "agent_integrations[{i}].reply_fallback.allow_always must not be empty when declared"
+            ),
+        );
+        for (field, keys) in [
+            ("allow", Some(&replies.allow)),
+            ("allow_always", replies.allow_always.as_ref()),
+            ("deny", Some(&replies.deny)),
+        ] {
+            if let Some(keys) = keys {
+                for (j, key) in keys.iter().enumerate() {
+                    check(
+                        agent_key_ok(key),
+                        format!(
+                            "agent_integrations[{i}].reply_fallback.{field}[{j}] must be a literal key or a named key Enter/Tab/Escape/Space/Backspace/Up/Down/Left/Right/Home/End/PageUp/PageDown/F1-F12"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl PluginManifest {
     /// Parse and validate an `aoe-plugin.toml` document.
     pub fn from_toml_str(input: &str) -> Result<Self, ManifestError> {
@@ -1046,6 +1356,7 @@ impl PluginManifest {
                     integration.tool
                 ),
             );
+            validate_agent_declarations(i, integration, status_integration, &mut check);
         }
         if self
             .agent_integrations
@@ -1211,6 +1522,15 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| !u.deep_link),
                 "deep_link requires api_version >= 20".into(),
+            );
+            check(
+                self.agent_integrations.iter().all(|integration| {
+                    integration.launch.is_none()
+                        && integration.detection.is_none()
+                        && integration.reply_fallback.is_none()
+                }),
+                "agent launch, detection, and reply fallback declarations require api_version >= 20"
+                    .into(),
             );
         }
         for key in self.setting_defaults.keys() {

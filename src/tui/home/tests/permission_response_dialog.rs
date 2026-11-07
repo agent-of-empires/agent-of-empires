@@ -31,9 +31,9 @@ fn pending(nonce: &str) -> Vec<PendingApproval> {
     }]
 }
 
-/// 'a' opens the permission dialog for any mapped agent, with no Waiting gate and even
-/// without allow-always (omp); an unmapped agent gets an info dialog and nothing is sent,
-/// and no selection is a no-op.
+/// 'a' opens the permission dialog for an agent with a verified keymap; an agent
+/// without one, including OMP whose replies are plugin-owned, gets an info dialog
+/// and nothing is sent, and no selection is a no-op.
 #[test]
 #[serial]
 fn a_opens_permission_dialog_only_for_supported_agents() {
@@ -41,7 +41,7 @@ fn a_opens_permission_dialog_only_for_supported_agents() {
         (None, false, false),
         (Some("some-unmapped-tool"), false, true),
         (Some("claude"), true, false),
-        (Some("omp"), true, false),
+        (Some("omp"), false, true),
     ];
     for (tool, dialog, info) in cases {
         let mut env = create_test_env_empty();

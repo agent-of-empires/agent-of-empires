@@ -5260,7 +5260,9 @@
       "description": "Plugin cards show validation, including a warning-styled dev badge.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
-        "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"
+        "src/components/settings/__tests__/PluginIdentityIcon.test.tsx",
+        "src/components/settings/__tests__/agentIntegrationDetails.test.ts",
+        "src/components/settings/__tests__/PluginConsentModals.test.tsx"
       ],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",
@@ -5271,7 +5273,8 @@
         "web/src/components/settings/PluginIdentityIcon.tsx",
         "web/src/components/settings/PluginCard.tsx",
         "web/src/components/settings/PluginMarketplace.tsx",
-        "web/src/components/settings/PluginModal.tsx"
+        "web/src/components/settings/PluginModal.tsx",
+        "web/src/components/settings/agentIntegrationDetails.ts"
       ]
     },
     {
