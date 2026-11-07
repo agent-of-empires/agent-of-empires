@@ -54,7 +54,7 @@ pub(crate) fn hook_command(status: &str, target: HookInstallTarget) -> String {
 
 /// The status writer for one event. `waiting_tools` adds the tool gate when it can change the
 /// outcome (it only ever rewrites to `waiting`). `bound` drops events from another conversation,
-/// see [`SESSION_BINDING_GUARD`].
+/// see [`session_binding_guard`].
 pub(crate) fn status_command_for_event(
     status: HookStatus,
     waiting_tools: &[String],
@@ -81,9 +81,22 @@ pub(crate) fn status_command_for_event(
 /// sidecar is trustworthy because `aoe __extract-session-id` refuses daemon workers. A missing or
 /// malformed sidecar keeps the write, and so does a payload that is not compact JSON, which Claude
 /// emits.
-const SESSION_BINDING_GUARD: &str = "read SID < \"$D/session_id\" 2>/dev/null; \
-     case \"$SID\" in \"\"|*[!0-9a-zA-Z._-]*) ;; \
-     *) case \"$IN\" in *\\\"session_id\\\":\\\"$SID\\\"*) ;; *) exit 0 ;; esac ;; esac; ";
+fn session_binding_guard(target: HookInstallTarget) -> String {
+    // Host launches publish `session_id.<AOE_SESSION_SOURCE>`; the sandbox writer has no source.
+    let leaf = match target {
+        HookInstallTarget::Host => {
+            "L=session_id; [ -z \"${AOE_SESSION_SOURCE:-}\" ] || L=\"session_id.$AOE_SESSION_SOURCE\"; "
+        }
+        HookInstallTarget::Sandbox => "L=session_id; ",
+    };
+    // The sidecar must pass the writer's own checks, else it is ignored like a missing one.
+    format!(
+        "SID=; {leaf}\
+         case \"$L\" in *[!0-9a-z._-]*) ;; *) {{ read SID < \"$D/$L\"; }} 2>/dev/null ;; esac; \
+         case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) ;; \
+         *) [ \"${{#SID}}\" -gt 256 ] || case \"$IN\" in *\\\"session_id\\\":\\\"$SID\\\"*) ;; *) exit 0 ;; esac ;; esac; "
+    )
+}
 
 /// Matches the compact `"tool_name":"X"` bytes, which an escaped mention inside a JSON string
 /// value cannot produce.
@@ -99,7 +112,11 @@ fn status_command_with_base(
     } else {
         ""
     };
-    let guard = if bound { SESSION_BINDING_GUARD } else { "" };
+    let guard = if bound {
+        session_binding_guard(target)
+    } else {
+        String::new()
+    };
     let write = if waiting_tools.is_empty() {
         format!("printf {status} > \"$D/status\" 2>/dev/null; ")
     } else {
@@ -710,8 +727,9 @@ mod tests {
             )
         };
         let tools = ["AskUserQuestion".to_string()];
+        let overlong = "a".repeat(257);
         // (sidecar, payload, waiting tools, expected status after a prior "idle")
-        let cases: [(Option<&str>, String, &[String], &str); 8] = [
+        let cases: [(Option<&str>, String, &[String], &str); 10] = [
             (Some(own), event(own, "Bash"), &[], "running"),
             (Some(own), event(foreign, "Bash"), &[], "idle"),
             (Some(own), event(foreign, "AskUserQuestion"), &tools, "idle"),
@@ -719,6 +737,8 @@ mod tests {
             (Some(own), event(own, "Bash"), &tools, "running"),
             (None, event(foreign, "Bash"), &[], "running"),
             (Some("bad id!"), event(foreign, "Bash"), &[], "running"),
+            (Some("-bad"), event(foreign, "Bash"), &[], "running"),
+            (Some(&overlong), event(foreign, "Bash"), &[], "running"),
             // An escaped mention of the pane's id inside a string value is not the event's id.
             (
                 Some(own),
@@ -750,6 +770,53 @@ mod tests {
                     "{sidecar:?} {payload}"
                 );
             }
+        }
+    }
+
+    /// A host launch publishes `session_id.<AOE_SESSION_SOURCE>`, so the guard must read that leaf.
+    #[test]
+    fn bound_host_status_command_reads_the_source_qualified_sidecar() {
+        let source = "6f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f";
+        let own = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let foreign = "11111111-2222-3333-4444-555555555555";
+        // (source env, sidecar leaf, event id, expected status after a prior "idle")
+        let cases = [
+            (
+                Some(source),
+                format!("session_id.{source}"),
+                foreign,
+                "idle",
+            ),
+            (Some(source), format!("session_id.{source}"), own, "running"),
+            // The unqualified file belongs to no launch of this pane.
+            (Some(source), "session_id".to_string(), foreign, "running"),
+            (None, "session_id".to_string(), foreign, "idle"),
+            (Some("../x"), "session_id".to_string(), foreign, "running"),
+        ];
+        for (env, leaf, id, want) in cases {
+            let tmp = TempDir::new().unwrap();
+            let base = tight_dir(&tmp.path().join("aoe-hooks"));
+            let inst = tight_dir(&base.join("bound"));
+            std::fs::write(inst.join("status"), "idle").unwrap();
+            std::fs::write(inst.join(&leaf), own).unwrap();
+            let cmd = status_command_with_base(
+                "running",
+                &[],
+                true,
+                base.to_str().unwrap(),
+                HookInstallTarget::Host,
+            );
+            let payload = format!(r#"{{"session_id":"{id}"}}"#);
+            run_hook("sh", &cmd, "bound", &payload, |c| {
+                if let Some(env) = env {
+                    c.env(crate::hooks::SESSION_SOURCE_ENV, env);
+                }
+            });
+            assert_eq!(
+                std::fs::read_to_string(inst.join("status")).unwrap(),
+                want,
+                "{env:?} {leaf} {id}"
+            );
         }
     }
 
