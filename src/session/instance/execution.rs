@@ -1636,7 +1636,31 @@ pub(super) struct UnattestedCodexPolicy {
     reason: String,
     /// What an unpinned host launch runs, when a local rollout can prove its store.
     store: Option<UnpinnedCodexLaunch>,
-    cwd: PathBuf,
+}
+
+/// Codex store routing: clear the remote routing keys, then pin the home and
+/// SQLite home.
+fn codex_store_routing(
+    home: &std::path::Path,
+    sqlite: &std::path::Path,
+) -> Result<Vec<(String, Option<String>)>> {
+    let mut routing: Vec<_> = CODEX_ROUTING_ENV_KEYS
+        .map(|key| (key.to_owned(), None))
+        .into();
+    routing.push((
+        "CODEX_HOME".into(),
+        Some(home.to_str().context("Codex home is not UTF-8")?.into()),
+    ));
+    routing.push((
+        "CODEX_SQLITE_HOME".into(),
+        Some(
+            sqlite
+                .to_str()
+                .context("Codex SQLite home is not UTF-8")?
+                .into(),
+        ),
+    ));
+    Ok(routing)
 }
 
 /// The executable and store routing an unpinned Codex resume keeps, as the
@@ -2018,14 +2042,9 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
-                let unverifiable = |reason: String| UnattestedCodexPolicy {
-                    reason,
-                    store: None,
-                    cwd: inputs.cwd.clone(),
-                };
+                let unverifiable = |reason: String| UnattestedCodexPolicy { reason, store: None };
                 for key in CODEX_ROUTING_ENV_KEYS {
                     anyhow::ensure!(value(key).is_none(), unverifiable(format!("managed Codex does not support {key}")));
-                    routing.push((key.into(), None));
                 }
                 let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".codex"))))?;
@@ -2066,22 +2085,16 @@ impl Instance {
                     store: (inputs.container.is_none() && declared.is_none())
                         .then(|| {
                             let sqlite = inputs.canonical_path(&sqlite).ok()?;
-                            let routing = [("CODEX_HOME", root.to_str()?), ("CODEX_SQLITE_HOME", sqlite.to_str()?)]
-                                .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
-                                .into_iter()
-                                .chain(CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)))
-                                .collect();
                             Some(UnpinnedCodexLaunch {
                                 home: root.clone(),
                                 program: program.clone(),
-                                routing,
+                                routing: codex_store_routing(&root, &sqlite).ok()?,
                                 cwd: inputs.cwd.clone(),
                                 raw_environment: inputs.raw_environment.clone(),
                                 environment: inputs.environment.clone(),
                             })
                         })
                         .flatten(),
-                    cwd: inputs.cwd.clone(),
                 };
                 let managed_preferences = inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES;
                 // Codex preference values may route the store; their absence only leaves policy unread.
@@ -2104,8 +2117,7 @@ impl Instance {
                 }
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
-                routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
-                routing.push(("CODEX_SQLITE_HOME".into(), Some(sqlite.to_str().context("Codex SQLite home is not UTF-8")?.into())));
+                routing.extend(codex_store_routing(&root, &sqlite)?);
                 namespace_arguments.extend(["-c".into(), format!("sqlite_home={}", toml::Value::String(sqlite.to_str().unwrap().into())), "-c".into(), "experimental_thread_store={type=\"local\"}".into(), "-c".into(), "cli_auth_credentials_store=\"file\"".into()]);
                 vec![root, sqlite]
             }
@@ -2591,9 +2603,7 @@ impl Instance {
         binding: Option<&ConversationBinding>,
     ) -> Option<&'a UnpinnedCodexLaunch> {
         let UnattestedCodexPolicy {
-            store: Some(store),
-            cwd,
-            ..
+            store: Some(store), ..
         } = error.downcast_ref()?
         else {
             return None;
@@ -2605,7 +2615,7 @@ impl Instance {
                         && execution.filesystem == "host"
                         && execution.stores.first() == Some(&store.home)
                 })
-        }) && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, cwd))
+        }) && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, &store.cwd))
         .then_some(store)
     }
 
