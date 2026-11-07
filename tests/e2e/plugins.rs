@@ -146,8 +146,13 @@ fn test_tui_web_toggle_does_not_replay_daemon_rejection() {
     open_manager(&h);
     let config = crate::harness::app_dir_in(h.home_path()).join("config.toml");
     let before = std::fs::read(&config).unwrap();
+    let error = h.run_cli_err(&["plugin", "disable", "aoe.web"]);
+    assert!(error.contains("read-only"), "{error}");
+    assert!(!error.contains("aoe serve --stop"), "{error}");
+    assert_eq!(std::fs::read(&config).unwrap(), before);
     h.send_keys("Space");
     h.wait_for("read-only");
+    h.assert_screen_not_contains("aoe serve --stop");
     assert_eq!(std::fs::read(config).unwrap(), before);
 }
 
@@ -182,14 +187,19 @@ fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
                 tokio::net::UnixListener::bind(&socket).unwrap()
             };
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let router = axum::Router::new().route(
-                "/api/plugins/aoe.web/enabled",
-                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                    assert_eq!(body["enabled"], false);
-                    sent.send(()).unwrap();
-                    std::future::ready(axum::http::StatusCode::NOT_FOUND)
-                }),
-            );
+            let router = axum::Router::new()
+                .route(
+                    "/api/plugins/aoe.web/enabled",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        assert_eq!(body["enabled"], false);
+                        sent.send(()).unwrap();
+                        std::future::ready(axum::http::StatusCode::NOT_FOUND)
+                    }),
+                )
+                .route(
+                    "/api/sessions",
+                    axum::routing::get(|| async { axum::http::StatusCode::OK }),
+                );
             let server = runtime.spawn(async move {
                 axum::serve(listener, router).await.unwrap();
             });
@@ -199,8 +209,11 @@ fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
         };
         h.run_cli_ok(&["serve", "--status"]);
         assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
-        let error = h.run_cli_err(&["plugin", "disable", "aoe.web"]);
-        assert!(error.contains("aoe serve --stop"), "{error}");
+        let error = h.run_cli_err(&["--no-autostart", "plugin", "disable", "aoe.web"]);
+        assert_eq!(error.contains("aoe serve --stop"), missing_route, "{error}");
+        if let Some(received) = &received {
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         assert_eq!(std::fs::read(&config).unwrap(), before);
         h.send_keys("Space");
         if let Some(received) = received {

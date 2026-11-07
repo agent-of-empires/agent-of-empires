@@ -2967,6 +2967,10 @@ fn cli_serve_web_toggle_rejects_active_lifecycle_transaction() {
             Some(agent_of_empires::daemon::ApiErrorCode::LifecycleLocked),
         );
     });
+    let error = h.run_cli_err(&["--no-autostart", "plugin", "disable", "aoe.web"]);
+    assert!(error.contains("HTTP 409"), "{error}");
+    assert!(error.contains("busy"), "{error}");
+    assert!(!error.contains("aoe serve --stop"), "{error}");
     assert_eq!(std::fs::read(app.join("config.toml")).unwrap(), before);
     drop(transaction);
     h.run_cli_ok(&["plugin", "disable", "aoe.web"]);

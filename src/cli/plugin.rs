@@ -1,6 +1,6 @@
 //! `aoe plugin`: plugin management (list, info, enable, disable, install,
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -193,7 +193,7 @@ async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
     .await;
     if id == "aoe.web" && result.is_err() && crate::acp::client::discovery::discover_env().is_none()
     {
-        result.context(crate::plugin::install::WEB_TOGGLE_RECOVERY)?;
+        result.map_err(crate::plugin::install::web_toggle_error)?;
     } else {
         result?;
     }

@@ -85,6 +85,37 @@ pub enum LiveToggle {
 pub(crate) const WEB_TOGGLE_RECOVERY: &str =
     "Local transport/404: run `aoe serve --stop`, inspect state, then retry";
 
+pub(crate) fn web_toggle_error(error: anyhow::Error) -> anyhow::Error {
+    use crate::acp::client::HttpError;
+    use crate::daemon::DaemonClientError;
+    let daemon_recoverable = |error: &DaemonClientError| {
+        matches!(
+            error,
+            DaemonClientError::UnixTransport
+                | DaemonClientError::Transport
+                | DaemonClientError::Timeout
+        ) || matches!(error, DaemonClientError::Status { status, .. } if *status == reqwest::StatusCode::NOT_FOUND)
+    };
+    let recoverable = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<HttpError>()
+            .is_some_and(|error| match error {
+                HttpError::Transport => true,
+                HttpError::Server { status, .. } => *status == reqwest::StatusCode::NOT_FOUND,
+                HttpError::Daemon(error) => daemon_recoverable(error),
+                _ => false,
+            })
+            || cause
+                .downcast_ref::<DaemonClientError>()
+                .is_some_and(daemon_recoverable)
+    });
+    if recoverable {
+        error.context(WEB_TOGGLE_RECOVERY)
+    } else {
+        error
+    }
+}
+
 /// Web RPC errors are terminal: idempotent local writes would bypass daemon
 /// authorization and live-worker reconciliation. Other plugins retain local fallback.
 pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveToggle> {
@@ -108,7 +139,7 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
             super::reload_registry();
             Ok(LiveToggle::Daemon)
         }
-        Err(e) if plugin_id == "aoe.web" => Err(e).context(WEB_TOGGLE_RECOVERY),
+        Err(e) if plugin_id == "aoe.web" => Err(web_toggle_error(e.into())),
         Err(e) => {
             set_enabled(plugin_id, enabled)?;
             Ok(LiveToggle::LocalDaemonStale {
@@ -1490,6 +1521,50 @@ mod tests {
     use crate::session::test_support::isolate_app_dir;
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
+
+    #[test]
+    fn web_recovery_guidance_preserves_authority_refusals() {
+        use crate::acp::client::HttpError;
+        use crate::daemon::DaemonClientError;
+        use reqwest::StatusCode;
+        for (error, guidance) in [
+            (HttpError::Transport, true),
+            (HttpError::Daemon(DaemonClientError::UnixTransport), true),
+            (HttpError::Daemon(DaemonClientError::Timeout), true),
+            (HttpError::Daemon(DaemonClientError::PeerIdentity), false),
+            (HttpError::Unauthorized, false),
+            (HttpError::ReadOnly, false),
+            (
+                HttpError::Server {
+                    status: StatusCode::FORBIDDEN,
+                    body: "policy refused".into(),
+                },
+                false,
+            ),
+            (
+                HttpError::Server {
+                    status: StatusCode::CONFLICT,
+                    body: "lifecycle_locked".into(),
+                },
+                false,
+            ),
+            (
+                HttpError::Server {
+                    status: StatusCode::NOT_FOUND,
+                    body: "missing route".into(),
+                },
+                true,
+            ),
+        ] {
+            let original = error.to_string();
+            let result = web_toggle_error(error.into());
+            assert!(result.downcast_ref::<HttpError>().is_some());
+            assert_eq!(format!("{result:#}").contains("aoe serve --stop"), guidance);
+            if !guidance {
+                assert_eq!(result.to_string(), original);
+            }
+        }
+    }
 
     fn ui(slot: UiSlot, id: &str) -> UiContribution {
         UiContribution {
