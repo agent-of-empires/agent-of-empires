@@ -3026,7 +3026,9 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
 
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
-    h.send_keys("RR");
+    h.send_keys_unfenced("R");
+    h.wait_for("Press R again to restart.");
+    h.send_keys_unfenced("R");
     h.wait_for("Dashboard start failed");
     assert_eq!(daemon_pid(&h), Some(successor));
     assert!(
