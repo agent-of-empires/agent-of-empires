@@ -304,7 +304,8 @@ pub struct ResolvedHookEvent {
     pub identity_field: Option<HookIdentityField>,
     pub waiting_tools: Vec<String>,
     /// Binary of the agent whose config declares this event. The identity publisher carries it
-    /// so a nested agent of another kind cannot publish into the pane's sidecar.
+    /// so a nested agent of another kind cannot publish into the pane's sidecar, and Claude's
+    /// status writers use it to bind to the pane's `session_id`.
     pub publisher: Option<&'static str>,
 }
 
@@ -1613,6 +1614,7 @@ pub fn effective_status_map(
 fn append_configured_status_events(
     events: &mut Vec<ResolvedHookEvent>,
     overrides: Option<&BTreeMap<String, HookStatus>>,
+    publisher: &'static str,
 ) {
     let Some(overrides) = overrides else {
         return;
@@ -1626,7 +1628,7 @@ fn append_configured_status_events(
                 status: Some(*status),
                 identity_field: None,
                 waiting_tools: Vec::new(),
-                publisher: None,
+                publisher: Some(publisher),
             });
         }
     }
@@ -1670,7 +1672,7 @@ pub fn resolved_hook_events(
             publisher: Some(agent.binary),
         })
         .collect();
-    append_configured_status_events(&mut events, overrides);
+    append_configured_status_events(&mut events, overrides, agent.binary);
     Ok(events)
 }
 
@@ -1698,7 +1700,7 @@ pub fn resolved_sidecar_hook_events(
             publisher: Some(agent.binary),
         })
         .collect();
-    append_configured_status_events(&mut events, overrides);
+    append_configured_status_events(&mut events, overrides, agent.binary);
     Ok(events)
 }
 
@@ -2511,6 +2513,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
             .unwrap();
         assert_eq!(custom.status, Some(HookStatus::Running));
         assert!(custom.matcher.is_none() && custom.identity_field.is_none());
+        assert_eq!(custom.publisher, Some("claude"));
 
         let config = config_with_status("vertex", "session.idle", HookStatus::Idle);
         let map = effective_status_map(&config, "vertex").unwrap();
