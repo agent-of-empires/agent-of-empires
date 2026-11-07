@@ -1,6 +1,10 @@
 //! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+
+pub(crate) fn codex_managed_preferences_present() -> bool {
+    false
+}
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::fs;

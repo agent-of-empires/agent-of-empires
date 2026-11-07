@@ -45,7 +45,8 @@ fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> 
 }
 
 /// The thread UUID of `rollout-<timestamp>-<uuid>[_<rollout-id>].jsonl[.zst]`.
-/// A reverted thread's file appends a distinct rollout ID.
+/// A reverted thread's file appends a distinct rollout ID, per openai/codex
+/// `codex-rs/rollout/src/rollout_file_name.rs` at 4ef836f.
 fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
@@ -129,7 +130,7 @@ fn collect_codex_sessions_anchored(
 }
 
 /// Rollouts named for `target`. Unlike the capture scan, the budget is per
-/// directory: a store's total size must not hide a long-lived conversation.
+/// directory, and a directory over it fails rather than hiding a rollout.
 fn find_codex_rollouts(
     root: &AnchoredDir,
     relative: &Path,
@@ -137,7 +138,12 @@ fn find_codex_rollouts(
     target: Uuid,
     found: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for name in root.read_dir(relative, CODEX_SCAN_MAX_ENTRIES)? {
+    let names = root.read_dir(relative, CODEX_SCAN_MAX_ENTRIES + 1)?;
+    anyhow::ensure!(
+        names.len() <= CODEX_SCAN_MAX_ENTRIES,
+        "Codex rollout directory exceeds its scan budget"
+    );
+    for name in names {
         let path = relative.join(&name);
         let numeric = name
             .to_str()
@@ -295,6 +301,11 @@ mod tests {
             );
         }
         assert!(codex_rollout_records_cwd(&store, foreign, &other));
+
+        for n in 0..CODEX_SCAN_MAX_ENTRIES {
+            std::fs::write(day.join(format!("pad-{n}")), "").unwrap();
+        }
+        assert!(!codex_rollout_records_cwd(&store, long, &project));
     }
 
     fn rollout_line(id: &str, cwd: &str) -> String {
@@ -362,6 +373,13 @@ mod tests {
         let path = PathBuf::from(format!("rollout-2025-03-06T12-00-00-{uuid}.jsonl"));
         assert_eq!(
             extract_codex_uuid_from_filename(&path).as_deref(),
+            Some(uuid)
+        );
+        let reverted = PathBuf::from(format!(
+            "rollout-2025-03-06T12-00-00-{uuid}_11111111-2222-4333-8444-555555555555.jsonl"
+        ));
+        assert_eq!(
+            extract_codex_uuid_from_filename(&reverted).as_deref(),
             Some(uuid)
         );
         assert_eq!(

@@ -1,6 +1,33 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
+/// Whether MDM installed forced `com.openai.codex` preferences for this
+/// computer or user. A lookup that cannot answer counts as installed.
+pub(crate) fn codex_managed_preferences_present() -> bool {
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.name);
+    codex_managed_preferences_present_in(
+        std::path::Path::new("/Library/Managed Preferences"),
+        user.as_deref(),
+    )
+}
+
+fn codex_managed_preferences_present_in(root: &std::path::Path, user: Option<&str>) -> bool {
+    let Some(user) = user else {
+        return true;
+    };
+    [root.to_path_buf(), root.join(user)]
+        .iter()
+        .any(|directory| {
+            !matches!(
+                directory.join("com.openai.codex.plist").symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+}
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
@@ -1157,6 +1184,21 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_managed_preferences_count_computer_and_user_plists() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("alice");
+        std::fs::create_dir(&user).unwrap();
+        let present = || codex_managed_preferences_present_in(root.path(), Some("alice"));
+        assert!(!present());
+        assert!(codex_managed_preferences_present_in(root.path(), None));
+        std::fs::write(user.join("com.openai.codex.plist"), "").unwrap();
+        assert!(present());
+        std::fs::remove_file(user.join("com.openai.codex.plist")).unwrap();
+        std::fs::write(root.path().join("com.openai.codex.plist"), "").unwrap();
+        assert!(present());
+    }
 
     #[test]
     fn foreign_runner_probe_requires_an_empty_original_group_and_keeps_native_tokens_strict() {

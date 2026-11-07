@@ -1591,9 +1591,19 @@ impl OpenCodeSessionSchema {
 #[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
 
-/// A Codex context AoE cannot attest. Unreadable policy or credentials do not
-/// change where an exact id resolves, so with a `store` a Default resume may
-/// still prove its rollout there; routing it cannot read leaves `store` empty.
+/// Environment that routes Codex away from its local store.
+pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
+    "CODEX_EXEC_SERVER_URL",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+];
+
+/// A Codex context AoE cannot attest. Credentials, and macOS managed
+/// preferences proven not installed, do not change where an exact id resolves,
+/// so with a `store` a Default resume may still prove its rollout there.
+/// Routing AoE cannot read, including installed managed preferences, leaves
+/// `store` empty.
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
 pub(super) struct UnattestedCodexPolicy {
@@ -1963,7 +1973,7 @@ impl Instance {
                     store: None,
                     cwd: inputs.cwd.clone(),
                 };
-                for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
+                for key in CODEX_ROUTING_ENV_KEYS {
                     anyhow::ensure!(value(key).is_none(), unverifiable(format!("managed Codex does not support {key}")));
                     routing.push((key.into(), None));
                 }
@@ -2006,10 +2016,13 @@ impl Instance {
                     }
                     configuration.push(file);
                 }
+                let managed_preferences = inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES;
+                // Installed managed preferences may route the store; absent ones only leave policy unread.
+                anyhow::ensure!(!(managed_preferences && crate::process::codex_managed_preferences_present()), unverifiable("Codex managed preferences are installed and cannot be attested by the local file contract".into()));
                 anyhow::ensure!(!external_auth, unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
                 // A host single-shot launch is deliberately left unmanaged: this
                 // only governs managed resume and fork.
-                if inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+                if managed_preferences {
                     bail!(unattested_policy("Codex managed preferences cannot be attested by the local file contract"));
                 }
                 let auth_file = root.join("auth.json");
@@ -2503,29 +2516,30 @@ impl Instance {
         })
     }
 
-    /// Whether a Default Codex resume stays on this project's conversation
-    /// without a pinned execution: an exact UUID whose rollout records this cwd.
-    pub(super) fn admits_unpinned_codex_resume(
-        error: &anyhow::Error,
+    /// The store a Default Codex resume reads without a pinned execution, when
+    /// it stays on this project's conversation: an exact UUID whose rollout records this cwd.
+    pub(super) fn unpinned_codex_resume_store<'a>(
+        error: &'a anyhow::Error,
         sid: &str,
         binding: Option<&ConversationBinding>,
-    ) -> bool {
-        let Some(UnattestedCodexPolicy {
+    ) -> Option<&'a std::path::Path> {
+        let UnattestedCodexPolicy {
             store: Some(store),
             cwd,
             ..
-        }) = error.downcast_ref()
+        } = error.downcast_ref()?
         else {
-            return false;
+            return None;
         };
-        binding
+        (binding
             .and_then(|binding| binding.execution.as_ref())
             .is_none_or(|execution| {
                 execution.agent == "codex"
                     && execution.filesystem == "host"
                     && execution.stores.first() == Some(store)
             })
-            && crate::session::capture::codex_rollout_records_cwd(store, sid, cwd)
+            && crate::session::capture::codex_rollout_records_cwd(store, sid, cwd))
+        .then_some(store.as_path())
     }
 
     /// Whether two executions describe one context.

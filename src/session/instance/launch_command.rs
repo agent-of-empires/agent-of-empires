@@ -816,15 +816,38 @@ impl Instance {
     pub(super) fn resolve_launch_execution(
         &self,
     ) -> Result<Option<super::execution::NativeExecution>> {
+        self.resolve_launch_routing()
+            .map(|(execution, _)| execution)
+    }
+
+    /// The execution to pin, or for an unpinned launch the pane environment
+    /// that keeps it on the store its conversation was verified in.
+    fn resolve_launch_routing(
+        &self,
+    ) -> Result<(
+        Option<super::execution::NativeExecution>,
+        Vec<tmux::PaneEnvMutation>,
+    )> {
         let target = self.conversation_target();
-        match (self.resolve_native_execution(target), target) {
-            (Ok(execution), _) => Ok(Some(execution)),
-            (Err(error), Some((sid, binding, false)))
-                if Self::admits_unpinned_codex_resume(&error, sid, binding) =>
-            {
+        let resolved = self.resolve_native_execution(target);
+        if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
+            if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
                 tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                Ok(None)
+                let store = store.to_str().context("Codex home is not UTF-8")?;
+                let routing = std::iter::once(tmux::PaneEnvMutation::set(
+                    "CODEX_HOME".into(),
+                    store.into(),
+                ))
+                .chain(
+                    super::execution::CODEX_ROUTING_ENV_KEYS
+                        .map(|key| tmux::PaneEnvMutation::unset(key.into())),
+                )
+                .collect();
+                return Ok((None, routing));
             }
+        }
+        let execution = match (resolved, target) {
+            (Ok(execution), _) => Ok(Some(execution)),
             (Err(error), Some((sid, binding, explicit)))
                 if explicit
                     || self.status_agent().is_some()
@@ -860,7 +883,8 @@ impl Instance {
                 tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                 Ok(None)
             }
-        }
+        };
+        execution.map(|execution| (execution, Vec::new()))
     }
 
     #[cfg(test)]
@@ -910,7 +934,7 @@ impl Instance {
                         ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
                     ));
             let mut handoff_prior = None;
-            let execution = self.resolve_launch_execution()?;
+            let (execution, unpinned_routing) = self.resolve_launch_routing()?;
             if let Some(execution) = execution.as_ref() {
                 handoff_prior = self.hand_off_prime_fork_parent(execution)?;
                 if validate_target {
@@ -946,11 +970,12 @@ impl Instance {
             } else {
                 None
             };
-            let parts = self.build_launch_command_in(
+            let mut parts = self.build_launch_command_in(
                 stores,
                 execution.as_ref(),
                 &mut expected_conversation,
             )?;
+            parts.launch_env.pane.extend(unpinned_routing);
             if (managed || parts.is_existing) && validate_target {
                 if let Some(execution) = execution.as_ref() {
                     self.validate_conversation_target(
@@ -3426,21 +3451,16 @@ mod tests {
             "#!/bin/sh\nexit 0\n",
         );
         let project = temp.path().join("project");
-        let other = temp.path().join("other");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
         let local = "11111111-2222-4333-8444-555555555551";
-        let foreign = "11111111-2222-4333-8444-555555555552";
-        for (sid, cwd) in [(local, &project), (foreign, &other)] {
-            std::fs::write(
-                day.join(format!("rollout-2026-11-06T12-00-00-{sid}.jsonl")),
-                format!(
-                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":{:?}}}}}\n",
-                    cwd.to_str().unwrap()
-                ),
-            )
-            .unwrap();
-        }
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{local}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{local}\",\"cwd\":{:?}}}}}\n",
+                project.to_str().unwrap()
+            ),
+        )
+        .unwrap();
         let instance = |sid: &str| {
             let mut inst = tool_instance("codex", project.to_str().unwrap());
             inst.agent_session_id = Some(sid.into());
@@ -3456,27 +3476,44 @@ mod tests {
         assert!(prepared.is_existing);
         let command = prepared.command.unwrap();
         assert!(command.contains(&format!("resume {local}")), "{command}");
+        let canonical_store = store.canonicalize().unwrap();
+        let routing = &prepared.launch_env.pane[prepared.launch_env.pane.len() - 5..];
+        assert_eq!(
+            routing[0],
+            tmux::PaneEnvMutation::set(
+                "CODEX_HOME".into(),
+                canonical_store.to_str().unwrap().into()
+            )
+        );
+        assert_eq!(
+            routing[1..],
+            super::super::execution::CODEX_ROUTING_ENV_KEYS
+                .map(|key| tmux::PaneEnvMutation::unset(key.into()))
+        );
 
         let other_store = temp.path().join("other-store");
         std::fs::create_dir_all(&other_store).unwrap();
-        let mut bound = ConversationBinding::unknown(local);
-        bound.provenance = ConversationProvenance::Observed;
-        bound.execution = Some(ExecutionBinding {
-            agent: "codex".into(),
-            stores: vec![other_store],
-            configuration: Vec::new(),
-            cwd: project.clone(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-            exported_default_store: None,
-        });
-        let mut moved_store = instance(local);
-        moved_store.agent_session_binding = Some(bound);
+        // The bound execution decides before the rollout does.
+        let bound = |agent: &str, store: &Path, filesystem: &str| {
+            let mut bound = ConversationBinding::unknown(local);
+            bound.provenance = ConversationProvenance::Observed;
+            bound.execution = Some(ExecutionBinding {
+                agent: agent.into(),
+                stores: vec![store.to_path_buf()],
+                configuration: Vec::new(),
+                cwd: project.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: filesystem.into(),
+                exported_default_store: None,
+            });
+            let mut inst = instance(local);
+            inst.agent_session_binding = Some(bound);
+            inst
+        };
         for inst in [
-            instance(foreign),
-            instance("11111111-2222-4333-8444-555555555559"),
-            instance("my-thread-name"),
-            moved_store,
+            bound("codex", &other_store, "host"),
+            bound("codex", &canonical_store, "container"),
+            bound("claude", &canonical_store, "host"),
         ] {
             let error = inst.resolve_launch_execution().err().unwrap();
             let chain = format!("{error:#}");
