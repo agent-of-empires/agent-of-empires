@@ -125,8 +125,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
-        let agent_key = self.agent_key_for_session(session_id).await;
-        let profile = crate::acp::agent_profiles::resolve(&agent_key);
+        let profile = self.profile_for_session(session_id, &text).await;
         let is_clear = profile.is_clear_command(&text);
         let disposition = if is_clear && profile.clear_requires_driven_reset {
             PromptDisposition::ResetContext
@@ -193,6 +192,48 @@ impl<S: BroadcastSink> Supervisor<S> {
                 assembled_markdown,
             },
         );
+    }
+
+    /// The session's agent profile. An agent with no built-in profile takes the reset alias its
+    /// resolved `session.agent_clear_alias` declares, so a custom agent's `/clear` drives a real
+    /// reset instead of reaching the model as text.
+    pub(crate) async fn profile_for_session(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> &'static crate::acp::agent_profiles::AgentProfile {
+        use crate::acp::agent_profiles::resolve;
+        let (agent_key, source_profile, cwd) = {
+            let live = self
+                .workers
+                .lock()
+                .await
+                .get(session_id)
+                .and_then(|handle| match &handle.kind {
+                    WorkerKind::Runner { spawn_config } => Some((
+                        spawn_config.agent_key.clone(),
+                        spawn_config.source_profile.clone(),
+                        spawn_config.cwd.clone(),
+                    )),
+                    _ => None,
+                });
+            match live {
+                Some(found) => found,
+                None => match crate::process::worker_registry::load(session_id) {
+                    Ok(Some(record)) if !record.agent_key.is_empty() => {
+                        (record.agent_key, record.source_profile, record.cwd)
+                    }
+                    _ => return resolve("claude"),
+                },
+            }
+        };
+        // Only a `/clear` or `/new` can match a declared alias, so every other prompt skips the
+        // configuration read. Settings changes are read fresh each time one of those arrives.
+        if !crate::acp::agent_profiles::could_be_declared_alias(text) {
+            return resolve(&agent_key);
+        }
+        super::agents::profile_for_agent(&agent_key, &source_profile.unwrap_or_default(), &cwd)
+            .await
     }
 
     /// The session's agent registry key: from the live runner, else its
@@ -542,6 +583,82 @@ mod tests {
                 assert_eq!(frames.len(), 1, "{session_id}: {frames:?}");
             }
             worker_registry::delete(session_id).ok();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_custom_agents_declared_alias_drives_a_reset_and_nothing_else_does() {
+        let (_home, _tmp) = isolate_home();
+        let config = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"
+[session.agent_clear_alias]
+bridge-clear = "/clear"
+bridge-new = "/new"
+claude = "/new"
+inherits-claude = "/new"
+
+[session.agent_acp_cmd]
+bridge-clear = "bridge-clear acp"
+bridge-new = "bridge-new acp"
+
+[session.agent_detect_as]
+inherits-claude = "claude"
+"#,
+        )
+        .unwrap();
+        // (agent key, text, disposition, SessionCleared published)
+        let cases = [
+            (
+                "bridge-clear",
+                "/clear",
+                PromptDisposition::ResetContext,
+                false,
+            ),
+            ("bridge-clear", "/new", PromptDisposition::Forward, false),
+            (
+                "bridge-clear",
+                "clear the cache",
+                PromptDisposition::Forward,
+                false,
+            ),
+            ("bridge-new", "/new", PromptDisposition::ResetContext, false),
+            ("bridge-new", "/clear", PromptDisposition::Forward, false),
+            // No alias declared: the text is an ordinary prompt, as before this setting.
+            ("bridge-none", "/clear", PromptDisposition::Forward, false),
+            // An agent that inherits a built-in adapter has no acp command of its own, so a
+            // declared alias is ignored for it rather than advertised and then forwarded as text.
+            ("inherits-claude", "/new", PromptDisposition::Forward, false),
+            // A built-in agent keeps its own alias whatever the map declares for it.
+            ("claude", "/clear", PromptDisposition::ResetContext, false),
+            ("claude", "/new", PromptDisposition::Forward, false),
+        ];
+        for (n, (key, text, disposition, cleared)) in cases.into_iter().enumerate() {
+            let session_id = format!("alias-{n}");
+            let dir = worker_registry::workers_dir().unwrap();
+            let mut record = worker_record(
+                &session_id,
+                std::process::id(),
+                dir.join(format!("{session_id}.sock")),
+            );
+            record.agent_name = key.into();
+            record.agent_key = key.into();
+            record.cwd = std::env::temp_dir();
+            worker_registry::save(&record).unwrap();
+
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            assert_eq!(
+                sup.publish_user_prompt(&session_id, text.into()).await,
+                disposition,
+                "{key} {text:?}"
+            );
+            let frames = sink.frames.lock().unwrap().clone();
+            assert_eq!(frames.len(), if cleared { 2 } else { 1 }, "{key} {text:?}");
+            worker_registry::delete(&session_id).ok();
         }
     }
 

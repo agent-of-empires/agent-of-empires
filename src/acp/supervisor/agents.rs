@@ -141,6 +141,33 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
+/// The agent's profile for a session running in `profile` and `project_path`. An agent with no
+/// built-in profile takes the reset alias its resolved `session.agent_clear_alias` declares, so a
+/// custom agent's `/clear` drives a real reset instead of reaching the model as text.
+pub(crate) async fn profile_for_agent(
+    agent: &str,
+    profile: &str,
+    project_path: &Path,
+) -> &'static crate::acp::agent_profiles::AgentProfile {
+    use crate::acp::agent_profiles::{resolve, resolve_with_aliases, DEFAULT};
+    let builtin = resolve(agent);
+    if builtin.key != DEFAULT.key {
+        return builtin;
+    }
+    let name = agent.to_string();
+    let aliases: HashMap<String, String> =
+        with_resolved_config(profile, project_path, move |cfg| {
+            cfg.session
+                .declared_clear_aliases()
+                .into_iter()
+                .filter(|(key, _)| *key == name)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+    resolve_with_aliases(agent, &aliases)
+}
+
 /// Resolve the profile + repo config off the async runtime; `None` if the task panics.
 async fn with_resolved_config<T: Send + 'static>(
     profile: &str,
