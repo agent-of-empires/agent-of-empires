@@ -143,7 +143,7 @@ pub struct App {
                     crate::daemon::RuntimeConnection,
                     crate::daemon::DaemonClient,
                 ),
-                String,
+                crate::tui::dialogs::ServeLaunchFailure,
             >,
         >,
     >,
@@ -1387,6 +1387,9 @@ impl App {
             }
 
             needs_full_refresh |= self.home.tick_dialog();
+            if self.home.pending_dashboard_launch.is_some() {
+                self.start_dashboard_launch();
+            }
             needs_full_refresh |= self.home.tick_settings_status();
             needs_full_refresh |= self.home.tick_opener();
             if self
@@ -1539,6 +1542,8 @@ impl App {
             }
         }
 
+        self.home.serve_view = None;
+        self.home.serve_jobs.shutdown();
         self.tool_detection = None;
         self.home.apply_restart_results();
         self.home.cleanup_pending_creation().await;
@@ -2593,7 +2598,10 @@ impl App {
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(crate::tui::dialogs::ServeLaunchFailure {
+                message: "Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned(),
+                log_tail: Vec::new(),
+            }),
         };
         self.dashboard_launch = None;
         let launch = self.home.dashboard_launch.take();
@@ -2611,21 +2619,17 @@ impl App {
                 );
             }
             Err(_) if self.dashboard_stop_requested => {}
-            Err(message) => {
+            Err(failure) => {
+                let message = failure.message.clone();
                 if let Some(serve) = &mut self.home.serve_view {
-                    serve.finish_launch(Err(message.clone()));
+                    serve.finish_launch(Err(failure));
                 } else if let Some(crate::tui::dialogs::DashboardLaunch::Running {
                     target, ..
                 }) = launch
                 {
-                    // Hidden with Esc: the offline takeover's "Didn't start" row reports it. The log
-                    // tail is read now, so a view opened later shows this failure's lines.
+                    // Retain the owner's failure until its first presentation.
                     self.home.dashboard_launch =
-                        Some(crate::tui::dialogs::DashboardLaunch::Failed {
-                            target,
-                            message: message.clone(),
-                            log_tail: crate::acp::client::autostart::initial_log_tail(),
-                        });
+                        Some(crate::tui::dialogs::DashboardLaunch::Failed { target, failure });
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -4406,8 +4410,12 @@ mod tests {
             // Reopened mid-launch through the gate, it counts from the launch and leaves the bound
             // to the App.
             assert!(!app.handle_runtime_gate_key(enter));
+            app.home
+                .serve_view
+                .as_mut()
+                .expect("owned launch view")
+                .tick();
             assert!(elapsed.is_match(&screen(&app)), "{}", screen(&app));
-            assert!(app.home.serve_view.as_mut().is_some_and(|v| !v.tick()));
             if !view_open {
                 app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
                 assert!(app.home.serve_view.is_none());
@@ -4417,7 +4425,11 @@ mod tests {
             std::fs::create_dir_all(log.parent().unwrap()).unwrap();
             std::fs::write(&log, "[AOE_START_MARKER]\nbind failed on port 8081\n").unwrap();
             let reason = "Dashboard start failed. Check `aoe logs`.";
-            assert!(settle.send(Err(reason.into())).is_ok());
+            assert!(settle
+                .send(Err(crate::tui::dialogs::ServeLaunchFailure::capture(
+                    reason.into()
+                )))
+                .is_ok());
             assert!(app.poll_dashboard_launch());
             if !view_open {
                 // Later Daemon activity mustn't stand in for this failure's log lines.
@@ -4438,7 +4450,10 @@ mod tests {
                 assert!(!app.handle_runtime_gate_key(enter));
             }
             let shown = screen(&app);
-            assert!(shown.contains("Dashboard start failed."), "{view_open}");
+            assert!(
+                shown.contains("Dashboard start failed."),
+                "{view_open}: {shown}"
+            );
             assert!(
                 shown.contains("bind failed on port 8081")
                     && !shown.contains("later daemon activity"),
@@ -4462,7 +4477,9 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled());
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled(
+            &mut app.home.serve_jobs,
+        ));
         app.home.pending_paste = Some("retained stop draft".into());
         let transaction = crate::daemon::lifecycle::Transaction::acquire()
             .await
@@ -4488,11 +4505,22 @@ mod tests {
             app.home.serve_view.is_none(),
             "input remains usable during deferred Stop"
         );
-        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled());
-        assert!(matches!(
-            app.home.handle_key(KeyEvent::from(KeyCode::Enter), None),
-            Some(Action::StartDashboard)
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled(
+            &mut app.home.serve_jobs,
         ));
+        assert!(app
+            .home
+            .handle_key(KeyEvent::from(KeyCode::Enter), None)
+            .is_none());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.home.pending_dashboard_launch.is_none() {
+            app.home.tick_dialog();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "launch preparation did not finish"
+            );
+            tokio::task::yield_now().await;
+        }
         app.start_dashboard_launch();
         assert!(
             app.dashboard_launch.is_some(),
@@ -4509,7 +4537,9 @@ mod tests {
             .is_none());
         drop(transaction);
         assert!(settle_launch
-            .send(Err("controlled failed startup".into()))
+            .send(Err(crate::tui::dialogs::ServeLaunchFailure::capture(
+                "controlled failed startup".into()
+            )))
             .is_ok());
         assert!(app.poll_dashboard_launch());
         assert!(app.dashboard_stop.is_some());

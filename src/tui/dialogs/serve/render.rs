@@ -37,77 +37,86 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
         );
         return;
     }
-    match &view.state {
-        ServeViewState::ModePicker {
-            selected,
-            tunnel_available,
-            local_available,
-            flash,
-        } => render_mode_picker(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*local_available, *tunnel_available),
-            flash_text(flash),
-        ),
-        ServeViewState::Confirm {
-            selected,
-            tailscale,
-            cloudflare,
-            flash,
-        } => render_confirm(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*tailscale, *cloudflare),
-            flash_text(flash),
-        ),
-        ServeViewState::Checking { .. } => render_pending(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            " Checking... ",
-            "Looking for a running daemon",
-        ),
-        ServeViewState::Starting {
-            mode, started_at, ..
-        } => render_starting(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *mode,
-            started_at.elapsed(),
-            false,
-        ),
-        ServeViewState::Active { mode, urls, .. } => {
-            render_active(view, frame, area, theme, &mut mouse);
-            if view.show_help {
-                // Any click closes the overlay, so nothing beneath is a target.
-                mouse.keys.clear();
-                mouse.copies.clear();
-                let effect =
-                    RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
-                render_help_overlay(frame, area, theme, *mode, effect);
+    if let Some(banner) = view
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.kind.banner())
+    {
+        render_pending(frame, area, theme, &mut mouse, " Checking... ", banner);
+    } else {
+        match &view.state {
+            ServeViewState::ModePicker {
+                selected,
+                tunnel_available,
+                local_available,
+                flash,
+            } => render_mode_picker(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                (*selected, *local_available, *tunnel_available),
+                &view.local_primary,
+                flash_text(flash),
+            ),
+            ServeViewState::Confirm {
+                selected,
+                tailscale,
+                cloudflare,
+                flash,
+            } => render_confirm(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *selected,
+                (*tailscale, *cloudflare),
+                flash_text(flash),
+            ),
+            ServeViewState::Checking { .. } => render_pending(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                " Checking... ",
+                "Looking for a running daemon",
+            ),
+            ServeViewState::Starting {
+                mode, started_at, ..
+            } => render_starting(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *mode,
+                started_at.elapsed(),
+                false,
+            ),
+            ServeViewState::Active { mode, urls, .. } => {
+                render_active(view, frame, area, theme, &mut mouse);
+                if view.show_help {
+                    // Any click closes the overlay, so nothing beneath is a target.
+                    mouse.keys.clear();
+                    mouse.copies.clear();
+                    let effect =
+                        RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+                    render_help_overlay(frame, area, theme, *mode, effect);
+                }
             }
+            ServeViewState::Error {
+                message,
+                mode,
+                transport,
+            } => render_error(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                message,
+                view.control_error.as_deref(),
+                &error_recovery_keys(message, *mode, *transport),
+            ),
         }
-        ServeViewState::Error {
-            message,
-            mode,
-            transport,
-        } => render_error(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            message,
-            &error_recovery_keys(message, *mode, *transport),
-        ),
     }
     if let Some(rect) = mouse.hover.current_in(&mouse.rects()) {
         paint_hover_bg(frame, rect, theme.selection);
@@ -223,8 +232,8 @@ fn render_mode_picker(
     area: Rect,
     theme: &Theme,
     mouse: &mut ServeMouse,
-    selected: ServeMode,
-    (local_available, tunnel_available): (bool, bool),
+    (selected, local_available, tunnel_available): (ServeMode, bool, bool),
+    local_primary: &str,
     flash: &str,
 ) {
     let title = format!(" {} ", view_title());
@@ -238,15 +247,6 @@ fn render_mode_picker(
         Style::default().fg(theme.title).bold(),
     );
 
-    let local_primary = crate::server::discover_tagged_ips()
-        .into_iter()
-        .next()
-        .map(|(kind, ip)| match kind {
-            crate::server::IpKind::Tailscale => format!("{} (Tailscale)", ip),
-            crate::server::IpKind::Lan => format!("{} (LAN)", ip),
-            crate::server::IpKind::Loopback => format!("{} (loopback)", ip),
-        })
-        .unwrap_or_else(|| "only localhost available".to_string());
     let tunnel_status = if tunnel_available {
         "reachable from your phone"
     } else {
@@ -267,7 +267,7 @@ fn render_mode_picker(
             "Internet (HTTPS)",
             ServeMode::Tunnel,
             tunnel_available,
-            tunnel_status.to_string(),
+            tunnel_status,
             [
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
@@ -577,6 +577,7 @@ fn render_active(
             theme,
             mouse,
             "Daemon started but no URL available yet.",
+            None,
             &[],
         );
         return;
@@ -933,6 +934,7 @@ fn render_error(
     theme: &Theme,
     mouse: &mut ServeMouse,
     message: &str,
+    control_error: Option<&str>,
     recovery: &[&str],
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
@@ -956,8 +958,17 @@ fn render_error(
         Layout::vertical([Constraint::Min(1), Constraint::Length(rows.len() as u16)])
             .margin(1)
             .areas(inner);
+    let mut content = Text::from(message);
+    if let Some(error) = control_error {
+        content.lines.push(Line::default());
+        content.lines.push(Line::styled(
+            "Recovery controls unavailable",
+            Style::default().fg(theme.error),
+        ));
+        content.lines.extend(error.lines().map(Line::raw));
+    }
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(content)
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(theme.text)),
         body,
@@ -1019,31 +1030,18 @@ mod tests {
     /// bundle must say the endpoint is API-only instead of drawing a code nothing answers.
     #[test]
     fn active_screen_matches_the_dashboard_feature() {
-        let view = ServeView {
-            state: ServeViewState::Active {
-                mode: ServeMode::Local,
-                transport: None,
-                urls: vec![ServeUrl {
-                    label: Some("lan".to_string()),
-                    url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
-                }],
-                url_index: 0,
-                passphrase: None,
-                opened_at: Instant::now(),
-                log_offset: 0,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        };
+        let view = view(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: Some("lan".to_string()),
+                url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
             .unwrap();
@@ -1083,20 +1081,9 @@ mod tests {
     }
 
     fn view(state: ServeViewState) -> ServeView {
-        ServeView {
-            state,
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        }
+        let mut view = ServeView::for_test(state);
+        view.running_persists = Some(true);
+        view
     }
 
     fn draw(view: &ServeView) -> ratatui::buffer::Buffer {

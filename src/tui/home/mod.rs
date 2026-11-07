@@ -295,6 +295,7 @@ pub struct HomeView {
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
+    pub(super) serve_jobs: super::dialogs::ServeJobs,
     pub(super) connections_view: Option<super::dialogs::ConnectionsView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
     pub(super) dashboard_launch: Option<super::dialogs::DashboardLaunch>,

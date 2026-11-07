@@ -133,8 +133,9 @@ fn wait_for_local_dashboard(h: &TuiTestHarness) -> (u16, String) {
 
 fn restart_local_from_tui(h: &TuiTestHarness) -> u32 {
     let before = daemon_pid(h).expect("serve.pid missing before restart");
-    // Queue confirmation before the renderer barrier consumes its deadline.
-    h.send_keys("RR");
+    h.send_keys_unfenced("R");
+    h.wait_for("Press R again to restart.");
+    h.send_keys_unfenced("R");
     wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
         let pid = daemon_pid(h).ok_or("serve.pid missing after restart")?;
         if pid == before {
@@ -3025,7 +3026,9 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
 
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
-    h.send_keys("RR");
+    h.send_keys_unfenced("R");
+    h.wait_for("Press R again to restart.");
+    h.send_keys_unfenced("R");
     h.wait_for("Dashboard start failed");
     assert_eq!(daemon_pid(&h), Some(successor));
     assert!(

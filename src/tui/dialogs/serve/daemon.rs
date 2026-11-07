@@ -86,11 +86,7 @@ pub(super) fn save_passphrase_to_disk(pp: &str) {
 }
 
 pub(super) fn load_or_generate_passphrase() -> String {
-    read_app_file(SAVED_PASSPHRASE_FILE).unwrap_or_else(|| {
-        let pp = generate_passphrase();
-        save_passphrase_to_disk(&pp);
-        pp
-    })
+    read_app_file(SAVED_PASSPHRASE_FILE).unwrap_or_else(generate_passphrase)
 }
 
 /// Four words from the list: about 35 bits, enough as a second factor and easy to type on a phone.
@@ -106,15 +102,17 @@ pub(super) fn generate_passphrase() -> String {
     words.join(" ")
 }
 
-pub(super) fn assess_transports() -> (TransportStatus, TransportStatus) {
-    let tailscale = if !crate::server::tunnel::tailscale_available_sync() {
+pub(super) fn assess_transports(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> (TransportStatus, TransportStatus) {
+    let tailscale = if !crate::server::tunnel::tailscale_available_sync(cancel) {
         TransportStatus::NotInstalled
-    } else if !crate::server::tunnel::tailscale_funnel_cap_ready_sync() {
+    } else if !crate::server::tunnel::tailscale_funnel_cap_ready_sync(cancel) {
         TransportStatus::FunnelNotEnabled
     } else {
         TransportStatus::Ready
     };
-    let cloudflare = if crate::server::tunnel::check_cloudflared().is_ok() {
+    let cloudflare = if crate::server::tunnel::check_cloudflared(cancel).is_ok() {
         TransportStatus::Ready
     } else {
         TransportStatus::NotInstalled
@@ -132,10 +130,6 @@ pub(super) fn default_transport(
         (_, TransportStatus::Ready) => TunnelTransport::Cloudflare,
         _ => TunnelTransport::Tailscale,
     }
-}
-
-fn current_exe() -> Result<PathBuf, String> {
-    std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))
 }
 
 /// A blank-line-prefixed hint for a recognized errno in the daemon log, or `""`.
@@ -160,18 +154,8 @@ pub(super) fn diagnose_daemon_exit(log: &str, mode: ServeMode) -> &'static str {
     ""
 }
 
-/// Stops the daemon; the saved passphrase survives for the next launch.
-pub(super) fn stop_daemon() -> Result<(), String> {
-    let output = Command::new(current_exe()?)
-        .args(["serve", "--stop"])
-        .output()
-        .map_err(|e| format!("Failed to invoke `aoe serve --stop`: {}", e))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
+pub(super) fn forget_stopped_passphrase() {
     set_cached_passphrase(None);
-    remove_app_file(EPHEMERAL_PASSPHRASE_FILE);
-    Ok(())
 }
 
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
@@ -232,16 +216,6 @@ pub(super) fn log_file_size() -> u64 {
     log_file_size_opt().unwrap_or(0)
 }
 
-/// Whether the log file changed size since `offset`, updating it.
-pub(super) fn log_grew(offset: &mut u64) -> bool {
-    let Some(size) = log_file_size_opt() else {
-        return false;
-    };
-    let changed = size != *offset;
-    *offset = size;
-    changed
-}
-
 /// `"\n\nLast log lines:\n..."` with compacted lines, or `""` for an empty tail.
 pub(super) fn last_log_lines(tail: &[String]) -> String {
     if tail.is_empty() {
@@ -282,20 +256,50 @@ pub(super) fn error_mentions_tailscale(msg: &str) -> bool {
     lower.contains("tailscale") || lower.contains("funnel")
 }
 
-pub(super) fn run_tailscale_funnel_reset() -> Result<(), String> {
-    let output = Command::new("tailscale")
-        .args(["funnel", "reset"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("could not spawn tailscale: {e}"))?;
-    if output.status.success() {
+pub(super) fn run_tailscale_funnel_reset(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    use std::io::{Read, Seek};
+    let mut stderr =
+        tempfile::tempfile().map_err(|e| format!("could not prepare reset diagnostics: {e}"))?;
+    let capture = stderr
+        .try_clone()
+        .map_err(|e| format!("could not capture reset diagnostics: {e}"))?;
+    let status = crate::process::run_status_with_timeout_process_group(
+        Command::new("tailscale")
+            .args(["funnel", "reset"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(capture)),
+        std::time::Duration::from_secs(3),
+        Some(cancel),
+    )
+    .map_err(|e| format!("could not complete tailscale reset: {e}; Funnel state may have changed"))?
+    .ok_or_else(|| {
+        "reset timed out; Funnel state may have changed. Inspect `tailscale funnel status` before retrying."
+            .to_owned()
+    })?;
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    stderr.rewind().map_err(|e| {
+        format!("could not read reset diagnostics: {e}; Funnel state may have changed")
+    })?;
+    let mut diagnostic = Vec::new();
+    stderr
+        .take(8192)
+        .read_to_end(&mut diagnostic)
+        .map_err(|e| {
+            format!("could not read reset diagnostics: {e}; Funnel state may have changed")
+        })?;
+    let stderr = String::from_utf8_lossy(&diagnostic).trim().to_string();
     Err(if stderr.is_empty() {
-        format!("exited with status {:?}", output.status.code())
+        format!(
+            "exited with status {:?}; Funnel state may have changed",
+            status.code()
+        )
     } else {
-        stderr
+        format!("{stderr}; Funnel state may have changed")
     })
 }
 
@@ -346,21 +350,6 @@ mod tests {
         assert!(diagnose_daemon_exit("Address already in use", ServeMode::Local).contains("port"));
         assert!(diagnose_daemon_exit("Permission denied", ServeMode::Tunnel).contains("permission"));
         assert_eq!(diagnose_daemon_exit("unrelated", ServeMode::Local), "");
-    }
-
-    /// One test: the cache is process-global.
-    #[test]
-    fn passphrase_cache_roundtrip() {
-        set_cached_passphrase(None);
-        assert_eq!(cached_passphrase(), None);
-        remember_passphrase("four word diceware phrase");
-        remember_passphrase("a different phrase later");
-        assert_eq!(
-            cached_passphrase().as_deref(),
-            Some("a different phrase later")
-        );
-        set_cached_passphrase(None);
-        assert_eq!(cached_passphrase(), None);
     }
 
     #[test]
