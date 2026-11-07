@@ -647,6 +647,49 @@ fn a_reopened_view_waits_for_its_owned_launch_and_ignores_an_old_stop() {
     assert!(view.launch_in_flight);
 }
 
+#[test]
+#[serial_test::serial]
+fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for (code, held) in [('P', Held::Retry), ('R', Held::Reset)] {
+        let mut jobs = ServeJobs::default();
+        let (_submitter, gate) = gated(&mut jobs, held);
+        let mut view =
+            ServeView::for_launch(DashboardLaunch::tunnel_for_test(Instant::now()), &mut jobs);
+        assert!(matches!(view.handle_key(key('S')), ServeAction::Stop));
+        view.begin_stop();
+        view.finish_stop(Err("tailscale funnel failed".to_owned()));
+        wait_for(&mut view, |view| view.pending.is_none());
+        assert!(matches!(&view.state, ServeViewState::Error { message, .. }
+            if message == "tailscale funnel failed"));
+        view.handle_key(key(code));
+        assert!(view.pending.is_some(), "{code} recovery did not start");
+        gate.entered(held);
+        gate.release(if code == 'P' {
+            JobResult::Retried {
+                tailscale: TransportStatus::Ready,
+                cloudflare: TransportStatus::Ready,
+                target: crate::cli::serve::tui_control_target().unwrap(),
+            }
+        } else {
+            JobResult::Reset(Err("fixture reset outcome unknown".to_owned()))
+        });
+        wait_for(&mut view, |view| view.pending.is_none());
+        if code == 'P' {
+            assert!(matches!(
+                view.state,
+                ServeViewState::Confirm {
+                    selected: TunnelTransport::Cloudflare,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(&view.state, ServeViewState::Error { message, .. }
+                if message.contains("fixture reset outcome unknown")));
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {

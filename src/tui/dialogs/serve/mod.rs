@@ -1198,6 +1198,10 @@ impl ServeView {
                     message,
                     mode,
                     transport,
+                };
+                if self.target.is_none() {
+                    self.control_error = None;
+                    self.request(Job::ErrorContext, PendingJob::ErrorContext);
                 }
             }
         }
