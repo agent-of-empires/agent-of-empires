@@ -1007,6 +1007,22 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/RowBadges.tsx"]
     },
     {
+      "id": "sidebar.group-expand",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowGroupExpand.test.tsx",
+        "src/components/__tests__/WorkspaceSidebarGroupSlices.test.tsx",
+        "src/lib/__tests__/sessionWorkspace.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/RowBadges.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ],
+      "notes": "A worktree row that collapsed more than one session into itself can expand into a full, indented row per session behind a guide line, instead of leaving every session but the row's picked one unreachable. Each expanded row has its own click-to-navigate (a modified click never selects the group), single-session context menu, optimistic triage and active-session marking; none of them read or write the group's selection or triage state. Expanded rows hide in the compact rail. On the group axis one workspace is split across groups under a single id, so every slice's children reconcile their optimistic overrides, and a later canonical update is not masked by a stale pin. A session keeps reconciling after its siblings leave, so a worktree going 2 -> 1 -> 2 sessions does not resurrect a stale override."
+    },
+    {
       "id": "app-shell.mobile-chrome-collapse",
       "kind": "mocked-playwright",
       "risk": "medium",
