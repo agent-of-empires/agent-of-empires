@@ -404,6 +404,16 @@ use anyhow::{bail, Context, Result};
 #[cfg(test)]
 thread_local! {
     pub(super) static FAIL_NEXT_NATIVE_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Keeps tests independent of the host's Codex preferences; `None` probes the host.
+    pub(super) static CODEX_MANAGED_PREFERENCES_PRESENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(Some(false)) };
+}
+
+fn codex_managed_preferences_present() -> bool {
+    #[cfg(test)]
+    if let Some(present) = CODEX_MANAGED_PREFERENCES_PRESENT.with(std::cell::Cell::get) {
+        return present;
+    }
+    crate::process::codex_managed_preferences_present()
 }
 
 const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
@@ -1599,10 +1609,10 @@ pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
     "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
 ];
 
-/// A Codex context AoE cannot attest. Credentials, and macOS managed
-/// preferences proven not installed, do not change where an exact id resolves,
-/// so with a `store` a Default resume may still prove its rollout there.
-/// Routing AoE cannot read, including installed managed preferences, leaves
+/// A Codex context AoE cannot attest. Credentials, and a macOS preference
+/// domain with no Codex configuration values, do not change where an exact id
+/// resolves, so with a `store` a Default resume may still prove its rollout
+/// there. Routing AoE cannot read, including set preference values, leaves
 /// `store` empty.
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
@@ -2017,8 +2027,8 @@ impl Instance {
                     configuration.push(file);
                 }
                 let managed_preferences = inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES;
-                // Installed managed preferences may route the store; absent ones only leave policy unread.
-                anyhow::ensure!(!(managed_preferences && crate::process::codex_managed_preferences_present()), unverifiable("Codex managed preferences are installed and cannot be attested by the local file contract".into()));
+                // Codex preference values may route the store; their absence only leaves policy unread.
+                anyhow::ensure!(!(managed_preferences && codex_managed_preferences_present()), unverifiable("Codex managed preferences are set and cannot be attested by the local file contract".into()));
                 anyhow::ensure!(!external_auth, unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
                 // A host single-shot launch is deliberately left unmanaged: this
                 // only governs managed resume and fork.

@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Native routing restored after the login shell's startup files.
+type Routing = Vec<(String, Option<String>)>;
+
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
     is_existing: bool,
@@ -820,29 +823,22 @@ impl Instance {
             .map(|(execution, _)| execution)
     }
 
-    /// The execution to pin, or for an unpinned launch the pane environment
-    /// that keeps it on the store its conversation was verified in.
+    /// The execution to pin, or for an unpinned launch the routing that keeps
+    /// it on the store its conversation was verified in.
     fn resolve_launch_routing(
         &self,
-    ) -> Result<(
-        Option<super::execution::NativeExecution>,
-        Vec<tmux::PaneEnvMutation>,
-    )> {
+    ) -> Result<(Option<super::execution::NativeExecution>, Routing)> {
         let target = self.conversation_target();
         let resolved = self.resolve_native_execution(target);
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
             if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
                 tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
                 let store = store.to_str().context("Codex home is not UTF-8")?;
-                let routing = std::iter::once(tmux::PaneEnvMutation::set(
-                    "CODEX_HOME".into(),
-                    store.into(),
-                ))
-                .chain(
-                    super::execution::CODEX_ROUTING_ENV_KEYS
-                        .map(|key| tmux::PaneEnvMutation::unset(key.into())),
-                )
-                .collect();
+                let routing = std::iter::once(("CODEX_HOME".to_owned(), Some(store.to_owned())))
+                    .chain(
+                        super::execution::CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)),
+                    )
+                    .collect();
                 return Ok((None, routing));
             }
         }
@@ -970,12 +966,12 @@ impl Instance {
             } else {
                 None
             };
-            let mut parts = self.build_launch_command_in(
+            let parts = self.build_launch_command_in(
                 stores,
                 execution.as_ref(),
+                &unpinned_routing,
                 &mut expected_conversation,
             )?;
-            parts.launch_env.pane.extend(unpinned_routing);
             if (managed || parts.is_existing) && validate_target {
                 if let Some(execution) = execution.as_ref() {
                     self.validate_conversation_target(
@@ -1102,13 +1098,20 @@ impl Instance {
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         let file_watch = crate::file_watch::FileWatchService::noop();
-        self.build_launch_command_in(CaptureStorage::Profiles(&file_watch), execution, expected)
+        self.build_launch_command_in(
+            CaptureStorage::Profiles(&file_watch),
+            execution,
+            &[],
+            expected,
+        )
     }
 
+    /// `unpinned_routing` applies to a host launch only when `execution` is absent.
     pub(super) fn build_launch_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned_routing: &[(String, Option<String>)],
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
@@ -1336,7 +1339,8 @@ impl Instance {
                 },
             }
         } else {
-            let mut result = self.build_host_command_in(stores, agent, execution, expected)?;
+            let mut result =
+                self.build_host_command_in(stores, agent, execution, unpinned_routing, expected)?;
             result.launch_env.pane = if execution.is_none() {
                 crate::session::environment::resolve_host_environment_pairs(
                     &self.resolved_host_environment(),
@@ -1366,6 +1370,7 @@ impl Instance {
             CaptureStorage::Profiles(&file_watch),
             agent,
             execution,
+            &[],
             expected,
         )
     }
@@ -1375,6 +1380,7 @@ impl Instance {
         stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned_routing: &[(String, Option<String>)],
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         let fallback_identity = execution
@@ -1389,6 +1395,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
+            unpinned_routing,
             expected,
         )
     }
@@ -1407,6 +1414,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
+            &[],
             expected,
         )
     }
@@ -1417,8 +1425,10 @@ impl Instance {
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned_routing: &[(String, Option<String>)],
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
+        let routing = execution.map_or(unpinned_routing, |execution| execution.routing.as_slice());
         let host_command = agent
             .filter(|agent| agent.spans_agent_generations)
             .and_then(|agent| self.host_agent_command(agent, execution));
@@ -1551,7 +1561,7 @@ impl Instance {
                             Some(wrap_command_ignore_suspend(
                                 &command,
                                 &self.project_path,
-                                execution.map_or(&[], |execution| execution.routing.as_slice()),
+                                routing,
                                 execution
                                     .map_or(&[], |execution| execution.case_insensitive_routing),
                             ))
@@ -1644,7 +1654,7 @@ impl Instance {
                     Some(wrap_command_ignore_suspend(
                         &command,
                         &self.project_path,
-                        execution.map_or(&[], |execution| execution.routing.as_slice()),
+                        routing,
                         execution.map_or(&[], |execution| execution.case_insensitive_routing),
                     ))
                 },
@@ -3476,20 +3486,24 @@ mod tests {
         assert!(prepared.is_existing);
         let command = prepared.command.unwrap();
         assert!(command.contains(&format!("resume {local}")), "{command}");
+        // Routing runs in the login shell's script, after its startup files.
         let canonical_store = store.canonicalize().unwrap();
-        let routing = &prepared.launch_env.pane[prepared.launch_env.pane.len() - 5..];
-        assert_eq!(
-            routing[0],
-            tmux::PaneEnvMutation::set(
-                "CODEX_HOME".into(),
-                canonical_store.to_str().unwrap().into()
+        let exec = command.find("exec env ").unwrap();
+        let pinned = format!(
+            "export CODEX_HOME={} || exit 1",
+            crate::session::environment::shell_escape_script_word(
+                canonical_store.to_str().unwrap()
             )
         );
-        assert_eq!(
-            routing[1..],
+        for line in std::iter::once(pinned).chain(
             super::super::execution::CODEX_ROUTING_ENV_KEYS
-                .map(|key| tmux::PaneEnvMutation::unset(key.into()))
-        );
+                .map(|key| format!("unset {key} || exit 1")),
+        ) {
+            assert!(
+                command.find(&line).is_some_and(|at| at < exec),
+                "{line}: {command}"
+            );
+        }
 
         let other_store = temp.path().join("other-store");
         std::fs::create_dir_all(&other_store).unwrap();
@@ -3603,6 +3617,14 @@ mod tests {
             refused_cause(wrapper),
             ManagedResumeCause::CodexConversationUnverified
         );
+
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            let preferences = &super::super::execution::CODEX_MANAGED_PREFERENCES_PRESENT;
+            preferences.with(|present| present.set(Some(true)));
+            let cause = refused_cause(instance(local));
+            preferences.with(|present| present.set(Some(false)));
+            assert_eq!(cause, ManagedResumeCause::CodexConversationUnverified);
+        }
 
         // An unpinned launch would not read a declared store.
         let path = crate::session::config::profile_config::get_profile_config_path(
