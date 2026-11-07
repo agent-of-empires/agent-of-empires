@@ -49,6 +49,8 @@ export function useSessions() {
   const [loaded, setLoaded] = useState(false);
   const [trashedCount, setTrashedCount] = useState(0);
   const [trashEpoch, setTrashEpoch] = useState<string | null>(null);
+  // The last trash read failed or timed out; cleared by the next one that lands.
+  const [trashError, setTrashError] = useState(false);
   // The list omits the trash; once a view asks for it, its rows ride in `state.sessions` and follow every poll.
   const trashWantedRef = useRef(false);
   const trashInFlightRef = useRef<Promise<void> | null>(null);
@@ -169,7 +171,10 @@ export function useSessions() {
     const run = (async () => {
       try {
         const data = await fetchTrashedSessions(request.signal);
-        if (!data) return;
+        if (!data) {
+          setTrashError(true);
+          return;
+        }
         const { cursor } = data;
         const floor = floorGet.current;
         // Only a read of the installed epoch may change rows; the next list poll installs a newer epoch and syncs
@@ -225,6 +230,7 @@ export function useSessions() {
           if (!covered.has(id) || !(outranks(held, cursor) || waiting)) pushed.delete(id);
         }
         setTrashEpoch(cursor.epoch);
+        setTrashError(false);
       } finally {
         clearTimeout(deadline);
         trashInFlightRef.current = null;
@@ -377,6 +383,7 @@ export function useSessions() {
     trashedCount,
     // A restart installs a new epoch whose trash is unread, so a link to a trashed session must wait for it.
     trashLoaded: trashEpoch !== null && trashEpoch === state.epoch,
+    trashError,
     loadTrash,
     injectSession,
     setSessionStatus,

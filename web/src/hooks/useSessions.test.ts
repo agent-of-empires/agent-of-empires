@@ -144,6 +144,29 @@ describe("useSessions / on-demand trash", () => {
     expect(result.current.sessions.map((s) => s.id)).toEqual(["a", "t"]);
   });
 
+  it("flags a failed trash read, keeps known rows, and clears the flag when a retry lands", async () => {
+    vi.spyOn(api, "fetchSessions").mockResolvedValue(envelope([row("a")], 1n, 1));
+    const trashed = vi
+      .spyOn(api, "fetchTrashedSessions")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(envelope([row("t", true)], 1n, 1));
+
+    const { result } = renderHook(() => useSessions());
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    expect(result.current.trashError).toBe(false);
+
+    act(() => result.current.loadTrash());
+    await waitFor(() => expect(result.current.trashError).toBe(true));
+    expect(result.current.trashLoaded).toBe(false);
+    expect(result.current.sessions.map((s) => s.id)).toEqual(["a"]);
+
+    act(() => result.current.loadTrash());
+    await waitFor(() => expect(result.current.trashLoaded).toBe(true));
+    expect(result.current.trashError).toBe(false);
+    expect(result.current.sessions.map((s) => s.id)).toEqual(["a", "t"]);
+    expect(trashed).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores a trash read of another epoch", async () => {
     vi.spyOn(api, "fetchSessions").mockResolvedValue(envelope([row("a")], 5n, 1));
     const trashed = vi.spyOn(api, "fetchTrashedSessions").mockResolvedValue({
