@@ -24,7 +24,7 @@ impl EventStore {
     /// All events with `seq < before`, oldest first.
     pub fn replay_before(&self, session_id: &str, before: u64) -> Vec<(u64, Event)> {
         let rows = events::scan(
-            &self.conn(),
+            &self.reader(),
             &self.schema,
             session_id,
             SeqBound::Before(before),
@@ -100,12 +100,18 @@ impl EventStore {
         order: Order,
         limit: Option<usize>,
     ) -> ReplayPage {
-        let conn = self.conn();
+        let conn = self.reader();
+        // One snapshot, so the bounds agree with the rows while writes land.
+        let snapshot = conn
+            .unchecked_transaction()
+            .map_err(|e| warn!(target: "acp.event_store", "replay snapshot for {session_id}: {e}"))
+            .ok();
         let highest_seq = events::highest_seq(&conn, &self.schema, session_id);
         let lowest_seq = events::lowest_seq(&conn, &self.schema, session_id);
         // One probe row past `limit` detects `has_more` without a second query.
         let probe = limit.map(|n| n.saturating_add(1));
         let rows = events::scan(&conn, &self.schema, session_id, bound, order, probe);
+        drop(snapshot);
         let (events, last_scanned_seq, has_more) = decode_rows(session_id, rows, limit);
         ReplayPage {
             events,
@@ -205,6 +211,30 @@ mod tests {
         let page2 = store.replay_page("bad", 2, Some(2));
         assert_eq!(seqs(&page2.events), [3]);
         assert!(!page2.has_more);
+    }
+
+    #[test]
+    fn replays_do_not_wait_for_the_writer_connection() {
+        let (_tmp, store) = open_store(1000);
+        record_from(&store, "s-1", 1, (1..=3).map(|_| Event::ThinkingStarted));
+        let writer = store.conn();
+        let (done, replayed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let page = store.replay_page("s-1", 0, Some(10));
+                let _ = done.send((
+                    seqs(&page.events),
+                    page.highest_seq,
+                    store.lowest_seq("s-1"),
+                ));
+            });
+            let result = replayed.recv_timeout(std::time::Duration::from_secs(5));
+            drop(writer);
+            assert_eq!(
+                result.expect("a replay must not wait while the writer is held"),
+                (vec![1, 2, 3], 3, Some(1))
+            );
+        });
     }
 
     #[test]
