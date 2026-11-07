@@ -958,6 +958,110 @@ fn the_structured_row_appears_only_for_an_acp_capable_tool() {
 }
 
 #[test]
+fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
+    // (terminal locked, structured locked), with a Yolo the user turned on beforehand.
+    for (name, expected) in [
+        ("my-pi", (true, true)),
+        ("own-pi", (true, false)),
+        ("my-claude", (false, false)),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_tools(vec![name], TEST_PATH.to_string());
+        let base = name.trim_start_matches("my-").trim_start_matches("own-");
+        dialog
+            .agent_detect_as
+            .insert(name.to_string(), base.to_string());
+        dialog
+            .agent_acp_cmd
+            .insert("own-pi".to_string(), "own-pi-acp".to_string());
+        dialog.set_structured_capable(true);
+        dialog.yolo_mode = true;
+        let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
+        assert_eq!(locked(&dialog), expected.0, "{name} terminal");
+
+        dialog.focused_field = dialog.field_indices().structured;
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(dialog.structured_enabled, "{name}");
+        assert_eq!(locked(&dialog), expected.1, "{name} structured");
+        // Leaving the lock resets Yolo to the default; an unchanged lock keeps the choice.
+        let yolo = expected.1 || expected.0 == expected.1;
+        assert_eq!(dialog.yolo_mode, yolo, "{name}");
+        assert_eq!(
+            submitted(dialog.build_submit_result()).yolo_mode,
+            yolo,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_view() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo_mapping = |base: &str| {
+        let repo = tempfile::tempdir().expect("repo dir");
+        fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+        fs::write(
+            repo.path().join(".agent-of-empires/config.toml"),
+            format!("[session]\nagent_detect_as = {{ wrap = \"{base}\" }}\n"),
+        )
+        .expect("repo config");
+        repo
+    };
+    let (pi, claude) = (repo_mapping("pi"), repo_mapping("claude"));
+    type Arrive = fn(&mut NewSessionDialog, String);
+    let arrivals: &[(&str, Arrive)] = &[
+        ("typed", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(String::new());
+            type_str(d, &path);
+            d.handle_key(key(KeyCode::Tab));
+        }),
+        ("picked", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            d.handle_key(ctrl_key(KeyCode::Char('p')));
+            d.handle_key(key(KeyCode::Enter));
+            assert!(!d.dir_picker.is_active());
+        }),
+        ("sandbox env edited", |d, path| {
+            d.extra_env_overridden = true;
+            d.set_path(path);
+        }),
+        ("scratch", |d, _| {
+            d.handle_key(ctrl_key(KeyCode::Char('t')));
+        }),
+    ];
+    let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
+    // Leaving the `pi` lock must drop the forced Yolo, not submit it.
+    for (from, to, to_locked) in [(&pi, &claude, false), (&claude, &pi, true)] {
+        for (name, arrive) in arrivals {
+            let mut dialog = NewSessionDialog::new_with_tools(vec!["wrap"], TEST_PATH.to_string());
+            dialog.set_path(from.path().to_string_lossy().to_string());
+            assert!(dialog.structured_capable, "{name}");
+            assert_eq!(locked(&dialog), !to_locked, "{name}");
+            arrive(&mut dialog, to.path().to_string_lossy().to_string());
+            // Scratch has no repo, so `wrap` is an unknown agent again.
+            let (lock, capable) = if *name == "scratch" {
+                (false, false)
+            } else {
+                (to_locked, true)
+            };
+            assert_eq!(
+                dialog.structured_capable, capable,
+                "{name} to_locked={to_locked}"
+            );
+            assert_eq!(locked(&dialog), lock, "{name} to_locked={to_locked}");
+            assert_eq!(
+                submitted(dialog.build_submit_result()).yolo_mode,
+                lock,
+                "{name} to_locked={to_locked}"
+            );
+        }
+    }
+}
+
+#[test]
 #[serial_test::serial]
 fn clicks_focus_and_act_on_a_row_while_hover_only_tints_it() {
     assert!(single_tool_dialog().handle_click(5, 5).is_none());

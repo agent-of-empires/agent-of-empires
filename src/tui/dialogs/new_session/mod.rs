@@ -216,6 +216,10 @@ pub struct NewSessionDialog {
     /// every tool or profile change. Gates the Structured field's visibility
     /// like `has_yolo` / `has_sandbox`.
     pub(super) structured_capable: bool,
+    /// The profile's custom-agent maps, which decide whether a custom tool always
+    /// runs in Yolo mode in the chosen view.
+    pub(super) agent_acp_cmd: std::collections::HashMap<String, String>,
+    pub(super) agent_detect_as: std::collections::HashMap<String, String>,
     pub(super) workspace_repos: Vec<String>,
     pub(super) workspace_repos_expanded: bool,
     pub(super) workspace_repo_selected_index: usize,
@@ -600,6 +604,8 @@ impl NewSessionDialog {
             structured_default,
             structured_choice: None,
             structured_capable,
+            agent_acp_cmd: config.session.agent_acp_cmd.clone(),
+            agent_detect_as: config.session.agent_detect_as.clone(),
             extra_env,
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -638,6 +644,9 @@ impl NewSessionDialog {
         self.path = Input::new(path);
         if !self.extra_env_overridden {
             self.reload_config_defaults();
+        } else {
+            let config = self.resolve_config_for_path(self.selected_profile());
+            self.refresh_path_agent_config(&config);
         }
     }
 
@@ -681,17 +690,28 @@ impl NewSessionDialog {
             return;
         }
         self.tool_index = index;
-        if self.selected_tool_always_yolo() {
-            self.yolo_mode = true;
-        } else {
-            self.yolo_mode = self.yolo_mode_default;
-        }
         if self.selected_tool_host_only() {
             self.sandbox_enabled = false;
             self.worktree_enabled = false;
             self.worktree_branch.reset();
         }
         self.reload_tool_config();
+        self.reset_yolo();
+    }
+
+    fn reset_yolo(&mut self) {
+        self.yolo_mode = self.selected_tool_always_yolo() || self.yolo_mode_default;
+    }
+
+    /// The Yolo choice resets only when the view moves the session onto or off an
+    /// always-Yolo agent.
+    fn set_structured(&mut self, enabled: bool) {
+        let was_locked = self.selected_tool_always_yolo();
+        self.structured_enabled = enabled;
+        self.structured_choice = Some(enabled);
+        if self.selected_tool_always_yolo() != was_locked {
+            self.reset_yolo();
+        }
     }
 
     /// Carry a session's agent, view and sandbox, each only as far as this form allows.
@@ -706,8 +726,7 @@ impl NewSessionDialog {
 
     fn inherit_modes(&mut self, structured: bool, sandboxed: bool) {
         if self.structured_capable {
-            self.structured_enabled = structured;
-            self.structured_choice = Some(structured);
+            self.set_structured(structured);
         }
         if sandboxed && self.docker_available && !self.selected_tool_host_only() {
             self.set_sandbox_enabled(true);
@@ -837,12 +856,13 @@ impl NewSessionDialog {
             return;
         }
         let profile = self.selected_profile().to_string();
+        let config = self.resolve_config_for_path(&profile);
+        self.refresh_path_agent_config(&config);
         // Unknown overrides leave the toggles alone: a guess could disable a sandbox the project asks for.
         let ProjectOverridesLookup::Known(overrides) = self.resolve_overrides(&profile) else {
             return;
         };
         let host_only = self.selected_tool_host_only();
-        let config = self.resolve_config_for_path(&profile);
         if !self.worktree_dirty {
             let on = overrides
                 .as_ref()
@@ -922,6 +942,22 @@ impl NewSessionDialog {
         }
     }
 
+    /// A path's repo config changes the agent only through `agent_detect_as`. When it does,
+    /// re-read whether the agent can run structured and re-check the Yolo lock.
+    fn refresh_path_agent_config(&mut self, config: &crate::session::Config) {
+        if config.session.agent_detect_as == self.agent_detect_as {
+            return;
+        }
+        let was_locked = self.selected_tool_always_yolo();
+        self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.structured_capable = !self.terminal_fork()
+            && compute_structured_capable(&self.available_tools[self.tool_index], config);
+        self.apply_structured_default();
+        if self.selected_tool_always_yolo() != was_locked {
+            self.reset_yolo();
+        }
+    }
+
     fn refresh_inherited_sandbox_settings(&mut self) {
         if !self.sandbox_enabled || self.extra_env_overridden {
             return;
@@ -932,7 +968,17 @@ impl NewSessionDialog {
     }
 
     fn selected_tool_always_yolo(&self) -> bool {
-        crate::agents::is_always_yolo(&self.available_tools[self.tool_index])
+        let view = if self.structured_enabled {
+            crate::session::View::Structured
+        } else {
+            crate::session::View::Terminal
+        };
+        crate::acp::runs_always_yolo(
+            &self.available_tools[self.tool_index],
+            view,
+            &self.agent_acp_cmd,
+            &self.agent_detect_as,
+        )
     }
 
     fn selected_tool_host_only(&self) -> bool {
@@ -1047,6 +1093,8 @@ impl NewSessionDialog {
         self.command_override = Input::new(config.session.resolve_tool_command(selected_tool));
         self.structured_capable =
             !self.terminal_fork() && compute_structured_capable(selected_tool, &config);
+        self.agent_acp_cmd = config.session.agent_acp_cmd.clone();
+        self.agent_detect_as = config.session.agent_detect_as.clone();
         self.apply_structured_default();
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;
@@ -1112,6 +1160,8 @@ impl NewSessionDialog {
             structured_default: false,
             structured_choice: None,
             structured_capable: false,
+            agent_acp_cmd: config.session.agent_acp_cmd.clone(),
+            agent_detect_as: config.session.agent_detect_as.clone(),
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -1193,6 +1243,8 @@ impl NewSessionDialog {
             structured_default: false,
             structured_choice: None,
             structured_capable: false,
+            agent_acp_cmd: Default::default(),
+            agent_detect_as: Default::default(),
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -1389,8 +1441,7 @@ impl NewSessionDialog {
         } else if self.focused_field == fields.tool {
             self.select_tool_index((self.tool_index + 1) % self.available_tools.len());
         } else if self.focused_field == fields.structured {
-            self.structured_enabled = !self.structured_enabled;
-            self.structured_choice = Some(self.structured_enabled);
+            self.set_structured(!self.structured_enabled);
         } else if self.focused_field == fields.yolo {
             self.yolo_mode = !self.yolo_mode;
         } else if self.focused_field == fields.worktree {
@@ -1473,6 +1524,7 @@ impl NewSessionDialog {
                 self.overrides_resolved_for = None;
                 let profile = self.selected_profile().to_string();
                 let config = self.resolve_config_for_path(&profile);
+                self.refresh_path_agent_config(&config);
                 self.seed_sandbox(&config, None);
             } else {
                 self.seed_defaults_for_path();
@@ -1661,8 +1713,7 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.structured =>
             {
-                self.structured_enabled = !self.structured_enabled;
-                self.structured_choice = Some(self.structured_enabled);
+                self.set_structured(!self.structured_enabled);
                 DialogResult::Continue
             }
             _ => {
@@ -2150,6 +2201,8 @@ impl NewSessionDialog {
         self.command_override = Input::new(config.session.resolve_tool_command(tool));
         self.structured_capable =
             !self.terminal_fork() && compute_structured_capable(tool, &config);
+        self.agent_acp_cmd = config.session.agent_acp_cmd.clone();
+        self.agent_detect_as = config.session.agent_detect_as.clone();
         self.apply_structured_default();
     }
 
