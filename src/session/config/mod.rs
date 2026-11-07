@@ -2190,13 +2190,13 @@ impl SessionConfig {
             if name.is_empty() {
                 tracing::warn!(target: "session.store", "custom_agents: entry with empty name will be ignored");
             }
-            if command.is_empty() {
+            if command.trim().is_empty() && self.launch_command_for(name).is_empty() {
                 tracing::warn!(target: "session.store",
                     "custom_agents: '{}' has an empty command, session will launch with no command",
                     name
                 );
             }
-            if crate::agents::get_agent(name).is_some() {
+            if self.custom_agent_selected(name) && crate::agents::get_agent(name).is_some() {
                 tracing::warn!(target: "session.store",
                     "custom_agents: '{}' shadows a built-in agent; use agent_command_override instead",
                     name

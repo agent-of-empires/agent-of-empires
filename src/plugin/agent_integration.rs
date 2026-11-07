@@ -32,13 +32,25 @@ const REPORT_MAX_AGE: Duration = Duration::from_secs(15);
 /// bare command name compare equal.
 fn program(command: &str) -> Option<String> {
     let executable = launch_executable(command)?;
-    Some(
-        std::path::Path::new(&executable)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&executable)
-            .to_string(),
-    )
+    let base = basename(&executable);
+    // `env FOO=1 tool` runs `tool`, so the wrapper is transparent to ownership.
+    if base != "env" {
+        return Some(base);
+    }
+    shell_words::split(command)
+        .ok()?
+        .iter()
+        .skip(1)
+        .find(|word| !word.contains('='))
+        .map(|word| basename(word))
+}
+
+fn basename(executable: &str) -> String {
+    std::path::Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable)
+        .to_string()
 }
 
 /// A configured custom agent owns its name, so no plugin declaration
@@ -1050,6 +1062,18 @@ pub fn respond(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_wrapper_resolves_the_wrapped_program() {
+        assert_eq!(program("acme --serve").as_deref(), Some("acme"));
+        assert_eq!(program("/usr/bin/acme").as_deref(), Some("acme"));
+        assert_eq!(program("env FOO=1 acme --serve").as_deref(), Some("acme"));
+        assert_eq!(
+            program("env FOO=1 /usr/local/bin/acme").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(program("env"), None);
+    }
+
     use super::*;
     use std::time::SystemTime;
     #[test]
