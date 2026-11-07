@@ -196,6 +196,11 @@ pub struct PluginConfig {
     /// when no update has been dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update: Option<String>,
+
+    /// Installed with `--dev` from a local directory: may claim a reserved
+    /// namespace, is never featured, and is refused under remote exposure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dev: bool,
 }
 
 /// A user's approval of an external plugin's requested capabilities, pinned to
@@ -230,6 +235,7 @@ impl Default for PluginConfig {
             settings: toml::Table::new(),
             grant: None,
             dismissed_update: None,
+            dev: false,
         }
     }
 }
@@ -432,7 +438,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Structured view",
         widget = "select",
-        options = "off:Off,terminal:Terminal view,structured:Structured view"
+        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view"
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
@@ -1900,9 +1906,10 @@ pub enum NewSessionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredView {
+    #[default]
+    Auto,
     Off,
     Terminal,
-    #[default]
     Structured,
 }
 
@@ -3156,7 +3163,7 @@ pub struct SystemdSettings {
     #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` expands to the escaped profile name. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Systemd slice",
@@ -4920,7 +4927,10 @@ mod tests {
     fn systemd_settings_defaults() {
         let cfg = Config::default();
         assert!(cfg.systemd.enabled);
-        assert_eq!(cfg.systemd.slice, "background-aoe-{profile}.slice");
+        assert_eq!(
+            cfg.systemd.slice,
+            "background-aoe-{profile}-{session}.slice"
+        );
         assert!(cfg.systemd.survive_daemon_restart);
         assert_eq!(cfg.systemd.memory_max, None);
         assert_eq!(cfg.systemd.tasks_max, 0);

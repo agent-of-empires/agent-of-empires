@@ -150,7 +150,7 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/sessions/creation-trust", (r) =>
     r.fulfill({ json: opts.creationTrustReview ?? DEFAULT_CREATION_TRUST_REVIEW }),
   );
-  await page.route("**/api/sessions", async (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, async (r) => {
     if (r.request().method() !== "POST") {
       return r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

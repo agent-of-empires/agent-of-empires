@@ -476,6 +476,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // A stop holds this lock while it removes the worker, so a retired
+        // worker's queued identity frame lands after the stop has committed. It
+        // keeps its id for a later resume but must not wake the stopped row.
+        let live_worker = match (frame.worker_generation, &acp_change) {
+            (Some(generation), Some(_)) => {
+                state
+                    .acp_supervisor
+                    .is_current_worker_generation(&frame.session_id, generation)
+                    .await
+            }
+            _ => true,
+        };
 
         // #4127: the worker's own store is the only observation of the route
         // this launch applied. Read it for the id the worker just assigned, and
@@ -536,7 +548,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
-            if let Some((policy, projected)) = status_update {
+            if let Some((policy, projected)) = status_update.filter(|_| live_worker) {
                 apply_status_intent(inst, policy, projected, &state.status_tx);
             }
             canonical_changed |= old_status != inst.status;
@@ -544,7 +556,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
                     .then(|| inst.source_profile.clone());
             let profile_to_save =
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref());
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref(), live_worker);
             canonical_changed |= profile_to_save.is_some();
             // An attestation alone still has to reach the disk: the durable
             // write below stamps it, and the mirror is only allowed to show it
@@ -615,6 +627,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             inst,
                             &session_id_for_save,
                             acp_change_for_save.as_ref(),
+                            live_worker,
                         );
                         if let Some(AcpSessionChange::Assigned(new_id)) =
                             acp_change_for_save.as_ref()
@@ -787,8 +800,9 @@ pub(crate) fn apply_status_intent(
                 return;
             }
         }
-        // Only from AcpSessionAssigned / RateLimitAutoResumed, both emitted
-        // when a fresh worker attaches and never as trailing post-stop events.
+        // Only from AcpSessionAssigned / RateLimitAutoResumed, emitted when a
+        // fresh worker attaches. The listener drops a retired worker's identity
+        // frame before it gets here, since it can trail the stop.
         StatusPolicy::Heal => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
@@ -971,6 +985,7 @@ pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
     change: Option<&AcpSessionChange>,
+    live_worker: bool,
 ) -> Option<String> {
     if !inst.is_structured()
         || inst.terminal_handoff.as_ref().is_some_and(|intent| {
@@ -981,9 +996,9 @@ pub(super) fn apply_acp_session_change(
     }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            // A worker just initialized (session/new or session/load), so the session is by
-            // definition no longer idle-dormant.
-            let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
+            // A live worker just initialized (session/new or session/load), so the
+            // session is no longer idle-dormant; a retired worker's frame proves nothing.
+            let cleared_stale_dormant = live_worker && inst.idle_dormant_since.take().is_some();
             let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
             // #2276.
             let cleared_import_pending = if same_acp_session {
@@ -1751,6 +1766,92 @@ mod tests {
         listener.abort();
         let _ = listener.await;
     }
+
+    #[tokio::test]
+    async fn a_retired_workers_assigned_id_does_not_wake_a_committed_stop() {
+        for live in [false, true] {
+            let _app_dir = crate::session::test_support::isolate_app_dir();
+            let mut inst = Instance::new("acp-session", "/tmp/acp");
+            inst.source_profile = "listener-retired-identity".into();
+            inst.view = crate::session::View::Structured;
+            inst.status = Status::Stopped;
+            inst.idle_dormant_since = Some(chrono::Utc::now());
+            let id = inst.id.clone();
+            let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let generation = state.acp_supervisor.test_insert_worker(&id).await;
+            if !live {
+                state.acp_supervisor.test_remove_worker(&id).await;
+            }
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            for _ in 0..500 {
+                if state.acp_events_tx.receiver_count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq: 1,
+                    event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                        acp_session_id: "assigned-acp-id".to_string(),
+                    }),
+                    worker_generation: Some(generation),
+                    sidebar_status: Some(Status::Idle),
+                })
+                .expect("listener is subscribed");
+            let on_disk = || {
+                storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .expect("row")
+            };
+            for _ in 0..500 {
+                if on_disk().acp_session_id.as_deref() == Some("assigned-acp-id") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let memory = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .expect("instance");
+            let disk = on_disk();
+            assert_eq!(
+                disk.acp_session_id.as_deref(),
+                Some("assigned-acp-id"),
+                "live={live}: the assigned id is kept for a later resume"
+            );
+            let expected = if live { Status::Idle } else { Status::Stopped };
+            assert_eq!(memory.status, expected, "live={live}");
+            assert_eq!(
+                memory.idle_dormant_since.is_some(),
+                !live,
+                "live={live}: only a live worker ends dormancy in memory"
+            );
+            assert_eq!(
+                disk.idle_dormant_since.is_some(),
+                !live,
+                "live={live}: only a live worker ends dormancy on disk"
+            );
+            listener.abort();
+            let _ = listener.await;
+        }
+    }
     /// End to end over `acp_event_listener` itself, the path that actually
     /// closes #3181. The predicate table and the TUI ownership tests all pass
     /// even if the snapshot is taken *after* `apply_status_intent`, the persist
@@ -2248,6 +2349,7 @@ mod tests {
             &mut inst,
             "seed",
             Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+            true,
         );
         assert!(
             inst.idle_dormant_since.is_none(),
@@ -2276,6 +2378,7 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+            true,
         );
 
         assert_eq!(inst.acp_session_id.as_deref(), Some("forked-child-id"));
@@ -2309,6 +2412,7 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Assigned("some-new-id".into())),
+            true,
         );
 
         assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
@@ -2340,6 +2444,7 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
+            true,
         );
 
         assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
@@ -2370,6 +2475,7 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Reset("session/load failed: gone".into())),
+            true,
         );
 
         assert_eq!(inst.acp_session_id, None, "reset clears the dead id");
@@ -2391,6 +2497,7 @@ mod tests {
             &mut inst,
             "seed",
             Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+            true,
         );
         assert!(
             persist.is_none(),
@@ -2424,7 +2531,7 @@ mod tests {
         inst.import_pending = Some(true);
 
         let profile =
-            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared), true);
 
         assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
         assert_eq!(
@@ -2455,7 +2562,7 @@ mod tests {
             inst.view = crate::session::View::Structured;
             inst.acp_session_id = Some("old-id".into());
             inst.resume_binding = Some(binding(provenance));
-            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id));
+            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id), true);
             assert_eq!(inst.resume_binding.is_some(), kept);
         }
     }
@@ -2471,10 +2578,11 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Assigned("old-id".into())),
+            true,
         );
         assert_eq!(inst.acp_session_id, Some("old-id".into()));
 
-        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared), true);
         assert_eq!(
             inst.acp_session_id, None,
             "a /clear after an assignment must not leave the old id on disk"
@@ -2491,6 +2599,7 @@ mod tests {
                 &mut inst,
                 "terminal",
                 Some(&AcpSessionChange::Assigned("acp-id".into())),
+                true,
             ),
             None
         );

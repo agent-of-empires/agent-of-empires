@@ -151,6 +151,10 @@ pub struct CreateSessionBody {
     /// Persisted replay key, retained until the created row is hard-deleted.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Make the new session a sub-session of this one, in its group. Sessions nest one
+    /// level deep, so the parent cannot itself be a sub-session.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
     /// Set on a retry: the `create_boot_id` of the daemon the first attempt went to. A
     /// daemon that does not know the key and did not take that attempt cannot tell
     /// whether it ran, so it refuses rather than run it, and its hooks, again.
@@ -1294,6 +1298,9 @@ pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
     pub workspace_ordering: Vec<String>,
+    /// Trashed rows in the whole snapshot, whatever the scope filtered out.
+    #[serde(default)]
+    pub trashed_count: usize,
 }
 
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with

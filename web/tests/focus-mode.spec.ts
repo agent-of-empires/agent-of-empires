@@ -223,7 +223,7 @@ for (const [how, expected] of [
     await page.setViewportSize({ width: 1280, height: 720 });
     let focused: Record<string, unknown> | null = {};
     await installSidebarMocks(page, { sessions: SESSIONS });
-    await page.route("**/api/sessions", (r) =>
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
       r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: {

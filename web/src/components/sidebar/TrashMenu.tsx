@@ -18,6 +18,9 @@ const DANGER = `${ACTION} gap-1.5 border-status-error/30 bg-status-error/10 text
 /** Footer Trash control; kept outside the filtered list so recovery stays reachable while a filter hides every row. */
 export function TrashMenu({
   trashedWorkspaces,
+  trashedCount,
+  loaded,
+  onLoad,
   readOnly,
   onOpen,
   onRestore,
@@ -25,6 +28,11 @@ export function TrashMenu({
   onEmptyTrash,
 }: {
   trashedWorkspaces: Workspace[];
+  /** Trashed sessions the daemon reports; shown until the rows load and the workspace count replaces it. */
+  trashedCount: number;
+  loaded: boolean;
+  /** Asks for the trash rows, which the session list omits. */
+  onLoad: () => void;
   readOnly?: boolean;
   onOpen: RowActivate;
   onRestore: (sessionIds: string[]) => void;
@@ -79,13 +87,18 @@ export function TrashMenu({
     };
   }, [open, positionPanel]);
 
-  const count = trashedWorkspaces.length;
+  // Sessions, the unit the daemon reports before the rows load, so the badge does not change meaning when Trash opens.
+  const loadedCount = trashedWorkspaces.reduce((sum, ws) => sum + ws.sessions.length, 0);
+  const count = loaded ? loadedCount : loadedCount || trashedCount;
 
   return (
     <div ref={ref} className="relative min-w-0 flex-1">
       <button
         onClick={() => {
-          if (!open) positionPanel();
+          if (!open) {
+            positionPanel();
+            onLoad();
+          }
           setOpen((o) => !o);
         }}
         aria-expanded={open}
@@ -128,7 +141,7 @@ export function TrashMenu({
                 <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                {!readOnly && (
+                {!readOnly && loaded && (
                   <button
                     type="button"
                     onClick={() => setConfirmEmpty(trashedWorkspaces)}

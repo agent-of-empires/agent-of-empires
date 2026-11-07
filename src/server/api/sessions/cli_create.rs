@@ -17,6 +17,46 @@ pub(crate) fn resolve_cli_session<'a>(
     Ok(*crate::cli::resolve_session(selector, &rows)?)
 }
 
+/// A `--parent` HTTP's create would refuse, with HTTP's code for it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CliParentRefused {
+    /// Missing, or trashed: HTTP answers both `parent_not_found`.
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    SubSession(String),
+}
+
+impl CliParentRefused {
+    pub(super) fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "parent_not_found",
+            Self::SubSession(_) => "parent_is_sub_session",
+        }
+    }
+}
+
+/// Resolves and checks a `--parent`. Runs while the request is resolved, before anything is
+/// provisioned, so a refusal leaves no worktree, branch or workspace behind.
+pub(crate) fn resolve_cli_parent<'a>(
+    rows: &'a [Instance],
+    profile: &str,
+    selector: &str,
+) -> std::result::Result<&'a Instance, CliParentRefused> {
+    let parent = resolve_cli_session(rows, profile, selector)
+        .map_err(|error| CliParentRefused::NotFound(error.to_string()))?;
+    if parent.is_trashed() {
+        return Err(CliParentRefused::NotFound(format!(
+            "Session '{}' is in the trash, so it can't be a parent. Restore it first.",
+            parent.title
+        )));
+    }
+    parent
+        .ensure_can_parent()
+        .map_err(|nested| CliParentRefused::SubSession(nested.to_string()))?;
+    Ok(parent)
+}
+
 pub(super) async fn resolve_cli_creation(
     state: &super::AppState,
     mut body: CreateSessionBody,
@@ -57,11 +97,7 @@ pub(super) async fn resolve_cli_creation(
     }
     if let Some(selector) = options.parent.as_deref() {
         let rows = state.instances.read().await;
-        let parent = resolve_cli_session(&rows, profile, selector)?;
-        anyhow::ensure!(
-            parent.parent_session_id.is_none(),
-            "Cannot create a sub-session of a sub-session"
-        );
+        let parent = resolve_cli_parent(&rows, profile, selector)?;
         body.group = parent.group_path.clone();
         options.parent = Some(parent.id.clone());
     }

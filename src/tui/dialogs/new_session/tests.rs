@@ -912,6 +912,7 @@ fn an_unset_hook_env_variable_warns_about_the_host_hook_not_the_container() {
 fn structured_view_setting_gates_the_offer_and_sets_the_default() {
     use crate::session::config::StructuredView;
     for (view, offered, starts_structured) in [
+        (StructuredView::Auto, true, false),
         (StructuredView::Off, false, false),
         (StructuredView::Terminal, true, false),
         (StructuredView::Structured, true, true),
@@ -924,6 +925,7 @@ fn structured_view_setting_gates_the_offer_and_sets_the_default() {
             starts_structured
         );
     }
+    assert_eq!(Config::default().acp.structured_view, StructuredView::Auto);
 }
 
 #[test]
