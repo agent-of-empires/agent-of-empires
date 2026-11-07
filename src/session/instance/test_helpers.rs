@@ -289,8 +289,9 @@ mode = "native_only"
 "#;
 
 /// Install the OMP declaration through the same plugin registry production uses.
-/// The app-dir guard drops before the registry reload, so the next test sees the
-/// caller's environment rather than this fixture.
+/// The guard owns the app dir, so `Drop` restores it before the registry reload
+/// and the next test sees the caller's environment rather than this fixture.
+#[must_use = "OmpTestPlugin restores the app dir and reloads the registry on Drop"]
 pub(crate) struct OmpTestPlugin {
     app: Option<crate::session::test_support::AppDirGuard>,
     reload: Option<crate::plugin::ReloadRegistryOnDrop>,
@@ -304,17 +305,44 @@ impl Drop for OmpTestPlugin {
 }
 
 pub(crate) fn install_omp_test_plugin() -> OmpTestPlugin {
-    let app = crate::session::test_support::isolate_app_dir();
-    let reload = install_omp_test_plugin_in_current_app();
+    install_omp_test_plugin_in_current_app(crate::session::test_support::isolate_app_dir())
+}
+
+/// Install the OMP declaration into an app dir the caller isolated for this
+/// test. The returned guard owns that app dir, so the registry reload reads the
+/// restored environment no matter how the caller binds its locals.
+pub(crate) fn install_omp_test_plugin_in_current_app(
+    app: crate::session::test_support::AppDirGuard,
+) -> OmpTestPlugin {
+    install_omp_test_plugin_config();
+    crate::plugin::reload_registry();
     OmpTestPlugin {
         app: Some(app),
-        reload: Some(reload),
+        reload: Some(crate::plugin::ReloadRegistryOnDrop),
     }
 }
 
-/// Install the OMP declaration into the caller's already-isolated app dir, for
-/// tests that own their `AppDirGuard` and must keep pointing at its paths.
-pub(crate) fn install_omp_test_plugin_in_current_app() -> crate::plugin::ReloadRegistryOnDrop {
+/// Install the OMP declaration into an app dir the caller already isolated.
+/// The caller owns restoration, so it owns the reload that must follow it.
+pub(crate) fn install_omp_test_plugin_in_caller_app() -> OmpTestPluginDeclaration {
+    install_omp_test_plugin_config();
+    crate::plugin::reload_registry();
+    OmpTestPluginDeclaration
+}
+
+pub(crate) struct OmpTestPluginDeclaration;
+
+impl Drop for OmpTestPluginDeclaration {
+    fn drop(&mut self) {
+        let _lock = crate::session::test_support::EnvGuard::unset(&[]);
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-test");
+        })
+        .ok();
+    }
+}
+
+fn install_omp_test_plugin_config() {
     use crate::session::{CapabilityGrant, PluginConfig};
 
     let plugin_id = "acme.omp-test";
@@ -337,8 +365,6 @@ pub(crate) fn install_omp_test_plugin_in_current_app() -> crate::plugin::ReloadR
         );
     })
     .unwrap();
-    crate::plugin::reload_registry();
-    crate::plugin::ReloadRegistryOnDrop
 }
 
 pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {
@@ -422,4 +448,38 @@ pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
     std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
     let binding = instance.asserted_resume_binding(sid, None).unwrap();
     instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_plugin_active() -> bool {
+        crate::plugin::registry()
+            .get("acme.omp-test")
+            .is_some_and(|plugin| plugin.active())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dropping_the_install_guard_restores_the_app_dir_before_reloading() {
+        let temporary = tempfile::tempdir().unwrap();
+        let plugin = install_omp_test_plugin_in_current_app(
+            crate::session::test_support::isolate_app_dir_at(temporary.path()),
+        );
+        assert!(
+            fixture_plugin_active(),
+            "the fixture is visible while isolated"
+        );
+        drop(plugin);
+        assert_ne!(
+            std::env::var_os("HOME"),
+            Some(temporary.path().as_os_str().to_owned()),
+            "the guard restores the app dir before it reloads"
+        );
+        assert!(
+            !fixture_plugin_active(),
+            "a reload before the restore would cache the temporary plugin and grant"
+        );
+    }
 }
