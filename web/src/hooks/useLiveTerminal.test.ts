@@ -543,6 +543,7 @@ describe("size owner", () => {
     vi.useFakeTimers();
     try {
       const { result, ws } = mount();
+      ws.deliver({ type: "size_owner", is_owner: true });
       ws.close = () => {
         ws.readyState = FakeWS.CLOSING;
       };
@@ -552,7 +553,13 @@ describe("size owner", () => {
 
       act(() => vi.advanceTimersByTime(1));
       expect(FakeWS.sockets).toHaveLength(2);
-      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
+      expect(result.current.state).toMatchObject({
+        connected: false,
+        isOwner: false,
+        ownerKnown: false,
+        reconnecting: false,
+        retryCount: 0,
+      });
 
       ws.readyState = FakeWS.CLOSED;
       act(() => ws.onclose?.(new CloseEvent("close")));

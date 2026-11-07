@@ -494,6 +494,7 @@ export function useLiveTerminal(
       retryTimerRef.current = setTimeout(() => {
         if (redialRef.current !== ws) return;
         redialRef.current = null;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
         connectRef.current?.();
       }, REDIAL_CLOSE_TIMEOUT_MS);
       ws.close();
