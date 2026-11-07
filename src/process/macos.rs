@@ -9,6 +9,90 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+
+/// Default reqwest system-proxy discovery ignores macOS proxy exceptions.
+/// Preserve explicit proxy and bypass settings, including empty values.
+pub(crate) fn apply_codex_loopback_bypass(cmd: &mut Command, overrides: &[(String, String)]) {
+    const EXPLICIT_KEYS: &[&str] = &[
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+    let explicit = overrides
+        .iter()
+        .any(|(key, _)| EXPLICIT_KEYS.contains(&key.as_str()))
+        || cmd
+            .get_envs()
+            .any(|(key, value)| value.is_some() && EXPLICIT_KEYS.iter().any(|name| key == *name));
+    if !explicit {
+        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1")
+            .env("no_proxy", "localhost,127.0.0.1,::1");
+    }
+}
+
+#[cfg(test)]
+mod codex_loopback_bypass_tests {
+    use super::*;
+
+    #[test]
+    fn codex_loopback_bypass_preserves_explicit_child_policy() {
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            for value in ["", "operator.example"] {
+                for carrier in [false, true] {
+                    let mut cmd = Command::new("unused");
+                    cmd.env_clear();
+                    let overrides = if carrier {
+                        vec![(key.to_string(), value.to_string())]
+                    } else {
+                        cmd.env(key, value);
+                        Vec::new()
+                    };
+                    let before: Vec<_> = cmd
+                        .get_envs()
+                        .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+                        .collect();
+                    apply_codex_loopback_bypass(&mut cmd, &overrides);
+                    let after: Vec<_> = cmd
+                        .get_envs()
+                        .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+                        .collect();
+                    assert_eq!(before, after, "{key}={value:?}, carrier={carrier}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_loopback_bypass_reaches_only_the_child() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear()
+            .env("HTTP_PROXY", "removed")
+            .env_remove("HTTP_PROXY")
+            .args(["-c", "printf '%s\\n%s' \"$NO_PROXY\" \"$no_proxy\""]);
+        apply_codex_loopback_bypass(&mut cmd, &[]);
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"localhost,127.0.0.1,::1\nlocalhost,127.0.0.1,::1"
+        );
+    }
+}
+
 /// Prove only the absence of the Linux scope backend on this kernel.
 /// Native process, worker and tmux custody must still pass their own guards.
 pub(super) fn legacy_scope_inventory_clear(
