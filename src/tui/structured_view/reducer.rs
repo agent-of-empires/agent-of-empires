@@ -533,6 +533,7 @@ mod tests {
         let mut t = AcpTranscript::new("s-1");
         let mut s = reduced(&[
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "go".into(),
                 attachments: vec![],
@@ -824,6 +825,7 @@ mod tests {
     #[test]
     fn context_primer_pending_tracks_the_newest_reset_or_prompt() {
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "go".into(),
             attachments: vec![],
@@ -936,6 +938,7 @@ mod tests {
         let mut t = AcpTranscript::new("s-1");
         let rows = server_rows(&[
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),

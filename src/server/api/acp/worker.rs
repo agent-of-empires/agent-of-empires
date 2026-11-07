@@ -3305,6 +3305,7 @@ mod tests {
             if code == "turn_active" {
                 state.acp_supervisor.test_insert_worker(&id).await;
                 let prompt = crate::acp::state::Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "still working".to_string(),
                     attachments: Vec::new(),
@@ -3555,6 +3556,7 @@ mod tests {
 
         let resets_at = Utc::now() - chrono::Duration::minutes(30);
         let prompt = || crate::acp::Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "continue the interrupted work".into(),
             attachments: Vec::new(),
             prompt_id: None,

@@ -3311,6 +3311,7 @@ time.sleep(60)
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "continue the original turn".into(),
                     attachments: vec![],
                     prompt_id: None,

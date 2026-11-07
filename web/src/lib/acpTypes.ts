@@ -415,6 +415,8 @@ export type AcpEvent =
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
+        /** Other queued rows a drain folded into this turn; each one's optimistic row is retired too. */
+        merged_prompt_ids?: string[];
       };
     }
   | {
@@ -1200,10 +1202,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    const merged = event.UserPromptSent.merged_prompt_ids ?? [];
     if (wasInflight) {
       next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
     } else {
       next.promptSeq += 1;
+    }
+    if (merged.length > 0) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => !merged.includes(id));
+      next.optimisticRows = next.optimisticRows.filter((r) => !merged.includes(r.id));
     }
     next.serverTurnActive = true;
     next.turnActive = true;

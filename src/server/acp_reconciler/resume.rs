@@ -881,6 +881,7 @@ mod tests {
         let id = "sess-3686-orphan";
         let (_home, state, _project) = test_state(id);
         let prompt = crate::acp::Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "keep going".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -986,6 +987,7 @@ mod tests {
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "original turn remains busy".into(),
                     attachments: vec![],
                     prompt_id: None,

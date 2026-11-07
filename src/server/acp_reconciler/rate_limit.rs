@@ -446,6 +446,7 @@ mod tests {
             },
         };
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,

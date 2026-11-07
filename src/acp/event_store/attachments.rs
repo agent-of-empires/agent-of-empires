@@ -122,6 +122,7 @@ mod tests {
 
     fn record_prompt_with_attachment(store: &EventStore, session_id: &str, id: &str) {
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "look at this".into(),
             attachments: vec![crate::daemon::PromptAttachmentRef {

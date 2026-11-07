@@ -1077,6 +1077,7 @@ mod tests {
         record(
             2,
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "go".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
