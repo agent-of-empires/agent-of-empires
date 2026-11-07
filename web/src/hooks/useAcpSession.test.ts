@@ -516,7 +516,8 @@ describe("sendPrompt outcomes", () => {
       (isParked: boolean): Route =>
       ({ url, method }) => {
         if (url.includes("/acp/replay")) {
-          const frames = isParked ? [{ session_id: `sess-${tag}`, seq: 1, event: { Stopped: { reason } } }] : [];
+          const sessionId = /\/sessions\/([^/]+)\//.exec(url)?.[1] ?? `sess-${tag}`;
+          const frames = isParked ? [{ session_id: sessionId, seq: 1, event: { Stopped: { reason } } }] : [];
           return json({ frames, lost: false, highest_seq: frames.length });
         }
         if (url.includes("/acp/prompt")) return new Response("worker_not_ready", { status: 503 });

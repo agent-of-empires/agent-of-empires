@@ -78,6 +78,33 @@ describe("canonical sent-prompt recovery", () => {
     expect(recovered.activity.map((row) => row.id)).toEqual(["old", "start-old-tool", "p1", "done-old-tool", "reply"]);
   });
 
+  it("restores a prompt before a genuine successor tool start", () => {
+    const tool: ActivityRow = {
+      id: "start-new-tool",
+      kind: "tool_start",
+      toolCallId: "new-tool",
+      text: "new tool",
+      at: "t",
+    };
+    const done: ActivityRow = { id: "done-new-tool", kind: "tool_complete", text: "done", at: "t" };
+    const state = { ...seed(), activity: [old, tool, done] };
+    const recovered = reducer(state, {
+      kind: "prompt_recovered",
+      id: "p1",
+      rows: [prompt, tool, done],
+      toolStartIds: ["new-tool"],
+    });
+    expect(recovered.activity.map((row) => row.id)).toEqual(["old", "p1", "start-new-tool", "done-new-tool"]);
+  });
+
+  it("does not duplicate a recovered canonical prompt when an overlapping older page is prepended", () => {
+    const state = reducer(seed(), { kind: "prompt_recovered", id: "p1", rows: [prompt, reply] });
+    const older: ActivityRow = { id: "older", kind: "message", text: "older", at: "t" };
+    const prepended = reducer(state, { kind: "prepend", rows: [older, prompt, prompt], oldestSeq: 1 });
+    expect(prepended.activity.map((row) => row.id)).toEqual(["older", "old", "p1", "reply"]);
+    expect(prepended.optimisticRows.map((row) => row.id)).toEqual(["p2"]);
+  });
+
   it("prunes an overlay replaced by a canonical older-history row", () => {
     const state = { ...seed(), oldestSeq: 20, activity: [reply] };
     const result = reducer(state, { kind: "prepend", rows: [prompt], oldestSeq: 10 });

@@ -3763,7 +3763,7 @@
         "web/src/hooks/acpSession/reducer.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "An acknowledged local prompt with a missed canonical row is recovered by prompt seq and canonical successor IDs, not by text or time. Live rows remain unchanged, late ACKs settle only their own send, retries are bounded and no prompt is resent. Normal row delivery needs no recovery. The browser fixture holds the live delta while preserving its row in replay, then verifies one user message before its reply and idempotent late delivery."
+      "notes": "An acknowledged local prompt with a missed canonical row is recovered by prompt seq and canonical successor IDs, not by text or time. Post-prompt raw tool starts attest genuine tool anchors; inferred prefix starts cannot move a new prompt before old tools. Recovery rechecks after optimistic-row commits and ignores fresh/late foreign ACKs. Older pages deduplicate canonical prompts while retaining tool reconciliation. Live rows remain unchanged, retries are bounded and no prompt is resent. Normal row delivery needs no recovery. The browser fixture holds the live delta while preserving its row in replay, then awaits a visible late-delta commit before checking order and uniqueness."
     },
     {
       "id": "acp.typing-keeps-transcript-pinned",

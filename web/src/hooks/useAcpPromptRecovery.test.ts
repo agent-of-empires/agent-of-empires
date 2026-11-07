@@ -93,6 +93,76 @@ describe("sent prompt transcript recovery", () => {
     },
   );
 
+  it.each([false, true])("a foreign ACK never settles this send (late ACK: %s)", async (lateAck) => {
+    let id = "";
+    const calls = installAcpFakes(({ url, body }) => {
+      if (!url.includes("/acp/prompt")) return undefined;
+      id = JSON.parse(body!).prompt_id;
+      return json({ disposition: "sent" }, 202);
+    });
+    const { result } = await open();
+    const count = calls.filter((call) => call.url.includes("/acp/replay")).length;
+    await act(() => result.current.sendPrompt("keep my send pending"));
+    if (lateAck)
+      lastSocket().message({ session_id: "prompt-recovery", seq: 10, event: { Stopped: { reason: "done" } } });
+    lastSocket().message({
+      session_id: "another-session",
+      seq: 1,
+      event: { UserPromptSent: { prompt_id: id, text: "keep my send pending" } },
+    });
+    await flushAsync();
+    expect(result.current.state.inflightPromptIds).toEqual([id]);
+    expect(result.current.state.optimisticRows).toMatchObject([{ id }]);
+    expect(calls.filter((call) => call.url.includes("/acp/replay"))).toHaveLength(count);
+  });
+
+  it("recovers when ACK and reply arrive before the optimistic-row commit", async () => {
+    let id = "";
+    let reads = 0;
+    installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        const socket = lastSocket();
+        socket.onmessage?.({
+          data: JSON.stringify({
+            session_id: "prompt-recovery",
+            seq: 101,
+            event: { UserPromptSent: { prompt_id: id, text: "batched send" } },
+          }),
+        } as MessageEvent);
+        socket.onmessage?.({
+          data: JSON.stringify({
+            session_id: "prompt-recovery",
+            seq: 102,
+            event: { AgentMessageChunk: { text: reply.text } },
+          }),
+        } as MessageEvent);
+        socket.onmessage?.({
+          data: JSON.stringify({ kind: "transcript_delta", delta: { Append: reply } }),
+        } as MessageEvent);
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (id && params.get("since") === "100" && params.get("view") === "rows") {
+        reads += 1;
+        return json({
+          frames: [],
+          rows: [{ id, kind: "user_prompt", text: "batched send", at: "t" }, reply],
+          highest_seq: 102,
+          lost: false,
+        });
+      }
+      return json({ frames: [], rows: [old], highest_seq: 100, next_cursor: 100, lost: false, has_more: false });
+    });
+    const { result } = await open();
+    await act(() => result.current.sendPrompt("batched send"));
+    await flushAsync();
+    expect(reads).toBe(1);
+    expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, id, reply.id]);
+    expect(result.current.state.optimisticRows).toEqual([]);
+  });
+
   it("ignores an in-flight recovery from the previous session even when its fetch ignores abort", async () => {
     let id = "";
     let release!: (response: Response) => void;
@@ -144,6 +214,46 @@ describe("sent prompt transcript recovery", () => {
     await flushAsync();
     expect(hook.result.current.state.activity).toEqual(before.activity);
     expect(hook.result.current.state.optimisticRows).toEqual([]);
+  });
+
+  it("recovers before a genuine tool-start successor attested by a post-prompt raw event", async () => {
+    let id = "";
+    const tool = { id: "new-tool", name: "Read", kind: "read", args_preview: "{}", started_at: "2026-01-01T00:00:02Z" };
+    const start = { id: "start-new-tool", kind: "tool_start", tool_call_id: tool.id, tool, text: "Read", at: "t" };
+    const done = { id: "done-new-tool", kind: "tool_complete", tool_call_id: tool.id, text: "done", at: "t" };
+    installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (id && params.get("since") === "100" && params.get("view") === "rows")
+        return json({
+          rows: [{ id, kind: "user_prompt", text: "read next", at: "t" }, start, done],
+          highest_seq: 103,
+          lost: false,
+        });
+      return json({ frames: [], rows: [old], highest_seq: 100, next_cursor: 100, has_more: false, lost: false });
+    });
+    const { result } = await open();
+    await act(() => result.current.sendPrompt("read next"));
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 101,
+      event: { UserPromptSent: { prompt_id: id, text: "read next" } },
+    });
+    lastSocket().message({ session_id: "prompt-recovery", seq: 102, event: { ToolCallStarted: { tool_call: tool } } });
+    lastSocket().message({ kind: "transcript_delta", delta: { Append: start } });
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 103,
+      event: { ToolCallCompleted: { tool_call_id: tool.id, is_error: false, content: "done" } },
+    });
+    lastSocket().message({ kind: "transcript_delta", delta: { Append: done } });
+    await flushAsync();
+    expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, id, start.id, done.id]);
+    expect(result.current.state.optimisticRows).toEqual([]);
   });
 
   it("bounds failed recovery to three attempts and never resends or hides the prompt", async () => {

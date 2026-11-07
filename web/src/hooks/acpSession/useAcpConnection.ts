@@ -69,6 +69,7 @@ export function acpSocketProtocols(): string[] {
   return protocols;
 }
 
+/** Maintain a session-scoped connection and bounded recovery without resending user prompts. */
 export function useAcpConnection(
   sessionId: string | null,
   sessionIdRef: RefObject<string | null>,
@@ -89,6 +90,7 @@ export function useAcpConnection(
   const oldestSeqRef = useLatestRef(state.oldestSeq);
   const optimisticRowsRef = useLatestRef(state.optimisticRows);
   const activityRef = useLatestRef(state.activity);
+  const promptRecoveryCheckRef = useRef<(() => void) | null>(null);
   const hasMoreOlderRef = useLatestRef(hasMoreOlder);
   const loadingOlderRef = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -258,13 +260,16 @@ export function useAcpConnection(
       (cached?.activity ?? []).filter((row) => row.kind === "user_prompt").map((row) => row.id),
     );
     const recoveryAttempts = new Map<string, number>();
+    const toolStartSeqs = new Map<string, number>();
     let latestFrameSeq = cached?.lastSeq ?? 0;
     let promptRecovery: AbortController | null = null;
     let promptRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
     const observePromptFrame = (frame: AcpFrame) => {
       if (frame.session_id !== sessionId || !Number.isSafeInteger(frame.seq) || frame.seq < 0) return;
       latestFrameSeq = Math.max(latestFrameSeq, frame.seq);
-      if (typeof frame.event !== "object" || !("UserPromptSent" in frame.event)) return;
+      if (typeof frame.event !== "object") return;
+      if ("ToolCallStarted" in frame.event) toolStartSeqs.set(frame.event.ToolCallStarted.tool_call.id, frame.seq);
+      if (!("UserPromptSent" in frame.event)) return;
       const prompt = frame.event.UserPromptSent;
       if (prompt.prompt_id && !prompt.synthesized && !promptRows.has(prompt.prompt_id))
         promptEchoes.set(prompt.prompt_id, frame.seq);
@@ -319,7 +324,8 @@ export function useAcpConnection(
         )
           return;
         const rows = toActivityRows(page.rows ?? [], sessionId);
-        dispatch({ kind: "prompt_recovered", id: pending.id, rows });
+        const toolStartIds = [...toolStartSeqs].filter(([, startedSeq]) => startedSeq > seq).map(([id]) => id);
+        dispatch({ kind: "prompt_recovered", id: pending.id, rows, toolStartIds });
       })()
         .catch(() => {})
         .finally(() => {
@@ -337,6 +343,8 @@ export function useAcpConnection(
         });
     };
 
+    promptRecoveryCheckRef.current = recoverMissingPrompt;
+
     const startReplay = (): { done: Promise<void>; abort: () => void; delivered: () => boolean } => {
       replayAbortRef.current?.abort();
       const controller = new AbortController();
@@ -348,8 +356,11 @@ export function useAcpConnection(
       const track: Dispatch<Action> = (action) => {
         if (action.kind === "frames") {
           if (action.frames.some((frame) => frame.seq > startSeq)) delivered = true;
-          action.frames.forEach(observePromptFrame);
+          const frames = action.frames.filter((frame) => frame.session_id === sessionId);
+          frames.forEach(observePromptFrame);
           if (action.rows) observePromptRows(action.rows);
+          dispatch({ ...action, frames });
+          return;
         }
         dispatch(action);
       };
@@ -402,6 +413,7 @@ export function useAcpConnection(
       if (typeof data === "object" && data !== null && "session_id" in data && "event" in data) {
         lastActivityRef.current = Date.now();
         const frame = data as AcpFrame;
+        if (frame.session_id !== sessionId) return;
         observePromptFrame(frame);
         dispatch({ kind: "frame", frame });
         recoverMissingPrompt();
@@ -493,6 +505,7 @@ export function useAcpConnection(
 
     return () => {
       cancelled = true;
+      promptRecoveryCheckRef.current = null;
       cancelPromptRecovery();
       dialGenRef.current += 1;
       replayAbortRef.current?.abort();
@@ -503,6 +516,11 @@ export function useAcpConnection(
       connectRef.current = null;
     };
   }, [sessionId, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef, optimisticRowsRef, activityRef]);
+
+  // ACKs may precede the local overlay's commit, so frame-time checks alone are insufficient.
+  useEffect(() => {
+    promptRecoveryCheckRef.current?.();
+  }, [state.optimisticRows]);
 
   const manualReconnect = useCallback(() => {
     setReconnecting(false);

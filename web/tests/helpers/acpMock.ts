@@ -49,7 +49,8 @@ export interface AcpSessionMock {
   telemetryPings: Array<{ surface?: string }>;
   /** Deliver events as frames, buffered until the WS connects. */
   pushEvents: (events: unknown[]) => void;
-  releasePromptTranscript: () => void;
+  /** Override text to make a late delta's React commit observable. */
+  releasePromptTranscript: (text?: string) => void;
 }
 
 /**
@@ -124,6 +125,7 @@ function foldEventToRow(event: unknown, seq: number, nextGroup: () => string, op
   return null;
 }
 
+/** Provide ordered REST/WS session history, optionally holding live prompt rows for recovery tests. */
 export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {}): Promise<AcpSessionMock> {
   const sessionId = opts.sessionId ?? "sess-1";
   const title = opts.title ?? "acp-mock";
@@ -160,8 +162,12 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     configOptionBodies: [],
     telemetryPings: [],
     pushEvents,
-    releasePromptTranscript: () => {
-      for (const payload of heldPromptTranscript.splice(0)) ws?.send(payload);
+    releasePromptTranscript: (text) => {
+      for (const payload of heldPromptTranscript.splice(0)) {
+        const delta = JSON.parse(payload);
+        if (text !== undefined) delta.delta.Append.text = text;
+        ws?.send(JSON.stringify(delta));
+      }
     },
   };
 

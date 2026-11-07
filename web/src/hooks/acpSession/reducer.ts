@@ -36,7 +36,7 @@ export type Action =
   | { kind: "transcript_append"; row: ActivityRow }
   | { kind: "transcript_patch"; row: ActivityRow }
   | { kind: "transcript_remove"; id: string }
-  | { kind: "prompt_recovered"; id: string; rows: ActivityRow[] }
+  | { kind: "prompt_recovered"; id: string; rows: ActivityRow[]; toolStartIds?: string[] }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected"; id: string }
@@ -141,6 +141,7 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
   return { ...state, queuedPrompts: merged.concat(stillPending) };
 }
 
+/** Reconcile server rows and local sends by identity, preserving authoritative controls and live output. */
 export function reducer(state: AcpState, action: Action): AcpState {
   switch (action.kind) {
     case "frame": {
@@ -165,7 +166,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // Older history only adds rows; control state is not a pure fold and must not be touched.
       const next = { ...state, oldestSeq: action.oldestSeq };
       if (action.rows.length === 0) return next;
-      return withServerRows(next, mergePrependedActivity(action.rows, state.activity));
+      const promptIds = new Set(state.activity.filter((row) => row.kind === "user_prompt").map((row) => row.id));
+      const rows = action.rows.filter((row) => {
+        if (row.kind !== "user_prompt") return true;
+        if (promptIds.has(row.id)) return false;
+        promptIds.add(row.id);
+        return true;
+      });
+      return withServerRows(next, mergePrependedActivity(rows, state.activity));
     }
     case "prompt_recovered": {
       const known = state.optimisticRows
@@ -174,12 +182,12 @@ export function reducer(state: AcpState, action: Action): AcpState {
       if (!known) return state;
       const index = action.rows.findIndex((row) => row.id === action.id && row.kind === "user_prompt");
       if (index < 0) return state;
-      // Only the ordered replay can prove where this prompt belongs. An ACK alone cannot.
-      // A partial replay can synthesize a prefix tool's start beside a later completion.
+      // Raw post-prompt starts distinguish genuine successors from replay-inferred prefix starts.
+      const toolStarts = new Set(action.toolStartIds);
       const following = new Set(
         action.rows
           .slice(index + 1)
-          .filter((row) => row.kind !== "tool_start")
+          .filter((row) => row.kind !== "tool_start" || toolStarts.has(row.toolCallId ?? ""))
           .map((row) => row.id),
       );
       const withoutPrompt = state.activity.filter((row) => row.id !== action.id);

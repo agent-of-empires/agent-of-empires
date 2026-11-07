@@ -45,7 +45,9 @@ test("a sent prompt recovers before its reply when its live transcript delta was
     await expect.poll(() => requests).toBe(1);
     releaseRecovery();
     await expect.poll(order).toEqual(["assistant-msg-1", promptId, "assistant-msg-4"]);
-    mock.releasePromptTranscript();
+    const committedText = "The late canonical transcript delta committed.";
+    mock.releasePromptTranscript(committedText);
+    await expect(viewport.locator(`[data-message-id="${promptId}"]`)).toContainText(committedText);
     await expect.poll(order).toEqual(["assistant-msg-1", promptId, "assistant-msg-4"]);
     await expect(viewport.locator(`[data-message-id="${promptId}"]`)).toHaveCount(1);
     expect(mock.promptBodies).toHaveLength(1);
