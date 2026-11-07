@@ -406,6 +406,20 @@ thread_local! {
     pub(super) static FAIL_NEXT_NATIVE_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// What tests see instead of the host's Codex preferences.
+    pub(super) static CODEX_MANAGED_PREFERENCES_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `cfg!` rather than `#[cfg]`, so each build still references both sources.
+fn codex_managed_preferences_present() -> bool {
+    if cfg!(test) {
+        CODEX_MANAGED_PREFERENCES_PRESENT.with(std::cell::Cell::get)
+    } else {
+        crate::process::codex_managed_preferences_present()
+    }
+}
+
 const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
     "SAVE_DIR",
     "SESSION_PREFIX",
@@ -437,27 +451,39 @@ pub(super) struct NativeExecution {
     pub(super) store_override: Option<(PathBuf, PathBuf, &'static str)>,
 }
 
+/// The native program in its resolved environment, with `routing` applied.
+fn native_host_command(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+    raw_environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    environment: &std::collections::HashMap<String, String>,
+    routing: &[(String, Option<String>)],
+) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .current_dir(cwd)
+        .env_clear()
+        .envs(raw_environment.iter().map(|(key, value)| (key, value)))
+        .envs(environment);
+    for (key, value) in routing {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 impl NativeExecution {
     pub(super) fn host_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new(&self.program);
-        command
-            .current_dir(&self.inputs.cwd)
-            .env_clear()
-            .envs(
-                self.inputs
-                    .raw_environment
-                    .iter()
-                    .map(|(key, value)| (key, value)),
-            )
-            .envs(&self.inputs.environment);
-        for (key, value) in &self.routing {
-            if let Some(value) = value {
-                command.env(key, value);
-            } else {
-                command.env_remove(key);
-            }
-        }
-        command
+        native_host_command(
+            &self.program,
+            &self.inputs.cwd,
+            &self.inputs.raw_environment,
+            &self.inputs.environment,
+            &self.routing,
+        )
     }
 
     pub(super) fn validate_opencode_session_target(&self, sid: &str) -> Result<()> {
@@ -1591,6 +1617,52 @@ impl OpenCodeSessionSchema {
 #[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
 
+/// Environment that routes Codex away from its local store.
+pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
+    "CODEX_EXEC_SERVER_URL",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+];
+
+/// A Codex context AoE cannot attest. Credentials, and a macOS preference
+/// domain with no Codex configuration values, do not change where an exact id
+/// resolves, so with a `store` a Default resume may still prove its rollout
+/// there. Routing AoE cannot read, including set preference values, leaves
+/// `store` empty.
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub(super) struct UnattestedCodexPolicy {
+    reason: String,
+    /// What an unpinned host launch runs, when a local rollout can prove its store.
+    store: Option<UnpinnedCodexLaunch>,
+    cwd: PathBuf,
+}
+
+/// The executable and store routing an unpinned Codex resume keeps, as the
+/// pinned path would have frozen them.
+#[derive(Clone, Debug)]
+pub(super) struct UnpinnedCodexLaunch {
+    pub(super) home: PathBuf,
+    pub(super) program: PathBuf,
+    pub(super) routing: Vec<(String, Option<String>)>,
+    cwd: PathBuf,
+    raw_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    environment: std::collections::HashMap<String, String>,
+}
+
+impl UnpinnedCodexLaunch {
+    pub(super) fn host_command(&self) -> std::process::Command {
+        native_host_command(
+            &self.program,
+            &self.cwd,
+            &self.raw_environment,
+            &self.environment,
+            &self.routing,
+        )
+    }
+}
+
 fn opencode_session_row(
     connection: &rusqlite::Connection,
     sid: &str,
@@ -1946,31 +2018,33 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
-                // A host single-shot launch is deliberately left unmanaged:
-                // the refusal below only governs managed resume and fork, where
-                // an unattested preference surface could redirect the
-                // conversation this pin claims to continue.
-                anyhow::ensure!(inputs.container.is_some() || !crate::process::HAS_CODEX_MANAGED_PREFERENCES, "Codex managed preferences cannot be attested by the local file contract");
-                for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
-                    anyhow::ensure!(value(key).is_none(), "managed Codex does not support {key}");
+                let unverifiable = |reason: String| UnattestedCodexPolicy {
+                    reason,
+                    store: None,
+                    cwd: inputs.cwd.clone(),
+                };
+                for key in CODEX_ROUTING_ENV_KEYS {
+                    anyhow::ensure!(value(key).is_none(), unverifiable(format!("managed Codex does not support {key}")));
                     routing.push((key.into(), None));
                 }
                 let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".codex"))))?;
                 let location = inputs.physical_location(&root);
-                anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), "managed Codex requires an existing local CODEX_HOME");
+                anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), unverifiable("managed Codex requires an existing local CODEX_HOME".into()));
                 for file in [PathBuf::from("/etc/codex/requirements.toml"), PathBuf::from("/etc/codex/managed_config.toml")] {
-                    anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), "Codex managed requirements require an independently attested namespace");
+                    anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), unverifiable("Codex managed requirements require an independently attested namespace".into()));
                     configuration.push(file);
                 }
                 let mut sqlite = value("CODEX_SQLITE_HOME").filter(|value| !value.trim().is_empty()).map(|value| absolute(PathBuf::from(value.trim()))).unwrap_or_else(|| root.clone());
+                // Reported after the routing checks, which it must not pre-empt.
+                let mut external_auth = false;
                 let user_config = root.join("config.toml");
                 for file in [PathBuf::from("/etc/codex/config.toml"), user_config.clone()] {
                     if let Some(bytes) = inputs.read_native_file(&file)? {
                         let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-                        anyhow::ensure!(!settings.contains_key("profile"), "managed Codex does not support a selected configuration profile");
-                        anyhow::ensure!(settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file")), "Codex keyring and external authentication do not attest a local namespace");
-                        anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), "managed Codex requires its durable local thread store");
+                        anyhow::ensure!(!settings.contains_key("profile"), unverifiable("managed Codex does not support a selected configuration profile".into()));
+                        external_auth |= !settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file"));
+                        anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), unverifiable("managed Codex requires its durable local thread store".into()));
                         if let Some(path) = settings.get("sqlite_home") {
                             let path = PathBuf::from(path.as_str().context("Codex sqlite_home must be a path")?);
                             sqlite = if path.is_absolute() { path } else { file.parent().unwrap().join(path) };
@@ -1983,18 +2057,51 @@ impl Instance {
                     if file == user_config { continue; }
                     if let Some(bytes) = inputs.read_native_file(&file)? {
                         let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-                        anyhow::ensure!(["sqlite_home", "experimental_thread_store", "cli_auth_credentials_store", "profile"].iter().all(|key| !settings.contains_key(*key)), "Codex project routing requires its native trust and profile resolution");
+                        anyhow::ensure!(["sqlite_home", "experimental_thread_store", "cli_auth_credentials_store", "profile"].iter().all(|key| !settings.contains_key(*key)), unverifiable("Codex project routing requires its native trust and profile resolution".into()));
                     }
                     configuration.push(file);
                 }
+                let unattested_policy = |reason: &str| UnattestedCodexPolicy {
+                    reason: reason.to_owned(),
+                    store: (inputs.container.is_none() && declared.is_none())
+                        .then(|| {
+                            let sqlite = inputs.canonical_path(&sqlite).ok()?;
+                            let routing = [("CODEX_HOME", root.to_str()?), ("CODEX_SQLITE_HOME", sqlite.to_str()?)]
+                                .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
+                                .into_iter()
+                                .chain(CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)))
+                                .collect();
+                            Some(UnpinnedCodexLaunch {
+                                home: root.clone(),
+                                program: program.clone(),
+                                routing,
+                                cwd: inputs.cwd.clone(),
+                                raw_environment: inputs.raw_environment.clone(),
+                                environment: inputs.environment.clone(),
+                            })
+                        })
+                        .flatten(),
+                    cwd: inputs.cwd.clone(),
+                };
+                let managed_preferences = inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES;
+                // Codex preference values may route the store; their absence only leaves policy unread.
+                anyhow::ensure!(!(managed_preferences && codex_managed_preferences_present()), unverifiable("Codex managed preferences are set and cannot be attested by the local file contract".into()));
+                anyhow::ensure!(!external_auth, unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
+                // A host single-shot launch is deliberately left unmanaged: this
+                // only governs managed resume and fork.
+                if managed_preferences {
+                    bail!(unattested_policy("Codex managed preferences cannot be attested by the local file contract"));
+                }
                 let auth_file = root.join("auth.json");
                 let Some(bytes) = inputs.read_native_file(&auth_file)? else {
-                    bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
+                    bail!(unattested_policy("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run"));
                 };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
-                anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
+                if !(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key (a ChatGPT login cannot be attested, because it may select cloud-managed requirements); replace the credentials with an OpenAI API key (OPENAI_API_KEY, no ChatGPT tokens) in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty())) {
+                    bail!(unattested_policy("Codex is not authenticated with a local OpenAI API key (a ChatGPT login cannot be attested, because it may select cloud-managed requirements); replace the credentials with an OpenAI API key (OPENAI_API_KEY, no ChatGPT tokens) in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run"));
+                }
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2476,6 +2583,32 @@ impl Instance {
         })
     }
 
+    /// The store a Default Codex resume reads without a pinned execution, when
+    /// it stays on this project's conversation: an exact UUID whose rollout records this cwd.
+    pub(super) fn unpinned_codex_resume_store<'a>(
+        error: &'a anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> Option<&'a UnpinnedCodexLaunch> {
+        let UnattestedCodexPolicy {
+            store: Some(store),
+            cwd,
+            ..
+        } = error.downcast_ref()?
+        else {
+            return None;
+        };
+        (binding.is_none_or(|binding| {
+            binding.session_id == sid
+                && binding.execution.as_ref().is_none_or(|execution| {
+                    execution.agent == "codex"
+                        && execution.filesystem == "host"
+                        && execution.stores.first() == Some(&store.home)
+                })
+        }) && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, cwd))
+        .then_some(store)
+    }
+
     /// Whether two executions describe one context.
     ///
     /// Host paths compare by local filesystem identity. Paths in every other
@@ -2843,19 +2976,22 @@ impl Instance {
         &self,
         command: String,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
         launch_context: &AgentLaunchContext<'_>,
     ) -> Result<String> {
-        let Some(execution) = execution else {
+        let Some(program) = execution
+            .map(|execution| &execution.program)
+            .or(unpinned.map(|unpinned| &unpinned.program))
+        else {
             return Ok(command);
         };
         let mut words = shell_words::split(&command)?;
-        *words.first_mut().context("native program is missing")? = execution
-            .program
+        *words.first_mut().context("native program is missing")? = program
             .to_str()
             .context("native executable path is not UTF-8")?
             .to_owned();
         // A shared service may have opened a different database.
-        if execution.agent.name == "opencode" {
+        if execution.is_some_and(|execution| execution.agent.name == "opencode") {
             match launch_context.generation() {
                 crate::agents::AgentGeneration::Current => words.push("--standalone".into()),
                 crate::agents::AgentGeneration::Legacy => {},
@@ -2979,7 +3115,14 @@ impl Instance {
         .unwrap_or_else(|| {
             self.resolve_native_execution(None)
                 .map(|execution| execution.binding)
-                .context("aoe session set-session-id cannot resolve the native execution identity for this context")
+                .map_err(|error| {
+                    let context = if error.is::<UnattestedCodexPolicy>() {
+                        "aoe session set-session-id cannot bind a Codex conversation in this context; clear it with set-session-id <session> \"\", restart, and run /resume <native-id> in Codex"
+                    } else {
+                        "aoe session set-session-id cannot resolve the native execution identity for this context"
+                    };
+                    error.context(context)
+                })
         })?;
         anyhow::ensure!(
             crate::agents::get_agent(&execution.agent)
