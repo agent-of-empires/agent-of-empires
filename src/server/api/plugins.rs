@@ -1257,9 +1257,13 @@ mod tests {
         assert!(built.exists());
         assert!(node_calls.exists());
         let entry = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
-        assert_eq!(entry.source.as_deref(), Some(input));
         assert!(entry.dev);
         assert!(entry.grant.is_some());
+        let recorded_source = entry.source.unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&recorded_source).unwrap(),
+            source.path().canonicalize().unwrap()
+        );
 
         write("3.0.0", false);
         let response =
@@ -1284,7 +1288,7 @@ mod tests {
             PluginJobStatus::Succeeded
         ));
         let entry = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
-        assert_eq!(entry.source.as_deref(), Some(input));
+        assert_eq!(entry.source, Some(recorded_source));
         assert!(entry.dev);
         assert_eq!(
             plugin::lockfile::Lockfile::load()
