@@ -136,6 +136,7 @@ import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
+import { TrashReadFailed } from "./components/TrashReadFailed";
 import { ContentSplit } from "./components/ContentSplit";
 import { StructuredSessionStack } from "./components/StructuredSessionStack";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -415,6 +416,7 @@ function AppContent({
     loaded: sessionsLoaded,
     trashedCount,
     trashLoaded,
+    trashError,
     loadTrash,
     injectSession,
     setSessionStatus,
@@ -460,6 +462,8 @@ function AppContent({
   // An opened session missing from the list is neither gone nor trashed until the trash read has landed.
   const openedSessionSettled =
     sessionsLoaded && (trashLoaded || error || !openedSessionId || sessions.some((s) => s.id === openedSessionId));
+  // A failed Trash read leaves the opened session unread: not settled, and not gone either.
+  const openedSessionUnread = !openedSessionSettled && trashError;
 
   // What this window notices: a focus-mode window ignores every other session's attention and sounds.
   const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
@@ -2270,6 +2274,9 @@ function AppContent({
     // reappears once the fetch lands. Hold the minimal pre-auth shell
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
+    if (activeSessionId && openedSessionUnread) {
+      return <TrashReadFailed onRetry={loadTrash} />;
+    }
     if (activeSessionId && !openedSessionSettled) {
       // The shell (TopBar + sidebar) already renders around this; fill the main
       // pane with a skeleton rather than blanking it until the first fetch lands.
