@@ -853,6 +853,16 @@ fn config_root(
     .ok()
 }
 
+/// The config root `tool` reads for this host session, which identifies the account behind it.
+/// `None` for a sandboxed row (its store is per container) or an unresolvable root.
+pub(crate) fn host_account_root(instance: &Instance, profile: &str, tool: &str) -> Option<PathBuf> {
+    if instance.is_sandboxed() {
+        return None;
+    }
+    let agent = crate::session::resolved_agent_for(profile, tool, &instance.detect_as)?;
+    config_root(instance, profile, tool, agent, &dirs::home_dir()?)
+}
+
 /// Every `projects/<encoded-cwd>/<sid>.jsonl` under `root`.
 ///
 /// The encoded directory is derived from the cwd the agent ran in, which for a

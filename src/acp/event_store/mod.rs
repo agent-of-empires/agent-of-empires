@@ -1,5 +1,6 @@
 //! Disk-backed event log for structured view sessions.
 
+mod account_limits;
 mod attachments;
 mod rate_limit;
 mod replay;
@@ -17,6 +18,7 @@ use tracing::{debug, trace, warn};
 use super::state::Event;
 use crate::events;
 
+pub use account_limits::AccountState;
 pub use attachments::AttachmentBlob;
 pub use rate_limit::RateLimitPark;
 pub use replay::ReplayPage;
@@ -82,6 +84,8 @@ impl EventStore {
         // Prefix "acp" maps to the existing acp_events / acp_attachments tables.
         let schema = events::Schema::new("acp")?;
         let conn = events::open(db_path, &schema)?;
+        conn.execute_batch(&account_limits::create_table_sql())
+            .context("create account limits table")?;
         let search_conn = Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
