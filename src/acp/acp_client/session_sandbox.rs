@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
 use super::spawn::{
-    adapter_default_env_pairs, allowlisted_env_pairs, is_host_only_path_env,
-    request_env_denyreason, SpawnConfig,
+    adapter_default_env_pairs, allowlisted_env_pairs, allowlisted_env_pairs_for,
+    is_host_only_path_env, request_env_denyreason, SpawnConfig,
 };
 
 /// Sandbox handles a connection task needs to route ACP fs/* and
@@ -152,24 +152,21 @@ pub(super) fn build_sandbox_docker_argv(
     // host-only paths (which name nothing inside the container) never cross.
     // docker forwards only a name handed to it via `-e`, so the value is set on
     // the runner via `inherit_env` and the key alone goes in the argv.
-    let request_auth = config
-        .provider_env
-        .iter()
-        .filter(|&(key, _)| request_env_denyreason(key).is_none())
-        .cloned();
-    let adapter_allowlist = allowlisted_env_pairs(config);
-    let adapter_defaults = adapter_default_env_pairs(config);
-    for (key, value) in request_auth
-        .chain(adapter_allowlist)
-        .chain(adapter_defaults)
-    {
-        if forwards_into_container(&key) {
-            if seen_keys.insert(key.clone()) {
-                docker_args.push("-e".into());
-                docker_args.push(key.clone());
-                inherit_env.push((key, value));
-            }
-        } else if seen_keys.insert(key.clone()) {
+    for ClaimedEnv {
+        key,
+        value,
+        forwards,
+    } in claim_launch_env(
+        &mut seen_keys,
+        &config.provider_env,
+        allowlisted_env_pairs(config),
+        adapter_default_env_pairs(config),
+    ) {
+        if forwards {
+            docker_args.push("-e".into());
+            docker_args.push(key.clone());
+            inherit_env.push((key, value));
+        } else {
             // Only a key the sandbox env did not already claim is really
             // dropped: one `docker_env_args` inlined keeps its value in argv,
             // so logging here would cry over a variable that crossed.
@@ -201,6 +198,68 @@ pub(super) fn build_sandbox_docker_argv(
         exec_prefix_len,
         inherit_env,
     })
+}
+
+/// One variable a sandboxed launch claims from the request or the adapter allowlist.
+pub(super) struct ClaimedEnv {
+    pub(super) key: String,
+    pub(super) value: String,
+    /// `false` for a host-only path, which the launch drops instead of forwarding.
+    pub(super) forwards: bool,
+}
+
+/// The variables a sandboxed launch takes beyond the sandbox environment, in claim order:
+/// the request's `provider_env` (minus denied keys), then the adapter allowlist. `claimed`
+/// holds the keys already taken, the sandbox environment's among them; the first claim of a
+/// key wins even when its value is empty, so a later source never fills it in. `defaults` are
+/// AoE's own adapter defaults, claimed last so any explicit value wins. The one resolution
+/// shared by the launch's argv and the launch-authentication admission.
+pub(super) fn claim_launch_env(
+    claimed: &mut std::collections::HashSet<String>,
+    request: &[(String, String)],
+    allowlist: Vec<(String, String)>,
+    defaults: Vec<(String, String)>,
+) -> Vec<ClaimedEnv> {
+    let request = request
+        .iter()
+        .filter(|&(key, _)| request_env_denyreason(key).is_none())
+        .cloned();
+    request
+        .chain(allowlist)
+        .chain(defaults)
+        .filter(|(key, _)| claimed.insert(key.clone()))
+        .map(|(key, value)| ClaimedEnv {
+            forwards: forwards_into_container(&key),
+            key,
+            value,
+        })
+        .collect()
+}
+
+/// The environment a sandboxed launch of an adapter with `allowlist` runs with, as far as its
+/// authentication is concerned: `sandbox_env` first, then what `claim_launch_env` forwards
+/// of the request's `provider_env` and the allowlisted host variables the daemon has set.
+/// Resolved in memory for the admission check; the request's values are never stored.
+pub fn effective_launch_env(
+    sandbox_env: &[crate::containers::EnvEntry],
+    request: &[(String, String)],
+    allowlist: Option<&[String]>,
+) -> Vec<crate::containers::EnvEntry> {
+    let mut claimed = sandbox_env.iter().map(|e| e.key().to_string()).collect();
+    // AoE's adapter defaults carry no authentication, so they take no part in the admission.
+    let forwarded = claim_launch_env(
+        &mut claimed,
+        request,
+        allowlisted_env_pairs_for(allowlist),
+        Vec::new(),
+    )
+    .into_iter()
+    .filter(|c| c.forwards)
+    .map(|c| crate::containers::EnvEntry::Inherit {
+        key: c.key,
+        value: c.value,
+    });
+    sandbox_env.iter().cloned().chain(forwarded).collect()
 }
 
 /// A path-valued key names nothing inside the container, so a sandboxed launch

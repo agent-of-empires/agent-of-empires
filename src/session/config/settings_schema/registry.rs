@@ -232,6 +232,7 @@ mod tests {
         for (section, field, expected) in [
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("sandbox", "shared_credential", RepoPolicy::Deny),
             ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),
