@@ -1320,6 +1320,7 @@ mod tests {
                 extra_args: String::new(),
                 command_override: String::new(),
                 extra_repo_paths: Vec::new(),
+                workspace: false,
                 repo_base_branches: Vec::new(),
                 scratch: false,
                 trust_hooks: None,
@@ -1348,6 +1349,7 @@ mod tests {
                     fork_source: None,
                     generated_name: false,
                     no_submodules: false,
+                    workspace: None,
                     worktree_path_id: None,
                 }),
             };
