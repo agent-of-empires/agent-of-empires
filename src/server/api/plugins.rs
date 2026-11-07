@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{api_error, AppState};
+use crate::daemon::{
+    ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
+    PluginJobResponse, PluginJobStatus, StartInstallBody,
+};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
@@ -43,6 +47,53 @@ async fn mutation_gate(
             crate::daemon::ApiErrorCode::ElevationRequired,
             "Re-enter the passphrase to continue",
         ));
+    }
+    Ok(())
+}
+
+fn source_gate(source: &str, dev: bool, principal: Option<&Principal>) -> Result<(), Response> {
+    let source = plugin::source::PluginSource::parse(source)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, "invalid_source", e.to_string()))?;
+    match source {
+        plugin::source::PluginSource::Local(path) => {
+            if !authorize(principal, Capability::LocalPluginSource) {
+                return Err(super::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::LocalPluginSourceRequired,
+                    "Local plugin directories require a verified local Unix socket peer",
+                ));
+            }
+            if !path.is_absolute() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_source",
+                    "Local plugin source must be an absolute path on the Daemon host",
+                ));
+            }
+        }
+        plugin::source::PluginSource::Github { .. } if dev => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_source",
+                "--dev requires a local plugin directory",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn update_source_gate(id: &str, principal: Option<&Principal>) -> Result<(), Response> {
+    let config = crate::session::Config::load().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_error",
+            "Cannot read plugin configuration",
+        )
+    })?;
+    if let Some(entry) = config.plugins.get(id) {
+        if let Some(source) = &entry.source {
+            source_gate(source, entry.dev, principal)?;
+        }
     }
     Ok(())
 }
@@ -646,6 +697,7 @@ fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serd
 /// actual apply). Network failures (no release, dead remote) surface as a 502.
 pub async fn plugin_update_preview(
     State(state): State<std::sync::Arc<AppState>>,
+    principal: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Response {
     if let Some(resp) = super::cityhall_block(&state) {
@@ -654,18 +706,18 @@ pub async fn plugin_update_preview(
     if state.read_only {
         return super::read_only_response();
     }
-    match plugin::install::preview_update(&id).await {
+    if let Err(resp) = update_source_gate(&id, principal.as_deref()) {
+        return resp;
+    }
+    match plugin::install::preview_update(
+        &id,
+        authorize(principal.as_deref(), Capability::LocalPluginSource),
+    )
+    .await
+    {
         Ok(preview) => Json(preview).into_response(),
         Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
     }
-}
-
-#[derive(Deserialize)]
-pub struct ApplyUpdateBody {
-    /// The fingerprint the user approved, from the preview. Pins the apply to
-    /// exactly what was shown: if the remote moved since, the apply is refused.
-    #[serde(default)]
-    pub expected_fingerprint: Option<String>,
 }
 
 /// `POST /api/plugins/{id}/update/apply`: apply an update the user approved in
@@ -686,11 +738,15 @@ pub async fn apply_plugin_update(
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
+    if let Err(resp) = update_source_gate(&id, loopback.as_deref()) {
+        return resp;
+    }
+    let allow_local_source = authorize(loopback.as_deref(), Capability::LocalPluginSource);
     let plugin_id = id.clone();
     let fingerprint = body.expected_fingerprint;
     let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Update, id, move |log| async move {
-        plugin::install::apply_update(&plugin_id, fingerprint, &log).await?;
+        plugin::install::apply_update(&plugin_id, fingerprint, allow_local_source, &log).await?;
         if let Some(host) = host {
             host.restart_worker(&plugin_id, &plugin::registry()).await;
         }
@@ -776,9 +832,8 @@ pub async fn set_plugin_enabled(
     }
 }
 
-/// `POST /api/plugins/{id}/worker/restart`: reload plugins from disk and
-/// replace this plugin's worker, so an update applied outside the daemon (CLI,
-/// TUI) runs the new build without a daemon restart.
+/// `POST /api/plugins/{id}/worker/restart`: reload plugins and replace the
+/// worker after an update applied outside the Daemon, such as a TUI-local update.
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
@@ -803,38 +858,10 @@ pub async fn restart_plugin_worker(
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A host-side plugin lifecycle operation the dashboard started and tails. The
-/// daemon owns the work; the browser polls `GET /api/plugins/jobs/{id}` for
-/// status plus the live log tail.
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginJobKind {
-    Install,
-    Update,
-    Uninstall,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum PluginJobStatus {
-    Running,
-    Succeeded,
-    Failed { error: String },
-}
-
-#[derive(Clone, Serialize)]
-pub struct PluginJob {
-    pub id: String,
-    pub kind: PluginJobKind,
-    /// What is being operated on: a source slug for install, a plugin id else.
-    pub target: String,
-    pub status: PluginJobStatus,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-    /// On-disk log file; never serialized (read via the tail endpoint instead).
-    #[serde(skip)]
+#[derive(Clone)]
+struct TrackedPluginJob {
+    job: PluginJob,
     log_path: PathBuf,
-    #[serde(skip)]
     started: std::time::Instant,
 }
 
@@ -844,14 +871,9 @@ pub struct PluginJob {
 /// daemon.
 const FINISHED_JOB_TTL_SECS: i64 = 3600;
 
-/// In-memory registry of plugin lifecycle jobs. Dies with the daemon: a job
-/// running at shutdown is gone, but its on-disk log survives so a tail after a
-/// restart still shows what happened, just without live status.
-// ponytail: in-memory only; a persisted job table would need process
-// supervision and orphaned-build recovery to mean anything. Add that only if
-// restart-survival of in-flight jobs is ever required.
+/// Jobs and status live only for this Daemon epoch; their log files survive restart.
 pub struct PluginJobRegistry {
-    jobs: Mutex<HashMap<String, PluginJob>>,
+    jobs: Mutex<HashMap<String, TrackedPluginJob>>,
     /// At most one lifecycle mutation runs at a time. Config + lockfile writes
     /// and in-place tree mutations are not concurrency-safe, so a second start
     /// is rejected with 409 rather than queued (a queued mutation can go stale
@@ -894,13 +916,15 @@ impl PluginJobRegistry {
         };
         let id = uuid::Uuid::new_v4().to_string();
         self.prune();
-        let job = PluginJob {
-            id: id.clone(),
-            kind,
-            target,
-            status: PluginJobStatus::Running,
-            started_at: chrono::Utc::now().timestamp(),
-            finished_at: None,
+        let job = TrackedPluginJob {
+            job: PluginJob {
+                id: id.clone(),
+                kind,
+                target,
+                status: PluginJobStatus::Running,
+                started_at: chrono::Utc::now().timestamp(),
+                finished_at: None,
+            },
             log_path: log_path.clone(),
             started: std::time::Instant::now(),
         };
@@ -910,9 +934,10 @@ impl PluginJobRegistry {
 
     /// Mark a job done and release the single-active guard.
     fn finish(&self, id: &str, result: anyhow::Result<()>) {
-        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+        if let Some(tracked) = self.jobs.lock().unwrap().get_mut(id) {
+            let duration_ms = tracked.started.elapsed().as_millis();
+            let job = &mut tracked.job;
             job.finished_at = Some(chrono::Utc::now().timestamp());
-            let duration_ms = job.started.elapsed().as_millis();
             job.status = match result {
                 Ok(()) => {
                     tracing::info!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, "plugin job finished");
@@ -928,7 +953,7 @@ impl PluginJobRegistry {
         self.active.store(false, Ordering::SeqCst);
     }
 
-    pub fn get(&self, id: &str) -> Option<PluginJob> {
+    fn get(&self, id: &str) -> Option<TrackedPluginJob> {
         self.jobs.lock().unwrap().get(id).cloned()
     }
 
@@ -936,7 +961,7 @@ impl PluginJobRegistry {
     fn prune(&self) {
         let cutoff = chrono::Utc::now().timestamp() - FINISHED_JOB_TTL_SECS;
         self.jobs.lock().unwrap().retain(|_, job| {
-            let stale = job.finished_at.is_some_and(|t| t < cutoff);
+            let stale = job.job.finished_at.is_some_and(|t| t < cutoff);
             if stale {
                 let _ = std::fs::remove_file(&job.log_path);
             }
@@ -972,20 +997,14 @@ where
         };
         jobs.finish(&id, result);
     });
-    (StatusCode::ACCEPTED, Json(json!({ "job_id": job_id }))).into_response()
+    (StatusCode::ACCEPTED, Json(PluginJobAccepted { job_id })).into_response()
 }
 
-#[derive(Deserialize)]
-pub struct InstallPreviewBody {
-    pub source: String,
-}
-
-/// `POST /api/plugins/install/preview`: classify a `gh:` install candidate and
-/// return the capability / build / UI disclosure the dashboard renders before
-/// the user approves. Read-write only, NOT elevation: it mutates nothing and
-/// powers the approval UI (elevation is required on the actual install).
+/// `POST /api/plugins/install/preview`: disclose a candidate before approval.
+/// Local directories require a verified local peer. No build or grant runs here.
 pub async fn preview_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
+    principal: Option<axum::Extension<Principal>>,
     Json(body): Json<InstallPreviewBody>,
 ) -> Response {
     if state.read_only {
@@ -995,23 +1014,17 @@ pub async fn preview_plugin_install(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    match plugin::install::preview_install(&body.source).await {
+    if let Err(resp) = source_gate(&body.source, body.dev, principal.as_deref()) {
+        return resp;
+    }
+    match plugin::install::preview_install(&body.source, body.dev).await {
         Ok(consent) => Json(consent).into_response(),
         Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
     }
 }
 
-#[derive(Deserialize)]
-pub struct StartInstallBody {
-    pub source: String,
-    /// The fingerprint the user approved, from the preview. Pins the install to
-    /// exactly what was shown.
-    pub expected_fingerprint: String,
-}
-
-/// `POST /api/plugins/install`: start a host-side install job for a `gh:` source
-/// the user approved in the dashboard. Read-write + elevation, like update
-/// apply. Returns a `job_id` to poll; `409` if another lifecycle job is running.
+/// `POST /api/plugins/install`: apply a fingerprint-approved candidate.
+/// Read-write and elevation are required; returns an observable lifecycle job.
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
@@ -1021,14 +1034,17 @@ pub async fn start_plugin_install(
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
-    let source = body.source.clone();
+    if let Err(resp) = source_gate(&body.source, body.dev, loopback.as_deref()) {
+        return resp;
+    }
+    let source = body.source;
     let fingerprint = body.expected_fingerprint;
     start_job(
         state,
         PluginJobKind::Install,
         source.clone(),
         move |log| async move {
-            plugin::install::apply_install(&source, &fingerprint, &log)
+            plugin::install::apply_install(&source, &fingerprint, body.dev, &log)
                 .await
                 .map(|_| ())
         },
@@ -1081,7 +1097,7 @@ pub async fn plugin_job_status(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    let Some(job) = state.plugin_jobs.get(&job_id) else {
+    let Some(tracked) = state.plugin_jobs.get(&job_id) else {
         return api_error(
             StatusCode::NOT_FOUND,
             "job_not_found",
@@ -1089,21 +1105,21 @@ pub async fn plugin_job_status(
         );
     };
     let tail = q.tail.unwrap_or(200).clamp(1, 2000);
-    let log_path = job.log_path.clone();
+    let log_path = tracked.log_path;
     let read = tokio::task::spawn_blocking(move || {
         crate::server::api::acp::read_log_tail(&log_path, tail)
     })
     .await;
     match read {
-        Ok(Ok((lines, truncated, exists))) => Json(json!({
-            "job": job,
-            "log": {
-                "exists": exists,
-                "tail": lines.join("\n"),
-                "lines_returned": lines.len(),
-                "truncated": truncated,
-            }
-        }))
+        Ok(Ok((lines, truncated, exists))) => Json(PluginJobResponse {
+            job: tracked.job,
+            log: PluginJobLog {
+                exists,
+                tail: lines.join("\n"),
+                lines_returned: lines.len(),
+                truncated,
+            },
+        })
         .into_response(),
         Ok(Err(e)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1120,6 +1136,287 @@ mod tests {
     use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_plugin_jobs_pin_consent_and_preserve_dev_source() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().to_str().unwrap();
+        let manifest = source.path().join("aoe-plugin.toml");
+        let effects = tempfile::tempdir().unwrap();
+        let built = effects.path().join("built");
+        let node = plugin::write_fake_node(effects.path(), "node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nprintf x >> \"$0.calls\"\nprintf '22.21.0\\n'\n",
+        )
+        .unwrap();
+        let node_calls = effects.path().join("node.calls");
+        let _node_env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let write = |version, build: bool| {
+            let runtime = if build {
+                format!("capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"sh\"]\nsystem = true\n[[runtime.build]]\ncommand = [\"touch\", {}]\n", serde_json::to_string(built.to_str().unwrap()).unwrap())
+            } else {
+                String::new()
+            };
+            std::fs::write(&manifest, format!(
+                "id = \"aoe.dev-fixture\"\nname = \"Fixture\"\nversion = \"{version}\"\napi_version = 2\n{runtime}"
+            )).unwrap();
+        };
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let peer = Some(axum::Extension(Principal::LocalPeer { uid: 1000 }));
+        let preview = |state| {
+            preview_plugin_install(
+                State(state),
+                peer,
+                Json(InstallPreviewBody {
+                    source: input.into(),
+                    dev: true,
+                }),
+            )
+        };
+        async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
+            serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+        async fn finish(state: &AppState, response: Response) -> PluginJob {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let accepted: PluginJobAccepted = decode(response).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let job = state.plugin_jobs.get(&accepted.job_id).unwrap().job;
+                    if !matches!(job.status, PluginJobStatus::Running) {
+                        return job;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let installed = plugin::plugins_dir().unwrap().join("aoe.dev-fixture");
+        write("1.0.0", true);
+        let response = preview(state.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let consent: plugin::install::InstallConsent = decode(response).await;
+        assert_eq!(consent.capabilities, ["runtime.worker"]);
+        assert!(!built.exists());
+        assert!(!node_calls.exists());
+        assert!(!installed.exists());
+        assert!(!Config::load()
+            .unwrap()
+            .plugins
+            .contains_key("aoe.dev-fixture"));
+
+        write("2.0.0", true);
+        let response = start_plugin_install(
+            State(state.clone()),
+            None,
+            peer,
+            Json(StartInstallBody {
+                source: input.into(),
+                dev: true,
+                expected_fingerprint: consent.fingerprint,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            finish(&state, response).await.status,
+            PluginJobStatus::Failed { .. }
+        ));
+        assert!(!installed.exists());
+        assert!(!built.exists());
+        assert!(!node_calls.exists());
+        assert!(!Config::load()
+            .unwrap()
+            .plugins
+            .contains_key("aoe.dev-fixture"));
+
+        let consent: plugin::install::InstallConsent = decode(preview(state.clone()).await).await;
+        let response = start_plugin_install(
+            State(state.clone()),
+            None,
+            peer,
+            Json(StartInstallBody {
+                source: input.into(),
+                dev: true,
+                expected_fingerprint: consent.fingerprint,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            finish(&state, response).await.status,
+            PluginJobStatus::Succeeded
+        ));
+        assert!(built.exists());
+        assert!(node_calls.exists());
+        let entry = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
+        assert!(entry.dev);
+        assert!(entry.grant.is_some());
+        let recorded_source = entry.source.unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&recorded_source).unwrap(),
+            source.path().canonicalize().unwrap()
+        );
+
+        write("3.0.0", false);
+        let response =
+            plugin_update_preview(State(state.clone()), peer, Path("aoe.dev-fixture".into())).await;
+        let preview: plugin::install::UpdatePreview = decode(response).await;
+        let fingerprint = match preview {
+            plugin::install::UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+            other => panic!("unexpected preview: {other:?}"),
+        };
+        let response = apply_plugin_update(
+            State(state.clone()),
+            None,
+            peer,
+            Path("aoe.dev-fixture".into()),
+            Json(ApplyUpdateBody {
+                expected_fingerprint: Some(fingerprint),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            finish(&state, response).await.status,
+            PluginJobStatus::Succeeded
+        ));
+        let entry = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
+        assert_eq!(entry.source, Some(recorded_source));
+        assert!(entry.dev);
+        assert_eq!(
+            plugin::lockfile::Lockfile::load()
+                .unwrap()
+                .get("aoe.dev-fixture")
+                .unwrap()
+                .version,
+            "3.0.0"
+        );
+        let response = start_plugin_uninstall(
+            State(state.clone()),
+            None,
+            peer,
+            Path("aoe.dev-fixture".into()),
+        )
+        .await;
+        assert!(matches!(
+            finish(&state, response).await.status,
+            PluginJobStatus::Succeeded
+        ));
+        assert!(!installed.exists());
+        assert!(!Config::load()
+            .unwrap()
+            .plugins
+            .contains_key("aoe.dev-fixture"));
+        state.runtime.work.drain().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_sources_require_owner_authority_and_mutation_policy() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().to_str().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.local\"\nname = \"Local\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let owner = Some(axum::Extension(Principal::LocalPeer { uid: 1000 }));
+        let token = Some(axum::Extension(Principal::TokenHolder));
+        let device = Some(axum::Extension(Principal::Device));
+        let normal = crate::server::test_support::build_test_app_state(Vec::new());
+        let read_only =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |s| {
+                s.read_only = true
+            });
+        let cityhall = crate::server::test_support::build_test_app_state_cityhall(Vec::new());
+        for (state, peer) in [
+            (normal.clone(), None),
+            (normal.clone(), token),
+            (normal.clone(), device),
+            (read_only.clone(), owner),
+            (cityhall.clone(), owner),
+        ] {
+            let response = preview_plugin_install(
+                State(state.clone()),
+                peer,
+                Json(InstallPreviewBody {
+                    source: input.into(),
+                    dev: false,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = start_plugin_install(
+                State(state.clone()),
+                None,
+                peer,
+                Json(StartInstallBody {
+                    source: input.into(),
+                    dev: true,
+                    expected_fingerprint: "unapproved".into(),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(state.plugin_jobs.jobs.lock().unwrap().is_empty());
+        }
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.local".into(),
+                PluginConfig {
+                    source: Some(input.into()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        for peer in [None, token, device] {
+            let response =
+                plugin_update_preview(State(normal.clone()), peer, Path("acme.local".into())).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                crate::daemon::ApiErrorCode::from_headers(
+                    response.status(),
+                    response.headers(),
+                    false
+                ),
+                Some(crate::daemon::ApiErrorCode::LocalPluginSourceRequired),
+            );
+            let response = apply_plugin_update(
+                State(normal.clone()),
+                None,
+                peer,
+                Path("acme.local".into()),
+                Json(ApplyUpdateBody {
+                    expected_fingerprint: Some("unapproved".into()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(plugin::install::preview_update("acme.local", false)
+            .await
+            .is_err());
+        assert!(
+            plugin::install::apply_update("acme.local", None, false, &OperationLog::Inherit)
+                .await
+                .is_err()
+        );
+        assert!(normal.plugin_jobs.jobs.lock().unwrap().is_empty());
+        assert!(!plugin::plugins_dir().unwrap().join("acme.local").exists());
+        for state in [normal, read_only, cityhall] {
+            state.runtime.work.drain().await;
+        }
+    }
+
     #[test]
     fn registry_allows_one_active_job_then_releases_on_finish() {
         let reg = PluginJobRegistry::new();
@@ -1133,13 +1430,13 @@ mod tests {
             "second job rejected while one is active"
         );
         assert!(matches!(
-            reg.get(&id1).unwrap().status,
+            reg.get(&id1).unwrap().job.status,
             PluginJobStatus::Running
         ));
 
         reg.finish(&id1, Ok(()));
         assert!(matches!(
-            reg.get(&id1).unwrap().status,
+            reg.get(&id1).unwrap().job.status,
             PluginJobStatus::Succeeded
         ));
 
@@ -1149,7 +1446,7 @@ mod tests {
             .begin(PluginJobKind::Update, "gh:c/d".into())
             .expect("job begins after the prior one finished");
         reg.finish(&id2, Err(anyhow::anyhow!("boom")));
-        match reg.get(&id2).unwrap().status {
+        match reg.get(&id2).unwrap().job.status {
             PluginJobStatus::Failed { error } => assert!(error.contains("boom"), "{error}"),
             other => panic!("expected Failed, got {other:?}"),
         }

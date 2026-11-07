@@ -12,6 +12,7 @@ pub enum ApiErrorCode {
     ElevationRequired,
     AccessPolicyDenied,
     CityhallMode,
+    LocalPluginSourceRequired,
     LifecycleLocked,
     LifecycleSuperseded,
     PendingTargetGone,
@@ -46,6 +47,7 @@ impl ApiErrorCode {
             Self::ElevationRequired => "elevation_required",
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
+            Self::LocalPluginSourceRequired => "local_plugin_source_required",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
@@ -79,6 +81,7 @@ impl ApiErrorCode {
             Self::ReadOnly
             | Self::ElevationRequired
             | Self::AccessPolicyDenied
+            | Self::LocalPluginSourceRequired
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::LifecycleSuperseded
@@ -139,6 +142,7 @@ impl ApiErrorCode {
             b"elevation_required" => Self::ElevationRequired,
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
+            b"local_plugin_source_required" => Self::LocalPluginSourceRequired,
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,

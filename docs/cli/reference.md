@@ -56,6 +56,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin install`↴](#aoe-plugin-install)
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin job`↴](#aoe-plugin-job)
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
 * [`aoe plugin discover`↴](#aoe-plugin-discover)
 * [`aoe plugin outdated`↴](#aoe-plugin-outdated)
@@ -915,6 +916,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
+* `job` — Observe an accepted plugin job without submitting another operation
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
 * `outdated` — List installed external plugins that have an update available
@@ -1019,6 +1021,18 @@ Uninstall an external plugin, removing its files and capability grant
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+
+
+## `aoe plugin job`
+
+Observe an accepted plugin job without submitting another operation
+
+**Usage:** `aoe plugin job <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id returned by install, update, or uninstall
 
 
 

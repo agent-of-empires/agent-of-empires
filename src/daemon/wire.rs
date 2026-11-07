@@ -5,6 +5,72 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::SessionScope;
 
+#[derive(Serialize, Deserialize)]
+pub struct InstallPreviewBody {
+    pub source: String,
+    #[serde(default)]
+    pub dev: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StartInstallBody {
+    pub source: String,
+    #[serde(default)]
+    pub dev: bool,
+    pub expected_fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ApplyUpdateBody {
+    #[serde(default)]
+    pub expected_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginJobKind {
+    Install,
+    Update,
+    Uninstall,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PluginJobStatus {
+    Running,
+    Succeeded,
+    Failed { error: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginJob {
+    pub id: String,
+    pub kind: PluginJobKind,
+    pub target: String,
+    pub status: PluginJobStatus,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobAccepted {
+    pub job_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobLog {
+    pub exists: bool,
+    pub tail: String,
+    pub lines_returned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobResponse {
+    pub job: PluginJob,
+    pub log: PluginJobLog,
+}
+
 /// One repository's branch base in a creation request.
 #[derive(Serialize, Deserialize)]
 pub struct RepoBaseInput {

@@ -42,11 +42,34 @@ aoe plugin install ./path/to/plugin       # a local directory
 
 With no `@ref`, install resolves the repo's latest stable GitHub release and records the source ref-less, so `aoe plugin update` keeps tracking releases. An explicit `@ref` installs unverified code, asks you to confirm (`--yes` skips the prompt), and keeps following that ref. A repo with no release falls back to the default branch behind the same confirmation.
 
+CLI install, update, and uninstall run only through the Daemon. With no explicit
+endpoint, the CLI starts the local Daemon when needed. `--no-autostart` refuses
+instead; `--daemon-url` and `AOE_DAEMON_URL` never start a local replacement.
+Read-only, CityHall, authentication, and elevation restrictions still apply.
+
+Local directories, including `--dev`, require the owner-authenticated local Unix
+socket. The CLI resolves relative paths from its working directory; the Daemon
+reads and copies the source. Explicit remote endpoints reject Client paths,
+including loopback TCP URLs. GitHub sources use `gh:owner/repo[@ref]`, not arbitrary
+Git URLs. Updates retain the recorded source and development marker.
+
+Preview may fetch into temporary staging but never builds, provisions Node,
+grants capabilities, or publishes the plugin. Approval pins the fetched content;
+`--yes` skips prompts, not the fingerprint check.
+
+Each accepted operation prints a job id and waits for its result. Resume observation
+with `aoe plugin job <job_id>` using the same Daemon endpoint and credentials.
+A polling failure, interrupted observation, or lost submission response means the
+outcome is unknown, not permission to retry. The CLI never resubmits automatically.
+If no job id arrived, inspect `GET /api/plugins` on that Daemon before deciding
+whether to submit again. Jobs expire after an hour when another job starts and
+do not survive a Daemon restart; a missing job requires inspecting current state.
+
 A plugin lands in `<app_dir>/plugins/<id>/`, with a GitHub source pinned to its exact commit and any release-binary worker downloaded for your platform. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 
 Build steps and workers run with `AOE_NODE` set to the resolved Node and its directory first on `PATH`. If no Node is found when a plugin declares a build step or a non-system worker, install downloads the pinned one on Linux and macOS. Elsewhere, put Node on `PATH` or set `AOE_ACP_NODE`.
 
-Every update, including the opt-in auto-update, restarts the plugin's worker in a running `aoe serve`. If the CLI or TUI cannot reach the daemon it warns, and the worker keeps the previous build until the daemon restarts.
+Every update, including the opt-in auto-update, restarts the plugin's worker in a running `aoe serve`. CLI updates apply and reload the worker within the Daemon job. The TUI's local update path warns if it cannot reach the Daemon; the worker then keeps the previous build until the Daemon restarts.
 
 The web dashboard's Plugins settings does the same things, with a marketplace searching the `aoe-plugin` GitHub topic; every mutating action confirms the plugin's capabilities first.
 

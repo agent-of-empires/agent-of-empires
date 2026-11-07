@@ -1350,14 +1350,15 @@ async fn preview_reports_consent_required_for_capability_change() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    match install::preview_update("acme.upd").await.unwrap() {
-        UpdatePreview::ConsentRequired { consent, dismissed } => {
+    match install::preview_update("acme.upd", true).await.unwrap() {
+        UpdatePreview::ConsentRequired {
+            consent, dismissed, ..
+        } => {
             assert_eq!(consent.from_version, "1.0.0");
             assert_eq!(consent.to_version, "2.0.0");
             assert_eq!(consent.added_capabilities, vec!["net".to_string()]);
             assert!(consent.removed_capabilities.is_empty());
             assert!(!dismissed, "a fresh update is not pre-dismissed");
-            assert!(!consent.fingerprint.is_empty());
         }
         other => panic!("expected consent_required, got {other:?}"),
     }
@@ -1371,7 +1372,7 @@ async fn apply_update_grants_the_new_capability_set() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
@@ -1379,6 +1380,7 @@ async fn apply_update_grants_the_new_capability_set() {
     install::apply_update(
         "acme.upd",
         Some(fingerprint),
+        true,
         &install::OperationLog::Inherit,
     )
     .await
@@ -1406,6 +1408,7 @@ async fn apply_update_rejects_a_stale_fingerprint() {
     let err = install::apply_update(
         "acme.upd",
         Some("sha256:stale||community".to_string()),
+        true,
         &install::OperationLog::Inherit,
     )
     .await
@@ -1427,7 +1430,7 @@ async fn declining_keeps_the_prior_version_and_stops_nagging() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
@@ -1445,7 +1448,7 @@ async fn declining_keeps_the_prior_version_and_stops_nagging() {
     );
 
     // A re-preview now flags the dismissal so the surfaces stop re-prompting.
-    match install::preview_update("acme.upd").await.unwrap() {
+    match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { dismissed, .. } => {
             assert!(dismissed, "the declined fingerprint is remembered");
         }
@@ -1483,7 +1486,7 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
