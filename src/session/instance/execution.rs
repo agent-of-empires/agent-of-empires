@@ -2553,14 +2553,14 @@ impl Instance {
         else {
             return None;
         };
-        (binding
-            .and_then(|binding| binding.execution.as_ref())
-            .is_none_or(|execution| {
-                execution.agent == "codex"
-                    && execution.filesystem == "host"
-                    && execution.stores.first() == Some(&store.home)
-            })
-            && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, cwd))
+        (binding.is_none_or(|binding| {
+            binding.session_id == sid
+                && binding.execution.as_ref().is_none_or(|execution| {
+                    execution.agent == "codex"
+                        && execution.filesystem == "host"
+                        && execution.stores.first() == Some(&store.home)
+                })
+        }) && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, cwd))
         .then_some(store)
     }
 

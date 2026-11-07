@@ -3529,10 +3529,15 @@ mod tests {
             inst.agent_session_binding = Some(bound);
             inst
         };
+        let mut other_conversation = bound("codex", &canonical_store, "host");
+        if let Some(binding) = other_conversation.agent_session_binding.as_mut() {
+            binding.session_id = "11111111-2222-4333-8444-555555555552".into();
+        }
         for inst in [
             bound("codex", &other_store, "host"),
             bound("codex", &canonical_store, "container"),
             bound("claude", &canonical_store, "host"),
+            other_conversation,
         ] {
             let error = inst.resolve_launch_execution().err().unwrap();
             let chain = format!("{error:#}");

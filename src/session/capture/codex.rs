@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use uuid::Uuid;
 
 use crate::session::AnchoredDir;
@@ -130,7 +130,8 @@ fn collect_codex_sessions_anchored(
 }
 
 /// Rollouts named for `target`. Unlike the capture scan, the budget is per
-/// directory, and a directory over it fails rather than hiding a rollout.
+/// directory, and anything that could hide a rollout fails: an unreadable
+/// entry, a directory over budget, or a date entry that is not a real directory.
 fn find_codex_rollouts(
     root: &AnchoredDir,
     relative: &Path,
@@ -138,7 +139,7 @@ fn find_codex_rollouts(
     target: Uuid,
     found: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let names = root.read_dir(relative, CODEX_SCAN_MAX_ENTRIES + 1)?;
+    let names = root.read_dir_complete(relative, CODEX_SCAN_MAX_ENTRIES + 1)?;
     anyhow::ensure!(
         names.len() <= CODEX_SCAN_MAX_ENTRIES,
         "Codex rollout directory exceeds its scan budget"
@@ -149,9 +150,9 @@ fn find_codex_rollouts(
             .to_str()
             .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()));
         if numeric && depth < CODEX_SCAN_MAX_DEPTH {
-            if root.directory_modified(&path).ok().flatten().is_some() {
-                find_codex_rollouts(root, &path, depth + 1, target, found)?;
-            }
+            root.directory_modified(&path)?
+                .context("Codex rollout date entry is not a directory")?;
+            find_codex_rollouts(root, &path, depth + 1, target, found)?;
         } else if is_codex_rollout(&path)
             && extract_codex_uuid_from_filename(&path)
                 .and_then(|id| Uuid::parse_str(&id).ok())
@@ -302,6 +303,11 @@ mod tests {
         }
         assert!(codex_rollout_records_cwd(&store, foreign, &other));
 
+        // Each refuses the whole scan, so they follow the table.
+        let linked = store.join("sessions/2025");
+        std::os::unix::fs::symlink(&other, &linked).unwrap();
+        assert!(!codex_rollout_records_cwd(&store, long, &project));
+        std::fs::remove_file(linked).unwrap();
         for n in 0..CODEX_SCAN_MAX_ENTRIES {
             std::fs::write(day.join(format!("pad-{n}")), "").unwrap();
         }
