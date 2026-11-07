@@ -1591,13 +1591,14 @@ impl OpenCodeSessionSchema {
 #[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
 
-/// A Codex policy surface AoE cannot read. It can reroute a pinned launch, but
-/// not what an exact id resolves to, so a Default resume may still prove its rollout.
+/// A Codex context AoE cannot attest. Unreadable policy or credentials do not
+/// change where an exact id resolves, so with a `store` a Default resume may
+/// still prove its rollout there; routing it cannot read leaves `store` empty.
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
 pub(super) struct UnattestedCodexPolicy {
-    reason: &'static str,
-    /// The store an unpinned host launch reads; `None` when it would read another.
+    reason: String,
+    /// The store an unpinned host launch reads, when a local rollout can prove it.
     store: Option<PathBuf>,
     cwd: PathBuf,
 }
@@ -1957,26 +1958,26 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
+                let unverifiable = |reason: String| UnattestedCodexPolicy {
+                    reason,
+                    store: None,
+                    cwd: inputs.cwd.clone(),
+                };
                 for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
-                    anyhow::ensure!(value(key).is_none(), "managed Codex does not support {key}");
+                    anyhow::ensure!(value(key).is_none(), unverifiable(format!("managed Codex does not support {key}")));
                     routing.push((key.into(), None));
                 }
                 let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".codex"))))?;
-                let unattested_policy = |reason| UnattestedCodexPolicy {
-                    reason,
+                let unattested_policy = |reason: &str| UnattestedCodexPolicy {
+                    reason: reason.to_owned(),
                     store: (inputs.container.is_none() && declared.is_none()).then(|| root.clone()),
                     cwd: inputs.cwd.clone(),
                 };
-                // A host single-shot launch is deliberately left unmanaged: this
-                // only governs managed resume and fork.
-                if inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
-                    bail!(unattested_policy("Codex managed preferences cannot be attested by the local file contract"));
-                }
                 let location = inputs.physical_location(&root);
-                anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), "managed Codex requires an existing local CODEX_HOME");
+                anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), unverifiable("managed Codex requires an existing local CODEX_HOME".into()));
                 for file in [PathBuf::from("/etc/codex/requirements.toml"), PathBuf::from("/etc/codex/managed_config.toml")] {
-                    anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), "Codex managed requirements require an independently attested namespace");
+                    anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), unverifiable("Codex managed requirements require an independently attested namespace".into()));
                     configuration.push(file);
                 }
                 let mut sqlite = value("CODEX_SQLITE_HOME").filter(|value| !value.trim().is_empty()).map(|value| absolute(PathBuf::from(value.trim()))).unwrap_or_else(|| root.clone());
@@ -1984,9 +1985,9 @@ impl Instance {
                 for file in [PathBuf::from("/etc/codex/config.toml"), user_config.clone()] {
                     if let Some(bytes) = inputs.read_native_file(&file)? {
                         let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-                        anyhow::ensure!(!settings.contains_key("profile"), "managed Codex does not support a selected configuration profile");
-                        anyhow::ensure!(settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file")), "Codex keyring and external authentication do not attest a local namespace");
-                        anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), "managed Codex requires its durable local thread store");
+                        anyhow::ensure!(!settings.contains_key("profile"), unverifiable("managed Codex does not support a selected configuration profile".into()));
+                        anyhow::ensure!(settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file")), unattested_policy("Codex keyring and external authentication do not attest a local namespace"));
+                        anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), unverifiable("managed Codex requires its durable local thread store".into()));
                         if let Some(path) = settings.get("sqlite_home") {
                             let path = PathBuf::from(path.as_str().context("Codex sqlite_home must be a path")?);
                             sqlite = if path.is_absolute() { path } else { file.parent().unwrap().join(path) };
@@ -1999,13 +2000,18 @@ impl Instance {
                     if file == user_config { continue; }
                     if let Some(bytes) = inputs.read_native_file(&file)? {
                         let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-                        anyhow::ensure!(["sqlite_home", "experimental_thread_store", "cli_auth_credentials_store", "profile"].iter().all(|key| !settings.contains_key(*key)), "Codex project routing requires its native trust and profile resolution");
+                        anyhow::ensure!(["sqlite_home", "experimental_thread_store", "cli_auth_credentials_store", "profile"].iter().all(|key| !settings.contains_key(*key)), unverifiable("Codex project routing requires its native trust and profile resolution".into()));
                     }
                     configuration.push(file);
                 }
+                // A host single-shot launch is deliberately left unmanaged: this
+                // only governs managed resume and fork.
+                if inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+                    bail!(unattested_policy("Codex managed preferences cannot be attested by the local file contract"));
+                }
                 let auth_file = root.join("auth.json");
                 let Some(bytes) = inputs.read_native_file(&auth_file)? else {
-                    bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
+                    bail!(unattested_policy("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run"));
                 };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 if !(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))

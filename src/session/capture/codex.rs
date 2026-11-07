@@ -44,10 +44,12 @@ fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> 
         .map(str::to_string)
 }
 
-/// The trailing 36-char UUID of `rollout-<timestamp>-<uuid>.jsonl[.zst]`.
+/// The thread UUID of `rollout-<timestamp>-<uuid>[_<rollout-id>].jsonl[.zst]`.
+/// A reverted thread's file appends a distinct rollout ID.
 fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
+    let stem = stem.split_once('_').map_or(stem, |(thread, _)| thread);
     let candidate = stem.get(stem.len().checked_sub(36)?..)?;
     Uuid::parse_str(candidate).ok()?;
     Some(candidate.to_string())
@@ -263,12 +265,26 @@ mod tests {
         .unwrap();
         std::fs::write(name(split, 0), rollout_line(split, here)).unwrap();
         std::fs::write(name(split, 1), rollout_line(split, there)).unwrap();
+        let revert_id = "11111111-2222-4333-8444-666666666666";
+        let reverted_here = "11111111-2222-4333-8444-555555555555";
+        let reverted_away = "11111111-2222-4333-8444-555555555556";
+        let segment = |id: &str| {
+            day.join(format!(
+                "rollout-2026-11-06T13-00-00-{id}_{revert_id}.jsonl"
+            ))
+        };
+        std::fs::write(segment(reverted_here), rollout_line(reverted_here, here)).unwrap();
+        std::fs::write(name(reverted_away, 0), rollout_line(reverted_away, here)).unwrap();
+        std::fs::write(segment(reverted_away), rollout_line(reverted_away, there)).unwrap();
 
         for (sid, expected) in [
             (long, true),
             (foreign, false),
             (child, false),
             (split, false),
+            (reverted_here, true),
+            (reverted_away, false),
+            (revert_id, false),
             ("11111111-2222-4333-8444-555555555559", false),
             ("my-thread-name", false),
         ] {

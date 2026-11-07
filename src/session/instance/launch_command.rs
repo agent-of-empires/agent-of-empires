@@ -836,7 +836,7 @@ impl Instance {
                 }
                 let cause = ManagedResumeCause::from_error(&error);
                 let recovery = if cause == ManagedResumeCause::CodexConversationUnverified {
-                    format!("restore its store and project path, or clear it with aoe session set-session-id {} \"\", restart, and run /resume {sid} in Codex", self.id)
+                    format!("restore a verifiable context, or clear it with aoe session set-session-id {} \"\", restart, and run /resume {sid} in Codex", self.id)
                 } else {
                     format!("restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)", self.id)
                 };
@@ -3491,6 +3491,10 @@ mod tests {
         let advice = ManagedResumeCause::CodexConversationUnverified.message();
         assert!(advice.contains("set-session-id <session> \"\""), "{advice}");
         assert!(
+            advice.contains("aoe session show <session> --json"),
+            "{advice}"
+        );
+        assert!(
             !advice.contains("set-session-id <session> <native-id>"),
             "{advice}"
         );
@@ -3500,10 +3504,51 @@ mod tests {
         explicit.resume_intent = ResumeIntent::Use(local.into());
         assert!(explicit.resolve_launch_execution().is_err());
 
+        let refused_cause = |inst: Instance| {
+            inst.resolve_launch_execution()
+                .err()
+                .unwrap()
+                .downcast_ref::<ManagedResumeRefused>()
+                .unwrap()
+                .0
+        };
+        // Credential surfaces leave the local rollout decisive on every platform;
+        // routing AoE cannot read does not.
+        let config = store.join("config.toml");
+        let auth = store.join("auth.json");
+        let chatgpt = std::fs::read(&auth).unwrap();
+        std::fs::write(&config, "cli_auth_credentials_store = \"keyring\"\n").unwrap();
+        assert!(instance(local)
+            .resolve_launch_execution()
+            .unwrap()
+            .is_none());
+        std::fs::remove_file(&config).unwrap();
+        std::fs::remove_file(&auth).unwrap();
+        assert!(instance(local)
+            .resolve_launch_execution()
+            .unwrap()
+            .is_none());
+        std::fs::write(&auth, chatgpt).unwrap();
+        for routing in [
+            "profile = \"work\"\n",
+            "[experimental_thread_store]\ntype = \"remote\"\n",
+        ] {
+            std::fs::write(&config, routing).unwrap();
+            assert_eq!(
+                refused_cause(instance(local)),
+                ManagedResumeCause::CodexConversationUnverified,
+                "{routing}"
+            );
+        }
+        std::fs::remove_file(&config).unwrap();
+
         // A wrapper's lookup is its own, whatever the rollout says.
         let mut wrapper = instance(local);
         wrapper.command = "my-codex-wrapper".into();
-        assert!(wrapper.resolve_launch_execution().is_err());
+        assert_ne!(
+            refused_cause(wrapper),
+            ManagedResumeCause::CodexConversationUnverified
+        );
 
         // An unpinned launch would not read a declared store.
         let path = crate::session::config::profile_config::get_profile_config_path(
@@ -3516,7 +3561,10 @@ mod tests {
             format!("[session.agent_config_dir]\ncodex = {store:?}\n"),
         )
         .unwrap();
-        assert!(instance(local).resolve_launch_execution().is_err());
+        assert_eq!(
+            refused_cause(instance(local)),
+            ManagedResumeCause::CodexConversationUnverified
+        );
     }
 
     /// After `--` the flag would be a second positional, not the option.

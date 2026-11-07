@@ -58,7 +58,7 @@ pub enum ManagedResumeCause {
     PiTranscriptBindingRequired,
     #[error("OMP exact transcript binding is missing")]
     OmpTranscriptBindingRequired,
-    #[error("Codex conversation cannot be verified for this project")]
+    #[error("Codex conversation cannot be verified in this context")]
     CodexConversationUnverified,
     #[error("native execution context cannot be attested")]
     ExecutionContextUnattested,
@@ -96,11 +96,14 @@ impl ManagedResumeCause {
             Self::PiTranscriptBindingRequired => transcript_recovery_message!("Pi"),
             Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
             Self::CodexConversationUnverified => concat!(
-                "Managed resume refused: no Codex rollout matches this ID and project.\n",
-                "Conversation preserved. Restore its store or project path, then retry.\n",
-                "Or continue it inside Codex (AoE drops this association):\n",
+                "Managed resume refused: cannot verify this Codex conversation here.\n",
+                "It needs a rollout recording this ID and project, on a host session with no\n",
+                "session.agent_config_dir, Codex profile, or alternate store routing.\n",
+                "Conversation preserved. Restore that context, then retry.\n",
+                "Or copy agent_session_id from aoe session show <session> --json and\n",
+                "continue inside Codex (AoE drops this association):\n",
                 "aoe session set-session-id <session> \"\"\n",
-                "Restart, then run /resume <native-id> in Codex once it is idle."
+                "Restart, then run /resume <native-id> once Codex is idle."
             ),
             Self::ExecutionContextUnattested => recovery_message!(
                 "Managed resume refused: execution context cannot be attested.\n\
