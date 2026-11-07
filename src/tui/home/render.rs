@@ -937,6 +937,10 @@ fn plan_plugin_statuses<'a>(
     let mut rejected = std::collections::HashSet::new();
     let mut reserved = 0;
     for (position, (plugin, text, tone, presentation)) in statuses.enumerate() {
+        let text_width = rendered_width(text);
+        if text_width == 0 {
+            continue;
+        }
         let index = if let Some(index) = contributors[..contributor_count]
             .iter()
             .position(|id| *id == Some(plugin))
@@ -958,7 +962,8 @@ fn plan_plugin_statuses<'a>(
             index
         };
         if counts[index] < MAX_PLUGIN_STATUS_COUNT {
-            candidates[index][counts[index]] = Some((position, text, tone, presentation));
+            candidates[index][counts[index]] =
+                Some((position, text, tone, presentation, text_width));
             counts[index] += 1;
         }
     }
@@ -968,7 +973,7 @@ fn plan_plugin_statuses<'a>(
         let mut order = [(usize::MAX, 0); MAX_PLUGIN_STATUS_COUNT];
         let mut count = 0;
         for (index, queue) in candidates[..contributor_count].iter().enumerate() {
-            if let Some((position, _, _, _)) = queue[round] {
+            if let Some((position, _, _, _, _)) = queue[round] {
                 order[count] = (position, index);
                 count += 1;
             }
@@ -981,7 +986,7 @@ fn plan_plugin_statuses<'a>(
             if plan.len == MAX_PLUGIN_STATUS_COUNT {
                 return plan;
             }
-            let (_, text, tone, presentation) = candidates[index][round].unwrap();
+            let (_, text, tone, presentation, text_width) = candidates[index][round].unwrap();
             let separator = presentation.separator_width();
             if round == 0 {
                 reserved -= separator + 1;
@@ -994,7 +999,6 @@ fn plan_plugin_statuses<'a>(
                 truncated = true;
                 continue;
             }
-            let text_width = rendered_width(text);
             let visible_width = text_width.min(available);
             plan.spans[plan.len] = Some(PluginStatusSpan {
                 text,
@@ -5754,6 +5758,16 @@ mod plugin_status_plan_tests {
             [("a long label", 2, 2), ("✓", 1, 1), ("issue", 2, 1)]
         );
         assert_eq!(plan.width, 9);
+    }
+
+    #[test]
+    fn status_plan_ignores_zero_width_contributors() {
+        use BadgePresentation::Glyph;
+        let statuses = [("a", "\0", None, Glyph), ("b", "✓", None, Glyph)];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 2);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓"]);
+        assert_eq!(plan.width, 2);
     }
 
     #[test]

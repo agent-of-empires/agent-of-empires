@@ -23,6 +23,11 @@ const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
 /// plugin cannot push the project path off the row. Matches the title column's
 /// budget.
 const ROW_COLUMN_MAX_WIDTH: usize = 24;
+const TITLE_WIDTH: usize = 24;
+const STATUS_WIDTH: usize = 10;
+const CONTEXT_WIDTH: usize = 11;
+const ROW_PREFIX_WIDTH: usize = 2 + 1 + TITLE_WIDTH + 2 + STATUS_WIDTH + 2 + CONTEXT_WIDTH + 2;
+const PATH_GAP_WIDTH: usize = 2;
 
 /// One plugin's `row-column` text plus the tone to paint it in.
 type RowColumnCell = (String, Option<Tone>, usize);
@@ -41,8 +46,16 @@ type MeasuredCells = (Vec<RowColumnCell>, usize);
 /// Budgets in terminal cells, not chars: plugin text is arbitrary, and a wide
 /// glyph (an emoji status marker, CJK) paints two cells while counting as one
 /// char, which would under-measure the column and shift the path after all.
+#[cfg(test)]
 fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells {
-    let mut budget = ROW_COLUMN_MAX_WIDTH;
+    row_column_cells_with_budget(state, session_id, ROW_COLUMN_MAX_WIDTH)
+}
+
+fn row_column_cells_with_budget(
+    state: &RemoteHomeState,
+    session_id: &str,
+    mut budget: usize,
+) -> MeasuredCells {
     let mut width = 0;
     let mut cells = Vec::new();
     for (_, text, tone, presentation) in
@@ -171,10 +184,13 @@ Press r to refresh, q to quit.",
         return;
     }
     // Measure every row's plugin cells first so they all pad to one width.
+    let lane_budget = usize::from(area.width)
+        .saturating_sub(ROW_PREFIX_WIDTH + PATH_GAP_WIDTH + 1)
+        .min(ROW_COLUMN_MAX_WIDTH);
     let plugin_cells: Vec<MeasuredCells> = state
         .sessions
         .iter()
-        .map(|s| row_column_cells(state, &s.id))
+        .map(|s| row_column_cells_with_budget(state, &s.id, lane_budget))
         .collect();
     let plugin_width = plugin_cells.iter().map(|(_, w)| *w).max().unwrap_or(0);
     let items: Vec<ListItem> = state
@@ -195,25 +211,24 @@ Press r to refresh, q to quit.",
             };
             let mut spans = vec![
                 Span::styled(
-                    format!(" {}  ", fixed_width(&s.title, 24)),
+                    format!(" {}  ", fixed_width(&s.title, TITLE_WIDTH)),
                     readable(title_style),
                 ),
                 Span::styled(
-                    format!("{}  ", fixed_width(&s.status, 10)),
+                    format!("{}  ", fixed_width(&s.status, STATUS_WIDTH)),
                     readable(status_style),
                 ),
                 Span::styled(
                     format!(
                         "{}  ",
-                        fixed_width(context_resume_summary(s.context_resume), 11)
+                        fixed_width(context_resume_summary(s.context_resume), CONTEXT_WIDTH)
                     ),
                     readable(status_style),
                 ),
             ];
             if plugin_width > 0 {
                 let (cells, width) = &plugin_cells[idx];
-                let available = usize::from(area.width).saturating_sub(54 + width);
-                spans.push(Span::raw(" ".repeat((plugin_width - width).min(available))));
+                spans.push(Span::raw(" ".repeat(plugin_width - width)));
                 for (text, tone, gap) in cells {
                     spans.push(Span::raw(" ".repeat(*gap)));
                     spans.push(Span::styled(
@@ -411,7 +426,12 @@ mod tests {
         );
         let painted = rows_with_width(&state, 60);
         assert!(
-            painted.iter().any(|line| line.ends_with('X')),
+            painted.iter().any(|line| line.contains("X  /")),
+            "{painted:?}"
+        );
+        assert_eq!(
+            painted.iter().filter(|line| line.ends_with('/')).count(),
+            2,
             "{painted:?}"
         );
     }
