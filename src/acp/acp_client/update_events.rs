@@ -24,8 +24,8 @@ use super::raw_input::{
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
-    extract_tool_output_blocks, preview_args, preview_optional_args, raw_event, tool_kind_str,
-    write_diff_from_meta,
+    extract_tool_output_blocks, full_prompt, preview_args, preview_optional_args, raw_event,
+    tool_kind_str, write_diff_from_meta,
 };
 
 /// Keeps synthetic tool-call ids minted in the same millisecond distinct.
@@ -376,6 +376,7 @@ pub(super) fn map_update_to_events(
                 name: tc.title.clone(),
                 kind: tool_kind_str(&tc.kind),
                 args_preview: args_preview.clone(),
+                prompt: tc.raw_input.as_ref().and_then(full_prompt),
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id,
                 memory_recall,
@@ -430,6 +431,12 @@ pub(super) fn map_update_to_events(
                     (!diffs.is_empty()).then_some(diffs)
                 })
                 .or_else(|| write_diff_from_meta(&update.meta));
+            let new_prompt = update
+                .fields
+                .raw_input
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .and_then(full_prompt);
             let new_args_preview = update
                 .fields
                 .raw_input
@@ -457,6 +464,7 @@ pub(super) fn map_update_to_events(
                     tool_call_id: id.clone(),
                     title: new_title,
                     args_preview: new_args_preview,
+                    prompt: new_prompt,
                     started_at: in_progress.then(chrono::Utc::now),
                     diffs: new_diffs,
                 });
@@ -536,6 +544,7 @@ pub(super) fn map_update_to_events(
             vec![
                 Event::ToolCallStarted {
                     tool_call: ToolCall {
+                        prompt: None,
                         id: tool_id.clone(),
                         name: "TodoWrite".to_string(),
                         kind: "think".to_string(),

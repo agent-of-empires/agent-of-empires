@@ -154,7 +154,7 @@ import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -754,11 +754,19 @@ function AppContent({
   );
   // Open (or focus) the Sub agents pane. Used by an inline async
   // sub-agent card to jump to its panel entry.
-  const openAgentsPane = useCallback(() => {
-    const dock = dockOf(paneLayout, "agents");
-    if (dock) activateTab(dock, "agents");
-    else toggleKind("agents", "right");
-  }, [paneLayout, activateTab, toggleKind]);
+  const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
+  const focusAgent = useCallback((agentId?: string) => {
+    if (agentId) setAgentFocus((f) => ({ agentId, nonce: (f?.nonce ?? 0) + 1 }));
+  }, []);
+  const openAgentsPane = useCallback(
+    (agentId?: string) => {
+      focusAgent(agentId);
+      const dock = dockOf(paneLayout, "agents");
+      if (dock) activateTab(dock, "agents");
+      else toggleKind("agents", "right");
+    },
+    [paneLayout, activateTab, toggleKind, focusAgent],
+  );
   const closePaneAny = useCallback(
     (id: string) => {
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
@@ -1998,7 +2006,13 @@ function AppContent({
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
-        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+        return (
+          <BackgroundAgentsPanel
+            sessionId={activeSessionId}
+            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+            focus={agentFocus}
+          />
+        );
       }
       if (id === "files") {
         // Remount on session switch so the selected file (and any in-flight
@@ -2083,6 +2097,7 @@ function AppContent({
                             onOpenFileRef={handleOpenFileRef}
                             fileRefSession={session}
                             onOpenAgentsPane={openAgentsPane}
+                            serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
@@ -2317,7 +2332,11 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
-          onOpenAgentsPane={() => handlePickView("agents")}
+          agentFocus={agentFocus}
+          onOpenAgentsPane={(agentId) => {
+            focusAgent(agentId);
+            handlePickView("agents");
+          }}
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}
