@@ -359,6 +359,9 @@ pub async fn update_session_archive(
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if row.is_trashed() {
+                return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
+            }
             let now = chrono::Utc::now();
             if matches!(row.status, Status::Creating | Status::Deleting)
                 || row.has_fresh_lifecycle_reservation(now) {
