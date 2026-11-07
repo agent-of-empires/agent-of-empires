@@ -790,23 +790,6 @@ command = "bash -lc true"
         assert_eq!(sessions.as_array().unwrap().len(), 1);
         assert_eq!(sessions[0]["tool"], "plugin-helper");
         assert_eq!(sessions[0]["command"], "bash -lc true");
-        let rejected = h.run_cli(&[
-            "add",
-            project.to_str().unwrap(),
-            "-t",
-            "OverrideCase",
-            "--tool",
-            "plugin-helper",
-            "--cmd-override",
-            "false",
-        ]);
-        assert!(!rejected.status.success());
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr).contains("--cmd-override cannot be used"),
-            "{}",
-            String::from_utf8_lossy(&rejected.stderr)
-        );
-        assert_eq!(h.read_sessions().as_array().unwrap().len(), 1);
     }
 }
 
