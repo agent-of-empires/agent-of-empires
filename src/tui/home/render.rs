@@ -898,6 +898,7 @@ struct PluginStatusSpan<'a> {
     text: &'a str,
     tone: Option<crate::plugin::ui_state::Tone>,
     width: usize,
+    separator: usize,
 }
 
 struct PluginStatusPlan<'a> {
@@ -913,7 +914,14 @@ impl<'a> PluginStatusPlan<'a> {
 }
 
 fn plan_plugin_statuses<'a>(
-    statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
+    statuses: impl Iterator<
+        Item = (
+            &'a str,
+            &'a str,
+            Option<crate::plugin::ui_state::Tone>,
+            crate::plugin::ui_state::BadgePresentation,
+        ),
+    >,
     budget: usize,
 ) -> PluginStatusPlan<'a> {
     let mut plan = PluginStatusPlan {
@@ -922,25 +930,92 @@ fn plan_plugin_statuses<'a>(
         width: 0,
     };
     let budget = budget.min(MAX_PLUGIN_STATUS_WIDTH);
-
-    for (text, tone) in statuses {
-        if plan.len == MAX_PLUGIN_STATUS_COUNT {
-            break;
-        }
-        let available = budget.saturating_sub(plan.width).saturating_sub(2);
-        if available == 0 {
-            break;
-        }
+    let mut contributors = [None; MAX_PLUGIN_STATUS_COUNT];
+    let mut candidates = [[None; MAX_PLUGIN_STATUS_COUNT]; MAX_PLUGIN_STATUS_COUNT];
+    let mut counts = [0; MAX_PLUGIN_STATUS_COUNT];
+    let mut contributor_count = 0;
+    let mut rejected = std::collections::HashSet::new();
+    let mut reserved = 0;
+    for (position, (plugin, text, tone, presentation)) in statuses.enumerate() {
         let text_width = rendered_width(text);
-        let visible_width = text_width.min(available);
-        plan.spans[plan.len] = Some(PluginStatusSpan {
-            text,
-            tone,
-            width: visible_width,
-        });
-        plan.len += 1;
-        plan.width += 2 + visible_width;
-        if visible_width < text_width {
+        if text_width == 0 {
+            continue;
+        }
+        let index = if let Some(index) = contributors[..contributor_count]
+            .iter()
+            .position(|id| *id == Some(plugin))
+        {
+            index
+        } else {
+            if contributor_count == MAX_PLUGIN_STATUS_COUNT || rejected.contains(plugin) {
+                continue;
+            }
+            let cost = presentation.separator_width() + 1;
+            if reserved + cost > budget {
+                rejected.insert(plugin);
+                continue;
+            }
+            let index = contributor_count;
+            contributors[index] = Some(plugin);
+            contributor_count += 1;
+            reserved += cost;
+            index
+        };
+        if counts[index] < MAX_PLUGIN_STATUS_COUNT {
+            candidates[index][counts[index]] =
+                Some((position, text, tone, presentation, text_width));
+            counts[index] += 1;
+        }
+    }
+    let mut truncated = false;
+
+    for round in 0..MAX_PLUGIN_STATUS_COUNT {
+        let mut order = [(usize::MAX, 0); MAX_PLUGIN_STATUS_COUNT];
+        let mut count = 0;
+        for (index, queue) in candidates[..contributor_count].iter().enumerate() {
+            if let Some((position, _, _, _, _)) = queue[round] {
+                order[count] = (position, index);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            break;
+        }
+        order[..count].sort_unstable_by_key(|&(position, _)| position);
+        for &(_, index) in &order[..count] {
+            if plan.len == MAX_PLUGIN_STATUS_COUNT {
+                return plan;
+            }
+            let (_, text, tone, presentation, text_width) = candidates[index][round].unwrap();
+            let separator = presentation.separator_width();
+            if round == 0 {
+                reserved -= separator + 1;
+            }
+            let reserve = if round == 0 { reserved } else { 0 };
+            let available = budget
+                .saturating_sub(plan.width + reserve)
+                .saturating_sub(separator);
+            if available == 0 {
+                truncated = true;
+                continue;
+            }
+            let visible_width = text_width.min(available);
+            plan.spans[plan.len] = Some(PluginStatusSpan {
+                text,
+                tone,
+                width: visible_width,
+                separator,
+            });
+            plan.len += 1;
+            plan.width += separator + visible_width;
+            if visible_width < text_width {
+                truncated = true;
+                if round != 0 {
+                    return plan;
+                }
+            }
+        }
+        if truncated {
             break;
         }
     }
@@ -2093,23 +2168,29 @@ impl HomeView {
         } else {
             String::new()
         };
-        let slot_width = if age.is_empty() {
-            0
-        } else {
+        let statuses: Vec<_> =
+            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id).collect();
+        let mut slot_width = if self.show_activity_age && (!age.is_empty() || !statuses.is_empty())
+        {
             LAST_ACTIVITY_SLOT
+        } else {
+            0
         };
 
         let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
-        let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
-
+        let mut fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
         let status_budget = room
             .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
             .min(MAX_PLUGIN_STATUS_WIDTH);
-
-        let plugin_status_plan = plan_plugin_statuses(
-            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
-            status_budget,
-        );
+        let mut plugin_status_plan = plan_plugin_statuses(statuses.iter().copied(), status_budget);
+        if plugin_status_plan.width == 0 && age.is_empty() && slot_width > 0 {
+            slot_width = 0;
+            fixed_trailing = badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+            let budget = room
+                .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
+                .min(MAX_PLUGIN_STATUS_WIDTH);
+            plugin_status_plan = plan_plugin_statuses(statuses.iter().copied(), budget);
+        }
         let plugin_status_width = plugin_status_plan.width;
 
         let (title_width, keep_tag) = if plugin_status_width > 0 {
@@ -2127,35 +2208,16 @@ impl HomeView {
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
-        for status in plugin_status_plan.iter() {
-            line_spans.push(Span::raw("  "));
-            let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
-            line_spans.push(Span::styled(
-                truncate_to_width(status.text, status.width),
-                if is_selected {
-                    selected_row_style(status_style, theme)
-                } else {
-                    status_style
-                },
-            ));
-        }
         let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
-        let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
+        let column_pad = activity_column_padding(
+            used_width + plugin_status_width,
+            list_width,
+            slot_width,
+            badge_width,
+        );
         let column_fits = column_pad.is_some();
         if let Some(pad_len) = column_pad.filter(|&p| p > 0) {
             line_spans.push(Span::raw(" ".repeat(pad_len)));
-        }
-        if column_fits && slot_width > 0 {
-            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-            let activity_style = Style::default().fg(theme.dimmed);
-            line_spans.push(Span::styled(
-                padded,
-                if is_selected {
-                    selected_row_style(activity_style, theme)
-                } else {
-                    activity_style
-                },
-            ));
         }
 
         if let Some(badge) = terminal_badge {
@@ -2188,6 +2250,35 @@ impl HomeView {
                     selected_row_style(badge_style, theme)
                 } else {
                     badge_style
+                },
+            ));
+        }
+        for status in plugin_status_plan.iter() {
+            line_spans.push(Span::raw(" ".repeat(status.separator)));
+            let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);
+            let mut text = truncate_to_width(status.text, status.width);
+            text.extend(std::iter::repeat_n(
+                ' ',
+                status.width.saturating_sub(rendered_width(&text)),
+            ));
+            line_spans.push(Span::styled(
+                text,
+                if is_selected {
+                    selected_row_style(status_style, theme)
+                } else {
+                    status_style
+                },
+            ));
+        }
+        if column_fits && slot_width > 0 {
+            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
+            let activity_style = Style::default().fg(theme.dimmed);
+            line_spans.push(Span::styled(
+                padded,
+                if is_selected {
+                    selected_row_style(activity_style, theme)
+                } else {
+                    activity_style
                 },
             ));
         }
@@ -5516,7 +5607,7 @@ mod tests {
 #[cfg(test)]
 mod plugin_status_plan_tests {
     use super::plan_plugin_statuses;
-    use crate::plugin::ui_state::Tone;
+    use crate::plugin::ui_state::{BadgePresentation, Tone};
 
     /// (name, budget, count, expected span list, expected width).
     type StatusPlanCase = (
@@ -5530,46 +5621,52 @@ mod plugin_status_plan_tests {
     #[test]
     fn status_plan_respects_width_budgets() {
         let statuses = [
-            ("Open", Some(Tone::Success)),
-            ("CI", Some(Tone::Info)),
-            ("WIP", Some(Tone::Warn)),
+            ("plugin", "Open", Some(Tone::Success)),
+            ("plugin", "CI", Some(Tone::Info)),
+            ("plugin", "WIP", Some(Tone::Warn)),
         ];
         let cases: &[StatusPlanCase] = &[
             ("empty", 32, 0, vec![], 0),
-            ("separator only", 2, 3, vec![], 0),
-            ("narrow", 3, 1, vec![("Open", Some(Tone::Success), 1)], 3),
-            ("exact", 6, 1, vec![("Open", Some(Tone::Success), 4)], 6),
+            ("separator only", 1, 3, vec![], 0),
+            ("narrow", 2, 1, vec![("Open", Some(Tone::Success), 1)], 2),
+            ("exact", 5, 1, vec![("Open", Some(Tone::Success), 4)], 5),
             (
                 "multiple",
-                10,
+                8,
                 2,
                 vec![
                     ("Open", Some(Tone::Success), 4),
                     ("CI", Some(Tone::Info), 2),
                 ],
-                10,
+                8,
             ),
             (
                 "truncated first",
-                5,
+                4,
                 1,
                 vec![("Open", Some(Tone::Success), 3)],
-                5,
+                4,
             ),
             (
                 "truncated later",
-                9,
+                7,
                 2,
                 vec![
                     ("Open", Some(Tone::Success), 4),
                     ("CI", Some(Tone::Info), 1),
                 ],
-                9,
+                7,
             ),
         ];
 
         for (name, budget, count, expected, expected_width) in cases {
-            let plan = plan_plugin_statuses(statuses[..*count].iter().copied(), *budget);
+            let plan = plan_plugin_statuses(
+                statuses[..*count]
+                    .iter()
+                    .copied()
+                    .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+                *budget,
+            );
             let actual: Vec<_> = plan
                 .iter()
                 .map(|span| (span.text, span.tone, span.width))
@@ -5577,5 +5674,143 @@ mod plugin_status_plan_tests {
             assert_eq!(&actual, expected, "{name}");
             assert_eq!(plan.width, *expected_width, "{name}");
         }
+    }
+
+    #[test]
+    fn status_plan_shares_lane_between_plugins() {
+        let statuses = [
+            ("github", "first pull request", None),
+            ("github", "second pull request", None),
+            ("linear", "ISSUE", None),
+        ];
+        let plan = plan_plugin_statuses(
+            statuses
+                .into_iter()
+                .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+            32,
+        );
+        let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
+        assert_eq!(
+            actual,
+            [
+                ("first pull request", 18),
+                ("ISSUE", 5),
+                ("second pull request", 6)
+            ]
+        );
+        assert_eq!(plan.width, 32);
+    }
+
+    #[test]
+    fn status_plan_keeps_snapshot_order_within_each_round() {
+        use BadgePresentation::Glyph;
+        let statuses = [
+            ("a", "a1", None, Glyph),
+            ("b", "b1", None, Glyph),
+            ("b", "b2", None, Glyph),
+            ("a", "a2", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 32);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["a1", "b1", "b2", "a2"]);
+    }
+
+    #[test]
+    fn status_plan_reserves_space_for_other_plugins() {
+        let statuses = [
+            ("github", "a very long pull request status label", None),
+            ("github", "second", None),
+            ("linear", "L", None),
+        ];
+        let plan = plan_plugin_statuses(
+            statuses
+                .into_iter()
+                .map(|(id, text, tone)| (id, text, tone, BadgePresentation::Glyph)),
+            32,
+        );
+        let actual: Vec<_> = plan.iter().map(|span| (span.text, span.width)).collect();
+        assert_eq!(
+            actual,
+            [("a very long pull request status label", 29), ("L", 1)]
+        );
+        assert_eq!(plan.width, 32);
+    }
+
+    #[test]
+    fn status_plan_reserves_mixed_contributor_gaps() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "a long label", None, Text),
+            ("a", "extra", None, Text),
+            ("b", "✓", None, Glyph),
+            ("c", "issue", None, Text),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 9);
+        let actual: Vec<_> = plan
+            .iter()
+            .map(|s| (s.text, s.separator, s.width))
+            .collect();
+        assert_eq!(
+            actual,
+            [("a long label", 2, 2), ("✓", 1, 1), ("issue", 2, 1)]
+        );
+        assert_eq!(plan.width, 9);
+    }
+
+    #[test]
+    fn status_plan_ignores_zero_width_contributors() {
+        use BadgePresentation::Glyph;
+        let statuses = [("a", "\0", None, Glyph), ("b", "✓", None, Glyph)];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 2);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓"]);
+        assert_eq!(plan.width, 2);
+    }
+
+    #[test]
+    fn status_plan_admits_later_glyph_in_same_round() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "✓", None, Glyph),
+            ("a", "text", None, Text),
+            ("b", "◐", None, Glyph),
+            ("b", "✉", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 6);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓", "◐", "✉"]);
+        assert_eq!(plan.width, 6);
+    }
+
+    #[test]
+    fn status_plan_admits_glyph_after_unaffordable_text() {
+        use BadgePresentation::{Glyph, Text};
+        let statuses = [
+            ("a", "✓", None, Glyph),
+            ("b", "Open", None, Text),
+            ("b", "✉", None, Glyph),
+            ("c", "◐", None, Glyph),
+        ];
+        let plan = plan_plugin_statuses(statuses.into_iter(), 4);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, ["✓", "◐"]);
+        assert_eq!(plan.width, 4);
+    }
+
+    #[test]
+    fn status_plan_skips_unaffordable_contributor_at_span_cap() {
+        use BadgePresentation::{Glyph, Text};
+        let ids = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+        ];
+        let statuses = ids.into_iter().map(|id| (id, "✓", None, Glyph)).chain([
+            ("rejected", "Open", None, Text),
+            ("rejected", "✉", None, Glyph),
+            ("last", "◐", None, Glyph),
+        ]);
+        let plan = plan_plugin_statuses(statuses, 32);
+        let actual: Vec<_> = plan.iter().map(|s| s.text).collect();
+        assert_eq!(actual, [&["✓"; 15][..], &["◐"]].concat());
+        assert_eq!(plan.width, 32);
     }
 }
