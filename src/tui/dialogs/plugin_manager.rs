@@ -703,7 +703,8 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Toggle live, reconciling daemon workers or falling back to a config write.
+    /// Keep displayed enable-state unchanged until the operation succeeds.
+    /// An RPC error can leave the remote outcome unknown.
     fn start_toggle(&mut self) {
         if self.pending.is_some() {
             return;
