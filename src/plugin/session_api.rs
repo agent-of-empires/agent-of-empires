@@ -948,6 +948,7 @@ async fn deliver_structured(
                     Some(plugin_id.to_string()),
                 )
                 .await
+                .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
                 .ok_or_else(session_not_found)?;
             return Ok(MessageSendResponse {
                 disposition: MessageDisposition::Queued,

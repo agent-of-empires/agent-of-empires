@@ -300,6 +300,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
         .find(|i| i.id == id)
         .expect("the session row must be on disk");
     assert_eq!(on_disk.queued_prompts.len(), 1);
+    assert_eq!(on_disk.queued_prompts[0].text, "follow up");
     assert!(on_disk.pending_initial_turn.is_none());
 }
 

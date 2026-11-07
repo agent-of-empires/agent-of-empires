@@ -21,7 +21,7 @@ use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
 use crate::server::api::sessions::cityhall_block_non_structured;
-use crate::server::session_service::EditQueuedOutcome;
+use crate::server::session_service::{EditQueuedOutcome, QueuePersistFailed};
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session: enough for
@@ -233,7 +233,7 @@ pub(super) async fn buffer_and_enqueue(
             )
             .await
     } else {
-        service
+        Ok(service
             .enqueue_prompt(
                 id,
                 prompt_id.to_string(),
@@ -242,17 +242,27 @@ pub(super) async fn buffer_and_enqueue(
                 origin_device,
                 origin_plugin,
             )
-            .await
+            .await)
+    };
+    // The blobs just buffered must not outlive a row that was never kept.
+    let drop_blobs = || {
+        state
+            .acp_event_store
+            .delete_pending_attachments_for_ref(id, prompt_id)
     };
     match entry {
-        Some(entry) => Ok(entry),
-        None => {
-            // Session vanished between the existence check and the enqueue;
-            // drop the blobs just buffered so they do not leak.
-            state
-                .acp_event_store
-                .delete_pending_attachments_for_ref(id, prompt_id);
+        Ok(Some(entry)) => Ok(entry),
+        // Session vanished between the existence check and the enqueue.
+        Ok(None) => {
+            drop_blobs();
             Err((StatusCode::NOT_FOUND, "session not found".to_string()))
+        }
+        Err(QueuePersistFailed) => {
+            drop_blobs();
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the prompt could not be saved; try again".to_string(),
+            ))
         }
     }
 }
