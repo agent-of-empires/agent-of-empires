@@ -1753,11 +1753,12 @@ mod tests {
         parked.id = "sess-msg-pending".to_string();
         parked.view = crate::session::View::Structured;
         parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
-        parked.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+        let seeded = crate::session::PendingInitialTurn {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
-        });
+        };
+        parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
         seed_native_rows(&state).await;
         let result = dispatch(
@@ -1768,10 +1769,9 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "the fake agent cannot start");
-        assert!(
-            state.instances.read().await[0]
-                .pending_initial_turn
-                .is_some(),
+        assert_eq!(
+            state.instances.read().await[0].pending_initial_turn,
+            Some(seeded),
             "a message refused before publication must keep the pending turn"
         );
     }
