@@ -79,8 +79,8 @@ export function useLiveTerminal(
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryCountRef = useRef(0);
-  // A user redial of a live socket reconnects from onclose instead of backing off.
-  const redialRef = useRef(false);
+  // The live socket a user redial closed; its onclose reconnects instead of backing off.
+  const redialRef = useRef<WebSocket | null>(null);
   const connectRef = useRef<(() => void) | null>(null);
   const desiredRef = useRef<{
     resize: { cols: number; rows: number } | null;
@@ -138,7 +138,7 @@ export function useLiveTerminal(
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
-    redialRef.current = false;
+    redialRef.current = null;
     setState(() => INITIAL_STATE);
 
     let disposed = false;
@@ -312,8 +312,8 @@ export function useLiveTerminal(
         disposeInflater();
         ownerKnownRef.current = false;
         const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
-        const redial = redialRef.current;
-        redialRef.current = false;
+        const redial = redialRef.current === ws;
+        redialRef.current = null;
         setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
         if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
@@ -477,13 +477,14 @@ export function useLiveTerminal(
   );
 
   const manualReconnect = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws && redialRef.current === ws) return;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
-    const ws = wsRef.current;
     // Wait for onclose so the server releases this socket's size claim before the redial asks for it.
     if (ws?.readyState === WebSocket.OPEN) {
-      redialRef.current = true;
+      redialRef.current = ws;
       setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
       ws.close();
       return;

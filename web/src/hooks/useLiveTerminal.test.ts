@@ -493,6 +493,7 @@ describe("size owner", () => {
     try {
       const { result, ws } = mount();
       act(() => result.current.manualReconnect());
+      act(() => result.current.manualReconnect());
       expect(ws.readyState).toBe(FakeWS.CLOSED);
       expect(FakeWS.sockets).toHaveLength(1);
       expect(result.current.state).toMatchObject({ connected: true, reconnecting: false });
@@ -505,6 +506,28 @@ describe("size owner", () => {
       next.open();
       next.readyState = FakeWS.CLOSED;
       act(() => next.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(result.current.state).toMatchObject({ reconnecting: true, retryCount: 1 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops a pending redial when an automatic reconnect replaces its socket first", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => result.current.manualReconnect());
+      act(() => {
+        window.dispatchEvent(new Event("online"));
+      });
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      const next = FakeWS.sockets[1]!;
+      next.open();
+
+      next.readyState = FakeWS.CLOSED;
+      act(() => next.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(FakeWS.sockets).toHaveLength(2);
       expect(result.current.state).toMatchObject({ reconnecting: true, retryCount: 1 });
     } finally {
       vi.clearAllTimers();
