@@ -59,6 +59,9 @@ struct AgentConfigMount {
 }
 
 /// The sole source-copy registry. Unknown root files never gain copy authority.
+/// MCP servers reach sandboxed agents only through ACP forwarding, so Claude's host
+/// `.claude.json` is never copied. Other agents' MCP-bearing config files below are
+/// still copied verbatim, a known gap.
 const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
     AgentConfigMount {
         tool_name: "claude",
@@ -2622,6 +2625,10 @@ pub(crate) fn build_container_config(
         });
     }
 
+    // Mounted whether or not a plugin serves MCP yet: mounts are fixed at container creation.
+    #[cfg(target_os = "linux")]
+    volumes.extend(crate::server::plugin_mcp_socket::sandbox_volume());
+
     let gitconfig = home.join(".gitconfig");
     if gitconfig.exists() {
         volumes.push(VolumeMount {
@@ -3296,6 +3303,49 @@ mod tests {
                 self.profile,
             )
         }
+    }
+
+    /// Every sandbox mounts the plugin socket directory read-only at a fixed path, so a plugin
+    /// installed later still reaches running containers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn every_sandbox_mounts_the_plugin_mcp_socket_dir_read_only() {
+        use crate::server::plugin_mcp_socket::{CONTAINER_DIR, FORWARDER_FILE};
+
+        let _home = IsolatedHome::new();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let config = Build::new("claude")
+            .instance("pluginmcpmount01")
+            .run(project_dir.path())
+            .unwrap();
+
+        let mounts: Vec<_> = config
+            .volumes
+            .iter()
+            .filter(|v| v.container_path == CONTAINER_DIR)
+            .collect();
+        let [mount] = mounts.as_slice() else {
+            panic!("one plugin MCP mount expected: {:?}", config.volumes);
+        };
+        assert!(mount.read_only);
+        let host = std::path::Path::new(&mount.host_path);
+        assert_eq!(
+            host,
+            std::fs::canonicalize(crate::session::get_app_dir().unwrap())
+                .unwrap()
+                .join("plugin-mcp"),
+            "the real path under the app dir"
+        );
+        assert!(
+            host.is_dir(),
+            "the mounted directory exists before any daemon"
+        );
+        assert!(
+            !host.join(FORWARDER_FILE).exists(),
+            "only a daemon that binds the socket writes the forwarder"
+        );
     }
 
     #[test]
@@ -3996,6 +4046,60 @@ mod tests {
         sync_fixture(&host, &sandbox, &["settings.json"], &[], &[], &[]).unwrap();
         assert!(!sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_store_never_carries_host_mcp_definitions() {
+        const SECRET: &str = "s3cr3t-guard-value";
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(host.join(".credentials.json"), r#"{"claudeAiOauth":{}}"#).unwrap();
+        fs::write(
+            dir.path().join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": false,
+                "mcpServers": {
+                    "stdio": {"command": "srv", "env": {"TOKEN": SECRET}},
+                    "http": {"type": "http", "url": "https://x.invalid",
+                             "headers": {"Authorization": SECRET}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .unwrap();
+        let sandbox = prepare_owned_fixture(
+            mount,
+            dir.path(),
+            Some("guardinstance"),
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join(".claude.json")).unwrap(),
+            r#"{"hasCompletedOnboarding":true}"#
+        );
+        assert!(sandbox.join("settings.json").exists());
+        let mut pending = vec![sandbox.clone()];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if let Ok(content) = fs::read_to_string(&path) {
+                assert!(!content.contains("mcpServers"), "{}", path.display());
+                assert!(!content.contains(SECRET), "{}", path.display());
+            }
+        }
     }
 
     #[test]

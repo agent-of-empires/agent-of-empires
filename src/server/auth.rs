@@ -135,8 +135,12 @@ fn is_machine_endpoint(path: &str) -> bool {
     path.starts_with("/api/")
         || path.contains("/ws")
         || (path.starts_with("/sessions/") && path.ends_with("/live-ws"))
-        || path == "/mcp"
-        || path.starts_with("/mcp/")
+        || is_mcp_path(path)
+}
+
+/// Whether `path` is the daemon's `/mcp` server (vs. the unrelated REST API).
+fn is_mcp_path(path: &str) -> bool {
+    path == "/mcp" || path.starts_with("/mcp/")
 }
 
 /// Whether a request path is exempt from the passphrase session + device-binding check.
@@ -162,6 +166,22 @@ fn is_login_session_exempt(path: &str) -> bool {
 /// for a session-authenticated request.
 fn should_refresh_session_cookie(path: &str) -> bool {
     !is_login_session_exempt(path)
+}
+
+/// Emit the accept event for a derived plugin-server credential.
+fn log_plugin_credential_accepted(
+    client_ip: IpAddr,
+    path: &str,
+    caller: &AuthenticatedPluginCaller,
+) {
+    tracing::trace!(
+        target: "auth.middleware",
+        ip = %client_ip,
+        path = %path,
+        plugin = %caller.plugin,
+        server = %caller.server,
+        "auth accepted via plugin-server credential"
+    );
 }
 
 /// Whether a request path + method needs an elevated login session (step-up auth, 15-minute
@@ -247,6 +267,9 @@ enum TokenSource {
     QueryParam,
     WebSocketProtocol,
     Bearer,
+    /// `X-AoE-Session` plus its matching `HMAC(secret, session_id)` bearer (see
+    /// `session_credential_claim` and `session_is_live`).
+    SessionCredential,
 }
 
 /// Request extension carrying the SHA-256 hash of the bearer token that authenticated this
@@ -257,7 +280,168 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 /// Request extension carrying the login session id used to authenticate the current
 /// request.
 #[derive(Clone, Debug)]
-pub struct AuthenticatedSession(pub String);
+pub struct AuthenticatedBrowserSession(pub String);
+
+/// Request extension carrying the AoE session id that authenticated the current request via
+/// its own `X-AoE-Session` credential. Distinct from [`AuthenticatedBrowserSession`], which
+/// carries a browser's passphrase login session.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedCallerSession(pub String);
+
+/// Request extension marking a request to a plugin MCP endpoint
+/// `/mcp/plugins/{plugin}/{server}`. `session` is the calling session when it authenticated
+/// with its derived per-plugin-server credential, `None` for the daemon-wide bearer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPluginCaller {
+    pub plugin: String,
+    pub server: String,
+    pub session: Option<String>,
+}
+
+/// The `(plugin, server)` of exactly `/mcp/plugins/{plugin}/{server}`.
+fn plugin_endpoint(path: &str) -> Option<(&str, &str)> {
+    let (plugin, server) = path.strip_prefix("/mcp/plugins/")?.split_once('/')?;
+    (!plugin.is_empty() && !server.is_empty() && !server.contains('/')).then_some((plugin, server))
+}
+
+/// The `X-AoE-Session` header name carrying the id a session credential claims to be.
+const SESSION_HEADER: &str = "x-aoe-session";
+
+/// The session id `request` claims via `X-AoE-Session`, if its bearer token equals
+/// `HMAC(secret, that session's id)`. Does not check that the session is live; callers must
+/// also check [`session_is_live`].
+///
+/// Kept synchronous and called directly rather than wrapped in an async fn: `Request`'s body is
+/// `Send` but not `Sync`, so an async fn taking `&Request` that also awaits breaks the caller's
+/// future's `Send` bound, which `axum::middleware::from_fn` requires.
+fn session_credential_claim(state: &AppState, request: &Request) -> Option<String> {
+    let secret = state.mcp_session_secret.as_ref()?;
+    let session_id = request
+        .headers()
+        .get(SESSION_HEADER)?
+        .to_str()
+        .ok()?
+        .to_string();
+    let presented = extract_tokens(request)
+        .into_iter()
+        .find(|(_, source)| *source == TokenSource::Bearer)
+        .map(|(value, _)| value)?;
+    secret.verify(&session_id, presented).then_some(session_id)
+}
+
+/// Whether `session_id` names a session that still exists and is neither archived nor trashed.
+async fn session_is_live(state: &AppState, session_id: &str) -> bool {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|inst| inst.id == session_id && !inst.is_archived() && !inst.is_trashed())
+}
+
+/// [`session_credential_claim`], but only for `/mcp` itself and only while it is mounted: this
+/// credential authenticates that surface alone, never the REST API, WebSocket routes or
+/// `/mcp/plugins/...`, which take the derived credential of [`live_plugin_caller`] instead.
+fn session_credential_claim_for_mcp(state: &AppState, request: &Request) -> Option<String> {
+    let path = request.uri().path();
+    if !state.web_config.mcp_enabled
+        || !is_mcp_path(path)
+        || path == "/mcp/plugins"
+        || path.starts_with("/mcp/plugins/")
+    {
+        return None;
+    }
+    session_credential_claim(state, request)
+}
+
+/// `(plugin, server, session)` of a plugin endpoint request whose bearer is the credential
+/// derived for that exact `(plugin, server)` and the session named by `X-AoE-Session`. Owned,
+/// because `Request` is not `Sync` and must not be held across an await. Does not check that
+/// the session is live; see [`live_plugin_caller`].
+fn plugin_credential_claim(
+    state: &AppState,
+    request: &Request,
+) -> Option<(String, String, String)> {
+    let (plugin, server) = plugin_endpoint(request.uri().path())?;
+    let secret = state.mcp_session_secret.as_ref()?;
+    let session = request.headers().get(SESSION_HEADER)?.to_str().ok()?;
+    let presented = extract_tokens(request)
+        .into_iter()
+        .find(|(_, source)| *source == TokenSource::Bearer)
+        .map(|(value, _)| value)?;
+    secret
+        .verify_plugin_server(plugin, server, session, presented)
+        .then(|| (plugin.to_string(), server.to_string(), session.to_string()))
+}
+
+/// The caller for a verified [`plugin_credential_claim`], if its session is still live.
+async fn live_plugin_caller(
+    state: &AppState,
+    claim: Option<(String, String, String)>,
+) -> Option<AuthenticatedPluginCaller> {
+    let (plugin, server, session) = claim?;
+    session_is_live(state, &session)
+        .await
+        .then_some(AuthenticatedPluginCaller {
+            plugin,
+            server,
+            session: Some(session),
+        })
+}
+
+/// The caller on the sandbox plugin socket, which accepts nothing but a live derived credential.
+/// `&mut` keeps the future `Send`, as in [`attach_caller_session`].
+pub(super) async fn socket_plugin_caller(
+    state: &AppState,
+    request: &mut Request,
+) -> Option<AuthenticatedPluginCaller> {
+    let claim = plugin_credential_claim(state, request);
+    live_plugin_caller(state, claim).await
+}
+
+/// The caller for a plugin endpoint request that authenticated by any means other than the
+/// derived credential (daemon-wide bearer, login session, or an open gate): no session.
+fn daemon_plugin_caller(path: &str) -> Option<AuthenticatedPluginCaller> {
+    let (plugin, server) = plugin_endpoint(path)?;
+    Some(AuthenticatedPluginCaller {
+        plugin: plugin.to_string(),
+        server: server.to_string(),
+        session: None,
+    })
+}
+
+/// Attach [`AuthenticatedCallerSession`] (on `/mcp`) or [`AuthenticatedPluginCaller`] (on a
+/// plugin endpoint) to `request` when it carries a live session credential, regardless of which
+/// gate (token, no-auth, or the passphrase wall) already decided to let the request through.
+/// On a plugin endpoint without one, the caller is the daemon (no session).
+///
+/// Takes `&mut Request`, not `&Request`: unlike a shared reference, `&mut Request` is `Send`
+/// without requiring `Request` to be `Sync`, so this can safely await internally.
+async fn attach_caller_session(state: &AppState, request: &mut Request) {
+    let claim = plugin_credential_claim(state, request);
+    let plugin_caller = live_plugin_caller(state, claim).await;
+    attach_resolved_caller(state, request, plugin_caller).await;
+}
+
+/// [`attach_caller_session`] with the [`live_plugin_caller`] already resolved.
+async fn attach_resolved_caller(
+    state: &AppState,
+    request: &mut Request,
+    plugin_caller: Option<AuthenticatedPluginCaller>,
+) {
+    if let Some(caller) = plugin_caller.or_else(|| daemon_plugin_caller(request.uri().path())) {
+        request.extensions_mut().insert(caller);
+        return;
+    }
+    let Some(claimed) = session_credential_claim_for_mcp(state, request) else {
+        return;
+    };
+    if session_is_live(state, &claimed).await {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedCallerSession(claimed));
+    }
+}
 
 /// Pure elevation decision, extracted so the matrix is unit-testable without standing up
 /// `AppState`.
@@ -275,11 +459,11 @@ fn elevation_verdict(
 /// Shared resolver for handler-side (body-shape) elevation gates.
 pub(crate) async fn handler_elevated(
     state: &AppState,
-    session: Option<&AuthenticatedSession>,
+    session: Option<&AuthenticatedBrowserSession>,
     local_owner: bool,
 ) -> bool {
     let session_elevated = match session {
-        Some(AuthenticatedSession(id)) => Some(state.login_manager.is_elevated(id).await),
+        Some(AuthenticatedBrowserSession(id)) => Some(state.login_manager.is_elevated(id).await),
         None => None,
     };
     elevation_verdict(
@@ -346,12 +530,21 @@ async fn session_valid(
 /// Passphrase login wall used when the token gate is disabled (`--auth=passphrase`).
 async fn run_passphrase_wall(
     state: &AppState,
-    request: Request,
+    mut request: Request,
     client_ip: IpAddr,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
+
+    // A verified derived credential on its own plugin endpoint for a live session is already
+    // scoped to one plugin server of that session, so it skips the login.
+    let claim = plugin_credential_claim(state, &request);
+    if let Some(caller) = live_plugin_caller(state, claim).await {
+        log_plugin_credential_accepted(client_ip, &path, &caller);
+        request.extensions_mut().insert(caller);
+        return next.run(request).await;
+    }
 
     if is_login_session_exempt(&path) {
         return next.run(request).await;
@@ -410,11 +603,12 @@ async fn run_passphrase_wall(
             .into_response();
     }
 
-    let mut request = request;
     request
         .extensions_mut()
-        .insert(AuthenticatedSession(session_id.clone()));
+        .insert(AuthenticatedBrowserSession(session_id.clone()));
     request.extensions_mut().insert(Principal::Device);
+    // Not a live plugin caller: the check at the top returned for one.
+    attach_resolved_caller(state, &mut request, None).await;
 
     let mut response = next.run(request).await;
 
@@ -466,6 +660,7 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(Principal::LocalPeer { uid });
+        attach_caller_session(&state, &mut request).await;
         return next.run(request).await;
     }
 
@@ -479,6 +674,7 @@ pub async fn auth_middleware(
                 TokenSource::QueryParam => "query",
                 TokenSource::Bearer => "bearer",
                 TokenSource::WebSocketProtocol => "ws-proto",
+                TokenSource::SessionCredential => "session-credential",
             })
             .collect();
         let ws_protocols = extract_ws_protocols(&request);
@@ -516,6 +712,7 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash([0u8; 32]));
         request.extensions_mut().insert(Principal::TokenHolder);
+        attach_caller_session(&state, &mut request).await;
         return next.run(request).await;
     }
 
@@ -576,14 +773,35 @@ pub async fn auth_middleware(
     let mut matched_source = None;
     let mut needs_upgrade = false;
     let mut matched_token_hash: Option<[u8; 32]> = None;
+    let mut caller_session: Option<String> = None;
+    let mut plugin_caller: Option<AuthenticatedPluginCaller> = None;
 
-    for (token_value, source) in extract_tokens(&request) {
-        let (valid, upgrade) = state.token_manager.validate(token_value).await;
-        if valid {
-            matched_source = Some(source);
-            needs_upgrade = upgrade;
-            matched_token_hash = Some(super::push::sha256_token(token_value));
-            break;
+    let claim = plugin_credential_claim(&state, &request);
+    if let Some(caller) = live_plugin_caller(&state, claim).await {
+        matched_source = Some(TokenSource::SessionCredential);
+        plugin_caller = Some(caller);
+    }
+
+    if let Some(claimed_session_id) = session_credential_claim_for_mcp(&state, &request) {
+        if session_is_live(&state, &claimed_session_id).await {
+            matched_source = Some(TokenSource::SessionCredential);
+            matched_token_hash = extract_tokens(&request)
+                .into_iter()
+                .find(|(_, source)| *source == TokenSource::Bearer)
+                .map(|(value, _)| super::push::sha256_token(value));
+            caller_session = Some(claimed_session_id);
+        }
+    }
+
+    if matched_source.is_none() {
+        for (token_value, source) in extract_tokens(&request) {
+            let (valid, upgrade) = state.token_manager.validate(token_value).await;
+            if valid {
+                matched_source = Some(source);
+                needs_upgrade = upgrade;
+                matched_token_hash = Some(super::push::sha256_token(token_value));
+                break;
+            }
         }
     }
 
@@ -635,11 +853,15 @@ pub async fn auth_middleware(
             .into_response();
     };
 
-    // Token valid: record success, stamp owner, record device.
-    state
-        .rate_limiter
-        .record_success(client_ip, super::rate_limit::AuthBudget::Token)
-        .await;
+    let plugin_credential = plugin_caller.is_some();
+    // Token valid: record success, stamp owner, record device. A plugin credential proves no
+    // token, so it neither resets the IP's token budget nor makes its caller a token holder.
+    if !plugin_credential {
+        state
+            .rate_limiter
+            .record_success(client_ip, super::rate_limit::AuthBudget::Token)
+            .await;
+    }
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -652,13 +874,28 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
     }
-    request.extensions_mut().insert(Principal::TokenHolder);
+    if !plugin_credential {
+        request.extensions_mut().insert(Principal::TokenHolder);
+    }
+    if let Some(session_id) = caller_session {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedCallerSession(session_id));
+    }
     let path = request.uri().path().to_string();
+    if let Some(caller) = &plugin_caller {
+        log_plugin_credential_accepted(client_ip, &path, caller);
+    }
+    if let Some(caller) = plugin_caller.or_else(|| daemon_plugin_caller(&path)) {
+        request.extensions_mut().insert(caller);
+    }
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
 
     let login_exempt = is_login_session_exempt(&path);
-    if login_enabled && !login_exempt {
+    // A verified derived plugin credential is scoped to one plugin server of a live session,
+    // so, like a login-exempt path, it needs no login.
+    if login_enabled && !login_exempt && !plugin_credential {
         tracing::warn!(
             target: "auth",
             ip = %client_ip,
@@ -743,8 +980,9 @@ async fn handle_session_authenticated(
 
     request
         .extensions_mut()
-        .insert(AuthenticatedSession(session_id.clone()));
+        .insert(AuthenticatedBrowserSession(session_id.clone()));
     request.extensions_mut().insert(Principal::Device);
+    attach_caller_session(state, &mut request).await;
 
     let mut response = next.run(request).await;
 
@@ -1338,5 +1576,47 @@ mod tests {
                 "{token:?}"
             );
         }
+    }
+
+    /// A session's own `/mcp` credential is scoped to `/mcp`; it must not also authenticate
+    /// unrelated REST API routes, which are a much larger surface than the MCP tool set.
+    #[tokio::test]
+    async fn session_credential_does_not_authenticate_non_mcp_routes() {
+        use crate::server::session_credential::McpSessionSecret;
+        use crate::session::Instance;
+        use tower::ServiceExt;
+
+        let inst = Instance::new("caller", "/repo");
+        let id = inst.id.clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = McpSessionSecret::load_or_generate(&dir.path().join("mcp_session_secret"))
+            .expect("load_or_generate");
+        let bearer = secret.credential_for(&id);
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            vec![inst],
+            vec!["localhost".to_string()],
+            Vec::new(),
+            Some("daemon-token".to_string()),
+            |state| state.mcp_session_secret = Some(Arc::new(secret)),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+
+        let mut req = Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("x-aoe-session", &id)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+        ));
+        let status = app.oneshot(req).await.unwrap().status();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a valid /mcp session credential must not authenticate /api/sessions"
+        );
     }
 }

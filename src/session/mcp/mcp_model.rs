@@ -30,6 +30,10 @@ pub enum McpProvenance {
     KeptOnRemoval {
         agent: String,
     },
+    /// Served by a plugin through the daemon; injected at launch only.
+    Plugin {
+        plugin_id: String,
+    },
 }
 
 impl McpProvenance {
@@ -40,6 +44,7 @@ impl McpProvenance {
             McpProvenance::Profile { name } => format!("profile:{name}"),
             McpProvenance::ProjectLocal => "project-local".to_string(),
             McpProvenance::KeptOnRemoval { agent } => format!("kept-on-removal:{agent}"),
+            McpProvenance::Plugin { plugin_id } => format!("plugin:{plugin_id}"),
         }
     }
 }
@@ -135,9 +140,13 @@ pub fn resolve(layers: Vec<McpLayer>) -> Vec<ResolvedMcpServer> {
 
 /// Names and transports only, safe for logs.
 pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
-    servers
-        .iter()
-        .map(|s| format!("{}({})", s.def.name, s.def.kind()))
+    summarize_defs(servers.iter().map(|s| &s.def))
+}
+
+/// Names and transports only, safe for logs.
+pub fn summarize_defs<'a>(defs: impl IntoIterator<Item = &'a ProjectMcpServer>) -> String {
+    defs.into_iter()
+        .map(|d| format!("{}({})", d.name, d.kind()))
         .collect::<Vec<_>>()
         .join(", ")
 }

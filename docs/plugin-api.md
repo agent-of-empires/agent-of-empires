@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `22`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 20
+api_version = 22
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `22`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -112,6 +112,8 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 21`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
+| `mcp.serve` | Serving MCP servers from the plugin's worker (`api_version >= 22`, requires a `[runtime]` worker). Gives the plugin an authenticated per-session MCP endpoint, so it can answer tool calls an agent makes in that session. The protocol never sends a worker a credential, but workers are not sandboxed from the daemon's files and run as the user, so a hostile worker could read the session secret in the app directory; the grant is high-severity for that reason. A distinct grant, never implied by another. See [Serving MCP servers](#serving-mcp-servers-api_version--22). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -341,6 +343,108 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `capability_missing` | The manifest lacks, or the user has not approved, `session.message`. |
 
 **Timing.** The call is synchronous. It returns, or fails with `delivery_timeout`, within 25 seconds (a 10 second worker-ready wait plus 15 seconds for a terminal resume), so a worker may call it from a scheduler loop.
+
+## Hooks
+
+### `[hooks.mcp_rewrite]` (`api_version >= 21`)
+
+Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
+
+```toml
+[hooks.mcp_rewrite]
+applies_to = "sandbox"   # "sandbox" (default) or "all"
+timeout_ms = 5000        # 1..=30000
+order = 0                # lower runs first; ties break by plugin id
+```
+
+Plugins that inject servers should keep the default or a negative `order`. A plugin that must see everything the others add, such as a security proxy, should declare a high `order` (for example `1000`) so it runs last.
+
+After AoE merges the MCP layers and before it hands the set to the agent, on every launch and respawn, the host sends the worker a `mcp.rewrite` request. It is a host-initiated JSON-RPC request whose `id` is a string of the form `h-<n>`. The worker answers with a JSON-RPC response carrying the same string `id` and either a `result` (the edit below) or an `error` object. A worker that is still starting is waited for until `timeout_ms` elapses.
+
+```json
+{
+  "session_id": "…", "agent": "…", "sandboxed": true,
+  "profile": null, "cwd": "/path",
+  "sandbox": {
+    "container_workdir": "/workspace/foo",
+    "mounts": [ { "host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false } ]
+  },
+  "servers": [
+    { "name": "docs", "type": "http", "url": "https://…", "headers": { "Authorization": "Bearer …" } },
+    { "name": "fs", "type": "stdio", "command": "…", "args": [], "env": { "K": "V" } }
+  ]
+}
+```
+
+`sandbox` is present only when `sandboxed` is true. `mounts` are the volumes AoE creates the container with, so a plugin can map container paths back to the host: a linked worktree lists both the worktree and its main repo, and a workspace (multi-repo) session lists the workspace directory plus every main repo outside it. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
+
+A server a plugin contributed carries `"plugin": "<plugin id>"`, so a hook can filter by who contributed it. AoE sets it, never a reply: on entries from `mcp.session.servers` (the serving plugin), and on entries an earlier hook added, full definitions and `serve` markers alike (that hook's plugin). A later hook that replaces the entry by name becomes its contributor, and a dropped entry loses it. User, project, agent-native and built-in servers never carry it, so the first hook sees it only on `mcp.session.servers` entries. `plugin` is accepted back on an `add` entry and ignored.
+
+The hook request is built per hook, so every `mcp.rewrite` plugin sees the `mcp.session.servers` entries, not only the serving plugin. Their credential is a `${AOE_PLUGIN_MCP_CRED_<id>}` reference, never the value, and a reference only works in the entry AoE minted it for (see [Serving MCP servers](#serving-mcp-servers-api_version--22)), so a hook cannot obtain a working credential by copying, modifying or re-adding entries. `mcp.rewrite` is still a high-trust grant: a hook can add a stdio command that runs as you, or in the container, and read the agent's environment. This is defense in depth, not a boundary. Entries added with `serve` (below) are likewise never shown to any hook with a credential.
+
+The `result` is an edit; unknown fields are rejected:
+
+```json
+{
+  "drop": ["fs"],
+  "add": [ { "name": "docs", "type": "http", "url": "http://gateway/mcp/docs" } ]
+}
+```
+
+`drop` is a list of names or `"*"`. `add` entries use the standard `mcpServers` shape plus `name`; an added server replaces any server of the same name, and a later duplicate in `add` wins. Plugins run in ascending `order`, ties broken by plugin id, each seeing the previous result.
+
+A plugin holding both `mcp.rewrite` and `mcp.serve` can also add a server it serves itself, which suits a plugin that decides its servers from the final set:
+
+```json
+{
+  "add": [ { "name": "docs", "serve": {} }, { "name": "fs", "serve": { "prefix": false } } ]
+}
+```
+
+- A `serve` entry has only `name` and `serve`, and `serve` only `prefix`; any other field, or any of `type`, `url`, `headers`, `command`, `args` or `env` next to it, makes the reply invalid. So does a `serve` entry from a plugin without both capabilities, or a `name` that is not a valid MCP server name.
+- The entry key is `<prefix>__<name>` with `"prefix": true` (the default), as for [served servers](#serving-mcp-servers-api_version--22), and the bare `<name>` with `"prefix": false`. Like any added server it replaces an entry of the same key, without a notification.
+- Later hooks see the entry as `{ "name": "<key>", "serve": { "prefix": … }, "plugin": "<plugin id>" }`, without `url` or `headers`, and can drop or replace it by name like any entry. A hook keeps a marker by leaving it alone; echoing it back in `add` is a new `serve` entry of the replying plugin (its `plugin` is ignored), and the reply is invalid if that plugin lacks `mcp.serve`.
+- After the last hook, AoE turns each remaining `serve` entry into the same `http` entry a served server gets: `/mcp/plugins/<plugin id>/<name>` with the unprefixed `<name>`, a credential reference for that session and server, and `X-AoE-Session`. No hook ever sees the credential value.
+- For a sandboxed session that reaches the daemon over its socket, the entry is the stdio forwarder entry described under [Serving MCP servers](#serving-mcp-servers-api_version--22) instead.
+- When the session has no route to the daemon, the entry is omitted together with any entry of the same key, so nothing falls back to the server it replaced, and AoE raises one notification attributed to the plugin naming the cause, unless the launch already did.
+
+A sandboxed session whose hook fails (no worker within the timeout, error reply, invalid reply) is given **no** MCP servers, and AoE raises a notification attributed to the plugin. A sandboxed session with an applicable hook also gets no servers when the plugin host could not start. An `error` reply is reported as a rejection without the worker's text, so a worker cannot write into AoE's logs or notifications through it. Other sessions keep their resolved set.
+
+AoE does not copy host MCP definitions into a Claude sandbox's agent store, though `.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are. Other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
+
+## Serving MCP servers (`api_version >= 22`)
+
+A plugin with the `mcp.serve` capability and a `[runtime]` worker can offer MCP servers to agent sessions without running a process per server: the agent connects to the daemon, and the daemon forwards each request to the worker. No manifest table is needed. The user-facing view is in the [MCP servers guide](guides/mcp-servers.md#plugin-served-servers).
+
+The host sends the worker these requests. All carry host-allocated string ids of the form `h-<n>`; a reply is a JSON-RPC response with the same id, either a `result` or an `error`.
+
+| Method | Params | Result |
+|---|---|---|
+| `mcp.session.servers` | `{ session_id, agent, sandboxed, profile, cwd, sandbox? }` (same fields as the [`mcp.rewrite`](#hooksmcp_rewrite-api_version--20) request, without `servers`) | `[ { "name": "<server>", "prefix": true } ]` |
+| `mcp.tools.list` | `{ server, session_id, cursor? }` | An MCP `ListToolsResult` |
+| `mcp.tools.call` | `{ server, session_id, name, arguments }` | An MCP `CallToolResult` |
+
+`session_id` is `null` when the daemon's own token made the call. The host also sends the notification `mcp.cancel` with `{ server, session_id, request_id }` when the agent abandons a call or the call times out; `request_id` is the `h-<n>` id of the request to stop. It needs no reply.
+
+`mcp.session.servers` is asked of every serving plugin at every launch and respawn, and answers which servers that session gets. Each entry has `name` and an optional `prefix` (default `true`); other fields make the reply invalid. Names must be valid MCP server names; entries are de-duplicated by entry key and capped at 64 per plugin (`MCP_SERVE_MAX_PER_PLUGIN`). A worker that errors, takes longer than 5 s, or replies with another shape contributes no servers, and AoE raises a notification attributed to the plugin. A JSON-RPC "method not found" error (`-32601`) counts as offering nothing, without a notification, so a plugin that only adds `serve` entries from its rewrite hook need not implement the method. A hung worker therefore delays a launch by up to 5 s.
+
+The agent receives each server under the key `<prefix>__<server>`, where `<prefix>` is the plugin id with `.` replaced by `_`, or under the bare `<server>` with `"prefix": false`. The entry points at `/mcp/plugins/<plugin id>/<server>` on the daemon and carries a credential derived for that session and server, plus an `X-AoE-Session` header; the credential opens only that endpoint and lives as long as its session; it is revoked only when the session is trashed or archived. Being scoped to one plugin server of one live session, it passes the passphrase login on that endpoint from any source, including through `--remote`, `--behind-proxy` or any tunnel, so anyone holding it can reach that endpoint without logging in. Sandboxes need this: Podman with pasta delivers their traffic with the host's address as source, which is not local. The daemon-wide token and plain session credentials still need the login from a non-local source. Policy rules or allowlists written against tool names must use the entry key: agents see tools as `mcp__<key>__<tool>`. Plugin entries replace user-layer entries of the same key, and AoE raises one notification per launch for each plugin that did, naming the replaced keys. The notice fires at launch before the rewrite hooks run, so a hook that later drops or replaces such a key can leave it looking stale. When two plugins produce the same key, an entry under its own plugin's prefix beats an unprefixed one, so no plugin can take another's namespace; otherwise the lowest plugin id keeps it. The other plugin's entry is skipped and AoE notifies that plugin, naming the key. They are not shown by `aoe mcp list` or the dashboard's MCP views.
+
+Credentials stay off the agent's command line where the agent allows it. An agent's MCP entries can end up on its process command line, which every local user can read, so a plugin entry carries the credential only as a reference: `Authorization: Bearer ${AOE_PLUGIN_MCP_CRED_<id>}` for `http`, `AOE_PLUGIN_MCP_TOKEN=${AOE_PLUGIN_MCP_CRED_<id>}` in the forwarder's `env`. `<id>` is a short hash of the credential itself, so it is unique per server and session, stable across respawns, and cannot be computed from public data such as plugin and server names. The value is set in the agent process's environment and the agent expands the reference itself. That environment is readable by you and not by other users, but every child of the agent inherits it: each tool or shell command and every stdio MCP server, in sandboxes too. This is no wider than the old command-line exposure (the same user), but narrower than "only you can read". AoE drops, for every agent, any entry it forwards that mentions an `AOE_PLUGIN_MCP_CRED_` variable (a project, global, profile or native entry, a hook-added entry, or an entry a hook edited) unless it is the exact, unmodified entry AoE minted the reference for, and it delivers a value only when that entry exists. This covers only what AoE forwards. Claude Code also loads `~/.claude.json` and an approved project `.mcp.json` itself and expands `${VAR}` there, and AoE does not filter those files; a reference in such a file can still expand. That path is protected only by the variable name being unguessable to the file's author. The names are visible in the process list (the agent's `--mcp-config` holds the references) and to every `mcp.rewrite` hook. A gateway-style hook that copies a plugin's `Authorization` header into a new key now copies a reference and loses the entry, so that route breaks: use the plugin's own entry instead. This is done only for agents verified to expand `${VAR}` in MCP entries from their own environment, currently Claude Code (`claude` and `claude-code`). Every other agent receives the literal credential in its entries, exactly as before, and so for those agents the credential remains readable on the agent's command line if it puts the entries there. For a sandboxed session the value reaches the container through `docker exec -e <name>`, with the value passed through the runner's environment and never in the `docker exec` argv. `X-AoE-Session` and `AOE_PLUGIN_MCP_SESSION` are not secret and stay literal. If the agent cannot expand a reference it sends the text `${AOE_PLUGIN_MCP_CRED_<id>}` as the bearer, which the daemon rejects.
+
+Forwarded calls have a fixed 600 s ceiling, and the host waits up to 5 s for a worker that is still starting. Results over 4 MiB are rejected. The host always marks results `complete` (rmcp strips it for older clients), so a worker may omit it; any value other than `"complete"` counts as a failure. A failed `mcp.tools.list` surfaces to the agent as a JSON-RPC internal error, a failed `mcp.tools.call` as an MCP error result (`isError: true`). Both texts are fixed: worker error text is never logged or returned, so a worker cannot write into AoE's logs or an agent's context through a failure.
+
+Limits:
+
+- Structured-view (ACP) launches only. Terminal-view sessions get none.
+- The endpoints do not depend on `web.mcp_enabled`: the daemon serves them, and creates the session credential secret, when a plugin holding `mcp.serve` is installed at daemon start. The built-in `/mcp` stays behind the setting, and a plain session credential opens nothing while it is off. A serving plugin installed later needs a daemon restart.
+- Sandboxed sessions on Linux reach the endpoints through a unix socket, with no bind address, allowed host or network route involved, so any `sandbox.network` value works, `none` included. The daemon serves only the plugin endpoints on `<app dir>/plugin-mcp/mcp.sock` (directory 0700, socket 0600) and accepts only the derived credential there: no daemon token, login session or loopback trust. Every sandbox container mounts that directory read-only at `/aoe/plugin-mcp`, so a daemon restart reaches running containers. Only the daemon that bound the socket writes `forward.mjs` there. The entry is then a stdio server, `node /aoe/plugin-mcp/forward.mjs /aoe/plugin-mcp/mcp.sock <plugin id> <server>` with `AOE_PLUGIN_MCP_TOKEN` (a credential reference, see above) and `AOE_PLUGIN_MCP_SESSION` in `env`, so a rewrite hook sees this form, without the credential value, for sandboxed sessions. The forwarder needs `node` in the image (the default image has it) and a container user that can open a 0600 socket owned by you: container root under rootless Podman or rootless Docker, or root under rootful Docker. Verified with rootless Podman and pasta on the default image, including `--network none`.
+- Not covered by the socket: macOS, VM-backed runtimes such as Docker Desktop, a Podman machine or Apple Container (the socket does not cross the VM boundary; at launch AoE asks the container for its kernel boot id and treats a mismatch as VM-backed; a container it cannot check, for example one without `cat` or a runtime that does not answer, is treated as unable to use the socket), images whose user is not root (the forwarder then answers every call with a JSON-RPC error), and containers created before this mount existed or under another app directory. Those sandboxes fall back to `http://host.containers.internal:<port>` when the daemon is bound to a non-loopback address and `host.containers.internal` is in its allowed hosts (`--allowed-host`); Docker on Linux also needs `--add-host host.containers.internal:host-gateway`.
+- Over that fallback, a sandbox's requests come from a shared address (pasta shows the host's LAN address), so its failed attempts count against the same per-IP rate limit budget as every other client on that address.
+- A daemon in CityHall mode serves no plugin MCP servers: it refuses the endpoints on every listener, binds no socket, and records no endpoint, so sessions get no entries and the no-endpoint notification below.
+- A session with no route gets none of a plugin's servers, and AoE raises one notification per plugin and launch naming the cause: no endpoint, no socket on this platform, a socket that did not start, a container without this daemon's mount (recreate it), a VM-backed runtime, or a container that could not be checked. The workers are still asked `mcp.session.servers`, so only plugins that offered servers are told.
+
+Any plugin holding `mcp.rewrite` sees the entries from `mcp.session.servers`, with credential references instead of values and `plugin` set. For an agent that does not expand references, AoE substitutes the literal values after the last hook; a hook can replace them by key like any entry. Entries a hook adds with `serve` get their credential only after the last hook. See [Hooks](#hooksmcp_rewrite-api_version--20). If that hook fails for a sandboxed session, the session gets no MCP servers at all, plugin-served ones included.
 
 ## Plugin storage
 

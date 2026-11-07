@@ -57,6 +57,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         stored_acp_session_id: None,
         fork_from: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
@@ -65,6 +66,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         artifact_dir: None,
         claude_store_pin: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         base_host_environment: Vec::new(),
     };
 

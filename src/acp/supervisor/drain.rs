@@ -13,7 +13,7 @@ use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
     await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    refresh_spawn_model_effort, resolve_mcp_servers, McpHostEnv, McpSandboxScope,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -788,16 +788,24 @@ impl<S: BroadcastSink> Drain<S> {
             config.host_environment = host_environment;
         }
 
-        config.mcp_servers = resolve_mcp_servers(
+        let resolved_mcp = resolve_mcp_servers(
             discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
             config.cwd.clone(),
-            config.host_environment.clone(),
-            claude_config_dir,
+            McpHostEnv {
+                session_env: config.host_environment.clone(),
+                native_config_override: claude_config_dir,
+            },
+            McpSandboxScope {
+                sandbox_info: config.sandbox_info.as_ref(),
+                workspace_info: config.workspace_info.as_ref(),
+            },
             "MCP re-resolution on respawn failed",
         )
         .await;
+        config.mcp_servers = resolved_mcp.servers;
+        config.mcp_credentials = resolved_mcp.credentials;
     }
 
     /// Route an archived, trashed or purged row through the stop path, so the cancellation retires
@@ -2305,6 +2313,115 @@ mod tests {
                     .and_then(|p| p.to_str()),
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_runs_the_rewrite_hook_with_the_sandbox_mounts() {
+        use crate::acp::mcp_rewrite::test_support::{
+            outside_main_mount, workspace_info, RecordingRewriter, SlotGuard, OUTSIDE_MAIN,
+        };
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        use agent_client_protocol::v1::schema::McpServer;
+        use std::path::Path;
+
+        let (_home, temp) = isolate_home();
+        let rewriter = RecordingRewriter::returning(vec![ProjectMcpServer {
+            name: "rewritten".into(),
+            transport: ProjectMcpTransport::Http {
+                url: "http://gateway/mcp".into(),
+                headers: Default::default(),
+            },
+        }]);
+        let _slot = SlotGuard::install(rewriter.clone());
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-hook").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        config.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-hook".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        });
+        config.workspace_info = Some(workspace_info(
+            temp.path(),
+            &[("alpha", Path::new(OUTSIDE_MAIN))],
+        ));
+        Drain::<VecSink>::refresh_launch_env("s-hook", &mut config).await;
+
+        let sandboxes = rewriter.sandboxes.lock().unwrap();
+        let [Some(sandbox)] = sandboxes.as_slice() else {
+            panic!("one sandboxed call expected: {sandboxes:?}");
+        };
+        assert!(
+            sandbox.mounts.contains(&outside_main_mount()),
+            "respawn reports the workspace mounts: {sandbox:?}"
+        );
+        assert!(matches!(
+            config.mcp_servers.as_slice(),
+            [McpServer::Http(server)] if server.name == "rewritten"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_reinjects_plugin_served_servers() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::{test_support::EndpointGuard, DaemonEndpoint};
+        use crate::server::session_credential::McpSessionSecret;
+        use agent_client_protocol::v1::schema::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], false);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let secret = std::sync::Arc::new(
+            McpSessionSecret::load_or_generate(&temp.path().join("mcp_session_secret")).unwrap(),
+        );
+        let _endpoint = EndpointGuard::install(DaemonEndpoint {
+            host_url: "http://127.0.0.1:4321".into(),
+            sandbox_url: None,
+            sandbox_socket: None,
+            secret: secret.clone(),
+        });
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-plugin").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        Drain::<VecSink>::refresh_launch_env("s-plugin", &mut config).await;
+
+        let [McpServer::Http(server)] = config.mcp_servers.as_slice() else {
+            panic!("one plugin entry expected: {:?}", config.mcp_servers);
+        };
+        assert_eq!(server.name, "acme_a__docs");
+        assert_eq!(server.url, "http://127.0.0.1:4321/mcp/plugins/acme.a/docs");
+        let credential = secret.plugin_server_credential_for("acme.a", "docs", "s-plugin");
+        let var = crate::plugin::mcp_serve::credential_var_name(&credential);
+        let bearer = format!("Bearer ${{{var}}}");
+        assert!(
+            server
+                .headers
+                .iter()
+                .any(|h| h.name == "Authorization" && h.value == bearer),
+            "{:?}",
+            server.headers
+        );
+        let want = vec![(var, credential)];
+        assert_eq!(
+            config.mcp_credentials,
+            want.into(),
+            "the respawn recomputes the pair from the derivation"
+        );
+        assert_eq!(
+            rewriter.requests.lock().unwrap()[0]["servers"][0]["plugin"],
+            "acme.a"
+        );
     }
 
     #[tokio::test]

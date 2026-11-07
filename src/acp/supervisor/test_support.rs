@@ -354,6 +354,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         seed_history_replay: false,
         prior_conversation: false,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         yolo_mode: false,
         acp_mode_id: None,
@@ -366,6 +367,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -390,6 +392,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         prior_conversation: false,
         artifact_dir: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         generation: 0,

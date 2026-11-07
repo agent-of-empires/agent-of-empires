@@ -487,6 +487,10 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PUT", "/mcp"),
     ("PATCH", "/mcp"),
     ("DELETE", "/mcp"),
+    ("POST", "/mcp/plugins/{plugin}/{server}"),
+    ("PUT", "/mcp/plugins/{plugin}/{server}"),
+    ("PATCH", "/mcp/plugins/{plugin}/{server}"),
+    ("DELETE", "/mcp/plugins/{plugin}/{server}"),
     ("POST", "/api/mcp/servers"),
     ("PUT", "/api/mcp/servers/{name}"),
     ("DELETE", "/api/mcp/servers/{name}"),
@@ -683,6 +687,10 @@ impl<'a> RouteAudit<'a> {
             syn::Expr::Path(path) => path.path.is_ident("state"),
             syn::Expr::Field(field) => Self::condition(&field.base),
             syn::Expr::Paren(paren) => Self::condition(&paren.expr),
+            syn::Expr::MethodCall(call) => call.args.is_empty() && Self::condition(&call.receiver),
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::Or(_)) => {
+                Self::condition(&binary.left) && Self::condition(&binary.right)
+            }
             _ => false,
         }
     }

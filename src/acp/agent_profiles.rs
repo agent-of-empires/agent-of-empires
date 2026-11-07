@@ -28,6 +28,10 @@ pub struct AgentProfile {
     pub yolo_mode_id: Option<&'static str>,
     /// Native agent whose on-disk configuration carries conversation state.
     pub native_config_agent: Option<&'static str>,
+    /// The agent expands `${VAR}` in MCP entries from its own environment, so aoe can pass
+    /// plugin credentials as references and keep the values off the command line. Verified
+    /// for `claude-agent-acp` only; every other agent receives the literal credential.
+    pub expands_mcp_env_refs: bool,
 }
 
 fn matches_alias(aliases: &[&str], text: &str) -> bool {
@@ -100,6 +104,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
     native_config_agent: None,
+    expands_mcp_env_refs: false,
 };
 
 /// Claude via `claude-agent-acp`.
@@ -114,6 +119,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     emits_heartbeat_keepalives: true,
     yolo_mode_id: Some("bypassPermissions"),
     native_config_agent: Some("claude"),
+    expands_mcp_env_refs: true,
 };
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).

@@ -42,6 +42,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -67,6 +68,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
@@ -91,6 +93,7 @@ pub(super) fn reset_fake_spawn_config(
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "codex".into(),
         tool: "codex".into(),
@@ -116,6 +119,7 @@ pub(super) fn reset_fake_spawn_config(
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,

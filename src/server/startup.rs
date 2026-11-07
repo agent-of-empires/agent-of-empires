@@ -543,6 +543,11 @@ pub(crate) async fn start_server(
         None
     };
 
+    let mcp_session_secret = mcp_session_secret(
+        crate::session::get_app_dir(),
+        mcp_endpoints_wanted(config.web.mcp_enabled, crate::plugin::registry().all()),
+    );
+
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
@@ -643,6 +648,8 @@ pub(crate) async fn start_server(
             }
         }
     };
+
+    install_mcp_rewriter(plugin_host.clone());
 
     // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
@@ -896,6 +903,19 @@ pub(crate) async fn start_server(
             "plaintext HTTP from non-loopback peers is rejected with 426"
         );
     }
+    // A core-only daemon has no TCP listener, so no endpoint plugin entries could point at.
+    // CityHall denies plugin endpoints, so sessions get no entries for them.
+    let plugin_listener = listener.as_ref().filter(|_| !cityhall_mode);
+    let plugin_socket =
+        bind_plugin_socket(mcp_session_secret.is_some() && plugin_listener.is_some());
+    if let Some(listener) = plugin_listener {
+        record_daemon_endpoint(
+            listener.local_addr()?,
+            &allowed_hosts,
+            plugin_socket_probe(plugin_socket.is_some()),
+            mcp_session_secret.clone(),
+        );
+    }
 
     let runtime_namespace = socket_path
         .parent()
@@ -933,6 +953,7 @@ pub(crate) async fn start_server(
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        mcp_session_secret,
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
@@ -1037,6 +1058,7 @@ pub(crate) async fn start_server(
     }
 
     spawn_serve_snapshot_loop(state.clone()).await;
+    let plugin_socket = serve_plugin_socket(&state, plugin_socket);
 
     // GC the recently_restarted suppression map periodically; the TTL check on read filters
     // but does not remove entries.
@@ -1337,6 +1359,10 @@ pub(crate) async fn start_server(
         tracing::error!(target: "serve.shutdown", %error, "shutdown task failed");
     }
     state.runtime.work.drain().await;
+    // Removes the plugin socket; its directory stays mounted in sandboxes.
+    if let Some(plugin_socket) = plugin_socket {
+        let _ = plugin_socket.await;
+    }
 
     // ACP runners outlive the daemon; detach only their control sockets.
     acp_supervisor.detach_all().await;
@@ -1356,6 +1382,68 @@ pub(crate) async fn start_server(
     );
 
     serve_result.map(|_| ()).map_err(Into::into)
+}
+
+/// The sandbox plugin socket, bound before the endpoint is recorded so launches see it.
+#[cfg(target_os = "linux")]
+fn bind_plugin_socket(served: bool) -> Option<super::plugin_mcp_socket::PluginSocket> {
+    if !served {
+        return None;
+    }
+    match super::plugin_mcp_socket::bind() {
+        Ok(Some(socket)) => Some(socket),
+        Ok(None) => {
+            tracing::warn!(target: "plugin.mcp",
+                "another process answers on the plugin MCP socket; sandboxes use the fallback route");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(target: "plugin.mcp", error = %format_args!("{error:#}"),
+                "plugin MCP socket not bound; sandboxes use the fallback route");
+            None
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn bind_plugin_socket(_: bool) -> Option<std::convert::Infallible> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn plugin_socket_probe(
+    bound: bool,
+) -> Option<fn(&str) -> crate::server::daemon_endpoint::SandboxSocket> {
+    bound.then_some(
+        super::plugin_mcp_socket::sandbox_socket
+            as fn(&str) -> crate::server::daemon_endpoint::SandboxSocket,
+    )
+}
+#[cfg(not(target_os = "linux"))]
+fn plugin_socket_probe(
+    _: bool,
+) -> Option<fn(&str) -> crate::server::daemon_endpoint::SandboxSocket> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn serve_plugin_socket(
+    state: &Arc<AppState>,
+    socket: Option<super::plugin_mcp_socket::PluginSocket>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let socket = socket?;
+    let state = state.clone();
+    Some(crate::task_util::spawn_supervised(
+        "plugin.mcp.socket",
+        crate::task_util::PanicPolicy::Log,
+        super::plugin_mcp_socket::serve(state, socket),
+    ))
+}
+#[cfg(not(target_os = "linux"))]
+fn serve_plugin_socket(
+    _: &Arc<AppState>,
+    _: Option<std::convert::Infallible>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 /// Best-effort launch of `url` in the user's default browser. Goes through the
@@ -1456,6 +1544,70 @@ async fn remote_rotation_loop(
     }
 }
 
+/// Always installed, read-only serve included: it still resumes and respawns agents, and with no
+/// host a rewriter fails closed for sessions a hook applies to.
+fn install_mcp_rewriter(plugin_host: Option<std::sync::Arc<crate::plugin::host::PluginHost>>) {
+    crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
+        crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host),
+    )));
+}
+
+/// Whether the daemon needs the session credential secret: for `/mcp`, or for the plugin
+/// endpoints when any installed plugin, active or not, holds `mcp.serve`.
+fn mcp_endpoints_wanted(mcp_enabled: bool, plugins: &[crate::plugin::LoadedPlugin]) -> bool {
+    mcp_enabled
+        || plugins.iter().any(|p| {
+            p.manifest
+                .capabilities
+                .iter()
+                .any(|c| c.as_str() == aoe_plugin_api::MCP_SERVE_CAPABILITY)
+        })
+}
+
+/// The session credential secret, loaded or generated only when `wanted`, so a daemon that
+/// serves no MCP endpoint never gets this file on disk.
+fn mcp_session_secret(
+    app_dir: anyhow::Result<std::path::PathBuf>,
+    wanted: bool,
+) -> Option<Arc<crate::server::session_credential::McpSessionSecret>> {
+    if !wanted {
+        return None;
+    }
+    let loaded = app_dir.and_then(|dir| {
+        crate::server::session_credential::McpSessionSecret::load_or_generate(
+            &dir.join("mcp_session_secret"),
+        )
+    });
+    match loaded {
+        Ok(secret) => Some(Arc::new(secret)),
+        Err(e) => {
+            tracing::warn!(target: "http.middleware",
+                "MCP session credentials disabled: failed to load the secret: {e:#}");
+            None
+        }
+    }
+}
+
+/// Plugin entries need session credentials; none without the secret. Sandboxes use the plugin
+/// socket when bound, else the sandbox URL, which needs a non-loopback bind and
+/// `host.containers.internal` in `allowed_hosts` (the list the DNS-rebinding gate enforces).
+fn record_daemon_endpoint(
+    addr: SocketAddr,
+    allowed_hosts: &[String],
+    sandbox_socket: Option<fn(&str) -> crate::server::daemon_endpoint::SandboxSocket>,
+    secret: Option<Arc<crate::server::session_credential::McpSessionSecret>>,
+) {
+    use crate::server::daemon_endpoint::{
+        host_url_for, sandbox_url_for, set_daemon_endpoint, DaemonEndpoint,
+    };
+    set_daemon_endpoint(secret.map(|secret| DaemonEndpoint {
+        host_url: host_url_for(addr),
+        sandbox_url: sandbox_url_for(addr, allowed_hosts),
+        sandbox_socket,
+        secret,
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,6 +1659,88 @@ mod tests {
         terminated.cancel();
         assert!(start.await.unwrap().is_err());
         dropped.await.expect("the guard must drop on the signal");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn daemon_endpoint_is_recorded_only_with_a_session_secret() {
+        use crate::server::daemon_endpoint::{daemon_endpoint, test_support::EndpointGuard};
+
+        let _guard = EndpointGuard::clear_on_drop();
+        let dir = tempfile::tempdir().unwrap();
+        let secret = Arc::new(
+            crate::server::session_credential::McpSessionSecret::load_or_generate(
+                &dir.path().join("secret"),
+            )
+            .unwrap(),
+        );
+        let allowed = vec!["host.containers.internal".to_string()];
+        record_daemon_endpoint(
+            "0.0.0.0:8123".parse().unwrap(),
+            &allowed,
+            None,
+            Some(secret),
+        );
+        let endpoint = daemon_endpoint().expect("recorded");
+        assert_eq!(endpoint.host_url, "http://127.0.0.1:8123");
+        assert_eq!(
+            endpoint.sandbox_url.as_deref(),
+            Some("http://host.containers.internal:8123")
+        );
+
+        record_daemon_endpoint("127.0.0.1:8123".parse().unwrap(), &allowed, None, None);
+        assert!(daemon_endpoint().is_none(), "no secret clears the endpoint");
+    }
+
+    /// The secret exists only when `/mcp` is on or an installed plugin serves MCP servers.
+    #[test]
+    fn the_session_secret_is_created_only_when_an_mcp_endpoint_is_served() {
+        let manifest = |caps: &str| {
+            aoe_plugin_api::PluginManifest::from_toml_str(&format!(
+                "id = \"acme.p\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
+            ))
+            .unwrap()
+        };
+        let plugin = |caps: &str, enabled: bool| crate::plugin::LoadedPlugin {
+            manifest: manifest(caps),
+            enabled,
+            trust: aoe_plugin_api::TrustLevel::Builtin,
+            validation: crate::plugin::registry::ValidationState::Builtin,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: false,
+        };
+        let serving = || plugin("\"runtime.worker\", \"mcp.serve\"", false);
+        let plain = || plugin("\"runtime.worker\"", true);
+        // (case, mcp_enabled, installed plugins, wanted)
+        let cases = [
+            ("nothing", false, vec![plain()], false),
+            ("mcp enabled", true, vec![plain()], true),
+            (
+                "an installed serving plugin",
+                false,
+                vec![plain(), serving()],
+                true,
+            ),
+        ];
+        for (case, mcp_enabled, plugins, wanted) in cases {
+            assert_eq!(
+                mcp_endpoints_wanted(mcp_enabled, &plugins),
+                wanted,
+                "{case}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let secret = mcp_session_secret(Ok(dir.path().to_path_buf()), wanted);
+            let file = dir.path().join("mcp_session_secret");
+            assert_eq!(secret.is_some(), wanted, "{case}");
+            assert_eq!(file.exists(), wanted, "{case}: no file unless wanted");
+            if wanted {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{case}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1561,6 +1795,17 @@ mod tests {
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"STOPPING=1\n");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_mcp_rewriter_sets_the_slot_without_a_plugin_host() {
+        use crate::acp::mcp_rewrite::test_support::{slot_is_set, SlotGuard};
+
+        let _slot = SlotGuard::clear_on_drop();
+        assert!(!slot_is_set());
+        install_mcp_rewriter(None);
+        assert!(slot_is_set());
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window
