@@ -9,12 +9,13 @@ import { UsageLimitBanner, UsageLimitSection } from "./UsageLimitBanner";
 
 vi.mock("../../lib/api", () => ({
   fetchAgents: vi.fn(),
+  fetchAccountTargets: vi.fn(),
   fetchAcpAgents: vi.fn(),
   switchAcpAgent: vi.fn(),
   fetchContextPrimer: vi.fn(),
 }));
 
-import { fetchAcpAgents, fetchAgents, fetchContextPrimer, switchAcpAgent } from "../../lib/api";
+import { fetchAccountTargets, fetchAcpAgents, fetchAgents, fetchContextPrimer, switchAcpAgent } from "../../lib/api";
 
 const NOW = new Date("2026-10-22T10:00:00Z");
 const IN_2H = "2026-10-22T12:00:00Z";
@@ -32,6 +33,7 @@ afterEach(() => {
 beforeEach(() => {
   setAgentNames([agent("claude"), agent("codex")]);
   vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("codex")]);
+  vi.mocked(fetchAccountTargets).mockResolvedValue([]);
 });
 
 type BannerProps = React.ComponentProps<typeof UsageLimitBanner>;
@@ -193,6 +195,8 @@ describe("UsageLimitSection", () => {
       <MemoryRouter>
         <UsageLimitSection
           sessionId="s-1"
+          currentTool="claude"
+          authStatus={null}
           agent={agent}
           rateLimit={rateLimit}
           autoResume
@@ -278,6 +282,18 @@ describe("UsageLimitSection", () => {
     limit(LIMITED);
     expect(resume().textContent).toBe("Try again");
     expect(resume().disabled).toBe(false);
+  });
+
+  it("offers Switch account only when another account can take the conversation", async () => {
+    mountSection();
+    await act(async () => {});
+    expect(screen.queryByTestId("usage-limit-switch-account")).toBeNull();
+    cleanup();
+
+    vi.mocked(fetchAccountTargets).mockResolvedValue(["claude-b"]);
+    mountSection();
+    fireEvent.click(await screen.findByTestId("usage-limit-switch-account"));
+    expect(await screen.findByLabelText("claude-b")).toBeTruthy();
   });
 
   it("says why Switch Agent is missing when the Agent list fails", async () => {

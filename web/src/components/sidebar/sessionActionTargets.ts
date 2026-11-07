@@ -9,6 +9,7 @@ export type SessionAction =
   | "recreateContainer"
   | "fork"
   | "switchAgent"
+  | "switchAccount"
   | "switchView"
   | "autoName"
   | "summarize"
@@ -26,6 +27,7 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
     s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status),
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
+  switchAccount: isStructured,
   switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
   autoName: isStructured,
   summarize: isStructured,
@@ -48,6 +50,7 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Op
     recreateContainer: targets("recreateContainer"),
     fork: targets("fork"),
     switchAgent: targets("switchAgent"),
+    switchAccount: targets("switchAccount"),
     switchView: targets("switchView"),
     autoName: targets("autoName"),
     summarize: targets("summarize"),

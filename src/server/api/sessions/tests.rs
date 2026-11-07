@@ -12091,3 +12091,97 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     );
     assert_eq!(breadcrumbs("nothing-to-replay"), 1);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn account_targets_list_only_names_that_keep_the_conversation() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
+    let home = dirs::home_dir().unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("config.toml"),
+        "[session.custom_agents]\na = \"claude\"\nb = \"claude\"\nother = \"opaque-wrapper\"\n\
+         [session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\n\
+         [session.agent_config_dir]\na = \"~/dir-a\"\nb = \"~/dir-b\"\n",
+    )
+    .unwrap();
+    let profile = crate::session::config::effective_profile("");
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+    let project = home.join("project");
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let transcript = home
+        .join("dir-a/projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &project.to_string_lossy(),
+        ))
+        .join(format!("{sid}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "conversation\n").unwrap();
+
+    let mut row = Instance::new("accounts", project.to_str().unwrap());
+    row.id = "accounts".into();
+    row.source_profile = profile;
+    row.tool = "a".into();
+    row.command = "claude".into();
+    row.detect_as = "claude".into();
+    row.view = crate::session::View::Structured;
+    row.agent_session_id = Some(sid.into());
+    row.agent_session_binding = Some(crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Asserted,
+        transcript_path: None,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.join("dir-a")],
+            configuration: vec![],
+            cwd: project,
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        }),
+    });
+
+    // The other claude account and the built-in qualify; the opaque wrapper and the session's own tool do not.
+    assert_eq!(lifecycle::account_targets(&row), ["b", "claude"]);
+
+    let mut plain = row.clone();
+    plain.view = crate::session::View::Terminal;
+    assert!(lifecycle::account_targets(&plain).is_empty());
+    let mut fresh = row;
+    fresh.agent_session_id = None;
+    fresh.agent_session_binding = None;
+    assert!(lifecycle::account_targets(&fresh).is_empty());
+}
+
+#[tokio::test]
+async fn account_targets_route_honours_the_guards() {
+    let mut inst = Instance::new("targets-guard", "/tmp/targets-guard");
+    inst.id = "targets-guard".into();
+    inst.view = crate::session::View::Structured;
+    let read_only =
+        crate::server::test_support::build_test_app_state_configured(vec![inst.clone()], |state| {
+            state.read_only = true
+        });
+    let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![inst.clone()]);
+    let open = crate::server::test_support::build_test_app_state(vec![inst]);
+    for (state, id, expected) in [
+        (read_only, "targets-guard", StatusCode::FORBIDDEN),
+        (cityhall, "targets-guard", StatusCode::FORBIDDEN),
+        (open.clone(), "missing", StatusCode::NOT_FOUND),
+        (open, "targets-guard", StatusCode::OK),
+    ] {
+        let response =
+            session_account_targets(axum::extract::State(state), axum::extract::Path(id.into()))
+                .await;
+        assert_eq!(response.status(), expected, "{id}");
+    }
+}

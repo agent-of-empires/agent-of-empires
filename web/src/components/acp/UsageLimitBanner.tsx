@@ -1,11 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Link } from "react-router-dom";
 
 import { type RespawnState, useRespawnSession } from "../../hooks/useRespawnSession";
-import type { AcpState } from "../../lib/acpTypes";
+import type { AcpState, AuthStatus } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { fetchAgents } from "../../lib/api";
+import { fetchAccountTargets, fetchAgents } from "../../lib/api";
+import {
+  clearPendingSwitchAccount,
+  getPendingSwitchAccount,
+  subscribePendingSwitchAccount,
+} from "../../lib/switchAccountTrigger";
 import { formatDurationSecondsShort } from "../sidebar/format";
+import { SwitchAccountModal } from "./SwitchAccountModal";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
 /** The agent's rate-limit wording without transport prefixes or the trailing
@@ -30,6 +36,7 @@ export function UsageLimitBanner({
   resumeError,
   onResume,
   onSwitchAgent,
+  onSwitchAccount,
   switchListFailed = false,
   settingsHref,
 }: {
@@ -43,6 +50,8 @@ export function UsageLimitBanner({
   onResume: () => void;
   /** Omitted when no other installed Agent could take over. */
   onSwitchAgent?: () => void;
+  /** Omitted when no other account could keep the conversation. */
+  onSwitchAccount?: () => void;
   /** Why the Agents to switch to couldn't be listed. */
   switchListFailed?: boolean;
   /** Where the auto-resume toggle lives; null where Settings can't be edited. */
@@ -113,6 +122,16 @@ export function UsageLimitBanner({
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {onSwitchAccount && (
+            <button
+              type="button"
+              data-testid="usage-limit-switch-account"
+              onClick={onSwitchAccount}
+              className={`${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`}
+            >
+              Switch account
+            </button>
+          )}
           {onSwitchAgent && (
             <button
               type="button"
@@ -180,6 +199,22 @@ function useSwitchTargets(current: string | null, limited: boolean): { targets: 
   return { targets, listFailed };
 }
 
+/** Accounts a limited Session could swap to; empty until loaded, and read only while `limited`. */
+function useAccountTargets(sessionId: string, limited: boolean): string[] {
+  const [targets, setTargets] = useState<string[]>([]);
+  useEffect(() => {
+    if (!limited) return;
+    let cancelled = false;
+    void fetchAccountTargets(sessionId).then((names) => {
+      if (!cancelled) setTargets(names ?? []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, limited]);
+  return targets;
+}
+
 /** The usage-limit banner wired to resume and to the Agent handoff. Mounted whether or not
  *  the Session is limited: a handoff clears the limit before its recap arrives, and its
  *  modal must stay until it settles. */
@@ -191,8 +226,12 @@ export function UsageLimitSection({
   retriesExhausted,
   settingsHref,
   onPrefill,
+  currentTool,
+  authStatus,
 }: {
   sessionId: string;
+  currentTool: string;
+  authStatus: AuthStatus | null;
   agent: string | null;
   rateLimit: AcpState["rateLimit"];
   autoResume: boolean | undefined;
@@ -203,6 +242,14 @@ export function UsageLimitSection({
   // A limit with no reported reset still needs a key, and a cleared limit ends the incident.
   const resume = useRespawnSession(sessionId, rateLimit ? (rateLimit.resets_at ?? "unknown") : null);
   const { targets, listFailed } = useSwitchTargets(agent, rateLimit !== null);
+  const accountTargets = useAccountTargets(sessionId, rateLimit !== null);
+  // Also opened from the sidebar row's "Switch account" item, limited or not.
+  const [accountOpen, setAccountOpen] = useState(false);
+  const pendingAccount = useSyncExternalStore(subscribePendingSwitchAccount, getPendingSwitchAccount, () => null);
+  const closeAccount = () => {
+    setAccountOpen(false);
+    clearPendingSwitchAccount();
+  };
   // Taken when the modal opens, so the switch's own Agent change doesn't reload it mid-handoff.
   const [handoff, setHandoff] = useState<{ from: string | null; eligible: string[] } | null>(null);
   return (
@@ -217,10 +264,20 @@ export function UsageLimitSection({
           resumeError={resume.error}
           onResume={() => void resume.respawn()}
           onSwitchAgent={targets.length > 0 ? () => setHandoff({ from: agent, eligible: targets }) : undefined}
+          onSwitchAccount={accountTargets.length > 0 ? () => setAccountOpen(true) : undefined}
           switchListFailed={listFailed}
           settingsHref={settingsHref}
         />
       )}
+      <SwitchAccountModal
+        open={accountOpen || pendingAccount === sessionId}
+        sessionId={sessionId}
+        currentTool={currentTool}
+        authStatus={authStatus}
+        targets={accountOpen ? accountTargets : undefined}
+        onClose={closeAccount}
+      />
+
       <SwitchAgentModal
         open={handoff !== null}
         sessionId={sessionId}

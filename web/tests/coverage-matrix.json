@@ -3433,6 +3433,23 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.switch-account",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-usage-limit.spec.ts",
+        "src/components/acp/SwitchAccountModal.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/acp/UsageLimitBanner.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/lib/switchAccountTrigger.ts"
+      ]
+    },
+    {
       "id": "acp.switch-view-ui",
       "kind": "mocked-playwright",
       "risk": "medium",

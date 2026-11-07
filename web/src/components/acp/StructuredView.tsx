@@ -431,6 +431,8 @@ function ComposerDock({
     <>
       <UsageLimitSection
         sessionId={sessionId}
+        currentTool={view.tool ?? ""}
+        authStatus={state.authStatus}
         agent={state.agent ?? acpAgent}
         rateLimit={state.rateLimit}
         autoResume={view.rateLimitAutoResume}

@@ -1986,6 +1986,49 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
+/// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
+pub async fn session_account_targets(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let Some(row) = crate::server::api::find_instance(&state, &id).await else {
+        return crate::server::api::session_not_found();
+    };
+    let targets = tokio::task::spawn_blocking(move || account_targets(&row))
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({ "targets": targets })).into_response()
+}
+
+pub(super) fn account_targets(row: &Instance) -> Vec<String> {
+    if !row.is_structured() {
+        return Vec::new();
+    }
+    let profile = row.effective_profile();
+    let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let mut names: Vec<&str> = crate::agents::agent_names();
+    names.extend(config.session.custom_agents.keys().map(String::as_str));
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| *name != row.tool)
+        .filter(|name| {
+            matches!(
+                crate::session::conversation_carry::classify(row, &profile, name),
+                crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+            )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Why a restart that demands an account swap (`require_account_carry`) cannot keep the
 /// conversation. A plain tool swap would park the ids and start a fresh conversation instead.
 pub(super) fn account_swap_refusal(

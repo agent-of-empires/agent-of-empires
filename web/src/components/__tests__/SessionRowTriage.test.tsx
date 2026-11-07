@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
+import { clearPendingSwitchAccount, getPendingSwitchAccount } from "../../lib/switchAccountTrigger";
 import { OPEN_SWITCH_AGENT_EVENT, consumePendingSwitchAgent } from "../../lib/switchAgentTrigger";
 import { firstRequest, makeSession, makeWorkspace, openRowMenu, renderRow, stubFetch } from "./fixtures";
 
@@ -384,6 +385,18 @@ describe("SessionRow triage actions", () => {
       window.removeEventListener(OPEN_SESSION_EVENT, record);
       window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, record);
     }
+  });
+
+  it("Switch account is offered on structured sessions only and latches the dialog request", () => {
+    openRowMenu(ws({ id: "sess-acct", view: "terminal" }));
+    expect(testId("sidebar-context-menu-switch-account")).toBeNull();
+    cleanup();
+
+    openRowMenu(ws({ id: "sess-acct", view: "structured" }));
+    click("sidebar-context-menu-switch-account");
+    expect(getPendingSwitchAccount()).toBe("sess-acct");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    clearPendingSwitchAccount();
   });
 
   it("New Session opens the wizard with main_repo_path over project_path (#2023)", () => {
