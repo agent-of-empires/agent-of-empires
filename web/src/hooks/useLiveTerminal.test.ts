@@ -539,6 +539,32 @@ describe("size owner", () => {
     }
   });
 
+  it("redials without waiting for a close handshake that stalls", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.close = () => {
+        ws.readyState = FakeWS.CLOSING;
+      };
+      act(() => result.current.manualReconnect());
+      act(() => vi.advanceTimersByTime(1999));
+      expect(FakeWS.sockets).toHaveLength(1);
+
+      act(() => vi.advanceTimersByTime(1));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
+
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps retrying other closes without flagging a dead pane", () => {
     vi.useFakeTimers();
     try {

@@ -16,6 +16,8 @@ const encodeControl = (message: LiveClientMessage) => JSON.stringify(message);
 // Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs.
 const CLOSE_CODE_PTY_DEAD = 4001;
 const MAX_PENDING_INPUT_BYTES = 64 * 1024;
+// A close handshake can stall for a minute on a dead network, so a redial stops waiting for it.
+const REDIAL_CLOSE_TIMEOUT_MS = 2000;
 
 export interface LiveStats {
   frames: number;
@@ -314,6 +316,7 @@ export function useLiveTerminal(
         const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
         const redial = redialRef.current === ws;
         redialRef.current = null;
+        if (redial && retryTimerRef.current) clearTimeout(retryTimerRef.current);
         setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
         if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
@@ -488,6 +491,11 @@ export function useLiveTerminal(
     if (ws?.readyState === WebSocket.OPEN) {
       redialRef.current = ws;
       setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
+      retryTimerRef.current = setTimeout(() => {
+        if (redialRef.current !== ws) return;
+        redialRef.current = null;
+        connectRef.current?.();
+      }, REDIAL_CLOSE_TIMEOUT_MS);
       ws.close();
       return;
     }
