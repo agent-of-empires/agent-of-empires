@@ -896,8 +896,17 @@ impl SettingsView {
         // wrote config wholesale, which a daemon never watches.
         if self.scope == SettingsScope::Global {
             let now_plugins = serde_json::to_value(&self.global_config.plugins).ok();
-            if now_plugins.as_ref() != self.baseline_global.get("plugins") {
+            let plugins_changed = now_plugins.as_ref() != self.baseline_global.get("plugins");
+            // The registry snapshots the custom agent names as well, so removing
+            // one must restore the plugin's declarations without an unrelated
+            // reload. Compared against the still-old baseline.
+            let now_custom = serde_json::to_value(&self.global_config.session.custom_agents).ok();
+            let custom_changed =
+                now_custom.as_ref() != self.baseline_global.pointer("/session/custom_agents");
+            if plugins_changed || custom_changed {
                 crate::plugin::reload_registry();
+            }
+            if plugins_changed {
                 // The active set changed, so the virtual `plugin:<id>`
                 // settings sections may have too.
                 self.rebuild_fields();

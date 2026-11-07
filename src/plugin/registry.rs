@@ -92,6 +92,9 @@ fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_has
 pub struct PluginRegistry {
     plugins: Vec<LoadedPlugin>,
     load_errors: Vec<String>,
+    /// Configured custom agent names. A custom command owns its name, so a
+    /// declaration of the same name must not describe it.
+    custom_agents: std::collections::HashSet<String>,
 }
 
 impl PluginRegistry {
@@ -135,7 +138,19 @@ impl PluginRegistry {
         Self {
             plugins,
             load_errors,
+            custom_agents: config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(name, _)| config.session.custom_agent_selected(name))
+                .map(|(name, _)| name.clone())
+                .collect(),
         }
+    }
+
+    /// Custom agent names from the config this registry was loaded with.
+    pub fn custom_agents(&self) -> &std::collections::HashSet<String> {
+        &self.custom_agents
     }
 
     pub fn all(&self) -> &[LoadedPlugin] {

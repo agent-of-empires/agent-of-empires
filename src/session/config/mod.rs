@@ -2129,6 +2129,14 @@ pub fn is_resolvable_agent_config_dir(dir: &str) -> bool {
 }
 
 impl SessionConfig {
+    /// Whether `name` selects a custom agent that actually runs. A blank
+    /// command defers to the plugin-provided agent, so it owns nothing.
+    pub fn custom_agent_selected(&self, name: &str) -> bool {
+        self.custom_agents
+            .get(name)
+            .is_some_and(|command| !command.trim().is_empty())
+    }
+
     /// Resolve the explicit command, custom command, or installed plugin agent command.
     pub fn resolve_tool_command(&self, tool: &str) -> String {
         self.agent_command_override
@@ -2138,7 +2146,7 @@ impl SessionConfig {
             .or_else(|| {
                 self.custom_agents
                     .get(tool)
-                    .filter(|command| !command.trim().is_empty())
+                    .filter(|_| self.custom_agent_selected(tool))
                     .cloned()
             })
             .or_else(|| {
@@ -2146,7 +2154,7 @@ impl SessionConfig {
                     tool,
                     self.custom_agents
                         .iter()
-                        .filter(|(_, command)| !command.trim().is_empty())
+                        .filter(|(name, _)| self.custom_agent_selected(name))
                         .map(|(name, _)| name.as_str()),
                 )
             })
@@ -2189,13 +2197,13 @@ impl SessionConfig {
             if name.is_empty() {
                 tracing::warn!(target: "session.store", "custom_agents: entry with empty name will be ignored");
             }
-            if command.is_empty() {
+            if command.trim().is_empty() && self.launch_command_for(name).is_empty() {
                 tracing::warn!(target: "session.store",
                     "custom_agents: '{}' has an empty command, session will launch with no command",
                     name
                 );
             }
-            if crate::agents::get_agent(name).is_some() {
+            if self.custom_agent_selected(name) && crate::agents::get_agent(name).is_some() {
                 tracing::warn!(target: "session.store",
                     "custom_agents: '{}' shadows a built-in agent; use agent_command_override instead",
                     name
