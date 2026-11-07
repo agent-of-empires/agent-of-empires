@@ -239,6 +239,60 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     );
 }
 
+/// #5253: a prompt that dispatch queues supersedes a pending continuation only once
+/// the enqueue succeeds; a rejected one leaves it in place.
+#[tokio::test]
+async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-5253-enqueue".to_string();
+    let state = structured_state(&id, false).await;
+    state
+        .acp_event_store
+        .record(&id, 1, &Event::ThinkingStarted)
+        .expect("seed a running turn");
+    state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+    state.instances.write().await[0].pending_initial_turn =
+        Some(crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+    seed_native_row(&state).await;
+
+    let oversized = "x".repeat(300 * 1024);
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        prompt_req(&oversized),
+    )
+    .await
+    .into_response();
+    assert!(response.status().is_client_error(), "{}", response.status());
+    assert!(state.instances.read().await[0]
+        .pending_initial_turn
+        .is_some());
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        prompt_req("follow up"),
+    )
+    .await
+    .into_response();
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(
+        state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .len(),
+        1
+    );
+    assert!(state.instances.read().await[0]
+        .pending_initial_turn
+        .is_none());
+}
+
 /// A Stop pressed right after Enter must wait out the prompt submission rather
 /// than reach the agent before the prompt it names.
 #[tokio::test]
