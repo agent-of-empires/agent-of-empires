@@ -76,12 +76,23 @@ describe("ProjectsSection", () => {
     expect(h.onCreateSession).toHaveBeenCalledWith("/work/alpha");
   });
 
-  it("explains the ◇ marker with the shared Project tooltip, not a native title", () => {
-    renderSection();
-    const mark = screen.getByText("◇");
-    expect(mark.hasAttribute("title")).toBe(false);
-    fireEvent.mouseEnter(mark.parentElement!);
-    expect(screen.getByRole("tooltip").textContent).toBe(meaningText(MARK_MEANING.project));
+  it("explains the row's marker with the shared tooltip, not a native title", () => {
+    const pinned: ProjectInfo = { name: "alpha", path: "/work/alpha", scope: "global", pinned: true };
+    // (registrations, marker, meaning); a pinned Project is listed here when the axis draws no ◆ header (#5065).
+    const cases: [ProjectInfo[] | undefined, string, (typeof MARK_MEANING)[keyof typeof MARK_MEANING]][] = [
+      [undefined, "◇", MARK_MEANING.project],
+      [[pinned], "◆", MARK_MEANING.pinnedProject],
+    ];
+    for (const [registeredProjects, marker, meaning] of cases) {
+      renderSection({
+        projects: [emptyProject("/work/alpha", registeredProjects ? { registeredProjects } : {})],
+      });
+      const mark = screen.getByText(marker);
+      expect(mark.hasAttribute("title"), marker).toBe(false);
+      fireEvent.mouseEnter(mark.parentElement!);
+      expect(screen.getByRole("tooltip").textContent, marker).toBe(meaningText(meaning));
+      cleanup();
+    }
   });
 
   it("hides add and disables create for read-only viewers", () => {
@@ -146,6 +157,36 @@ describe("ProjectsSection", () => {
     );
     const label = screen.getByTestId("sidebar-projects-toggle").querySelector("span[title]")!;
     expect([label.textContent, label.getAttribute("title")]).toEqual(["Projects", "Projects, no sessions"]);
+  });
+
+  // #5065: an axis without repository headers lists every Project, so the label drops "no sessions".
+  it("labels the section by whether the axis draws repository headers; compact stays Projects", () => {
+    // (draws repository headers, compact, label, title)
+    const cases: [boolean, boolean, string, string][] = [
+      [true, false, "Projects, no sessions", "Projects, no sessions"],
+      [false, false, "Projects", "Projects"],
+      [true, true, "Projects", "Projects, no sessions"],
+      [false, true, "Projects", "Projects"],
+    ];
+    for (const [drawsRepoHeaders, compact, text, title] of cases) {
+      render(
+        <SidebarCompactContext.Provider value={compact}>
+          <ProjectsSection
+            projects={[emptyProject("/work/alpha")]}
+            query=""
+            offline={false}
+            drawsRepoHeaders={drawsRepoHeaders}
+            onCreateSession={vi.fn()}
+            onAddProject={vi.fn()}
+            onEditProject={vi.fn()}
+            onRemoveProject={vi.fn()}
+          />
+        </SidebarCompactContext.Provider>,
+      );
+      const label = screen.getByTestId("sidebar-projects-toggle").querySelector("span[title]")!;
+      expect([label.textContent, label.getAttribute("title")], `${drawsRepoHeaders} ${compact}`).toEqual([text, title]);
+      cleanup();
+    }
   });
 
   it("shows the no-match and empty hints, and nothing when there is no way to add", () => {
