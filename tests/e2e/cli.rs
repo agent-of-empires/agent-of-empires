@@ -838,6 +838,25 @@ command = "bash -lc true"
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
+    let explicit = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ExplicitCase",
+        "--tool",
+        "plugin-helper",
+        "--cmd-override",
+        "false",
+    ]);
+    assert!(
+        !explicit.status.success(),
+        "an explicitly selected plugin tool must reject --cmd-override"
+    );
+    assert!(
+        String::from_utf8_lossy(&explicit.stderr).contains("--cmd-override cannot be used"),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
 }
 
 /// `aoe add` rejects bad requests before writing anything, without leaking
