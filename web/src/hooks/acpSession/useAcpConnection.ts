@@ -87,6 +87,8 @@ export function useAcpConnection(
 
   const lastSeqRef = useLatestRef(state.lastSeq);
   const oldestSeqRef = useLatestRef(state.oldestSeq);
+  const optimisticRowsRef = useLatestRef(state.optimisticRows);
+  const activityRef = useLatestRef(state.activity);
   const hasMoreOlderRef = useLatestRef(hasMoreOlder);
   const loadingOlderRef = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -251,6 +253,90 @@ export function useAcpConnection(
       }, delayMs);
     };
 
+    const promptEchoes = new Map<string, number>();
+    const promptRows = new Set(
+      (cached?.activity ?? []).filter((row) => row.kind === "user_prompt").map((row) => row.id),
+    );
+    const recoveryAttempts = new Map<string, number>();
+    let latestFrameSeq = cached?.lastSeq ?? 0;
+    let promptRecovery: AbortController | null = null;
+    let promptRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+    const observePromptFrame = (frame: AcpFrame) => {
+      if (frame.session_id !== sessionId || !Number.isSafeInteger(frame.seq) || frame.seq < 0) return;
+      latestFrameSeq = Math.max(latestFrameSeq, frame.seq);
+      if (typeof frame.event !== "object" || !("UserPromptSent" in frame.event)) return;
+      const prompt = frame.event.UserPromptSent;
+      if (prompt.prompt_id && !prompt.synthesized && !promptRows.has(prompt.prompt_id))
+        promptEchoes.set(prompt.prompt_id, frame.seq);
+    };
+    const observePromptRows = (rows: readonly { id: string; kind: string }[]) => {
+      for (const row of rows) {
+        if (row.kind !== "user_prompt") continue;
+        promptRows.add(row.id);
+        promptEchoes.delete(row.id);
+        recoveryAttempts.delete(row.id);
+      }
+    };
+    const cancelPromptRecovery = () => {
+      promptRecovery?.abort();
+      promptRecovery = null;
+      if (promptRecoveryTimer !== null) clearTimeout(promptRecoveryTimer);
+      promptRecoveryTimer = null;
+    };
+    const recoverMissingPrompt = () => {
+      if (cancelled || promptRecovery || promptRecoveryTimer !== null || wsRef.current?.readyState !== WebSocket.OPEN)
+        return;
+      const pending = optimisticRowsRef.current.find((row) => {
+        const seq = promptEchoes.get(row.id);
+        return (
+          row.kind === "user_prompt" &&
+          seq !== undefined &&
+          seq < latestFrameSeq &&
+          (recoveryAttempts.get(row.id) ?? 0) < 3
+        );
+      });
+      if (!pending) return;
+      const seq = promptEchoes.get(pending.id)!;
+      const attempt = (recoveryAttempts.get(pending.id) ?? 0) + 1;
+      recoveryAttempts.set(pending.id, attempt);
+      const controller = new AbortController();
+      const generation = dialGenRef.current;
+      promptRecovery = controller;
+      const deadline = setTimeout(() => controller.abort(), ACP_DIAL_TIMEOUT_MS);
+      void (async () => {
+        const response = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionId)}/acp/replay?since=${Math.max(0, seq - 1)}&limit=1000&view=rows`,
+          { credentials: "same-origin", signal: controller.signal },
+        );
+        if (!response.ok) return;
+        const page = (await response.json()) as { rows?: TranscriptRow[]; lost?: boolean; highest_seq: number };
+        if (
+          controller.signal.aborted ||
+          cancelled ||
+          generation !== dialGenRef.current ||
+          page.lost ||
+          page.highest_seq < seq
+        )
+          return;
+        const rows = toActivityRows(page.rows ?? [], sessionId);
+        dispatch({ kind: "prompt_recovered", id: pending.id, rows });
+      })()
+        .catch(() => {})
+        .finally(() => {
+          clearTimeout(deadline);
+          if (promptRecovery !== controller) return;
+          promptRecovery = null;
+          if (cancelled || generation !== dialGenRef.current) return;
+          // A missing row or anchor is not evidence of rejection. Keep the overlay and bound retries.
+          promptRecoveryTimer = setTimeout(() => {
+            promptRecoveryTimer = null;
+            const ids = new Set(activityRef.current.filter((row) => row.kind === "user_prompt").map((row) => row.id));
+            for (const id of ids) promptEchoes.delete(id);
+            recoverMissingPrompt();
+          }, acpRetryDelayMs(attempt));
+        });
+    };
+
     const startReplay = (): { done: Promise<void>; abort: () => void; delivered: () => boolean } => {
       replayAbortRef.current?.abort();
       const controller = new AbortController();
@@ -260,11 +346,19 @@ export function useAcpConnection(
       const startSeq = lastSeqRef.current;
       let delivered = false;
       const track: Dispatch<Action> = (action) => {
-        if (action.kind === "frames" && action.frames.some((frame) => frame.seq > startSeq)) delivered = true;
+        if (action.kind === "frames") {
+          if (action.frames.some((frame) => frame.seq > startSeq)) delivered = true;
+          action.frames.forEach(observePromptFrame);
+          if (action.rows) observePromptRows(action.rows);
+        }
         dispatch(action);
       };
       return {
-        done: fetchReplay(sessionId, lastSeqRef, oldestSeqRef.current, track, setHasMoreOlder, controller.signal),
+        done: fetchReplay(sessionId, lastSeqRef, oldestSeqRef.current, track, setHasMoreOlder, controller.signal).then(
+          () => {
+            if (!controller.signal.aborted) recoverMissingPrompt();
+          },
+        ),
         abort: () => controller.abort(),
         delivered: () => delivered,
       };
@@ -289,7 +383,9 @@ export function useAcpConnection(
         case "transcript_snapshot": {
           const rows = toActivityRows((data as { rows?: TranscriptRow[] }).rows ?? [], sessionId);
           lastActivityRef.current = Date.now();
+          observePromptRows(rows);
           dispatch({ kind: "transcript_snapshot", rows });
+          recoverMissingPrompt();
           return;
         }
         case "transcript_delta": {
@@ -297,19 +393,26 @@ export function useAcpConnection(
           const act = delta ? transcriptDeltaAction(delta, sessionId) : null;
           if (!act) return;
           lastActivityRef.current = Date.now();
+          if (act.kind === "transcript_append" || act.kind === "transcript_patch") observePromptRows([act.row]);
           dispatch(act);
+          recoverMissingPrompt();
           return;
         }
       }
       if (typeof data === "object" && data !== null && "session_id" in data && "event" in data) {
         lastActivityRef.current = Date.now();
-        dispatch({ kind: "frame", frame: data as AcpFrame });
+        const frame = data as AcpFrame;
+        observePromptFrame(frame);
+        dispatch({ kind: "frame", frame });
+        recoverMissingPrompt();
       }
     };
 
     const connect = () => {
       if (cancelled) return;
       clearRetryTimers();
+      cancelPromptRecovery();
+      recoveryAttempts.clear();
       dialGenRef.current += 1;
       if (wsRef.current) {
         closeQuietly(wsRef.current);
@@ -361,6 +464,7 @@ export function useAcpConnection(
           setReconnecting(false);
           setRetryCount(0);
           setRetryCountdown(0);
+          recoverMissingPrompt();
         };
         ws.onerror = () => {
           if (isCurrentDial()) setStatus("error");
@@ -369,6 +473,7 @@ export function useAcpConnection(
           clearTimeout(handshakeTimer);
           if (!isCurrentDial()) return;
           setStatus("closed");
+          cancelPromptRecovery();
           wsRef.current = null;
           scheduleReconnect();
         };
@@ -388,6 +493,7 @@ export function useAcpConnection(
 
     return () => {
       cancelled = true;
+      cancelPromptRecovery();
       dialGenRef.current += 1;
       replayAbortRef.current?.abort();
       replayAbortRef.current = null;
@@ -396,7 +502,7 @@ export function useAcpConnection(
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef]);
+  }, [sessionId, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef, optimisticRowsRef, activityRef]);
 
   const manualReconnect = useCallback(() => {
     setReconnecting(false);

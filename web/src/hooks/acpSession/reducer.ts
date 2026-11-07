@@ -36,6 +36,7 @@ export type Action =
   | { kind: "transcript_append"; row: ActivityRow }
   | { kind: "transcript_patch"; row: ActivityRow }
   | { kind: "transcript_remove"; id: string }
+  | { kind: "prompt_recovered"; id: string; rows: ActivityRow[] }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected"; id: string }
@@ -142,13 +143,19 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
 
 export function reducer(state: AcpState, action: Action): AcpState {
   switch (action.kind) {
-    case "frame":
-      return applyEvent(state, action.frame);
+    case "frame": {
+      let next = applyEvent(state, action.frame);
+      if (typeof action.frame.event === "object" && "UserPromptSent" in action.frame.event) {
+        const prompt = action.frame.event.UserPromptSent;
+        if (prompt.prompt_id && !prompt.synthesized) next = settleInflightPrompt(next, prompt.prompt_id);
+      }
+      return next;
+    }
     case "reduced_state":
       return applyReducedState(state, action.state, action.unchanged);
     case "frames": {
       // Frames feed control state; the transcript comes from the server-folded rows.
-      let next = action.frames.reduce(applyEvent, state);
+      let next = action.frames.reduce((current, frame) => reducer(current, { kind: "frame", frame }), state);
       if (action.rows && action.rows.length > 0)
         next = withServerRows(next, mergeServerRows(next.activity, action.rows));
       if (action.oldestSeq != null && state.oldestSeq === 0) return { ...next, oldestSeq: action.oldestSeq };
@@ -158,8 +165,29 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // Older history only adds rows; control state is not a pure fold and must not be touched.
       const next = { ...state, oldestSeq: action.oldestSeq };
       if (action.rows.length === 0) return next;
-      next.activity = mergePrependedActivity(action.rows, state.activity);
-      return next;
+      return withServerRows(next, mergePrependedActivity(action.rows, state.activity));
+    }
+    case "prompt_recovered": {
+      const known = state.optimisticRows
+        .concat(state.activity)
+        .some((row) => row.id === action.id && row.kind === "user_prompt");
+      if (!known) return state;
+      const index = action.rows.findIndex((row) => row.id === action.id && row.kind === "user_prompt");
+      if (index < 0) return state;
+      // Only the ordered replay can prove where this prompt belongs. An ACK alone cannot.
+      // A partial replay can synthesize a prefix tool's start beside a later completion.
+      const following = new Set(
+        action.rows
+          .slice(index + 1)
+          .filter((row) => row.kind !== "tool_start")
+          .map((row) => row.id),
+      );
+      const withoutPrompt = state.activity.filter((row) => row.id !== action.id);
+      const anchor = withoutPrompt.findIndex((row) => following.has(row.id));
+      if (anchor < 0) return state;
+      const row = action.rows[index]!;
+      const activity = withoutPrompt.slice(0, anchor).concat(row, withoutPrompt.slice(anchor));
+      return withServerRows(settleInflightPrompt(state, action.id), activity);
     }
     case "transcript_snapshot":
       if (action.rows.length === 0) return state;

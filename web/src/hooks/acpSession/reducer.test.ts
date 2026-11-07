@@ -17,6 +17,75 @@ import { classifyResolveResponse, reducer, type Action } from "./reducer";
 const run = (state: AcpState, ...actions: Action[]) => actions.reduce(reducer, state);
 const empty = emptyAcpState;
 
+describe("canonical sent-prompt recovery", () => {
+  const prompt: ActivityRow = { id: "p1", kind: "user_prompt", text: "same", at: "t" };
+  const old: ActivityRow = { id: "old", kind: "message", text: "old", at: "t" };
+  const reply: ActivityRow = { id: "reply", kind: "message", text: "new", at: "t" };
+  const seed = () => ({
+    ...run(empty(), { kind: "user_prompt", id: "p1", text: "same" }, { kind: "user_prompt", id: "p2", text: "same" }),
+    activity: [old, reply],
+  });
+
+  it("uses canonical successor IDs, preserves live row updates and keeps another same-text send", () => {
+    const state = seed();
+    const result = reducer(state, {
+      kind: "prompt_recovered",
+      id: "p1",
+      rows: [prompt, { ...reply, text: "stale replay" }],
+    });
+    expect(result.activity.map((row) => row.id)).toEqual(["old", "p1", "reply"]);
+    expect(result.activity[2]).toBe(reply);
+    expect(result.optimisticRows.map((row) => row.id)).toEqual(["p2"]);
+    expect(result.inflightPromptIds).toEqual(["p2"]);
+  });
+
+  it("repairs a canonical row that arrived at the wrong tail while recovery was pending", () => {
+    const state = { ...seed(), activity: [old, reply, prompt], optimisticRows: [] };
+    const result = reducer(state, { kind: "prompt_recovered", id: "p1", rows: [prompt, reply] });
+    expect(result.activity.map((row) => row.id)).toEqual(["old", "p1", "reply"]);
+  });
+
+  it.each([{ rows: [reply] }, { rows: [prompt] }, { rows: [{ ...prompt, id: "unrelated" }, reply] }])(
+    "preserves text when canonical identity or successor proof is absent: %j",
+    ({ rows }) => {
+      const state = seed();
+      expect(reducer(state, { kind: "prompt_recovered", id: "p1", rows })).toBe(state);
+    },
+  );
+
+  it.each(["frame", "frames"] as const)(
+    "a late %s ACK settles its own ID without reviving a completed turn",
+    (kind) => {
+      const state = { ...seed(), lastSeq: 20, serverTurnActive: false };
+      const frame: AcpFrame = {
+        session_id: "s",
+        seq: 10,
+        event: { UserPromptSent: { prompt_id: "p1", text: "same" } },
+      };
+      let result: AcpState;
+      if (kind === "frame") result = reducer(state, { kind, frame });
+      else result = reducer(state, { kind, frames: [frame] });
+      expect(result).toMatchObject({ lastSeq: 20, serverTurnActive: false, inflightPromptIds: ["p2"], promptSeq: 2 });
+      expect(result.optimisticRows).toHaveLength(2);
+    },
+  );
+
+  it("does not use a replay-synthesized prefix tool start as a new prompt's successor", () => {
+    const tool: ActivityRow = { id: "start-old-tool", kind: "tool_start", text: "earlier tool", at: "t" };
+    const done: ActivityRow = { id: "done-old-tool", kind: "tool_complete", text: "done", at: "t" };
+    const state = { ...seed(), activity: [old, tool, done, reply] };
+    const recovered = reducer(state, { kind: "prompt_recovered", id: "p1", rows: [prompt, tool, done, reply] });
+    expect(recovered.activity.map((row) => row.id)).toEqual(["old", "start-old-tool", "p1", "done-old-tool", "reply"]);
+  });
+
+  it("prunes an overlay replaced by a canonical older-history row", () => {
+    const state = { ...seed(), oldestSeq: 20, activity: [reply] };
+    const result = reducer(state, { kind: "prepend", rows: [prompt], oldestSeq: 10 });
+    expect(result.activity.map((row) => row.id)).toEqual(["p1", "reply"]);
+    expect(result.optimisticRows.map((row) => row.id)).toEqual(["p2"]);
+  });
+});
+
 describe("classifyResolveResponse", () => {
   it.each([
     ["approval", true, 204, "", "resolved"],
