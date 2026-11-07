@@ -1960,7 +1960,10 @@
         "src/hooks/useSessions.test.ts",
         "src/hooks/__tests__/useOrphanSweep.test.tsx",
         "src/hooks/useLastSessionRestore.test.tsx",
-        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/__tests__/TrashReadFailed.test.tsx",
+        "tests/session-trash-read-failure.spec.ts",
+        "tests/plugin-pages.spec.ts"
       ],
       "components": [
         "web/src/hooks/useSessions.ts",
@@ -1969,9 +1972,10 @@
         "web/src/lib/api.ts",
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/TrashReadFailed.tsx",
         "web/src/components/sidebar/TrashMenu.tsx"
       ],
-      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
+      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. A failed or timed-out trash read keeps the known rows and, for an opened session the list does not carry, shows an error with Retry instead of the skeleton or a gone screen; the next read that lands clears it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
     },
     {
       "id": "sidebar.trash-row-context-menu",
