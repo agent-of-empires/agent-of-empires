@@ -1207,6 +1207,216 @@ mod tests {
         );
     }
 
+    /// `aoe add --sandbox -w`: `on_create` needs the container while the creation holds its
+    /// Launch reservation. Peers stay out until it settles, and a failure rolls back only itself.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandboxed_cli_create_runs_on_create_and_rolls_back_only_itself() {
+        use crate::session::{LifecycleOperation, LifecycleReservationError, Storage};
+        use std::os::unix::fs::PermissionsExt;
+        for (label, hook) in [
+            ("no hook", None),
+            ("hook", Some("echo created")),
+            ("slow hook", Some("echo slow")),
+            ("failing hook", Some("exit 7")),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let app = crate::session::get_app_dir().unwrap();
+            crate::session::purge_owners::initialize(&app).unwrap();
+            crate::tmux::tool_retirement::initialize(&app).unwrap();
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })
+            .unwrap();
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.hooks.on_create = hook.iter().map(|hook| hook.to_string()).collect();
+            })
+            .unwrap();
+            // Existing native config is what the store isolation copies on a real host.
+            std::fs::create_dir(root.path().join(".claude")).unwrap();
+            std::fs::write(root.path().join(".claude/settings.json"), "{}").unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let calls = root.path().join("calls");
+            let started = root.path().join("hook-started");
+            let release = root.path().join("hook-release");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
+                 'image inspect'*) exit 0;;\n\
+                 *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;;\n\
+                 run\\ *|create\\ *) echo fake-id;;\n\
+                 exec*'echo slow'*) touch '{started}'; i=0; \
+                 until [ -e '{release}' ] || [ $i -ge 1200 ]; do sleep 0.05; i=$((i+1)); done;;\n\
+                 exec*'exit 7'*) exit 7;;\n\
+                 esac\nexit 0\n",
+                calls = calls.display(),
+                started = started.display(),
+                release = release.display(),
+            );
+            for runtime in ["docker", "podman", "container"] {
+                let path = bin.join(runtime);
+                std::fs::write(&path, &script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let repo = git2::Repository::init(&project).unwrap();
+            let signature = git2::Signature::now("t", "t@example.com").unwrap();
+            let tree = repo
+                .find_tree(repo.index().unwrap().write_tree().unwrap())
+                .unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+                .unwrap();
+            let profile = "default";
+            let peers: Vec<Instance> = (0..4)
+                .map(|index| {
+                    let mut peer =
+                        Instance::new(&format!("peer-{index}"), project.to_str().unwrap());
+                    peer.source_profile = profile.into();
+                    peer.sandbox_info = Some(crate::session::SandboxInfo {
+                        provider: None,
+                        enabled: true,
+                        container_id: None,
+                        image: "test-image".into(),
+                        container_name: crate::containers::DockerContainer::from_session_id(
+                            &peer.id,
+                        )
+                        .name,
+                        extra_env: None,
+                        custom_instruction: None,
+                        before_start_env: Vec::new(),
+                        before_start_hook_env: Vec::new(),
+                        container_workdir: None,
+                    });
+                    peer
+                })
+                .collect();
+            crate::server::test_support::seed_instances_on_disk_for_test(profile, peers.clone());
+            let state = crate::server::test_support::build_test_app_state(peers.clone());
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let spec = StructuredSessionSpec {
+                title: Some("hooked".into()),
+                title_typed: true,
+                size: None,
+                path: project.to_string_lossy().into_owned(),
+                group: String::new(),
+                tool: "claude".into(),
+                worktree_enabled: true,
+                worktree_branch: Some("feature".into()),
+                create_new_branch: true,
+                base_branch: None,
+                sandbox: true,
+                sandbox_image: Some("test-image".into()),
+                yolo_mode: false,
+                extra_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                extra_args: String::new(),
+                command_override: String::new(),
+                extra_repo_paths: Vec::new(),
+                repo_base_branches: Vec::new(),
+                scratch: false,
+                trust_hooks: None,
+                trust_review: None,
+                custom_instruction: None,
+                callback_url: None,
+                idempotency_key: Some("create-key".into()),
+                profile: profile.into(),
+                created_by_plugin: None,
+                plugin_create_idempotency: None,
+                pending_initial_turn: None,
+                parent_session_id: None,
+                acp_mode_id: None,
+                view: crate::session::View::Terminal,
+                agent_name: None,
+                agent_model: None,
+                agent_effort: None,
+                import_acp_session_id: None,
+                import_binding: None,
+                fork_seed: None,
+                progress: None,
+                cli: Some(crate::daemon::CliCreationOptions {
+                    parent: None,
+                    projects: Vec::new(),
+                    command: None,
+                    fork_source: None,
+                    generated_name: false,
+                    no_submodules: false,
+                    worktree_path_id: None,
+                }),
+            };
+            let create = tokio::spawn({
+                let service = state.session_service.clone();
+                async move { spawn_structured_session(&service, spec).await.map(|_| ()) }
+            });
+            if label == "slow hook" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !started.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the hook never started"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let peer = Storage::open_unwatched(profile).unwrap().update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.title == "hooked")
+                        .expect("the creation published its row before the hook")
+                        .try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(anyhow::Error::from)
+                });
+                assert_eq!(
+                    peer.unwrap_err()
+                        .downcast_ref::<LifecycleReservationError>(),
+                    Some(&LifecycleReservationError::Busy(LifecycleOperation::Launch)),
+                );
+                std::fs::write(&release, "").unwrap();
+            }
+            let result = create.await.unwrap();
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+            for peer in &peers {
+                let row = rows.iter().find(|row| row.id == peer.id);
+                assert!(
+                    row.is_some_and(|row| !row.is_trashed()
+                        && row.lifecycle_generation == peer.lifecycle_generation),
+                    "{label}: {} changed: {row:?}",
+                    peer.title
+                );
+                let container = crate::containers::DockerContainer::from_session_id(&peer.id).name;
+                assert!(
+                    !log.lines()
+                        .any(|line| line.starts_with("rm ") && line.contains(&container)),
+                    "{label}: removed {container}: {log}"
+                );
+            }
+            let branch = repo.find_branch("feature", git2::BranchType::Local);
+            if label == "failing hook" {
+                let error = format!("{:#}", result.expect_err("the hook failed"));
+                assert!(error.contains("on_create"), "{error}");
+                assert!(!rows.iter().any(|row| row.title == "hooked"), "{label}");
+                assert!(branch.is_err(), "{label}: the created branch was kept");
+            } else {
+                result.unwrap_or_else(|error| panic!("{label}: {error:#}\n{log}"));
+                let created = rows.iter().find(|row| row.title == "hooked").expect(label);
+                assert_eq!(created.status, crate::session::Status::Stopped, "{label}");
+                assert!(created.lifecycle_reservation.is_none(), "{label}");
+                assert!(branch.is_ok(), "{label}");
+                assert_eq!(
+                    log.lines().any(|line| line.contains("bash -c echo")),
+                    hook.is_some(),
+                    "{label}: {log}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn create_spawn_refuses_a_row_archived_while_the_hook_runs() {
