@@ -340,6 +340,22 @@ pub enum StartupErrorDetail {
         expected: String,
         received: String,
     },
+    /// The adapter's proxy sent a `_meta.aoe.proxy` hello core cannot accept.
+    InvalidProxyHello {
+        reason: String,
+    },
+}
+
+/// Why a proxied session's integration was lost mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationLostReason {
+    /// A `_meta.aoe` frame broke the contract.
+    ContractViolation { detail: String },
+    /// Too many frames waited on an adapter sequence that never arrived.
+    HoldOverflow,
+    /// The proxy held more leases than any real agent does.
+    LeaseOverflow,
 }
 
 /// Lifecycle status of an async background sub-agent.
@@ -506,6 +522,8 @@ pub struct AcpState {
     pub last_agent_switch: Option<AgentSwitchInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_error: Option<StartupErrorDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -800,6 +818,11 @@ pub enum Event {
     /// `initialize` completed but the adapter failed the compatibility policy.
     IncompatibleAgent {
         detail: StartupErrorDetail,
+    },
+    /// A proxied agent broke the `_meta.aoe` contract mid-session; core stops
+    /// interpreting its frames.
+    IntegrationLost {
+        reason: IntegrationLostReason,
     },
     UserPromptSent {
         text: String,
@@ -1108,10 +1131,17 @@ impl AcpState {
                 self.startup_error = Some(detail);
                 self.sidebar_phase = SidebarPhase::Error;
             }
+            Event::IntegrationLost { reason } => {
+                self.integration_lost = Some(reason);
+                self.turn_active = false;
+                self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = steering,
             Event::AcpSessionAssigned { .. } => {
                 self.startup_error = None;
+                self.integration_lost = None;
                 self.rate_limit = None;
                 self.heal_sidebar_phase();
             }
@@ -1291,7 +1321,10 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = SidebarPhase::Idle;
+        // A lost integration is an error until a new connection restores it.
+        if self.integration_lost.is_none() {
+            self.sidebar_phase = SidebarPhase::Idle;
+        }
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -2492,5 +2525,28 @@ mod tests {
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+    }
+
+    /// The turn that ends after an integration loss must not heal the Error
+    /// phase; a new connection (`AcpSessionAssigned`) does.
+    #[test]
+    fn integration_loss_keeps_the_error_phase_until_a_new_session() {
+        let mut state = AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+        let lost = Event::IntegrationLost {
+            reason: IntegrationLostReason::HoldOverflow,
+        };
+        let stopped = Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "s2".into(),
+        };
+        for (seq, event) in [lost, stopped].into_iter().enumerate() {
+            state.apply_event(seq as u64 + 1, event).unwrap();
+        }
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state.apply_event(3, assigned).unwrap();
+        assert!(state.integration_lost.is_none());
+        assert_ne!(state.sidebar_phase, SidebarPhase::Error);
     }
 }

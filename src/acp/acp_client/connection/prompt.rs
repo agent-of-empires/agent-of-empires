@@ -517,7 +517,8 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
+        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+            && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
             // The turn finished but the PromptResponse never came: end cleanly

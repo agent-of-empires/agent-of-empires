@@ -4,6 +4,7 @@
 //! connection task (see `connection`) that owns the session; this module holds
 //! the public surface, and each concern lives in a submodule.
 
+mod aoe_ingress;
 mod batch;
 mod between_prompt;
 mod close;

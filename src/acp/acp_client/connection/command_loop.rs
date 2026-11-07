@@ -221,7 +221,10 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
+        let Some(cost_seen) = shared
+            .between_prompt
+            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
+        else {
             return false;
         };
         // An adopted turn races the detached resume-idle task for its
@@ -286,7 +289,10 @@ impl Session {
             return Ok(());
         };
         let work = self.shared.between_prompt.work_state();
-        if work.is_busy() || !self.shared.bg_tasks.is_empty() {
+        if work.is_busy()
+            || !self.shared.bg_tasks.is_empty()
+            || self.shared.aoe.leases.any_live(now_ms())
+        {
             // Old-session events would be attributed to the new conversation.
             warn!(
                 target: "acp.protocol",
@@ -343,6 +349,7 @@ impl Session {
                 // session/new is the irreversible commit; the loop picks the
                 // id back up from the ingress on its next iteration.
                 self.session_from_storage = false;
+                self.shared.aoe.session_reset();
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),
                     new_session.config_options.as_deref(),

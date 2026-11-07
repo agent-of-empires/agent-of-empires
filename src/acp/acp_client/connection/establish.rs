@@ -2,6 +2,7 @@
 //! session and apply configured defaults.
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::aoe_meta;
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use crate::acp::transcript::LOAD_FAILED_PREFIX;
@@ -155,6 +156,36 @@ pub(super) async fn establish(
         }
         return Ok(None);
     }
+
+    // A proxy announces itself on the initialize response; any other agent
+    // has no hello and is not held to the `_meta.aoe` contract.
+    let proxied = match init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+    {
+        Ok(hello) => hello.flatten().is_some(),
+        Err(err) => {
+            warn!(
+                target: "acp.protocol",
+                session = %label,
+                error = %err,
+                "proxy hello rejected; refusing to enter session"
+            );
+            let detail = StartupErrorDetail::InvalidProxyHello {
+                reason: err.to_string(),
+            };
+            let message = detail.user_message();
+            if let Some(tx) = ctx.ready_tx.lock().await.take() {
+                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
+                    IncompatibleAgentError { detail, message },
+                ))));
+            }
+            return Ok(None);
+        }
+    };
+    shared.aoe.begin_connection(proxied);
 
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter

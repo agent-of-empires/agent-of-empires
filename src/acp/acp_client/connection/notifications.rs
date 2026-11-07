@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
@@ -77,6 +78,7 @@ pub(super) struct Shared {
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
+    pub(super) aoe: AoeIngress,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -124,6 +126,7 @@ impl Shared {
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            aoe: AoeIngress::default(),
             claude_home,
         }
     }
@@ -181,8 +184,44 @@ impl Shared {
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
         &self,
+        notification: SessionNotification,
+        local_prompt_signals: bool,
+    ) {
+        // A frame the contract consumes without delivering (a lease renewal)
+        // still proves the agent is alive.
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        match self
+            .aoe
+            .ingest(notification, local_prompt_signals, epoch, now_ms())
+        {
+            Ingested::Deliver(frames) => {
+                for frame in frames {
+                    self.handle_adapter_notification(
+                        frame.notification,
+                        frame.local_prompt_signals,
+                        frame.epoch,
+                    )
+                    .await;
+                }
+            }
+            Ingested::Lost(reason) => {
+                tracing::warn!(
+                    target: "acp.protocol",
+                    session = %self.session_label,
+                    ?reason,
+                    "agent integration lost; ignoring further frames"
+                );
+                self.emit(Event::IntegrationLost { reason }).await;
+            }
+        }
+    }
+
+    async fn handle_adapter_notification(
+        &self,
         mut notification: SessionNotification,
         local_prompt_signals: bool,
+        epoch: u64,
     ) {
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
@@ -223,9 +262,8 @@ impl Shared {
         let restored_wake_event = restored_title
             .as_deref()
             .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
-        // One epoch per notification, so its signals belong to the prompt
-        // that was current when it arrived.
-        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        // `epoch` is the prompt current when the frame arrived, so its signals
+        // belong to that prompt even if the frame was held.
         let (lifecycle, wakeup) = classify_watchdog_notification_signals(
             &notification.update,
             restored_title.as_deref(),
