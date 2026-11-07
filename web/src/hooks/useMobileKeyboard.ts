@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, type RefObject } from "react";
 import { useSnapshotStore } from "./useSnapshotStore";
 import { listen } from "./domEvents";
+import { isIOS } from "../lib/platform";
 
 interface MobileKeyboardSnapshot {
   isMobile: boolean;
@@ -12,7 +13,7 @@ const RESUME_SETTLE_MS = 500;
 
 /**
  * `releaseOnResume` names an input with no visible tap target of its own: iOS can drop the keyboard on an app switch
- * while leaving it activeElement, so it is blurred once the viewport settles without the keyboard it had before.
+ * while leaving it activeElement, so there it is blurred once the viewport settles without the keyboard it had before.
  */
 export function useMobileKeyboard(releaseOnResume?: RefObject<HTMLElement | null>) {
   const { state, setState } = useSnapshotStore<MobileKeyboardSnapshot>(() => ({
@@ -102,9 +103,23 @@ export function useMobileKeyboard(releaseOnResume?: RefObject<HTMLElement | null
       rafRef.current = requestAnimationFrame(poll);
     };
 
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    const armResumeSettle = () => {
+      if (resumeTimer) clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => {
+        resumeTimer = null;
+        measure();
+        const input = releaseOnResume?.current;
+        if (input && isIOS() && !lastOpen && input === document.activeElement && input === softKeyboardFor) {
+          input.blur();
+        }
+      }, RESUME_SETTLE_MS);
+    };
+
     const handleViewportChange = () => {
       measure();
       startPolling();
+      if (resumeTimer) armResumeSettle();
     };
 
     const handleFocusIn = (e: Event) => {
@@ -112,6 +127,11 @@ export function useMobileKeyboard(releaseOnResume?: RefObject<HTMLElement | null
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
         startPolling();
       }
+    };
+
+    // WebKit's page-deactivation replay fires focusout with activeElement unchanged; only a real blur ends the focus.
+    const handleFocusOut = () => {
+      if (document.activeElement !== softKeyboardFor) softKeyboardFor = null;
     };
 
     let orientTimer: ReturnType<typeof setTimeout> | null = null;
@@ -124,23 +144,20 @@ export function useMobileKeyboard(releaseOnResume?: RefObject<HTMLElement | null
       }, 500);
     };
 
-    // Viewport events can be missed while suspended, and the viewport can still be moving when the page returns.
-    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    // Viewport events can be missed while suspended, and the settle waits out a viewport still moving on return.
     const handleResume = () => {
+      if (resumeTimer) clearTimeout(resumeTimer);
+      resumeTimer = null;
       if (document.visibilityState !== "visible") return;
       handleViewportChange();
-      if (resumeTimer) clearTimeout(resumeTimer);
-      resumeTimer = setTimeout(() => {
-        measure();
-        const input = releaseOnResume?.current;
-        if (input && !lastOpen && input === document.activeElement && input === softKeyboardFor) input.blur();
-      }, RESUME_SETTLE_MS);
+      armResumeSettle();
     };
 
     measure();
     const stop = [
       listen(handleViewportChange, [vv, "resize"], [vv, "scroll"], [window, "scroll"]),
       listen(handleFocusIn, [document, "focusin"]),
+      listen(handleFocusOut, [document, "focusout"]),
       listen(handleOrientationChange, [window, "orientationchange"]),
       listen(handleResume, [document, "visibilitychange"], [window, "pageshow"]),
     ];

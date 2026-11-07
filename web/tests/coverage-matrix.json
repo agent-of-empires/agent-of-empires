@@ -171,12 +171,14 @@
         "tests/mobile-keyboard.spec.ts",
         "src/hooks/useMobileViewportLock.test.ts",
         "src/components/__tests__/LiveTerminalView.recover.test.tsx",
-        "src/components/__tests__/LiveTerminalView.restart.test.tsx"
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx",
+        "src/components/__tests__/LiveTerminalView.keyboardResume.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useMobileKeyboard.ts",
         "web/src/hooks/useMobileViewportLock.ts",
         "web/src/hooks/useLiveTerminal.ts"
       ]

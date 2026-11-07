@@ -83,7 +83,11 @@ function raiseKeyboard(vv: { height: number } & EventTarget, input: HTMLTextArea
   });
 }
 
+const IPHONE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15";
+const ANDROID_UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 Chrome/130.0 Mobile Safari/537.36";
+
 beforeEach(() => {
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPHONE_UA);
   stubMatchMedia(true, "(pointer: coarse)");
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: FULL_HEIGHT });
 });
@@ -138,6 +142,100 @@ describe("LiveTerminalView keyboard FAB across an iOS app switch", () => {
 
     expect(document.activeElement).toBe(input);
     expect(screen.getByRole("button", { name: "Close keyboard" })).toBeTruthy();
+  });
+
+  it("keeps focus when the keyboard comes back within the settle", async () => {
+    const vv = stubViewport();
+    const input = await openTerminal();
+    raiseKeyboard(vv, input);
+
+    act(() => {
+      setVisibility("hidden");
+      vv.height = FULL_HEIGHT;
+      setVisibility("visible");
+      vi.advanceTimersByTime(300);
+      vv.height = KEYBOARD_UP_HEIGHT;
+      vv.dispatchEvent(new Event("resize"));
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("waits for a viewport still moving at the settle deadline", async () => {
+    const vv = stubViewport();
+    const input = await openTerminal();
+    raiseKeyboard(vv, input);
+
+    const moveTo = (height: number) => {
+      vv.height = height;
+      vv.dispatchEvent(new Event("resize"));
+    };
+    act(() => {
+      setVisibility("hidden");
+      vv.height = FULL_HEIGHT;
+      setVisibility("visible");
+      vi.advanceTimersByTime(400);
+      moveTo(740);
+      vi.advanceTimersByTime(400);
+      moveTo(KEYBOARD_UP_HEIGHT);
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("leaves focus alone off iOS", async () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ANDROID_UA);
+    const vv = stubViewport();
+    const input = await openTerminal();
+    raiseKeyboard(vv, input);
+
+    act(() => {
+      setVisibility("hidden");
+      vv.height = FULL_HEIGHT;
+      setVisibility("visible");
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("does not release focus when the page is hidden again before the settle ends", async () => {
+    const vv = stubViewport();
+    const input = await openTerminal();
+    raiseKeyboard(vv, input);
+
+    act(() => {
+      setVisibility("hidden");
+      vv.height = FULL_HEIGHT;
+      setVisibility("visible");
+      vi.advanceTimersByTime(100);
+      setVisibility("hidden");
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("does not undo a reopen tapped during the settle", async () => {
+    const vv = stubViewport();
+    const input = await openTerminal();
+    raiseKeyboard(vv, input);
+
+    act(() => {
+      setVisibility("hidden");
+      vv.height = FULL_HEIGHT;
+      setVisibility("visible");
+      vi.advanceTimersByTime(400);
+    });
+    act(() => screen.getByRole("button", { name: "Close keyboard" }).click());
+    act(() => screen.getByRole("button", { name: "Open keyboard" }).click());
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(document.activeElement).toBe(input);
   });
 
   // A hardware keyboard never occludes the viewport, so absence of occlusion says nothing about it.
