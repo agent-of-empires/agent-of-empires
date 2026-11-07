@@ -13,10 +13,12 @@ test("a queued prompt whose POST response is lost clears the busy composer and t
     ],
   });
   let sentId = "";
+  let posts = 0;
   let promptSeen!: () => void;
   const seen = new Promise<void>((resolve) => (promptSeen = resolve));
   // Never fulfilled: the daemon answered, but the response did not land in this tab.
   await page.route("**/api/sessions/*/acp/prompt", (r) => {
+    posts++;
     sentId = (JSON.parse(r.request().postData() ?? "{}") as { prompt_id?: string }).prompt_id ?? "";
     promptSeen();
   });
@@ -37,10 +39,10 @@ test("a queued prompt whose POST response is lost clears the busy composer and t
   await composer.press("Enter");
   await seen;
   await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
-  expect(mock.promptBodies).toEqual([]);
 
   releaseQueue();
   await expect(page.getByTestId("queued-strip-header")).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(0);
   await expect(page.getByText("queued during compact")).toHaveCount(1);
+  expect(posts).toBe(1);
 });
