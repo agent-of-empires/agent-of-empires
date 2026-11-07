@@ -28,7 +28,7 @@ import {
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { HooksTrustDialog } from "./HooksTrustDialog";
-import { ACP_CAPABLE_TOOLS, isAcpEligible } from "../../lib/acpCapableTools";
+import { ACP_CAPABLE_TOOLS, acpAdapterMissing, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey, overridesForPath } from "../../lib/registeredProjects";
@@ -697,9 +697,10 @@ export function SessionWizard({
     const body = {
       ...buildCreateRequest(
         d,
-        isAcpEligible(
+        structuredAvailable(
           d.tool,
           agents.find((a) => a.name === d.tool),
+          d,
         ),
       ),
       idempotency_key: newIdempotencyKey(),
@@ -828,6 +829,9 @@ export function SessionWizard({
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
+  // `agents` is the list loaded for the selected Profile, whose hooks `acp_create_ready` counts.
+  const adapterMissing = acpCapable && acpAdapterMissing(selectedAgent, d);
+  const structuredOn = acpCapable && !adapterMissing && d.useStructuredView;
   const isHostOnly = selectedAgent?.host_only ?? false;
   const hostOnlyReason = `${d.tool} runs on the host only`;
   const worktreeBlocked = d.scratch
@@ -843,8 +847,7 @@ export function SessionWizard({
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
   // Locked on without touching the stored value, so another agent gets it back.
-  const alwaysYolo =
-    (acpCapable && d.useStructuredView ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
+  const alwaysYolo = (structuredOn ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
   const effectiveProfile = d.profile || servedProfile;
@@ -978,10 +981,15 @@ export function SessionWizard({
           <SegmentedRow
             label="View"
             testId="wizard-view-row"
-            value={acpCapable && d.useStructuredView ? "structured" : "terminal"}
+            value={structuredOn ? "structured" : "terminal"}
             onChange={(v) => handleChange("useStructuredView", v === "structured")}
             options={[
-              { value: "structured", label: "Structured", name: "Structured view", disabled: !acpCapable },
+              {
+                value: "structured",
+                label: "Structured",
+                name: "Structured view",
+                disabled: !acpCapable || adapterMissing,
+              },
               { value: "terminal", label: "Terminal", name: "Terminal view" },
             ]}
             summary={
@@ -991,9 +999,11 @@ export function SessionWizard({
                   : selectedAgent?.kind === "custom"
                     ? "needs agent_acp_cmd"
                     : "no ACP adapter, terminal only"
-                : d.useStructuredView
-                  ? "plan, tool calls and diffs as cards"
-                  : "the Agent's own terminal UI"
+                : adapterMissing
+                  ? "ACP adapter not installed"
+                  : d.useStructuredView
+                    ? "plan, tool calls and diffs as cards"
+                    : "the Agent's own terminal UI"
             }
           />
         )}

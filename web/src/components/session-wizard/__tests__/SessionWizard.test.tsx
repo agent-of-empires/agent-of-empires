@@ -429,14 +429,45 @@ describe("SessionWizard rows", () => {
   });
   const viewSwitch = () => screen.getByRole("radio", { name: "Structured view" }) as HTMLButtonElement;
 
-  it.each([
-    ["claude", undefined, false, /plan, tool calls and diffs as cards/],
-    ["aider", [agent("aider", { acp_capable: false })], true, /no ACP adapter/],
-    ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
-    ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
-  ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
+  const noAdapter = [agent("claude", { acp_create_ready: false })];
+  const cards = /plan, tool calls and diffs as cards/;
+  const viewGates: [
+    string,
+    string,
+    AgentInfo[] | undefined,
+    WizardPrefill & { commandOverride?: string },
+    boolean,
+    RegExp,
+  ][] = [
+    ["claude", "claude", undefined, {}, false, cards],
+    ["aider", "aider", [agent("aider", { acp_capable: false })], {}, true, /no ACP adapter/],
+    ["custom", "helper", [agent("helper", { kind: "custom", acp_capable: false })], {}, true, /needs agent_acp_cmd/],
+    ["not allowed", "claude", [agent("claude", { acp_allowed: false })], {}, true, /not on the allowed agents list/],
+    ["adapter missing", "claude", noAdapter, {}, true, /ACP adapter not installed/],
+    ["adapter missing, Sandbox on", "claude", noAdapter, { sandboxEnabled: true }, false, cards],
+    ["adapter missing, command override", "claude", noAdapter, { commandOverride: "my-wrapper acp" }, false, cards],
+    // The list is loaded for the selected Profile, so its flag answers for that Profile.
+    ["adapter missing, other Profile", "claude", noAdapter, { profile: "other" }, true, /ACP adapter not installed/],
+    // A Profile hook that installs the adapter makes the create ready though it isn't installed yet.
+    [
+      "installed by a Profile hook",
+      "claude",
+      [agent("claude", { acp_installed: false, acp_create_ready: true })],
+      {},
+      false,
+      cards,
+    ],
+  ];
+  it.each(viewGates)("gates the structured view: %s", async (_label, tool, agents, setup, disabled, summary) => {
     if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
-    renderWizard({ path: "/tmp/proj", tool });
+    const { commandOverride, ...prefill } = setup;
+    renderWizard({ path: "/tmp/proj", tool, ...prefill });
+    if (agents) await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
+    if (commandOverride) {
+      fireEvent.click(screen.getByTestId("wizard-agent-row"));
+      fireEvent.change(screen.getByLabelText("Command override"), { target: { value: commandOverride } });
+      fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    }
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
     expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
     // A reason cut off at md stays readable on hover.
@@ -447,6 +478,27 @@ describe("SessionWizard rows", () => {
     // Terminal view is what an agent without Structured view gets.
     const terminal = screen.getByRole("radio", { name: "Terminal view" });
     expect(terminal.getAttribute("aria-checked")).toBe(String(disabled));
+  });
+
+  it("creates a terminal session when the adapter is missing", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce(noAdapter);
+    renderWizard();
+    await waitFor(() => expect(viewSwitch().disabled).toBe(true));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ view: "terminal" });
+  });
+
+  it("shows the Daemon's message when it refuses a missing adapter", async () => {
+    const message = "ACP adapter `claude-agent-acp` is not installed or not on $PATH. Install: npm install -g x";
+    createSession.mockResolvedValueOnce({
+      ok: false,
+      error: message,
+      failure: { code: "acp_adapter_missing", message, stage: null, reference: null },
+    });
+    renderWizard();
+    await launch();
+    expect(await screen.findByText(message)).toBeTruthy();
   });
 
   it.each([
