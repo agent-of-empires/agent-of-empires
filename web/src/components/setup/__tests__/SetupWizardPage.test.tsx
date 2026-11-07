@@ -1,0 +1,221 @@
+// @vitest-environment jsdom
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { useState } from "react";
+import { MemoryRouter } from "react-router-dom";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { resetSettingsSchemaCache, type SetupStatus, type SetupStepKey } from "../../../lib/api";
+import { SetupWizardPage } from "../SetupWizardPage";
+
+const server = setupServer();
+beforeAll(() => server.listen({ onUnhandledRequest: "bypass" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+let patches: unknown[];
+beforeEach(() => {
+  resetSettingsSchemaCache();
+  patches = [];
+  server.use(
+    http.get("*/api/settings/schema", () => HttpResponse.json([])),
+    http.get("*/api/settings", () => HttpResponse.json({})),
+    http.get("*/api/telemetry/status", () =>
+      HttpResponse.json({ enabled: false, responded: false, do_not_track: false }),
+    ),
+    http.get("*/api/themes", () => HttpResponse.json(["empire"])),
+    http.get("*/api/agents", () => HttpResponse.json([])),
+    http.get("*/api/setup/runtimes", () => HttpResponse.json([])),
+    http.get("*/api/projects", () => HttpResponse.json([])),
+    http.patch("*/api/setup", async ({ request }) => {
+      patches.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+});
+
+const KEYS: SetupStepKey[] = ["theme_telemetry", "agents", "project", "worktrees", "sandbox", "notifications"];
+const status = (configured: SetupStepKey[] = []): SetupStatus => ({
+  finished: false,
+  deferred: false,
+  banner_dismissed: false,
+  tmux: true,
+  git: true,
+  access: { serve_mode: "local" },
+  steps: KEYS.map((key) => ({
+    key,
+    required: key === "agents",
+    configured: configured.includes(key),
+    confirmed: false,
+    skipped: false,
+  })),
+});
+
+/** Settings-backed steps keep Next disabled until saved settings load. */
+async function enabled(name: string) {
+  const button = screen.getByRole("button", { name }) as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  return button;
+}
+
+function renderPage(current: SetupStatus, entry = "/setup") {
+  const onLeave = vi.fn();
+  render(
+    <MemoryRouter initialEntries={[entry]}>
+      <SetupWizardPage status={current} about={null} profile="" refresh={async () => current} onLeave={onLeave} />
+    </MemoryRouter>,
+  );
+  return { onLeave };
+}
+
+it("opens on the first open step and never offers Skip on the required Agents step", () => {
+  renderPage(status(["theme_telemetry"]));
+  expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Skip for now" })).toBeNull();
+  expect(screen.getByText("Required to start Sessions")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("Skip records the step and moves on", async () => {
+  renderPage(status(["agents"]), "/setup?step=sandbox");
+  fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+  await waitFor(() => expect(patches).toEqual([{ skipped_steps: ["sandbox"] }]));
+  expect(await screen.findByRole("heading", { name: "Notifications and access" })).toBeTruthy();
+});
+
+it("Finish sends the user back to the open required step instead of finishing", async () => {
+  const { onLeave } = renderPage(status(), "/setup?step=notifications");
+  fireEvent.click(await enabled("Finish setup"));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
+  expect(patches).not.toContainEqual({ finished: true });
+  expect(onLeave).not.toHaveBeenCalled();
+});
+
+it("Finish keeps the last step's defaults and marks setup finished once Agents is configured", async () => {
+  const { onLeave } = renderPage(status(["agents"]), "/setup?step=notifications");
+  fireEvent.click(await enabled("Finish setup"));
+  await waitFor(() => expect(onLeave).toHaveBeenCalled());
+  expect(patches).toEqual([{ confirmed_steps: ["notifications"] }, { finished: true }]);
+});
+
+it("Go to dashboard defers setup so / stops redirecting", async () => {
+  const { onLeave } = renderPage(status());
+  fireEvent.click(screen.getAllByRole("button", { name: /Go to dashboard/ })[0]!);
+  await waitFor(() => expect(onLeave).toHaveBeenCalled());
+  expect(patches).toEqual([{ deferred: true }]);
+});
+
+it("keeps earlier skips and confirmations as later steps are saved", async () => {
+  let serverStatus = status(["agents"]);
+  server.use(
+    http.patch("*/api/setup", async ({ request }) => {
+      const body = (await request.json()) as { skipped_steps?: string[]; confirmed_steps?: string[] };
+      patches.push(body);
+      serverStatus = {
+        ...serverStatus,
+        steps: serverStatus.steps.map((s) => {
+          const confirmed = body.confirmed_steps ? body.confirmed_steps.includes(s.key) : s.confirmed;
+          const skipped = body.skipped_steps ? body.skipped_steps.includes(s.key) : s.skipped && !confirmed;
+          return { ...s, confirmed, skipped, configured: s.key === "agents" || confirmed };
+        }),
+      };
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  function Harness() {
+    const [current, setCurrent] = useState(serverStatus);
+    const refresh = async () => {
+      setCurrent(serverStatus);
+      return serverStatus;
+    };
+    return <SetupWizardPage status={current} about={null} profile="" refresh={refresh} onLeave={() => {}} />;
+  }
+  render(
+    <MemoryRouter initialEntries={["/setup?step=project"]}>
+      <Harness />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Worktrees" });
+  fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+  await screen.findByRole("heading", { name: "Sandbox" });
+  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Notifications and access" });
+  expect(patches).toEqual([
+    { confirmed_steps: ["project"] },
+    { skipped_steps: ["worktrees"] },
+    { confirmed_steps: ["project", "sandbox"] },
+  ]);
+});
+
+it("stays on the step and reports it when keeping the defaults fails to save", async () => {
+  server.use(http.patch("*/api/setup", () => HttpResponse.json({ message: "Disk full" }, { status: 500 })));
+  renderPage(status(["agents"]), "/setup?step=sandbox");
+  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  expect((await screen.findByRole("alert")).textContent).toBe("Disk full");
+  expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
+});
+
+it("telemetry waits for the saved choice, then Next saves it instead of confirming the step", async () => {
+  let answer!: () => void;
+  const consent: unknown[] = [];
+  server.use(
+    http.get(
+      "*/api/telemetry/status",
+      () =>
+        new Promise<Response>(
+          (resolve) =>
+            (answer = () => resolve(HttpResponse.json({ enabled: true, responded: true, do_not_track: false }))),
+        ),
+    ),
+    http.post("*/api/telemetry/consent", async ({ request }) => {
+      consent.push(await request.json());
+      return HttpResponse.json({ enabled: true, responded: true, do_not_track: false });
+    }),
+  );
+  renderPage(status(["agents"]), "/setup?step=theme_telemetry");
+  await waitFor(() => expect(answer).toBeDefined());
+  expect(screen.getByText("Loading your current choice…")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+
+  await act(async () => answer());
+  const sharing = await screen.findByRole("radio", { name: /Share anonymous usage counts/ });
+  expect((sharing as HTMLInputElement).checked).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByRole("heading", { name: "Agents" });
+  expect(consent).toEqual([{ enabled: true }]);
+  expect(patches).toEqual([]);
+});
+
+it("a failed telemetry read offers a retry and keeps Next disabled", async () => {
+  let fail = true;
+  server.use(
+    http.get("*/api/telemetry/status", () =>
+      fail
+        ? new HttpResponse(null, { status: 500 })
+        : HttpResponse.json({ enabled: false, responded: true, do_not_track: false }),
+    ),
+  );
+  renderPage(status(["agents"]), "/setup?step=theme_telemetry");
+  expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load your current choice");
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  expect(await screen.findByRole("radio", { name: /Not now/ })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("a failed settings read offers a retry instead of showing defaults as the saved choices", async () => {
+  let fail = true;
+  server.use(
+    http.get("*/api/settings", () => (fail ? new HttpResponse(null, { status: 500 }) : HttpResponse.json({}))),
+  );
+  renderPage(status(["agents"]), "/setup?step=worktrees");
+  expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load your settings");
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await enabled("Next");
+  expect(screen.queryByRole("alert")).toBeNull();
+});

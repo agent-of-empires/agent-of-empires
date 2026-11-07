@@ -320,6 +320,10 @@ export interface AgentInfo {
   acp_args?: string[];
   /** Omitted for Active agents. Mirrors `AgentLifecycle` in src/agents.rs. */
   lifecycle?: AgentLifecycleInfo;
+  /** Resolved binary on the daemon's PATH, for installed built-in agents. */
+  path?: string;
+  /** Installs the missing ACP adapter, when known. */
+  acp_install_command?: string;
 }
 
 export interface ProfileInfo {
