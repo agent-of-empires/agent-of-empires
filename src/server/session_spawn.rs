@@ -720,9 +720,9 @@ pub(crate) async fn spawn_structured_session(
             return Err(error.into());
         }
 
-        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
-        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
-        let _guard = lock.blocking_lock();
+        let namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let guard = lock.blocking_lock();
         let mut acp_reservation = None;
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
@@ -768,6 +768,10 @@ pub(crate) async fn spawn_structured_session(
             }
             Ok(())
         })();
+        // Rollback takes these guards again.
+        drop(guard);
+        drop(submission);
+        drop(namespace);
         if let Err(error) = post_hooks {
             // Archiving during hooks preserves the row but refuses ACP admission.
             if !error.is::<crate::session::StartBlocked>() {
@@ -1265,6 +1269,91 @@ mod tests {
             state.acp_supervisor.worker_state(&stored.id).await,
             crate::daemon::AcpWorkerState::Absent
         );
+    }
+
+    /// A finalization failure after the launch hooks rolls back with the
+    /// spawn guards already released; holding them deadlocked the rollback on
+    /// the non-reentrant instance lock.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_launch_finalization_failure_rolls_back_without_deadlock() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let barrier = tempfile::tempdir().unwrap();
+        let (ready, release) =
+            support::install_blocking_before_session_hook(barrier.path(), "launch");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = support::build_test_app_state(Vec::new());
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "created-5212", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let create = tokio::spawn({
+            let state = state.clone();
+            async move {
+                crate::server::api::sessions::create_session(
+                    State(state),
+                    Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                    None,
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch hook never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Dropping the launch reservation fails finalization without being a
+        // StartBlocked refusal, so the creation rolls back.
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let id = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.title == "created-5212")
+            .expect("row published before the launch hook")
+            .id;
+        {
+            let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            storage
+                .update(|rows, _| {
+                    for row in rows.iter_mut().filter(|row| row.id == id) {
+                        row.lifecycle_reservation = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::fs::write(release, b"release").unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("rollback must return instead of waiting on its own guards")
+            .unwrap();
+        assert!(!response.status().is_success());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _submission = state.session_service.prompt_submission(&id).await;
+            let _guard = state.instance_lock(&id).await.lock_owned().await;
+        })
+        .await
+        .expect("the session must be released for later operations");
     }
 
     /// A create that answered has registered every resource the launch owns,
