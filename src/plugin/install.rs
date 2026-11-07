@@ -82,8 +82,11 @@ pub enum LiveToggle {
     LocalDaemonStale { reason: String },
 }
 
-/// Failed discovery permits a local save. After discovery, Web errors are terminal:
-/// a failed RPC can have an unknown outcome. Other plugins retain local fallback.
+pub(crate) const WEB_TOGGLE_RECOVERY: &str =
+    "Local transport/404: run `aoe serve --stop`, inspect state, then retry";
+
+/// Web RPC errors are terminal: idempotent local writes would bypass daemon
+/// authorization and live-worker reconciliation. Other plugins retain local fallback.
 pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveToggle> {
     if super::registry().get(plugin_id).is_none() {
         bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");
@@ -105,7 +108,7 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
             super::reload_registry();
             Ok(LiveToggle::Daemon)
         }
-        Err(e) if plugin_id == "aoe.web" => Err(e.into()),
+        Err(e) if plugin_id == "aoe.web" => Err(e).context(WEB_TOGGLE_RECOVERY),
         Err(e) => {
             set_enabled(plugin_id, enabled)?;
             Ok(LiveToggle::LocalDaemonStale {

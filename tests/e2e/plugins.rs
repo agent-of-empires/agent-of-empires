@@ -199,13 +199,15 @@ fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
         };
         h.run_cli_ok(&["serve", "--status"]);
         assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+        let error = h.run_cli_err(&["plugin", "disable", "aoe.web"]);
+        assert!(error.contains("aoe serve --stop"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), before);
         h.send_keys("Space");
         if let Some(received) = received {
             received.recv_timeout(Duration::from_secs(5)).unwrap();
             h.wait_for("HTTP 404");
-        } else {
-            h.wait_for("daemon Unix transport failed");
         }
+        h.wait_for("aoe serve --stop");
         assert!(
             std::fs::read(&config).unwrap() == before,
             "A failed Web RPC rewrote local configuration"
@@ -226,6 +228,17 @@ fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
         );
         h.run_cli_ok(&["serve", "--status"]);
         assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+        h.kill_tui();
+        h.run_cli_ok(&["serve", "--stop"]);
+        h.run_cli_ok(&["plugin", "info", "aoe.web"]);
+        h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+        h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+        let recovered: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            recovered["plugins"]["aoe.web"]["enabled"].as_bool(),
+            Some(false)
+        );
     }
 }
 
