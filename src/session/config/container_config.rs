@@ -5830,11 +5830,12 @@ volume_ignores = ["node_modules"]
             violations.is_empty(),
             "native history crossed config seeding: {violations:#?}"
         );
-        // Reload only once the caller's guard has restored the original app
-        // dir; a reload before that re-caches the fixture the loop just dropped.
-        drop(_env);
-        crate::plugin::reload_registry();
-        assert!(crate::plugin::registry().get("acme.omp-test").is_none());
+        // Restore the caller's app dir and reload under the same env lock, so
+        // the process-global registry cannot read a peer test's app dir.
+        _env.restore_then(|| {
+            crate::plugin::reload_registry();
+            assert!(crate::plugin::registry().get("acme.omp-test").is_none());
+        });
     }
 
     #[test]
@@ -5847,9 +5848,10 @@ volume_ignores = ["node_modules"]
             assert!(crate::plugin::registry().get("acme.omp-test").is_some());
         }
         assert!(crate::plugin::registry().get("acme.omp-test").is_some());
-        drop(_env);
-        crate::plugin::reload_registry();
-        assert!(crate::plugin::registry().get("acme.omp-test").is_none());
+        _env.restore_then(|| {
+            crate::plugin::reload_registry();
+            assert!(crate::plugin::registry().get("acme.omp-test").is_none());
+        });
     }
 
     #[serial_test::serial]
