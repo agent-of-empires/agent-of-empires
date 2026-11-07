@@ -2152,8 +2152,11 @@ pub(crate) fn resolve_active_agent(
         }
     });
     // A configured custom command owns its name, so a declaration for that same
-    // name does not describe it. A distinctly named alias still applies.
+    // name does not describe it. An explicit `agent_execution_as` is the
+    // caller's assertion that it does, and discarding it would also discard the
+    // declared environment. A distinctly named alias still applies.
     if session_config.custom_agent_selected(tool)
+        && !session_config.agent_execution_as.contains_key(tool)
         && resolved.is_some_and(|agent| {
             crate::plugin::agent_integration::declared_agent(tool)
                 .is_some_and(|declared| std::ptr::eq(declared, agent))
