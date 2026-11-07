@@ -1558,35 +1558,6 @@ fn create_failure_response(
         failure.into_response()
     }
 }
-/// Lets a test make the create with one idempotency key panic once released.
-#[cfg(test)]
-pub(super) mod panic_hook {
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::Notify;
-
-    static GATE: Mutex<Option<(String, Arc<Notify>)>> = Mutex::new(None);
-
-    pub(in crate::server::api::sessions) fn arm(key: &str) -> Arc<Notify> {
-        let release = Arc::new(Notify::new());
-        *GATE.lock().unwrap() = Some((key.to_owned(), Arc::clone(&release)));
-        release
-    }
-
-    pub(super) async fn fire(key: Option<&str>) {
-        let release = {
-            let mut gate = GATE.lock().unwrap();
-            match gate.as_ref() {
-                Some((armed, _)) if Some(armed.as_str()) == key => gate.take().map(|(_, r)| r),
-                _ => None,
-            }
-        };
-        if let Some(release) = release {
-            release.notified().await;
-            panic!("create panic injected by test");
-        }
-    }
-}
-
 /// Runs a create inside its detached task. A failure, a panic included, is logged and
 /// recorded here, not by the waiting request, which may be gone by now.
 pub(super) async fn run_create_task<T>(
@@ -1848,4 +1819,33 @@ fn not_installed(runtime: &str) -> String {
 
 fn not_running(runtime: &str) -> String {
     format!("{runtime} isn't running, so the Sandbox can't start. Start {runtime}, then try again.")
+}
+
+/// Lets a test make the create with one idempotency key panic once released.
+#[cfg(test)]
+pub(super) mod panic_hook {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    static GATE: Mutex<Option<(String, Arc<Notify>)>> = Mutex::new(None);
+
+    pub(in crate::server::api::sessions) fn arm(key: &str) -> Arc<Notify> {
+        let release = Arc::new(Notify::new());
+        *GATE.lock().unwrap() = Some((key.to_owned(), Arc::clone(&release)));
+        release
+    }
+
+    pub(super) async fn fire(key: Option<&str>) {
+        let release = {
+            let mut gate = GATE.lock().unwrap();
+            match gate.as_ref() {
+                Some((armed, _)) if Some(armed.as_str()) == key => gate.take().map(|(_, r)| r),
+                _ => None,
+            }
+        };
+        if let Some(release) = release {
+            release.notified().await;
+            panic!("create panic injected by test");
+        }
+    }
 }
