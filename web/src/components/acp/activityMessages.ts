@@ -158,8 +158,10 @@ export function activityToThreadMessages(
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
-    } else if (row.kind !== "thinking") {
-      // Thinking shows in the spinner; message and unknown kinds render as text.
+    } else if (row.kind === "thinking") {
+      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendReasoning(row.text, row.messageStart);
+    } else {
+      // Message and unknown kinds render as text.
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(row.text, row.messageStart);
     }
   }
@@ -187,6 +189,7 @@ type ToolResult = {
 // Loose part shape, cast at build time; the renderer parses argsText itself.
 type DraftPart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -218,6 +221,14 @@ class AssistantBuilder {
     if (last && last.type === "text") last.text += this.paragraphBreak ? `\n\n${text}` : text;
     else this.parts.push({ type: "text", text });
     this.paragraphBreak = false;
+  }
+
+  /** Adjacent thinking rows join one part unless a new thought starts. */
+  appendReasoning(text: string, thoughtStart = false) {
+    if (!text) return;
+    const last = this.parts[this.parts.length - 1];
+    if (!thoughtStart && last && last.type === "reasoning") last.text += text;
+    else this.parts.push({ type: "reasoning", text });
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */

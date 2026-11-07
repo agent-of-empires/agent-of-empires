@@ -8,7 +8,7 @@ on:
   merge_group:
 
 # The event keeps a queue run and the push of its fast-forwarded commit apart.
-# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
+# Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -25,12 +25,18 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
         leg: [web-e2e, core-rest, bare-core]
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
@@ -38,19 +44,31 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          key: ${{ matrix.leg }}
-          # Only main saves: PR and queue entries would evict main's within
-          # the 10 GB repository budget.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            acp-worker/test-shim/package-lock.json
+      - name: Validate web lockfile
+        if: matrix.leg == 'web-e2e'
+        working-directory: web
+        run: npm ci --dry-run --ignore-scripts --no-audit --no-fund
+      - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/kache
+        with:
+          manifest-key: test-${{ matrix.leg }}
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         if: matrix.leg != 'web-e2e'
         with:
           tool: cargo-nextest
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
+      # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
+      - name: Keep inherited PATH in login shells
+        run: sudo sed -i '/runs-on\/env/d' /etc/profile
       - name: Install confined Local test prerequisites
         if: matrix.leg == 'web-e2e'
         run: |
@@ -63,13 +81,6 @@ jobs:
             userns,
           }
           PROFILE
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: |
-            web/package-lock.json
-            acp-worker/test-shim/package-lock.json
       # tests/integration/acp_smoke.rs spawns the Node ACP shim under
       # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
       # so its deps must be installed before the integration crate runs. Only
@@ -204,12 +215,12 @@ jobs:
       # Folded in from a former standalone `hook-privdrop` job. That job existed
       # only to build a lib test binary it could re-run under sudo, which meant a
       # third full compile of the crate at a third feature set (~1.7 min) plus
-      # its own 451MB rust-cache slot. This leg has already built the lib test
+      # its own cache slot. This leg has already built the lib test
       # binary, and the privdrop tests are core, so they are present in it.
       # Reusing that binary makes the privileged run nearly free.
       #
-      # The privileged step is safe only on a disposable GitHub-hosted runner.
-      # Do not move this leg to a persistent or self-hosted machine.
+      # The privileged step is safe only on a disposable runner (GitHub-hosted
+      # or single-job RunsOn). Do not move this leg to a persistent machine.
       - name: Exercise alien uid guards (privdrop)
         if: matrix.leg == 'core-rest'
         shell: bash
@@ -310,6 +321,9 @@ jobs:
     needs: macos-gate
     if: ${{ !cancelled() && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') }}
     runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
     steps:
@@ -321,9 +335,9 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: test-macos
       - name: Install tmux
         run: brew install tmux
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
@@ -341,8 +355,11 @@ jobs:
 
   vitest:
     name: Vitest
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 15
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
@@ -447,8 +464,11 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
@@ -538,8 +558,14 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
@@ -552,10 +578,13 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: Install web deps
+        working-directory: web
+        run: npm ci
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: playwright-live
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
       # Debug build instead of --release: --release with LTO and
@@ -573,9 +602,6 @@ jobs:
           # smaller `.js`, far faster navigation); see web/vite.config.ts.
           AOE_COVERAGE_INLINE_SOURCEMAP: '1'
         run: cargo build --features web
-      - name: Install web deps
-        working-directory: web
-        run: npm ci
       # Same scheme as the mocked job: cache Chromium under
       # ~/.cache/ms-playwright, key on the lockfile, skip --with-deps
       # because ubuntu-latest already has the apt prerequisites.

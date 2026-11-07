@@ -1,7 +1,7 @@
 //! The command channel the connection task pumps, and how each connection
 //! attempt reaches its agent.
 
-use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::v1::schema::ContentBlock;
 use tokio::sync::oneshot;
 
 use super::delete::DeleteSessionOutcome;

@@ -1260,6 +1260,17 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
         if args.passphrase.is_none() {
             bail!("Remote exposure requires --passphrase or AOE_SERVE_PASSPHRASE");
         }
+        let dev_plugins: Vec<String> = crate::plugin::registry()
+            .active()
+            .filter(|p| p.validation == crate::plugin::registry::ValidationState::Dev)
+            .map(|p| p.id().to_string())
+            .collect();
+        if !dev_plugins.is_empty() {
+            bail!(
+                "Remote exposure is refused while dev plugins are active: {}. Disable or uninstall them first.",
+                dev_plugins.join(", ")
+            );
+        }
         // The same decision `start_server` makes, so a wedged Tailscale fails here with the
         // probe's `--no-tailscale` advice rather than the cloudflared install error below.
         use crate::server::tunnel::{skips_tailscale, tailscale_probe};
@@ -1307,6 +1318,9 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
     } = startup;
 
     let auth_mode = validate_launch_args(profile, &args).await?;
+    if args.remote {
+        crate::plugin::set_remote_exposure();
+    }
     let is_localhost = host_is_localhost(&args.host);
 
     if args.behind_proxy && args.remote {
@@ -1564,7 +1578,7 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
 pub(crate) async fn ensure_local_daemon(
     native_profile: Option<&str>,
     allow_start: bool,
-) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
+) -> Result<(crate::daemon::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let existing = match daemon_status() {
@@ -1586,6 +1600,12 @@ pub(crate) async fn ensure_local_daemon(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
         );
+        let transaction = tokio::task::spawn_blocking(move || {
+            let lock = try_lock_serve()?.context("Another daemon or migration owns serve.lock")?;
+            crate::migrations::run_migrations_under_exclusion(None, false, &transaction, &lock)?;
+            Ok::<_, anyhow::Error>(transaction)
+        })
+        .await??;
         let resolved_profile = if let Some(profile) = native_profile {
             crate::session::config::effective_profile(profile)
         } else {
@@ -1609,7 +1629,7 @@ pub(crate) async fn ensure_local_daemon(
     } else {
         None
     };
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
@@ -1658,7 +1678,7 @@ pub(crate) async fn start_dashboard_for_tui(
     let instance = launch
         .instance_id
         .context("Successor instance proof is missing")?;
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let connection = crate::daemon::RuntimeConnection::connect(
@@ -1856,7 +1876,7 @@ async fn start_daemon(
         return Err(error);
     }
     drop(_state_lock);
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
@@ -1867,38 +1887,31 @@ async fn start_daemon(
     } else {
         std::time::Duration::from_secs(60)
     };
-    let deadline = tokio::time::Instant::now() + readiness;
-    let ready = tokio::time::timeout_at(deadline, async {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("Daemon exited before readiness: {status}");
-            }
-            if client.local_daemon_ready(pid).await.unwrap_or(false)
-                && daemon_pid() == Some(pid)
-                && launch
-                    .instance_id
-                    .as_deref()
-                    .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
-                && crate::process::process_birth_identity(pid)
-                    .is_ok_and(|current| current.as_ref() == Some(&birth))
-            {
-                return Ok::<(), anyhow::Error>(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
+    let log = stdio_redirect_path()
+        .map(|p| format!(" See {}.", p.display()))
+        .unwrap_or_default();
+    let ready = await_daemon_ready(
+        pid,
+        &log,
+        tokio::time::Instant::now() + readiness,
+        || Ok(child.try_wait()?),
+        || {
+            Box::pin(async {
+                client.local_daemon_ready(pid).await.unwrap_or(false)
+                    && daemon_pid() == Some(pid)
+                    && launch
+                        .instance_id
+                        .as_deref()
+                        .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                    && crate::process::process_birth_identity(pid)
+                        .is_ok_and(|current| current.as_ref() == Some(&birth))
+            })
+        },
+    )
     .await;
-    match ready {
-        Ok(Ok(())) => {}
-        result => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return match result {
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(anyhow::anyhow!("Daemon readiness timed out")),
-                Ok(Ok(())) => unreachable!(),
-            };
-        }
+    if let Err(error) = ready {
+        stop_unready_daemon(&mut child).await;
+        return Err(error);
     }
 
     if announce {
@@ -1906,6 +1919,64 @@ async fn start_daemon(
         println!("Stop with: aoe serve --stop");
     }
     Ok(())
+}
+
+/// Polls until `ready`, the child exits, or `deadline`. The deadline error is
+/// "unconfirmed" because the daemon may still have been starting.
+async fn await_daemon_ready<'a>(
+    pid: u32,
+    log: &str,
+    deadline: tokio::time::Instant,
+    mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
+    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let wait = tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(status) = exited()? {
+                anyhow::bail!("Daemon exited before readiness ({status}).{log}");
+            }
+            if ready().await {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    wait.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "Daemon startup remains unconfirmed after {}s (PID {pid}); stopping it.{log}",
+            started.elapsed().as_secs()
+        ))
+    })
+}
+
+/// Covers the Funnel guard's two sequential cleanup commands, each bounded by
+/// `FUNNEL_OFF_TIMEOUT`, plus margin.
+const UNREADY_DAEMON_GRACE: std::time::Duration = crate::server::tunnel::FUNNEL_OFF_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(std::time::Duration::from_secs(2));
+
+/// SIGTERM, then SIGKILL after the grace.
+async fn stop_unready_daemon(child: &mut std::process::Child) {
+    stop_child_within(child, UNREADY_DAEMON_GRACE).await;
+}
+
+async fn stop_child_within(child: &mut std::process::Child, grace: std::time::Duration) {
+    // A reaped child's pid may be reused, so signal only one `try_wait` shows still running.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let deadline = tokio::time::Instant::now() + grace;
+    while !matches!(child.try_wait(), Ok(Some(_))) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 async fn migrate_managed_launch(
@@ -2171,7 +2242,105 @@ pub fn cached_serve_mode_label() -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn daemon_readiness_outcomes() {
+        use std::os::unix::process::ExitStatusExt;
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let mut polls = 0;
+        await_daemon_ready(
+            7,
+            "",
+            far,
+            || Ok(None),
+            || {
+                polls += 1;
+                Box::pin(std::future::ready(polls == 3))
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = await_daemon_ready(
+            7,
+            " See /log.",
+            far,
+            || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
+            || Box::pin(async { false }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exited before readiness") && err.ends_with("See /log."),
+            "{err}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let err = await_daemon_ready(
+            7,
+            " See /log.",
+            deadline,
+            || Ok(None),
+            || Box::pin(async { false }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "Daemon startup remains unconfirmed after 105s (PID 7); stopping it. See /log."
+        );
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn an_already_exited_daemon_is_not_signalled() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Reap it as the readiness loop does, then keep the pid from a stale signal.
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let started = std::time::Instant::now();
+        stop_child_within(&mut child, std::time::Duration::from_secs(30)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn an_unready_daemon_is_stopped_within_the_grace() {
+        // The ready file is touched once the shell has installed its trap.
+        for (trap, kill_expected) in [("exit 0", false), ("", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let mut child = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"trap "$2" TERM; touch "$1"; while :; do sleep 0.05; done"#,
+                    "sh",
+                ])
+                .arg(&ready)
+                .arg(trap)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(std::time::Instant::now() < deadline, "shell never started");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let grace = std::time::Duration::from_millis(500);
+            let started = std::time::Instant::now();
+            stop_child_within(&mut child, grace).await;
+            let elapsed = started.elapsed();
+            assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+            if kill_expected {
+                assert!(elapsed >= grace, "{elapsed:?}");
+            } else {
+                assert!(elapsed < grace, "{elapsed:?}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cityhall_refusal_cannot_reflect_the_bearer_into_errors() {
@@ -2997,6 +3166,72 @@ mod tests {
                 "serve.launch",
             ] {
                 assert!(!dir.join(name).exists(), "{name} should be removed");
+            }
+        }
+    }
+    mod dev_plugin_refusal {
+        use super::super::validate_launch_args;
+        use crate::cli::{Cli, Commands};
+        use crate::session::{update_config, CapabilityGrant, PluginConfig};
+        use clap::Parser;
+        use serial_test::serial;
+
+        fn serve_args(argv: &[&str]) -> super::super::ServeArgs {
+            match Cli::try_parse_from(argv).expect("argv parses").command {
+                Some(Commands::Serve(args)) => args,
+                _ => panic!("expected a serve invocation"),
+            }
+        }
+
+        fn install_dev_plugin(id: &str, enabled: bool) {
+            let manifest =
+                format!("id = \"{id}\"\nname = \"Dev\"\nversion = \"1.0.0\"\napi_version = 2\n");
+            let dir = crate::plugin::plugins_dir().unwrap().join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            update_config(|config| {
+                config.plugins.insert(
+                    id.to_string(),
+                    PluginConfig {
+                        enabled,
+                        source: Some("/src/dev".to_string()),
+                        dev: true,
+                        grant: Some(CapabilityGrant {
+                            manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                                manifest.as_bytes(),
+                            ),
+                            capabilities: vec![],
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..PluginConfig::default()
+                    },
+                );
+            })
+            .unwrap();
+            crate::plugin::reload_registry();
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn remote_exposure_is_refused_only_while_a_dev_plugin_is_active() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let _reload = crate::plugin::ReloadRegistryOnDrop;
+            let remote = serve_args(&["aoe", "serve", "--remote", "--passphrase", "pw"]);
+            let local = serve_args(&["aoe", "serve"]);
+
+            install_dev_plugin("acme.dev", true);
+            let err = validate_launch_args("default", &remote)
+                .await
+                .expect_err("remote with an active dev plugin must be refused");
+            assert!(
+                err.to_string().contains("dev plugins are active: acme.dev"),
+                "{err}"
+            );
+            validate_launch_args("default", &local).await.unwrap();
+
+            install_dev_plugin("acme.dev", false);
+            if let Err(err) = validate_launch_args("default", &remote).await {
+                assert!(!err.to_string().contains("dev plugins"), "{err}");
             }
         }
     }

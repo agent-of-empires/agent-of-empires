@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     ElicitationSchema, ElicitationScope, EnumOption, MultiSelectItems, StringFormat,
@@ -651,7 +651,7 @@ pub fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         BooleanPropertySchema, ElicitationFormMode, ElicitationSessionScope, IntegerPropertySchema,
         MultiSelectPropertySchema, NumberPropertySchema, StringPropertySchema,
     };
@@ -666,8 +666,8 @@ mod tests {
         parse_elicitation(Nonce::new(), &request, Utc::now()).unwrap()
     }
 
-    fn preview_meta(preview: &str) -> agent_client_protocol::schema::v1::Meta {
-        let mut meta = agent_client_protocol::schema::v1::Meta::new();
+    fn preview_meta(preview: &str) -> agent_client_protocol::v1::schema::Meta {
+        let mut meta = agent_client_protocol::v1::schema::Meta::new();
         meta.insert(
             OPTION_META_KEY.into(),
             serde_json::json!({ "preview": preview }),

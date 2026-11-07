@@ -4,7 +4,7 @@ use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
 use crate::acp::fs_handler::FsPolicy;
 use crate::acp::terminal_handler::TerminalManager;
-use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};

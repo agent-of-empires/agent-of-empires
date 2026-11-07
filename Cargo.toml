@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.21.0"
+version = "1.22.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
@@ -28,7 +28,7 @@ ansi-to-tui = "8.0"
 # In-process VT emulator for the default live-preview path (`src/tmux/vt.rs`,
 # opt out with `AOE_VT_LIVE=0`): parse a pane's raw byte stream into an owned
 # grid instead of scraping `capture-pane` snapshots.
-vt100 = "0.16"
+vt100 = "0.18"
 ratatui-textarea = "0.9"
 tui-input = "0.15"
 # Markdown parsing for the structured view transcript. We map events to ratatui
@@ -84,7 +84,7 @@ zstd = "0.14"
 rand = "0.10"
 
 # Directory utilities
-dirs = "6.0"
+dirs = "7.0"
 
 # Glob expansion for sandbox volume_ignores patterns (e.g. `**/bin`, `**/obj`)
 glob = "0.3"
@@ -149,7 +149,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
-tower-http = { version = "0.7", features = ["fs"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-zstd", "fs"] }
 # Embedded dashboard bundle, behind `web`.
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 # Content type for the session file-read endpoint.
@@ -174,7 +174,7 @@ jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # Agent Client Protocol — drives the structured view surface.
-agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_compaction", "unstable_session_fork", "unstable_session_notices"] }
+agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = "1"

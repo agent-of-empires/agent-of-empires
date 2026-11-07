@@ -55,6 +55,10 @@ pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
                 include_bytes!("../../acp-worker/aoe-agent/src/toolKind.ts"),
             ),
             (
+                "src/transport.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/transport.ts"),
+            ),
+            (
                 "src/transcript.ts",
                 include_bytes!("../../acp-worker/aoe-agent/src/transcript.ts"),
             ),

@@ -423,13 +423,16 @@ impl serde::Serialize for SessionsView {
         struct Envelope<'a> {
             sessions: ScopedSessions<'a>,
             workspace_ordering: &'a [String],
+            trashed_count: usize,
         }
+        let rows = &self.snapshot.value.contents.sessions;
         Envelope {
             sessions: ScopedSessions {
-                rows: &self.snapshot.value.contents.sessions,
+                rows,
                 filter: &self.filter,
             },
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
+            trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
         .serialize(serializer)
     }
@@ -458,6 +461,7 @@ pub(crate) async fn list_sessions_envelope(
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     let view = match list_sessions_envelope(
         &state,
@@ -474,7 +478,27 @@ pub async fn list_sessions(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    crate::server::runtime::mutation_response(&view.snapshot.value.cursor, Json(&view))
+    // A snapshot's revision changes exactly when its contents do, so cursor and scope identify the body.
+    let cursor = &view.snapshot.value.cursor;
+    let etag = format!(
+        "\"{}.{}.{:?}\"",
+        cursor.epoch, cursor.revision, view.filter.scope
+    );
+    let response = if crate::server::runtime::if_none_match(&headers, &etag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Json(&view).into_response()
+    };
+    // `no-cache` makes the browser revalidate and serve its stored body on a 304, so a poll of an unchanged list is
+    // a header-only exchange that still reaches the page as a 200 carrying the cursor headers.
+    let validators = [
+        (axum::http::header::ETAG, etag),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "private, no-cache".into(),
+        ),
+    ];
+    crate::server::runtime::mutation_response(cursor, (validators, response))
 }
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a
@@ -822,6 +846,7 @@ mod workspace_ordering_tests {
             list_sessions(
                 State(state.clone()),
                 axum::extract::Query(ListSessionsQuery { state: None }),
+                axum::http::HeaderMap::new(),
             )
             .await,
         )
@@ -845,6 +870,67 @@ mod workspace_ordering_tests {
             snapshot["workspace_ordering"],
             serde_json::to_value(expected_order)?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unchanged_listing_answers_not_modified_without_a_body() -> anyhow::Result<()> {
+        use axum::http::{header, HeaderMap, HeaderValue};
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let live = Instance::new("live", "/repo");
+        let mut trashed = Instance::new("trashed", "/repo");
+        trashed.trash();
+        let state = crate::server::test_support::build_test_app_state(vec![live, trashed]);
+        let get = |scope: Option<crate::session::SessionScope>, etag: Option<&str>| {
+            let state = state.clone();
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = etag {
+                headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(etag).unwrap());
+            }
+            async move {
+                list_sessions(
+                    State(state),
+                    axum::extract::Query(ListSessionsQuery { state: scope }),
+                    headers,
+                )
+                .await
+            }
+        };
+        let untrashed = Some(crate::session::SessionScope::Untrashed);
+
+        let first = get(untrashed, None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers()[header::ETAG].to_str()?.to_string();
+        let revision = first.headers()[crate::daemon::RUNTIME_REVISION_HEADER].clone();
+        let body = axum::body::to_bytes(first.into_body(), 1024 * 1024).await?;
+        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body)?;
+        assert_eq!(envelope.sessions.len(), 1, "untrashed omits the trash");
+        assert_eq!(envelope.trashed_count, 1);
+
+        let again = get(untrashed, Some(&etag)).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(again.headers()[header::ETAG], etag.as_str());
+        assert_eq!(
+            again.headers()[crate::daemon::RUNTIME_REVISION_HEADER],
+            revision
+        );
+        assert!(axum::body::to_bytes(again.into_body(), 1024)
+            .await?
+            .is_empty());
+
+        let other_scope = get(Some(crate::session::SessionScope::Trashed), Some(&etag)).await;
+        assert_eq!(
+            other_scope.status(),
+            StatusCode::OK,
+            "an ETag is bound to its scope"
+        );
+
+        state.instances.write().await[0].title = "renamed".into();
+        state.runtime.publish(&state).await?;
+        let changed = get(untrashed, Some(&etag)).await;
+        assert_eq!(changed.status(), StatusCode::OK, "a new revision refetches");
         Ok(())
     }
 

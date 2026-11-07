@@ -378,7 +378,7 @@ pub(super) async fn handle_control_connection(
     let _ = control_closed_tx.send(true);
     if !writer_finished {
         let _ = writer_shutdown_tx.send(true);
-        let _ = writer.await;
+        log_writer_exit(writer.await, &session_id);
     }
     shared
         .disconnect_control(attachment_id, &agent_stdin, &session_id)
@@ -417,7 +417,7 @@ mod tests {
     /// A failed write reports why and how much was waiting, never what.
     #[tokio::test(start_paused = true)]
     async fn writer_failure_separates_timeout_from_io_error() {
-        for (peer_reading, expected) in [
+        for (peer_holds_open_unread, expected) in [
             (true, ControlWriteCause::TimedOut),
             (false, ControlWriteCause::Io(std::io::ErrorKind::BrokenPipe)),
         ] {
@@ -441,7 +441,7 @@ mod tests {
                 );
             }
             let (daemon, runner) = UnixStream::pair().unwrap();
-            let _daemon = peer_reading.then_some(daemon);
+            let _daemon = peer_holds_open_unread.then_some(daemon);
             let (_read, write) = runner.into_split();
             let (_shutdown, shutdown_rx) = watch::channel(false);
             let failure = run_control_writer(write, Arc::clone(&shared), attachment, shutdown_rx)

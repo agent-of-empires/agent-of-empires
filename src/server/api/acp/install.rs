@@ -180,8 +180,11 @@ pub async fn agent_install_info(
     let package = binary
         .as_deref()
         .and_then(crate::acp::install_hints::npm_package_for);
+    // A stopped container outranks the install setting: the screen offers to
+    // start it even when installs are off. Only dashboards that can't respawn come first.
     let install_blocked = match install_block(&state) {
-        None if instance.is_sandboxed() && !container_running(&id).await => {
+        block @ Some(InstallBlock::ReadOnly | InstallBlock::Cityhall) => block,
+        _ if instance.is_sandboxed() && !container_running(&id).await => {
             Some(InstallBlock::ContainerNotRunning)
         }
         block => block,
@@ -394,6 +397,7 @@ mod tests {
         let claude_npm = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
         let in_container =
             "podman exec aoe-sandbox-sandboxe npm install -g @agentclientprotocol/claude-agent-acp@latest";
+        // Installs are off; the sandboxed session's container never ran, which wins.
         for (id, agent, name, command, npm, sandboxed, container) in [
             (
                 "claude",
@@ -451,7 +455,7 @@ mod tests {
                     "install_command": command,
                     "npm_installable": npm,
                     "install_allowed": false,
-                    "install_blocked": "setting_off",
+                    "install_blocked": if sandboxed { "container_not_running" } else { "setting_off" },
                     "sandboxed": sandboxed,
                     "container_install_command": container,
                 }),
@@ -462,21 +466,65 @@ mod tests {
         assert_eq!(get("missing").await.0, StatusCode::NOT_FOUND);
 
         // `install_allowed` is false exactly where `install-agent` refuses.
-        let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![session(
-            "claude", "claude", None, false,
-        )]);
+        let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![
+            session("claude", "claude", None, false),
+            session("sandboxed", "claude", None, true),
+        ]);
         let read_only = crate::server::test_support::build_test_app_state_configured(
-            vec![session("claude", "claude", None, false)],
+            vec![
+                session("claude", "claude", None, false),
+                session("sandboxed", "claude", None, true),
+            ],
             |state| state.read_only = true,
         );
-        for (label, setting, state, blocked) in [
-            ("setting off", false, state.clone(), Some("setting_off")),
-            ("setting on", true, state.clone(), None),
-            ("CityHall", true, cityhall, Some("cityhall")),
-            ("read-only", true, read_only, Some("read_only")),
+        // install-info names a stopped container first; install-agent still refuses for the setting.
+        for (label, setting, state, id, blocked) in [
+            (
+                "setting off",
+                false,
+                state.clone(),
+                "claude",
+                Some("setting_off"),
+            ),
+            (
+                "setting off, stopped container",
+                false,
+                state.clone(),
+                "sandboxed",
+                Some("container_not_running"),
+            ),
+            ("setting on", true, state.clone(), "claude", None),
+            (
+                "CityHall",
+                true,
+                cityhall.clone(),
+                "claude",
+                Some("cityhall"),
+            ),
+            (
+                "CityHall, stopped container",
+                true,
+                cityhall,
+                "sandboxed",
+                Some("cityhall"),
+            ),
+            (
+                "read-only",
+                true,
+                read_only.clone(),
+                "claude",
+                Some("read_only"),
+            ),
+            (
+                "read-only, stopped container",
+                true,
+                read_only,
+                "sandboxed",
+                Some("read_only"),
+            ),
         ] {
             crate::session::config::update_config(|c| c.acp.allow_agent_install = setting).unwrap();
-            let body = fetch(state.clone(), "claude").await.1;
+            let body = fetch(state.clone(), id).await.1;
             let allowed = blocked.is_none();
             assert_eq!(body["install_allowed"], allowed, "{label}");
             assert_eq!(
@@ -485,7 +533,7 @@ mod tests {
                 "{label}"
             );
             if !allowed {
-                let refused = install_agent(State(state), Path("claude".to_string()))
+                let refused = install_agent(State(state), Path(id.to_string()))
                     .await
                     .into_response();
                 assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{label}");

@@ -829,6 +829,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
+            None,
             Ok(Json(body)),
         )
         .await
@@ -887,11 +888,104 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
 
 #[tokio::test]
 #[serial_test::serial]
+async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    crate::session::test_support::write_stub_adapter(adapters.path(), "own-pi-acp");
+    crate::session::config::update_config(|config| {
+        for (name, base) in [("my-pi", "pi"), ("own-pi", "pi")] {
+            config
+                .session
+                .custom_agents
+                .insert(name.into(), base.into());
+            config
+                .session
+                .agent_detect_as
+                .insert(name.into(), base.into());
+        }
+        config
+            .session
+            .agent_acp_cmd
+            .insert("own-pi".into(), "own-pi-acp".into());
+    })?;
+    let project = tempfile::tempdir()?;
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let storage = Storage::new("always-yolo", state.file_watch.clone())?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let mut panes = Vec::new();
+    let mut guarded = std::collections::HashSet::new();
+    // A structured session runs the agent `agent_name` picks, not `tool`.
+    let terminal = serde_json::json!({ "command_override": "sleep 120" });
+    let structured = |agent: &str| serde_json::json!({ "view": "structured", "agent_name": agent });
+    for (tool, extra, expected) in [
+        ("pi", terminal.clone(), true),
+        ("claude", terminal.clone(), false),
+        ("pi", structured("claude"), false),
+        ("claude", structured("pi"), true),
+        // A custom agent without its own adapter runs the base it inherits.
+        ("claude", structured("my-pi"), true),
+        // One with its own adapter runs that in a structured session, and the base CLI in a terminal.
+        ("claude", structured("own-pi"), false),
+        ("own-pi", terminal, true),
+    ] {
+        let label = format!("{tool} {extra}");
+        let mut body = serde_json::json!({
+            "title": format!("yolo {tool}"), "path": project.path(),
+            "tool": tool, "profile": "always-yolo", "yolo_mode": false,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let body = serde_json::from_value(body)?;
+        let response = create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        for instance in storage.load()? {
+            if !guarded.insert(instance.id.clone()) {
+                continue;
+            }
+            panes.push(crate::tmux::test_helpers::TmuxTestSession::from_name(
+                crate::tmux::Session::generate_name(&instance.id, &instance.title),
+            ));
+        }
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{label}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let row: SessionResponse = serde_json::from_slice(&bytes)?;
+        assert_eq!(row.yolo_mode, expected, "{label}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> {
     async fn request(state: Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
         create_session(
             State(state),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(create_body_from_json(body))),
         )
@@ -3433,6 +3527,7 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
@@ -3471,6 +3566,7 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -3514,6 +3610,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -3561,6 +3658,7 @@ async fn list_sessions_state_filter() {
     let all = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -3573,6 +3671,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Live),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(live_only).await, ["scope-live"]);
@@ -3582,6 +3681,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Trashed),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(trashed_only).await, ["scope-trashed"]);
@@ -3591,6 +3691,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::All),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -4323,6 +4424,7 @@ async fn create_hook_failure_details_are_local_owner_only() {
     let error = anyhow::Error::new(CreateHookFailed::new(
         anyhow::anyhow!("command exited with status 1"),
         Some("Defined in /tmp/project/.agent-of-empires.yml"),
+        true,
     ));
     assert!(local_create_hook_error_response(&error, false).is_none());
 
@@ -4342,57 +4444,236 @@ async fn create_hook_failure_details_are_local_owner_only() {
 }
 
 #[test]
-fn public_create_session_error_forwards_whitelisted_git_errors_only() {
-    let dup: anyhow::Error =
-        GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo")).into();
-    assert_eq!(
-        public_create_session_error(&dup),
-        "Worktree already exists at /tmp/repo-worktrees/foo"
-    );
-
-    let in_use: anyhow::Error = GitError::BranchAlreadyCheckedOut("feature/foo".to_string()).into();
-    assert_eq!(
-        public_create_session_error(&in_use),
-        "Branch 'feature/foo' is already in use by another worktree"
-    );
-
-    let template: anyhow::Error =
-        GitError::InvalidTemplate("environment variable `X` is unset or empty".to_string()).into();
-    assert_eq!(
-        public_create_session_error(&template),
-        "Invalid worktree path template: environment variable `X` is unset or empty"
-    );
-
-    // Whitelisted variants survive an anyhow::Context wrapper too.
-    let wrapped = anyhow::Error::from(GitError::BranchNotFound("nope".to_string()))
-        .context("while creating worktree");
-    assert_eq!(
-        public_create_session_error(&wrapped),
-        "Branch 'nope' not found"
-    );
-
-    // Raw git stderr (even already-sanitized) must not reach the client.
-    let cmd: anyhow::Error = GitError::WorktreeCommandFailed(
-        "fatal: unable to access 'https://<redacted>@host/repo.git'".to_string(),
+#[serial_test::serial]
+fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
+    use crate::containers::error::DockerError;
+    use crate::session::builder::BuildRefusal;
+    const SECRET: &str = "ghp_sekrit";
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Podman
+    })
+    .unwrap();
+    // A real hook failure whose output carries a secret and a path.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("out.txt"),
+        format!("token {SECRET} in /home/alice/.ssh"),
     )
-    .into();
-    assert_eq!(
-        public_create_session_error(&cmd),
-        "Failed to create session"
-    );
+    .unwrap();
+    let hook = |cmd: &str| {
+        crate::session::config::repo_config::execute_hooks(&[cmd.to_string()], project.path(), &[])
+            .unwrap_err()
+    };
+    let generic = ("create_failed", "Failed to create session".to_string());
+    let rows: Vec<(&str, anyhow::Error, (&str, String))> = vec![
+        (
+            "repo hook exit code",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook("cat out.txt; cat out.txt >&2; exit 3"),
+                Some("Defined in .agent-of-empires.yml"),
+                true,
+            )),
+            (
+                "hook_failed",
+                "The Repo hook `cat out.txt; cat out.txt >&2; exit 3` exited with code 3.".into(),
+            ),
+        ),
+        (
+            "repo hook under context",
+            anyhow::Error::new(CreateHookFailed::new(hook("exit 7"), None, true))
+                .context("create failed"),
+            (
+                "hook_failed",
+                "The Repo hook `exit 7` exited with code 7.".into(),
+            ),
+        ),
+        (
+            "global or profile hook",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook(&format!("echo {SECRET}; exit 5")),
+                Some("Defined in config.toml"),
+                false,
+            )),
+            (
+                "hook_failed",
+                "An on_create hook exited with code 5.".into(),
+            ),
+        ),
+        (
+            "hook outside the create path",
+            hook(&format!("echo {SECRET}; exit 6")),
+            (
+                "hook_failed",
+                "An on_create hook exited with code 6.".into(),
+            ),
+        ),
+        (
+            "runtime not installed",
+            BuildRefusal::RuntimeNotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime down at the pre-check",
+            BuildRefusal::RuntimeNotRunning.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime down while starting the container",
+            anyhow::Error::from(DockerError::DaemonNotRunning).context("ensure container"),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime missing while starting the container",
+            DockerError::NotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime permission",
+            DockerError::PermissionDenied.into(),
+            (
+                "sandbox_unavailable",
+                "The Daemon's user isn't allowed to use Podman, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "image pull",
+            anyhow::Error::from(DockerError::ImagePullFailed {
+                runtime: "Podman",
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+            })
+            .context("ensure image"),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
+            "working dir missing",
+            BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
+            (
+                "working_dir_missing",
+                "The Working directory doesn't exist where the Daemon runs.".into(),
+            ),
+        ),
+        // The git whitelist is unchanged.
+        (
+            "git: worktree exists",
+            GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
+                .into(),
+            (
+                "create_failed",
+                "Worktree already exists at /tmp/repo-worktrees/foo".into(),
+            ),
+        ),
+        (
+            "git: branch in use",
+            GitError::BranchAlreadyCheckedOut("feature/foo".into()).into(),
+            (
+                "create_failed",
+                "Branch 'feature/foo' is already in use by another worktree".into(),
+            ),
+        ),
+        (
+            "git: under context",
+            anyhow::Error::from(GitError::BranchNotFound("nope".into()))
+                .context("while creating worktree"),
+            ("create_failed", "Branch 'nope' not found".into()),
+        ),
+        (
+            "git: worktree path template",
+            GitError::InvalidTemplate("environment variable `X` is unset or empty".into()).into(),
+            (
+                "create_failed",
+                "Invalid worktree path template: environment variable `X` is unset or empty".into(),
+            ),
+        ),
+        // Raw git stderr (even already-sanitized) must not reach the client.
+        (
+            "git: command output",
+            GitError::WorktreeCommandFailed(format!(
+                "fatal: unable to access 'https://{SECRET}@host'"
+            ))
+            .into(),
+            generic.clone(),
+        ),
+        (
+            "git: clone credentials",
+            GitError::CloneFailed(format!("https://alice:{SECRET}@host/repo.git")).into(),
+            generic.clone(),
+        ),
+        (
+            "untyped",
+            anyhow::anyhow!("something internal at /home/user/.config/{SECRET}"),
+            generic.clone(),
+        ),
+        // An image inspect miss is not a pull failure.
+        (
+            "image not found",
+            DockerError::ImageNotFound(format!("img {SECRET}")).into(),
+            generic.clone(),
+        ),
+    ];
+    for (label, error, expected) in rows {
+        let got = public_create_session_error(&error);
+        assert!(!got.1.contains(SECRET), "{label}: leaked into {got:?}");
+        assert!(
+            !got.1.contains("/home/alice"),
+            "{label}: leaked a path into {got:?}"
+        );
+        assert!(
+            !got.1.contains("Docker"),
+            "{label}: named Docker, not Podman: {got:?}"
+        );
+        assert_eq!(got, expected, "{label}");
+    }
 
-    let clone: anyhow::Error =
-        GitError::CloneFailed("https://alice:supersecret@host/repo.git".to_string()).into();
-    let msg = public_create_session_error(&clone);
-    assert_eq!(msg, "Failed to create session");
-    assert!(!msg.contains("supersecret"));
-
-    // A non-GitError anyhow also stays generic.
-    let other = anyhow::anyhow!("something internal at /home/user/.config/secret");
-    assert_eq!(
-        public_create_session_error(&other),
-        "Failed to create session"
-    );
+    // Direct responses and replayed failures share the same message cap.
+    for (long, code) in [
+        (
+            anyhow::Error::from(DockerError::ImagePullFailed {
+                runtime: "Docker",
+                image: "x".repeat(2000),
+                detail: String::new(),
+            }),
+            "sandbox_image_pull_failed",
+        ),
+        (
+            anyhow::Error::from(
+                crate::session::builder::structured::StructuredChoiceError::AdapterMissing(
+                    "x".repeat(2000),
+                ),
+            ),
+            "acp_adapter_missing",
+        ),
+    ] {
+        let failure = create_failure(
+            &long,
+            crate::server::create_progress::CreateStage::StartingContainer,
+            "ref",
+        )
+        .unwrap();
+        assert_eq!(failure.code, code);
+        assert_eq!(failure.message.chars().count(), 1024);
+        let registry = crate::server::create_progress::CreateProgressRegistry::default();
+        registry.record_failure("long", failure.clone());
+        assert_eq!(registry.recent_failure("long").unwrap(), failure);
+    }
 }
 
 #[test]
@@ -5777,34 +6058,6 @@ async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
         0,
         "an id that was never admitted must not leave a lock-registry entry behind"
     );
-}
-
-#[test]
-fn create_session_validates_tool_before_builder_or_persistence() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions/create.rs"),
-    )
-    .unwrap();
-    let create_start = source.find("pub async fn create_session").unwrap();
-    let create_source = &source[create_start..];
-    // Anchor on the call, not the bare name: a comment above mentions the
-    // fn earlier in the handler and would satisfy a name-only find.
-    let validation = create_source
-        .find("if !validate_session_tool_identity(")
-        .unwrap();
-    let profile_default = create_source.find("body.profile.unwrap_or").unwrap();
-    let spawn_blocking = create_source.find("tokio::task::spawn_blocking").unwrap();
-    // Build and persistence both go through session_spawn.
-    let session_spawn = create_source
-        .find("crate::server::session_spawn::")
-        .unwrap();
-
-    assert!(validation < profile_default);
-    assert!(validation < spawn_blocking);
-    assert!(validation < session_spawn);
-    assert!(create_source.contains("body.profile.as_deref().unwrap_or(&default_profile)"));
-    assert!(create_source.contains("std::path::Path::new(&body.path)"));
-    assert!(!create_source[validation..spawn_blocking].contains("command_override"));
 }
 
 /// Session and terminal handlers must take the per-session lock before
@@ -8141,6 +8394,7 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -8226,6 +8480,7 @@ async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -8485,6 +8740,7 @@ async fn post_create_bytes(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
         None,
+        None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
     .await
@@ -8507,6 +8763,7 @@ async fn post_create_raw(
     let response = create_session(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
+        None,
         None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
@@ -8722,6 +8979,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                             uid: nix::unistd::geteuid().as_raw(),
                         },
                     )),
+                    None,
                     Ok(Json(serde_json::from_value(body).unwrap())),
                 )
                 .await
@@ -8833,13 +9091,264 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
         })
     };
 
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
     let (status, failed) = post_create(&state, body("k1")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
-    // A re-run would now succeed, so a matching 400 proves the replay.
+    assert_eq!(failed["error"], "working_dir_missing", "{failed}");
+    assert_eq!(failed["stage"], "preparing", "{failed}");
+    // The reference shown in the browser finds the failure's one log line.
+    let reference = failed["reference"].as_str().unwrap();
+    assert_eq!(failure_log_lines(&log, reference), 1);
+    // A re-run would now succeed, so a matching 400, stage and reference included,
+    // proves the replay.
     std::fs::create_dir_all(&path).unwrap();
     assert_eq!(post_create(&state, body("k1")).await, (status, failed));
     let (fresh, session) = post_create(&state, body("k2")).await;
     assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}
+
+/// Failure events carrying `reference`; a hook's message can span lines, so events are
+/// split on the "Session creation failed" text rather than on newlines.
+fn failure_log_lines(log: &std::sync::Mutex<Vec<u8>>, reference: &str) -> usize {
+    String::from_utf8(log.lock().unwrap().clone())
+        .unwrap()
+        .split("Session creation failed")
+        .skip(1)
+        .filter(|event| event.contains(&format!("reference={reference}")))
+        .count()
+}
+
+/// A create whose request is dropped still logs its failure under the reference its
+/// retry replays.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_failing_create_logs_the_reference_its_retry_replays() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let runs = gate.path().join("runs");
+    let hook = format!(
+        "echo run >> '{}'; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; exit 1",
+        runs.display(),
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let review = reviewed_creation_trust("test", project.path());
+    let body = serde_json::json!({
+        "title": "dropped-failure", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "trust_review": review, "idempotency_key": "drop-fail",
+    });
+
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    std::fs::write(&release, "").unwrap();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+    let reference = failed["reference"].as_str().unwrap();
+    assert_eq!(failure_log_lines(&log, reference), 1);
+}
+
+/// The log line behind a reference carries the whole cause chain, not just the
+/// outermost context.
+#[test]
+fn the_failure_log_names_a_context_wrapped_cause() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let error = anyhow::Error::new(GitError::NotAGitRepo).context("Worktree mode needs a repo");
+    log_create_failure(
+        &error,
+        crate::server::create_progress::CreateStage::Preparing,
+        "ref-chain",
+    );
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("Worktree mode needs a repo"), "{logged}");
+    assert!(
+        logged.contains(&GitError::NotAGitRepo.to_string()),
+        "{logged}"
+    );
+}
+
+/// A create that panics after its request is gone is still logged under its reference
+/// and recorded, so a same-key retry replays it instead of running the create again.
+#[tokio::test]
+async fn a_panicking_create_nobody_awaits_is_logged_and_replayed() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let failures = Arc::new(crate::server::create_progress::CreateProgressRegistry::default());
+    let progress = Arc::new(crate::server::create_progress::CreateProgress::default());
+    drop(tokio::spawn({
+        let (failures, progress) = (Arc::clone(&failures), Arc::clone(&progress));
+        async move {
+            run_create_task(
+                async { panic!("create blew up") as anyhow::Result<()> },
+                &failures,
+                &progress,
+                Some("dropped-panic"),
+                "ref-panic",
+            )
+            .await
+        }
+    }));
+
+    wait_for("the panic to be recorded", || {
+        failures.recent_failure("dropped-panic").is_some()
+    })
+    .await;
+    let failure = failures.recent_failure("dropped-panic").unwrap();
+    assert_eq!(
+        failure.status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(failure.code, "internal");
+    assert_eq!(failure.reference, "ref-panic");
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(logged.matches("reference=ref-panic").count(), 1, "{logged}");
+    assert!(logged.contains("create blew up"), "{logged}");
+}
+
+/// A create that panics after its request was dropped is replayed to a same-key retry
+/// with the reference it was logged under, and does not run again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_panicking_create_is_replayed_to_its_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let body = serde_json::json!({
+        "title": "dropped-panic", "path": "", "tool": "claude", "scratch": true,
+        "view": "structured", "profile": "test", "idempotency_key": "drop-panic",
+    });
+
+    let release = create::panic_hook::arm("drop-panic");
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the create to be registered", || {
+        state.create_progress.snapshot("drop-panic", None).is_some()
+    })
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.notify_one();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "{failed}"
+    );
+    assert_eq!(failed["error"], "internal", "{failed}");
+    let reference = failed["reference"].as_str().unwrap();
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logged.matches(&format!("reference={reference}")).count(),
+        1,
+        "{logged}"
+    );
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Repo approval covers only the repo's own commands, so a failing global or profile
+/// on_create hook reaches a remote client without its command, even when the repo
+/// declares other hook types.
+#[tokio::test]
+#[serial_test::serial]
+async fn only_an_approved_repo_on_create_hook_is_named_to_a_remote_client() {
+    use crate::server::test_support as support;
+    const SENTINEL: &str = "global-hook-sentinel";
+    let global_hook = format!("echo {SENTINEL}; exit 4 # {SENTINEL}");
+    let repo_hooks = |toml: &str| {
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), toml).unwrap();
+        project
+    };
+    let neutral = "An on_create hook exited with code 4.".to_string();
+    let rows = [
+        (
+            "no repo hooks",
+            tempfile::tempdir().unwrap(),
+            false,
+            neutral.clone(),
+        ),
+        (
+            "repo declares only on_launch",
+            repo_hooks("[hooks]\non_launch = [\"true\"]\n"),
+            true,
+            neutral,
+        ),
+        (
+            "repo declares on_create",
+            repo_hooks("[hooks]\non_create = [\"exit 4\"]\n"),
+            true,
+            "The Repo hook `exit 4` exited with code 4.".to_string(),
+        ),
+    ];
+    for (label, project, trust, expected) in rows {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        crate::session::config::update_config(|c| c.hooks.on_create = vec![global_hook.clone()])
+            .unwrap();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, _launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let mut body = serde_json::json!({
+            "title": "hook-origin", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test",
+        });
+        if trust {
+            body["trust_hooks"] = true.into();
+            body["trust_review"] =
+                serde_json::to_value(reviewed_creation_trust("test", project.path())).unwrap();
+        }
+
+        let (status, failed) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{label}: {failed}"
+        );
+        assert_eq!(failed["error"], "hook_failed", "{label}: {failed}");
+        assert_eq!(failed["message"], expected.as_str(), "{label}");
+        assert!(!failed.to_string().contains(SENTINEL), "{label}: {failed}");
+    }
 }
 
 /// A full replay map must not forget a live failure: its retry would run the create,
@@ -8886,6 +9395,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 
     let (status, failed) = post_create(&state, body("oldest")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["error"], "hook_failed", "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
     assert_eq!(hook_runs(), 1);
 
     // More live failures than the map holds.
@@ -8896,6 +9407,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
                 status: axum::http::StatusCode::BAD_REQUEST,
                 code: "create_failed",
                 message: "filler".to_string(),
+                stage: crate::server::create_progress::CreateStage::Preparing,
+                reference: format!("filler-{n}"),
             },
         );
     }
@@ -10364,4 +10877,1104 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
     assert_eq!(kept.title, "edited while the batch ran");
     assert!(kept.is_trashed());
     Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let marker = tempfile::tempdir().unwrap();
+    let created = marker.path().join("created");
+    let launched = marker.path().join("launched");
+    let project = project_with_on_create_hooks(&[]);
+    std::fs::write(
+        project.path().join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_create = [{:?}]\non_launch = [{:?}]\n",
+            format!("echo created >> '{}'", created.display()),
+            format!("touch '{}'; false", launched.display()),
+        ),
+    )
+    .unwrap();
+    let review = reviewed_creation_trust("test", project.path());
+    let body = serde_json::json!({
+        "title": "deferred", "path": project.path(), "tool": "",
+        "profile": "test", "view": "terminal", "cli": {},
+        "trust_hooks": true, "trust_review": review, "idempotency_key": "deferred",
+    });
+    let (status, first) = post_create(&state, body.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{first}");
+    let (status, replay) = post_create(&state, body).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{replay}");
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(std::fs::read_to_string(created).unwrap(), "created\n");
+    assert!(!launched.exists());
+    let rows = state.instances.read().await;
+    let row = rows
+        .iter()
+        .find(|row| row.id == first["id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(row.status, Status::Stopped);
+    assert!(row.lifecycle_reservation.is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let body = |title: &str, parent: Option<&str>| {
+        serde_json::json!({
+            "title": title, "path": project.path(), "tool": "", "profile": "test",
+            "group": "aoe", "cli": {"parent": parent},
+        })
+    };
+    let (status, parent) = post_create(&state, body("parent", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{parent}");
+    let id = parent["id"].as_str().unwrap();
+    let (status, child) = post_create(&state, body("child", Some(&id[..8]))).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{child}");
+    assert_eq!(child["parent_session_id"], parent["id"]);
+    assert_eq!(child["group_path"], "aoe");
+    let (status, rejected) = post_create(&state, body("grandchild", child["id"].as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{rejected}");
+    assert!(!state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.title == "grandchild"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_generated_worktree_avoids_existing_directories_without_renaming_branch() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let (project, repo) = crate::git::test_support::init_repo();
+    let root = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.worktree.path_template = root.path().join("{branch}").to_string_lossy().into_owned();
+    })
+    .unwrap();
+    for title in crate::session::civilizations::CIVILIZATIONS {
+        let path = root.path().join(title.to_lowercase());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("owned-by-user"), b"preserve").unwrap();
+    }
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let response = review_creation_trust(
+        State(state.clone()),
+        Ok(Json(
+            serde_json::from_value(serde_json::json!({
+                "path": project.path(), "profile": "test",
+                "generated_worktree_branch": "feature/4466", "create_new_branch": true,
+            }))
+            .unwrap(),
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let preview: crate::daemon::CreationTrustReview = serde_json::from_slice(&bytes).unwrap();
+    assert!(repo.find_reference("refs/heads/feature/4466").is_err());
+    let (status, row) = post_create(&state, serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": preview.suggested_title, "title_typed": true,
+        "worktree_branch": "feature/4466", "create_new_branch": true,
+        "base_branch": repo.head().unwrap().shorthand().unwrap(),
+        "cli": {"generated_name": true, "no_submodules": true, "worktree_path_id": preview.worktree_path_id},
+    })).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{row}");
+    let title = row["title"].as_str().unwrap();
+    assert!(!crate::session::civilizations::CIVILIZATIONS.contains(&title));
+    let path = std::path::Path::new(row["project_path"].as_str().unwrap());
+    assert!(path.join(".git").is_file());
+    assert_eq!(
+        crate::git::test_support::run_git(path, &["branch", "--show-current"]).trim(),
+        "feature/4466"
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/feature/4466")
+            .unwrap()
+            .target(),
+        repo.head().unwrap().target()
+    );
+    for title in crate::session::civilizations::CIVILIZATIONS {
+        assert_eq!(
+            std::fs::read(root.path().join(title.to_lowercase()).join("owned-by-user")).unwrap(),
+            b"preserve"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_concurrent_duplicate_creation_runs_hooks_only_for_the_winner() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let marker = tempfile::tempdir().unwrap();
+    let calls = marker.path().join("calls");
+    let command = format!("echo created >> '{}'", calls.display());
+    let project = project_with_on_create_hooks(&[&command]);
+    let review = reviewed_creation_trust("test", project.path());
+    let request = |key| {
+        serde_json::json!({
+            "title": "one owner", "path": project.path(), "tool": "", "profile": "test",
+            "cli": {}, "trust_hooks": true, "trust_review": review, "idempotency_key": key,
+        })
+    };
+    let (first, second) = tokio::join!(
+        post_create(&state, request("first")),
+        post_create(&state, request("second")),
+    );
+    let mut statuses = [first.0.as_u16(), second.0.as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [201, 400], "{first:?}, {second:?}");
+    assert_eq!(std::fs::read_to_string(calls).unwrap(), "created\n");
+    let rows = state.instances.read().await;
+    let owner = rows.iter().find(|row| row.title == "one owner").unwrap();
+    assert_eq!(owner.status, crate::session::Status::Stopped);
+    assert!(owner.lifecycle_reservation.is_none());
+    assert_eq!(
+        rows.iter().filter(|row| row.title == "one owner").count(),
+        1
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn creation_boundary_cli_fork_reads_the_pinned_binding_across_agent_accounts() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let binding = qualified_parent_binding();
+    let mut source = Instance::new("source", "/tmp");
+    source.source_profile = "test".into();
+    source.tool = "claude".into();
+    source.agent_session_id = Some("superseded-conversation".into());
+    source.resume_intent = crate::session::ResumeIntent::Cleared;
+    source.status = Status::Stopped;
+    crate::server::test_support::seed_instances_on_disk_for_test("test", vec![source.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows[0].resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+            rows[0].resume_binding = Some(binding.clone());
+            Ok(())
+        })
+        .unwrap();
+    state.instances.write().await[0].status = Status::Running;
+    for tool in ["claude", "claude-b"] {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp", "profile": "test", "tool": tool, "cli": {},
+        }));
+        let seed = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+            .await
+            .unwrap();
+        let crate::session::ForkSeed::Terminal { parent, .. } = seed else {
+            panic!("terminal creation must fork the native conversation");
+        };
+        assert_eq!(*parent, binding);
+    }
+    let other_project = tempfile::tempdir().unwrap();
+    let body = create_body_from_json(serde_json::json!({
+        "path": other_project.path(), "profile": "test", "tool": "claude", "cli": {},
+    }));
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::CONFLICT);
+    {
+        let canonical = state.instances.read().await;
+        assert_eq!(canonical[0].status, Status::Running);
+        assert_eq!(
+            canonical[0].resume_intent,
+            crate::session::ResumeIntent::Cleared
+        );
+    }
+    {
+        let mut canonical = state.instances.write().await;
+        canonical[0].resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+        canonical[0].resume_binding = Some(binding.clone());
+    }
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows[0].resume_intent = crate::session::ResumeIntent::Cleared;
+            rows[0].resume_binding = None;
+            Ok(())
+        })
+        .unwrap();
+    let body = create_body_from_json(serde_json::json!({
+        "path": "/tmp", "profile": "test", "tool": "claude", "cli": {},
+    }));
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+
+    let profile = "fork-after-profile-create";
+    let created = crate::server::api::system::create_profile(
+        State(state.clone()),
+        Ok(Json(crate::daemon::CreateProfileBody {
+            name: profile.into(),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let mut new_source = Instance::new("new profile parent", "/tmp");
+    new_source.source_profile = profile.into();
+    new_source.tool = "claude".into();
+    new_source.resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+    new_source.resume_binding = Some(binding.clone());
+    Storage::open_unwatched(profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(new_source.clone());
+            Ok(())
+        })
+        .unwrap();
+    state.instances.write().await.push(new_source.clone());
+    let body = create_body_from_json(serde_json::json!({
+        "path": "/tmp", "profile": profile, "tool": "claude", "cli": {},
+    }));
+    let seed = create::resolve_canonical_fork_seed(&state, &body, &new_source.id)
+        .await
+        .unwrap();
+    let crate::session::ForkSeed::Terminal { parent, .. } = seed else {
+        panic!("a freshly acknowledged profile must support native forks");
+    };
+    assert_eq!(*parent, binding);
+
+    let retired = tempfile::tempdir().unwrap();
+    std::fs::rename(
+        crate::session::get_profile_dir_path(profile).unwrap(),
+        retired.path().join("retired"),
+    )
+    .unwrap();
+    Storage::new_unwatched(profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(new_source.clone());
+            Ok(())
+        })
+        .unwrap();
+    let refusal = create::resolve_canonical_fork_seed(&state, &body, &new_source.id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut commits = state.session_service.arm_creation_commit();
+    let create =
+        tokio::spawn({
+            let state = state.clone();
+            async move {
+                post_create_raw(&state, serde_json::json!({
+            "path": "", "tool": "", "profile": "test", "scratch": true,
+            "title": "cancel-at-commit", "cli": {}, "idempotency_key": "cancel-at-commit",
+        })).await
+            }
+        });
+    let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let path = {
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.status, Status::Creating);
+        std::path::PathBuf::from(&row.project_path)
+    };
+    assert!(path.is_dir());
+    assert!(state.session_service.cancel_creation(&id));
+    release.send(()).unwrap();
+    let (status, code, body) = create.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code.as_deref(), Some("creation_cancelled"));
+    assert!(!path.exists());
+    assert!(!state.instances.read().await.iter().any(|row| row.id == id));
+    assert!(!Storage::open_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == id));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_post_commit_failure_preserves_creation_and_reports_unknown_on_replay() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let project = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": "post-commit-failure", "view": "terminal",
+        "cli": {}, "idempotency_key": "post-commit-failure",
+    });
+    let mut commits = state.session_service.arm_creation_commit();
+    let request = tokio::spawn({
+        let state = state.clone();
+        let body = body.clone();
+        async move { post_create_raw(&state, body).await }
+    });
+    let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let storage = Storage::open_unwatched("test").unwrap();
+    let failure = storage.fail_writes_for_test();
+    release.send(()).unwrap();
+    let (status, code, response) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+    drop(failure);
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        code.as_deref(),
+        Some("create_outcome_unknown"),
+        "{response}"
+    );
+    let rows = storage.load().unwrap();
+    let row = rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(row.idempotency_key.as_deref(), Some("post-commit-failure"));
+    assert_eq!(row.status, Status::Creating);
+    assert!(row.lifecycle_reservation.is_some());
+    let original_response = response;
+    let (status, code, response) = post_create_raw(&state, body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        code.as_deref(),
+        Some("create_outcome_unknown"),
+        "{response}"
+    );
+    assert_eq!(response, original_response);
+    assert_eq!(response["stage"], "preparing");
+    assert!(response["reference"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(
+        storage
+            .load()
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == id)
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_shell_validation_preserves_owner_literals_and_remote_word_boundaries() {
+    use crate::server::peer::ConnectionPeer;
+    use crate::server::test_support as support;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tower::ServiceExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("agent");
+    let observed = root.path().join("arguments");
+    let injected = root.path().join("must-not-run");
+    let project = root.path().join("project;literal");
+    std::fs::create_dir(&project).unwrap();
+    let alias = root.path().join("safe-alias");
+    symlink(&project, &alias).unwrap();
+    let hook_effect = root.path().join("created");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            shell_words::quote(observed.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("lenovo-claude".into());
+        config.session.custom_agents.insert(
+            "lenovo-claude".into(),
+            script.to_string_lossy().into_owned(),
+        );
+        config.hooks.on_create = vec![format!(
+            "printf x >> {}",
+            shell_words::quote(hook_effect.to_str().unwrap())
+        )];
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state_with_policy(
+        Vec::new(),
+        vec!["localhost".into()],
+        Vec::new(),
+        Some("shell-policy-token".into()),
+    );
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let app = support::build_router_for_test(state.clone());
+    let request = |peer, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer shell-policy-token")
+            .extension(axum::extract::ConnectInfo(peer))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
+    let literal = format!("$(touch {})", injected.display());
+    let args = format!(
+        "--append-system-prompt \"hello world\" --model opus[1m] '{}'",
+        literal
+    );
+    for peer in [
+        ConnectionPeer::Tcp("127.0.0.1:4521".parse().unwrap()),
+        ConnectionPeer::Tcp("192.0.2.1:4521".parse().unwrap()),
+    ] {
+        for (path, extra_args, scratch, field) in [
+            (project.as_path(), "", false, "path"),
+            (alias.as_path(), "", false, "path"),
+            (root.path(), args.as_str(), false, "extra_args"),
+            (
+                std::path::Path::new(""),
+                "'literal;value'",
+                true,
+                "extra_args",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    peer,
+                    serde_json::json!({
+                        "path": path, "tool": "", "profile": "test",
+                        "extra_args": extra_args, "scratch": scratch, "cli": {},
+                    }),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{peer:?}: {result}");
+            assert_eq!(result["error"], "validation_failed");
+            assert!(
+                result["message"].as_str().unwrap().contains(field),
+                "{result}"
+            );
+            assert!(Storage::open_unwatched("test")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty());
+            assert!(state.instances.read().await.is_empty());
+            assert!(!hook_effect.exists());
+        }
+    }
+    let safe_args = "--append-system-prompt \"hello world\" ''";
+    for (index, (peer, tool, extra_args, expected)) in [
+        (
+            ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+            "",
+            args.as_str(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n"),
+        ),
+        (
+            ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+            " lenovo-claude ",
+            args.as_str(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n"),
+        ),
+        (
+            ConnectionPeer::Tcp("127.0.0.1:4521".parse().unwrap()),
+            "",
+            safe_args,
+            "--append-system-prompt\nhello world\n\n".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let owner = matches!(peer, ConnectionPeer::UnixOwner { .. });
+        let response = app
+            .clone()
+            .oneshot(request(
+                peer,
+                serde_json::json!({
+                    "path": if owner { project.as_path() } else { root.path() },
+                    "tool": tool, "profile": "test",
+                    "title": format!("literal arguments {index}"),
+                    "extra_args": extra_args, "cli": {},
+                }),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{result}");
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == result["id"].as_str().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(row.tool, "lenovo-claude");
+        let launched = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("{} {}", row.command, row.extra_args)])
+            .status()
+            .unwrap();
+        assert!(launched.success());
+        assert_eq!(std::fs::read_to_string(&observed).unwrap(), expected);
+        assert!(!injected.exists());
+    }
+    for cli in [serde_json::Value::Null, serde_json::json!({})] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                ConnectionPeer::UnixOwner { uid: nix::unistd::geteuid().as_raw() },
+                serde_json::json!({
+                    "path": root.path(), "tool": "", "profile": "test", "extra_args": "'unterminated",
+                    "cli": cli,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_fork_inherits_a_custom_identity_instead_of_its_builtin_token() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("claude".into());
+        config
+            .session
+            .custom_agents
+            .insert("claude-personal".into(), "claude".into());
+    })
+    .unwrap();
+    let mut source = Instance::new("source", project.path().to_str().unwrap());
+    source.source_profile = "test".into();
+    source.tool = "claude-personal".into();
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    let body = create_body_from_json(serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test", "cli": {"fork_source": source.id},
+    }));
+    let (body, _) = super::cli_create::resolve_cli_creation(&state, body, "test")
+        .await
+        .unwrap();
+    assert_eq!(body.tool, "claude-personal");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_structured_hook_refusal_replays_without_repeating_create_hooks() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let marker = project.path().join("create-count");
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("claude".into());
+        config
+            .session
+            .agent_command_override
+            .insert("claude".into(), "/bin/true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), "/bin/true".into());
+        config.hooks.on_create = vec![format!(
+            "printf 'x\\n' >> {}",
+            shell_words::quote(marker.to_str().unwrap())
+        )];
+    })
+    .unwrap();
+    crate::session::config::update_app_state(|app| {
+        app.has_acknowledged_agent_hooks = false;
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut body = serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": "consent", "view": "structured", "agent_name": "fake",
+        "idempotency_key": "consent-refusal", "cli": {},
+    });
+    let (status, code, failure) = post_create_raw(&state, body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code.as_deref(), Some("agent_hooks_not_approved"));
+    assert!(failure["message"]
+        .as_str()
+        .unwrap()
+        .contains("aoe hooks approve"));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\n");
+    assert!(state.instances.read().await.is_empty());
+
+    crate::session::config::update_app_state(|app| {
+        app.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+    let (status, code, _) = post_create_raw(&state, body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code.as_deref(), Some("agent_hooks_not_approved"));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\n");
+    assert!(state.instances.read().await.is_empty());
+
+    body["idempotency_key"] = serde_json::json!("consent-new-intention");
+    let (status, created) = post_create(&state, body).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x\nx\n");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_relative_adapter_uses_the_provisioned_directory_and_effective_hooks() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("fake".into());
+        config
+            .session
+            .custom_agents
+            .insert("fake".into(), "/bin/true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), "./adapter".into());
+        config.acp.acp_defaults.insert(
+            "fake".into(),
+            crate::session::config::AcpAgentDefaults {
+                model: Some("derived-model".into()),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let base = serde_json::json!({
+        "path": "", "scratch": true, "tool": "", "profile": "test",
+        "view": "structured", "cli": {},
+    });
+    let mut explicit = base.clone();
+    explicit["agent_name"] = serde_json::json!("fake");
+    let (status, failure) = post_create(&state, explicit).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{failure}");
+    assert_eq!(failure["error"], "acp_adapter_missing");
+    assert!(state.instances.read().await.is_empty());
+    assert!(support::load_instances_from_disk_for_test("test").is_empty());
+    assert_eq!(std::fs::read_dir(app.join("scratch")).unwrap().count(), 0);
+
+    for model in [None, Some("explicit-model")] {
+        let mut implicit = base.clone();
+        implicit["title"] = serde_json::json!(format!("terminal fallback {model:?}"));
+        implicit["agent_model"] = serde_json::json!(model);
+        let (status, created) = post_create(&state, implicit).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let fallback = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == created["id"].as_str().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(fallback.view, crate::session::View::Terminal);
+        assert_eq!(fallback.status, crate::session::Status::Stopped);
+        assert_eq!(fallback.agent_model.as_deref(), model);
+        assert!(fallback.acp_effort.is_none());
+    }
+
+    crate::session::config::update_config(|config| {
+        config.hooks.on_create =
+            vec!["printf '%s\\n' '#!/bin/sh' 'exit 0' > ./adapter && chmod +x ./adapter".into()];
+    })
+    .unwrap();
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut installed = base;
+    installed["title"] = serde_json::json!("installed adapter");
+    installed["agent_name"] = serde_json::json!("fake");
+    let (status, created) = post_create(&state, installed).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == created["id"].as_str().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(row.view, crate::session::View::Structured);
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        std::fs::metadata(std::path::Path::new(&row.project_path).join("adapter"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+}
+
+/// A sub-session is created in its parent's group, and only a top-level session can be a
+/// parent, as `aoe add --parent` decides.
+#[tokio::test]
+async fn create_with_a_parent_joins_its_group_one_level_deep() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let mut parent = Instance::new("parent", "/tmp/aoe-parent");
+    parent.id = "parent".into();
+    parent.source_profile = "test".into();
+    parent.group_path = "team".into();
+    let mut child = Instance::new("child", "/tmp/aoe-child");
+    child.id = "child".into();
+    child.source_profile = "test".into();
+    child.parent_session_id = Some("parent".into());
+    let mut trashed = Instance::new("trashed", "/tmp/aoe-trashed");
+    trashed.id = "trashed".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    crate::session::Storage::new_unwatched("other").unwrap();
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-elsewhere");
+    elsewhere.id = "other-parent".into();
+    elsewhere.source_profile = "other".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![parent.clone(), child.clone(), trashed.clone()],
+    );
+    crate::server::test_support::seed_instances_on_disk_for_test("other", vec![elsewhere.clone()]);
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![parent, child, trashed, elsewhere],
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    // (parent, refusal code, or None when created in the parent's group)
+    let cases = [
+        ("missing", Some("parent_not_found")),
+        // Another profile's session can't parent one created in this profile.
+        ("other-parent", Some("parent_not_found")),
+        ("trashed", Some("parent_not_found")),
+        ("child", Some("parent_is_sub_session")),
+        ("parent", None),
+    ];
+    for (parent_id, refusal) in cases {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "scratch": true,
+                "view": "structured", "group": "elsewhere", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        if let Some(code) = refusal {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {session}");
+            assert_eq!(session["error"], code, "{parent_id}");
+            assert_eq!(state.instances.read().await.len(), 4, "{parent_id}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::CREATED, "{parent_id}: {session}");
+        let id = session["id"].as_str().unwrap();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(row.group_path, "team");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}
+
+/// CityHall answers a Terminal view parent like a missing one, so the mode doesn't reveal which
+/// ids exist, and neither refusal writes a child; a Structured view parent still works.
+#[tokio::test]
+async fn cityhall_create_hides_terminal_parents_like_missing_ones() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::Storage::new_unwatched("test").unwrap();
+    // CityHall creates only in a configured project.
+    let project = tempfile::tempdir().unwrap();
+    crate::session::projects::add(
+        "test",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "cityhall",
+            project.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    let mut structured = Instance::new("structured-parent", "/tmp/aoe-structured-parent");
+    structured.id = "structured-parent".into();
+    structured.source_profile = "test".into();
+    structured.view = crate::session::View::Structured;
+    structured.group_path = "team".into();
+    let mut terminal = Instance::new("terminal-parent", "/tmp/aoe-terminal-parent");
+    terminal.id = "terminal-parent".into();
+    terminal.source_profile = "test".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "test",
+        vec![structured.clone(), terminal.clone()],
+    );
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![structured, terminal],
+        Vec::new(),
+        Vec::new(),
+        None,
+        true,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for parent_id in ["terminal-parent", "missing"] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "sub", "path": "", "tool": "claude", "parent_session_id": parent_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent_id}: {body}");
+        assert_eq!(body["error"], "parent_not_found", "{parent_id}");
+        assert_eq!(state.instances.read().await.len(), 2, "{parent_id}");
+    }
+
+    let (status, session) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "sub", "path": "", "tool": "claude", "parent_session_id": "structured-parent",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["id"].as_str().unwrap();
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row.parent_session_id.as_deref(), Some("structured-parent"));
+    assert_eq!(row.group_path, "team");
+    assert!(row.is_structured());
+    wait_for("launcher-rejected startup", || {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .iter()
+            .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+    })
+    .await;
+}
+
+/// `aoe add --parent` refuses a trashed parent as HTTP's create does, with
+/// `parent_not_found`, and says why.
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_create_refuses_a_trashed_parent() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut trashed = Instance::new("old", project.path().to_str().unwrap());
+    trashed.id = "trashed-id".into();
+    trashed.source_profile = "test".into();
+    trashed.trashed_at = Some(chrono::Utc::now());
+    support::seed_instances_on_disk_for_test("test", vec![trashed.clone()]);
+    let state = support::build_test_app_state(vec![trashed]);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let (status, refused) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "child", "path": project.path(), "tool": "", "profile": "test",
+            "cli": {"parent": "trashed-id"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "parent_not_found", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("in the trash"),
+        "{refused}"
+    );
+    assert_eq!(state.instances.read().await.len(), 1);
+}
+
+/// A refused `--parent` is decided before anything is provisioned, so `-b` with a fresh
+/// worktree leaves no worktree, branch or session behind.
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let (project, repo) = crate::git::test_support::init_repo();
+    let root = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.worktree.path_template = root.path().join("{branch}").to_string_lossy().into_owned();
+    })
+    .unwrap();
+    let seeded = |id: &str| {
+        let mut row = Instance::new(id, project.path().to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = "test".into();
+        row
+    };
+    let mut trashed = seeded("trashed-id");
+    trashed.trashed_at = Some(chrono::Utc::now());
+    let mut child = seeded("child-id");
+    child.parent_session_id = Some("top-id".into());
+    support::seed_instances_on_disk_for_test("test", vec![trashed.clone(), child.clone()]);
+    let state = support::build_test_app_state(vec![trashed, child]);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let base = repo.head().unwrap().shorthand().unwrap().to_string();
+
+    // (parent, branch the create would have made, HTTP's code, message contains)
+    let cases = [
+        (
+            "trashed-id",
+            "feat/under-trashed",
+            "parent_not_found",
+            "in the trash",
+        ),
+        (
+            "child-id",
+            "feat/under-child",
+            "parent_is_sub_session",
+            "sub-session of a sub-session",
+        ),
+        (
+            "missing-id",
+            "feat/under-missing",
+            "parent_not_found",
+            "missing-id",
+        ),
+    ];
+    for (parent, branch, code, message) in cases {
+        let (status, refused) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "child", "path": project.path(), "tool": "", "profile": "test",
+                "worktree_branch": branch, "create_new_branch": true, "base_branch": base,
+                "cli": {"parent": parent, "no_submodules": true},
+            }),
+        )
+        .await;
+        // What was provisioned is checked first, so a late refusal fails on what it left behind.
+        assert!(
+            repo.find_branch(branch, git2::BranchType::Local).is_err(),
+            "{parent}: branch {branch} was created"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "{parent}: a worktree was created"
+        );
+        assert_eq!(
+            state.instances.read().await.len(),
+            2,
+            "{parent}: a session was written"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{parent}: {refused}");
+        assert_eq!(refused["error"], code, "{parent}");
+        assert!(
+            refused["message"].as_str().unwrap().contains(message),
+            "{parent}: {refused}"
+        );
+    }
 }

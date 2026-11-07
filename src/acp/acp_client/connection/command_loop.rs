@@ -2,12 +2,13 @@
 //! the driven conversation reset.
 
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, McpServer, NewSessionRequest, NewSessionResponse,
     SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId,
     SetSessionConfigOptionRequest,
 };
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::Agent;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

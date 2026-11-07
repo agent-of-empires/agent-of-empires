@@ -17,8 +17,8 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
-| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
-| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
+| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude auth login`, or `ANTHROPIC_API_KEY` |
+| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or `codex login` (`codex login --device-auth` in a Container) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` (deprecated) | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
@@ -49,6 +49,8 @@ Each built-in adapter receives only verified provider variables from the Daemon'
 | `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, and its verified provider, Vertex, Bedrock and AWS credential-chain keys. See the [adapter allowlists](https://github.com/agent-of-empires/agent-of-empires/blob/main/src/acp/install_hints.rs). |
 
 `vibe`, `pi`, `omp`, `kimi` and custom adapters have no ambient provider allowlist. Supply host auth through `extra_env`, `environment`, or opt-in `session.inherit_host_environment`. Sandbox auth uses `sandbox.environment`; whole-host inheritance never crosses that boundary. Verified provider keys can cross, but ambient file/directory selectors, including config roots and AWS credential files, cannot: managed config roots are already mounted at canonical container paths. Explicit `provider_env` values are separate from ambient filtering. Drops are logged under `acp` with the key and reason.
+
+The `claude` adapter also gets `CLAUDE_CODE_THINKING_DISPLAY=summarized`, so Opus 5 and Sonnet 5 stream a thinking summary into the transcript. To turn it off, set `CLAUDE_CODE_THINKING_DISPLAY=omitted` in `environment`, `sandbox.environment` or an inherited host value; exporting it only in the Daemon's shell does not override the default.
 
 ### Prime runtime ownership
 
@@ -121,7 +123,7 @@ aoe add . --agent codex --effort high
 ## Requirements
 
 - Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess); `aoe-agent` needs 22.6+ for `--experimental-strip-types` and declares `engines.node: >=22.6.0`.
-- For Claude Code, a `claude login` session.
+- For Claude Code, a `claude auth login` session.
 
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:
 
@@ -140,7 +142,7 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard and TUI dialog:** default to the structured view; set [`acp.structured_view`](guides/configuration.md) to `terminal` to preselect the terminal, or `off` to hide the option. Pick **Terminal** in the wizard's **View** row, or turn off the **Structured** field in the TUI (shown for ACP-capable tools), to get the terminal view.
+- **Web wizard and TUI dialog:** `acp.structured_view = "auto"` defaults to structured in the web wizard and terminal in the TUI. Set it to `terminal` or `structured` to preselect that view in both, or `off` to hide the option. The per-session choice wins.
 - **CLI:** defaults to the terminal view; opt in with `--structured-view` or `--agent`.
 - Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 

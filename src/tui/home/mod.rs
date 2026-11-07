@@ -87,7 +87,14 @@ pub(super) struct GroupRenameContext {
 
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
-    Structured { session_id: String, nonce: String },
+    Structured {
+        session_id: String,
+        nonce: String,
+    },
+    Integration {
+        session_id: String,
+        snapshot: aoe_plugin_api::agent_integration::AgentIntegrationSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -300,6 +307,7 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
+    pub(super) agent_question_dialog: Option<super::dialogs::AgentQuestionDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     pub(super) pending_send_session: Option<String>,
     pub(super) pending_send_target: live_send::LiveSendTarget,
@@ -387,10 +395,6 @@ pub struct HomeView {
     // snapshot drives the row; see `apply_restart_results`.
     /// Sessions awaiting a daemon start snapshot (see `apply_restart_results`).
     pub(super) restart_in_flight: std::collections::HashSet<String>,
-
-    store_move_poller: crate::tui::store_move_poller::StoreMovePoller,
-    store_move_in_flight: Option<store_move::StoreMoveInFlight>,
-    store_move_bypass: Option<String>,
 
     /// The creation this view submitted to the daemon and still displays. The
     /// daemon owns provisioning, hooks, and the committed row.

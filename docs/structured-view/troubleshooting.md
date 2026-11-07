@@ -10,7 +10,7 @@ Install Node.js 22 or newer (`brew install node`, `apt install nodejs`, `nvm ins
 
 ### An adapter is missing or too old
 
-aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude login` if you have not.
+aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude auth login` if you have not.
 
 `aoe-agent` ships inside the `aoe` binary and installs into the data dir on demand: `aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6+. An `aoe` upgrade that changes its bundled sources makes an installed copy stale, and sessions refuse it until `doctor --fix` reinstalls it.
 
@@ -18,7 +18,7 @@ The dashboard shows the same thing inline, as a screen that names the Agent, the
 
 - **An npm adapter, with installs allowed:** **Update & restart** runs the agent's `npm install -g` on the host as the daemon user and respawns, queueing every other session blocked on that adapter for a respawn too. In a sandboxed session the button is **Update in Sandbox & restart** and installs inside the session's container instead. That fixes this session only; refresh the sandbox image so new sessions don't hit it.
 - **Installs not allowed yet:** step 1 is to turn on `acp.allow_agent_install`, and the button stays disabled until it's on. The setting is **off by default**, because a global install runs the package's lifecycle scripts as the daemon user. It is `local_only`, so the dashboard can't turn it on: enable it from the TUI settings (Advanced) or the config file. The screen notices the change when you come back to the tab.
-- **An npm adapter whose sandbox container isn't running:** **Start the container** first; the update comes back once it runs. Other adapters keep their own steps.
+- **A sandbox container that isn't running:** for an npm adapter, **Start the container** first; the update comes back once it runs. For an adapter you install by hand, step 1 is **Check again**, which starts the container so the command can run inside it.
 - **Not installable from here:** the command to run by hand, with **Copy**, then **Check again**, which respawns the worker and re-runs the version check.
 - **Read-only and CityHall dashboards** show the command only. Restart the agent from the TUI.
 
@@ -66,6 +66,7 @@ Some adapters finish a turn, stream the final message and end-of-turn usage, but
 
 - Read `aoe acp logs --session <id>`, or **Open agent log** on the red startup-error banner.
 - Check the connection chrome at the top of the view for reconnect status.
+- A new session whose agent hasn't started after 30 seconds offers **Restart** on its startup line, which replaces the start in progress. A message you sent while it was starting is stopped; send it again once the agent is ready.
 - A repeatedly-failing worker is parked with a red "session parked" banner: retry from the dashboard or run `aoe acp restart <session>`.
 
 The view auto-reconnects with exponential backoff if the WebSocket drops and resumes the transcript where it left off. The banner counts the attempts and offers a manual **Reconnect** once they are exhausted; returning the tab to the foreground reconnects immediately.

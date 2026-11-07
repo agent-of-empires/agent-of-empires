@@ -225,10 +225,10 @@ pub struct SessionService {
     install_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
     >,
-    // `created_instance_gate` was deleted with the rewrite of `session_spawn.rs`:
-    // it existed only to let a test hold a creation between the store read and
-    // the commit, and nothing arms or reads it any more. Upstream kept the
-    // field; bringing it back would leave it declared, initialised and dead.
+    #[cfg(test)]
+    creation_commit_barrier: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
+    >,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -402,6 +402,8 @@ impl SessionService {
             submission_claims: std::sync::OnceLock::new(),
             #[cfg(test)]
             install_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            creation_commit_barrier: std::sync::Mutex::new(None),
         }
     }
 
@@ -906,14 +908,18 @@ impl SessionService {
     /// if needed, publish the prompt into the event stream, then forward it
     /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
     /// non-HTTP caller (the plugin host, #2897) delivers turns through the
-    /// same path; the handler keeps HTTP concerns (read-only gate, wake,
-    /// attachment validation, smart-rename, status mapping).
+    /// same path; wake, attachment validation and queueing stay with the caller
+    /// (`api::acp::prompt::submit_prompt` for the user path).
+    ///
+    /// Returns the seq of the turn's `UserPromptSent` event, or `None` when that
+    /// event was not persisted: the turn is still forwarded, but nothing in the
+    /// event log marks where it began.
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
         id: &str,
         turn: SendTurnRequest<'_>,
-    ) -> Result<(), SendTurnError> {
+    ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
             text,
@@ -990,7 +996,7 @@ impl SessionService {
             return Err(SendTurnError::RevivalRefused);
         }
         // Persist the admitted turn before forwarding it to the agent.
-        let disposition = self
+        let published = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
                 id,
@@ -1001,7 +1007,7 @@ impl SessionService {
                 caller.message_origin().map(str::to_string),
             )
             .await;
-        let outcome = match disposition {
+        let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
                 self.acp_supervisor.send_prompt(id, text, attachments).await
             }
@@ -1012,7 +1018,7 @@ impl SessionService {
             }
         };
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
@@ -2166,6 +2172,18 @@ impl SessionService {
             .expect("one submission watcher per service");
         rx
     }
+
+    #[cfg(test)]
+    pub(crate) fn arm_creation_commit(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .creation_commit_barrier
+            .lock()
+            .expect("creation commit barrier poisoned") = Some(tx);
+        rx
+    }
 }
 
 /// Releases a session's `pending_drains` claim on every exit path of
@@ -2275,6 +2293,21 @@ impl CreationGuard {
     }
 
     pub(super) fn commit(&self) -> Result<(), CreationCancelled> {
+        #[cfg(test)]
+        if let Some(tx) = self
+            .service
+            .creation_commit_barrier
+            .lock()
+            .expect("creation commit barrier poisoned")
+            .take()
+        {
+            let (ack, released) = tokio::sync::oneshot::channel();
+            if tx.send((self.id.clone(), ack)).is_ok() {
+                released
+                    .blocking_recv()
+                    .expect("creation commit barrier released");
+            }
+        }
         let mut entry = self.entry.lock().expect("creation entry poisoned");
         match entry.lifecycle {
             CreationLifecycle::Cancelled => Err(CreationCancelled),
@@ -2563,6 +2596,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            parent_session_id: None,
             acp_mode_id: None,
             view: crate::session::View::Structured,
             agent_name: Some("claude".to_string()),
@@ -2572,6 +2606,7 @@ mod tests {
             import_binding: None,
             fork_seed: None,
             progress: None,
+            cli: None,
         }
     }
 
@@ -2901,7 +2936,7 @@ mod tests {
                     },
                 )
                 .await,
-            Ok(()) | Err(SendTurnError::NotOwner)
+            Ok(_) | Err(SendTurnError::NotOwner)
         ));
         assert!(!matches!(
             service
@@ -2920,7 +2955,7 @@ mod tests {
                     },
                 )
                 .await,
-            Ok(()) | Err(SendTurnError::NotOwner)
+            Ok(_) | Err(SendTurnError::NotOwner)
         ));
     }
 

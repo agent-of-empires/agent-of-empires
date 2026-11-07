@@ -75,6 +75,26 @@ impl YoloMode {
             mode => Some(mode),
         }
     }
+
+    /// Whether the agent runs in Yolo mode with no way to turn it off, whichever
+    /// generation is installed.
+    pub fn always_on(&self) -> bool {
+        match self {
+            YoloMode::AlwaysYolo => true,
+            YoloMode::EitherGeneration { legacy, current } => {
+                legacy.always_on() && current.always_on()
+            }
+            YoloMode::CliFlag(_) | YoloMode::EnvVar(..) => false,
+        }
+    }
+}
+
+/// Whether the built-in agent `name` always runs in Yolo mode. False for
+/// unknown and custom agents.
+pub fn is_always_yolo(name: &str) -> bool {
+    get_agent(name)
+        .and_then(|agent| agent.yolo.as_ref())
+        .is_some_and(YoloMode::always_on)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,16 +408,16 @@ pub struct AgentDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyToken {
-    Literal(&'static str),
-    Named(&'static str),
+pub enum KeyToken<'a> {
+    Literal(&'a str),
+    Named(&'a str),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PermissionResponse {
-    pub allow: &'static [KeyToken],
-    pub allow_always: Option<&'static [KeyToken]>,
-    pub deny: &'static [KeyToken],
+    pub allow: &'static [KeyToken<'static>],
+    pub allow_always: Option<&'static [KeyToken<'static>]>,
+    pub deny: &'static [KeyToken<'static>],
 }
 
 const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
@@ -978,6 +998,12 @@ pub const AGENTS: &[AgentDef] = &[
             "prime-agent",
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
         )
+    },
+    // Neutral stand-in for core tests; keep last so settings indices stay stable.
+    #[cfg(feature = "e2e-tests")]
+    AgentDef {
+        host_only: true,
+        ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
     },
 ];
 
@@ -1828,6 +1854,29 @@ mod tests {
     }
 
     #[test]
+    fn always_yolo_follows_each_agents_declaration() {
+        for agent in AGENTS {
+            let declared = agent.yolo.as_ref().is_some_and(YoloMode::always_on);
+            assert_eq!(is_always_yolo(agent.name), declared, "{}", agent.name);
+        }
+        for name in ["pi", "settl", "prime-agent"] {
+            assert!(is_always_yolo(name), "{name}");
+        }
+        assert!(!is_always_yolo("not-an-agent"));
+        // A mode spanning two generations is always on only when both are.
+        static ON: YoloMode = YoloMode::AlwaysYolo;
+        static FLAG: YoloMode = YoloMode::CliFlag("--yolo");
+        for (legacy, current, expected) in
+            [(&ON, &ON, true), (&ON, &FLAG, false), (&FLAG, &ON, false)]
+        {
+            assert_eq!(
+                YoloMode::EitherGeneration { legacy, current }.always_on(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn registry_invariants() {
         for agent in AGENTS {
             let name = agent.name;
@@ -2519,6 +2568,17 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         ];
         for (cmd, expected) in cases {
             assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn fake_agent_exists_only_in_e2e_builds_and_is_last() {
+        assert_eq!(
+            get_agent("fake-agent").is_some(),
+            cfg!(feature = "e2e-tests")
+        );
+        if cfg!(feature = "e2e-tests") {
+            assert_eq!(AGENTS.last().map(|a| a.name), Some("fake-agent"));
         }
     }
 

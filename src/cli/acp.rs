@@ -11,7 +11,7 @@ use crate::agents::registry_lifecycle;
 #[derive(Subcommand)]
 pub enum AcpCommands {
     /// Verify the structured view can start: Node runtime, configured agents,
-    /// provider auth (claude login).
+    /// provider auth (claude auth login).
     Doctor {
         /// Emit machine-readable JSON instead of a human report.
         #[arg(long)]
@@ -1240,6 +1240,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
+        Event::AgentThoughtChunk { .. } => "agent_thought_chunk",
         Event::ThinkingEnded => "thinking_ended",
         Event::RateLimit { .. } => "rate_limit",
         Event::RateLimitAutoResumed { .. } => "rate_limit_auto_resumed",

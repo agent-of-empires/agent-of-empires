@@ -2087,8 +2087,10 @@ impl Instance {
                             namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
                         }
                     } else if let Some(binding) = binding {
-                        anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
-                            "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
+                        (!explicit && binding.provenance == ConversationProvenance::Preallocated)
+                            .then_some(())
+                            .context("Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript")
+                            .context(ManagedResumeCause::PiTranscriptBindingRequired)?;
                     }
                 }
                 pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
@@ -2252,10 +2254,16 @@ impl Instance {
             }
             context.layout.sessions = inputs.canonical_path(&context.layout.sessions)?;
             if let Some((sid, binding, _)) = target {
-                let binding = binding.context("OMP resume requires a bound transcript")?;
-                let file = binding.transcript_path.as_ref().context(
-                    "OMP resume requires its exact transcript; rebind using --store with that file",
-                )?;
+                let binding = binding
+                    .context("OMP resume requires a bound transcript")
+                    .context(ManagedResumeCause::OmpTranscriptBindingRequired)?;
+                let file = binding
+                    .transcript_path
+                    .as_ref()
+                    .context(
+                        "OMP resume requires its exact transcript; rebind using --store with that file",
+                    )
+                    .context(ManagedResumeCause::OmpTranscriptBindingRequired)?;
                 anyhow::ensure!(
                     binding
                         .execution
@@ -2662,6 +2670,24 @@ pub(super) fn validate_managed_arguments(
                     "-nc",
                 ],
             ),
+            "pi" => (
+                &[
+                    "--model",
+                    "--thinking",
+                    "-m",
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--agent",
+                    "--session-dir",
+                ],
+                &[
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "--allow-all-tools",
+                    "--trust-all-tools",
+                    "--verbose",
+                ],
+            ),
             _ => (
                 &[
                     "--model",
@@ -2696,6 +2722,10 @@ pub(super) fn validate_managed_arguments(
             anyhow::ensure!(
                 agent.name != "prime-agent" || inline.is_none(),
                 "Prime options require a separate value"
+            );
+            anyhow::ensure!(
+                agent.name != "pi" || key != "--thinking" || inline.is_none(),
+                "pi requires --thinking and its value as separate arguments"
             );
             let value = if let Some(value) = inline {
                 value
@@ -4145,6 +4175,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_thinking_option_is_accepted_for_pi_only() {
+        for (name, arguments, allowed) in [
+            ("pi", "--model x --thinking medium", true),
+            ("pi", "--thinking=medium", false),
+            ("pi", "--thinking", false),
+            ("kimi", "--thinking medium", false),
+        ] {
+            let agent = crate::agents::get_agent(name).unwrap();
+            let words = shell_words::split(arguments).unwrap();
+            assert_eq!(
+                validate_managed_arguments(agent, &words).is_ok(),
+                allowed,
+                "{name}: {arguments}"
+            );
+        }
+    }
+
+    #[test]
     fn managed_codex_no_daemon_does_not_admit_context_overrides() {
         let agent = crate::agents::get_agent("codex").unwrap();
         for (arguments, allowed) in [
@@ -4356,5 +4404,87 @@ mod tests {
             .resolve_native_execution(Some((unknown, None, false)))
             .unwrap();
         assert_eq!(fresh.pi_transcript_path, None, "no transcript, no selector");
+
+        let mut preallocated = ConversationBinding::unknown(unknown);
+        preallocated.provenance = ConversationProvenance::Preallocated;
+        assert!(inst
+            .resolve_native_execution(Some((unknown, Some(&preallocated), false)))
+            .unwrap()
+            .pi_transcript_path
+            .is_none());
+        let missing_binding = ConversationBinding::unknown(unknown);
+        let mut missing_file = ConversationBinding::unknown(unknown);
+        missing_file.execution = Some(fresh.binding.clone());
+        missing_file.provenance = ConversationProvenance::Asserted;
+        missing_file.transcript_path = Some(store.join(format!("missing_{unknown}.jsonl")));
+        let mut wrong_header = missing_file.clone();
+        wrong_header.transcript_path = Some(transcript.clone());
+        for (target, binding, explicit, expected) in [
+            (
+                unknown,
+                &missing_binding,
+                false,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                sid,
+                &migrated,
+                true,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                unknown,
+                &preallocated,
+                true,
+                ManagedResumeCause::PiTranscriptBindingRequired,
+            ),
+            (
+                unknown,
+                &missing_file,
+                true,
+                ManagedResumeCause::ExecutionContextUnattested,
+            ),
+            (
+                unknown,
+                &wrong_header,
+                true,
+                ManagedResumeCause::ExecutionContextUnattested,
+            ),
+        ] {
+            let error = inst
+                .resolve_native_execution(Some((target, Some(binding), explicit)))
+                .err()
+                .expect("invalid Pi target must refuse");
+            assert_eq!(
+                ManagedResumeCause::from_error(&error),
+                expected,
+                "{error:#}"
+            );
+        }
+
+        inst.agent_session_id = Some(unknown.into());
+        inst.agent_session_binding = Some(missing_binding.clone());
+        let error = inst
+            .resolve_launch_execution()
+            .err()
+            .expect("managed Pi target must refuse");
+        assert_eq!(
+            error
+                .downcast_ref::<super::super::ManagedResumeRefused>()
+                .unwrap()
+                .0,
+            ManagedResumeCause::PiTranscriptBindingRequired
+        );
+        inst.resume_intent = ResumeIntent::Use(unknown.into());
+        inst.resume_binding = Some(missing_binding);
+        let error = inst
+            .resolve_launch_execution()
+            .err()
+            .expect("explicit Pi target must refuse");
+        assert_eq!(
+            ManagedResumeCause::from_error(&error),
+            ManagedResumeCause::PiTranscriptBindingRequired
+        );
+        assert!(!error.is::<super::super::ManagedResumeRefused>());
     }
 }

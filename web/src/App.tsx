@@ -23,7 +23,8 @@ import { createToasts, focusNavigation, noticedSessions, withFocusMode } from ".
 import { FocusModeNote } from "./components/FocusModeNote";
 import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
-import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
+import { clearDraft } from "./lib/acpDrafts";
+import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
@@ -50,7 +51,7 @@ import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
-import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
+import { clearStoredComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
@@ -60,7 +61,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -105,6 +106,9 @@ import {
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
+import { onServerDownChange } from "./lib/connectionState";
+import { createAboutRequests } from "./lib/aboutRequests";
+import { ABOUT_RETRY_DELAYS_MS, fetchAboutOnce, fetchAboutRetrying } from "./lib/serverAbout";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
@@ -156,6 +160,8 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { PairedShellPane } from "./components/PairedTerminal";
+import { usePairedShellModes } from "./hooks/usePairedShellModes";
+import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
@@ -170,7 +176,7 @@ import { useWelcomePhase } from "./hooks/useWelcomePhase";
 import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
-import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
+import type { WizardPrefill, WizardRestore } from "./components/session-wizard/SessionWizard";
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
@@ -407,6 +413,9 @@ function AppContent({
     markLocalOrderingUpdate,
     error,
     loaded: sessionsLoaded,
+    trashedCount,
+    trashLoaded,
+    loadTrash,
     injectSession,
     setSessionStatus,
     clearDeletingStatus,
@@ -441,6 +450,16 @@ function AppContent({
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+  // The list omits the trash, so a link to a trashed session finds no row until the trash is loaded.
+  const openedSessionId = focusSessionId ?? activeSessionId;
+  useEffect(() => {
+    if (sessionsLoaded && !trashLoaded && openedSessionId && !sessions.some((s) => s.id === openedSessionId)) {
+      loadTrash();
+    }
+  }, [sessionsLoaded, trashLoaded, openedSessionId, sessions, loadTrash]);
+  // An opened session missing from the list is neither gone nor trashed until the trash read has landed.
+  const openedSessionSettled =
+    sessionsLoaded && (trashLoaded || error || !openedSessionId || sessions.some((s) => s.id === openedSessionId));
 
   // What this window notices: a focus-mode window ignores every other session's attention and sounds.
   const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
@@ -457,35 +476,16 @@ function AppContent({
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
-  useLastSessionRestore({ activeSessionId: focusMode ? null : activeSessionId, sessions, sessionsLoaded });
+  useLastSessionRestore({
+    activeSessionId: focusMode ? null : activeSessionId,
+    sessions,
+    sessionsLoaded,
+    trashedCount,
+    trashLoaded,
+    loadTrash,
+  });
 
-  // One-shot orphan-draft sweep once useSessions has settled its first
-  // fetch (success or null). Catches acp:draft:<id> keys left behind
-  // by deletions that happened in another tab or on another device since
-  // the last load (#1358). The local-tab delete path calls clearDraft
-  // directly so it does not need to wait for this. Gating on
-  // `sessionsLoaded` rather than `sessions.length > 0` covers the
-  // legitimate empty-server case: a brand-new user with zero sessions
-  // must still get prior orphan drafts swept. Bounded by localStorage
-  // entry count; cheap.
-  const sweptDraftsRef = useRef(false);
-  useEffect(() => {
-    if (sweptDraftsRef.current) return;
-    if (!sessionsLoaded) return;
-    sweptDraftsRef.current = true;
-    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
-  }, [sessionsLoaded, sessions]);
-
-  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
-  // deleted sessions and retroactively removes empty keys written before the
-  // empty-removal fix. Mirrors the draft sweep above.
-  const sweptCommentsRef = useRef(false);
-  useEffect(() => {
-    if (sweptCommentsRef.current) return;
-    if (!sessionsLoaded) return;
-    sweptCommentsRef.current = true;
-    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
-  }, [sessionsLoaded, sessions]);
+  useOrphanSweep(sessions, sessionsLoaded && !error, trashedCount);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
@@ -820,6 +820,7 @@ function AppContent({
   // switches. Mounting it eagerly would spawn a shell for every mobile
   // session the user never opens the shell on.
   const [pairedMounted, setPairedMounted] = useState(false);
+  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
@@ -868,7 +869,7 @@ function AppContent({
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
-  const focusSession = useFocusSession(focusSessionId, activeSession, sessionsLoaded);
+  const focusSession = useFocusSession(focusSessionId, activeSession, openedSessionSettled);
   const allPaneIds: string[] = [
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
@@ -909,7 +910,7 @@ function AppContent({
     commentsEnabled &&
     !activeSession?.trashed_at &&
     !activeSession?.archived_at &&
-    (activeSession?.view === "structured" || !serverAbout?.read_only);
+    (activeSession?.view === "structured" || !caps.readOnly);
   const commentSendDisabledReason = !activeSession
     ? "Select a session to send comments to the agent."
     : activeSession?.trashed_at
@@ -1157,6 +1158,8 @@ function AppContent({
   }, [navigate, focusSessionId]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
+  // A background create's failure to reopen on; the count remounts a wizard already open.
+  const [wizardRestore, setWizardRestore] = useState<{ restore: WizardRestore; n: number } | null>(null);
   const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
@@ -1164,32 +1167,29 @@ function AppContent({
   // the tour gates auto-launch on an explicit loaded flag instead.
   const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
   const [servedProfileReady, setServedProfileReady] = useState(false);
-  const serverAboutGeneration = useRef(0);
-
-  const refreshServerAbout = useCallback(async () => {
-    const generation = ++serverAboutGeneration.current;
-    setServedProfileReady(false);
-    try {
-      const about = await fetchAbout();
-      if (generation === serverAboutGeneration.current && about) {
+  const [aboutRequests] = useState(() =>
+    createAboutRequests(() => fetchAboutOnce(fetchAbout), {
+      start: () => setServedProfileReady(false),
+      answer: (about) => {
         setServerAbout(about);
         setServedProfileReady(true);
         settleSettingsIntrosReadOnly(about.read_only);
-      }
-    } finally {
-      if (generation === serverAboutGeneration.current) setServerAboutLoaded(true);
-    }
-  }, []);
+      },
+      settled: () => setServerAboutLoaded(true),
+    }),
+  );
+  const refreshServerAbout = aboutRequests.refresh;
+  const recoverServerAbout = aboutRequests.recover;
 
   // Kick off the initial server-about fetch on mount. The effect body only
   // calls fetchAbout and schedules the telemetry consent check; neither runs
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
-    const generation = ++serverAboutGeneration.current;
-    void fetchAbout()
+    const generation = aboutRequests.begin();
+    void fetchAboutRetrying(fetchAbout, ABOUT_RETRY_DELAYS_MS, () => !active || !aboutRequests.isCurrent(generation))
       .then((about) => {
-        if (!active || generation !== serverAboutGeneration.current) return;
+        if (!active || !aboutRequests.isCurrent(generation)) return;
         if (about) {
           setServerAbout(about);
           setServedProfileReady(true);
@@ -1199,11 +1199,11 @@ function AppContent({
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
       })
-      // `serverAboutLoaded` gates the shell render, so it must flip on a failed
-      // or missing /api/about too, not only on success. Otherwise the shell
-      // would hang on its placeholder.
+      // `serverAboutLoaded` gates the shell render, so it must flip once the tries
+      // run out too, not only on success. Otherwise the shell would hang on its
+      // placeholder; it then renders read-only with a Retry notice.
       .finally(() => {
-        if (active && generation === serverAboutGeneration.current) setServerAboutLoaded(true);
+        if (active && aboutRequests.isCurrent(generation)) setServerAboutLoaded(true);
       });
     void fetchTelemetryStatus()
       .then((status) => {
@@ -1218,7 +1218,15 @@ function AppContent({
     return () => {
       active = false;
     };
-  }, []);
+  }, [aboutRequests]);
+
+  // A failed /api/about leaves write actions hidden, so ask again once the server answers.
+  useEffect(() => {
+    if (!serverAboutLoaded || serverAbout) return;
+    return onServerDownChange((down) => {
+      if (!down) void recoverServerAbout();
+    });
+  }, [serverAboutLoaded, serverAbout, recoverServerAbout]);
 
   // Telemetry: report that the acp web UI was opened, folded into the
   // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
@@ -1229,10 +1237,10 @@ function AppContent({
   // (decremented by exactly what each snapshot reported), so re-fires on
   // session switch are harmless. See #1882.
   useEffect(() => {
-    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    if (!serverAboutLoaded || caps.readOnly) return;
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");
-  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.view]);
+  }, [serverAboutLoaded, caps.readOnly, activeSession?.view]);
 
   const handleTelemetryConsent = useCallback((enabled: boolean) => {
     setTelemetryConsentNeeded(false);
@@ -1403,7 +1411,9 @@ function AppContent({
   }, []);
   // The startup error banner's way out, where the server allows the switch. Each
   // mounted Structured view switches its own Session.
-  const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
+  const canSwitchToTerminal = !caps.readOnly && caps.canUseTerminal;
+  // The server refuses a restart on a read-only or CityHall server.
+  const canRestartAgent = !caps.readOnly && !caps.cityhall;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1728,21 +1738,42 @@ function AppContent({
   // caller (keyboard shortcut, command palette) is a no-op rather than opening
   // a wizard that 403s on submit. Caught by the live read-only-mode spec.
   const handleNewSession = useCallback(() => {
-    if (serverAbout?.read_only) return;
+    if (caps.readOnly) return;
     setWizardPrefill(undefined);
     setShowSessionWizard(true);
-  }, [serverAbout?.read_only]);
+  }, [caps.readOnly]);
 
   const handleNewScratch = useCallback(() => {
-    if (serverAbout?.read_only) return;
+    if (caps.readOnly) return;
     setWizardPrefill({ scratch: true });
     setShowSessionWizard(true);
-  }, [serverAbout?.read_only]);
+  }, [caps.readOnly]);
 
   const handleCloneFromUrl = useCallback(() => {
     setWizardPrefill({ initialTab: "clone" });
     setShowSessionWizard(true);
   }, []);
+
+  const showPairedTerminal = usePairedTerminalReveal({
+    singlePane,
+    layout: paneLayout,
+    openTab,
+    activateTab,
+    setRightPanelView,
+  });
+
+  // PairedTerminal shows Host whatever the stored mode while the Session isn't sandboxed.
+  const shownShellMode = useCallback(
+    (sessionId: string, terminalIndex: number) =>
+      activeSession?.is_sandboxed ? shellModeFor(sessionId, terminalIndex) : "host",
+    [activeSession?.is_sandboxed, shellModeFor],
+  );
+  const handleOpenPairedTerminal = useOpenPairedTerminal(
+    activeSessionId,
+    showPairedTerminal,
+    shownShellMode,
+    setShellMode,
+  );
 
   const handleToggleTerminalFocus = useCallback(() => {
     if (!activeSessionId) return;
@@ -1766,40 +1797,13 @@ function AppContent({
     }
     const target = inPaired ? "agent" : "paired";
 
-    if (singlePane) {
-      // Below md there is one full-viewport pane. Promote the target view,
-      // then dispatch focus on the next frame: the inactive layer is inert
-      // until React commits the switch, and focus() on an inert subtree is
-      // a no-op. The paired shell mounts lazily on first activation, so its
-      // PTY may not be ready when the dispatch fires; latch the intent too,
-      // and PairedTerminal grabs focus once ready.
-      setRightPanelView(target);
-      if (target === "paired") setPendingTerminalFocus("paired");
-      requestAnimationFrame(() => dispatchFocusTerminal(target));
+    if (target === "paired") {
+      showPairedTerminal();
       return;
     }
-
-    if (target === "paired") {
-      // The paired shell only mounts when a terminal tab is the active tab of
-      // its group. Prefer a terminal that is already active (and thus mounted)
-      // over the first one, so multi-group layouts focus the live terminal
-      // instead of switching another group's tab.
-      const terminalTabs = (["right", "bottom"] as DockLocation[])
-        .flatMap((d) => dockTabs(paneLayout, d))
-        .filter(isTerminalTabId);
-      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
-      const termDock = dockOf(paneLayout, termTab);
-      if (termDock && isActiveTab(paneLayout, termTab)) {
-        // Already the active tab (mounted): move focus synchronously so rapid
-        // agent<->paired toggles stay deterministic.
-        dispatchFocusTerminal("paired");
-        return;
-      }
-      // Not mounted yet: latch the intent and activate/open its tab; the paired
-      // panel grabs focus once its PTY is ready.
-      setPendingTerminalFocus("paired");
-      if (termDock) activateTab(termDock, termTab);
-      else openTab(termTab, "right");
+    if (singlePane) {
+      setRightPanelView("agent");
+      requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -1811,7 +1815,7 @@ function AppContent({
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
+  }, [activeSessionId, singlePane, selectedFilePath, showPairedTerminal]);
 
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
@@ -1896,6 +1900,8 @@ function AppContent({
         focusMode,
       ],
     ),
+    // New session and scratch wait for the read-only answer, so a key before it would be dropped.
+    serverAboutLoaded,
   );
 
   // Palette triage toggles for the active session. "snooze" needs a duration,
@@ -1930,7 +1936,7 @@ function AppContent({
     activeSession: activeSession ?? null,
     loginRequired,
     hasActiveSession: !!activeSession,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     onNewSession: handleNewSession,
     onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
@@ -1960,7 +1966,7 @@ function AppContent({
   );
   const settingsCommands = useSettingsCommands({
     open: showPalette,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     onOpenSettingsTab: openSettingsTab,
   });
   const { actions: pluginCommandActions, overlay: pluginLinkPicker } = usePluginCommands(
@@ -2022,12 +2028,15 @@ function AppContent({
           />
         );
       }
+      const terminalIndex = isTerminalTabId(id) ? terminalIndexOf(id) : 0;
       return (
         <PairedShellPane
-          readOnly={!!serverAbout?.read_only}
+          readOnly={caps.readOnly}
           session={activeSession ?? null}
           sessionId={activeSessionId}
-          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+          terminalIndex={terminalIndex}
+          mode={shellModeFor(activeSessionId, terminalIndex)}
+          onModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, terminalIndex, mode)}
         />
       );
     };
@@ -2078,13 +2087,17 @@ function AppContent({
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
                             }
+                            onOpenTerminal={
+                              canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
+                            }
+                            canRestartAgent={canRestartAgent}
                           />
                         </Suspense>
                       )}
                     />
                   ) : (
                     <TerminalSessionStack
-                      readOnly={!!serverAbout?.read_only}
+                      readOnly={caps.readOnly}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
@@ -2125,7 +2138,7 @@ function AppContent({
                   onActivate={(id) => activateTab("right", id)}
                   onMove={movePaneAny}
                   onClose={closePaneAny}
-                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
+                  onNewTerminal={caps.readOnly ? undefined : () => addTerminal("right")}
                 />
               </div>
             }
@@ -2138,7 +2151,7 @@ function AppContent({
               onActivate={(id) => activateTab("bottom", id)}
               onMove={movePaneAny}
               onClose={closePaneAny}
-              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+              onNewTerminal={caps.readOnly ? undefined : () => addTerminal("bottom")}
             />
           )}
         </PaneDndController>
@@ -2183,9 +2196,10 @@ function AppContent({
           pluginId={pluginPageMatch.params.pluginId ?? ""}
           pageId={pluginPageMatch.params.pageId ?? ""}
           onBack={handleClosePluginPage}
-          readOnly={serverAbout?.read_only ?? false}
+          readOnly={caps.readOnly}
           cityhall={caps.cityhall}
           theme={resolvedTheme}
+          link={searchParams.get("link")}
           selectedSessionId={activeSessionId}
           onSelectSession={selectPluginPageSession}
           renderSession={() => {
@@ -2196,7 +2210,7 @@ function AppContent({
             <PluginSessionMenu
               request={request}
               workspaces={workspaces}
-              readOnly={serverAbout?.read_only ?? false}
+              readOnly={caps.readOnly}
               observedById={observedById}
               runtimeEpoch={runtimeEpoch}
               handlers={{
@@ -2244,7 +2258,7 @@ function AppContent({
             next.set("profile", p);
             setSearchParams(next, { replace: true });
           }}
-          readOnly={serverAbout?.read_only}
+          readOnly={caps.readOnly}
           cityhall={caps.cityhall}
         />
       );
@@ -2256,7 +2270,7 @@ function AppContent({
     // reappears once the fetch lands. Hold the minimal pre-auth shell
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
-    if (activeSessionId && !sessionsLoaded) {
+    if (activeSessionId && !openedSessionSettled) {
       // The shell (TopBar + sidebar) already renders around this; fill the main
       // pane with a skeleton rather than blanking it until the first fetch lands.
       return <MainPaneSkeleton />;
@@ -2281,7 +2295,7 @@ function AppContent({
           onNewSession={handleNewSession}
           onCloneFromUrl={handleCloneFromUrl}
           onToggleSidebar={handleToggleSidebar}
-          readOnly={serverAbout?.read_only}
+          readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
         />
       );
@@ -2299,12 +2313,16 @@ function AppContent({
       return (
         <MobileMainPane
           onStartSession={(id) => void handleStartSession(id)}
-          readOnly={!!serverAbout?.read_only}
+          readOnly={caps.readOnly}
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
           onOpenAgentsPane={() => handlePickView("agents")}
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
+          onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
+          canRestartAgent={canRestartAgent}
+          shellMode={shellModeFor(activeSessionId, 0)}
+          onShellModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, 0, mode)}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2430,14 +2448,14 @@ function AppContent({
   // resolves so the two never overlap on first load.
   const welcome = useWelcomePhase({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: caps.readOnly,
     autoLaunchReady: tourAutoLaunchReady,
     tourSeen,
     tourSeenKnown,
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: serverAbout?.read_only,
+    readOnly: caps.readOnly,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
@@ -2524,7 +2542,7 @@ function AppContent({
         runtimeEpoch={runtimeEpoch}
         observedById={observedById}
         onSessionMutation={applySessionMutation}
-        readOnly={serverAbout?.read_only}
+        readOnly={caps.readOnly}
         available={!error}
       >
         <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
@@ -2565,7 +2583,7 @@ function AppContent({
             />
           </CollapsibleRegion>
 
-          <BannerStack />
+          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
@@ -2596,6 +2614,9 @@ function AppContent({
                 nestedGroups={nestedGroups}
                 orgGroups={orgGroups}
                 trashedWorkspaces={trashedWorkspaces}
+                trashedCount={trashedCount}
+                trashLoaded={trashLoaded}
+                onLoadTrash={loadTrash}
                 onToggleSubgroup={toggleSubgroupCollapsed}
                 onToggleOrg={toggleOrgCollapsed}
                 onToggleOrgRepo={toggleOrgRepoCollapsed}
@@ -2627,7 +2648,7 @@ function AppContent({
                 onStartSession={handleStartSession}
                 onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
-                readOnly={serverAbout?.read_only}
+                readOnly={caps.readOnly}
                 canManageProjects={caps.canManageProjects}
                 sortMode={sidebarSortMode}
                 onSortModeChange={selectSidebarSortMode}
@@ -2643,11 +2664,18 @@ function AppContent({
 
           {showSessionWizard && (
             <SessionWizard
+              key={wizardRestore?.n ?? 0}
+              restore={wizardRestore?.restore}
+              onReopenFailure={(restore) => {
+                setWizardRestore((prev) => ({ restore, n: (prev?.n ?? 0) + 1 }));
+                setShowSessionWizard(true);
+              }}
               servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
               onRetryServedProfile={refreshServerAbout}
               onClose={() => {
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
+                setWizardRestore(null);
               }}
               onCreated={(session?: SessionResponse) => {
                 if (session) {
@@ -2657,6 +2685,7 @@ function AppContent({
                 }
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
+                setWizardRestore(null);
               }}
               onCreatedInBackground={(session?: SessionResponse) => {
                 if (!session) return;

@@ -277,6 +277,41 @@ Wire members declared nullable must still be present. CLI JSON is a separate con
 
 Background daemon maintenance can recover missing native session IDs from validated publications after the agent pane exits. Read requests do not perform these writes.
 
+## GET /api/runtime/ws
+
+The native runtime stream carries canonical snapshots and advisory progress.
+Protocol 4 reports sandbox store migration progress with this frame:
+
+```json
+{
+  "kind": "sandbox",
+  "data": {
+    "epoch": "daemon-epoch",
+    "progress": [
+      {
+        "operation_id": "migration-attempt",
+        "session_id": "session-id",
+        "profile": "default",
+        "activity": "copying an agent store"
+      }
+    ]
+  }
+}
+```
+
+`epoch` must match the connection's `Hello`. Each initial or updated `progress`
+list replaces the previous list, and updates may coalesce. `operation_id`
+identifies one migration attempt; concurrent attempts have separate entries.
+An empty list clears displayed migration progress.
+
+Activity is bounded display text, not a stable machine-readable phase. It may
+contain host paths, so only a Daemon-authorized local-owner stream receives this
+frame. TCP bearer clients, including loopback clients, and remote clients do not.
+Progress is not a canonical revision, completion receipt, or attachment grant.
+Display-update failures must not fail the migration.
+Use canonical snapshots and mutation receipts to settle the original operation;
+a disconnect does not cancel admitted work or authorize replay.
+
 ## GET /api/sessions
 
 List sessions. Returns every session by default, including trashed and
@@ -288,11 +323,15 @@ The response is an object, not a bare array:
 ```json
 {
   "sessions": [ { "id": "…", "status": "Running" } ],
-  "workspace_ordering": ["/path/to/repo::main"]
+  "workspace_ordering": ["/path/to/repo::main"],
+  "trashed_count": 0
 }
 ```
 
 - `sessions`: the session rows, in the daemon's canonical order.
+- `trashed_count`: the trashed rows in the whole snapshot, whatever `state`
+  filtered out, so a client that lists without the trash can still show its
+  size.
 - `workspace_ordering`: the user's persisted manual workspace order, so a
   client can render workspaces in place without a second request. Unknown
   workspaces (present in `sessions`, absent from this list) follow the
@@ -312,7 +351,15 @@ at a higher revision cannot satisfy that receipt.
 
 | Name | Default | Notes |
 | --- | --- | --- |
-| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
+| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `untrashed` excludes only trashed sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
+
+The response carries a strong `ETag` built from the runtime epoch, revision and
+`state`, and `Cache-Control: private, no-cache`. A request whose
+`If-None-Match` names it (weak comparison, `*` included) gets `304 Not Modified`
+with no body and the same `aoe-runtime-*` headers. A snapshot's revision changes
+exactly when its contents do, so polling an unchanged list costs headers only.
+`GET /api/plugins/ui-state` follows the same scheme, with an `ETag` derived from
+the response body.
 
 Each session row includes `context_resume`, the request-invariant availability
 of preserving that agent's context across a later lifecycle transition. It is
@@ -346,7 +393,7 @@ consuming both surfaces must not compare the two directly.
 
 | Value | Meaning |
 | --- | --- |
-| `Starting` | Session was just created or restarted; the agent process is not yet up. |
+| `Starting` | Session was just created or restarted; activity detection may lag an already-live agent pane. |
 | `Running` | Agent is actively working. |
 | `Waiting` | Agent has stopped and is waiting for user input. This is the signal a dispatcher should treat as "needs a prompt". |
 | `Idle` | The agent's turn has finished with no pending question. This is the signal a dispatcher should treat as "task complete". |
@@ -398,6 +445,60 @@ HTTP requests wait for the admitted creation to finish.
 Repository hook and MCP approvals are persisted against the source repository
 before provisioning begins. Failure to persist approval aborts creation.
 
+The optional `cli` object carries CLI selection intent: `parent`, `projects`,
+`command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
+Selectors, project registries, configuration and paths are resolved on the Daemon host.
+A `cli.parent` follows `parent_session_id`'s rules and codes: a missing or trashed parent is
+`400 parent_not_found` and a sub-session is `400 parent_is_sub_session`. The parent is checked
+before anything is provisioned, so a refusal leaves no worktree, branch or workspace behind.
+CLI agent selection also resolves approved plugin agents on the Daemon host.
+Nonblank configured custom commands take precedence over plugin commands; blank
+custom commands allow built-in or plugin fallback. Plugin `--tool` selections
+reject command overrides, matching configured custom-agent selections.
+A terminal creation with `cli` runs creation hooks and finishes **Stopped**, without
+launching the agent. Launch is a separate epoch-checked request. The CLI client
+allows up to 30 minutes for creation and launch, including host hooks. Requests without
+`cli` keep the existing lifecycle. `GET /api/runtime` advertises `cli_creation: true`;
+clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
+Concurrent CLI requests with the same title and working directory cannot create duplicates.
+Interrupting the CLI while launch is pending leaves the created session intact;
+inspect Daemon state before retrying launch.
+If terminal finalization fails after creation commits, the Daemon returns `409`
+with `aoe-error-code: create_outcome_unknown` and does not roll back the session or resources.
+The CLI checks canonical state without resubmitting creation. A healthy, finalized
+session confirms success; otherwise the CLI reports an unknown outcome.
+
+CLI forks use the latest durable parent binding, including a completed
+`aoe session set-session-id`, without waiting for the filesystem watcher.
+Parent and requested project paths are compared after canonicalization, so
+equivalent symlink paths keep the existing binding.
+For a single repository, base selectors accept its principal identity and the
+input worktree's path or name. Both aliases target the same repository.
+
+CLI sandbox image selections trim surrounding whitespace. A blank explicit image
+uses `sandbox.default_image`; if that configured value is blank too, creation uses
+the container runtime's default image.
+Deferred CLI terminal creation requires an installed sandbox runtime, but not a
+running engine, when no effective `on_create` hooks need a container. Container
+creation hooks and later launch still require the engine. Non-CLI creation
+retains its existing readiness checks.
+
+With CLI intent, `extra_args` uses shell-style word grouping and each decoded
+argument is quoted for literal delivery. Only the authenticated owner on the
+Daemon's Unix socket may use shell metacharacters in decoded arguments or
+canonical project paths. HTTP callers retain the shared shell-metacharacter
+gate, even with `cli`: grouping quotes and empty arguments are accepted, but
+quoted substitutions and model values such as `opus[1m]` are rejected.
+Project paths are canonicalized on the Daemon host before this check, not
+shell-quoted. `cli` expresses selection intent, not authenticated origin.
+Requests without `cli` retain their existing input validation.
+
+Host launches and structured creations that need agent-hook approval return `409`
+with `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
+host; repository creation trust does not grant this approval. The Daemon caches
+failed creations. Use a new key after approval; replaying a cached refusal does
+not repeat creation hooks.
+
 For `trust_hooks`, omission refuses unapproved repository hooks with
 `hooks_need_trust`; `true` approves hooks and project MCP; `false` explicitly
 skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
@@ -409,6 +510,12 @@ granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
+
+For an interactive generated worktree title, the review may also receive
+`generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
+and `worktree_path_id`, computed without provisioning. Pass the accepted title and
+`cli.worktree_path_id` to creation so templates containing `{session-id}` use the
+same identity. Creation rechecks collisions; the suggestion does not reserve a path.
 
 Pass the returned fingerprint as `trust_review` with the chosen `trust_hooks`
 decision in the creation request. A changed source repository, global/profile
@@ -489,6 +596,7 @@ rollback.
 | Field | Notes |
 | --- | --- |
 | `callback_url` | An HTTP POST fires here when the session transitions to `Waiting`, `Idle`, or `Error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time, and re-resolved and re-checked before every dispatch; the approved address is then pinned for the request, so a DNS answer that changes in between cannot redirect it). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
+| `parent_session_id` | Make the new session a sub-session of this one. The parent must be a live (not trashed) top-level session in the profile the new session is created in, as `aoe add --parent` resolves it. The new session joins the parent's group, which replaces any `group` in the request. Otherwise the request is refused with `400 parent_not_found` (no such session, another profile's, or a trashed one) or `400 parent_is_sub_session` (sessions nest one level deep). In CityHall mode a Terminal view parent is answered with `parent_not_found` too, so the mode doesn't reveal which ids exist. These checks apply to a new creation; a replay of a known `idempotency_key` returns its session as before. |
 | `idempotency_key` | A retry using the same key (even across a daemon restart, since the key is persisted on the created session) returns the existing session as `200` instead of creating a duplicate. Max 200 characters. If the originally-created session was later hard-deleted (not just trashed), the key is no longer found and a fresh session is created. |
 
 `callback_url` is persisted with the session in the session store on disk, so
@@ -532,6 +640,8 @@ structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
 `aoe-runtime-revision` response headers, not in the JSON body. Native clients
 attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
+A successful terminal restart can still have canonical status `Starting`.
+Clients must not wait for `Idle` as an additional attachment grant.
 
 ## POST /api/sessions/{id}/send
 
@@ -657,14 +767,27 @@ A failed launch can still commit a lifecycle generation. The finite
 acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
 probe failure can likewise retain a preparation cursor; it does not acknowledge
-message delivery. Transport loss or malformed mutation receipts remain unknown;
-effect-free daemon refusals do not acknowledge a commit.
+message delivery. Transport loss, local request-task failure, or malformed
+mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
+a commit.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.
-Missing, unknown, or ambiguous cause metadata keeps the refusal generic; native
-clients do not read response bodies to derive that reason. See
+The `omp_transcript_binding_required` cause identifies an absent OMP conversation
+binding or exact transcript path. `pi_transcript_binding_required` identifies
+the refusal when a matching Pi binding lacks the required transcript path
+after permitted discovery. Neither cause identifies a missing file on disk or
+another failed attestation. Missing, unknown, or ambiguous cause metadata keeps
+the refusal generic; native clients do not read response bodies to derive that
+reason. See
 [managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
+
+Sandbox preparation failures use `409 sandbox_migration_deferred` or
+`500 sandbox_migration_failed`, with the finite code header and canonical receipt.
+Clients apply that snapshot before offering an explicit retry. These known
+failures do not quarantine mutation authority. Missing or invalid receipt headers
+remain an unknown outcome. Public messages omit migration paths and underlying
+filesystem errors. Daemon logs retain the full cause and session ID.
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
 includes the finite code header and its canonical receipt; clients wait for that

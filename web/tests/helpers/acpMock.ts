@@ -173,22 +173,24 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       }),
     );
   }
-  await page.route("**/api/agents", (r) =>
-    r.fulfill({
-      json: [
-        {
-          name: "claude",
-          display_name: "Claude Code",
-          kind: "builtin",
-          binary: "claude",
-          host_only: false,
-          installed: true,
-          install_hint: "",
-          acp_capable: true,
-          acp_installed: true,
-        },
-      ],
-    }),
+  await page.route(
+    (url) => url.pathname === "/api/agents",
+    (r) =>
+      r.fulfill({
+        json: [
+          {
+            name: "claude",
+            display_name: "Claude Code",
+            kind: "builtin",
+            binary: "claude",
+            host_only: false,
+            installed: true,
+            install_hint: "",
+            acp_capable: true,
+            acp_installed: true,
+          },
+        ],
+      }),
   );
   await page.route("**/api/about", (r) => r.fulfill({ json: opts.about ?? {} }));
   await page.route("**/api/telemetry/seen", (r) => {
@@ -202,7 +204,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     }
     return r.fulfill({ status: 204 });
   });
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

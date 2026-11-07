@@ -1,8 +1,9 @@
 //! `TranscriptModel`: the server-side render model for the structured-view transcript.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
@@ -44,8 +45,8 @@ pub struct TranscriptRow {
     /// A `tool_complete` row that launched an async sub-agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub async_subagent: bool,
-    /// A `message` row that opens a new agent message, so a client keeps it
-    /// apart from the previous message's text.
+    /// A `message` or `thinking` row that opens a new agent message, so a
+    /// client keeps it apart from the previous one's text.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub message_start: bool,
 }
@@ -58,6 +59,8 @@ pub enum TranscriptRowKind {
     ToolError,
     ToolStopped,
     Message,
+    /// Summarized model thinking; consecutive rows of one group form one block.
+    Thinking,
     UserPrompt,
     UserDiffComments,
     ElicitationAnswered,
@@ -107,21 +110,40 @@ fn session_notice_text(severity: &str, title: &str, description: &Option<String>
     }
 }
 
+/// Projection lifecycle is independent of whether its start row is in this page.
+#[derive(Debug, Clone)]
+enum ToolLifecycle {
+    Buffered(String),
+    Open(String),
+    Terminal(String),
+}
+
+impl ToolLifecycle {
+    fn finish(&mut self) -> String {
+        match std::mem::replace(self, Self::Terminal(String::new())) {
+            Self::Buffered(output) | Self::Open(output) | Self::Terminal(output) => output,
+        }
+    }
+}
+
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
     rows: Vec<TranscriptRow>,
     row_ids: HashSet<String>,
-    /// Tool calls that reached a terminal row, so nothing closes them twice.
-    terminal_tools: HashSet<String>,
-    /// Streamed `ToolCallContent`, keyed by tool call id.
-    tool_outputs: HashMap<String, String>,
+    /// Tool lifecycle and buffered output, in opening order, including skipped starts.
+    tools: IndexMap<String, ToolLifecycle>,
     /// Tool calls surfaced as an elicitation (AskUserQuestion); their cards are suppressed.
     elicitation_tool_ids: HashSet<String>,
     /// Group of the still-open run of consecutive message chunks.
     open_message_group: Option<String>,
     /// ACP message id of the last chunk that carried one.
     last_message_id: Option<String>,
+    /// The thought counterparts of `open_message_group` and `last_message_id`.
+    open_thought_group: Option<String>,
+    last_thought_id: Option<String>,
+    /// A blank chunk changed the thought id, so the next row starts a thought.
+    thought_start_pending: bool,
     group_counter: u64,
     /// Frames at or below this seq are dropped, so replay overlap is harmless.
     last_seq: u64,
@@ -145,25 +167,60 @@ impl TranscriptModel {
         self.last_seq
     }
 
-    /// Note an event that precedes this fold without rendering it, so a chunk
-    /// that opens the fold still knows which message it follows, and a
-    /// completion still finds its elicitation suppressed.
-    pub fn observe_prior(&mut self, event: &Event) {
+    /// Observe prefix lifecycle and context without rows, advancing the replay watermark.
+    pub fn observe_prior(&mut self, seq: u64, event: &Event) {
+        if seq <= self.last_seq {
+            return;
+        }
+        self.last_seq = seq;
         match event {
+            Event::ToolCallStarted { tool_call }
+                if !self.elicitation_tool_ids.contains(&tool_call.id) =>
+            {
+                self.track_tool_start(&tool_call.id, true);
+            }
+            Event::ToolCallUpdated { tool_call_id, .. }
+                if !self.elicitation_tool_ids.contains(tool_call_id) =>
+            {
+                self.track_tool_start(tool_call_id, false);
+            }
+            Event::ToolCallContent {
+                tool_call_id,
+                content,
+            } => {
+                self.buffer_tool_output(tool_call_id, content);
+            }
             Event::ElicitationRequested { elicitation } => {
                 if let Some(id) = &elicitation.tool_call_id {
                     self.elicitation_tool_ids.insert(id.clone());
+                    self.finish_tool(id);
                 }
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
+                self.finish_tool(tool_call_id);
                 self.elicitation_tool_ids.remove(tool_call_id);
             }
             Event::AgentMessageChunk {
                 message_id: Some(id),
                 ..
             } => self.last_message_id = Some(id.clone()),
+            Event::AgentThoughtChunk {
+                message_id: Some(id),
+                ..
+            } => self.last_thought_id = Some(id.clone()),
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
                 self.last_message_id = None;
+                self.last_thought_id = None;
+            }
+            Event::Stopped { .. }
+            | Event::AgentStartupError { .. }
+            | Event::IncompatibleAgent { .. }
+            | Event::AgentSwitched { .. } => {
+                for tool in self.tools.values_mut() {
+                    if matches!(tool, ToolLifecycle::Buffered(_) | ToolLifecycle::Open(_)) {
+                        drop(tool.finish());
+                    }
+                }
             }
             _ => {}
         }
@@ -177,6 +234,9 @@ impl TranscriptModel {
         self.last_seq = seq;
         if !matches!(event, Event::AgentMessageChunk { .. }) {
             self.open_message_group = None;
+        }
+        if !matches!(event, Event::AgentThoughtChunk { .. }) {
+            self.open_thought_group = None;
         }
 
         match event {
@@ -200,6 +260,38 @@ impl TranscriptModel {
                     text.clone(),
                 );
                 row.message_start = message_start;
+                vec![self.append(row)]
+            }
+            Event::AgentThoughtChunk { text, message_id } => {
+                self.turn_has_output = true;
+                if message_id.is_some()
+                    && self.last_thought_id.is_some()
+                    && self.last_thought_id != *message_id
+                {
+                    self.open_thought_group = None;
+                    self.thought_start_pending = true;
+                }
+                if message_id.is_some() {
+                    self.last_thought_id = message_id.clone();
+                }
+                if text.trim().is_empty() && self.open_thought_group.is_none() {
+                    return Vec::new();
+                }
+                let group_id = match &self.open_thought_group {
+                    Some(group) => group.clone(),
+                    None => {
+                        let group = self.fresh_group();
+                        self.open_thought_group = Some(group.clone());
+                        group
+                    }
+                };
+                let mut row = TranscriptRow::new(
+                    format!("thought-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Thinking,
+                    text.clone(),
+                );
+                row.message_start = std::mem::take(&mut self.thought_start_pending);
                 vec![self.append(row)]
             }
             Event::UserPromptSent {
@@ -258,10 +350,18 @@ impl TranscriptModel {
                 async_subagent,
             } => {
                 if self.elicitation_tool_ids.remove(tool_call_id) {
+                    self.finish_tool(tool_call_id);
                     return Vec::new();
                 }
-                let mut deltas =
-                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None);
+                let mut deltas = if matches!(
+                    self.tools.get(tool_call_id),
+                    Some(ToolLifecycle::Open(_) | ToolLifecycle::Terminal(_))
+                ) {
+                    Vec::new()
+                } else {
+                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None)
+                };
+                self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, *is_error, content);
                 row.at = *completed_at;
                 row.output = output.clone();
@@ -274,8 +374,7 @@ impl TranscriptModel {
                 content,
             } => {
                 // Each content frame replaces the previous snapshot.
-                self.tool_outputs
-                    .insert(tool_call_id.clone(), content.clone());
+                self.buffer_tool_output(tool_call_id, content);
                 Vec::new()
             }
             Event::ToolCallUpdated {
@@ -296,6 +395,7 @@ impl TranscriptModel {
                     return Vec::new();
                 };
                 self.elicitation_tool_ids.insert(tool_call_id.clone());
+                self.finish_tool(tool_call_id);
                 self.remove_rows_for_tool(tool_call_id)
             }
             Event::ElicitationResolved { nonce, answers, .. } => {
@@ -451,12 +551,64 @@ impl TranscriptModel {
         }
     }
 
+    fn track_tool_start(&mut self, id: &str, reopen_terminal: bool) {
+        let moved = match self.tools.get_full_mut(id) {
+            Some((index, _, tool @ ToolLifecycle::Buffered(_))) => {
+                let output = tool.finish();
+                *tool = ToolLifecycle::Open(output);
+                Some(index)
+            }
+            Some((index, _, tool @ ToolLifecycle::Terminal(_))) if reopen_terminal => {
+                *tool = ToolLifecycle::Open(String::new());
+                Some(index)
+            }
+            Some(_) => None,
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Open(String::new()));
+                None
+            }
+        };
+        if let Some(index) = moved {
+            self.tools.move_index(index, self.tools.len() - 1);
+        }
+    }
+
+    fn buffer_tool_output(&mut self, id: &str, content: &str) {
+        match self.tools.get_mut(id) {
+            Some(
+                ToolLifecycle::Buffered(output)
+                | ToolLifecycle::Open(output)
+                | ToolLifecycle::Terminal(output),
+            ) => {
+                output.clear();
+                output.push_str(content);
+            }
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Buffered(content.to_owned()));
+            }
+        }
+    }
+
+    fn finish_tool(&mut self, id: &str) -> String {
+        match self.tools.get_mut(id) {
+            Some(tool) => tool.finish(),
+            None => {
+                self.tools
+                    .insert(id.to_owned(), ToolLifecycle::Terminal(String::new()));
+                String::new()
+            }
+        }
+    }
+
     fn on_tool_started(&mut self, tool_call: &ToolCall) -> Vec<TranscriptDelta> {
         if self.elicitation_tool_ids.contains(&tool_call.id) {
             return Vec::new();
         }
+        self.track_tool_start(&tool_call.id, true);
+        self.turn_has_output = true;
         let Some(idx) = self.find_tool_start(&tool_call.id) else {
-            self.turn_has_output = true;
             return vec![self.append(tool_start_row(tool_call.clone()))];
         };
         let row = &mut self.rows[idx];
@@ -475,6 +627,14 @@ impl TranscriptModel {
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
+        if self.elicitation_tool_ids.contains(tool_call_id)
+            || (matches!(
+                self.tools.get(tool_call_id),
+                Some(ToolLifecycle::Terminal(_))
+            ) && self.find_tool_start(tool_call_id).is_none())
+        {
+            return Vec::new();
+        }
         // A non-empty diff list replaces wholesale; none or empty keeps earlier diffs.
         let diffs = diffs.filter(|d| !d.is_empty());
         let synthesized = self.ensure_tool_start(
@@ -523,6 +683,7 @@ impl TranscriptModel {
         if self.find_tool_start(tool_call_id).is_some() {
             return Vec::new();
         }
+        self.track_tool_start(tool_call_id, false);
         self.turn_has_output = true;
         let tool = ToolCall {
             id: tool_call_id.to_string(),
@@ -548,7 +709,7 @@ impl TranscriptModel {
         content: &str,
     ) -> TranscriptRow {
         // Completion content wins, then streamed output, then a status word.
-        let buffered = self.tool_outputs.remove(tool_call_id).unwrap_or_default();
+        let buffered = self.finish_tool(tool_call_id);
         let text = if !content.is_empty() {
             content.to_string()
         } else if !buffered.is_empty() {
@@ -565,7 +726,6 @@ impl TranscriptModel {
         } else {
             base_id
         };
-        self.terminal_tools.insert(tool_call_id.to_string());
         let kind = if is_error {
             TranscriptRowKind::ToolError
         } else {
@@ -579,30 +739,29 @@ impl TranscriptModel {
     /// Close every `tool_start` without a terminal row with a `tool_stopped`
     /// carrying any buffered output.
     fn sweep_open_tools(&mut self, seq: u64) -> Vec<TranscriptDelta> {
-        let mut seen = self.terminal_tools.clone();
-        let open: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|row| row.kind == TranscriptRowKind::ToolStart)
-            .filter_map(|row| row.tool_call_id.clone())
-            .filter(|id| seen.insert(id.clone()))
-            .collect();
         let now = Utc::now();
-        open.into_iter()
-            .map(|id| {
-                self.terminal_tools.insert(id.clone());
-                let buffered = self.tool_outputs.remove(&id).unwrap_or_default();
-                let mut row = TranscriptRow::new(
-                    format!("stopped-{id}-{seq}"),
-                    format!("tool-{id}"),
-                    TranscriptRowKind::ToolStopped,
-                    buffered,
-                );
-                row.at = now;
-                row.tool_call_id = Some(id);
-                self.append(row)
-            })
-            .collect()
+        let mut deltas = Vec::new();
+        for index in 0..self.tools.len() {
+            let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
+            if !matches!(tool, ToolLifecycle::Open(_)) {
+                if matches!(tool, ToolLifecycle::Buffered(_)) {
+                    drop(tool.finish());
+                }
+                continue;
+            }
+            let buffered = tool.finish();
+            let id = id.clone();
+            let mut row = TranscriptRow::new(
+                format!("stopped-{id}-{seq}"),
+                format!("tool-{id}"),
+                TranscriptRowKind::ToolStopped,
+                buffered,
+            );
+            row.at = now;
+            row.tool_call_id = Some(id);
+            deltas.push(self.append(row));
+        }
+        deltas
     }
 
     fn remove_rows_for_tool(&mut self, tool_call_id: &str) -> Vec<TranscriptDelta> {
@@ -657,6 +816,8 @@ impl TranscriptModel {
 
     fn begin_turn(&mut self) {
         self.last_message_id = None;
+        self.last_thought_id = None;
+        self.thought_start_pending = false;
         let steered_continuation = self.turn_active && self.steering;
         self.turn_active = true;
         if !steered_continuation {
@@ -1220,7 +1381,7 @@ mod tests {
                 "case {i}"
             );
             assert!(
-                !m.tool_outputs.contains_key("t"),
+                matches!(m.tools.get("t"), Some(ToolLifecycle::Terminal(output)) if output.is_empty()),
                 "case {i}: buffer drained"
             );
         }
@@ -1427,6 +1588,92 @@ mod tests {
         }
     }
 
+    /// #5088: thought chunks fold into `thinking` rows with their own groups,
+    /// split by a new thought id or any other event, and blank ones render
+    /// nothing but still carry a boundary.
+    #[test]
+    fn agent_thought_chunks_fold_into_thinking_rows() {
+        let thought = |text: &str, id: Option<&str>| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: id.map(Into::into),
+        };
+        let msg = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: None,
+        };
+        let (a, b) = (Some("t-a"), Some("t-b"));
+        // (events, (text, message_start) per thinking row, thinking groups)
+        let cases: [(Vec<Event>, Vec<(&str, bool)>, usize); 7] = [
+            (
+                vec![
+                    thought("Weighing", a),
+                    thought(" ", a),
+                    thought("options", a),
+                ],
+                vec![("Weighing", false), (" ", false), ("options", false)],
+                1,
+            ),
+            (
+                vec![thought("one ", a), thought("two", a)],
+                vec![("one ", false), ("two", false)],
+                1,
+            ),
+            (
+                vec![thought("one", a), thought(" ", b), thought("two", b)],
+                vec![("one", false), ("two", true)],
+                2,
+            ),
+            (
+                vec![thought("one", a), msg("reply"), thought("two", a)],
+                vec![("one", false), ("two", false)],
+                2,
+            ),
+            (vec![thought("", None), thought("\n", a)], vec![], 0),
+            (
+                vec![thought("one", a), prompt("next"), thought("two", b)],
+                vec![("one", false), ("two", false)],
+                2,
+            ),
+            (
+                vec![thought("x", None), thought("y", None)],
+                vec![("x", false), ("y", false)],
+                1,
+            ),
+        ];
+        for (events, want, groups) in cases {
+            let label = format!("{events:?}");
+            let m = fold(events);
+            let thinking: Vec<_> = m
+                .rows()
+                .iter()
+                .filter(|r| r.kind == TranscriptRowKind::Thinking)
+                .collect();
+            let got: Vec<(&str, bool)> = thinking
+                .iter()
+                .map(|r| (r.text.as_str(), r.message_start))
+                .collect();
+            assert_eq!(got, want, "{label}");
+            let distinct: HashSet<_> = thinking.iter().map(|r| &r.group_id).collect();
+            assert_eq!(distinct.len(), groups, "{label}");
+        }
+
+        // A thought splits the message around it, and a partial fold that
+        // observed an earlier thought id marks the next thought's start.
+        let m = fold(vec![msg("a"), thought("t", a), msg("b")]);
+        assert_eq!(
+            kinds(&m),
+            [
+                TranscriptRowKind::Message,
+                TranscriptRowKind::Thinking,
+                TranscriptRowKind::Message
+            ]
+        );
+        let mut m = TranscriptModel::new();
+        m.observe_prior(1, &thought("earlier", a));
+        m.apply_event(2, &thought("later", b));
+        assert!(m.rows()[0].message_start);
+    }
+
     /// A fold that starts after earlier events (a reconnect, a rows page)
     /// still marks the first chunk of a new message.
     #[test]
@@ -1442,8 +1689,8 @@ mod tests {
             (vec![], false),
         ] {
             let mut m = TranscriptModel::new();
-            for event in &prior {
-                m.observe_prior(event);
+            for (index, event) in prior.iter().enumerate() {
+                m.observe_prior(index as u64 + 1, event);
             }
             m.apply_event(10, &chunk("", "m-b"));
             assert!(m.rows().len() == 1, "{prior:?}");
@@ -1470,12 +1717,377 @@ mod tests {
             let mut m = TranscriptModel::new();
             for (i, e) in events.iter().enumerate() {
                 if i < split {
-                    m.observe_prior(e);
+                    m.observe_prior(i as u64 + 1, e);
                 } else {
                     m.apply_event(i as u64 + 1, e);
                 }
             }
-            assert_eq!(kinds(&m), kinds(&full), "split at {split}");
+            let expected = if split == events.len() - 1 {
+                vec![TranscriptRowKind::ToolComplete]
+            } else {
+                kinds(&full)
+            };
+            assert_eq!(kinds(&m), expected, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn prefix_tool_lifecycle_retains_output_and_order_without_rendering_old_rows() {
+        use TranscriptRowKind as K;
+        for (label, prefix, suffix, expected) in [
+            (
+                "open",
+                vec![
+                    started(tool("t", "T")),
+                    content("t", "old"),
+                    content("t", "latest"),
+                ],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "t", "latest")],
+            ),
+            (
+                "completed",
+                vec![started(tool("t", "T")), completed("t", false, "done")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "already stopped",
+                vec![started(tool("t", "T")), stopped("cancelled")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "update first",
+                vec![updated("t", Some("Read"), None, None)],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "t", "")],
+            ),
+            (
+                "content alone",
+                vec![content("t", "buffered")],
+                vec![stopped("cancelled")],
+                vec![],
+            ),
+            (
+                "ordered reuse",
+                vec![
+                    started(tool("b", "B")),
+                    started(tool("a", "A")),
+                    completed("b", false, ""),
+                    started(tool("c", "C")),
+                    started(tool("b", "B again")),
+                ],
+                vec![stopped("cancelled")],
+                vec![
+                    (K::ToolStopped, "a", ""),
+                    (K::ToolStopped, "c", ""),
+                    (K::ToolStopped, "b", ""),
+                ],
+            ),
+            (
+                "elicitation",
+                vec![
+                    started(tool("q", "AskUserQuestion")),
+                    elicitation_requested("q"),
+                    content("q", "not a tool result"),
+                ],
+                vec![
+                    updated("q", Some("Question"), None, None),
+                    stopped("cancelled"),
+                ],
+                vec![],
+            ),
+            (
+                "elicitation id reused",
+                vec![
+                    started(tool("q", "AskUserQuestion")),
+                    elicitation_requested("q"),
+                    completed("q", false, "answered"),
+                    started(tool("q", "Bash")),
+                ],
+                vec![stopped("cancelled")],
+                vec![(K::ToolStopped, "q", "")],
+            ),
+            (
+                "content before live start",
+                vec![content("t", "prefix output")],
+                vec![started(tool("t", "Bash")), stopped("cancelled")],
+                vec![
+                    (K::ToolStart, "t", "Bash"),
+                    (K::ToolStopped, "t", "prefix output"),
+                ],
+            ),
+            (
+                "new start drops old trailing output",
+                vec![
+                    started(tool("t", "T")),
+                    completed("t", false, "done"),
+                    content("t", "old trailing output"),
+                ],
+                vec![started(tool("t", "Bash")), stopped("cancelled")],
+                vec![(K::ToolStart, "t", "Bash"), (K::ToolStopped, "t", "")],
+            ),
+        ] {
+            let mut model = TranscriptModel::new();
+            for (index, event) in prefix.iter().enumerate() {
+                model.observe_prior(index as u64 + 1, event);
+                assert!(model.rows().is_empty(), "{label}: prefix stays unrendered");
+            }
+            for (index, event) in suffix.iter().enumerate() {
+                let seq = 100 + index as u64;
+                model.apply_event(seq, event);
+                assert!(
+                    model.apply_event(seq, event).is_empty(),
+                    "{label}: replay overlap"
+                );
+            }
+            let actual: Vec<_> = model
+                .rows()
+                .iter()
+                .map(|row| {
+                    let id = row
+                        .tool_call_id
+                        .as_deref()
+                        .or_else(|| row.tool.as_ref().map(|tool| tool.id.as_str()))
+                        .unwrap();
+                    (row.kind, id, row.text.as_str())
+                })
+                .collect();
+            assert_eq!(actual, expected, "{label}");
+            let terminals: Vec<_> = model
+                .rows()
+                .iter()
+                .map(|row| (row.id.clone(), row.at))
+                .collect();
+            model.apply_event(1000, &stopped("prompt_complete"));
+            assert_eq!(
+                model
+                    .rows()
+                    .iter()
+                    .map(|row| (row.id.clone(), row.at))
+                    .collect::<Vec<_>>(),
+                terminals,
+                "{label}: no second terminal or ticking end time"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_start_completion_emits_only_its_correlated_terminal() {
+        for (is_error, final_content, expected) in [
+            (false, "", "latest streamed output"),
+            (true, "final result", "final result"),
+        ] {
+            let mut model = TranscriptModel::new();
+            for (index, event) in [
+                started(tool("t", "Bash")),
+                content("t", "old snapshot"),
+                content("t", "latest streamed output"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                model.observe_prior(index as u64 + 1, event);
+            }
+            assert!(model.rows().is_empty());
+            let output = vec![ToolOutputBlock::Text {
+                text: "structured output".into(),
+            }];
+            let deltas = model.apply_event(
+                10,
+                &Event::ToolCallCompleted {
+                    tool_call_id: "t".into(),
+                    is_error,
+                    content: final_content.into(),
+                    output: output.clone(),
+                    completed_at: at(200),
+                    async_subagent: true,
+                },
+            );
+            assert!(matches!(deltas.as_slice(), [TranscriptDelta::Append(_)]));
+            let terminal = &model.rows()[0];
+            assert_eq!(
+                terminal.kind,
+                if is_error {
+                    TranscriptRowKind::ToolError
+                } else {
+                    TranscriptRowKind::ToolComplete
+                }
+            );
+            assert_eq!(terminal.tool_call_id.as_deref(), Some("t"));
+            assert_eq!(terminal.text, expected);
+            assert_eq!(terminal.at, at(200));
+            assert_eq!(terminal.output, output);
+            assert!(terminal.async_subagent);
+            assert!(model
+                .apply_event(11, &stopped("prompt_complete"))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn observed_prefix_advances_watermark_for_every_event() {
+        let mut model = TranscriptModel::new();
+        for (index, event) in [
+            chunk("prior message"),
+            Event::AgentThoughtChunk {
+                text: "prior thought".into(),
+                message_id: Some("thought".into()),
+            },
+            prompt("next turn"),
+            Event::ThinkingStarted,
+            started(tool("prior", "Prior tool")),
+            updated("prior", Some("Prior title"), None, None),
+            content("prior", "prior output"),
+            elicitation_requested("prior"),
+            completed("prior", false, "answered"),
+            stopped("prompt_complete"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seq = index as u64 + 1;
+            model.observe_prior(seq, event);
+            assert_eq!(model.last_seq(), seq, "{event:?}");
+            assert!(model.rows().is_empty(), "{event:?}");
+            assert!(model.apply_event(seq, event).is_empty(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn observed_prefix_rejects_stale_stop_before_later_tool() {
+        let mut model = TranscriptModel::new();
+        model.observe_prior(1, &stopped("prompt_complete"));
+        model.observe_prior(2, &started(tool("later", "Later tool")));
+        model.observe_prior(1, &stopped("prompt_complete"));
+        assert_eq!(model.last_seq(), 2, "stale observation keeps the watermark");
+        assert!(model.rows().is_empty());
+        assert!(
+            model.apply_event(1, &stopped("prompt_complete")).is_empty(),
+            "a queued prefix stop must not close a tool opened later in the prefix"
+        );
+        model.apply_event(3, &stopped("cancelled"));
+        assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
+        assert_eq!(
+            row(&model, "stopped-later-3").tool_call_id.as_deref(),
+            Some("later")
+        );
+        assert!(model.apply_event(4, &stopped("cancelled")).is_empty());
+    }
+
+    #[test]
+    fn orphan_output_clears_at_observed_turn_endings_without_stopped_rows() {
+        for closer in [
+            stopped("cancelled"),
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::IncompatibleAgent {
+                detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
+                    expected: "1".into(),
+                    received: "2".into(),
+                },
+            },
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "rate_limit".into(),
+            },
+        ] {
+            let mut model = TranscriptModel::new();
+            model.observe_prior(1, &content("reused", "old orphan output"));
+            model.observe_prior(2, &closer);
+            assert!(model.rows().is_empty(), "{closer:?}: prefix stays hidden");
+            model.apply_event(10, &started(tool("reused", "New call")));
+            model.apply_event(11, &stopped("cancelled"));
+            assert_eq!(
+                count(&model, TranscriptRowKind::ToolStopped),
+                1,
+                "{closer:?}"
+            );
+            assert_eq!(
+                row(&model, "stopped-reused-11").text,
+                "",
+                "{closer:?}: a reused ID must not inherit orphan output"
+            );
+            assert!(model.apply_event(12, &stopped("cancelled")).is_empty());
+        }
+    }
+
+    #[test]
+    fn orphan_output_clears_at_live_turn_endings_without_stopped_rows() {
+        for closer in [
+            stopped("cancelled"),
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::IncompatibleAgent {
+                detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
+                    expected: "1".into(),
+                    received: "2".into(),
+                },
+            },
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "rate_limit".into(),
+            },
+        ] {
+            for observed_content in [false, true] {
+                let mut model = TranscriptModel::new();
+                if observed_content {
+                    model.observe_prior(1, &content("reused", "old orphan output"));
+                } else {
+                    model.apply_event(1, &content("reused", "old orphan output"));
+                }
+                model.apply_event(2, &closer);
+                assert_eq!(
+                    count(&model, TranscriptRowKind::ToolStopped),
+                    0,
+                    "{closer:?}: content alone must not invent a stopped tool"
+                );
+                model.apply_event(3, &started(tool("reused", "New call")));
+                model.apply_event(4, &stopped("cancelled"));
+                assert_eq!(
+                    count(&model, TranscriptRowKind::ToolStopped),
+                    1,
+                    "{closer:?}"
+                );
+                assert_eq!(
+                    row(&model, "stopped-reused-4").text,
+                    "",
+                    "{closer:?}: a reused ID must not inherit orphan output"
+                );
+                assert!(model.apply_event(5, &stopped("cancelled")).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_after_prefix_completion_does_not_create_unpaired_start() {
+        for observed_start in [false, true] {
+            let mut model = TranscriptModel::new();
+            if observed_start {
+                model.observe_prior(1, &started(tool("done", "Old call")));
+            }
+            model.observe_prior(2, &completed("done", false, "finished before cursor"));
+            assert!(
+                model
+                    .apply_event(
+                        10,
+                        &updated("done", Some("Late title"), Some("new args"), None)
+                    )
+                    .is_empty(),
+                "metadata alone must not render a running card for a terminal prefix tool"
+            );
+            assert!(model.rows().is_empty());
+            assert!(model.apply_event(11, &stopped("cancelled")).is_empty());
+            model.apply_event(12, &started(tool("done", "New call")));
+            model.apply_event(13, &stopped("cancelled"));
+            assert_eq!(count(&model, TranscriptRowKind::ToolStart), 1);
+            assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
+            assert_eq!(row(&model, "start-done").text, "New call");
         }
     }
 
@@ -1591,7 +2203,9 @@ mod tests {
             (swept.kind, swept.text.as_str()),
             (TranscriptRowKind::ToolStopped, "partial out")
         );
-        assert!(!m.tool_outputs.contains_key("open-1"));
+        assert!(
+            matches!(m.tools.get("open-1"), Some(ToolLifecycle::Terminal(output)) if output.is_empty())
+        );
 
         let mut m = fold([
             started(tool("a", "A")),
@@ -1627,8 +2241,35 @@ mod tests {
         ];
         for closer in closers {
             let label = format!("{closer:?}");
-            let m = fold([started(tool("t1", "T")), closer]);
+            let m = fold([started(tool("t1", "T")), closer.clone()]);
             assert_eq!(count(&m, TranscriptRowKind::ToolStopped), 1, "{label}");
+            let mut partial = TranscriptModel::new();
+            partial.observe_prior(1, &started(tool("t1", "T")));
+            partial.observe_prior(2, &content("t1", "buffered before cursor"));
+            assert!(partial.rows().is_empty(), "{label}");
+            partial.apply_event(10, &closer);
+            let stopped_rows = partial
+                .rows()
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::ToolStopped)
+                .collect::<Vec<_>>();
+            assert_eq!(stopped_rows.len(), 1, "{label}");
+            assert_eq!(
+                stopped_rows[0].tool_call_id.as_deref(),
+                Some("t1"),
+                "{label}"
+            );
+            assert_eq!(stopped_rows[0].text, "buffered before cursor", "{label}");
+            let mut closed_prefix = TranscriptModel::new();
+            closed_prefix.observe_prior(1, &started(tool("t1", "T")));
+            closed_prefix.observe_prior(2, &closer);
+            assert!(closed_prefix.rows().is_empty(), "{label}");
+            assert!(
+                closed_prefix
+                    .apply_event(10, &stopped("cancelled"))
+                    .is_empty(),
+                "{label}"
+            );
         }
     }
 

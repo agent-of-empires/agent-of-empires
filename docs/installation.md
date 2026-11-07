@@ -52,17 +52,19 @@ Local Unix transport requires a current-user-owned `daemon/` directory with mode
 group-write bits, including under umask `002`; it does not change existing
 `~/.config` permissions. On each daemon start, AoE removes group and other write
 permissions from an existing application directory owned by the current user.
-If the parent chain is unsafe, repair its unsafe ancestors from the highest down,
-or select a location with trusted ancestors, then retry before changing the
-refused directory. Once the parent chain is trusted, follow the recovery advice:
+Permission refusals name the highest unsafe ancestor unless a higher ancestor
+cannot be verified.
+Repair unsafe ancestors from the highest down, or select a location with trusted
+ancestors, then retry before changing the refused directory. Once the parent
+chain is trusted, follow the recovery advice:
 set `daemon/` to mode `0700`, or remove both group and other write permissions
 from another refused ancestor. A directory owned by another user also requires
 ownership recovery; changing its mode alone is not sufficient.
 
 Daemon directory refusals report escaped paths and recovery guidance. Paths with
-an unsafe parent chain, non-UTF-8 bytes, control characters, bidirectional
-formatting characters, or backticks receive manual instructions instead of a
-shell command.
+an unsafe or unverified parent chain, non-UTF-8 bytes, control characters,
+bidirectional formatting characters, or backticks receive manual instructions
+instead of a shell command.
 
 ## Downgrading
 
@@ -98,9 +100,9 @@ Managerless Linux operation resolves legacy rows to no scopes when `/run/user` o
 
 The kernel-only proof checks the cgroup2 filesystem, complete mount boundary, physical-root interfaces and namespace stability, then scans the full hierarchy without exempting captured units. A populated matching scope, unreadable or partial inventory, symlink, or changing boundary retains unresolved authority and resources. Existing `systemd/` with an unavailable private socket still refuses recovery. Kernel discovery never grants retirement authority or changes original captured receipts. Caller-selected `XDG_RUNTIME_DIR`, disabling scope creation and a failed capability probe are not absence proof.
 
-Disappearance reported by a child-directory open does not block the scan. Missing or unreadable population evidence for an opened scope still blocks recovery.
+Disappearance reported by a child-directory open does not block the scan. Missing or unreadable population evidence for an opened scope still blocks recovery. Names are matched by bytes: unrelated non-UTF8 cgroups do not block recovery, but a non-UTF8 name matching the session's scope pattern does.
 
-Unsupported or incomplete evidence remains protected: cgroup v1, hybrid layouts without the required root-mounted cgroup2 view, and views exposing only a delegated subtree do not establish absence. If the caller's namespace restricts that view, retry from the original host and context exposing the complete original hierarchy. Do not reboot, switch cgroup modes or manufacture receipts to make unknown authority disappear. Without supported original evidence, retain the resources; automatic v1 recovery and operator-attestation overrides are not provided.
+Unsupported or incomplete evidence remains protected: cgroup v1, hybrid layouts without the required root-mounted cgroup2 view, and views exposing only a subtree, such as inside a cgroup namespace or container, do not establish absence. Pre-upgrade rows record no namespace, so a subtree scan cannot prove a scope outside it is gone. Retry from the original host and context exposing the complete original hierarchy. Do not reboot, switch cgroup modes or manufacture receipts to make unknown authority disappear. Without supported original evidence, retain the resources; automatic v1 recovery and operator-attestation overrides are not provided.
 
 On macOS, recovery verifies the native Darwin kernel, which cannot host Linux systemd cgroups. This resolves only missing Linux-scope evidence. Explicit captured Linux unit receipts remain refused on macOS; recover those original resources on their Linux host. Worker PID, birth, generation, native runtime, producer and tmux authority are not adopted or replaced. Their own stop and cleanup guards still apply.
 

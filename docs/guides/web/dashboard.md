@@ -15,7 +15,7 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
-The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
+The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
 
 ## Creating a session
 
@@ -25,9 +25,10 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 - **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
 - **Group**: search existing groups, including empty groups, or select the create row for a new name; surrounding spaces are trimmed on selection and `/` nests groups. Counts show sessions directly in the group, excluding archived and trashed sessions. Escape closes the suggestions without closing the wizard.
 - **Agent**: the tool, plus instructions, command override, and extra args.
-- **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
+- **Structured**, **Yolo mode**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
 Choosing a profile (the **Profile** row, shown when there is more than one) seeds these defaults; switching profiles after you have edited a field asks first. A create that runs `on_create` hooks shows their output while it runs, and **Continue in background** closes the wizard and reports the result when it finishes.
+If the daemon refuses the create, the wizard stays open and says what failed and at which step. For a Sandbox or Project failure, it outlines the row that caused it. It offers the fixes that apply, such as **Retry** once the container runtime is running or **Launch without Sandbox**. Its reference finds the failure in `debug.log`. A create the daemon refuses after **Continue in background** shows a notice whose **Reopen** brings the wizard back with the same form, unless the connection dropped while it was sent.
 Renaming a profile in either Settings surface refreshes the served-profile
 authority before an implicit wizard reads profile settings or projects. Failed
 refreshes keep Launch disabled and offer Retry server profile without discarding edits.

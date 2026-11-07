@@ -2,7 +2,7 @@
 //! routing ACP frames over it.
 
 use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
-use agent_client_protocol::schema::v1::PromptResponse;
+use agent_client_protocol::v1::schema::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, RawFd};
@@ -1927,7 +1927,7 @@ mod tests {
             let marker_client = client.clone();
             let (read, write) = tokio::io::split(crate_side);
             Client
-                .builder()
+                .v1()
                 // One handler for both, as the connection registers them.
                 .on_receive_notification(
                     {
@@ -1979,9 +1979,13 @@ mod tests {
                             replayed.as_mut().now_or_never().is_none(),
                             "a load must not count as replayed mid-replay"
                         );
-                        while client.settled.lock().unwrap().is_empty() {
-                            tokio::task::yield_now().await;
-                        }
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            while client.settled.lock().unwrap().is_empty() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("the reader never queued the adopted completion delivery");
                         assert!(
                             matches!(adopted_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
                             "an adopted completion must wait behind the blocked update"
@@ -1996,14 +2000,18 @@ mod tests {
                         entered_rx.await.unwrap();
                         // Wait for the reader to match the completion while the
                         // crate is still applying the update sent before it.
-                        while client.settled.lock().unwrap().is_empty() {
-                            assert_eq!(
-                                completion.try_recv(),
-                                Err(oneshot::error::TryRecvError::Empty),
-                                "a prompt must not resolve before its updates are applied"
-                            );
-                            tokio::task::yield_now().await;
-                        }
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            while client.settled.lock().unwrap().is_empty() {
+                                assert_eq!(
+                                    completion.try_recv(),
+                                    Err(oneshot::error::TryRecvError::Empty),
+                                    "a prompt must not resolve before its updates are applied"
+                                );
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("the reader never queued the local prompt completion delivery");
                         release_tx.send(()).unwrap();
                         assert_eq!(completion.await.unwrap(), end("end_turn"));
                         assert_eq!(applied.load(AtomicOrdering::Relaxed), 2);
