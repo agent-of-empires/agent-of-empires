@@ -45,10 +45,19 @@ pub(super) fn preview_args(raw: &serde_json::Value) -> String {
     out
 }
 
-/// The `prompt` argument in full, only when `preview_args` cut the call.
+/// Cap on the retained prompt so a runaway one cannot bloat the event log.
+const PROMPT_MAX_CHARS: usize = 256 * 1024;
+
+/// The `prompt` argument, only when `preview_args` cut the call, clipped at `PROMPT_MAX_CHARS`.
 pub(super) fn full_prompt(raw: &serde_json::Value) -> Option<String> {
     let prompt = raw.get("prompt")?.as_str()?;
-    (serde_json::to_string(raw).ok()?.len() > 16 * 1024).then(|| prompt.to_string())
+    if serde_json::to_string(raw).ok()?.len() <= 16 * 1024 {
+        return None;
+    }
+    Some(match prompt.char_indices().nth(PROMPT_MAX_CHARS) {
+        Some((end, _)) => format!("{}\u{2026}[truncated]", &prompt[..end]),
+        None => prompt.to_string(),
+    })
 }
 
 /// A missing field and an explicit JSON `null` both mean "no args", so the UI
@@ -298,6 +307,13 @@ mod tests {
         assert_eq!(
             full_prompt(&serde_json::json!({ "command": "x".repeat(20_000) })),
             None
+        );
+        let runaway = serde_json::json!({ "prompt": "p".repeat(PROMPT_MAX_CHARS + 10) });
+        let clipped = full_prompt(&runaway).unwrap();
+        assert!(clipped.ends_with("\u{2026}[truncated]"));
+        assert_eq!(
+            clipped.chars().count(),
+            PROMPT_MAX_CHARS + "\u{2026}[truncated]".chars().count()
         );
     }
 
