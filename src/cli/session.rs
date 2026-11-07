@@ -238,6 +238,18 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+
+    /// Restart as this tool, through the Daemon. Swapping between tools that
+    /// run the same agent under different `[session.agent_config_dir]`
+    /// accounts keeps the conversation (Claude). Any other swap starts a
+    /// fresh conversation. Use `aoe acp switch-account` to refuse instead.
+    #[arg(long, conflicts_with = "all")]
+    pub tool: Option<String>,
+
+    /// Move the session to this existing profile while restarting, through
+    /// the Daemon.
+    #[arg(long, conflicts_with = "all")]
+    pub to_profile: Option<String>,
 }
 
 #[derive(Args)]
@@ -1097,7 +1109,68 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
     let identifier = args
         .identifier
         .ok_or_else(|| anyhow::anyhow!("session identifier required (or pass --all)"))?;
+    if args.tool.is_some() || args.to_profile.is_some() {
+        let body = crate::daemon::RestartSessionBody {
+            size: crate::terminal::get_size().and_then(|(cols, rows)| {
+                Some(crate::daemon::TerminalSize {
+                    cols: std::num::NonZeroU16::new(cols)?,
+                    rows: std::num::NonZeroU16::new(rows)?,
+                })
+            }),
+            tool: args.tool,
+            profile: args.to_profile,
+            ..Default::default()
+        };
+        let row = restart_through_daemon(Some(profile), &identifier, body, |_| Ok(())).await?;
+        println!("✓ Restarted session: {}", row.title);
+        return Ok(());
+    }
     restart_session(profile, SessionIdArgs { identifier }).await
+}
+
+/// Restart through the Daemon's epoch-checked route, the only path that can swap the tool.
+/// `profile` narrows the identifier lookup; `None` searches every profile.
+pub(super) async fn restart_through_daemon(
+    profile: Option<&str>,
+    identifier: &str,
+    body: crate::daemon::RestartSessionBody,
+    check: impl FnOnce(&crate::daemon::SessionResponse) -> Result<()>,
+) -> Result<crate::daemon::SessionResponse> {
+    use crate::daemon::{RuntimeHealth, RUNTIME_PROTOCOL_VERSION};
+    let client = crate::acp::client::HttpClient::new(crate::acp::client::require_daemon().await?)?;
+    let mut sessions = client.list_sessions(None).await?.sessions;
+    if let Some(profile) = profile {
+        let profile = super::send::resolve_profile(&client, profile).await?;
+        sessions.retain(|row| row.profile == profile);
+    }
+    let row = super::resolve_session(identifier, &sessions)?.clone();
+    check(&row)?;
+    let daemon = client.daemon_client().await?;
+    let info = daemon.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    daemon
+        .restart_session(&row.id, &body, &info.epoch)
+        .await
+        .map_err(|error| match account_swap_refusal(&error) {
+            Some(message) => anyhow::anyhow!(message),
+            None => error.into(),
+        })?;
+    Ok(row)
+}
+
+/// The Daemon's own wording for a refused account swap, which the generic status text would bury
+/// in raw JSON.
+fn account_swap_refusal(error: &crate::daemon::DaemonClientError) -> Option<String> {
+    let crate::daemon::DaemonClientError::Status { body, .. } = error else {
+        return None;
+    };
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    (body["error"] == "account_swap_unavailable")
+        .then(|| body["message"].as_str().map(str::to_owned))
+        .flatten()
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
@@ -3813,5 +3886,35 @@ mod wait_decision_tests {
         let mut converted = adopted;
         converted.view = crate::session::View::Structured;
         assert!(adopt_stored(&live, converted).is_err());
+    }
+}
+
+#[cfg(test)]
+mod account_swap_tests {
+    use super::account_swap_refusal;
+    use crate::daemon::{ApiErrorCode, DaemonClientError};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn the_daemons_refusal_message_replaces_the_raw_status_text() {
+        let status = |body: &str| DaemonClientError::Status {
+            status: StatusCode::CONFLICT,
+            code: None::<ApiErrorCode>,
+            body: body.to_owned(),
+            truncated: false,
+        };
+        assert_eq!(
+            account_swap_refusal(&status(
+                r#"{"error":"account_swap_unavailable","message":"Cannot switch. Nothing changed."}"#
+            ))
+            .as_deref(),
+            Some("Cannot switch. Nothing changed.")
+        );
+        assert_eq!(
+            account_swap_refusal(&status(r#"{"error":"lifecycle_busy","message":"busy"}"#)),
+            None
+        );
+        assert_eq!(account_swap_refusal(&status("not json")), None);
+        assert_eq!(account_swap_refusal(&DaemonClientError::Timeout), None);
     }
 }
