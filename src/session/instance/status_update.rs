@@ -258,9 +258,14 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
-        let integration_configured = crate::plugin::agent_integration::configured(self);
+        // Ownership is keyed on the detection identity, so a custom tool aliased
+        // to a provider tool still reads that provider's report.
+        let pane_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
+        let integration_configured =
+            crate::plugin::agent_integration::status_configured(self, &pane_tool);
         let integration_snapshot = integration_configured
-            .then(|| crate::plugin::agent_integration::snapshot(self))
+            .then(|| crate::plugin::agent_integration::status_snapshot(self, &pane_tool))
             .flatten();
         if let Some(status) = crate::plugin::agent_integration::session_status_override(
             integration_configured,
@@ -302,9 +307,6 @@ impl Instance {
         } else {
             &hook_alias
         };
-        let pane_tool =
-            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
-
         let hook =
             crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
                 status,
