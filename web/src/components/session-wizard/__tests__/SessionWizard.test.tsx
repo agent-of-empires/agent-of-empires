@@ -40,6 +40,7 @@ vi.mock("../../../lib/api", () => ({
   fetchProfileAgents: vi.fn().mockResolvedValue([]),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
+  fetchBranches: vi.fn().mockResolvedValue([]),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
@@ -522,6 +523,29 @@ describe("SessionWizard rows", () => {
       await waitFor(() => expect(createSession).toHaveBeenCalled());
       expect(view().getAttribute("aria-checked")).toBe("true");
       expect(payload()).toMatchObject({ profile: "work", view: "structured" });
+    });
+
+    it("keeps a workspace choice made while the profile response is pending", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const worktrees = { worktree: { enabled: true } } as never;
+      let release!: (v: never) => void;
+      vi.mocked(fetchSettings)
+        .mockResolvedValueOnce(worktrees)
+        .mockReturnValueOnce(new Promise((r) => (release = r)));
+      renderWizard();
+      await waitFor(() =>
+        expect(screen.getByRole("switch", { name: "Create a worktree" }).getAttribute("aria-checked")).toBe("true"),
+      );
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+      await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      fireEvent.click(screen.getByRole("button", { name: "Configure worktree" }));
+      fireEvent.click(await screen.findByRole("switch", { name: "Workspace directory" }));
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      await act(async () => release(worktrees));
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalled());
+      expect(payload()).toMatchObject({ profile: "work", workspace: true });
     });
 
     it("resets a view set before the profile was picked", async () => {

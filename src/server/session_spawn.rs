@@ -29,6 +29,7 @@ pub(crate) struct StructuredSessionSpec {
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
+    pub workspace: bool,
     /// Per-repo creation bases as `(selector, base)` pairs. See #3329.
     pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
@@ -143,6 +144,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches,
             scratch,
             trust_hooks,
@@ -238,6 +240,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches: if create_new_branch {
                 repo_base_branches
             } else {
@@ -1161,6 +1164,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: true,
             trust_hooks: None,
@@ -1316,6 +1320,7 @@ mod tests {
                 extra_args: String::new(),
                 command_override: String::new(),
                 extra_repo_paths: Vec::new(),
+                workspace: false,
                 repo_base_branches: Vec::new(),
                 scratch: false,
                 trust_hooks: None,
@@ -1344,6 +1349,7 @@ mod tests {
                     fork_source: None,
                     generated_name: false,
                     no_submodules: false,
+                    workspace: None,
                     worktree_path_id: None,
                 }),
             };

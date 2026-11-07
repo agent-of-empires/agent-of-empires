@@ -953,6 +953,40 @@ mod tests {
     /// The create-time-pinned `SandboxInfo::container_workdir` defends against
     /// that drift.
     #[test]
+    fn only_repo_hooks_target_the_launch_repo_checkout_in_a_workspace() {
+        let mut inst = Instance::new("hooks", "/ws/feat");
+        assert_eq!(inst.repo_config_path(), Path::new("/ws/feat"));
+        assert_eq!(inst.hook_workdir(true), Path::new("/ws/feat"));
+
+        let repo = |name: &str| crate::session::WorkspaceRepo {
+            name: name.to_string(),
+            source_path: format!("/src/{name}"),
+            branch: "feat".to_string(),
+            worktree_path: format!("/ws/feat/{name}"),
+            main_repo_path: format!("/src/{name}"),
+            managed_by_aoe: true,
+            branch_preexisting: false,
+            base_branch: None,
+            base_branch_override: None,
+        };
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feat".to_string(),
+            workspace_dir: "/ws/feat".to_string(),
+            repos: vec![repo("backend"), repo("frontend")],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        assert_eq!(inst.repo_config_path(), Path::new("/ws/feat/backend"));
+        assert_eq!(inst.hook_workdir(true), Path::new("/ws/feat/backend"));
+        assert_eq!(inst.hook_workdir(false), Path::new("/ws/feat"));
+        assert_eq!(
+            inst.hook_container_workdir(true),
+            format!("{}/backend", inst.container_workdir())
+        );
+        assert_eq!(inst.hook_container_workdir(false), inst.container_workdir());
+    }
+
+    #[test]
     fn container_workdir_stays_pinned_when_worktree_linkage_breaks() {
         use tempfile::TempDir;
         let root = TempDir::new().unwrap();

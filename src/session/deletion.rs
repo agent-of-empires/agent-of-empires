@@ -2485,9 +2485,9 @@ fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[Strin
 
 /// Hooks are best-effort; unapproved repository hooks never override host hooks.
 fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[String]) {
-    let project_path = Path::new(&instance.project_path);
     let mut resolved_on_destroy = std::borrow::Cow::Borrowed(configured_hooks);
-    match repo_config::check_repo_trust(project_path) {
+    let mut from_repo = false;
+    match repo_config::check_repo_trust(instance.repo_config_path()) {
         Ok(trust) if trust.hooks.needs_trust() => {
             tracing::warn!(target: "session.delete",
                 "Repo hooks changed since last trust approval; skipping repo on_destroy hooks"
@@ -2497,6 +2497,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
             if let Some(hooks) = trust.hooks.trusted() {
                 if !hooks.on_destroy.is_empty() {
                     resolved_on_destroy = std::borrow::Cow::Owned(hooks.on_destroy);
+                    from_repo = true;
                 }
             }
         }
@@ -2520,7 +2521,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
     // (see issue); CLI passes detach=false so interactive prompts work.
     let errors = if is_sandboxed {
         if let Some(ref sandbox) = instance.sandbox_info {
-            let workdir = instance.container_workdir();
+            let workdir = instance.hook_container_workdir(from_repo);
             repo_config::execute_hooks_in_container_best_effort(
                 &resolved_on_destroy,
                 &sandbox.container_name,
@@ -2534,7 +2535,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
     } else {
         repo_config::execute_hooks_best_effort(
             &resolved_on_destroy,
-            project_path,
+            instance.hook_workdir(from_repo),
             detach,
             &hook_env,
         )

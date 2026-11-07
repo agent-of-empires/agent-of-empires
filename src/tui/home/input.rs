@@ -3746,14 +3746,24 @@ impl HomeView {
             return;
         };
 
-        let repo_path = std::path::PathBuf::from(&inst.project_path);
         let session_id_owned = inst.id.clone();
         let profile = inst.source_profile.clone();
-        let base_override = inst.base_branch_override.clone();
-        let worktree_base = inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone());
+        // A single-repo workspace's cwd is the workspace dir, not a checkout, so
+        // diff its one repo; the daemon routes an unnamed base write there too.
+        let (repo_path, base_override, worktree_base) = match inst.all_repos() {
+            [only] => (
+                std::path::PathBuf::from(&only.worktree_path),
+                only.base_branch_override.clone(),
+                only.base_branch.clone(),
+            ),
+            _ => (
+                std::path::PathBuf::from(&inst.project_path),
+                inst.base_branch_override.clone(),
+                inst.worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
+            ),
+        };
 
         // A session on a non-git project runs in place, so there is no repo to diff
         // against; say so rather than surfacing the git layer's raw error.
@@ -7555,6 +7565,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            workspace: false,
             sandbox: true,
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,

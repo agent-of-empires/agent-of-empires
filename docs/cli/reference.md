@@ -229,6 +229,8 @@ Add a new session
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
 * `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
+* `--workspace` — Create the worktree inside a workspace directory (from `worktree.workspace_path_template`) even with no `--repo`/`--project`, so more projects can be attached later without moving the session (use with --worktree). Overrides `worktree.workspace_by_default`
+* `--no-workspace` — Create a plain worktree even when `worktree.workspace_by_default` is on. Ignored when `--repo`/`--project` make a multi-repo workspace
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
