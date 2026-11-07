@@ -1,9 +1,7 @@
 //! Building the shell command a session launches with.
 
+use super::execution::UnpinnedCodexLaunch;
 use super::*;
-
-/// Native routing restored after the login shell's startup files.
-type Routing = Vec<(String, Option<String>)>;
 
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
@@ -176,14 +174,21 @@ fn apply_no_daemon_flag(
     agent: Option<&crate::agents::AgentDef>,
     inst: &Instance,
     execution: Option<&super::execution::NativeExecution>,
+    unpinned: Option<&UnpinnedCodexLaunch>,
 ) {
     let Some(agent) = agent else {
         return;
     };
-    let Some(execution) = execution.filter(|execution| {
-        execution.inputs.container.is_none() && execution.agent.name == agent.name
-    }) else {
-        return;
+    let (program, probe) = match (execution, unpinned) {
+        (Some(execution), _)
+            if execution.inputs.container.is_none() && execution.agent.name == agent.name =>
+        {
+            (&execution.program, execution.host_command())
+        }
+        (None, Some(unpinned)) if agent.name == "codex" => {
+            (&unpinned.program, unpinned.host_command())
+        }
+        _ => return,
     };
     let Some(invocation) = parse_launch_command(inst.get_tool_command()) else {
         return;
@@ -194,13 +199,13 @@ fn apply_no_daemon_flag(
     let Ok(mut words) = shell_words::split(cmd) else {
         return;
     };
-    if words.first().map(String::as_str) != execution.program.to_str() {
+    if words.first().map(String::as_str) != program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&execution.host_command(), options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(&probe, options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
@@ -823,29 +828,20 @@ impl Instance {
             .map(|(execution, _)| execution)
     }
 
-    /// The execution to pin, or for an unpinned launch the routing that keeps
-    /// it on the store its conversation was verified in.
+    /// The execution to pin, or for an unpinned launch the executable and
+    /// routing that keep it on the store its conversation was verified in.
     fn resolve_launch_routing(
         &self,
-    ) -> Result<(Option<super::execution::NativeExecution>, Routing)> {
+    ) -> Result<(
+        Option<super::execution::NativeExecution>,
+        Option<UnpinnedCodexLaunch>,
+    )> {
         let target = self.conversation_target();
         let resolved = self.resolve_native_execution(target);
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
             if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
                 tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                let home = store.home.to_str().context("Codex home is not UTF-8")?;
-                let sqlite = store
-                    .sqlite
-                    .to_str()
-                    .context("Codex SQLite home is not UTF-8")?;
-                let routing = [("CODEX_HOME", home), ("CODEX_SQLITE_HOME", sqlite)]
-                    .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
-                    .into_iter()
-                    .chain(
-                        super::execution::CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)),
-                    )
-                    .collect();
-                return Ok((None, routing));
+                return Ok((None, Some(store.clone())));
             }
         }
         let execution = match (resolved, target) {
@@ -886,7 +882,7 @@ impl Instance {
                 Ok(None)
             }
         };
-        execution.map(|execution| (execution, Vec::new()))
+        execution.map(|execution| (execution, None))
     }
 
     #[cfg(test)]
@@ -936,7 +932,7 @@ impl Instance {
                         ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
                     ));
             let mut handoff_prior = None;
-            let (execution, unpinned_routing) = self.resolve_launch_routing()?;
+            let (execution, unpinned) = self.resolve_launch_routing()?;
             if let Some(execution) = execution.as_ref() {
                 handoff_prior = self.hand_off_prime_fork_parent(execution)?;
                 if validate_target {
@@ -975,7 +971,7 @@ impl Instance {
             let parts = self.build_launch_command_in(
                 stores,
                 execution.as_ref(),
-                &unpinned_routing,
+                unpinned.as_ref(),
                 &mut expected_conversation,
             )?;
             if (managed || parts.is_existing) && validate_target {
@@ -1107,17 +1103,17 @@ impl Instance {
         self.build_launch_command_in(
             CaptureStorage::Profiles(&file_watch),
             execution,
-            &[],
+            None,
             expected,
         )
     }
 
-    /// `unpinned_routing` applies to a host launch only when `execution` is absent.
+    /// `unpinned` applies to a host launch only when `execution` is absent.
     pub(super) fn build_launch_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
-        unpinned_routing: &[(String, Option<String>)],
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
@@ -1213,6 +1209,7 @@ impl Instance {
             let launch_cmd = self.freeze_native_invocation(
                 self.get_launch_command(),
                 execution,
+                None,
                 launch_context,
             )?;
             let base_cmd = if self.extra_args.is_empty() {
@@ -1346,7 +1343,7 @@ impl Instance {
             }
         } else {
             let mut result =
-                self.build_host_command_in(stores, agent, execution, unpinned_routing, expected)?;
+                self.build_host_command_in(stores, agent, execution, unpinned, expected)?;
             result.launch_env.pane = if execution.is_none() {
                 crate::session::environment::resolve_host_environment_pairs(
                     &self.resolved_host_environment(),
@@ -1376,7 +1373,7 @@ impl Instance {
             CaptureStorage::Profiles(&file_watch),
             agent,
             execution,
-            &[],
+            None,
             expected,
         )
     }
@@ -1386,7 +1383,7 @@ impl Instance {
         stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
-        unpinned_routing: &[(String, Option<String>)],
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         let fallback_identity = execution
@@ -1401,7 +1398,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
-            unpinned_routing,
+            unpinned,
             expected,
         )
     }
@@ -1420,7 +1417,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
-            &[],
+            None,
             expected,
         )
     }
@@ -1431,10 +1428,13 @@ impl Instance {
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
-        unpinned_routing: &[(String, Option<String>)],
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
-        let routing = execution.map_or(unpinned_routing, |execution| execution.routing.as_slice());
+        let routing = execution
+            .map(|execution| execution.routing.as_slice())
+            .or(unpinned.map(|unpinned| unpinned.routing.as_slice()))
+            .unwrap_or_default();
         let host_command = agent
             .filter(|agent| agent.spans_agent_generations)
             .and_then(|agent| self.host_agent_command(agent, execution));
@@ -1485,6 +1485,7 @@ impl Instance {
                     let mut cmd = self.freeze_native_invocation(
                         a.launch_base_command(),
                         execution,
+                        unpinned,
                         launch_context,
                     )?;
                     if let Some((ref flag, _)) = identity_extension {
@@ -1530,7 +1531,7 @@ impl Instance {
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-                    apply_no_daemon_flag(&mut cmd, agent, self, execution);
+                    apply_no_daemon_flag(&mut cmd, agent, self, execution, unpinned);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!(
                         "{}{}",
@@ -1587,8 +1588,12 @@ impl Instance {
                 }),
             }
         } else {
-            let mut cmd =
-                self.freeze_native_invocation(self.command.clone(), execution, launch_context)?;
+            let mut cmd = self.freeze_native_invocation(
+                self.command.clone(),
+                execution,
+                unpinned,
+                launch_context,
+            )?;
             if let Some((ref flag, _)) = identity_extension {
                 cmd.push_str(flag);
             }
@@ -1624,7 +1629,7 @@ impl Instance {
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-            apply_no_daemon_flag(&mut cmd, agent, self, execution);
+            apply_no_daemon_flag(&mut cmd, agent, self, execution, unpinned);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!(
                 "{}{}",
@@ -3461,11 +3466,40 @@ mod tests {
         )
         .unwrap();
         let _env = EnvGuard::set(&[("CODEX_HOME", &store), ("CODEX_SQLITE_HOME", &store)]);
-        let _codex = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "codex",
-            "#!/bin/sh\nexit 0\n",
-        );
+        // The login shell's startup files compete for the executable and the store.
+        let ran = temp.path().join("ran");
+        let install = |dir: &str, help: &str| {
+            let dir = temp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; *) printf '%s\\n' \"$0\" \"$PWD\" \"$CODEX_HOME\" \"$CODEX_SQLITE_HOME\" \"${{CODEX_EXEC_SERVER_URL-unset}}\" \"$*\" > {};; esac\nexit 0\n",
+                    shell_escape(help),
+                    shell_escape(ran.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        let probed = install("probed", "      --no-daemon  Run without the daemon");
+        let login = install("login", "      --model <MODEL>");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::write(
+            temp.path().join(".profile"),
+            format!(
+                "export PATH={}:$PATH CODEX_HOME={elsewhere} CODEX_SQLITE_HOME={elsewhere} CODEX_EXEC_SERVER_URL=ws://elsewhere\n",
+                shell_escape(login.to_str().unwrap()),
+                elsewhere = shell_escape(elsewhere.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let path = format!("{}:/usr/bin:/bin", probed.display());
+        let _path = EnvGuard::set(&[("PATH", path.as_str()), ("SHELL", "/bin/sh")]);
+        crate::agents::forget_agent_help_for_test();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let local = "11111111-2222-4333-8444-555555555551";
@@ -3491,24 +3525,39 @@ mod tests {
             .unwrap();
         assert!(prepared.is_existing);
         let command = prepared.command.unwrap();
-        assert!(command.contains(&format!("resume {local}")), "{command}");
-        // Routing runs in the login shell's script, after its startup files.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", temp.path())
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        let ran = std::fs::read_to_string(&ran).unwrap();
+        let [program, cwd, home, sqlite, exec_server, args] =
+            <[&str; 6]>::try_from(ran.lines().collect::<Vec<_>>()).unwrap();
         let canonical_store = store.canonicalize().unwrap();
-        let exec = command.find("exec env ").unwrap();
-        let store_word = crate::session::environment::shell_escape_script_word(
-            canonical_store.to_str().unwrap(),
+        assert_eq!(Path::new(program), probed.join("codex"), "{command}");
+        assert_eq!(
+            Path::new(cwd).canonicalize().unwrap(),
+            project.canonicalize().unwrap()
         );
-        let pinned = ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-            .map(|key| format!("export {key}={store_word} || exit 1"));
-        for line in pinned.into_iter().chain(
-            super::super::execution::CODEX_ROUTING_ENV_KEYS
-                .map(|key| format!("unset {key} || exit 1")),
-        ) {
-            assert!(
-                command.find(&line).is_some_and(|at| at < exec),
-                "{line}: {command}"
-            );
-        }
+        assert_eq!(
+            [Path::new(home), Path::new(sqlite)],
+            [canonical_store.as_path(); 2]
+        );
+        assert_eq!(exec_server, "unset");
+        let words = shell_words::split(args).unwrap();
+        assert!(
+            words.windows(2).any(|pair| pair == ["resume", local]),
+            "{words:?}"
+        );
+        assert_eq!(
+            words.iter().filter(|word| *word == "--no-daemon").count(),
+            1,
+            "{words:?}"
+        );
 
         let other_store = temp.path().join("other-store");
         std::fs::create_dir_all(&other_store).unwrap();
@@ -3691,6 +3740,7 @@ mod tests {
             Some(execution.agent),
             &codex,
             Some(&execution),
+            None,
         );
         let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();
@@ -3704,6 +3754,7 @@ mod tests {
             Some(execution.agent),
             &codex,
             Some(&execution),
+            None,
         );
         let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();

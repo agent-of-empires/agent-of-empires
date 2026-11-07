@@ -451,27 +451,39 @@ pub(super) struct NativeExecution {
     pub(super) store_override: Option<(PathBuf, PathBuf, &'static str)>,
 }
 
+/// The native program in its resolved environment, with `routing` applied.
+fn native_host_command(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+    raw_environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    environment: &std::collections::HashMap<String, String>,
+    routing: &[(String, Option<String>)],
+) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .current_dir(cwd)
+        .env_clear()
+        .envs(raw_environment.iter().map(|(key, value)| (key, value)))
+        .envs(environment);
+    for (key, value) in routing {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 impl NativeExecution {
     pub(super) fn host_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new(&self.program);
-        command
-            .current_dir(&self.inputs.cwd)
-            .env_clear()
-            .envs(
-                self.inputs
-                    .raw_environment
-                    .iter()
-                    .map(|(key, value)| (key, value)),
-            )
-            .envs(&self.inputs.environment);
-        for (key, value) in &self.routing {
-            if let Some(value) = value {
-                command.env(key, value);
-            } else {
-                command.env_remove(key);
-            }
-        }
-        command
+        native_host_command(
+            &self.program,
+            &self.inputs.cwd,
+            &self.inputs.raw_environment,
+            &self.inputs.environment,
+            &self.routing,
+        )
     }
 
     pub(super) fn validate_opencode_session_target(&self, sid: &str) -> Result<()> {
@@ -1622,15 +1634,33 @@ pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
 #[error("{reason}")]
 pub(super) struct UnattestedCodexPolicy {
     reason: String,
-    /// The store an unpinned host launch reads, when a local rollout can prove it.
-    store: Option<UnpinnedCodexStore>,
+    /// What an unpinned host launch runs, when a local rollout can prove its store.
+    store: Option<UnpinnedCodexLaunch>,
     cwd: PathBuf,
 }
 
-#[derive(Debug)]
-pub(super) struct UnpinnedCodexStore {
+/// The executable and store routing an unpinned Codex resume keeps, as the
+/// pinned path would have frozen them.
+#[derive(Clone, Debug)]
+pub(super) struct UnpinnedCodexLaunch {
     pub(super) home: PathBuf,
-    pub(super) sqlite: PathBuf,
+    pub(super) program: PathBuf,
+    pub(super) routing: Vec<(String, Option<String>)>,
+    cwd: PathBuf,
+    raw_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    environment: std::collections::HashMap<String, String>,
+}
+
+impl UnpinnedCodexLaunch {
+    pub(super) fn host_command(&self) -> std::process::Command {
+        native_host_command(
+            &self.program,
+            &self.cwd,
+            &self.raw_environment,
+            &self.environment,
+            &self.routing,
+        )
+    }
 }
 
 fn opencode_session_row(
@@ -2034,7 +2064,22 @@ impl Instance {
                 let unattested_policy = |reason: &str| UnattestedCodexPolicy {
                     reason: reason.to_owned(),
                     store: (inputs.container.is_none() && declared.is_none())
-                        .then(|| Some(UnpinnedCodexStore { home: root.clone(), sqlite: inputs.canonical_path(&sqlite).ok()? }))
+                        .then(|| {
+                            let sqlite = inputs.canonical_path(&sqlite).ok()?;
+                            let routing = [("CODEX_HOME", root.to_str()?), ("CODEX_SQLITE_HOME", sqlite.to_str()?)]
+                                .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
+                                .into_iter()
+                                .chain(CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)))
+                                .collect();
+                            Some(UnpinnedCodexLaunch {
+                                home: root.clone(),
+                                program: program.clone(),
+                                routing,
+                                cwd: inputs.cwd.clone(),
+                                raw_environment: inputs.raw_environment.clone(),
+                                environment: inputs.environment.clone(),
+                            })
+                        })
                         .flatten(),
                     cwd: inputs.cwd.clone(),
                 };
@@ -2544,7 +2589,7 @@ impl Instance {
         error: &'a anyhow::Error,
         sid: &str,
         binding: Option<&ConversationBinding>,
-    ) -> Option<&'a UnpinnedCodexStore> {
+    ) -> Option<&'a UnpinnedCodexLaunch> {
         let UnattestedCodexPolicy {
             store: Some(store),
             cwd,
@@ -2931,19 +2976,22 @@ impl Instance {
         &self,
         command: String,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
         launch_context: &AgentLaunchContext<'_>,
     ) -> Result<String> {
-        let Some(execution) = execution else {
+        let Some(program) = execution
+            .map(|execution| &execution.program)
+            .or(unpinned.map(|unpinned| &unpinned.program))
+        else {
             return Ok(command);
         };
         let mut words = shell_words::split(&command)?;
-        *words.first_mut().context("native program is missing")? = execution
-            .program
+        *words.first_mut().context("native program is missing")? = program
             .to_str()
             .context("native executable path is not UTF-8")?
             .to_owned();
         // A shared service may have opened a different database.
-        if execution.agent.name == "opencode" {
+        if execution.is_some_and(|execution| execution.agent.name == "opencode") {
             match launch_context.generation() {
                 crate::agents::AgentGeneration::Current => words.push("--standalone".into()),
                 crate::agents::AgentGeneration::Legacy => {},
