@@ -1140,6 +1140,11 @@ pub struct SessionResponse {
     /// whose readers keep the value they last saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_auto_resume: Option<bool>,
+    /// The pool account a failover is about to move this parked session to, so the banner can
+    /// say it is switching rather than ask. Absent when the session will stay parked:
+    /// failover off or already tried, or no pool account has headroom. Set by the list handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_failover_to: Option<String>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads

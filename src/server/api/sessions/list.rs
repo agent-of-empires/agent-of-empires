@@ -205,7 +205,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // Inputs for the rate-limit park overlay, snapshotted so the blocking
     // batch can run once the registry read lock is released. A live worker is
     // never parked, so only workerless sessions pay for the probe.
-    let park_probes: Vec<(usize, String, String, bool)> = sessions
+    let park_probes: Vec<(usize, String, String, Option<crate::session::Instance>)> = sessions
         .iter()
         .zip(scoped_instances.iter().copied())
         .enumerate()
@@ -215,7 +215,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 i,
                 inst.id.clone(),
                 inst.source_profile.clone(),
-                resp.acp_worker_state != crate::daemon::AcpWorkerState::Running,
+                (resp.acp_worker_state != crate::daemon::AcpWorkerState::Running)
+                    .then(|| inst.clone()),
             )
         })
         .collect();
@@ -298,33 +299,54 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         let store = Arc::clone(&state.acp_event_store);
         let overlays = tokio::task::spawn_blocking(move || {
             use std::collections::HashMap;
-            let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+            let mut config_cache: HashMap<
+                String,
+                (bool, crate::server::acp_reconciler::FailoverSettings),
+            > = HashMap::new();
             park_probes
                 .into_iter()
                 .map(|(i, id, profile, workerless)| {
-                    let auto_resume =
-                        *auto_resume_cache.entry(profile.clone()).or_insert_with(|| {
-                            crate::session::config::profile_config::resolve_config_or_warn(&profile)
-                                .acp
-                                .rate_limit_auto_resume
-                        });
-                    let park = workerless
-                        .then(|| {
-                            store.rate_limit_park(&id).map(|park| {
-                                park.info
-                                    .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
-                            })
+                    let (auto_resume, failover) = config_cache
+                        .entry(profile.clone())
+                        .or_insert_with(|| {
+                            let config =
+                                crate::session::config::profile_config::resolve_config_or_warn(
+                                    &profile,
+                                );
+                            (
+                                config.acp.rate_limit_auto_resume,
+                                crate::server::acp_reconciler::FailoverSettings::of(&config),
+                            )
                         })
-                        .flatten();
-                    (i, auto_resume, park)
+                        .clone();
+                    let park = workerless.as_ref().and_then(|_| store.rate_limit_park(&id));
+                    let failover_to =
+                        workerless
+                            .as_ref()
+                            .zip(park.as_ref())
+                            .and_then(|(row, park)| {
+                                crate::server::acp_reconciler::failover_target(
+                                    row,
+                                    &failover,
+                                    park,
+                                    store.rate_limit_redelivery_streak(&id),
+                                    &store,
+                                )
+                            });
+                    let park = park.map(|park| {
+                        park.info
+                            .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
+                    });
+                    (i, auto_resume, park, failover_to)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
-        for (i, auto_resume, park) in overlays {
+        for (i, auto_resume, park, failover_to) in overlays {
             sessions[i].rate_limit_auto_resume = Some(auto_resume);
             sessions[i].rate_limit = park;
+            sessions[i].rate_limit_failover_to = failover_to;
         }
     }
 
@@ -772,6 +794,7 @@ mod workspace_ordering_tests {
             }),
             rate_limit: None,
             rate_limit_auto_resume: None,
+            rate_limit_failover_to: None,
             acp_capable: false,
             acp_session_id: None,
             import_pending: false,
