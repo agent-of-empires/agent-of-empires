@@ -404,16 +404,20 @@ use anyhow::{bail, Context, Result};
 #[cfg(test)]
 thread_local! {
     pub(super) static FAIL_NEXT_NATIVE_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Keeps tests independent of the host's Codex preferences; `None` probes the host.
-    pub(super) static CODEX_MANAGED_PREFERENCES_PRESENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(Some(false)) };
 }
 
+thread_local! {
+    /// What tests see instead of the host's Codex preferences.
+    pub(super) static CODEX_MANAGED_PREFERENCES_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `cfg!` rather than `#[cfg]`, so each build still references both sources.
 fn codex_managed_preferences_present() -> bool {
-    #[cfg(test)]
-    if let Some(present) = CODEX_MANAGED_PREFERENCES_PRESENT.with(std::cell::Cell::get) {
-        return present;
+    if cfg!(test) {
+        CODEX_MANAGED_PREFERENCES_PRESENT.with(std::cell::Cell::get)
+    } else {
+        crate::process::codex_managed_preferences_present()
     }
-    crate::process::codex_managed_preferences_present()
 }
 
 const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
@@ -1619,8 +1623,14 @@ pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
 pub(super) struct UnattestedCodexPolicy {
     reason: String,
     /// The store an unpinned host launch reads, when a local rollout can prove it.
-    store: Option<PathBuf>,
+    store: Option<UnpinnedCodexStore>,
     cwd: PathBuf,
+}
+
+#[derive(Debug)]
+pub(super) struct UnpinnedCodexStore {
+    pub(super) home: PathBuf,
+    pub(super) sqlite: PathBuf,
 }
 
 fn opencode_session_row(
@@ -1989,11 +1999,6 @@ impl Instance {
                 }
                 let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".codex"))))?;
-                let unattested_policy = |reason: &str| UnattestedCodexPolicy {
-                    reason: reason.to_owned(),
-                    store: (inputs.container.is_none() && declared.is_none()).then(|| root.clone()),
-                    cwd: inputs.cwd.clone(),
-                };
                 let location = inputs.physical_location(&root);
                 anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), unverifiable("managed Codex requires an existing local CODEX_HOME".into()));
                 for file in [PathBuf::from("/etc/codex/requirements.toml"), PathBuf::from("/etc/codex/managed_config.toml")] {
@@ -2026,6 +2031,13 @@ impl Instance {
                     }
                     configuration.push(file);
                 }
+                let unattested_policy = |reason: &str| UnattestedCodexPolicy {
+                    reason: reason.to_owned(),
+                    store: (inputs.container.is_none() && declared.is_none())
+                        .then(|| Some(UnpinnedCodexStore { home: root.clone(), sqlite: inputs.canonical_path(&sqlite).ok()? }))
+                        .flatten(),
+                    cwd: inputs.cwd.clone(),
+                };
                 let managed_preferences = inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES;
                 // Codex preference values may route the store; their absence only leaves policy unread.
                 anyhow::ensure!(!(managed_preferences && codex_managed_preferences_present()), unverifiable("Codex managed preferences are set and cannot be attested by the local file contract".into()));
@@ -2532,7 +2544,7 @@ impl Instance {
         error: &'a anyhow::Error,
         sid: &str,
         binding: Option<&ConversationBinding>,
-    ) -> Option<&'a std::path::Path> {
+    ) -> Option<&'a UnpinnedCodexStore> {
         let UnattestedCodexPolicy {
             store: Some(store),
             cwd,
@@ -2546,10 +2558,10 @@ impl Instance {
             .is_none_or(|execution| {
                 execution.agent == "codex"
                     && execution.filesystem == "host"
-                    && execution.stores.first() == Some(store)
+                    && execution.stores.first() == Some(&store.home)
             })
-            && crate::session::capture::codex_rollout_records_cwd(store, sid, cwd))
-        .then_some(store.as_path())
+            && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, cwd))
+        .then_some(store)
     }
 
     /// Whether two executions describe one context.

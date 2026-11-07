@@ -201,6 +201,10 @@ schemars = { version = "1", features = ["chrono04"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
 # plain `cargo build` ships it and needs no Node. `web` adds the embedded

@@ -5,67 +5,38 @@ pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 const CODEX_PREFERENCES_DOMAIN: &str = "com.openai.codex";
 
 /// Whether CFPreferences holds a Codex managed configuration or requirements
-/// value. Forced or not: Codex before openai/codex#46032 read either. A lookup
-/// that cannot answer counts as present.
+/// value. Forced or not: Codex before openai/codex#46032 read either.
 pub(crate) fn codex_managed_preferences_present() -> bool {
     codex_managed_preferences_present_with(|key| {
         preference_value_present(key, CODEX_PREFERENCES_DOMAIN)
     })
 }
 
-fn codex_managed_preferences_present_with(present: impl Fn(&str) -> Option<bool>) -> bool {
+fn codex_managed_preferences_present_with(present: impl Fn(&str) -> bool) -> bool {
     ["config_toml_base64", "requirements_toml_base64"]
         .into_iter()
-        .any(|key| present(key) != Some(false))
+        .any(present)
 }
 
-type CFTypeRef = *const std::ffi::c_void;
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFStringCreateWithBytes(
-        allocator: CFTypeRef,
-        bytes: *const u8,
-        length: isize,
-        encoding: u32,
-        external_representation: u8,
-    ) -> CFTypeRef;
-    fn CFPreferencesCopyAppValue(key: CFTypeRef, application: CFTypeRef) -> CFTypeRef;
-    fn CFRelease(value: CFTypeRef);
-}
-
-/// An owned CoreFoundation reference.
-struct CfOwned(CFTypeRef);
-
-impl CfOwned {
-    fn string(value: &str) -> Option<Self> {
-        const UTF8: u32 = 0x0800_0100;
-        let length = isize::try_from(value.len()).ok()?;
-        // SAFETY: the bytes outlive the call, which copies them.
-        let string =
-            unsafe { CFStringCreateWithBytes(std::ptr::null(), value.as_ptr(), length, UTF8, 0) };
-        (!string.is_null()).then_some(Self(string))
-    }
-}
-
-impl Drop for CfOwned {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a non-null reference this value owns.
-        unsafe { CFRelease(self.0) }
-    }
-}
-
-fn preference_value_present(key: &str, application: &str) -> Option<bool> {
-    let key = CfOwned::string(key)?;
-    let application = CfOwned::string(application)?;
-    // SAFETY: both arguments are live CFStrings; the result follows the copy rule.
-    let value = unsafe { CFPreferencesCopyAppValue(key.0, application.0) };
+fn preference_value_present(key: &str, application: &str) -> bool {
+    use core_foundation::base::{CFType, TCFType as _};
+    use core_foundation::string::CFString;
+    let (key, application) = (CFString::new(key), CFString::new(application));
+    // SAFETY: both arguments are live CFStrings.
+    let value = unsafe {
+        core_foundation_sys::preferences::CFPreferencesCopyAppValue(
+            key.as_concrete_TypeRef(),
+            application.as_concrete_TypeRef(),
+        )
+    };
     if value.is_null() {
-        return Some(false);
+        return false;
     }
-    drop(CfOwned(value));
-    Some(true)
+    // SAFETY: the copy rule hands ownership of a non-null result to the wrapper.
+    drop(unsafe { CFType::wrap_under_create_rule(value) });
+    true
 }
+
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
@@ -1224,25 +1195,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_managed_preferences_refuse_either_key_or_an_unanswered_lookup() {
+    fn codex_managed_preferences_refuse_either_key() {
         for (config, requirements, expected) in [
-            (Some(false), Some(false), false),
-            (Some(true), Some(false), true),
-            (Some(false), Some(true), true),
-            (None, Some(false), true),
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
         ] {
             let present = codex_managed_preferences_present_with(|key| match key {
                 "config_toml_base64" => config,
                 "requirements_toml_base64" => requirements,
                 _ => unreachable!("{key}"),
             });
-            assert_eq!(present, expected, "{config:?} {requirements:?}");
+            assert_eq!(present, expected, "{config} {requirements}");
         }
         let unused = format!("dev.aoe.test.{}", uuid::Uuid::new_v4());
-        assert_eq!(
-            preference_value_present("config_toml_base64", &unused),
-            Some(false)
-        );
+        assert!(!preference_value_present("config_toml_base64", &unused));
     }
 
     #[test]

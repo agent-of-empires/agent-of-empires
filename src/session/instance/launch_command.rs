@@ -833,8 +833,14 @@ impl Instance {
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
             if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
                 tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                let store = store.to_str().context("Codex home is not UTF-8")?;
-                let routing = std::iter::once(("CODEX_HOME".to_owned(), Some(store.to_owned())))
+                let home = store.home.to_str().context("Codex home is not UTF-8")?;
+                let sqlite = store
+                    .sqlite
+                    .to_str()
+                    .context("Codex SQLite home is not UTF-8")?;
+                let routing = [("CODEX_HOME", home), ("CODEX_SQLITE_HOME", sqlite)]
+                    .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
+                    .into_iter()
                     .chain(
                         super::execution::CODEX_ROUTING_ENV_KEYS.map(|key| (key.to_owned(), None)),
                     )
@@ -3489,13 +3495,12 @@ mod tests {
         // Routing runs in the login shell's script, after its startup files.
         let canonical_store = store.canonicalize().unwrap();
         let exec = command.find("exec env ").unwrap();
-        let pinned = format!(
-            "export CODEX_HOME={} || exit 1",
-            crate::session::environment::shell_escape_script_word(
-                canonical_store.to_str().unwrap()
-            )
+        let store_word = crate::session::environment::shell_escape_script_word(
+            canonical_store.to_str().unwrap(),
         );
-        for line in std::iter::once(pinned).chain(
+        let pinned = ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+            .map(|key| format!("export {key}={store_word} || exit 1"));
+        for line in pinned.into_iter().chain(
             super::super::execution::CODEX_ROUTING_ENV_KEYS
                 .map(|key| format!("unset {key} || exit 1")),
         ) {
@@ -3620,9 +3625,9 @@ mod tests {
 
         if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
             let preferences = &super::super::execution::CODEX_MANAGED_PREFERENCES_PRESENT;
-            preferences.with(|present| present.set(Some(true)));
+            preferences.with(|present| present.set(true));
             let cause = refused_cause(instance(local));
-            preferences.with(|present| present.set(Some(false)));
+            preferences.with(|present| present.set(false));
             assert_eq!(cause, ManagedResumeCause::CodexConversationUnverified);
         }
 
