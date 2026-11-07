@@ -394,7 +394,11 @@ pub(super) fn map_update_to_events(
                     content: extract_tool_content_text(&tc.content),
                     output: extract_tool_output_blocks(&tc.content),
                     completed_at: chrono::Utc::now(),
-                    async_subagent: false,
+                    async_subagent: tc.status == ToolCallStatus::Completed
+                        && matches!(
+                            detect_off_protocol_work_completed(&tc.content),
+                            Some(OffProtocolWorkKind::AsyncAgent)
+                        ),
                 });
             }
             if is_destructive(&tc.title, &args_preview) {
@@ -1307,6 +1311,21 @@ mod tests {
                 assert_eq!(*is_error, want_error);
                 assert_eq!(content, "file body");
             }
+        }
+
+        let marker = "Async agent launched successfully\nagentId: a1";
+        for (status, want) in [
+            (ToolCallStatus::Completed, true),
+            (ToolCallStatus::Failed, false),
+        ] {
+            let mut tc = AcpToolCall::new("tc-async", "Agent");
+            tc.status = status;
+            tc.content = vec![ToolCallContent::Content(Content::new(marker))];
+            let events = claude(SessionUpdate::ToolCall(tc));
+            assert!(
+                matches!(events.get(1), Some(Event::ToolCallCompleted { async_subagent, .. }) if *async_subagent == want),
+                "{status:?} {events:?}"
+            );
         }
     }
 
