@@ -488,6 +488,30 @@ describe("size owner", () => {
     }
   });
 
+  it("redials a live socket once it closes, without counting a retry or showing the reconnect banner", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => result.current.manualReconnect());
+      expect(ws.readyState).toBe(FakeWS.CLOSED);
+      expect(FakeWS.sockets).toHaveLength(1);
+      expect(result.current.state).toMatchObject({ connected: true, reconnecting: false });
+
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ connected: false, reconnecting: false, retryCount: 0 });
+
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      next.readyState = FakeWS.CLOSED;
+      act(() => next.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(result.current.state).toMatchObject({ reconnecting: true, retryCount: 1 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps retrying other closes without flagging a dead pane", () => {
     vi.useFakeTimers();
     try {

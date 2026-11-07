@@ -79,6 +79,8 @@ export function useLiveTerminal(
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryCountRef = useRef(0);
+  // A user redial of a live socket reconnects from onclose instead of backing off.
+  const redialRef = useRef(false);
   const connectRef = useRef<(() => void) | null>(null);
   const desiredRef = useRef<{
     resize: { cols: number; rows: number } | null;
@@ -136,6 +138,7 @@ export function useLiveTerminal(
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
+    redialRef.current = false;
     setState(() => INITIAL_STATE);
 
     let disposed = false;
@@ -309,9 +312,14 @@ export function useLiveTerminal(
         disposeInflater();
         ownerKnownRef.current = false;
         const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
+        const redial = redialRef.current;
+        redialRef.current = false;
         setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
         if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
+        } else if (redial) {
+          connect();
+          return;
         }
         if (retryCountRef.current < MAX_RETRIES) {
           retryCountRef.current += 1;
@@ -472,6 +480,14 @@ export function useLiveTerminal(
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
+    const ws = wsRef.current;
+    // Wait for onclose so the server releases this socket's size claim before the redial asks for it.
+    if (ws?.readyState === WebSocket.OPEN) {
+      redialRef.current = true;
+      setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
+      ws.close();
+      return;
+    }
     setState((prev) => ({
       ...prev,
       connected: false,
@@ -479,7 +495,6 @@ export function useLiveTerminal(
       retryCount: 0,
       retryCountdown: 0,
     }));
-    const ws = wsRef.current;
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       connectRef.current?.();
     } else {

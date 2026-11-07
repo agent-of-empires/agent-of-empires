@@ -30,7 +30,8 @@ vi.mock("../../hooks/useLiveTerminal", () => ({
   useLiveTerminal: (_id: unknown, _readOnly: unknown, _path: unknown, _clip: unknown, onGrid: () => void) => {
     live.onGridTransport = onGrid;
     return {
-      ...live,
+      state: live.state,
+      manualReconnect: live.manualReconnect,
       sendData: vi.fn(),
       sendPaste: vi.fn(),
       maxRetries: 7,
@@ -103,7 +104,7 @@ describe("LiveTerminalView pipe contention notice", () => {
 
   it("Retry reconnects the live terminal", async () => {
     await mountPiped();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry faster updates" }));
     expect(live.manualReconnect).toHaveBeenCalledTimes(1);
   });
 
@@ -123,10 +124,14 @@ describe("LiveTerminalView pipe contention notice", () => {
   });
 
   it("forgets a dismissal once a grid transport arrives", async () => {
-    const { rerender } = await mountPiped();
+    const { rerender, unmount } = await mountPiped();
     dismiss();
     act(() => live.onGridTransport?.());
     rerender(<LiveTerminalView session={makeSession({ id: "piped", status: "Running" })} />);
+    expect(pipeNotice()).not.toBeNull();
+    unmount();
+
+    await mountPiped();
     expect(pipeNotice()).not.toBeNull();
   });
 

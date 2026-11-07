@@ -48,21 +48,6 @@ const SURFACES = {
   },
 };
 
-function useStoredDismissal(key: string) {
-  const [stored, setStored] = useState(() => ({ key, dismissed: safeGetItem(key) !== null }));
-  const current = stored.key === key ? stored : { key, dismissed: safeGetItem(key) !== null };
-  if (current !== stored) setStored(current);
-  const setDismissed = useCallback(
-    (dismissed: boolean) => {
-      if (dismissed) safeSetItem(key, "1");
-      else safeRemoveItem(key);
-      setStored({ key, dismissed });
-    },
-    [key],
-  );
-  return [current.dismissed, setDismissed] as const;
-}
-
 /** Touch-device agent terminal: chrome around the capture-snapshot live pane (MobileLiveTerminal). */
 export function LiveTerminalView({ session, readOnly, active = true, surface = "agent", terminalIndex = 0 }: Props) {
   const base = SURFACES[surface];
@@ -97,11 +82,19 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     },
     [],
   );
-  // Each surface is its own pane, so a grid on one must not clear another's dismissal.
-  const [pipeNoticeDismissed, setPipeNoticeDismissed] = useStoredDismissal(
-    `aoe-live-pipe-notice-dismissed:${session.id}:${surface}:${terminalIndex}`,
-  );
-  const clearPipeNoticeDismissal = useCallback(() => setPipeNoticeDismissed(false), [setPipeNoticeDismissed]);
+  // Each surface is its own pane, so a grid on one must not clear another's dismissal. Callers key this view by
+  // session, surface and index, so the key is fixed for its lifetime.
+  const pipeNoticeKey = `aoe-live-pipe-notice-dismissed:${session.id}:${surface}:${terminalIndex}`;
+  const [pipeNoticeDismissed, setPipeNoticeDismissed] = useState(() => safeGetItem(pipeNoticeKey) !== null);
+  const dismissPipeNotice = useCallback(() => {
+    safeSetItem(pipeNoticeKey, "1");
+    setPipeNoticeDismissed(true);
+  }, [pipeNoticeKey]);
+  const clearPipeNoticeDismissal = useCallback(() => {
+    if (!pipeNoticeDismissed) return;
+    safeRemoveItem(pipeNoticeKey);
+    setPipeNoticeDismissed(false);
+  }, [pipeNoticeDismissed, pipeNoticeKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
     readOnly || ensureState === "ready" ? session.id : null,
@@ -433,13 +426,14 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
             <button
               type="button"
               onClick={reconnect}
+              aria-label="Retry faster updates"
               className="h-8 shrink-0 px-2 rounded-md text-brand-500 hover:text-brand-400 cursor-pointer underline"
             >
               Retry
             </button>
             <button
               type="button"
-              onClick={() => setPipeNoticeDismissed(true)}
+              onClick={dismissPipeNotice}
               aria-label="Dismiss slower updates notice"
               className="h-8 w-8 shrink-0 rounded-md text-text-muted hover:text-text-primary cursor-pointer text-base leading-none"
             >
