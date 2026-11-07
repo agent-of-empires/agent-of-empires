@@ -2253,6 +2253,17 @@
       ]
     },
     {
+      "id": "sidebar.popup-escape-keeps-selection",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSortPicker.test.tsx"],
+      "components": [
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/useOutsideDismiss.ts",
+        "web/src/components/sidebar/useSidebarSelection.ts"
+      ]
+    },
+    {
       "id": "sidebar.sort-live",
       "kind": "mocked-playwright",
       "risk": "medium",
