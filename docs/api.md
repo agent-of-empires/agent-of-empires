@@ -220,8 +220,10 @@ Install uses `POST /api/plugins/install/preview` with `source` and optional
 and `expected_fingerprint` set to the preview's `fingerprint`. Update uses
 `GET /api/plugins/{id}/update/preview` and
 `POST /api/plugins/{id}/update/apply` with `expected_fingerprint`.
-Update previews include a `notice` describing the source; the CLI shows it before
-applying the update.
+Update previews include a source `notice` and a fingerprint, including
+`no_update`. Explicit CLI updates reapply that pinned source to repair missing
+files; other consumers can keep treating `no_update` as no available version.
+The CLI shows the notice before applying.
 Uninstall uses `POST /api/plugins/{id}/uninstall`.
 Apply returns `202` with `job_id`; observe it through
 `GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.

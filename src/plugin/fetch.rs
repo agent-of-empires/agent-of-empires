@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,7 +13,7 @@ use crate::github::{GitHubClient, GitHubClientConfig, GitHubError, DEFAULT_USER_
 use super::source::PluginSource;
 
 pub struct FetchedPlugin {
-    _staging: tempfile::TempDir,
+    staging: Option<tempfile::TempDir>,
     pub tree: PathBuf,
     pub manifest: PluginManifest,
     pub manifest_bytes: Vec<u8>,
@@ -25,8 +26,68 @@ pub struct FetchedPlugin {
     pub asset_sha256: Option<String>,
 }
 
-pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
+impl FetchedPlugin {
+    pub(super) fn close(mut self) {
+        drop(self.staging.take());
+    }
+
+    pub(super) async fn cleanup(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || self.close())
+            .await
+            .context("plugin staging cleanup task failed")
+    }
+}
+
+impl Drop for FetchedPlugin {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            // Cancellation or validation failure must not remove a large tree on a runtime worker.
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(move || drop(staging))),
+                Err(_) => drop(staging),
+            }
+        }
+    }
+}
+
+pub(super) async fn fetch(
+    source: &PluginSource,
+    operation: Option<Arc<crate::session::StorageFlock>>,
+) -> Result<FetchedPlugin> {
     let plugins_root = super::plugins_dir()?;
+    let clone_url = source.github_clone_url();
+    let source = source.clone();
+    let mut fetched = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        stage(source, plugins_root, clone_url)
+    })
+    .await
+    .context("plugin preparation task failed")??;
+
+    if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &fetched.manifest.runtime {
+        if matches!(&fetched.source, PluginSource::Github { .. }) {
+            let (tag, name, sha) = download_release_binary(
+                &fetched.source,
+                &fetched.manifest,
+                asset,
+                bin.as_deref(),
+                &fetched.tree,
+                fetched.requested_ref.as_deref(),
+            )
+            .await?;
+            fetched.release_tag = Some(tag);
+            fetched.asset_name = Some(name);
+            fetched.asset_sha256 = Some(sha);
+        }
+    }
+    Ok(fetched)
+}
+
+fn stage(
+    source: PluginSource,
+    plugins_root: PathBuf,
+    clone_url: Option<String>,
+) -> Result<FetchedPlugin> {
     std::fs::create_dir_all(&plugins_root)
         .with_context(|| format!("creating {}", plugins_root.display()))?;
     let staging = tempfile::Builder::new()
@@ -35,18 +96,15 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
         .context("creating plugin staging dir")?;
     let tree = staging.path().join("tree");
 
-    let (requested_ref, resolved_commit) = match source {
+    let (requested_ref, resolved_commit) = match &source {
         PluginSource::Github { reference, .. } => {
-            let url = source
-                .github_clone_url()
-                .expect("github source yields a clone url");
-            let reference = reference.clone();
-            let tree_clone = tree.clone();
-            let sha = tokio::task::spawn_blocking(move || {
-                git_clone_checkout(&url, reference.as_deref(), &tree_clone)
-            })
-            .await
-            .context("git clone task panicked")??;
+            let sha = git_clone_checkout(
+                clone_url
+                    .as_deref()
+                    .expect("github source yields a clone url"),
+                reference.as_deref(),
+                &tree,
+            )?;
             (source.reference().map(String::from), Some(sha))
         }
         PluginSource::Local(path) => {
@@ -57,54 +115,27 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
             (None, None)
         }
     };
-
     let (manifest, manifest_bytes) = read_manifest(&tree)?;
-
     if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
         bail!(
             "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
             super::integrity::BUILD_OUTPUT_DIR
         );
     }
-
     // Hash before any release binary is injected so it matches `aoe plugin hash` on the checkout.
     let tree_hash = super::integrity::tree_hash(&tree)?;
-
-    let mut release_tag = None;
-    let mut asset_name = None;
-    let mut asset_sha256 = None;
-    if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &manifest.runtime {
-        match source {
-            PluginSource::Github { .. } => {
-                let (tag, name, sha) = download_release_binary(
-                    source,
-                    &manifest,
-                    asset,
-                    bin.as_deref(),
-                    &tree,
-                    requested_ref.as_deref(),
-                )
-                .await?;
-                release_tag = Some(tag);
-                asset_name = Some(name);
-                asset_sha256 = Some(sha);
-            }
-            PluginSource::Local(_) => {}
-        }
-    }
-
     Ok(FetchedPlugin {
-        _staging: staging,
+        staging: Some(staging),
         tree,
         manifest,
         manifest_bytes,
         tree_hash,
-        source: source.clone(),
+        source,
         requested_ref,
         resolved_commit,
-        release_tag,
-        asset_name,
-        asset_sha256,
+        release_tag: None,
+        asset_name: None,
+        asset_sha256: None,
     })
 }
 

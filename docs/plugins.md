@@ -61,6 +61,10 @@ Git URLs. Updates retain the recorded source and development marker.
 Preview may fetch into temporary staging but never builds, provisions Node,
 grants capabilities, or publishes the plugin. Approval pins the fetched content;
 `--yes` skips prompts, not the fingerprint check.
+Source-tree preparation and cleanup run off Daemon runtime workers. Cancellation
+keeps mutation exclusion until an already-running preparation finishes.
+Explicit CLI updates reapply even unchanged sources, so they can restore missing
+plugin files. They use the preview fingerprint and preserve the enabled state.
 
 An incompatible or malformed update preview stops before submission. Check the
 Client and Daemon versions, then upgrade and restart the Daemon on its host with

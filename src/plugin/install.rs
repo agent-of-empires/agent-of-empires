@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::agent_integration::AgentIntegrationContribution;
@@ -67,9 +68,10 @@ impl OperationLog {
 
 const OPERATION_LOCK: &str = ".plugin-operation.lock";
 
-fn begin_operation() -> Result<StorageFlock> {
+fn begin_operation() -> Result<Arc<StorageFlock>> {
     crate::session::try_acquire_storage_flock(&crate::session::get_app_dir()?, OPERATION_LOCK)
         .context("acquiring plugin operation lock")?
+        .map(Arc::new)
         .ok_or_else(|| {
             anyhow!("another plugin operation is running; inspect its outcome before retrying")
         })
@@ -235,7 +237,10 @@ pub struct UpdateConsent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpdatePreview {
-    NoUpdate,
+    NoUpdate {
+        fingerprint: String,
+        notice: String,
+    },
     SafeUpdate {
         to_version: String,
         fingerprint: String,
@@ -278,13 +283,17 @@ pub struct InstallConsent {
     pub fingerprint: String,
 }
 
-async fn prepare_install(input: &str, dev: bool) -> Result<PreparedInstall> {
+async fn prepare_install(
+    input: &str,
+    dev: bool,
+    operation: Option<Arc<StorageFlock>>,
+) -> Result<PreparedInstall> {
     let source = PluginSource::parse(input)?;
     if dev && !matches!(source, PluginSource::Local(_)) {
         bail!("--dev requires a local plugin directory");
     }
     let resolved = resolve_source(source, true).await?;
-    let fetched = fetch::fetch(&resolved.source).await?;
+    let fetched = fetch::fetch(&resolved.source, operation).await?;
 
     let id = fetched.manifest.id.as_str().to_string();
     let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
@@ -393,7 +402,7 @@ fn apply_prepared_install(
 
 pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<InstallReport> {
     let operation = begin_operation()?;
-    let prepared = prepare_install(input, dev).await?;
+    let prepared = prepare_install(input, dev, Some(operation.clone())).await?;
     eprintln!("{}", prepared.notice);
     if prepared.unverified && !assume_yes && !confirm_unverified()? {
         bail!("install cancelled; the unverified source was not approved");
@@ -422,22 +431,24 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
+        let result = apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit);
+        prepared.fetched.close();
+        result
     })
     .await
     .context("plugin install task failed")?
 }
 
 pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
-    let p = prepare_install(input, dev).await?;
-    Ok(InstallConsent {
-        id: p.id.clone(),
+    let p = prepare_install(input, dev, None).await?;
+    let consent = InstallConsent {
+        id: p.id,
         version: p.fetched.manifest.version.clone(),
-        source: p.persisted_source.clone(),
-        notice: p.notice.clone(),
+        source: p.persisted_source,
+        notice: p.notice,
         unverified: p.unverified,
         validation: p.validation.as_str().to_string(),
-        capabilities: p.capabilities.clone(),
+        capabilities: p.capabilities,
         ui: p
             .fetched
             .manifest
@@ -453,8 +464,10 @@ pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
             .map(|s| s.command.join(" "))
             .collect(),
         agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
-        fingerprint: p.fingerprint.clone(),
-    })
+        fingerprint: p.fingerprint,
+    };
+    p.fetched.cleanup().await?;
+    Ok(consent)
 }
 
 pub async fn apply_install(
@@ -464,7 +477,7 @@ pub async fn apply_install(
     log: OperationLog,
 ) -> Result<InstallReport> {
     let operation = begin_operation()?;
-    let prepared = prepare_install(input, dev).await?;
+    let prepared = prepare_install(input, dev, Some(operation.clone())).await?;
     if prepared.fingerprint != expected_fingerprint {
         bail!(
             "the plugin at {input} changed since it was shown; review it again before installing"
@@ -473,7 +486,9 @@ pub async fn apply_install(
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        apply_prepared_install(&prepared, &node_env, &log)
+        let result = apply_prepared_install(&prepared, &node_env, &log);
+        prepared.fetched.close();
+        result
     })
     .await
     .context("plugin install task failed")?
@@ -575,7 +590,11 @@ fn agent_integrations_changed(
     })
 }
 
-async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> {
+async fn prepare_update(
+    id: &str,
+    allow_local_source: bool,
+    operation: Option<Arc<StorageFlock>>,
+) -> Result<Prepared> {
     let config = Config::load()?;
     let plugin_config = config
         .plugins
@@ -593,7 +612,7 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
         bail!("local plugin directories and --dev require a verified local Unix socket peer");
     }
     let resolved = resolve_source(source, false).await?;
-    let fetched = fetch::fetch(&resolved.source).await?;
+    let fetched = fetch::fetch(&resolved.source, operation).await?;
     if fetched.manifest.id.as_str() != id {
         bail!(
             "source {source_str:?} now resolves to plugin {:?}, not {id}",
@@ -612,6 +631,7 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
             .as_ref()
             .is_some_and(|grant| super::registry::grant_covers(grant, manifest, hash))
     });
+    let prior_grant = prior_grant.filter(|_| grant_valid);
     let installed_matches_source = grant_valid
         && installed
             .as_ref()
@@ -787,7 +807,7 @@ fn apply_prepared(
 
 async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
     let operation = begin_operation()?;
-    let prepared = prepare_update(id, true).await?;
+    let prepared = prepare_update(id, true, Some(operation.clone())).await?;
     if mode != ConsentMode::CleanOnlyNonInteractive {
         eprintln!("{}", prepared.notice);
     }
@@ -842,7 +862,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
 async fn finish_update<F, Fut>(
     prepared: Prepared,
     grant: Option<CapabilityGrant>,
-    operation: StorageFlock,
+    operation: Arc<StorageFlock>,
     provision: F,
 ) -> Result<UpdateOutcome>
 where
@@ -853,7 +873,9 @@ where
     let node_env = provision(prepared.fetched.manifest.clone()).await;
     let report = tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit)
+        let result = apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit);
+        prepared.fetched.close();
+        result
     })
     .await
     .context("plugin update task failed")??;
@@ -912,30 +934,38 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
 }
 
 pub async fn preview_update(id: &str, allow_local_source: bool) -> Result<UpdatePreview> {
-    let prepared = prepare_update(id, allow_local_source).await?;
-    if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint)
+    let prepared = prepare_update(id, allow_local_source, None).await?;
+    let preview = if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint)
         && prepared.installed_matches_source
     {
-        return Ok(UpdatePreview::NoUpdate);
-    }
-    let changelog = changelog_of(&prepared).await;
-    if !prepared.needs_consent {
-        return Ok(UpdatePreview::SafeUpdate {
-            to_version: prepared.fetched.manifest.version.clone(),
-            fingerprint: prepared.fingerprint.clone(),
-            changelog,
+        UpdatePreview::NoUpdate {
+            fingerprint: prepared.fingerprint,
             notice: prepared.notice,
-        });
-    }
-    let dismissed = Config::load()
-        .ok()
-        .and_then(|c| c.plugins.get(id).and_then(|p| p.dismissed_update.clone()))
-        == Some(prepared.fingerprint.clone());
-    Ok(UpdatePreview::ConsentRequired {
-        consent: Box::new(consent_of(&prepared, changelog)),
-        dismissed,
-        notice: prepared.notice,
-    })
+        }
+    } else {
+        let changelog = changelog_of(&prepared).await;
+        if !prepared.needs_consent {
+            UpdatePreview::SafeUpdate {
+                to_version: prepared.fetched.manifest.version.clone(),
+                fingerprint: prepared.fingerprint,
+                changelog,
+                notice: prepared.notice,
+            }
+        } else {
+            let dismissed = Config::load()
+                .ok()
+                .and_then(|c| c.plugins.get(id).and_then(|p| p.dismissed_update.clone()))
+                .as_deref()
+                == Some(prepared.fingerprint.as_str());
+            UpdatePreview::ConsentRequired {
+                consent: Box::new(consent_of(&prepared, changelog)),
+                dismissed,
+                notice: prepared.notice,
+            }
+        }
+    };
+    prepared.fetched.cleanup().await?;
+    Ok(preview)
 }
 
 pub async fn apply_update(
@@ -945,7 +975,7 @@ pub async fn apply_update(
     log: OperationLog,
 ) -> Result<InstallReport> {
     let operation = begin_operation()?;
-    let prepared = prepare_update(id, allow_local_source).await?;
+    let prepared = prepare_update(id, allow_local_source, Some(operation.clone())).await?;
     match &expected_fingerprint {
         Some(expected) if *expected != prepared.fingerprint => {
             bail!(
@@ -965,7 +995,9 @@ pub async fn apply_update(
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        apply_prepared(&prepared, grant, &node_env, &log)
+        let result = apply_prepared(&prepared, grant, &node_env, &log);
+        prepared.fetched.close();
+        result
     })
     .await
     .context("plugin update task failed")?
@@ -1674,7 +1706,7 @@ mod tests {
             std::future::ready(NodeEnv::new())
         };
 
-        let declined = prepare_update("acme.upd", true).await.unwrap();
+        let declined = prepare_update("acme.upd", true, None).await.unwrap();
         assert!(declined.needs_consent);
         let err = finish_update(declined, None, begin_operation().unwrap(), provision)
             .await
@@ -1684,7 +1716,7 @@ mod tests {
         assert!(!installed.join("built").exists());
         assert_eq!(installed_version(), "0.1.0");
 
-        let approved = prepare_update("acme.upd", true).await.unwrap();
+        let approved = prepare_update("acme.upd", true, None).await.unwrap();
         let grant = CapabilityGrant {
             manifest_hash: approved.manifest_hash.clone(),
             capabilities: approved.capabilities.clone(),
@@ -1914,7 +1946,7 @@ mod tests {
         let _reload = super::super::ReloadRegistryOnDrop;
         let _home = isolate_app_dir();
         let source = tempfile::tempdir().unwrap();
-        let effects = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir_in("/tmp").unwrap();
         let node = super::super::write_fake_node(effects.path(), "node");
         let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
         let manifest = format!(
@@ -2036,5 +2068,130 @@ mod tests {
             drop(lease);
         }
         uninstall(ID).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn source_preparation_keeps_runtime_and_exclusion_through_cancellation() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct ReleasePreparation {
+            release: Option<mpsc::Sender<()>>,
+            controller: Option<std::thread::JoinHandle<bool>>,
+            abort: Option<tokio::task::AbortHandle>,
+        }
+        impl ReleasePreparation {
+            fn finish(mut self) -> bool {
+                let _ = self.release.take().unwrap().send(());
+                self.controller.take().unwrap().join().unwrap()
+            }
+        }
+        impl Drop for ReleasePreparation {
+            fn drop(&mut self) {
+                if let Some(abort) = self.abort.take() {
+                    abort.abort();
+                }
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(controller) = self.controller.take() {
+                    let _ = controller.join();
+                }
+            }
+        }
+
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().to_str().unwrap().to_owned();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.preparation\"\nname = \"Preparation\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let consent = preview_install(&input, false).await.unwrap();
+        let fifo = source.path().join("held-source");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let root = super::super::plugins_dir().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let controller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let tree = loop {
+                let tree = std::fs::read_dir(&root)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .find_map(|entry| {
+                        let tree = entry.path().join("tree");
+                        (entry.file_name().to_string_lossy().starts_with(".staging-")
+                            && tree.is_dir())
+                        .then_some(tree)
+                    });
+                if let Some(tree) = tree {
+                    break tree;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let _ = started_tx.send(());
+            let requested = release_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+            let writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tree.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(writer);
+            requested
+        });
+        let mut release = ReleasePreparation {
+            release: Some(release_tx),
+            controller: Some(controller),
+            abort: None,
+        };
+        let operation = tokio::spawn(async move {
+            apply_install(&input, &consent.fingerprint, false, OperationLog::Inherit).await
+        });
+        release.abort = Some(operation.abort_handle());
+        tokio::time::timeout(Duration::from_secs(35), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        assert!(begin_operation().is_err());
+        assert!(
+            release.finish(),
+            "runtime made no progress before the preparation watchdog released"
+        );
+        let _operation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(operation) = begin_operation() {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!Config::load()
+            .unwrap()
+            .plugins
+            .contains_key("acme.preparation"));
+        assert!(!super::super::plugins_dir()
+            .unwrap()
+            .join("acme.preparation")
+            .exists());
     }
 }

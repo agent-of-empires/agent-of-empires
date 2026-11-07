@@ -1542,19 +1542,39 @@ async fn unchanged_sources_repair_missing_or_stale_approval() {
             "id = \"{id}\"\nname = \"Repair\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = {capabilities}\n"
         );
         let dir = write_plugin_dir(source.path(), &manifest);
+        let worker = dir.join("worker.js");
+        if index == 0 {
+            std::fs::write(&worker, b"original worker bytes").unwrap();
+        }
         let dev = index == 0;
         install::install(dir.to_str().unwrap(), true, dev)
             .await
             .unwrap();
         assert!(matches!(
             install::preview_update(&id, true).await.unwrap(),
-            UpdatePreview::NoUpdate
+            UpdatePreview::NoUpdate { .. }
         ));
         install::set_enabled(&id, false).unwrap();
-        assert!(matches!(
-            install::preview_update(&id, true).await.unwrap(),
-            UpdatePreview::NoUpdate
-        ));
+        let preview = install::preview_update(&id, true).await.unwrap();
+        if index == 0 {
+            let UpdatePreview::NoUpdate { fingerprint, .. } = preview else {
+                panic!("unchanged source should remain current");
+            };
+            let installed_worker = agent_of_empires::plugin::plugins_dir()
+                .unwrap()
+                .join(&id)
+                .join("worker.js");
+            std::fs::remove_file(&installed_worker).unwrap();
+            install::apply_update(&id, Some(fingerprint), true, install::OperationLog::Inherit)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(installed_worker).unwrap(),
+                b"original worker bytes"
+            );
+        } else {
+            assert!(matches!(preview, UpdatePreview::NoUpdate { .. }));
+        }
         assert!(!Config::load().unwrap().plugins[&id].enabled);
         install::set_enabled(&id, true).unwrap();
 
@@ -1576,6 +1596,7 @@ async fn unchanged_sources_repair_missing_or_stale_approval() {
         let fingerprint = match install::preview_update(&id, true).await.unwrap() {
             UpdatePreview::ConsentRequired { consent, .. } => {
                 assert!(!consent.stays_active_if_declined);
+                assert_eq!(consent.added_capabilities, consent.new_capabilities);
                 consent.fingerprint
             }
             other => panic!("repair needs explicit approval: {other:?}"),
@@ -1612,7 +1633,7 @@ async fn unchanged_sources_repair_missing_or_stale_approval() {
         assert_eq!(config.plugins[&id].dev, dev);
         assert!(matches!(
             install::preview_update(&id, true).await.unwrap(),
-            UpdatePreview::NoUpdate
+            UpdatePreview::NoUpdate { .. }
         ));
         install::uninstall(&id).unwrap();
     }

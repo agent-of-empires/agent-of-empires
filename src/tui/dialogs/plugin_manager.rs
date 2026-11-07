@@ -1100,7 +1100,7 @@ impl PluginManagerDialog {
                     self.pending = None;
                     self.loading = None;
                     match result {
-                        Ok(UpdatePreview::NoUpdate) => {
+                        Ok(UpdatePreview::NoUpdate { .. }) => {
                             self.info = Some("Already up to date.".to_string());
                         }
                         Ok(UpdatePreview::SafeUpdate {

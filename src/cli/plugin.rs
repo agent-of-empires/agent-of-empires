@@ -341,11 +341,11 @@ async fn run_update(id: &str, yes: bool) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let fingerprint = match preview {
-        UpdatePreview::NoUpdate => {
-            println!("{id} is already up to date.");
-            return Ok(());
+        UpdatePreview::NoUpdate {
+            fingerprint,
+            notice,
         }
-        UpdatePreview::SafeUpdate {
+        | UpdatePreview::SafeUpdate {
             fingerprint,
             notice,
             ..
