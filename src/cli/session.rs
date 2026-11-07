@@ -493,17 +493,16 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         inst.kill_all_tmux_sessions_locked()?;
     }
 
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
-            stored.archive();
-            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    })?;
-    if landed {
+    let archived_structured = archive_row(&storage, &id)?;
+    if let Some(structured) = archived_structured {
         println!("Archived: {}", title);
+        if structured {
+            super::acp::stop_runner(&id).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "{title} is archived, but its agent runner could not be stopped: {error:#}"
+                )
+            })?;
+        }
         Ok(())
     } else {
         bail!(
@@ -511,6 +510,19 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
             title
         );
     }
+}
+
+/// Archives the stored row; `Some(structured)` is that row's view at the moment it was
+/// archived, so a view switch between the caller's snapshot and the lock is not missed.
+fn archive_row(storage: &Storage, id: &str) -> Result<Option<bool>> {
+    storage.update(|instances, _groups| {
+        let Some(stored) = instances.iter_mut().find(|i| i.id == id) else {
+            return Ok(None);
+        };
+        stored.archive();
+        stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
+        Ok(Some(stored.is_structured()))
+    })
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -3813,5 +3825,41 @@ mod wait_decision_tests {
         let mut converted = adopted;
         converted.view = crate::session::View::Structured;
         assert!(adopt_stored(&live, converted).is_err());
+    }
+}
+
+#[cfg(test)]
+mod archive_row_tests {
+    use super::archive_row;
+    use crate::session::{Instance, Storage, View};
+
+    #[test]
+    #[serial_test::serial]
+    fn archive_row_reports_the_view_of_the_row_it_archives() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("archive-row").unwrap();
+        let mut row = Instance::new("switching", "/tmp/archive-row");
+        row.source_profile = "archive-row".into();
+        let id = row.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = storage.load().unwrap().remove(0);
+        assert!(!snapshot.is_structured());
+
+        // A completed Terminal to Structured switch lands after the caller's snapshot.
+        storage
+            .update(|rows, _| {
+                rows[0].view = View::Structured;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(archive_row(&storage, &id).unwrap(), Some(true));
+        assert!(storage.load().unwrap()[0].is_archived());
+        assert_eq!(archive_row(&storage, "no-such-row").unwrap(), None);
     }
 }
