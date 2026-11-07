@@ -201,7 +201,7 @@ pub struct TaskOutputResponse {
     /// False when the file is gone or lives off this host (sandboxed session).
     pub exists: bool,
     pub output: String,
-    /// The file exceeded the read window, so the output starts mid-file.
+    /// The output was cut: the file exceeded the read window or the line cap, so only its end is shown.
     pub truncated: bool,
 }
 
