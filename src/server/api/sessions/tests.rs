@@ -11875,3 +11875,219 @@ async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
         );
     }
 }
+
+fn account_swap_body(tool: Option<&str>) -> crate::daemon::RestartSessionBody {
+    crate::daemon::RestartSessionBody {
+        tool: tool.map(str::to_owned),
+        require_account_carry: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_required_account_swap_refuses_what_would_start_a_fresh_conversation() {
+    let mut row = Instance::new("claude-row", "/tmp/claude-row");
+    row.tool = "claude".into();
+    let refusal = |row: &Instance, body: &crate::daemon::RestartSessionBody| {
+        lifecycle::account_swap_refusal(row, body)
+    };
+
+    let mut plain = account_swap_body(Some("claude-b"));
+    plain.require_account_carry = false;
+    assert_eq!(
+        refusal(&row, &plain),
+        None,
+        "a plain restart keeps park semantics"
+    );
+
+    assert!(refusal(&row, &account_swap_body(None))
+        .unwrap()
+        .contains("needs the tool"));
+    assert!(refusal(&row, &account_swap_body(Some("claude")))
+        .unwrap()
+        .contains("already runs as 'claude'"));
+    // No recorded conversation: the swap would park and start fresh.
+    assert!(refusal(&row, &account_swap_body(Some("claude-b")))
+        .unwrap()
+        .contains("without losing the conversation"));
+
+    let mut command = account_swap_body(Some("claude-b"));
+    command.command_override = Some("codex".into());
+    assert!(refusal(&row, &command).unwrap().contains("launch command"));
+    assert!(
+        !serde_json::to_string(&crate::daemon::RestartSessionBody::default())
+            .unwrap()
+            .contains("require_account_carry"),
+        "an older daemon rejects the field, so a plain restart must not send it"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_account_swap_stops_nothing() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("swap-refused", "/tmp/swap-refused");
+    inst.id = "swap-refused".to_string();
+    inst.source_profile = "default".into();
+    inst.tool = "claude".into();
+    inst.view = crate::session::View::Structured;
+    inst.status = Status::Idle;
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = lifecycle::prepare_agent_session(
+        state.clone(),
+        "swap-refused".to_string(),
+        Ok(None),
+        lifecycle::AgentPreparation::Restart,
+        Some(Arc::new(account_swap_body(Some("claude-b")))),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "account_swap_unavailable");
+    let instances = state.instances.read().await;
+    assert_eq!(instances[0].status, Status::Idle);
+    assert_eq!(instances[0].tool, "claude");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prompt() {
+    use crate::acp::Event;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut rows = Vec::new();
+    for id in [
+        "parked",
+        "explicit",
+        "superseded",
+        "nothing-to-replay",
+        "unparked",
+    ] {
+        let mut row = Instance::new(id, project.path().to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        rows.push(row);
+    }
+    crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
+    let state = crate::server::test_support::build_test_app_state(rows);
+    let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
+    let prompt = || Event::UserPromptSent {
+        text: "finish the migration".into(),
+        attachments: Vec::new(),
+        prompt_id: None,
+        synthesized: false,
+        origin_plugin: None,
+    };
+    let limit = || Event::RateLimit {
+        info: crate::acp::state::RateLimitInfo {
+            status: "limited".into(),
+            resets_at: Some(resets_at),
+            kind: "usage".into(),
+        },
+    };
+    let stopped = || Event::Stopped {
+        reason: "rate_limited".into(),
+    };
+    for id in ["parked", "explicit", "superseded"] {
+        for (seq, event) in [prompt(), limit(), stopped()].iter().enumerate() {
+            state
+                .acp_event_store
+                .record(id, u64::try_from(seq).unwrap() + 1, event)
+                .unwrap();
+        }
+    }
+    // Retention removed the interrupted prompt: only the limit remains.
+    for (seq, event) in [limit(), stopped()].iter().enumerate() {
+        state
+            .acp_event_store
+            .record("nothing-to-replay", u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    state.acp_supervisor.hydrate_seqs(
+        ["parked", "explicit", "superseded", "nothing-to-replay"]
+            .map(|id| (id.to_string(), state.acp_event_store.highest_seq(id))),
+    );
+
+    let probe = |id: &'static str| {
+        let state = state.clone();
+        async move { crate::server::api::acp::rate_limit_resume_probe(&state, id).await }
+    };
+    assert!(probe("parked").await.is_some());
+    assert_eq!(
+        probe("unparked").await,
+        None,
+        "not parked: the wake message stays"
+    );
+
+    let generations: std::collections::HashMap<String, u64> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .map(|row| (row.id.clone(), row.lifecycle_generation))
+        .collect();
+    let generation = |id: &str| generations[id];
+    let pending = |id: &str| {
+        crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .pending_initial_turn
+            .map(|turn| turn.text)
+    };
+    let breadcrumbs = |id: &str| {
+        state
+            .acp_event_store
+            .replay_from(id, 1)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, Event::RateLimitAutoResumed { manual: true, .. }))
+            .count()
+    };
+
+    let g = generation("parked");
+    assert!(
+        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false).await,
+        "the interrupted prompt is the next turn, so no wake message"
+    );
+    assert_eq!(pending("parked").as_deref(), Some("finish the migration"));
+    assert_eq!(breadcrumbs("parked"), 1);
+
+    let g = generation("explicit");
+    assert!(
+        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true).await,
+        "an explicit wake message keeps precedence"
+    );
+    assert_eq!(pending("explicit"), None);
+    assert_eq!(breadcrumbs("explicit"), 1, "the budget is still disarmed");
+
+    let g = generation("superseded") + 1;
+    assert!(
+        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false).await
+    );
+    assert_eq!(
+        pending("superseded"),
+        None,
+        "a superseded restart installs nothing"
+    );
+    assert_eq!(breadcrumbs("superseded"), 0);
+
+    let g = generation("nothing-to-replay");
+    assert!(
+        !lifecycle::continue_interrupted_prompt(&state, "nothing-to-replay", g, resets_at, false)
+            .await,
+        "no turn to deliver: the default wake message must still go out"
+    );
+    assert_eq!(breadcrumbs("nothing-to-replay"), 1);
+}
