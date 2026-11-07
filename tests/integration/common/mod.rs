@@ -88,10 +88,14 @@ pub fn disable_systemd_scopes(app_dir: &Path) {
 /// Point `HOME` (and `XDG_CONFIG_HOME`) at a fresh temp dir; drop the guard to
 /// restore. `set_var` is not thread-safe, so callers must be `#[serial]`.
 ///
-/// Rooted in `/tmp` because the Daemon socket lives under the home and macOS
-/// `$TMPDIR` overflows the 104-byte `sun_path` limit.
+/// Rooted in `/tmp` on macOS because the Daemon socket lives under the home and
+/// `$TMPDIR` overflows the 104-byte `sun_path` limit. Elsewhere the default root
+/// is kept, since fixtures execute files under the home and `/tmp` may be noexec.
 pub fn setup_temp_home() -> TestHome {
+    #[cfg(target_os = "macos")]
     let temp = TempDir::new_in("/tmp").unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let temp = TempDir::new().unwrap();
     let env = set_temp_home(temp.path());
     TestHome { env, temp }
 }
