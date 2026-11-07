@@ -982,6 +982,14 @@
       "notes": "A toast that opens a session (in-app push) or a validated URL (plugin ui.open_url) renders its message as a native button before Dismiss in tab order: activating it opens the target once and dismisses the toast, a click elsewhere on the toast still opens it, and Dismiss closes it without navigating. Plain toasts keep a non-interactive message; status and alert roles are unchanged."
     },
     {
+      "id": "notifications.linked-toasts-keyboard",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/toast-keyboard.spec.ts"],
+      "components": ["web/src/components/Toasts.tsx"],
+      "notes": "In a real browser, a session push toast and a plugin ui.open_url link toast are reached with Tab (the opener first, Dismiss after it); Enter or Space opens the target exactly once (window.open and the open-session event are counted), and Dismiss from the keyboard removes the toast without opening anything."
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",
