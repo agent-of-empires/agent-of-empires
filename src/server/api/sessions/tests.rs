@@ -4690,10 +4690,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
         )
         .unwrap();
         assert_eq!(failure.code, code);
-        assert_eq!(
-            failure.message.chars().count(),
-            crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS
-        );
+        assert_eq!(failure.message.chars().count(), 1024);
         let registry = crate::server::create_progress::CreateProgressRegistry::default();
         registry.record_failure("long", failure.clone());
         assert_eq!(registry.recent_failure("long").unwrap(), failure);
@@ -9236,6 +9233,112 @@ async fn a_dropped_failing_create_logs_the_reference_its_retry_replays() {
     assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
     let reference = failed["reference"].as_str().unwrap();
     assert_eq!(failure_log_lines(&log, reference), 1);
+}
+
+/// The log line behind a reference carries the whole cause chain, not just the
+/// outermost context.
+#[test]
+fn the_failure_log_names_a_context_wrapped_cause() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let error = anyhow::Error::new(GitError::NotAGitRepo).context("Worktree mode needs a repo");
+    log_create_failure(
+        &error,
+        crate::server::create_progress::CreateStage::Preparing,
+        "ref-chain",
+    );
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("Worktree mode needs a repo"), "{logged}");
+    assert!(
+        logged.contains(&GitError::NotAGitRepo.to_string()),
+        "{logged}"
+    );
+}
+
+/// A create that panics after its request is gone is still logged under its reference
+/// and recorded, so a same-key retry replays it instead of running the create again.
+#[tokio::test]
+async fn a_panicking_create_nobody_awaits_is_logged_and_replayed() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let failures = Arc::new(crate::server::create_progress::CreateProgressRegistry::default());
+    let progress = Arc::new(crate::server::create_progress::CreateProgress::default());
+    drop(tokio::spawn({
+        let (failures, progress) = (Arc::clone(&failures), Arc::clone(&progress));
+        async move {
+            run_create_task(
+                async { panic!("create blew up") as anyhow::Result<()> },
+                &failures,
+                &progress,
+                Some("dropped-panic"),
+                "ref-panic",
+            )
+            .await
+        }
+    }));
+
+    wait_for("the panic to be recorded", || {
+        failures.recent_failure("dropped-panic").is_some()
+    })
+    .await;
+    let failure = failures.recent_failure("dropped-panic").unwrap();
+    assert_eq!(
+        failure.status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(failure.code, "internal");
+    assert_eq!(failure.reference, "ref-panic");
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(logged.matches("reference=ref-panic").count(), 1, "{logged}");
+    assert!(logged.contains("create blew up"), "{logged}");
+}
+
+/// A create that panics after its request was dropped is replayed to a same-key retry
+/// with the reference it was logged under, and does not run again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_panicking_create_is_replayed_to_its_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let body = serde_json::json!({
+        "title": "dropped-panic", "path": "", "tool": "claude", "scratch": true,
+        "view": "structured", "profile": "test", "idempotency_key": "drop-panic",
+    });
+
+    let release = create::panic_hook::arm("drop-panic");
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the create to be registered", || {
+        state.create_progress.snapshot("drop-panic", None).is_some()
+    })
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.notify_one();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "{failed}"
+    );
+    assert_eq!(failed["error"], "internal", "{failed}");
+    let reference = failed["reference"].as_str().unwrap();
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logged.matches(&format!("reference={reference}")).count(),
+        1,
+        "{logged}"
+    );
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 /// Repo approval covers only the repo's own commands, so a failing global or profile
