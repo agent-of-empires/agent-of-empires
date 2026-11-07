@@ -304,8 +304,17 @@ pub(crate) enum SendTurnError {
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
     RevivalRefused,
+    /// Post-publish: the forward found the resumed worker gone.
+    WorkerLostAfterPublish,
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
+}
+
+impl SendTurnError {
+    /// Whether the prompt reached the transcript before this error.
+    pub(crate) fn published(&self) -> bool {
+        matches!(self, Self::WorkerLostAfterPublish | Self::Send(_))
+    }
 }
 
 /// Outcome of [`SessionService::touch_and_wake_on_prompt`].
@@ -355,7 +364,7 @@ impl std::fmt::Display for SendTurnError {
             Self::NotOwner => write!(f, "session was not created by the calling plugin"),
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
-            Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
@@ -1021,7 +1030,7 @@ impl SessionService {
             Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
-                Err(SendTurnError::WorkerNotReady)
+                Err(SendTurnError::WorkerLostAfterPublish)
             }
             Err(e) => Err(SendTurnError::Send(e)),
         }

@@ -134,7 +134,9 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::Turn(e)) => match e {
             SendTurnError::SessionNotFound => session_not_found(),
             SendTurnError::ResumeFailed(e) => resume_failed_response(&e),
-            SendTurnError::WorkerNotReady => worker_not_ready(),
+            SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
+                worker_not_ready()
+            }
             SendTurnError::RevivalRefused => no_revive_refused(),
             // Unreachable for a User caller.
             SendTurnError::NotOwner => {
@@ -171,11 +173,10 @@ pub(crate) struct PromptSubmitted {
 
 /// Why [`submit_prompt`] did not deliver a prompt.
 ///
-/// `Enqueue`, and every `Turn` error except `Turn(RevivalRefused)`, come after the pending
-/// initial turn was cleared. The other variants leave the transcript, the queue and the
-/// pending initial turn as they were, though the session may already have been woken. A
-/// `Turn` error can also come after the prompt was published, so the transcript may show a
-/// prompt the agent never received.
+/// Every `Turn` error for which [`SendTurnError::published`] holds comes after the pending
+/// initial turn was cleared, and the transcript may show a prompt the agent never received.
+/// The other variants leave the transcript, the queue and the pending initial turn as they
+/// were, though the session may already have been woken.
 pub(crate) enum PromptSubmitError {
     SessionNotFound,
     RevivalRefused,
@@ -267,12 +268,11 @@ pub(crate) async fn submit_prompt(
         return Err(PromptSubmitError::RevivalRefused);
     }
     if let PromptDispatch::Queued { reason } = dispatch {
-        // A fresh prompt supersedes a queued rate-limit continuation (#3028).
-        // Only once queueing is certain: a `no_revive` refusal above must
-        // leave it in place (#4081 review).
-        state.session_service.clear_pending_initial_turn(id).await;
+        // A fresh prompt supersedes a queued rate-limit continuation (#3028),
+        // but only once it is queued: a refusal must leave it in place (#4081 review).
         // The named row is already the parked copy; queueing again would duplicate it.
         if let Some(row) = &queued_row {
+            state.session_service.clear_pending_initial_turn(id).await;
             return Ok(PromptSubmitted {
                 dispatch,
                 queued_id: Some(row.id.clone()),
@@ -295,6 +295,7 @@ pub(crate) async fn submit_prompt(
         .await
         {
             Ok(entry) => {
+                state.session_service.clear_pending_initial_turn(id).await;
                 tracing::debug!(
                     target: "acp.queue",
                     session = %id,
@@ -363,9 +364,9 @@ pub(crate) async fn submit_prompt(
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-    // but only once delivery is certain: a `no_revive` refusal must leave
-    // the pending turn in place (#4081 review).
-    if !matches!(outcome, Err(SendTurnError::RevivalRefused)) {
+    // but only once it is published: a prompt refused before that must leave
+    // the pending turn in place (#4081 review, #5253).
+    if outcome.as_ref().err().is_none_or(SendTurnError::published) {
         state.session_service.clear_pending_initial_turn(id).await;
     }
     let seq = outcome.map_err(PromptSubmitError::Turn)?;
