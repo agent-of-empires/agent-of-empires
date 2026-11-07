@@ -45,6 +45,9 @@ fn is_serve_daemon_child(cli: &Cli) -> bool {
 
 /// Reject disabled Web starts while keeping lifecycle controls available.
 fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
+    if !cli::graft::serve_start_blocked(cli, true) {
+        return None;
+    }
     let config = agent_of_empires::session::Config::load_or_warn();
     cli::graft::serve_start_blocked(cli, cli::graft::web_disabled(&config)).then(|| {
         Cli::command().error(
