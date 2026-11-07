@@ -2723,6 +2723,10 @@ pub(super) fn validate_managed_arguments(
                 agent.name != "prime-agent" || inline.is_none(),
                 "Prime options require a separate value"
             );
+            anyhow::ensure!(
+                agent.name != "pi" || key != "--thinking" || inline.is_none(),
+                "pi requires --thinking and its value as separate arguments"
+            );
             let value = if let Some(value) = inline {
                 value
             } else {
@@ -4174,7 +4178,7 @@ mod tests {
     fn managed_thinking_option_is_accepted_for_pi_only() {
         for (name, arguments, allowed) in [
             ("pi", "--model x --thinking medium", true),
-            ("pi", "--thinking=medium", true),
+            ("pi", "--thinking=medium", false),
             ("pi", "--thinking", false),
             ("kimi", "--thinking medium", false),
         ] {
