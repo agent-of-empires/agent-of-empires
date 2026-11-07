@@ -385,7 +385,11 @@ impl Instance {
                 })
             }
         } else {
-            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool)
+            tmux::detect_status_from_content_unowned(
+                &self.source_profile,
+                &pane_content,
+                &pane_tool,
+            )
         };
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",

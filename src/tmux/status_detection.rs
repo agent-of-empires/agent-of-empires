@@ -14,6 +14,12 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
     if crate::plugin::agent_integration::status_owned(tool) {
         return Status::Unknown;
     }
+    detect_status_from_content_unowned(profile, content, tool)
+}
+
+/// Pane detection for a caller that already decided no integration owns the
+/// session, so a plugin tool name cannot reassert ownership from the registry.
+pub fn detect_status_from_content_unowned(profile: &str, content: &str, tool: &str) -> Status {
     // capture-pane runs with -e, so colors would split plain substring matches.
     let clean = strip_ansi(content);
     if let Some(status) = super::status_rules::detect(profile, tool, &clean) {
