@@ -7000,6 +7000,78 @@ async fn archive_persists_under_the_lifecycle_lock() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #5346: a stale client can archive a session after a peer completed its Trash. The locked
+/// canonical row refuses it and leaves the flags Trash preserves for restore; an active
+/// pinned row still archives and drops its pin.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_refuses_trashed_row_and_keeps_preserved_flags() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "archive-trashed";
+    let mut trashed = make_test_instance();
+    trashed.source_profile = profile.to_string();
+    trashed.status = Status::Stopped;
+    trashed.pinned_at = Some(chrono::Utc::now());
+    trashed.trash();
+    let mut active = make_test_instance();
+    active.source_profile = profile.to_string();
+    active.status = Status::Stopped;
+    active.pinned_at = Some(chrono::Utc::now());
+    let (trashed_id, active_id) = (trashed.id.clone(), active.id.clone());
+    let state =
+        crate::server::test_support::build_test_app_state(vec![trashed.clone(), active.clone()]);
+    let storage = Storage::new(profile, state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(trashed);
+        rows.push(active);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let archive = |id: String| {
+        let state = state.clone();
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                })),
+            )
+            .await
+            .into_response()
+        }
+    };
+    let stored = |id: &str| -> anyhow::Result<Instance> {
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the stored row"))
+    };
+
+    let response = archive(trashed_id.clone()).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await?)?;
+    assert_eq!(body["error"], "session_trashed");
+    let row = stored(&trashed_id)?;
+    assert!(row.is_trashed());
+    assert!(!row.is_archived());
+    assert!(row.pinned_at.is_some());
+
+    let response = archive(active_id.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = stored(&active_id)?;
+    assert!(row.is_archived());
+    assert!(row.pinned_at.is_none());
+    Ok(())
+}
+
 /// #4116: a group archive reaches the runtime as one archive per member, so the ordering
 /// invariant the TUI's sorted multi-lock test pinned has no multi-lock holder left to speak
 /// of. What replaced it: each member's stamp is gated by that member's own lifecycle lock,
