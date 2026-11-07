@@ -304,6 +304,7 @@ mod tests {
         command
             .args(["-c", script])
             .env("AOE_INSTANCE_ID", id)
+            .env_remove(crate::hooks::SESSION_SOURCE_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
