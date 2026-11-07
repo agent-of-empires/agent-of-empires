@@ -93,6 +93,66 @@ impl EventStore {
         page
     }
 
+    /// Read one coherent retained page; `None` means the expected identity changed.
+    pub(crate) fn retained_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        before: Option<u64>,
+        limit: usize,
+        expected_identity: Option<&str>,
+    ) -> anyhow::Result<Option<(ReplayPage, String)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let identity = super::identity::read(&tx, session_id)?;
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Ok(None);
+        }
+        let table = self.schema.events_table();
+        let (highest, lowest): (Option<i64>, Option<i64>) = tx.query_row(
+            &format!("SELECT MAX(seq), MIN(seq) FROM {table} WHERE session_id = ?1"),
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let highest_seq = highest.map(u64::try_from).transpose()?.unwrap_or(0);
+        let lowest_seq = lowest.map(u64::try_from).transpose()?;
+        let (comparison, order, cursor) = match before {
+            Some(before) => ("<", "DESC", before),
+            None => (">", "ASC", since),
+        };
+        let rows = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT seq, event_json FROM {table}
+                 WHERE session_id = ?1 AND seq {comparison} ?2
+                 ORDER BY seq {order} LIMIT ?3"
+            ))?;
+            let found = statement.query_map(
+                rusqlite::params![
+                    session_id,
+                    i64::try_from(cursor).unwrap_or(i64::MAX),
+                    i64::try_from(limit.saturating_add(1))?
+                ],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )?;
+            found.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let (mut events, last_scanned_seq, has_more) = decode_rows(session_id, rows, Some(limit));
+        if before.is_some() {
+            events.reverse();
+        }
+        tx.commit()?;
+        Ok(Some((
+            ReplayPage {
+                events,
+                last_scanned_seq,
+                has_more,
+                highest_seq,
+                lowest_seq,
+            },
+            identity,
+        )))
+    }
+
     fn page(
         &self,
         session_id: &str,

@@ -1,6 +1,7 @@
 //! Disk-backed event log for structured view sessions.
 
 mod attachments;
+pub(crate) mod identity;
 mod rate_limit;
 mod replay;
 mod search;
@@ -81,7 +82,8 @@ impl EventStore {
     pub fn open(db_path: &Path, max_events_per_session: usize) -> Result<Self> {
         // Prefix "acp" maps to the existing acp_events / acp_attachments tables.
         let schema = events::Schema::new("acp")?;
-        let conn = events::open(db_path, &schema)?;
+        let mut conn = events::open(db_path, &schema)?;
+        identity::install(&mut conn)?;
         let search_conn = Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
