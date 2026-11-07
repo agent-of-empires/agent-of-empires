@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, type RefObject } from "react";
 import { useSnapshotStore } from "./useSnapshotStore";
 import { listen } from "./domEvents";
 
@@ -8,7 +8,13 @@ interface MobileKeyboardSnapshot {
   keyboardHeight: number;
 }
 
-export function useMobileKeyboard() {
+const RESUME_SETTLE_MS = 500;
+
+/**
+ * `releaseOnResume` names an input with no visible tap target of its own: iOS can drop the keyboard on an app switch
+ * while leaving it activeElement, so it is blurred once the viewport settles without the keyboard it had before.
+ */
+export function useMobileKeyboard(releaseOnResume?: RefObject<HTMLElement | null>) {
   const { state, setState } = useSnapshotStore<MobileKeyboardSnapshot>(() => ({
     isMobile: typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
     keyboardOpen: false,
@@ -42,6 +48,7 @@ export function useMobileKeyboard() {
 
     let lastOpen = false;
     let lastPadding = 0;
+    let softKeyboardFor: Element | null = null;
 
     const safeBottom =
       parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--safe-area-bottom")) || 0;
@@ -57,6 +64,11 @@ export function useMobileKeyboard() {
       const open = totalOcclusion > 100;
 
       const padding = open ? Math.max(0, window.innerHeight - currentVvH - safeBottom) : 0;
+
+      // Remembered per focus so a hardware keyboard, which never occludes, is not mistaken for a lost one.
+      const focused = document.activeElement;
+      if (open) softKeyboardFor = focused;
+      else if (softKeyboardFor !== focused) softKeyboardFor = null;
 
       if (open !== lastOpen || padding !== lastPadding) {
         lastOpen = open;
@@ -112,18 +124,33 @@ export function useMobileKeyboard() {
       }, 500);
     };
 
+    // Viewport events can be missed while suspended, and the viewport can still be moving when the page returns.
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleResume = () => {
+      if (document.visibilityState !== "visible") return;
+      handleViewportChange();
+      if (resumeTimer) clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => {
+        measure();
+        const input = releaseOnResume?.current;
+        if (input && !lastOpen && input === document.activeElement && input === softKeyboardFor) input.blur();
+      }, RESUME_SETTLE_MS);
+    };
+
     measure();
     const stop = [
       listen(handleViewportChange, [vv, "resize"], [vv, "scroll"], [window, "scroll"]),
       listen(handleFocusIn, [document, "focusin"]),
       listen(handleOrientationChange, [window, "orientationchange"]),
+      listen(handleResume, [document, "visibilitychange"], [window, "pageshow"]),
     ];
     return () => {
       cancelAnimationFrame(rafRef.current);
       if (orientTimer) clearTimeout(orientTimer);
+      if (resumeTimer) clearTimeout(resumeTimer);
       for (const off of stop) off();
     };
-  }, [state.isMobile, update]);
+  }, [state.isMobile, update, releaseOnResume]);
 
   return state;
 }

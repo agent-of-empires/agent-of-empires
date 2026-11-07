@@ -90,9 +90,9 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   );
   // The viewport hook supplies the iOS-regular-Safari bottom inset and the occlusion-based keyboardOpen used to
   // gate the pane's sizing latch (occlusion is what shrinks the container, whichever element is focused).
-  const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
-  const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
+  const [inputFocused, setInputFocused] = useState(false);
   const policyRef = useRef({ readOnly, sessionId: session.id, surface, terminalIndex });
   useLayoutEffect(() => {
     policyRef.current = { readOnly, sessionId: session.id, surface, terminalIndex };
