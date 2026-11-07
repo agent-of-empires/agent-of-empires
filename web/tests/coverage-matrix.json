@@ -2895,6 +2895,7 @@
       "risk": "medium",
       "specs": [
         "tests/diff.spec.ts",
+        "src/lib/snippetHighlighter.themes.test.ts",
         "src/components/diff/find/findMatches.test.ts",
         "src/components/diff/find/changedLines.test.ts",
         "src/components/diff/find/FindBar.test.tsx",
@@ -2904,6 +2905,7 @@
       ],
       "components": [
         "web/src/components/diff/find/FindBar.tsx",
+        "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
       ]
     },
