@@ -343,6 +343,18 @@ describe("transport reason", () => {
     expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
   });
 
+  it("reports only a grid transport to onGridTransport", () => {
+    const onGridTransport = vi.fn();
+    renderHook(() => useLiveTerminal("s1", false, "live-ws", undefined, onGridTransport));
+    const ws = FakeWS.sockets[0]!;
+    ws.open();
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    ws.deliver({ type: "transport", grid: false });
+    expect(onGridTransport).not.toHaveBeenCalled();
+    ws.deliver({ type: "transport", grid: true });
+    expect(onGridTransport).toHaveBeenCalledTimes(1);
+  });
+
   it("drops the previous connection's transport and reason when a replacement socket opens", () => {
     vi.useFakeTimers();
     try {

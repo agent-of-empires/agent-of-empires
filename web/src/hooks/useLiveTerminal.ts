@@ -70,8 +70,11 @@ export function useLiveTerminal(
   readOnly: boolean,
   wsPath: string = "live-ws",
   onClipboard?: (text: string) => void,
+  /** The server confirmed this socket's grid transport, so it holds the pane pipe. */
+  onGridTransport?: () => void,
 ) {
   const handleClipboard = useEffectEvent((text: string) => onClipboard?.(text));
+  const handleGridTransport = useEffectEvent(() => onGridTransport?.());
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -227,6 +230,7 @@ export function useLiveTerminal(
               ? prev
               : { ...prev, transport, transportReason },
           );
+          if (msg.grid) handleGridTransport();
           return;
         }
         if (msg.type === "clipboard") {

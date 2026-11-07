@@ -23,6 +23,7 @@ import {
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { isSessionActive } from "../lib/session";
 import { StrokeIcon } from "./icons";
 
@@ -46,6 +47,21 @@ const SURFACES = {
     dataTerm: "paired",
   },
 };
+
+function useStoredDismissal(key: string) {
+  const [stored, setStored] = useState(() => ({ key, dismissed: safeGetItem(key) !== null }));
+  const current = stored.key === key ? stored : { key, dismissed: safeGetItem(key) !== null };
+  if (current !== stored) setStored(current);
+  const setDismissed = useCallback(
+    (dismissed: boolean) => {
+      if (dismissed) safeSetItem(key, "1");
+      else safeRemoveItem(key);
+      setStored({ key, dismissed });
+    },
+    [key],
+  );
+  return [current.dismissed, setDismissed] as const;
+}
 
 /** Touch-device agent terminal: chrome around the capture-snapshot live pane (MobileLiveTerminal). */
 export function LiveTerminalView({ session, readOnly, active = true, surface = "agent", terminalIndex = 0 }: Props) {
@@ -81,12 +97,18 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     },
     [],
   );
+  // Each surface is its own pane, so a grid on one must not clear another's dismissal.
+  const [pipeNoticeDismissed, setPipeNoticeDismissed] = useStoredDismissal(
+    `aoe-live-pipe-notice-dismissed:${session.id}:${surface}:${terminalIndex}`,
+  );
+  const clearPipeNoticeDismissal = useCallback(() => setPipeNoticeDismissed(false), [setPipeNoticeDismissed]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
     readOnly || ensureState === "ready" ? session.id : null,
     readOnly,
     wsPath,
     receiveAgentClipboard,
+    clearPipeNoticeDismissal,
   );
   // The viewport hook supplies the iOS-regular-Safari bottom inset and the occlusion-based keyboardOpen used to
   // gate the pane's sizing latch (occlusion is what shrinks the container, whichever element is focused).
@@ -127,7 +149,12 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           : "Not sent: terminal not connected.",
     );
   }, [notOwner, readOnly]);
-  const { sendData, sendPaste } = live;
+  const { sendData, sendPaste, manualReconnect } = live;
+  // Automatic redials keep the dismissal; only a reconnect the user asked for brings the notice back.
+  const reconnect = useCallback(() => {
+    clearPipeNoticeDismissal();
+    manualReconnect();
+  }, [clearPipeNoticeDismissal, manualReconnect]);
   // Explicit sends (toolbar, paste, compose) report a drop; typed keys stay quiet.
   const sendDataOrReport = useCallback(
     (data: string) => {
@@ -367,7 +394,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         retryCount={live.state.retryCount}
         retryCountdown={live.state.retryCountdown}
         maxRetries={live.maxRetries}
-        onRetry={live.manualReconnect}
+        onRetry={reconnect}
         paneDead={live.state.paneDead}
         onRestart={readOnly ? undefined : retryEnsure}
       />
@@ -396,14 +423,29 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         </div>
       )}
 
-      {live.state.connected && live.state.transportReason === "pipe_owned" && (
+      {live.state.connected && live.state.transportReason === "pipe_owned" && !pipeNoticeDismissed && (
         <div
           data-live-pipe-notice
           className={`absolute left-0 right-0 ${ensureWarning ? "top-24" : "top-14"} z-20 flex justify-center px-3 pointer-events-none`}
         >
-          <span className="text-xs text-text-muted bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
-            Another client was already rendering this pane, so updates use slower snapshots. Reconnect to retry.
-          </span>
+          <div className="pointer-events-auto flex items-center gap-1 text-xs text-text-muted bg-surface-900/90 border border-surface-700/60 rounded-lg pl-3 pr-1 max-w-md">
+            <span className="py-1 break-words">Slower updates: another client is rendering this pane.</span>
+            <button
+              type="button"
+              onClick={reconnect}
+              className="h-8 shrink-0 px-2 rounded-md text-brand-500 hover:text-brand-400 cursor-pointer underline"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => setPipeNoticeDismissed(true)}
+              aria-label="Dismiss slower updates notice"
+              className="h-8 w-8 shrink-0 rounded-md text-text-muted hover:text-text-primary cursor-pointer text-base leading-none"
+            >
+              &times;
+            </button>
+          </div>
         </div>
       )}
 
