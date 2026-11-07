@@ -180,6 +180,8 @@ The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll
 position. Read failures keep the last loaded content visible with an error.
 Content, size, or theme changes clear the previous text selection.
+Missing ranges do not trigger repeated transcript reloads while retained content
+is unchanged.
 
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation

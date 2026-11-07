@@ -39,7 +39,6 @@ pub enum EmbeddedEvent {
 }
 
 const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const RETAINED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct RetainedTextCache {
     width: u16,
@@ -67,7 +66,6 @@ pub struct RetainedView {
     known_coverage: Vec<(u64, u64)>,
     known_incomplete: bool,
     next_read: Instant,
-    next_recheck: Instant,
     message: String,
 }
 
@@ -115,7 +113,6 @@ impl RetainedView {
             known_coverage: Vec::new(),
             known_incomplete: false,
             next_read: now,
-            next_recheck: now,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
         };
         let Some(endpoint) = endpoint else {
@@ -164,11 +161,7 @@ impl RetainedView {
         };
         let http = state.http.clone();
         let id = self.session_id.clone();
-        let known_identity = if self.known_incomplete && Instant::now() >= self.next_recheck {
-            None
-        } else {
-            self.known_identity.clone()
-        };
+        let known_identity = self.known_identity.clone();
         let (tx, result) = tokio::sync::oneshot::channel();
         self.result = result;
         self.load = Some(tokio::spawn(async move {
@@ -226,12 +219,6 @@ impl RetainedView {
                 self.known_identity = Some(replay.history_identity);
                 self.known_coverage = replay.coverage;
                 self.known_incomplete = replay.incomplete;
-                self.next_recheck = now
-                    + if changed {
-                        RETAINED_REFRESH_INTERVAL
-                    } else {
-                        RETAINED_RECHECK_INTERVAL
-                    };
                 if !changed {
                     return false;
                 }
@@ -1534,7 +1521,7 @@ mod retained_tests {
     async fn retained_refresh_preserves_content_on_failure_and_replaces_reset_history() {
         use crate::acp::state::Event;
         use axum::{middleware, response::IntoResponse};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let _app = crate::session::test_support::isolate_app_dir();
         let _discovery = crate::session::test_support::EnvGuard::unset(&[
             "AOE_DAEMON_URL",
@@ -1558,6 +1545,7 @@ mod retained_tests {
                 .unwrap();
         }
         let failing = Arc::new(AtomicBool::new(false));
+        let full_reads = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 "/api/sessions/{id}/acp/replay",
@@ -1565,13 +1553,17 @@ mod retained_tests {
             )
             .with_state(state.clone())
             .layer(middleware::from_fn_with_state(
-                failing.clone(),
-                |State(failing): State<Arc<AtomicBool>>,
+                (failing.clone(), full_reads.clone()),
+                |State((failing, full_reads)): State<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
                  request: axum::extract::Request,
                  next: middleware::Next| async move {
                     if failing.load(Ordering::SeqCst) {
                         StatusCode::SERVICE_UNAVAILABLE.into_response()
                     } else {
+                        let query = axum::extract::Query::<crate::acp::protocol::ReplayQuery>::try_from_uri(request.uri()).unwrap().0;
+                        if query.since != u64::MAX {
+                            full_reads.fetch_add(1, Ordering::SeqCst);
+                        }
                         next.run(request).await
                     }
                 },
@@ -1710,17 +1702,30 @@ mod retained_tests {
             )
             .unwrap();
         assert!(refresh(&mut view).await);
-        assert!(view.message.contains("incomplete"));
-        let rechecked_at = Instant::now();
-        view.next_recheck = rechecked_at;
-        assert!(
-            !refresh(&mut view).await,
-            "unchanged authoritative replay must preserve selection"
-        );
-        assert!(
-            view.next_recheck >= rechecked_at + RETAINED_RECHECK_INTERVAL,
-            "stable gaps must not cause full replays at every metadata poll"
-        );
+        let previous_reads = full_reads.load(Ordering::SeqCst);
+        for unrelated_write in [false, true] {
+            if unrelated_write {
+                state
+                    .acp_event_store
+                    .record(
+                        "unrelated",
+                        1,
+                        &Event::Stopped {
+                            reason: "done".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            tokio::time::resume();
+            assert!(!refresh(&mut view).await);
+            assert_eq!(
+                full_reads.load(Ordering::SeqCst),
+                previous_reads,
+                "unchanged retention gaps must not refetch or refold history"
+            );
+        }
         state
             .acp_event_store
             .record(
@@ -1732,12 +1737,11 @@ mod retained_tests {
                 },
             )
             .unwrap();
-        view.next_recheck = Instant::now();
         assert!(refresh(&mut view).await);
         assert!(prepared_text(&mut view, 80)
             .to_string()
             .contains("BACKFILLED"));
-        assert!(!view.message.contains("incomplete"));
+        assert_eq!(full_reads.load(Ordering::SeqCst), previous_reads + 1);
         replacement.abort();
         let _ = replacement.await;
     }
