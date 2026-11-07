@@ -1591,6 +1591,17 @@ impl OpenCodeSessionSchema {
 #[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
 
+/// A Codex policy surface AoE cannot read. It can reroute a pinned launch, but
+/// not what an exact id resolves to, so a Default resume may still prove its rollout.
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub(super) struct UnattestedCodexPolicy {
+    reason: &'static str,
+    /// The store an unpinned host launch reads; `None` when it would read another.
+    store: Option<PathBuf>,
+    cwd: PathBuf,
+}
+
 fn opencode_session_row(
     connection: &rusqlite::Connection,
     sid: &str,
@@ -1946,17 +1957,22 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
-                // A host single-shot launch is deliberately left unmanaged:
-                // the refusal below only governs managed resume and fork, where
-                // an unattested preference surface could redirect the
-                // conversation this pin claims to continue.
-                anyhow::ensure!(inputs.container.is_some() || !crate::process::HAS_CODEX_MANAGED_PREFERENCES, "Codex managed preferences cannot be attested by the local file contract");
                 for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
                     anyhow::ensure!(value(key).is_none(), "managed Codex does not support {key}");
                     routing.push((key.into(), None));
                 }
                 let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".codex"))))?;
+                let unattested_policy = |reason| UnattestedCodexPolicy {
+                    reason,
+                    store: (inputs.container.is_none() && declared.is_none()).then(|| root.clone()),
+                    cwd: inputs.cwd.clone(),
+                };
+                // A host single-shot launch is deliberately left unmanaged: this
+                // only governs managed resume and fork.
+                if inputs.container.is_none() && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+                    bail!(unattested_policy("Codex managed preferences cannot be attested by the local file contract"));
+                }
                 let location = inputs.physical_location(&root);
                 anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), "managed Codex requires an existing local CODEX_HOME");
                 for file in [PathBuf::from("/etc/codex/requirements.toml"), PathBuf::from("/etc/codex/managed_config.toml")] {
@@ -1992,9 +2008,11 @@ impl Instance {
                     bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
                 };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
-                anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
+                if !(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key (a ChatGPT login cannot be attested, because it may select cloud-managed requirements); replace the credentials with an OpenAI API key (OPENAI_API_KEY, no ChatGPT tokens) in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty())) {
+                    bail!(unattested_policy("Codex is not authenticated with a local OpenAI API key (a ChatGPT login cannot be attested, because it may select cloud-managed requirements); replace the credentials with an OpenAI API key (OPENAI_API_KEY, no ChatGPT tokens) in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run"));
+                }
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2474,6 +2492,31 @@ impl Instance {
                 false,
             ),
         })
+    }
+
+    /// Whether a Default Codex resume stays on this project's conversation
+    /// without a pinned execution: an exact UUID whose rollout records this cwd.
+    pub(super) fn admits_unpinned_codex_resume(
+        error: &anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> bool {
+        let Some(UnattestedCodexPolicy {
+            store: Some(store),
+            cwd,
+            ..
+        }) = error.downcast_ref()
+        else {
+            return false;
+        };
+        binding
+            .and_then(|binding| binding.execution.as_ref())
+            .is_none_or(|execution| {
+                execution.agent == "codex"
+                    && execution.filesystem == "host"
+                    && execution.stores.first() == Some(store)
+            })
+            && crate::session::capture::codex_rollout_records_cwd(store, sid, cwd)
     }
 
     /// Whether two executions describe one context.
@@ -2979,7 +3022,14 @@ impl Instance {
         .unwrap_or_else(|| {
             self.resolve_native_execution(None)
                 .map(|execution| execution.binding)
-                .context("aoe session set-session-id cannot resolve the native execution identity for this context")
+                .map_err(|error| {
+                    let context = if error.is::<UnattestedCodexPolicy>() {
+                        "aoe session set-session-id cannot bind a Codex conversation in this context; clear it with set-session-id <session> \"\", restart, and run /resume <native-id> in Codex"
+                    } else {
+                        "aoe session set-session-id cannot resolve the native execution identity for this context"
+                    };
+                    error.context(context)
+                })
         })?;
         anyhow::ensure!(
             crate::agents::get_agent(&execution.agent)

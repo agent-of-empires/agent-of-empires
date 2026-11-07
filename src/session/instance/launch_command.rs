@@ -819,6 +819,12 @@ impl Instance {
         let target = self.conversation_target();
         match (self.resolve_native_execution(target), target) {
             (Ok(execution), _) => Ok(Some(execution)),
+            (Err(error), Some((sid, binding, false)))
+                if Self::admits_unpinned_codex_resume(&error, sid, binding) =>
+            {
+                tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
+                Ok(None)
+            }
             (Err(error), Some((sid, binding, explicit)))
                 if explicit
                     || self.status_agent().is_some()
@@ -829,10 +835,14 @@ impl Instance {
                     return Err(error);
                 }
                 let cause = ManagedResumeCause::from_error(&error);
+                let recovery = if cause == ManagedResumeCause::CodexConversationUnverified {
+                    format!("restore its store and project path, or clear it with aoe session set-session-id {} \"\", restart, and run /resume {sid} in Codex", self.id)
+                } else {
+                    format!("restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)", self.id)
+                };
                 Err(error
                     .context(format!(
-                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
-                        self.id
+                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; {recovery}"
                     ))
                     .context(ManagedResumeRefused(cause)))
             }
@@ -2432,7 +2442,7 @@ mod tests {
             if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
                 assert_eq!(
                     format!("{:#}", asserted.unwrap_err()),
-                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
+                    "aoe session set-session-id cannot bind a Codex conversation in this context; clear it with set-session-id <session> \"\", restart, and run /resume <native-id> in Codex: Codex managed preferences cannot be attested by the local file contract"
                 );
                 continue;
             }
@@ -3393,6 +3403,120 @@ mod tests {
             1,
             "the profile selects a newer install: {command}"
         );
+    }
+
+    /// A ChatGPT login and a macOS host both hit the unreadable-policy refusal.
+    #[test]
+    #[serial_test::serial]
+    fn default_codex_resume_without_attested_policy_requires_a_verified_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let store = temp.path().join(".codex");
+        let day = store.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            store.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[("CODEX_HOME", &store), ("CODEX_SQLITE_HOME", &store)]);
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "codex",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let project = temp.path().join("project");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let local = "11111111-2222-4333-8444-555555555551";
+        let foreign = "11111111-2222-4333-8444-555555555552";
+        for (sid, cwd) in [(local, &project), (foreign, &other)] {
+            std::fs::write(
+                day.join(format!("rollout-2026-11-06T12-00-00-{sid}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":{:?}}}}}\n",
+                    cwd.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        let instance = |sid: &str| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = Some(sid.into());
+            inst
+        };
+
+        let mut admitted = instance(local);
+        assert!(admitted.resolve_launch_execution().unwrap().is_none());
+        admitted.preflight_resume_launch().unwrap();
+        let prepared = admitted
+            .prepare_launch_command(admitted.conversation_state())
+            .unwrap();
+        assert!(prepared.is_existing);
+        let command = prepared.command.unwrap();
+        assert!(command.contains(&format!("resume {local}")), "{command}");
+
+        let other_store = temp.path().join("other-store");
+        std::fs::create_dir_all(&other_store).unwrap();
+        let mut bound = ConversationBinding::unknown(local);
+        bound.provenance = ConversationProvenance::Observed;
+        bound.execution = Some(ExecutionBinding {
+            agent: "codex".into(),
+            stores: vec![other_store],
+            configuration: Vec::new(),
+            cwd: project.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        });
+        let mut moved_store = instance(local);
+        moved_store.agent_session_binding = Some(bound);
+        for inst in [
+            instance(foreign),
+            instance("11111111-2222-4333-8444-555555555559"),
+            instance("my-thread-name"),
+            moved_store,
+        ] {
+            let error = inst.resolve_launch_execution().err().unwrap();
+            let chain = format!("{error:#}");
+            assert_eq!(
+                error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                ManagedResumeCause::CodexConversationUnverified,
+                "{chain}"
+            );
+            assert!(chain.contains("/resume"), "{chain}");
+            assert!(!chain.contains("rebind"), "{chain}");
+        }
+        let advice = ManagedResumeCause::CodexConversationUnverified.message();
+        assert!(advice.contains("set-session-id <session> \"\""), "{advice}");
+        assert!(
+            !advice.contains("set-session-id <session> <native-id>"),
+            "{advice}"
+        );
+
+        // An explicit target stays on the attested path.
+        let mut explicit = tool_instance("codex", project.to_str().unwrap());
+        explicit.resume_intent = ResumeIntent::Use(local.into());
+        assert!(explicit.resolve_launch_execution().is_err());
+
+        // A wrapper's lookup is its own, whatever the rollout says.
+        let mut wrapper = instance(local);
+        wrapper.command = "my-codex-wrapper".into();
+        assert!(wrapper.resolve_launch_execution().is_err());
+
+        // An unpinned launch would not read a declared store.
+        let path = crate::session::config::profile_config::get_profile_config_path(
+            &admitted.effective_profile(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("[session.agent_config_dir]\ncodex = {store:?}\n"),
+        )
+        .unwrap();
+        assert!(instance(local).resolve_launch_execution().is_err());
     }
 
     /// After `--` the flag would be a second positional, not the option.

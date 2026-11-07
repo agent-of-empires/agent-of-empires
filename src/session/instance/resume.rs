@@ -58,6 +58,8 @@ pub enum ManagedResumeCause {
     PiTranscriptBindingRequired,
     #[error("OMP exact transcript binding is missing")]
     OmpTranscriptBindingRequired,
+    #[error("Codex conversation cannot be verified for this project")]
+    CodexConversationUnverified,
     #[error("native execution context cannot be attested")]
     ExecutionContextUnattested,
 }
@@ -70,6 +72,7 @@ impl ManagedResumeCause {
             Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
             Self::PiTranscriptBindingRequired => "pi_transcript_binding_required",
             Self::OmpTranscriptBindingRequired => "omp_transcript_binding_required",
+            Self::CodexConversationUnverified => "codex_conversation_unverified",
             Self::ExecutionContextUnattested => "execution_context_unattested",
         }
     }
@@ -92,6 +95,13 @@ impl ManagedResumeCause {
             ),
             Self::PiTranscriptBindingRequired => transcript_recovery_message!("Pi"),
             Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
+            Self::CodexConversationUnverified => concat!(
+                "Managed resume refused: no Codex rollout matches this ID and project.\n",
+                "Conversation preserved. Restore its store or project path, then retry.\n",
+                "Or continue it inside Codex (AoE drops this association):\n",
+                "aoe session set-session-id <session> \"\"\n",
+                "Restart, then run /resume <native-id> in Codex once it is idle."
+            ),
             Self::ExecutionContextUnattested => recovery_message!(
                 "Managed resume refused: execution context cannot be attested.\n\
                  Restore the original agent configuration and store."
@@ -104,6 +114,8 @@ impl ManagedResumeCause {
             *cause
         } else if error.is::<super::execution::UnattestedOpenCodeSchema>() {
             Self::OpenCodeSchemaUnattested
+        } else if error.is::<super::execution::UnattestedCodexPolicy>() {
+            Self::CodexConversationUnverified
         } else {
             Self::ExecutionContextUnattested
         }
