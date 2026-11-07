@@ -37,12 +37,18 @@ fn program(command: &str) -> Option<String> {
     if base != "env" {
         return Some(base);
     }
+    // Start from the executable so `A=1 env tool` unwraps to `tool` too.
     shell_words::split(command)
         .ok()?
         .iter()
+        .skip_while(|word| is_assignment(word))
         .skip(1)
-        .find(|word| !word.contains('='))
+        .find(|word| !is_assignment(word))
         .map(|word| basename(word))
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.contains('=')
 }
 
 fn basename(executable: &str) -> String {
@@ -1069,6 +1075,13 @@ mod tests {
         assert_eq!(program("env FOO=1 acme --serve").as_deref(), Some("acme"));
         assert_eq!(
             program("env FOO=1 /usr/local/bin/acme").as_deref(),
+            Some("acme")
+        );
+        // A leading assignment still names `env`, and the wrapped program is
+        // what runs.
+        assert_eq!(program("A=1 env acme --serve").as_deref(), Some("acme"));
+        assert_eq!(
+            program("A=1 env B=2 /usr/local/bin/acme").as_deref(),
             Some("acme")
         );
         assert_eq!(program("env"), None);
