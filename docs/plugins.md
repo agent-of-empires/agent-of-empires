@@ -20,7 +20,9 @@ The command-palette manager can save locally when initial local-daemon discovery
 
 A repeated Boolean write is idempotent, but a configuration lock does not enforce daemon authorization or reconcile live workers. A failed response is not permission to bypass that daemon. For persistent local transport or HTTP 404 failures, run `aoe serve --stop`, inspect `aoe plugin info aoe.web`, then explicitly retry the desired `aoe plugin enable aoe.web` or `aoe plugin disable aoe.web` command if still needed. Stopping disconnects daemon clients; supervised daemons must be stopped through their manager. Retry may autostart using current configuration. For remote endpoints, recover the selected daemon on its host instead. Lifecycle-busy, read-only and authentication refusals remain authoritative.
 
-`aoe plugin enable` and `aoe plugin disable` also report daemon errors without a local fallback. The TUI Plugins settings tab remains an explicit local configuration save, separate from the command-palette manager's immediate daemon request.
+`aoe plugin enable` and `aoe plugin disable` also report daemon errors without a local fallback. If the CLI fails to acquire an endpoint for a live owner with a missing socket, it reports the acquisition error without adding the stop/retry hint. The command-palette manager can instead reach the failed request and show the hint.
+
+The TUI Plugins settings tab remains an explicit local configuration save, separate from the command-palette manager's immediate daemon request.
 
 ## Worker logs
 
