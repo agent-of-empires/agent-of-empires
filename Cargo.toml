@@ -5,7 +5,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 name = "agent-of-empires"
 version = "1.22.1"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 # MIT throughout, except the OSC 8 emission state machine in
@@ -128,7 +128,7 @@ sha2 = "0.11"
 
 # Locking
 fs2 = "0.4"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"
