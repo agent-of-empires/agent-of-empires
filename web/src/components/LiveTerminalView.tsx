@@ -91,9 +91,9 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     setPipeNoticeDismissed(true);
   }, [pipeNoticeKey]);
   const clearPipeNoticeDismissal = useCallback(() => {
-    if (!pipeNoticeDismissed) return;
-    safeRemoveItem(pipeNoticeKey);
-    setPipeNoticeDismissed(false);
+    // Another tab may have stored a dismissal this view never saw.
+    if (safeGetItem(pipeNoticeKey) !== null) safeRemoveItem(pipeNoticeKey);
+    if (pipeNoticeDismissed) setPipeNoticeDismissed(false);
   }, [pipeNoticeDismissed, pipeNoticeKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(

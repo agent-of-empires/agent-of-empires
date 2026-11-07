@@ -135,6 +135,23 @@ describe("LiveTerminalView pipe contention notice", () => {
     expect(pipeNotice()).not.toBeNull();
   });
 
+  it("clears a dismissal another tab stored when this view resets the notice", async () => {
+    const resets = {
+      grid: () => act(() => live.onGridTransport?.()),
+      retry: () => fireEvent.click(screen.getByRole("button", { name: "Retry faster updates" })),
+    };
+    for (const [name, reset] of Object.entries(resets)) {
+      const { unmount } = await mountPiped();
+      window.localStorage.setItem("aoe-live-pipe-notice-dismissed:piped:agent:0", "1");
+      reset();
+      unmount();
+
+      await mountPiped();
+      expect(pipeNotice(), name).not.toBeNull();
+      cleanup();
+    }
+  });
+
   it("forgets a dismissal when the user reconnects from the connection banner", async () => {
     const { rerender } = await mountPiped();
     dismiss();
