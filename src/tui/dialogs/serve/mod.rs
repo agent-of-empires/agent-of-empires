@@ -961,6 +961,9 @@ impl ServeView {
                 "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
             }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
+            (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
+                "cloudflared isn't installed; press R to retry Tailscale."
+            }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
         *flash = Some((rejection.to_string(), Instant::now()));
@@ -1433,6 +1436,20 @@ mod tests {
                 transport: Some(TunnelTransport::Cloudflare),
                 ..
             })
+        ));
+
+        // With cloudflared missing too, the only way forward is a retry.
+        view.state = ServeViewState::Confirm {
+            selected: TunnelTransport::Cloudflare,
+            tailscale: TransportStatus::TimedOut,
+            cloudflare: TransportStatus::NotInstalled,
+            flash: None,
+        };
+        let action = view.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ServeAction::Continue));
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry Tailscale")
         ));
     }
 
