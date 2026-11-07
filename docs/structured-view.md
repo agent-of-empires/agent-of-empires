@@ -152,6 +152,9 @@ Non-ACP tools always run in the terminal view.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
+In the native TUI, wrapping and copying keep Unicode grapheme clusters intact
+across ANSI style changes. A cluster uses its first code point's style.
+
 ### Launch command and session naming
 
 `--cmd <tool>` uses `session.agent_command_override`, preserving required ACP arguments, such as `opencode acp`. Adapter-backed agents use `session.agent_acp_cmd` for a full command swap. The wizard displays the resolved command read-only.
