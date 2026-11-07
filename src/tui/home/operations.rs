@@ -1040,6 +1040,20 @@ impl HomeView {
                 .filter(|i| self.org_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
+            // Status headers key on the status's API spelling, the same key
+            // `build_flat_items_by_status` rewrites `group_path` to.
+            crate::session::config::GroupByMode::Status => self
+                .instances
+                .values()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| super::rows::status_group_key(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
             // Manual groups nest, so a session belongs when its path matches exactly or
             // sits beneath the group; scoped to the owning profile the same way
             // `delete_selected_group` does.
@@ -1060,7 +1074,19 @@ impl HomeView {
     /// Queue the whole group's archive before submitting any row. The daemon
     /// tears down each pane and publishes its committed state.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
+        // Prefer the set captured when the prompt opened: a status bucket can gain
+        // members while the dialog is up, and those were never counted in it.
+        let ids = match self.pending_archive_group_ids.take() {
+            Some(ids) => ids,
+            None => self.active_sessions_in_selected_group(),
+        };
+        // Trash wins over archive and keeps the flags it was trashed with, so archiving
+        // a member now would only change where it restores to. A member removed while the
+        // prompt was up has no row left at all. Skip both.
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| self.instances.get(id).is_some_and(|i| !i.is_trashed()))
+            .collect();
         if ids.is_empty() {
             return Ok(());
         }

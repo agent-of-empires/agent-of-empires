@@ -1284,16 +1284,21 @@ impl HomeView {
         let Some(group_path) = self.selected_group.clone() else {
             return;
         };
-        let count = self.active_sessions_in_selected_group().len();
+        let ids = self.active_sessions_in_selected_group();
+        let count = ids.len();
         if count == 0 {
             return;
         }
-        // Project/Org mode groups by repo or owner and Manual mode by assigned path, so
-        // name the scope accordingly and show the full path, or nested groups sharing a
-        // leaf segment would be ambiguous.
+        // Status buckets reshuffle while the dialog is open, so pin the set the
+        // count describes instead of recomputing it on confirm.
+        self.pending_archive_group_ids = Some(ids);
+        // Project/Org group by repo or owner, Manual by assigned path and Status by its
+        // bucket name, so name the scope and show the full path, or nested groups
+        // sharing a leaf segment would be ambiguous.
         let (title, scope) = match self.group_by {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Status => ("Archive status", "status"),
             crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
@@ -1511,6 +1516,7 @@ impl HomeView {
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
+                        self.pending_archive_group_ids = None;
                         // Mirrors the keyboard route: Cancel means "don't discard", so
                         // settings stays open and `settings_close_confirm` resets.
                         self.settings_close_confirm = false;
@@ -2288,6 +2294,7 @@ impl HomeView {
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
+                    self.pending_archive_group_ids = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -3217,6 +3224,11 @@ impl HomeView {
                 }
             })
             .or_else(|| {
+                // Status headers name a state, not a group, so prefilling the field
+                // would create a manual group called "Waiting".
+                if self.group_by == GroupByMode::Status {
+                    return None;
+                }
                 // The scratch bucket's group_path is an internal sentinel; show
                 // its display label in the Group field, not the raw sentinel (#3237).
                 self.selected_group
@@ -3224,7 +3236,7 @@ impl HomeView {
                     .map(|g| crate::session::project_group_display_name(g).to_string())
             });
 
-        if prefill_path.is_some() || prefill_group.is_some() {
+        if prefill_path.is_some() || prefill_group.is_some() || self.selected_group.is_some() {
             let existing_groups: Vec<String> = self.all_group_paths();
             let current_profile = self
                 .profile_for_cursor(self.cursor)
@@ -3545,7 +3557,7 @@ impl HomeView {
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org => false,
+                GroupByMode::Org | GroupByMode::Status => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
@@ -4506,13 +4518,14 @@ impl HomeView {
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
-    /// (Project/Org), where there is no user-owned group to act on. `None` for `Manual`,
+    /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
     fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Status => "Status",
         };
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
         Some((
@@ -4552,6 +4565,18 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_org_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Status {
+            let collapsed = self
+                .status_group_collapsed
+                .get(path)
+                .copied()
+                .unwrap_or(false);
+            self.status_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_status_group_collapsed();
             return;
         }
         let result = (|| -> anyhow::Result<()> {

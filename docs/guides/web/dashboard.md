@@ -67,13 +67,17 @@ A sort picker next to the filter button offers three modes:
 
 Drag-to-reorder is disabled in the computed modes. The picker's state is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
-## Sidebar grouping: by repo, by group, or both
+## Sidebar grouping: repo, org, group, both, or status
 
-A grouping toggle (layers icon) next to the sort toggle cycles the axis. Each click advances **By repo** to **By group** to **By repo and group** and back:
+A grouping picker (layers icon) next to the sort picker opens a menu of axes, so any of them is one pick away:
+
+![The sidebar grouped by session status, with the grouping picker open](../../assets/web/sidebar-grouping.png)
 
 - **By repo** (default): groups by git repository.
+- **By org**: groups repositories by their remote owner, across any hosted git remote. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
 - **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
+- **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
 
 The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but group rename, color, and drag-reorder live on the repo axis only.
 

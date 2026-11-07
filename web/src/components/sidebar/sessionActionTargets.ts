@@ -39,7 +39,7 @@ export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
 export function resolveActionTargets(sessions: SessionResponse[], optimistic: OptimisticTriage): SessionActionTargets {
   // A pending archive applies to the one session it was issued for, not every sibling.
   const archivedOf = (s: SessionResponse) =>
-    s.id === optimistic.archivedSessionId ? effectiveArchivedOf(optimistic, !!s.archived_at) : !!s.archived_at;
+    s.id === optimistic.sessionId ? effectiveArchivedOf(optimistic, !!s.archived_at) : !!s.archived_at;
   const targets = (action: SessionAction) => sessions.filter((s) => ELIGIBLE[action](s, archivedOf(s)));
   return {
     stop: targets("stop"),
