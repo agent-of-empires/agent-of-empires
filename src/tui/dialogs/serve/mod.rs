@@ -651,7 +651,7 @@ enum PendingJob {
     Reset,
     Restart {
         intent: RestartIntent,
-        confirmed: Option<(PendingConfirm, Instant)>,
+        confirmed: Option<PendingConfirm>,
     },
     LaunchContext(ServeLaunchRequest),
     LaunchOutcome,
@@ -1211,13 +1211,17 @@ impl ServeView {
         if std::mem::take(&mut self.show_help) {
             return ServeAction::Continue;
         }
-        let confirmed = self.pending_confirm.take().filter(|(action, when)| {
-            let repeated = match action {
-                PendingConfirm::NewPassphrase => matches!(code, KeyCode::Char('g' | 'G')),
-                PendingConfirm::Restart => matches!(code, KeyCode::Char('r' | 'R')),
-            };
-            repeated && when.elapsed() <= CONFIRM_TTL
-        });
+        let confirmed = self
+            .pending_confirm
+            .take()
+            .filter(|(action, when)| {
+                let repeated = match action {
+                    PendingConfirm::NewPassphrase => matches!(code, KeyCode::Char('g' | 'G')),
+                    PendingConfirm::Restart => matches!(code, KeyCode::Char('r' | 'R')),
+                };
+                repeated && when.elapsed() <= CONFIRM_TTL
+            })
+            .map(|(action, _)| action);
         let (mode, transport) = self.context();
         let intent = match code {
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
@@ -1279,7 +1283,7 @@ impl ServeView {
         &mut self,
         fresh: RestartProbe,
         intent: RestartIntent,
-        confirmed: Option<(PendingConfirm, Instant)>,
+        confirmed: Option<PendingConfirm>,
     ) {
         let ServeViewState::Active {
             mode,
@@ -1297,8 +1301,7 @@ impl ServeView {
             self.show_help = true;
             return;
         };
-        let repeated = confirmed
-            .is_some_and(|(previous, when)| previous == action && when.elapsed() <= CONFIRM_TTL);
+        let repeated = confirmed == Some(action);
         let unchanged = action == PendingConfirm::NewPassphrase
             || RestartEffect::of(mode, urls, &fresh, self.running_persists)
                 == RestartEffect::of(mode, urls, &self.restart_probe, self.running_persists);

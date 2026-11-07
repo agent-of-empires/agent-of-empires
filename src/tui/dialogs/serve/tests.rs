@@ -503,6 +503,38 @@ fn a_key_during_second_restart_assessment_cancels_the_confirmation() {
 
 #[test]
 #[serial_test::serial]
+fn a_timely_confirmation_survives_a_slow_second_assessment() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for (code, mode) in [('R', ServeMode::Local), ('G', ServeMode::Tunnel)] {
+        let mut jobs = ServeJobs::default();
+        let (submitter, gate) = gated(&mut jobs, Held::Restart);
+        let mut view = ServeView::with_state(active_state(mode), submitter);
+        view.handle_key(key(code));
+        gate.entered(Held::Restart);
+        gate.release(JobResult::Restart(RestartProbe::default()));
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        let confirmed_at = view.pending_confirm.unwrap().1;
+
+        view.handle_key(key(code));
+        gate.entered(Held::Restart);
+        while let Some(remaining) = CONFIRM_TTL.checked_sub(confirmed_at.elapsed()) {
+            std::thread::park_timeout(remaining + Duration::from_millis(1));
+        }
+        view.tick();
+        assert!(view.take_launch().is_none());
+
+        gate.release(JobResult::Restart(RestartProbe::default()));
+        wait_assessment(&mut view);
+        assert!(
+            view.take_launch().is_some_and(|request| request.restart),
+            "{code} discarded a timely confirmation after its assessment"
+        );
+        assert!(view.pending_confirm.is_none());
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn every_pending_state_leaves_a_closed_worker() {
     let _home = crate::session::test_support::isolate_app_dir();
     for held in [
