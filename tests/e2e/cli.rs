@@ -810,6 +810,54 @@ command = "bash -lc true"
     }
 }
 
+/// An implicitly selected plugin tool owns its launch, so `--cmd-override`
+/// cannot replace it.
+#[test]
+#[parallel]
+fn cli_add_rejects_cmd_override_for_implicit_plugin_tool() {
+    let h = TuiTestHarness::new("cli_add_plugin_implicit");
+    h.append_config("[session]\ndefault_tool = \"plugin-helper\"");
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("aoe-plugin.toml"),
+        r#"id = "acme.agent"
+name = "Agent"
+version = "1.0.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "bash -lc true"
+"#,
+    )
+    .unwrap();
+    h.run_cli_ok(&[
+        "plugin",
+        "install",
+        source.path().to_str().unwrap(),
+        "--yes",
+    ]);
+    let project = h.project_path();
+    let rejected = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ImplicitCase",
+        "--cmd-override",
+        "false",
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "implicit plugin selection must reject --cmd-override"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("--cmd-override cannot be used"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(h.read_sessions().as_array().unwrap().is_empty());
+}
+
 /// `aoe add` rejects bad requests before writing anything, without leaking
 /// configured command strings.
 #[test]
