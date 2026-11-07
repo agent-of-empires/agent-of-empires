@@ -99,6 +99,10 @@ pub enum HttpError {
     ReadOnly,
     #[error("local plugin directories and --dev require a verified local Daemon Unix socket peer; remote endpoints cannot read Client paths")]
     LocalPluginSourceRequired,
+    #[error("plugin preview failed; check the source, manifest, host compatibility and GitHub access on the Daemon host")]
+    PluginPreviewFailed,
+    #[error("another plugin operation is running; wait for its outcome and inspect the plugin state before submitting again")]
+    PluginJobActive,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
     #[error("Auto-name skipped: the session changed or no title could be applied")]
@@ -1156,6 +1160,8 @@ fn classify_code(
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
         (_, Some(ApiErrorCode::LocalPluginSourceRequired)) => HttpError::LocalPluginSourceRequired,
+        (_, Some(ApiErrorCode::PluginPreviewFailed)) => HttpError::PluginPreviewFailed,
+        (_, Some(ApiErrorCode::PluginJobActive)) => HttpError::PluginJobActive,
         (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
         (_, Some(ApiErrorCode::SmartRenameSkipped)) => HttpError::SmartRenameSkipped,
@@ -1633,6 +1639,52 @@ mod tests {
                     | (504, HttpError::SmartRenameTimeout)
             ));
             assert!(!error.to_string().contains("secret-provider-credential"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_failures_use_fixed_headers_without_waiting_for_sensitive_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, code) in [(502, "preview_failed"), (409, "plugin_job_active")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 {status} Error\r\nAoE-Error-Code: {code}\r\nContent-Length: 999999999\r\n\r\nsecret-daemon-credential"
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), async {
+                if status == 502 {
+                    client
+                        .preview_plugin_install(&crate::daemon::InstallPreviewBody {
+                            source: "gh:acme/fixture".into(),
+                            dev: false,
+                        })
+                        .await
+                        .err()
+                        .unwrap()
+                } else {
+                    client.uninstall_plugin("acme.fixture").await.err().unwrap()
+                }
+            })
+            .await;
+            server.abort();
+            let _ = server.await;
+            let error = error.unwrap();
+            assert!(matches!(
+                (status, &error),
+                (502, HttpError::PluginPreviewFailed) | (409, HttpError::PluginJobActive)
+            ));
+            assert!(!error.to_string().contains("secret-daemon-credential"));
         }
     }
 

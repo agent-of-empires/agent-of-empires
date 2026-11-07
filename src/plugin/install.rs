@@ -10,7 +10,7 @@ use aoe_plugin_api::agent_integration::AgentIntegrationContribution;
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::{Deserialize, Serialize};
 
-use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
+use crate::session::{update_config, CapabilityGrant, Config, PluginConfig, StorageFlock};
 
 use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
@@ -65,8 +65,19 @@ impl OperationLog {
     }
 }
 
+const OPERATION_LOCK: &str = ".plugin-operation.lock";
+
+fn begin_operation() -> Result<StorageFlock> {
+    crate::session::try_acquire_storage_flock(&crate::session::get_app_dir()?, OPERATION_LOCK)
+        .context("acquiring plugin operation lock")?
+        .ok_or_else(|| {
+            anyhow!("another plugin operation is running; inspect its outcome before retrying")
+        })
+}
+
 pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
-    let registry = super::registry();
+    let _operation = begin_operation()?;
+    let registry = super::reload_registry();
     if registry.get(plugin_id).is_none() {
         bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");
     }
@@ -381,6 +392,7 @@ fn apply_prepared_install(
 }
 
 pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<InstallReport> {
+    let operation = begin_operation()?;
     let prepared = prepare_install(input, dev).await?;
     eprintln!("{}", prepared.notice);
     if prepared.unverified && !assume_yes && !confirm_unverified()? {
@@ -408,7 +420,12 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
         bail!("install cancelled; no capabilities were granted");
     }
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
-    apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
+    })
+    .await
+    .context("plugin install task failed")?
 }
 
 pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
@@ -444,8 +461,9 @@ pub async fn apply_install(
     input: &str,
     expected_fingerprint: &str,
     dev: bool,
-    log: &OperationLog,
+    log: OperationLog,
 ) -> Result<InstallReport> {
+    let operation = begin_operation()?;
     let prepared = prepare_install(input, dev).await?;
     if prepared.fingerprint != expected_fingerprint {
         bail!(
@@ -453,7 +471,12 @@ pub async fn apply_install(
         );
     }
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
-    apply_prepared_install(&prepared, &node_env, log)
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        apply_prepared_install(&prepared, &node_env, &log)
+    })
+    .await
+    .context("plugin install task failed")?
 }
 
 pub async fn update(id: &str, assume_yes: bool) -> Result<InstallReport> {
@@ -500,6 +523,8 @@ struct Prepared {
     runtime_change: Option<String>,
     trust_downgrade: bool,
     needs_consent: bool,
+    installed_matches_source: bool,
+    stays_active_if_declined: bool,
 }
 
 /// The consent structures serialize to the CLI/TUI/web disclosures, so their
@@ -525,19 +550,11 @@ fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> Stri
     format!("{tree_hash}|{}|{trust}", asset_sha256.unwrap_or(""))
 }
 
-fn installed_agent_integrations(
-    id: &str,
-    expected_manifest_hash: Option<&str>,
-) -> Option<Vec<AgentIntegrationContribution>> {
+fn installed_manifest(id: &str) -> Option<(PluginManifest, String)> {
     let bytes = std::fs::read(super::plugins_dir().ok()?.join(id).join("aoe-plugin.toml")).ok()?;
-    let actual_manifest_hash = PluginManifest::hash_bytes(&bytes);
-    if expected_manifest_hash != Some(actual_manifest_hash.as_str()) {
-        return None;
-    }
-    let manifest = std::str::from_utf8(&bytes).ok()?;
-    PluginManifest::from_toml_str(manifest)
-        .ok()
-        .map(|manifest| manifest.agent_integrations)
+    let hash = PluginManifest::hash_bytes(&bytes);
+    let manifest = PluginManifest::from_toml_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some((manifest, hash))
 }
 
 fn agent_integrations_changed(
@@ -589,12 +606,29 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
 
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let previous_agent_integrations = installed_agent_integrations(
-        id,
+    let installed = prior_grant.as_ref().and_then(|_| installed_manifest(id));
+    let grant_valid = installed.as_ref().is_some_and(|(manifest, hash)| {
         prior_grant
             .as_ref()
-            .map(|grant| grant.manifest_hash.as_str()),
-    );
+            .is_some_and(|grant| super::registry::grant_covers(grant, manifest, hash))
+    });
+    let installed_matches_source = grant_valid
+        && installed
+            .as_ref()
+            .is_some_and(|(_, hash)| hash == &manifest_hash);
+    let previous_agent_integrations = installed
+        .as_ref()
+        .filter(|(_, hash)| {
+            prior_grant
+                .as_ref()
+                .is_some_and(|grant| &grant.manifest_hash == hash)
+        })
+        .map(|(manifest, _)| manifest.agent_integrations.as_slice());
+    let stays_active_if_declined = grant_valid
+        && plugin_config.enabled
+        && super::registry()
+            .get(id)
+            .is_some_and(|plugin| plugin.active());
 
     let lock = Lockfile::load()?;
     let prior_locked = lock.get(id);
@@ -641,7 +675,7 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
     let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
     let agents_changed = agent_integrations_changed(
-        previous_agent_integrations.as_deref(),
+        previous_agent_integrations,
         &fetched.manifest.agent_integrations,
     );
     let new_is_release_binary = matches!(
@@ -665,7 +699,8 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
         || ui_changed
         || agents_changed
         || runtime_change.is_some()
-        || trust_downgrade;
+        || trust_downgrade
+        || !grant_valid;
 
     Ok(Prepared {
         id: id.to_string(),
@@ -693,6 +728,8 @@ async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> 
         runtime_change,
         trust_downgrade,
         needs_consent,
+        installed_matches_source,
+        stays_active_if_declined,
     })
 }
 
@@ -749,6 +786,7 @@ fn apply_prepared(
 }
 
 async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
+    let operation = begin_operation()?;
     let prepared = prepare_update(id, true).await?;
     if mode != ConsentMode::CleanOnlyNonInteractive {
         eprintln!("{}", prepared.notice);
@@ -793,7 +831,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         })
     };
 
-    finish_update(prepared, grant, |manifest| async move {
+    finish_update(prepared, grant, operation, |manifest| async move {
         apply_node_env(&manifest).await
     })
     .await
@@ -804,6 +842,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
 async fn finish_update<F, Fut>(
     prepared: Prepared,
     grant: Option<CapabilityGrant>,
+    operation: StorageFlock,
     provision: F,
 ) -> Result<UpdateOutcome>
 where
@@ -812,12 +851,13 @@ where
 {
     ensure_approved(&prepared.id, prepared.needs_consent, grant.as_ref())?;
     let node_env = provision(prepared.fetched.manifest.clone()).await;
-    Ok(UpdateOutcome::Applied(apply_prepared(
-        &prepared,
-        grant,
-        &node_env,
-        &OperationLog::Inherit,
-    )?))
+    let report = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit)
+    })
+    .await
+    .context("plugin update task failed")??;
+    Ok(UpdateOutcome::Applied(report))
 }
 
 fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
@@ -851,7 +891,7 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
         fingerprint: p.fingerprint.clone(),
-        stays_active_if_declined: true,
+        stays_active_if_declined: p.stays_active_if_declined,
         changelog,
     }
 }
@@ -873,7 +913,9 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
 
 pub async fn preview_update(id: &str, allow_local_source: bool) -> Result<UpdatePreview> {
     let prepared = prepare_update(id, allow_local_source).await?;
-    if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
+    if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint)
+        && prepared.installed_matches_source
+    {
         return Ok(UpdatePreview::NoUpdate);
     }
     let changelog = changelog_of(&prepared).await;
@@ -900,8 +942,9 @@ pub async fn apply_update(
     id: &str,
     expected_fingerprint: Option<String>,
     allow_local_source: bool,
-    log: &OperationLog,
+    log: OperationLog,
 ) -> Result<InstallReport> {
+    let operation = begin_operation()?;
     let prepared = prepare_update(id, allow_local_source).await?;
     match &expected_fingerprint {
         Some(expected) if *expected != prepared.fingerprint => {
@@ -920,7 +963,12 @@ pub async fn apply_update(
         granted_at: chrono::Utc::now(),
     });
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
-    apply_prepared(&prepared, grant, &node_env, log)
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        apply_prepared(&prepared, grant, &node_env, &log)
+    })
+    .await
+    .context("plugin update task failed")?
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -980,6 +1028,7 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
 }
 
 pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
+    let _operation = begin_operation()?;
     super::reload_registry();
     let consent = reapprove_consent(id)?;
     if consent.manifest_hash != expected_manifest_hash {
@@ -1042,6 +1091,7 @@ pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
 }
 
 pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
+    let _operation = begin_operation()?;
     update_config(|config| {
         let Some(entry) = config.plugins.get_mut(id) else {
             bail!("{id} is not an installed external plugin");
@@ -1083,6 +1133,7 @@ fn skip_reason(prepared: &Prepared) -> String {
 
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
+    let _operation = begin_operation()?;
     if !is_installed_external(id)? {
         bail!("{id} is not an installed external plugin");
     }
@@ -1625,7 +1676,9 @@ mod tests {
 
         let declined = prepare_update("acme.upd", true).await.unwrap();
         assert!(declined.needs_consent);
-        let err = finish_update(declined, None, provision).await.err();
+        let err = finish_update(declined, None, begin_operation().unwrap(), provision)
+            .await
+            .err();
         assert!(err.is_some_and(|e| e.to_string().contains("update cancelled")));
         assert_eq!(provisioned.load(Ordering::SeqCst), 0);
         assert!(!installed.join("built").exists());
@@ -1637,7 +1690,7 @@ mod tests {
             capabilities: approved.capabilities.clone(),
             granted_at: chrono::Utc::now(),
         };
-        finish_update(approved, Some(grant), provision)
+        finish_update(approved, Some(grant), begin_operation().unwrap(), provision)
             .await
             .unwrap();
         assert_eq!(provisioned.load(Ordering::SeqCst), 1);
@@ -1791,5 +1844,197 @@ mod tests {
         let config = Config::load().unwrap();
         assert!(!config.plugins.contains_key("no.such.plugin"));
         assert!(config.plugins["acme.thing"].dismissed_update.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn blocking_updates_keep_exclusion_through_cancellation() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const ID: &str = "acme.serial";
+        const MODE: &str = "AOE_PLUGIN_OPERATION_TEST_MODE";
+        const CONTROL: &str = "AOE_PLUGIN_OPERATION_TEST_CONTROL";
+        const RECORD: &str = "AOE_PLUGIN_OPERATION_TEST_RECORD";
+        const TEST: &str =
+            "plugin::install::tests::blocking_updates_keep_exclusion_through_cancellation";
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "build" {
+                let mut stream = UnixStream::connect(std::env::var_os(CONTROL).unwrap()).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream.write_all(b"B").unwrap();
+                let mut release = [0];
+                stream.read_exact(&mut release).unwrap();
+                assert_ne!(release, [b'F'], "controlled build failure");
+            } else {
+                assert_eq!(mode, "uninstall");
+                assert!(uninstall(ID).is_err());
+                std::fs::write(std::env::var_os(RECORD).unwrap(), b"refused").unwrap();
+            }
+            return;
+        }
+
+        struct ReleaseBuild {
+            release: Option<mpsc::Sender<()>>,
+            controller: Option<std::thread::JoinHandle<bool>>,
+            socket: std::path::PathBuf,
+            log_reader: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
+        }
+        impl ReleaseBuild {
+            fn finish(mut self) -> bool {
+                let _ = self.release.take().unwrap().send(());
+                let requested = self.controller.take().unwrap().join().unwrap();
+                self.log_reader.take().unwrap().join().unwrap().unwrap();
+                requested
+            }
+        }
+        impl Drop for ReleaseBuild {
+            fn drop(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(controller) = self.controller.take() {
+                    if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                        let _ = stream.write_all(b"X");
+                    }
+                    let _ = controller.join();
+                }
+                if let Some(reader) = self.log_reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let node = super::super::write_fake_node(effects.path(), "node");
+        let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let manifest = format!(
+            "id = \"{ID}\"\nname = \"Serial\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"sh\"]\nsystem = true\n"
+        );
+        let source_manifest = source.path().join("aoe-plugin.toml");
+        std::fs::write(&source_manifest, &manifest).unwrap();
+        install(source.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let installed = super::super::plugins_dir()
+            .unwrap()
+            .join(ID)
+            .join("aoe-plugin.toml");
+
+        for (index, fail) in [false, true].into_iter().enumerate() {
+            let socket = effects.path().join(format!("build{index}.sock"));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let controller = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut started = [0];
+                stream.read_exact(&mut started).unwrap();
+                if started != [b'B'] {
+                    return false;
+                }
+                let _ = started_tx.send(());
+                let requested = release_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+                stream.write_all(&[if fail { b'F' } else { b'S' }]).unwrap();
+                requested
+            });
+            let mut release = ReleaseBuild {
+                release: Some(release_tx),
+                controller: Some(controller),
+                socket: socket.clone(),
+                log_reader: None,
+            };
+            let command = vec![
+                "env".to_string(),
+                format!("{MODE}=build"),
+                format!("{CONTROL}={}", socket.display()),
+                executable.to_str().unwrap().to_string(),
+                "--exact".to_string(),
+                TEST.to_string(),
+                "--nocapture".to_string(),
+            ];
+            let next_manifest = format!(
+                "{}\n[[runtime.build]]\ncommand = {}\n",
+                manifest.replace("1.0.0", &format!("{}.0.0", index + 2)),
+                serde_json::to_string(&command).unwrap()
+            );
+            std::fs::write(&source_manifest, &next_manifest).unwrap();
+            let before_manifest = std::fs::read(&installed).unwrap();
+            let before_config = serde_json::to_value(&Config::load().unwrap().plugins[ID]).unwrap();
+            let fingerprint = match preview_update(ID, true).await.unwrap() {
+                UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+                other => panic!("build update needs approval: {other:?}"),
+            };
+            let (mut log_reader, log_writer) = UnixStream::pair().unwrap();
+            log_reader
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            release.log_reader = Some(std::thread::spawn(move || {
+                std::io::copy(&mut log_reader, &mut std::io::sink())
+            }));
+            let log =
+                OperationLog::File(std::fs::File::from(std::os::fd::OwnedFd::from(log_writer)));
+            let operation = tokio::spawn(apply_update(ID, Some(fingerprint), true, log));
+            tokio::time::timeout(Duration::from_secs(35), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let record = effects.path().join(format!("uninstall{index}"));
+            let child_record = record.clone();
+            let child_executable = executable.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                Command::new(child_executable)
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(MODE, "uninstall")
+                    .env(RECORD, child_record)
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(probe.status.success(), "{probe:?}");
+            assert_eq!(std::fs::read(record).unwrap(), b"refused");
+            assert!(set_enabled(ID, false).is_err());
+            assert!(dismiss_update(ID, "declined").is_err());
+            assert!(
+                approve_installed(ID, &PluginManifest::hash_bytes(next_manifest.as_bytes()))
+                    .is_err()
+            );
+            operation.abort();
+            assert!(operation.await.unwrap_err().is_cancelled());
+            assert!(begin_operation().is_err());
+            assert!(
+                release.finish(),
+                "runtime made no progress before watchdog release"
+            );
+
+            let lease = begin_operation().unwrap();
+            if fail {
+                assert_eq!(std::fs::read(&installed).unwrap(), before_manifest);
+                assert_eq!(
+                    serde_json::to_value(&Config::load().unwrap().plugins[ID]).unwrap(),
+                    before_config
+                );
+            } else {
+                assert_eq!(std::fs::read(&installed).unwrap(), next_manifest.as_bytes());
+                assert!(super::super::registry().get(ID).unwrap().active());
+            }
+            assert_eq!(Lockfile::load().unwrap().get(ID).unwrap().version, "2.0.0");
+            drop(lease);
+        }
+        uninstall(ID).unwrap();
     }
 }

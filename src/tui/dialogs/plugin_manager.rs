@@ -884,7 +884,7 @@ impl PluginManagerDialog {
             let result = async {
                 let log = crate::plugin::install::OperationLog::file(&task_log)
                     .map_err(|e| format!("{e:#}"))?;
-                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, true, &log)
+                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, true, log)
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 let updated = format!("Updated {} to {}", report.id, report.version);
@@ -979,7 +979,7 @@ impl PluginManagerDialog {
             let result = async {
                 let log = crate::plugin::install::OperationLog::file(&task_log)
                     .map_err(|e| format!("{e:#}"))?;
-                crate::plugin::install::apply_install(&source, &fingerprint, false, &log)
+                crate::plugin::install::apply_install(&source, &fingerprint, false, log)
                     .await
                     .map(|report| format!("Installed {} {}.", report.id, report.version))
                     .map_err(|e| format!("{e:#}"))

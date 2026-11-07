@@ -1381,7 +1381,7 @@ async fn apply_update_grants_the_new_capability_set() {
         "acme.upd",
         Some(fingerprint),
         true,
-        &install::OperationLog::Inherit,
+        install::OperationLog::Inherit,
     )
     .await
     .unwrap();
@@ -1409,7 +1409,7 @@ async fn apply_update_rejects_a_stale_fingerprint() {
         "acme.upd",
         Some("sha256:stale||community".to_string()),
         true,
-        &install::OperationLog::Inherit,
+        install::OperationLog::Inherit,
     )
     .await
     .unwrap_err()
@@ -1525,4 +1525,95 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn unchanged_sources_repair_missing_or_stale_approval() {
+    let _home = isolate();
+    for (index, (capabilities, remove_grant)) in
+        [("[\"net\"]", true), ("[]", true), ("[\"net\"]", false)]
+            .into_iter()
+            .enumerate()
+    {
+        let id = format!("acme.repair{index}");
+        let source = tempfile::tempdir().unwrap();
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"Repair\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = {capabilities}\n"
+        );
+        let dir = write_plugin_dir(source.path(), &manifest);
+        let dev = index == 0;
+        install::install(dir.to_str().unwrap(), true, dev)
+            .await
+            .unwrap();
+        assert!(matches!(
+            install::preview_update(&id, true).await.unwrap(),
+            UpdatePreview::NoUpdate
+        ));
+        install::set_enabled(&id, false).unwrap();
+        assert!(matches!(
+            install::preview_update(&id, true).await.unwrap(),
+            UpdatePreview::NoUpdate
+        ));
+        assert!(!Config::load().unwrap().plugins[&id].enabled);
+        install::set_enabled(&id, true).unwrap();
+
+        let installed = agent_of_empires::plugin::plugins_dir()
+            .unwrap()
+            .join(&id)
+            .join("aoe-plugin.toml");
+        if remove_grant {
+            agent_of_empires::session::update_config(|config| {
+                config.plugins.get_mut(&id).unwrap().grant = None;
+            })
+            .unwrap();
+        } else {
+            std::fs::write(&installed, format!("{manifest}\n# changed locally\n")).unwrap();
+        }
+        assert!(load_registry().get(&id).unwrap().needs_reapproval());
+        let before_manifest = std::fs::read(&installed).unwrap();
+        let before_entry = serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap();
+        let fingerprint = match install::preview_update(&id, true).await.unwrap() {
+            UpdatePreview::ConsentRequired { consent, .. } => {
+                assert!(!consent.stays_active_if_declined);
+                consent.fingerprint
+            }
+            other => panic!("repair needs explicit approval: {other:?}"),
+        };
+        assert!(matches!(
+            install::update_clean(&id).await.unwrap(),
+            install::UpdateOutcome::Skipped { .. }
+        ));
+        for fingerprint in [None, Some("stale".to_string())] {
+            assert!(
+                install::apply_update(&id, fingerprint, true, install::OperationLog::Inherit,)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read(&installed).unwrap(), before_manifest);
+        assert_eq!(
+            serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap(),
+            before_entry
+        );
+
+        let report =
+            install::apply_update(&id, Some(fingerprint), true, install::OperationLog::Inherit)
+                .await
+                .unwrap();
+        assert!(report.granted);
+        assert!(load_registry().get(&id).unwrap().active());
+        assert_eq!(std::fs::read(&installed).unwrap(), manifest.as_bytes());
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.plugins[&id].source.as_deref(),
+            dir.canonicalize().unwrap().to_str()
+        );
+        assert_eq!(config.plugins[&id].dev, dev);
+        assert!(matches!(
+            install::preview_update(&id, true).await.unwrap(),
+            UpdatePreview::NoUpdate
+        ));
+        install::uninstall(&id).unwrap();
+    }
 }

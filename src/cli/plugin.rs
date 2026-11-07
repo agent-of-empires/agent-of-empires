@@ -10,6 +10,10 @@ use crate::plugin::install::{UiView, UpdatePreview};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Remote plugin inspection is not supported; use the same Daemon's /api/plugins API, or run this command on its host without --daemon-url or AOE_DAEMON_URL")]
+struct RemoteInspectionUnsupported;
+
 #[derive(Subcommand)]
 pub enum PluginCommands {
     /// List every known plugin with version, validation, and state
@@ -87,6 +91,20 @@ pub enum PluginCommands {
 }
 
 pub async fn run(command: PluginCommands) -> Result<()> {
+    if matches!(
+        &command,
+        PluginCommands::List
+            | PluginCommands::Info { .. }
+            | PluginCommands::Logs { .. }
+            | PluginCommands::Outdated
+    ) {
+        anyhow::ensure!(
+            std::env::var_os("AOE_DAEMON_URL")
+                .as_deref()
+                .is_none_or(super::runtime_read::env_url_is_unset),
+            RemoteInspectionUnsupported,
+        );
+    }
     match command {
         PluginCommands::List => run_list(),
         PluginCommands::Info { id } => run_info(&id),
@@ -313,7 +331,16 @@ async fn run_install(source: &str, yes: bool, dev: bool) -> Result<()> {
 async fn run_update(id: &str, yes: bool) -> Result<()> {
     let endpoint = crate::acp::client::require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    let fingerprint = match client.preview_plugin_update(id).await? {
+    let preview = match client.preview_plugin_update(id).await {
+        Ok(preview) => preview,
+        Err(error @ HttpError::Daemon(crate::daemon::DaemonClientError::AuthenticatedDecode)) => {
+            return Err(error).context(
+                "Plugin preview response is incompatible or malformed; no update was submitted. Check the Client and Daemon versions, then upgrade and restart the Daemon on its host with `aoe serve --restart`, or restart its foreground process or service manager",
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let fingerprint = match preview {
         UpdatePreview::NoUpdate => {
             println!("{id} is already up to date.");
             return Ok(());
@@ -380,6 +407,7 @@ fn submission(
         Ok(accepted) => Ok(accepted),
         Err(error) if matches!(&error,
             HttpError::Unauthorized | HttpError::ReadOnly | HttpError::LocalPluginSourceRequired
+                | HttpError::PluginJobActive
                 | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
         ) || matches!(&error, HttpError::Server { status, .. }
             if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT) => Err(error.into()),
@@ -531,5 +559,134 @@ mod tests {
             serve.abort();
             let _ = serve.await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn inspection_and_preview_keep_endpoint_and_approval_boundaries() {
+        use crate::session::test_support::EnvGuard;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _credentials = EnvGuard::unset(&[
+            "AOE_DAEMON_URL",
+            "AOE_DAEMON_TOKEN",
+            "AOE_DAEMON_PASSPHRASE",
+        ]);
+        crate::plugin::reload_registry();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("file"), b"local source").unwrap();
+        for value in [
+            std::ffi::OsString::from("http://127.0.0.1:1"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ] {
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", &value)]);
+            for command in [
+                PluginCommands::List,
+                PluginCommands::Info {
+                    id: "acme.local".into(),
+                },
+                PluginCommands::Logs {
+                    id: "acme.local".into(),
+                },
+                PluginCommands::Outdated,
+            ] {
+                let error = run(command).await.unwrap_err();
+                assert!(error
+                    .downcast_ref::<RemoteInspectionUnsupported>()
+                    .is_some());
+            }
+            run(PluginCommands::Hash {
+                path: source.path().to_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        }
+        for value in ["", " \t "] {
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", value)]);
+            run(PluginCommands::List).await.unwrap();
+        }
+
+        let changelog = serde_json::json!({
+            "entries": [], "truncated": false,
+            "unavailable_reason": null, "more_url": null,
+        });
+        for preview in [
+            serde_json::json!({
+                "kind": "safe_update", "to_version": "2.0.0",
+                "fingerprint": "fixture", "changelog": changelog,
+            }),
+            serde_json::json!({
+                "kind": "consent_required", "dismissed": false,
+                "consent": {
+                    "id": "acme.old", "from_version": "1.0.0", "to_version": "2.0.0",
+                    "prior_capabilities": [], "new_capabilities": ["net"],
+                    "added_capabilities": ["net"], "removed_capabilities": [],
+                    "ui": [], "build_steps": [], "agent_integrations": [],
+                    "runtime_change": null, "trust_downgrade": false,
+                    "fingerprint": "fixture", "stays_active_if_declined": true,
+                    "changelog": changelog,
+                },
+            }),
+        ] {
+            let applies = Arc::new(AtomicUsize::new(0));
+            let mutations = applies.clone();
+            let preview = Arc::new(preview);
+            let router = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(|| async { Json(serde_json::json!([])) }),
+                )
+                .route(
+                    "/api/plugins/acme.old/update/preview",
+                    get(move || {
+                        let preview = preview.clone();
+                        async move { Json(preview) }
+                    }),
+                )
+                .route(
+                    "/api/plugins/acme.old/update/apply",
+                    post(move || {
+                        let mutations = mutations.clone();
+                        async move {
+                            mutations.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", format!("http://{address}"))]);
+            let result = run_update("acme.old", true).await;
+            server.abort();
+            let _ = server.await;
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<HttpError>(),
+                Some(HttpError::Daemon(
+                    crate::daemon::DaemonClientError::AuthenticatedDecode
+                ))
+            ));
+            assert!(error.to_string().contains("aoe serve --restart"));
+            assert_eq!(applies.load(Ordering::SeqCst), 0);
+        }
+
+        let refusal = submission(Err(HttpError::PluginJobActive)).err().unwrap();
+        assert!(matches!(
+            refusal.chain().next().unwrap().downcast_ref::<HttpError>(),
+            Some(HttpError::PluginJobActive)
+        ));
+        let unknown = submission(Err(HttpError::PluginPreviewFailed))
+            .err()
+            .unwrap();
+        assert!(unknown
+            .chain()
+            .next()
+            .unwrap()
+            .downcast_ref::<HttpError>()
+            .is_none());
     }
 }

@@ -217,7 +217,7 @@ Native clients classify errors from the status and one `AoE-Error-Code` response
 
 Install uses `POST /api/plugins/install/preview` with `source` and optional
 `dev` (default `false`), then `POST /api/plugins/install` with those fields
-and the preview's `expected_fingerprint`. Update uses
+and `expected_fingerprint` set to the preview's `fingerprint`. Update uses
 `GET /api/plugins/{id}/update/preview` and
 `POST /api/plugins/{id}/update/apply` with `expected_fingerprint`.
 Update previews include a `notice` describing the source; the CLI shows it before
@@ -225,6 +225,13 @@ applying the update.
 Uninstall uses `POST /api/plugins/{id}/uninstall`.
 Apply returns `202` with `job_id`; observe it through
 `GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.
+Preview failures return `502` with `AoE-Error-Code: preview_failed`; conflicting
+Daemon jobs return `409` with `AoE-Error-Code: plugin_job_active`. Native clients
+show fixed recovery guidance from these codes without reflecting response bodies.
+
+Lifecycle changes share cross-process exclusion with local TUI operations and
+startup sweeps. If another process owns that exclusion, an accepted job fails
+before fetching or applying its candidate; it is not queued or retried.
 
 Only a verified local Unix peer may use absolute local directories or `dev`,
 including updates whose recorded source is local. Other principals receive

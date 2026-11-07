@@ -716,7 +716,10 @@ pub async fn plugin_update_preview(
     .await
     {
         Ok(preview) => Json(preview).into_response(),
-        Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+        Err(e) => super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::PluginPreviewFailed,
+            format!("{e:#}"),
+        ),
     }
 }
 
@@ -746,7 +749,7 @@ pub async fn apply_plugin_update(
     let fingerprint = body.expected_fingerprint;
     let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Update, id, move |log| async move {
-        plugin::install::apply_update(&plugin_id, fingerprint, allow_local_source, &log).await?;
+        plugin::install::apply_update(&plugin_id, fingerprint, allow_local_source, log).await?;
         if let Some(host) = host {
             host.restart_worker(&plugin_id, &plugin::registry()).await;
         }
@@ -982,9 +985,8 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let Some((job_id, log_path)) = state.plugin_jobs.begin(kind, target) else {
-        return api_error(
-            StatusCode::CONFLICT,
-            "plugin_job_active",
+        return super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::PluginJobActive,
             "Another plugin operation is already running",
         );
     };
@@ -1019,7 +1021,10 @@ pub async fn preview_plugin_install(
     }
     match plugin::install::preview_install(&body.source, body.dev).await {
         Ok(consent) => Json(consent).into_response(),
-        Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+        Err(e) => super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::PluginPreviewFailed,
+            format!("{e:#}"),
+        ),
     }
 }
 
@@ -1039,14 +1044,17 @@ pub async fn start_plugin_install(
     }
     let source = body.source;
     let fingerprint = body.expected_fingerprint;
+    let host = state.plugin_host.clone();
     start_job(
         state,
         PluginJobKind::Install,
         source.clone(),
         move |log| async move {
-            plugin::install::apply_install(&source, &fingerprint, body.dev, &log)
-                .await
-                .map(|_| ())
+            plugin::install::apply_install(&source, &fingerprint, body.dev, log).await?;
+            if let Some(host) = host {
+                host.reconcile(&plugin::registry()).await;
+            }
+            Ok(())
         },
     )
     .await
@@ -1065,17 +1073,15 @@ pub async fn start_plugin_uninstall(
         return resp;
     }
     let plugin_id = id.clone();
+    let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Uninstall, id, move |log| async move {
-        // Uninstall is synchronous filesystem work; run it off the async task so
-        // it never parks a runtime worker.
-        match tokio::task::spawn_blocking(move || {
-            plugin::install::uninstall_logged(&plugin_id, &log)
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => Err(anyhow::anyhow!("uninstall task failed: {e}")),
+        tokio::task::spawn_blocking(move || plugin::install::uninstall_logged(&plugin_id, &log))
+            .await
+            .map_err(|e| anyhow::anyhow!("uninstall task failed: {e}"))??;
+        if let Some(host) = host {
+            host.reconcile(&plugin::registry()).await;
         }
+        Ok(())
     })
     .await
 }
@@ -1137,6 +1143,33 @@ mod tests {
     use aoe_plugin_api::PluginManifest;
 
     #[cfg(unix)]
+    async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn finish(state: &AppState, response: Response) -> PluginJob {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: PluginJobAccepted = decode(response).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let job = state.plugin_jobs.get(&accepted.job_id).unwrap().job;
+                if !matches!(job.status, PluginJobStatus::Running) {
+                    return job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
     async fn local_plugin_jobs_pin_consent_and_preserve_dev_source() {
@@ -1177,29 +1210,6 @@ mod tests {
                 }),
             )
         };
-        async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
-            serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap()
-        }
-        async fn finish(state: &AppState, response: Response) -> PluginJob {
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-            let accepted: PluginJobAccepted = decode(response).await;
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    let job = state.plugin_jobs.get(&accepted.job_id).unwrap().job;
-                    if !matches!(job.status, PluginJobStatus::Running) {
-                        return job;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap()
-        }
         let installed = plugin::plugins_dir().unwrap().join("aoe.dev-fixture");
         write("1.0.0", true);
         let response = preview(state.clone()).await;
@@ -1317,6 +1327,115 @@ mod tests {
         state.runtime.work.drain().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lifecycle_jobs_start_and_stop_live_workers() {
+        use futures_util::FutureExt;
+
+        let _reload = plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let pid_file = effects.path().join("worker-pid");
+        let receipt = effects.path().join("notification");
+        let command = serde_json::to_string(&[
+            "sh",
+            "-c",
+            "printf '%s' $$ > \"$1\"; while IFS= read -r line; do printf received > \"$2\"; done",
+            "worker-fixture",
+            pid_file.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            format!(
+                "id = \"acme.live\"\nname = \"Live worker\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = {command}\nsystem = true\n"
+            ),
+        )
+        .unwrap();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.plugin_host = Some(
+                    plugin::host::PluginHost::new(
+                        &crate::session::get_app_dir().unwrap(),
+                        "default",
+                        None,
+                        state.runtime.work.clone(),
+                    )
+                    .unwrap(),
+                );
+            });
+        let host = state.plugin_host.as_ref().unwrap();
+        let peer = Some(axum::Extension(Principal::LocalPeer { uid: 1000 }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let consent: plugin::install::InstallConsent = decode(
+                preview_plugin_install(
+                    State(state.clone()),
+                    peer,
+                    Json(InstallPreviewBody {
+                        source: source.path().to_str().unwrap().into(),
+                        dev: false,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert!(!pid_file.exists());
+            let response = start_plugin_install(
+                State(state.clone()),
+                None,
+                peer,
+                Json(StartInstallBody {
+                    source: source.path().to_str().unwrap().into(),
+                    dev: false,
+                    expected_fingerprint: consent.fingerprint,
+                }),
+            )
+            .await;
+            assert!(matches!(
+                finish(&state, response).await.status,
+                PluginJobStatus::Succeeded
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !host
+                    .notify_worker("acme.live", "fixture.ping", json!({}))
+                    .await
+                {
+                    tokio::task::yield_now().await;
+                }
+                while !receipt.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let pid = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+            assert!(crate::process::worker::is_process_group_alive(pid));
+            let response =
+                start_plugin_uninstall(State(state.clone()), None, peer, Path("acme.live".into()))
+                    .await;
+            assert!(matches!(
+                finish(&state, response).await.status,
+                PluginJobStatus::Succeeded
+            ));
+            assert!(
+                !host
+                    .notify_worker("acme.live", "fixture.ping", json!({}))
+                    .await
+            );
+            assert!(!crate::process::worker::is_process_group_alive(pid));
+        })
+        .catch_unwind()
+        .await;
+        host.shutdown().await;
+        state.runtime.work.drain().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn plugin_sources_require_owner_authority_and_mutation_policy() {
@@ -1368,6 +1487,28 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
             assert!(state.plugin_jobs.jobs.lock().unwrap().is_empty());
         }
+        for response in [
+            preview_plugin_install(
+                State(normal.clone()),
+                owner,
+                Json(InstallPreviewBody {
+                    source: source.path().join("missing").to_str().unwrap().into(),
+                    dev: false,
+                }),
+            )
+            .await,
+            plugin_update_preview(State(normal.clone()), owner, Path("acme.missing".into())).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                crate::daemon::ApiErrorCode::from_headers(
+                    response.status(),
+                    response.headers(),
+                    false,
+                ),
+                Some(crate::daemon::ApiErrorCode::PluginPreviewFailed),
+            );
+        }
         crate::session::update_config(|config| {
             config.plugins.insert(
                 "acme.local".into(),
@@ -1406,12 +1547,29 @@ mod tests {
             .await
             .is_err());
         assert!(
-            plugin::install::apply_update("acme.local", None, false, &OperationLog::Inherit)
+            plugin::install::apply_update("acme.local", None, false, OperationLog::Inherit)
                 .await
                 .is_err()
         );
         assert!(normal.plugin_jobs.jobs.lock().unwrap().is_empty());
         assert!(!plugin::plugins_dir().unwrap().join("acme.local").exists());
+        let (running, _) = normal
+            .plugin_jobs
+            .begin(PluginJobKind::Install, "fixture".into())
+            .unwrap();
+        let response = start_plugin_uninstall(
+            State(normal.clone()),
+            None,
+            owner,
+            Path("acme.local".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false,),
+            Some(crate::daemon::ApiErrorCode::PluginJobActive),
+        );
+        normal.plugin_jobs.finish(&running, Ok(()));
         for state in [normal, read_only, cityhall] {
             state.runtime.work.drain().await;
         }
