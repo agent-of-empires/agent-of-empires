@@ -231,7 +231,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container", controller.signal);
     ensure
       .then((res) => {
         if (controller.signal.aborted) return;
