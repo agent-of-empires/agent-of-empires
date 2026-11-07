@@ -478,7 +478,9 @@ pub(super) fn map_update_to_events(
             }
             if completed {
                 let async_subagent = matches!(
-                    detect_off_protocol_work_completed(&update.fields.content),
+                    detect_off_protocol_work_completed(
+                        update.fields.content.as_deref().unwrap_or_default()
+                    ),
                     Some(OffProtocolWorkKind::AsyncAgent)
                 );
                 events.push(Event::ToolCallCompleted {
