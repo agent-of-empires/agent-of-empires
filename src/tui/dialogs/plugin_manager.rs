@@ -854,7 +854,7 @@ impl PluginManagerDialog {
         let preview_id = id.clone();
         tokio::spawn(async move {
             let _ = tx.send(
-                crate::plugin::install::preview_update(&preview_id)
+                crate::plugin::install::preview_update(&preview_id, true)
                     .await
                     .map_err(|e| format!("{e:#}")),
             );
@@ -884,7 +884,7 @@ impl PluginManagerDialog {
             let result = async {
                 let log = crate::plugin::install::OperationLog::file(&task_log)
                     .map_err(|e| format!("{e:#}"))?;
-                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, &log)
+                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, true, &log)
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 let updated = format!("Updated {} to {}", report.id, report.version);
@@ -948,7 +948,7 @@ impl PluginManagerDialog {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let _ = tx.send(
-                crate::plugin::install::preview_install(&source)
+                crate::plugin::install::preview_install(&source, false)
                     .await
                     .map_err(|e| format!("{e:#}")),
             );
@@ -979,7 +979,7 @@ impl PluginManagerDialog {
             let result = async {
                 let log = crate::plugin::install::OperationLog::file(&task_log)
                     .map_err(|e| format!("{e:#}"))?;
-                crate::plugin::install::apply_install(&source, &fingerprint, &log)
+                crate::plugin::install::apply_install(&source, &fingerprint, false, &log)
                     .await
                     .map(|report| format!("Installed {} {}.", report.id, report.version))
                     .map_err(|e| format!("{e:#}"))
@@ -1107,6 +1107,7 @@ impl PluginManagerDialog {
                             to_version,
                             fingerprint,
                             changelog,
+                            ..
                         }) => {
                             if let Some(id) = self.pending_plugin.clone() {
                                 let from_version = self
@@ -1127,7 +1128,9 @@ impl PluginManagerDialog {
                         }
                         // A dismissed version resurfaces only when a newer
                         // one appears.
-                        Ok(UpdatePreview::ConsentRequired { consent, dismissed }) => {
+                        Ok(UpdatePreview::ConsentRequired {
+                            consent, dismissed, ..
+                        }) => {
                             if dismissed {
                                 self.info = Some(format!(
                                     "Update for {} was already declined.",

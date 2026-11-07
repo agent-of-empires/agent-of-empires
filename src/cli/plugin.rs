@@ -1,6 +1,13 @@
 //! `aoe plugin`: plugin management (list, info, enable, disable, install,
 
-use anyhow::Result;
+use std::io::{self, IsTerminal, Write};
+
+use crate::acp::client::{HttpClient, HttpError};
+use crate::daemon::{
+    ApplyUpdateBody, InstallPreviewBody, PluginJobAccepted, PluginJobStatus, StartInstallBody,
+};
+use crate::plugin::install::{UiView, UpdatePreview};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -59,6 +66,11 @@ pub enum PluginCommands {
         /// Plugin id
         id: String,
     },
+    /// Observe an accepted plugin job without submitting another operation
+    Job {
+        /// Job id returned by install, update, or uninstall
+        id: String,
+    },
     /// Print the deterministic source tree hash for a plugin directory, the
     /// value a maintainer pins in the featured index
     Hash {
@@ -83,7 +95,11 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes, dev } => run_install(&source, yes, dev).await,
         PluginCommands::Update { id, yes } => run_update(&id, yes).await,
-        PluginCommands::Uninstall { id } => run_uninstall(&id),
+        PluginCommands::Uninstall { id } => run_uninstall(&id).await,
+        PluginCommands::Job { id } => {
+            let endpoint = crate::acp::client::require_daemon().await?;
+            observe_job(&HttpClient::new(endpoint)?, &id).await
+        }
         PluginCommands::Hash { path } => run_hash(&path),
         PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
         PluginCommands::Outdated => run_outdated().await,
@@ -196,51 +212,213 @@ async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> String {
-    let mut out = format!("{verb} {} {}.\n", report.id, report.version);
-    out.push_str(&format!("  validation: {}\n", report.validation.as_str()));
-    out.push_str("  capabilities: ");
-    if report.capabilities.is_empty() {
-        out.push_str("none");
-    } else {
-        out.push_str(&report.capabilities.join(", "));
+fn confirm(question: &str) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("stdin is not a terminal; re-run with --yes to approve this plugin");
     }
-    if !report.granted {
-        out.push_str(" (not granted, plugin inactive)");
-    } else if !report.capabilities.is_empty() {
-        out.push_str(" (granted)");
-    }
-    out
+    print!("{question} [y/N] ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
-    println!("{}", format_report(report, verb));
+fn disclose(
+    id: &str,
+    capabilities: &[String],
+    ui: &[UiView],
+    build_steps: &[String],
+    integrations: &[aoe_plugin_api::agent_integration::AgentIntegrationContribution],
+) {
+    println!("Plugin {id}:");
+    for capability in capabilities {
+        println!("  capability: {capability}");
+    }
+    for item in ui {
+        println!("  UI: {} ({})", item.slot, item.id);
+    }
+    for command in build_steps {
+        println!("  build (runs now as your user, unsandboxed): {command}");
+    }
+    for integration in integrations {
+        println!(
+            "  agent command (runs as your user, unsandboxed): {}: {}",
+            integration.tool,
+            integration
+                .command
+                .as_deref()
+                .unwrap_or("No launch command declared"),
+        );
+    }
+    println!("Only install plugins you trust. Workers and build steps are not contained by capability checks or OS sandboxing.");
 }
 
 async fn run_install(source: &str, yes: bool, dev: bool) -> Result<()> {
-    let report = crate::plugin::install::install(source, yes, dev).await?;
-    print_report(&report, "Installed");
-    Ok(())
+    use crate::plugin::source::PluginSource;
+
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let source = match PluginSource::parse(source)? {
+        PluginSource::Local(path) => {
+            anyhow::ensure!(
+                endpoint.unix_path().is_some(),
+                "Local plugin sources and --dev require the local Daemon Unix socket; remote endpoints cannot read Client paths",
+            );
+            std::path::absolute(path)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("plugin source path is not valid UTF-8"))?
+        }
+        PluginSource::Github { .. } => {
+            anyhow::ensure!(!dev, "--dev requires a local plugin directory");
+            source.trim().to_owned()
+        }
+    };
+    let client = HttpClient::new(endpoint)?;
+    let preview = InstallPreviewBody { source, dev };
+    let consent = client.preview_plugin_install(&preview).await?;
+    eprintln!("{}", consent.notice);
+    if consent.unverified {
+        println!("This is unverified, un-audited code, not covered by the featured index.");
+        if !yes && !confirm("Continue?")? {
+            bail!("install cancelled; the unverified source was not approved");
+        }
+    }
+    disclose(
+        &consent.id,
+        &consent.capabilities,
+        &consent.ui,
+        &consent.build_steps,
+        &consent.agent_integrations,
+    );
+    let needs_consent = !consent.capabilities.is_empty()
+        || !consent.ui.is_empty()
+        || !consent.build_steps.is_empty()
+        || !consent.agent_integrations.is_empty();
+    if needs_consent && !yes && !confirm("Grant them and install?")? {
+        bail!("install cancelled; no capabilities were granted");
+    }
+    let accepted = submission(
+        client
+            .install_plugin(&StartInstallBody {
+                source: preview.source,
+                dev,
+                expected_fingerprint: consent.fingerprint,
+            })
+            .await,
+    )?;
+    observe_job(&client, &accepted.job_id).await
 }
 
 async fn run_update(id: &str, yes: bool) -> Result<()> {
-    use crate::plugin::install::LiveRestart;
-    let report = crate::plugin::install::update(id, yes).await?;
-    print_report(&report, "Updated");
-    match crate::plugin::install::restart_worker_live(id).await {
-        LiveRestart::Daemon => println!("  the running daemon reloaded the plugin."),
-        LiveRestart::NoDaemon => {}
-        LiveRestart::DaemonStale { reason } => println!(
-            "  warning: a daemon is running but did not reload the plugin ({reason}); its worker keeps the previous build until the daemon restarts."
-        ),
-    }
-    Ok(())
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let fingerprint = match client.preview_plugin_update(id).await? {
+        UpdatePreview::NoUpdate => {
+            println!("{id} is already up to date.");
+            return Ok(());
+        }
+        UpdatePreview::SafeUpdate {
+            fingerprint,
+            notice,
+            ..
+        } => {
+            eprintln!("{notice}");
+            fingerprint
+        }
+        UpdatePreview::ConsentRequired {
+            consent, notice, ..
+        } => {
+            eprintln!("{notice}");
+            println!(
+                "Update {id}: {} -> {}",
+                consent.from_version, consent.to_version
+            );
+            if let Some(change) = &consent.runtime_change {
+                println!("  runtime: {change}");
+            }
+            if consent.trust_downgrade {
+                println!("  warning: this update is no longer featured");
+            }
+            disclose(
+                id,
+                &consent.new_capabilities,
+                &consent.ui,
+                &consent.build_steps,
+                &consent.agent_integrations,
+            );
+            if !yes && !confirm("Approve this update?")? {
+                bail!("update cancelled; the installed version is unchanged");
+            }
+            consent.fingerprint
+        }
+    };
+    let accepted = submission(
+        client
+            .update_plugin(
+                id,
+                &ApplyUpdateBody {
+                    expected_fingerprint: Some(fingerprint),
+                },
+            )
+            .await,
+    )?;
+    observe_job(&client, &accepted.job_id).await
 }
 
-fn run_uninstall(id: &str) -> Result<()> {
-    crate::plugin::install::uninstall(id)?;
-    println!("Uninstalled {id}.");
-    Ok(())
+async fn run_uninstall(id: &str) -> Result<()> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let accepted = submission(client.uninstall_plugin(id).await)?;
+    observe_job(&client, &accepted.job_id).await
+}
+
+fn submission(
+    result: std::result::Result<PluginJobAccepted, HttpError>,
+) -> Result<PluginJobAccepted> {
+    match result {
+        Ok(accepted) => Ok(accepted),
+        Err(error) if matches!(&error,
+            HttpError::Unauthorized | HttpError::ReadOnly | HttpError::LocalPluginSourceRequired
+                | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
+        ) || matches!(&error, HttpError::Server { status, .. }
+            if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT) => Err(error.into()),
+        Err(error) => Err(error).context(
+            "Plugin operation outcome unknown; no operation was resubmitted. Inspect GET /api/plugins on the same Daemon before deciding whether to retry",
+        ),
+    }
+}
+
+async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
+    eprintln!("Plugin job {id}; resume observation with `aoe plugin job {id}` on the same Daemon endpoint");
+    let observe = async {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            poll.tick().await;
+            let response = client.plugin_job(id).await.with_context(|| format!(
+                "Plugin job {id} outcome unknown; run `aoe plugin job {id}` on the same Daemon. No operation was resubmitted",
+            ))?;
+            match response.job.status {
+                PluginJobStatus::Running => {}
+                PluginJobStatus::Succeeded => {
+                    if !response.log.tail.is_empty() {
+                        println!("{}", response.log.tail);
+                    }
+                    println!("Plugin job {id} succeeded.");
+                    return Ok(());
+                }
+                PluginJobStatus::Failed { error } => {
+                    bail!("Plugin job {id} failed: {error}");
+                }
+            }
+        }
+    };
+    tokio::select! {
+        result = observe => result,
+        _ = tokio::signal::ctrl_c() => bail!("Observation stopped; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30 * 60)) => bail!("Observation timed out; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
+    }
 }
 
 async fn run_discover(query: Option<&str>) -> Result<()> {
@@ -290,44 +468,68 @@ async fn run_outdated() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_report;
-    use crate::plugin::install::InstallReport;
-    use crate::plugin::registry::ValidationState;
+    use super::*;
+    use axum::{
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
-    #[test]
-    fn format_report_surfaces_validation_and_grant_state() {
-        let report =
-            |version: &str, capabilities: Vec<String>, granted, validation| InstallReport {
-                id: "acme.foo".into(),
-                version: version.into(),
-                capabilities,
-                granted,
-                validation,
-            };
-
-        let granted = report(
-            "1.2.3",
-            vec!["session.read".into(), "filesystem.read".into()],
-            true,
-            ValidationState::Community,
-        );
-        assert_eq!(
-            format_report(&granted, "Installed"),
-            "Installed acme.foo 1.2.3.\n  validation: community\n  capabilities: session.read, filesystem.read (granted)"
-        );
-
-        let local = report("0.1.0", vec![], true, ValidationState::Local);
-        let out = format_report(&local, "Installed");
-        assert!(
-            out.contains("\n  validation: local\n"),
-            "a local install surfaces its validation: {out:?}"
-        );
-
-        let inactive = report("0.1.0", vec![], false, ValidationState::Community);
-        let out = format_report(&inactive, "Updated");
-        assert!(
-            out.ends_with("  capabilities: none (not granted, plugin inactive)"),
-            "inactivity is surfaced with no capabilities: {out:?}"
-        );
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_plugin_operations_are_not_resubmitted() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for lost_reply in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mutations = calls.clone();
+            let router = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(|| async { Json(serde_json::json!([])) }),
+                )
+                .route(
+                    "/api/plugins/acme.fixture/uninstall",
+                    post(move || {
+                        let calls = mutations.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            if lost_reply {
+                                (StatusCode::ACCEPTED, "{")
+                            } else {
+                                (StatusCode::ACCEPTED, "{\"job_id\":\"accepted-fixture\"}")
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/api/plugins/jobs/accepted-fixture",
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                ("AOE_DAEMON_URL", format!("http://{address}")),
+                ("AOE_DAEMON_TOKEN", String::new()),
+                ("AOE_DAEMON_PASSPHRASE", String::new()),
+            ]);
+            let error = run_uninstall("acme.fixture").await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("outcome unknown"),
+                "{error:#}"
+            );
+            if !lost_reply {
+                assert!(error
+                    .to_string()
+                    .contains("aoe plugin job accepted-fixture"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            serve.abort();
+            let _ = serve.await;
+        }
     }
 }

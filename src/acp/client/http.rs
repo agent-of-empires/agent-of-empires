@@ -97,6 +97,8 @@ pub enum HttpError {
     ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
+    #[error("local plugin directories and --dev require a verified local Daemon Unix socket peer; remote endpoints cannot read Client paths")]
+    LocalPluginSourceRequired,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
     #[error("Auto-name skipped: the session changed or no title could be applied")]
@@ -796,6 +798,89 @@ impl HttpClient {
         })
     }
 
+    pub async fn preview_plugin_install(
+        &self,
+        body: &crate::daemon::InstallPreviewBody,
+    ) -> Result<crate::plugin::install::InstallConsent, HttpError> {
+        let url = format!("{}/api/plugins/install/preview", self.endpoint.base_url);
+        let response = check_global_status(
+            self.execute(self.http.post(url).json(body).timeout(SEND_TIMEOUT))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn install_plugin(
+        &self,
+        body: &crate::daemon::StartInstallBody,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!("{}/api/plugins/install", self.endpoint.base_url);
+        let response = check_global_status(
+            self.execute_elevated(|| self.http.post(&url).json(body))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn preview_plugin_update(
+        &self,
+        id: &str,
+    ) -> Result<crate::plugin::install::UpdatePreview, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/update/preview",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(
+            self.execute(self.http.get(url).timeout(SEND_TIMEOUT))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn update_plugin(
+        &self,
+        id: &str,
+        body: &crate::daemon::ApplyUpdateBody,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/update/apply",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(
+            self.execute_elevated(|| self.http.post(&url).json(body))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn uninstall_plugin(
+        &self,
+        id: &str,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/uninstall",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(self.execute_elevated(|| self.http.post(&url)).await?)?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn plugin_job(
+        &self,
+        id: &str,
+    ) -> Result<crate::daemon::PluginJobResponse, HttpError> {
+        let url = format!(
+            "{}/api/plugins/jobs/{}",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(self.execute(self.http.get(url)).await?)?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
     /// `GET /api/log-level`, or `PATCH` it first when `patch` is given.
     pub async fn log_level(
         &self,
@@ -1070,6 +1155,7 @@ fn classify_code(
     match (status, code) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
+        (_, Some(ApiErrorCode::LocalPluginSourceRequired)) => HttpError::LocalPluginSourceRequired,
         (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
         (_, Some(ApiErrorCode::SmartRenameSkipped)) => HttpError::SmartRenameSkipped,

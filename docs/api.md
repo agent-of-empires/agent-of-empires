@@ -213,6 +213,25 @@ rejects symlinks, special files, packages over 64 MiB, individual files over
 
 Native clients classify errors from the status and one `AoE-Error-Code` response header, never from the body. A missing, repeated, unknown or status-inconsistent value means "generic status". Plain HTTP from a non-loopback peer gets `426 tls_required` before authentication unless the bind sets `--dangerously-allow-plaintext-remote`.
 
+## Plugin lifecycle
+
+Install uses `POST /api/plugins/install/preview` with `source` and optional
+`dev` (default `false`), then `POST /api/plugins/install` with those fields
+and the preview's `expected_fingerprint`. Update uses
+`GET /api/plugins/{id}/update/preview` and
+`POST /api/plugins/{id}/update/apply` with `expected_fingerprint`.
+Update previews include a `notice` describing the source; the CLI shows it before
+applying the update.
+Uninstall uses `POST /api/plugins/{id}/uninstall`.
+Apply returns `202` with `job_id`; observe it through
+`GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.
+
+Only a verified local Unix peer may use absolute local directories or `dev`,
+including updates whose recorded source is local. Other principals receive
+`403` with `AoE-Error-Code: local_plugin_source_required`, even over loopback TCP.
+Preview and apply retain read-only and CityHall restrictions; apply also requires
+elevation. See [plugin consent and job recovery](plugins.md#installing-external-plugins).
+
 ## Runtime CLI reads
 
 The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.

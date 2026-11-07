@@ -3659,6 +3659,7 @@ mod tests {
             (SigHandler::SigDfl, SigHandler::SigDfl) => true,
             (SigHandler::SigIgn, SigHandler::SigIgn) => true,
             (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
+            (SigHandler::SigAction(f1), SigHandler::SigAction(f2)) => f1 as usize == f2 as usize,
             _ => false,
         }
     }
@@ -3731,6 +3732,13 @@ mod tests {
     #[serial_test::serial]
     fn ignore_signals_guard_installs_sig_ign_and_restores_prior_disposition() {
         use nix::sys::signal::{SigHandler, Signal};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let _interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
 
         let baseline_sigint = current_disposition(Signal::SIGINT);
         let baseline_sigquit = current_disposition(Signal::SIGQUIT);

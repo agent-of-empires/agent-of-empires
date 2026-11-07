@@ -8,7 +8,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::agent_integration::AgentIntegrationContribution;
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
 
@@ -196,13 +196,13 @@ pub enum UpdateOutcome {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiView {
     pub slot: String,
     pub id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConsent {
     pub id: String,
     pub from_version: String,
@@ -221,7 +221,7 @@ pub struct UpdateConsent {
     pub changelog: UpdateChangelog,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpdatePreview {
     NoUpdate,
@@ -229,10 +229,12 @@ pub enum UpdatePreview {
         to_version: String,
         fingerprint: String,
         changelog: UpdateChangelog,
+        notice: String,
     },
     ConsentRequired {
         consent: Box<UpdateConsent>,
         dismissed: bool,
+        notice: String,
     },
 }
 
@@ -250,7 +252,7 @@ struct PreparedInstall {
     validation: ValidationState,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallConsent {
     pub id: String,
     pub version: String,
@@ -409,11 +411,8 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
     apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
 }
 
-pub async fn preview_install(input: &str) -> Result<InstallConsent> {
-    if !input.starts_with("gh:") {
-        bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
-    }
-    let p = prepare_install(input, false).await?;
+pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
+    let p = prepare_install(input, dev).await?;
     Ok(InstallConsent {
         id: p.id.clone(),
         version: p.fetched.manifest.version.clone(),
@@ -444,12 +443,10 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
 pub async fn apply_install(
     input: &str,
     expected_fingerprint: &str,
+    dev: bool,
     log: &OperationLog,
 ) -> Result<InstallReport> {
-    if !input.starts_with("gh:") {
-        bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
-    }
-    let prepared = prepare_install(input, false).await?;
+    let prepared = prepare_install(input, dev).await?;
     if prepared.fingerprint != expected_fingerprint {
         bail!(
             "the plugin at {input} changed since it was shown; review it again before installing"
@@ -561,7 +558,7 @@ fn agent_integrations_changed(
     })
 }
 
-async fn prepare_update(id: &str) -> Result<Prepared> {
+async fn prepare_update(id: &str, allow_local_source: bool) -> Result<Prepared> {
     let config = Config::load()?;
     let plugin_config = config
         .plugins
@@ -575,6 +572,9 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let dev = plugin_config.dev;
 
     let source = PluginSource::parse(&source_str)?;
+    if !allow_local_source && (dev || matches!(source, PluginSource::Local(_))) {
+        bail!("local plugin directories and --dev require a verified local Unix socket peer");
+    }
     let resolved = resolve_source(source, false).await?;
     let fetched = fetch::fetch(&resolved.source).await?;
     if fetched.manifest.id.as_str() != id {
@@ -749,7 +749,7 @@ fn apply_prepared(
 }
 
 async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
-    let prepared = prepare_update(id).await?;
+    let prepared = prepare_update(id, true).await?;
     if mode != ConsentMode::CleanOnlyNonInteractive {
         eprintln!("{}", prepared.notice);
     }
@@ -871,8 +871,8 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
     .await
 }
 
-pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
-    let prepared = prepare_update(id).await?;
+pub async fn preview_update(id: &str, allow_local_source: bool) -> Result<UpdatePreview> {
+    let prepared = prepare_update(id, allow_local_source).await?;
     if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
         return Ok(UpdatePreview::NoUpdate);
     }
@@ -882,6 +882,7 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
             to_version: prepared.fetched.manifest.version.clone(),
             fingerprint: prepared.fingerprint.clone(),
             changelog,
+            notice: prepared.notice,
         });
     }
     let dismissed = Config::load()
@@ -891,15 +892,17 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     Ok(UpdatePreview::ConsentRequired {
         consent: Box::new(consent_of(&prepared, changelog)),
         dismissed,
+        notice: prepared.notice,
     })
 }
 
 pub async fn apply_update(
     id: &str,
     expected_fingerprint: Option<String>,
+    allow_local_source: bool,
     log: &OperationLog,
 ) -> Result<InstallReport> {
-    let prepared = prepare_update(id).await?;
+    let prepared = prepare_update(id, allow_local_source).await?;
     match &expected_fingerprint {
         Some(expected) if *expected != prepared.fingerprint => {
             bail!(
@@ -1620,7 +1623,7 @@ mod tests {
             std::future::ready(NodeEnv::new())
         };
 
-        let declined = prepare_update("acme.upd").await.unwrap();
+        let declined = prepare_update("acme.upd", true).await.unwrap();
         assert!(declined.needs_consent);
         let err = finish_update(declined, None, provision).await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("update cancelled")));
@@ -1628,7 +1631,7 @@ mod tests {
         assert!(!installed.join("built").exists());
         assert_eq!(installed_version(), "0.1.0");
 
-        let approved = prepare_update("acme.upd").await.unwrap();
+        let approved = prepare_update("acme.upd", true).await.unwrap();
         let grant = CapabilityGrant {
             manifest_hash: approved.manifest_hash.clone(),
             capabilities: approved.capabilities.clone(),
@@ -1721,20 +1724,6 @@ mod tests {
         assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
         // The manifest / launch command stays raw.
         assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
-    }
-
-    #[tokio::test]
-    async fn web_install_rejects_non_gh_sources() {
-        let err = preview_install("/tmp/some/plugin")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("gh:"), "{err}");
-        let err = apply_install("./local/dir", "fp", &OperationLog::Inherit)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("gh:"), "{err}");
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
