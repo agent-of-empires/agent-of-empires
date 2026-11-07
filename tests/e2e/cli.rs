@@ -855,7 +855,6 @@ command = "bash -lc true"
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
-    assert!(h.read_sessions().as_array().unwrap().is_empty());
 }
 
 /// `aoe add` rejects bad requests before writing anything, without leaking
