@@ -56,7 +56,7 @@ Successful tool calls collapse to one line with their target and, for edits, add
 
 ## Tool cards
 
-Tool calls render per kind rather than as one generic line: an edit or write shows the path and a compact diff in your theme's diff colors, an execute shows the command and a bounded output preview, a read shows the path and a content preview, a delete shows the target. Diffs cap at 20 changed lines and previews at 12, with a "+N more" footer. A single patch touching several files shows each file in one card. In the dashboard, Claude's harness tools get dedicated cards too (a tool search shows its query, a background monitor its description and command, a task stop the stopped task id). Other kinds fall back to a generic one-liner.
+Tool calls render per kind rather than as one generic line: an edit or write shows the path and a compact diff in your theme's diff colors, an execute shows the command and a bounded output preview, a read shows the path and a content preview, a delete shows the target. Diffs cap at 20 changed lines and previews at 12, with a "+N more" footer. A single patch touching several files shows each file in one card. In the dashboard, Claude's harness tools get dedicated cards too (a tool search shows its query, a background monitor its description and command, a task stop the stopped task id, a send message its target and summary). Other kinds fall back to a generic one-liner.
 
 When a tool returns images, audio, or resources they render inline on the card (a textual placeholder in the TUI), and anything that cannot be shown degrades to a labelled placeholder rather than being dropped.
 
