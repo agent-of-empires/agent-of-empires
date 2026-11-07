@@ -71,6 +71,7 @@ pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
 pub use serve::{served_via, DashboardLaunch, ServeAction, ServeLaunchRequest, ServeView};
+pub(crate) use serve::{ServeJobs, ServeLaunchFailure};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;

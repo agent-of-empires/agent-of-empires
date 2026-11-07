@@ -3842,7 +3842,10 @@ impl HomeView {
         self.dashboard_launch = launch
             .clone()
             .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
-        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
+        self.serve_view = Some(match launch {
+            Some(launch) => ServeView::for_launch(launch, &mut self.serve_jobs),
+            None => ServeView::new(&mut self.serve_jobs),
+        });
     }
 
     pub(super) fn open_settings(&mut self) {

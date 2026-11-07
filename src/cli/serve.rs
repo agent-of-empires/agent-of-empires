@@ -897,12 +897,16 @@ fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
             .is_some_and(|environment| environment_has_daemon_instance(&environment, instance_id));
     }
 
-    std::process::Command::new("ps")
-        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
+    crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    )
+    .ok()
+    .flatten()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
 fn recall_serve_passphrase(launch: &ServeLaunch) -> Result<Option<String>> {
@@ -1069,17 +1073,19 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     // macOS / other: shell out to `ps`. `-o command=` prints the full
     // command (path + args) with no header, and `-ww` stops it being clipped
     // at the terminal width before `serve` shows up.
-    match std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-    {
-        Ok(out) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
-        Ok(out) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(out) if command_mentions_aoe_executable(&out.stdout) => {
+    match crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(Some(out)) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
             DaemonProcessIdentity::Indeterminate
         }
-        Ok(_) => DaemonProcessIdentity::Foreign,
-        Err(_) => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(_)) => DaemonProcessIdentity::Foreign,
+        Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
 }
 
@@ -1284,7 +1290,12 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
             tailscale_probe().await.use_funnel()?
         };
         if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
-            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared).await??;
+            tokio::task::spawn_blocking(|| {
+                crate::server::tunnel::check_cloudflared(
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+            })
+            .await??;
         }
     }
     Ok(auth_mode)
@@ -2053,6 +2064,81 @@ fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
     } else {
         "Daemon was not running; serve state changed meanwhile and was preserved"
     })
+}
+/// Opaque Daemon incarnation observed before a TUI control request is queued.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TuiControlTarget {
+    process: Option<(u32, crate::process::ProcessBirthIdentity, Option<String>)>,
+}
+
+impl TuiControlTarget {
+    pub(crate) fn is_running(&self) -> bool {
+        self.process.is_some()
+    }
+}
+
+pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
+    let process = match daemon_status() {
+        DaemonStatus::Absent => None,
+        DaemonStatus::Unverified => bail!("Cannot verify the Daemon; inspect `aoe serve --status`"),
+        DaemonStatus::Verified(pid) => {
+            let birth = crate::process::process_birth_identity(pid)?
+                .context("Daemon exited while its identity was being observed")?;
+            let launch = launch_file("serve.launch")?
+                .read()?
+                .map(|raw| serde_json::from_str::<ServeLaunch>(&raw))
+                .transpose()?;
+            let instance = match launch {
+                Some(launch) if launch.pid == pid => {
+                    anyhow::ensure!(
+                        !launch_contradicts(&launch, pid, instance_is_live(&launch, pid)),
+                        "Daemon launch identity contradicts its process; preserving serve state"
+                    );
+                    launch.instance_id
+                }
+                _ => None,
+            };
+            Some((pid, birth, instance))
+        }
+    };
+    Ok(TuiControlTarget { process })
+}
+
+/// Holds lifecycle exclusion from identity validation through the mutation's outcome.
+pub(crate) struct TuiControlLease {
+    transaction: crate::daemon::lifecycle::Transaction,
+    target: TuiControlTarget,
+}
+
+impl TuiControlLease {
+    pub(crate) async fn prepare(
+        target: TuiControlTarget,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("Serve operation cancelled before admission"),
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                crate::daemon::lifecycle::Transaction::acquire(),
+            ) => result.context("Daemon lifecycle is busy; inspect status before retrying")??,
+        };
+        anyhow::ensure!(
+            !cancel.is_cancelled() && tui_control_target()? == target,
+            "Daemon identity changed before control admission; preserving its successor"
+        );
+        Ok(Self {
+            transaction,
+            target,
+        })
+    }
+
+    pub(crate) async fn stop(&self) -> Result<()> {
+        if self.target.process.is_none() {
+            return Ok(());
+        }
+        stop_daemon_locked(&self.transaction, false).await
+    }
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
@@ -3352,6 +3438,114 @@ mod tests {
             std::fs::read_to_string(app.join(".schema_version"))?,
             version
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_refuses_a_successor_before_stop_or_reset_admission() -> Result<()> {
+        use std::future::Future;
+        use std::os::unix::process::CommandExt;
+        use std::task::Poll;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let spawn = || -> Result<ChildGuard> {
+            Ok(ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            ))
+        };
+        let pid_path = pid_file_path()?;
+        for had_predecessor in [false, true] {
+            let mut predecessor = if had_predecessor {
+                Some(spawn()?)
+            } else {
+                None
+            };
+            if let Some(child) = &predecessor {
+                std::fs::write(&pid_path, child.0.id().to_string())?;
+            }
+            let target = tui_control_target()?;
+            let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+            std::future::poll_fn(|cx| {
+                assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            if let Some(child) = &mut predecessor {
+                child.0.kill()?;
+                child.0.wait()?;
+            }
+            let mut successor = spawn()?;
+            std::fs::write(&pid_path, successor.0.id().to_string())?;
+            drop(transaction);
+            assert!(waiting.await.is_err());
+            assert!(
+                successor.0.try_wait()?.is_none(),
+                "stale admission affected the successor"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pid_path)?,
+                successor.0.id().to_string(),
+            );
+            let lease = TuiControlLease::prepare(tui_control_target()?, &cancel).await?;
+            lease.stop().await?;
+            successor.0.wait()?;
+            assert!(
+                !pid_path.exists(),
+                "the freshly authorized stop must finish cleanup"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_cancellation_releases_a_queued_lifecycle_request() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let target = tui_control_target()?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        cancel.cancel();
+        assert!(waiting.await.is_err());
+        drop(transaction);
+        let lease = TuiControlLease::prepare(
+            tui_control_target()?,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        lease.stop().await?;
         Ok(())
     }
 }

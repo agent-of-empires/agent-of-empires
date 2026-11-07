@@ -169,6 +169,7 @@ impl HomeView {
             skills_manager_dialog: None,
             command_palette: None,
             serve_view: None,
+            serve_jobs: super::super::dialogs::ServeJobs::default(),
             connections_view: None,
             pending_dashboard_launch: None,
             dashboard_launch: None,
