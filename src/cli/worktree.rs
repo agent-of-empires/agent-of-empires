@@ -183,7 +183,7 @@ fn purge_aside(inst: &Instance) -> Option<PathBuf> {
 /// A row is orphaned once its checkout is gone and no lifecycle operation, such as a purge that
 /// may restore it, has it reserved.
 fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if inst.has_fresh_lifecycle_reservation(now) {
+    if inst.has_fresh_lifecycle_reservation(now) || inst.has_pending_trash() {
         return false;
     }
     if inst.worktree_info.is_some() {
@@ -238,7 +238,22 @@ pub(crate) fn find_orphaned_worktrees(
         .iter()
         .flat_map(|inst| {
             let aside = purge_aside(inst).map(|aside| aside.to_string_lossy().into_owned());
-            std::iter::once(inst.project_path.clone()).chain(aside)
+            let holding = inst
+                .has_pending_trash()
+                .then(|| {
+                    let original = inst
+                        .pre_trash_project_path
+                        .as_deref()
+                        .unwrap_or(&inst.project_path);
+                    crate::session::trash::trash_holding_path(Path::new(original), &inst.id)?
+                        .canonicalize()
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .flatten();
+            std::iter::once(inst.project_path.clone())
+                .chain(aside)
+                .chain(holding)
         })
         .collect();
     Ok(partition_orphaned_worktrees(
@@ -648,6 +663,68 @@ mod tests {
         });
         remove_confirmed_worktrees(&git_wt, &orphans, &HashSet::new()).unwrap();
         assert_eq!(creator_blocked.get(), Some(true));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_keeps_unfinished_trash_row_and_moved_checkout() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let worktree = root.path().join("worktree");
+        let repo = git2::Repository::init(&main).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        let git = GitWorktree::new(main.clone()).unwrap();
+        git.create_worktree("unfinished-trash", &worktree, true, None)
+            .unwrap();
+        std::fs::write(worktree.join("payload"), b"retained").unwrap();
+        let mut row = Instance::new("unfinished trash", worktree.to_str().unwrap());
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "unfinished-trash".into(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        row.trash();
+        let mut uncommitted = row.clone();
+        assert!(matches!(
+            crate::session::trash::relocate_worktree_to_trash(&mut uncommitted),
+            crate::session::trash::RelocateOutcome::Relocated { .. },
+        ));
+        let storage = Storage::new_unwatched("cleanup").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(find_orphaned_sessions(std::slice::from_ref(&row)).is_empty());
+        assert_eq!(
+            remove_orphaned_sessions(&storage, std::slice::from_ref(&row)).unwrap(),
+            0
+        );
+        let (orphans, _) = find_orphaned_worktrees(std::slice::from_ref(&row), &git).unwrap();
+        assert!(!orphans
+            .iter()
+            .any(|entry| entry.path == Path::new(&uncommitted.project_path)));
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(Path::new(&uncommitted.project_path).join("payload")).unwrap(),
+            b"retained"
+        );
     }
 
     #[test]

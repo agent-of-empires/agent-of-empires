@@ -6,6 +6,9 @@ use super::*;
 impl HomeView {
     /// Queue a read intent after engagement. Canonical feedback clears the row.
     pub(crate) fn clear_unread_on_view(&mut self, id: &str) -> bool {
+        if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
+            return false;
+        }
         if self.manual_unread_hold.as_deref() == Some(id) {
             self.manual_unread_hold = None;
         }
@@ -27,7 +30,7 @@ impl HomeView {
     /// Queue a read after a foreground dwell, except for a manually marked visit.
     /// Returns whether a request was admitted, not whether the row changed.
     pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
-        if !crate::session::unread_enabled() || self.has_dialog() {
+        if !crate::session::unread_enabled() || self.has_dialog() || self.selected_is_trashed() {
             self.unread_dwell = None;
             return false;
         }

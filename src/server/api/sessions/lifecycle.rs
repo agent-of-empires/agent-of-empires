@@ -206,6 +206,152 @@ impl Drop for ArchiveReservationRelease {
     }
 }
 
+struct TrashReservationRetirement<'a> {
+    native: crate::server::session_store::NativeSessionStore,
+    id: &'a str,
+    generation: Option<u64>,
+}
+
+impl Drop for TrashReservationRetirement<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            if let Err(error) = self.native.retire_trash_reservation(self.id, generation) {
+                tracing::warn!(target: "session.trash", session = %self.id, %error, "unfinished trash lease retirement failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod trash_reservation_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_trash_claim_retires_only_its_durable_owner() {
+        for failure in [
+            "returned",
+            "claim_adoption",
+            "terminal_adoption",
+            "superseded",
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut row = Instance::new("trash claim boundary", "/tmp/trash-claim-boundary");
+            row.source_profile = "default".into();
+            let id = row.id.clone();
+            let initial_generation = row.lifecycle_generation;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let worker_state = state.clone();
+            let worker_id = id.clone();
+            let peer_at = chrono::Utc::now()
+                + Instance::LIFECYCLE_RESERVATION_TTL
+                + chrono::Duration::seconds(1);
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    worker_state.clone(),
+                    "default",
+                    Some(worker_id.clone()),
+                )?;
+                let mut retirement = TrashReservationRetirement {
+                    native,
+                    id: &worker_id,
+                    generation: None,
+                };
+                let store: &dyn crate::session::SessionStore = &retirement.native;
+                let _lifecycle = store
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&worker_id)?;
+                if failure == "claim_adoption" {
+                    let state = worker_state.clone();
+                    crate::server::session_store::before_next_adoption_for_test(move || {
+                        state.canonical_metadata.blocking_write().profiles.clear();
+                    });
+                }
+                let generation = store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == worker_id).unwrap();
+                    let generation = row.try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )?;
+                    retirement.generation = Some(generation);
+                    row.trash();
+                    Ok(generation)
+                })?;
+                if failure == "returned" {
+                    anyhow::bail!("post-claim operation failed");
+                }
+                if failure == "terminal_adoption" {
+                    let state = worker_state.clone();
+                    crate::server::session_store::before_next_adoption_for_test(move || {
+                        state.canonical_metadata.blocking_write().profiles.clear();
+                    });
+                }
+                store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == worker_id).unwrap();
+                    if failure == "superseded" {
+                        row.try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Trash,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            peer_at,
+                        )?;
+                    } else {
+                        row.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), failure == "superseded");
+            let stored = crate::session::Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert!(stored.is_trashed());
+            assert_eq!(stored.project_path, "/tmp/trash-claim-boundary");
+            match failure {
+                "terminal_adoption" => {
+                    assert!(stored.lifecycle_reservation.is_none());
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 1);
+                }
+                "superseded" => {
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 2);
+                    assert_eq!(stored.lifecycle_reservation.unwrap().at, peer_at);
+                }
+                _ => {
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 1);
+                    assert!(stored.has_pending_trash());
+                    assert!(!stored.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                    let mut retry = stored;
+                    assert_eq!(
+                        retry
+                            .try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Trash,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )
+                            .unwrap(),
+                        initial_generation + 2
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod archive_reservation_tests {
     use super::*;
@@ -591,21 +737,43 @@ pub async fn trash_session(
         let native = crate::server::session_store::NativeSessionStore::open(
             worker_state.clone(), &profile, Some(worker_id.clone()),
         )?;
-        let store: &dyn crate::session::SessionStore = &native;
+        let mut retirement = TrashReservationRetirement {
+            native,
+            id: &worker_id,
+            generation: None,
+        };
+        let native = &retirement.native;
+        let store: &dyn crate::session::SessionStore = native;
         let title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
-        let mut instance = store.update(|rows, _| {
+        let instance = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
+            }
+            let retrying = row.is_trashed();
+            if retrying {
+                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, row.lifecycle_generation) {
+                    return Ok(None);
+                }
+            }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
+            retirement.generation = Some(row.lifecycle_generation);
             row.trash();
-            Ok(row.clone())
+            Ok(Some((row.clone(), retrying)))
         })?;
+        let Some((mut instance, retrying)) = instance else {
+            return Ok((crate::session::trash::RelocateOutcome::Skipped, None));
+        };
         instance.source_profile = profile;
         instance.file_watch = Some(worker_state.file_watch.clone());
         let generation = instance.lifecycle_generation;
@@ -638,8 +806,31 @@ pub async fn trash_session(
         instance.source_profile = store.storage().profile().to_owned();
         instance.file_watch = Some(worker_state.file_watch.clone());
         let outcome = match &stopped {
-            Ok(()) => crate::session::trash::prepare_trashed_worktree(&mut instance),
-            Err(error) => crate::session::trash::RelocateOutcome::Failed { reason: format!("Tmux teardown failed; worktree retained: {error}") },
+            Ok(()) => {
+                let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+                if retrying && !matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
+                    crate::session::trash::recover_trashed_worktree_move(&mut instance).unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
+            Err(error) => {
+                let recovered = retrying.then(|| crate::session::trash::recover_trashed_worktree_move(&mut instance)).flatten();
+                recovered.unwrap_or_else(|| crate::session::trash::RelocateOutcome::Failed {
+                    reason: format!("Tmux teardown failed; worktree retained: {error}"),
+                })
+            }
+        };
+        let terminal = !retrying
+            || matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. })
+            || crate::session::trash::trashed_worktree_location_is_verified(&instance)
+            || crate::session::trash::trashed_worktree_paths_are_missing(&instance);
+        let outcome = if retrying && !terminal && matches!(outcome, crate::session::trash::RelocateOutcome::Skipped) {
+            crate::session::trash::RelocateOutcome::Failed {
+                reason: "Retained worktree location is unproven; Trash transition remains unfinished".into(),
+            }
+        } else {
+            outcome
         };
         store.update(|rows, _| {
             if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
@@ -648,23 +839,31 @@ pub async fn trash_session(
                     pre_trash_project_path: instance.pre_trash_project_path,
                 };
                 match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, &relocation) {
-                    crate::session::claim::RelocationCommit::Persisted => Ok(()),
-                    crate::session::claim::RelocationCommit::AlreadyGone => Err(LifecycleTargetError::Missing.into()),
-                    crate::session::claim::RelocationCommit::Superseded => Err(LifecycleTargetError::Busy.into()),
+                    crate::session::claim::RelocationCommit::Persisted => {}
+                    crate::session::claim::RelocationCommit::AlreadyGone => return Err(LifecycleTargetError::Missing.into()),
+                    crate::session::claim::RelocationCommit::Superseded => return Err(LifecycleTargetError::Busy.into()),
                 }
             } else {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
-                if !row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation) {
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
-                if let Err(error) = &stopped {
-                    row.status = Status::Error;
-                    row.last_error = Some(error.to_string());
+                if terminal {
+                    row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
+                } else {
+                    row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
                 }
-                Ok(())
             }
+            if let Err(error) = &stopped {
+                let row = rows.iter_mut().find(|row| row.id == worker_id)
+                    .ok_or(LifecycleTargetError::Missing)?;
+                row.status = Status::Error;
+                row.last_error = Some(error.to_string());
+            }
+            Ok(())
         })?;
+        retirement.generation = None;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
     if result.is_ok() {
@@ -1179,6 +1378,11 @@ pub(crate) fn lifecycle_rejection(
     let (code, operation, message) = match error
         .downcast_ref::<crate::session::LifecycleReservationError>()
     {
+        Some(crate::session::LifecycleReservationError::Busy(LifecycleOperation::Trash)) => (
+            "trash_incomplete",
+            Some(LifecycleOperation::Trash),
+            "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".to_owned(),
+        ),
         Some(crate::session::LifecycleReservationError::Busy(operation)) => (
             "lifecycle_busy",
             Some(*operation),
@@ -1207,10 +1411,10 @@ pub(crate) fn lifecycle_rejection(
         }
         _ => return None,
     };
-    let header = if code == "lifecycle_superseded" {
-        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
-    } else {
-        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    let header = match code {
+        "lifecycle_superseded" => crate::daemon::ApiErrorCode::LifecycleSuperseded.header(),
+        "trash_incomplete" => crate::daemon::ApiErrorCode::TrashIncomplete.header(),
+        _ => crate::daemon::ApiErrorCode::LifecycleLocked.header(),
     };
     Some(
         (
