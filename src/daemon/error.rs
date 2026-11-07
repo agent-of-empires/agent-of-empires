@@ -38,6 +38,7 @@ pub enum ApiErrorCode {
     SessionNotRunning,
     SessionArchived,
     SessionTrashed,
+    AccountSwapUnavailable,
 }
 
 impl ApiErrorCode {
@@ -73,6 +74,7 @@ impl ApiErrorCode {
             Self::SessionNotRunning => "session_not_running",
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
+            Self::AccountSwapUnavailable => "account_swap_unavailable",
         }
     }
 
@@ -99,7 +101,8 @@ impl ApiErrorCode {
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
-            | Self::SessionTrashed => StatusCode::CONFLICT,
+            | Self::SessionTrashed
+            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -168,6 +171,7 @@ impl ApiErrorCode {
             b"session_not_running" => Self::SessionNotRunning,
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
+            b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -296,6 +300,12 @@ mod tests {
                 Some(ApiErrorCode::GroupNotEmpty),
             ),
             (StatusCode::FORBIDDEN, "group_not_empty", false, None),
+            (
+                StatusCode::CONFLICT,
+                "account_swap_unavailable",
+                false,
+                Some(ApiErrorCode::AccountSwapUnavailable),
+            ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

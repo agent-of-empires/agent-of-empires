@@ -195,6 +195,21 @@ pub enum AcpCommands {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Switch a structured session to another account of the same agent,
+    /// keeping the conversation. Accounts are tool names with their own
+    /// `[session.agent_config_dir]`; the transcript is copied into the new
+    /// account's store and the worker resumes it. A session parked on a
+    /// rate limit continues with the interrupted prompt; otherwise it gets
+    /// the usual restart wake message. Refuses, changing nothing, where the
+    /// swap would start a fresh conversation (not Claude, no recorded
+    /// conversation, other agent).
+    SwitchAccount {
+        /// Acp session id.
+        session: String,
+        /// Tool name of the target account, as declared in
+        /// `[session.agent_config_dir]` (e.g. `claude-b`).
+        tool: String,
+    },
     /// Re-route a Claude session to a different LLM provider, keeping the
     /// transcript. Refused mid-turn; once idle the worker restarts and
     /// resumes the same conversation. Credentials are not provisioned by
@@ -262,6 +277,7 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             target,
             model,
         } => switch_agent(&session, &target, model.as_deref()).await,
+        AcpCommands::SwitchAccount { session, tool } => switch_account(&session, &tool).await,
         AcpCommands::SwitchProvider { session, provider } => {
             switch_provider(&session, &provider).await
         }
@@ -1164,6 +1180,25 @@ async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Resul
         .await
         .map_err(map_http)?;
     println!("switched agent for {session} -> {}", resp.agent);
+    Ok(())
+}
+
+async fn switch_account(session: &str, tool: &str) -> Result<()> {
+    let body = crate::daemon::RestartSessionBody {
+        tool: Some(tool.to_owned()),
+        require_account_carry: true,
+        ..Default::default()
+    };
+    let row = super::session::restart_through_daemon(None, session, body, |row| {
+        anyhow::ensure!(
+            row.view == crate::session::View::Structured,
+            "'{}' is not a structured session; use `aoe session restart --tool {tool}`",
+            row.title
+        );
+        Ok(())
+    })
+    .await?;
+    println!("switched account for {} -> {tool}", row.title);
     Ok(())
 }
 

@@ -842,7 +842,7 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                 .await;
                 assert!(matches!(
                     outcome,
-                    crate::server::acp_reconciler::ContinuationOutcome::Stands
+                    crate::server::acp_reconciler::ContinuationOutcome::Installed
                 ));
             }
         });
