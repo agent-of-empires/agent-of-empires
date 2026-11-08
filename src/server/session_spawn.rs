@@ -1566,6 +1566,95 @@ mod tests {
         .expect("the session must be released for later operations");
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_terminal_creation_is_finalized_and_idempotent() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let creations = root.path().join("creations");
+        let sends = root.path().join("sends");
+        let quote = crate::session::environment::shell_escape_script_word;
+        // Run the real server, but lose only its birth receipt. The pane remains alive.
+        let shim = bin.join("tmux");
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\ncase \"$arg\" in\nnew-session) printf 'birth\\n' >> {}; {} \"$@\" >/dev/null; exit $?;;\nsend-keys|paste-buffer) printf 'input\\n' >> {};;\nesac\ndone\nexec {} \"$@\"\n",
+            quote(&creations.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            quote(&sends.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let input = root.path().join("native-input");
+        let body = serde_json::json!({
+            "title": "indeterminate-created", "path": "", "tool": "claude",
+            "scratch": true, "view": "terminal", "profile": "test",
+            "idempotency_key": "indeterminate-creation",
+            "command_override": format!("exec cat > {}", quote(&input.to_string_lossy())),
+        });
+        let first = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body.clone()).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+        let rows = crate::server::test_support::load_instances_from_disk_for_test("test");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::Session::from_name(&name).exists_live());
+        assert!(row.lifecycle_reservation.is_none());
+        let second = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        assert!(
+            !sends.exists(),
+            "unknown readiness grants no input authority"
+        );
+        assert_eq!(
+            crate::server::test_support::load_instances_from_disk_for_test("test")[0].id,
+            row.id,
+        );
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        assert_eq!(row.status, Status::Starting);
+    }
+
     /// A create that answered has registered every resource the launch owns,
     /// so a delete issued while its ACP handshake is still unanswered must
     /// claim the row. Holding the launch reservation for that wait instead made
