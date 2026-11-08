@@ -238,6 +238,18 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+
+    /// Restart as this tool, through the Daemon. Swapping between tools that
+    /// run the same agent under different `[session.agent_config_dir]`
+    /// accounts keeps the conversation (Claude). Any other swap starts a
+    /// fresh conversation. Use `aoe acp switch-account` to refuse instead.
+    #[arg(long, conflicts_with = "all")]
+    pub tool: Option<String>,
+
+    /// Move the session to this existing profile while restarting, through
+    /// the Daemon.
+    #[arg(long, conflicts_with = "all")]
+    pub to_profile: Option<String>,
 }
 
 #[derive(Args)]
@@ -484,17 +496,27 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
+    let inst = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .context("session disappeared before archive")?;
+    anyhow::ensure!(
+        !inst.has_pending_trash(),
+        crate::session::LifecycleReservationError::Busy(crate::session::LifecycleOperation::Trash)
+    );
     if !args.no_kill {
-        let inst = storage
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .context("session disappeared before archive")?;
         inst.kill_all_tmux_sessions_locked()?;
     }
 
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
+            anyhow::ensure!(
+                !stored.has_pending_trash(),
+                crate::session::LifecycleReservationError::Busy(
+                    crate::session::LifecycleOperation::Trash
+                )
+            );
             stored.archive();
             stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
             Ok(true)
@@ -1097,7 +1119,50 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
     let identifier = args
         .identifier
         .ok_or_else(|| anyhow::anyhow!("session identifier required (or pass --all)"))?;
+    if args.tool.is_some() || args.to_profile.is_some() {
+        let body = crate::daemon::RestartSessionBody {
+            size: crate::terminal::get_size().and_then(|(cols, rows)| {
+                Some(crate::daemon::TerminalSize {
+                    cols: std::num::NonZeroU16::new(cols)?,
+                    rows: std::num::NonZeroU16::new(rows)?,
+                })
+            }),
+            tool: args.tool,
+            profile: args.to_profile,
+            ..Default::default()
+        };
+        let row = restart_through_daemon(Some(profile), &identifier, body, |_| Ok(())).await?;
+        println!("✓ Restarted session: {}", row.title);
+        return Ok(());
+    }
     restart_session(profile, SessionIdArgs { identifier }).await
+}
+
+/// Restart through the Daemon's epoch-checked route, the only path that can swap the tool.
+/// `profile` narrows the identifier lookup; `None` searches every profile.
+pub(super) async fn restart_through_daemon(
+    profile: Option<&str>,
+    identifier: &str,
+    body: crate::daemon::RestartSessionBody,
+    check: impl FnOnce(&crate::daemon::SessionResponse) -> Result<()>,
+) -> Result<crate::daemon::SessionResponse> {
+    use crate::daemon::{RuntimeHealth, RUNTIME_PROTOCOL_VERSION};
+    let client = crate::acp::client::HttpClient::new(crate::acp::client::require_daemon().await?)?;
+    let mut sessions = client.list_sessions(None).await?.sessions;
+    if let Some(profile) = profile {
+        let profile = super::send::resolve_profile(&client, profile).await?;
+        sessions.retain(|row| row.profile == profile);
+    }
+    let row = super::resolve_session(identifier, &sessions)?.clone();
+    check(&row)?;
+    let daemon = client.daemon_client().await?;
+    let info = daemon.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    daemon.restart_session(&row.id, &body, &info.epoch).await?;
+    Ok(row)
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
@@ -3379,6 +3444,40 @@ mod session_mutation_tests {
 
     #[tokio::test]
     #[serial]
+    async fn archive_preserves_unfinished_trash_before_teardown() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("unfinished trash", "/tmp/unfinished-trash");
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        row.trash();
+        let (storage, id) = seed("archive-debt", row);
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        for no_kill in [false, true] {
+            let error = super::archive_session(
+                "archive-debt",
+                super::ArchiveArgs {
+                    identifier: id.clone(),
+                    no_kill,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                Some(crate::session::LifecycleReservationError::Busy(
+                    crate::session::LifecycleOperation::Trash
+                ))
+            ));
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn set_session_id_replaces_intent_and_clears_the_resume_probe_marker() {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -3834,5 +3933,25 @@ mod wait_decision_tests {
         let mut converted = adopted;
         converted.view = crate::session::View::Structured;
         assert!(adopt_stored(&live, converted).is_err());
+    }
+}
+
+#[cfg(test)]
+mod account_swap_tests {
+    use crate::daemon::{ApiErrorCode, DaemonClientError};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn a_refused_swap_is_explained_without_a_response_body() {
+        // The Unix and authenticated transports never retain a body, only the typed code.
+        let error = DaemonClientError::Status {
+            status: StatusCode::CONFLICT,
+            code: Some(ApiErrorCode::AccountSwapUnavailable),
+            body: String::new(),
+            truncated: false,
+        };
+        let message = error.to_string();
+        assert!(message.contains("nothing changed"), "{message}");
+        assert!(message.contains("agent_config_dir"), "{message}");
     }
 }

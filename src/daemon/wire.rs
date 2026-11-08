@@ -400,6 +400,9 @@ pub struct RestartSessionBody {
     /// Refuse, under the lifecycle locks, a session that is no longer Idle.
     #[serde(default)]
     pub only_if_idle: bool,
+    /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_account_carry: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -534,6 +537,9 @@ pub struct TrashSessionBody {
     /// False preserves tmux panes, not structured workers.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
+    /// Reject a lifecycle change after the caller captured its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -567,6 +573,7 @@ impl Default for TrashSessionBody {
     fn default() -> Self {
         Self {
             kill_pane: default_kill_pane(),
+            expected_generation: None,
         }
     }
 }
@@ -1292,6 +1299,9 @@ pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
     pub workspace_ordering: Vec<String>,
+    /// Trashed rows in the whole snapshot, whatever the scope filtered out.
+    #[serde(default)]
+    pub trashed_count: usize,
 }
 
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with

@@ -206,6 +206,152 @@ impl Drop for ArchiveReservationRelease {
     }
 }
 
+struct TrashReservationRetirement<'a> {
+    native: crate::server::session_store::NativeSessionStore,
+    id: &'a str,
+    generation: Option<u64>,
+}
+
+impl Drop for TrashReservationRetirement<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            if let Err(error) = self.native.retire_trash_reservation(self.id, generation) {
+                tracing::warn!(target: "session.trash", session = %self.id, %error, "unfinished trash lease retirement failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod trash_reservation_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_trash_claim_retires_only_its_durable_owner() {
+        for failure in [
+            "returned",
+            "claim_adoption",
+            "terminal_adoption",
+            "superseded",
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut row = Instance::new("trash claim boundary", "/tmp/trash-claim-boundary");
+            row.source_profile = "default".into();
+            let id = row.id.clone();
+            let initial_generation = row.lifecycle_generation;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let worker_state = state.clone();
+            let worker_id = id.clone();
+            let peer_at = chrono::Utc::now()
+                + Instance::LIFECYCLE_RESERVATION_TTL
+                + chrono::Duration::seconds(1);
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    worker_state.clone(),
+                    "default",
+                    Some(worker_id.clone()),
+                )?;
+                let mut retirement = TrashReservationRetirement {
+                    native,
+                    id: &worker_id,
+                    generation: None,
+                };
+                let store: &dyn crate::session::SessionStore = &retirement.native;
+                let _lifecycle = store
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&worker_id)?;
+                if failure == "claim_adoption" {
+                    let state = worker_state.clone();
+                    crate::server::session_store::before_next_adoption_for_test(move || {
+                        state.canonical_metadata.blocking_write().profiles.clear();
+                    });
+                }
+                let generation = store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == worker_id).unwrap();
+                    let generation = row.try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )?;
+                    retirement.generation = Some(generation);
+                    row.trash();
+                    Ok(generation)
+                })?;
+                if failure == "returned" {
+                    anyhow::bail!("post-claim operation failed");
+                }
+                if failure == "terminal_adoption" {
+                    let state = worker_state.clone();
+                    crate::server::session_store::before_next_adoption_for_test(move || {
+                        state.canonical_metadata.blocking_write().profiles.clear();
+                    });
+                }
+                store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == worker_id).unwrap();
+                    if failure == "superseded" {
+                        row.try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Trash,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            peer_at,
+                        )?;
+                    } else {
+                        row.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), failure == "superseded");
+            let stored = crate::session::Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert!(stored.is_trashed());
+            assert_eq!(stored.project_path, "/tmp/trash-claim-boundary");
+            match failure {
+                "terminal_adoption" => {
+                    assert!(stored.lifecycle_reservation.is_none());
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 1);
+                }
+                "superseded" => {
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 2);
+                    assert_eq!(stored.lifecycle_reservation.unwrap().at, peer_at);
+                }
+                _ => {
+                    assert_eq!(stored.lifecycle_generation, initial_generation + 1);
+                    assert!(stored.has_pending_trash());
+                    assert!(!stored.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                    let mut retry = stored;
+                    assert_eq!(
+                        retry
+                            .try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Trash,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )
+                            .unwrap(),
+                        initial_generation + 2
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod archive_reservation_tests {
     use super::*;
@@ -591,21 +737,43 @@ pub async fn trash_session(
         let native = crate::server::session_store::NativeSessionStore::open(
             worker_state.clone(), &profile, Some(worker_id.clone()),
         )?;
-        let store: &dyn crate::session::SessionStore = &native;
+        let mut retirement = TrashReservationRetirement {
+            native,
+            id: &worker_id,
+            generation: None,
+        };
+        let native = &retirement.native;
+        let store: &dyn crate::session::SessionStore = native;
         let title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
-        let mut instance = store.update(|rows, _| {
+        let instance = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
+            }
+            let retrying = row.is_trashed();
+            if retrying {
+                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, row.lifecycle_generation) {
+                    return Ok(None);
+                }
+            }
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
+            retirement.generation = Some(row.lifecycle_generation);
             row.trash();
-            Ok(row.clone())
+            Ok(Some((row.clone(), retrying)))
         })?;
+        let Some((mut instance, retrying)) = instance else {
+            return Ok((crate::session::trash::RelocateOutcome::Skipped, None));
+        };
         instance.source_profile = profile;
         instance.file_watch = Some(worker_state.file_watch.clone());
         let generation = instance.lifecycle_generation;
@@ -638,8 +806,31 @@ pub async fn trash_session(
         instance.source_profile = store.storage().profile().to_owned();
         instance.file_watch = Some(worker_state.file_watch.clone());
         let outcome = match &stopped {
-            Ok(()) => crate::session::trash::prepare_trashed_worktree(&mut instance),
-            Err(error) => crate::session::trash::RelocateOutcome::Failed { reason: format!("Tmux teardown failed; worktree retained: {error}") },
+            Ok(()) => {
+                let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+                if retrying && !matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
+                    crate::session::trash::recover_trashed_worktree_move(&mut instance).unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
+            Err(error) => {
+                let recovered = retrying.then(|| crate::session::trash::recover_trashed_worktree_move(&mut instance)).flatten();
+                recovered.unwrap_or_else(|| crate::session::trash::RelocateOutcome::Failed {
+                    reason: format!("Tmux teardown failed; worktree retained: {error}"),
+                })
+            }
+        };
+        let terminal = !retrying
+            || matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. })
+            || crate::session::trash::trashed_worktree_location_is_verified(&instance)
+            || crate::session::trash::trashed_worktree_paths_are_missing(&instance);
+        let outcome = if retrying && !terminal && matches!(outcome, crate::session::trash::RelocateOutcome::Skipped) {
+            crate::session::trash::RelocateOutcome::Failed {
+                reason: "Retained worktree location is unproven; Trash transition remains unfinished".into(),
+            }
+        } else {
+            outcome
         };
         store.update(|rows, _| {
             if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
@@ -648,23 +839,31 @@ pub async fn trash_session(
                     pre_trash_project_path: instance.pre_trash_project_path,
                 };
                 match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, &relocation) {
-                    crate::session::claim::RelocationCommit::Persisted => Ok(()),
-                    crate::session::claim::RelocationCommit::AlreadyGone => Err(LifecycleTargetError::Missing.into()),
-                    crate::session::claim::RelocationCommit::Superseded => Err(LifecycleTargetError::Busy.into()),
+                    crate::session::claim::RelocationCommit::Persisted => {}
+                    crate::session::claim::RelocationCommit::AlreadyGone => return Err(LifecycleTargetError::Missing.into()),
+                    crate::session::claim::RelocationCommit::Superseded => return Err(LifecycleTargetError::Busy.into()),
                 }
             } else {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
-                if !row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation) {
+                if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
-                if let Err(error) = &stopped {
-                    row.status = Status::Error;
-                    row.last_error = Some(error.to_string());
+                if terminal {
+                    row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
+                } else {
+                    row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
                 }
-                Ok(())
             }
+            if let Err(error) = &stopped {
+                let row = rows.iter_mut().find(|row| row.id == worker_id)
+                    .ok_or(LifecycleTargetError::Missing)?;
+                row.status = Status::Error;
+                row.last_error = Some(error.to_string());
+            }
+            Ok(())
         })?;
+        retirement.generation = None;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
     if result.is_ok() {
@@ -1128,6 +1327,9 @@ pub(super) enum LifecycleTargetError {
     Busy,
     #[error("session is not in structured view")]
     NotStructured,
+    /// A requested account swap that would not keep the conversation.
+    #[error("{0}")]
+    AccountSwapRefused(String),
     /// An archived or trashed session refuses to launch or resume (#4116).
     #[error(transparent)]
     Blocked(#[from] crate::session::StartBlocked),
@@ -1155,6 +1357,12 @@ pub(crate) fn lifecycle_rejection(
                 "Switch the session to structured view before stopping an ACP worker",
             ))
         }
+        Some(LifecycleTargetError::AccountSwapRefused(message)) => {
+            return Some(crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::AccountSwapUnavailable,
+                message.clone(),
+            ))
+        }
         _ => {}
     }
     if let Some(blocked) = error
@@ -1179,6 +1387,11 @@ pub(crate) fn lifecycle_rejection(
     let (code, operation, message) = match error
         .downcast_ref::<crate::session::LifecycleReservationError>()
     {
+        Some(crate::session::LifecycleReservationError::Busy(LifecycleOperation::Trash)) => (
+            "trash_incomplete",
+            Some(LifecycleOperation::Trash),
+            "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".to_owned(),
+        ),
         Some(crate::session::LifecycleReservationError::Busy(operation)) => (
             "lifecycle_busy",
             Some(*operation),
@@ -1207,10 +1420,10 @@ pub(crate) fn lifecycle_rejection(
         }
         _ => return None,
     };
-    let header = if code == "lifecycle_superseded" {
-        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
-    } else {
-        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    let header = match code {
+        "lifecycle_superseded" => crate::daemon::ApiErrorCode::LifecycleSuperseded.header(),
+        "trash_incomplete" => crate::daemon::ApiErrorCode::TrashIncomplete.header(),
+        _ => crate::daemon::ApiErrorCode::LifecycleLocked.header(),
     };
     Some(
         (
@@ -1976,6 +2189,69 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// Why a restart that demands an account swap (`require_account_carry`) is malformed: the
+/// tool to switch to, or what makes the swap impossible whatever the configuration says.
+fn account_swap_precondition<'a>(
+    row: &Instance,
+    body: &'a crate::daemon::RestartSessionBody,
+) -> Result<Option<&'a str>, String> {
+    if !body.require_account_carry {
+        return Ok(None);
+    }
+    let Some(tool) = body.tool.as_deref() else {
+        return Err("An account swap needs the tool to switch to".to_owned());
+    };
+    if tool == row.tool {
+        return Err(format!("Session already runs as '{tool}'"));
+    }
+    if body.command_override.is_some() {
+        return Err("An account swap cannot also change the launch command".to_owned());
+    }
+    Ok(Some(tool))
+}
+
+/// A plain tool swap would park the ids and start a fresh conversation instead.
+fn park_refusal(tool: &str) -> String {
+    format!(
+        "Cannot switch to '{tool}' without losing the conversation. Both tools must run the \
+         same agent with a known transcript layout (Claude), the session needs a recorded \
+         conversation, and a sandboxed session must not have a store move pending. Nothing changed."
+    )
+}
+
+/// Why a restart that demands an account swap cannot keep the conversation, decided on `row`
+/// alone so it can run before anything mutates.
+pub(super) fn account_swap_refusal(
+    row: &Instance,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<String> {
+    let tool = match account_swap_precondition(row, body) {
+        Ok(Some(tool)) => tool,
+        Ok(None) => return None,
+        Err(message) => return Some(message),
+    };
+    let target_profile = body.profile.as_deref().unwrap_or(&row.source_profile);
+    match crate::session::conversation_carry::classify(row, target_profile, tool) {
+        // The launch later attests its destination; one whose retained command or arguments
+        // name another agent fails there, after the worker stopped, so attest the swapped row now.
+        crate::session::conversation_carry::ToolSwap::KeepConversation(_) => {
+            let mut swapped = row.clone();
+            swapped.source_profile = target_profile.to_owned();
+            swapped.swap_account(tool);
+            if let Some(extra_args) = &body.extra_args {
+                swapped.extra_args.clone_from(extra_args);
+            }
+            swapped.attested_carry_destination().err().map(|error| {
+                format!(
+                    "Cannot switch to '{tool}': this session's launch cannot carry the \
+                     conversation ({error:#}). Nothing changed."
+                )
+            })
+        }
+        crate::session::conversation_carry::ToolSwap::Park => Some(park_refusal(tool)),
+    }
+}
+
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
@@ -2051,6 +2327,10 @@ fn reserve_structured_restart(
             && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
+    // Decided on the durable row, before the reservation and before the worker stops.
+    if let Some(message) = account_swap_refusal(&probe, body) {
+        return Err(LifecycleTargetError::AccountSwapRefused(message).into());
+    }
     if matches!(restart_origin, RestartOrigin::StartupRecovery) {
         // Preserve archived/trashed refusals.
         probe
@@ -2112,9 +2392,90 @@ struct StructuredRestartLaunch {
     started: Instance,
     native: crate::server::session_store::NativeSessionStore,
     hooks: anyhow::Result<()>,
+    /// The restart changed only the account, so the conversation continues where it stopped.
+    account_swap: bool,
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
     wake: Option<String>,
     reason: &'static str,
+}
+
+/// Without auto-resume a terminal launch starts a fresh conversation and still reports success,
+/// so a required account swap must not reach it.
+pub(super) fn terminal_resume_refusal(
+    body: &crate::daemon::RestartSessionBody,
+    structured: bool,
+    auto_resume_on_restart: bool,
+) -> Option<String> {
+    (body.require_account_carry && !structured && !auto_resume_on_restart).then(|| {
+        "A terminal session only keeps its conversation across an account swap while \
+         auto_resume_on_restart is on for the target profile. Nothing changed."
+            .to_owned()
+    })
+}
+
+/// An explicit wake outranks a continuation an earlier failed resume left pending. Runs under the
+/// submission authority, before the replacement worker exists to drain it.
+pub(super) async fn discard_stale_continuation(
+    state: &Arc<AppState>,
+    id: &str,
+    resumes_rate_limit: bool,
+    explicit_wake: bool,
+) {
+    if resumes_rate_limit && explicit_wake {
+        state.session_service.clear_pending_initial_turn(id).await;
+    }
+}
+
+/// After an account swap out of a rate-limit park: same sequence as `/acp/spawn`, with the
+/// submission authority covering the checks and the install. Returns whether the interrupted
+/// prompt (or a queued one) is now the next turn, so the default wake message can give way.
+///
+/// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
+/// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
+/// disarms the auto-resume budget exactly once.
+pub(super) async fn continue_interrupted_prompt(
+    state: &Arc<AppState>,
+    id: &str,
+    generation: u64,
+    resets_at: chrono::DateTime<chrono::Utc>,
+    explicit_wake: bool,
+) -> bool {
+    let submission = state.session_service.prompt_submission(id).await;
+    let current = state.instances.read().await.iter().any(|row| {
+        row.id == id
+            && row.lifecycle_generation == generation
+            && row.launch_is_finalized()
+            && row.ensure_startable().is_ok()
+    });
+    if !current {
+        return false;
+    }
+    // Published while this task still owns the submission authority, so a newer limit and its
+    // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
+    state
+        .acp_supervisor
+        .publish_rate_limit_auto_resumed(id, resets_at, true);
+    if explicit_wake {
+        // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
+        // now newer work may have been installed, and it must survive.
+        drop(submission);
+        return false;
+    }
+    // A continuation already pending is work too, even when the interrupted prompt is gone.
+    let pending_before = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.pending_initial_turn.is_some());
+    use crate::server::acp_reconciler::ContinuationOutcome;
+    let outcome =
+        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, submission).await;
+    pending_before
+        || matches!(
+            outcome,
+            ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
+        )
 }
 
 async fn finish_structured_restart(
@@ -2135,10 +2496,18 @@ async fn finish_structured_restart(
             mut started,
             native,
             hooks,
+            account_swap,
             carry,
             wake,
             reason: _,
         } = launch;
+        // Read before the spawn: the new worker's session assignment retires the park.
+        let resumes_rate_limit = if account_swap {
+            crate::server::api::acp::rate_limit_resume_probe(state, id).await
+        } else {
+            None
+        };
+        let wake_requested = wake.is_some();
         let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
             let sandbox_info = started.sandbox_info.take();
             let ownership =
@@ -2216,6 +2585,9 @@ async fn finish_structured_restart(
             Ok::<_, anyhow::Error>((started, Arc::new(native), wake, reservation))
         })
         .await??;
+        // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
+        // under the submission authority, so the new worker cannot drain it before the wake.
+        discard_stale_continuation(state, id, resumes_rate_limit.is_some(), wake_requested).await;
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -2248,6 +2620,13 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
+        let continued = match resumes_rate_limit {
+            Some(resets_at) => {
+                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
+            }
+            None => false,
+        };
+        let wake = if continued { String::new() } else { wake };
         if !wake.is_empty() {
             let state = state.clone();
             let id = id.to_owned();
@@ -2317,6 +2696,9 @@ async fn finish_structured_restart(
         }
         Err(error) => {
             if let Some(response) = lifecycle_rejection(state, &error) {
+                return response;
+            }
+            if let Some(response) = sandbox_migration_response(state, id, &error).await {
                 return response;
             }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
@@ -2506,6 +2888,17 @@ async fn prepare_agent_session_inner(
             );
         }
     }
+    // A refused swap must not first consume a stop's resume authority below; the durable row is
+    // checked again under the locks before the worker stops.
+    if let Some(message) = restart
+        .as_ref()
+        .and_then(|body| account_swap_refusal(&instance, body))
+    {
+        return crate::server::api::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::AccountSwapUnavailable,
+            message,
+        );
+    }
     if instance.is_structured()
         && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
@@ -2639,6 +3032,22 @@ async fn prepare_agent_session_inner(
                 );
             }
         }
+        if let Some(body) = &worker_restart {
+            account_swap_precondition(&outgoing, body)
+                .map_err(LifecycleTargetError::AccountSwapRefused)?;
+            // The launch runs under the target profile.
+            let auto_resume = target_native
+                .as_ref()
+                .unwrap_or(&native)
+                .configuration(Some(target.unwrap_or(&profile)))?
+                .session
+                .auto_resume_on_restart;
+            if let Some(message) =
+                terminal_resume_refusal(body, outgoing.is_structured(), auto_resume)
+            {
+                return Err(LifecycleTargetError::AccountSwapRefused(message).into());
+            }
+        }
         let (account_swap, mut conversation_carry) = match worker_restart
             .as_ref()
             .and_then(|body| body.tool.as_deref())
@@ -2657,6 +3066,16 @@ async fn prepare_agent_session_inner(
             }
             _ => (false, None),
         };
+        // One classification decides both the refusal and the carry.
+        if let Some(body) = worker_restart
+            .as_ref()
+            .filter(|body| body.require_account_carry)
+        {
+            if !account_swap {
+                let tool = body.tool.as_deref().unwrap_or_default();
+                return Err(LifecycleTargetError::AccountSwapRefused(park_refusal(tool)).into());
+            }
+        }
         if let Some(body) = &worker_restart {
             let mut probe = outgoing.clone();
             if let Some(target) = target {
@@ -2699,9 +3118,6 @@ async fn prepare_agent_session_inner(
                     Ok(())
                 },
             )?;
-            if let (Some(carry), Some(moved)) = (conversation_carry.as_mut(), moved.as_ref()) {
-                carry.retarget(crate::session::conversation_carry::conversation_ids(moved));
-            }
             lifecycle_lock = target_native
                 .storage()
                 .acquire_instance_lifecycle_lock(&instance.id)?;
@@ -2774,6 +3190,12 @@ async fn prepare_agent_session_inner(
         let Some(mut started) = started.take() else {
             return Ok(None);
         };
+        // The final capture can move an unbound id, so the copy follows the admitted row's ids.
+        if let Some(carry) = conversation_carry.as_mut() {
+            carry.retarget(crate::session::conversation_carry::conversation_ids(
+                &started,
+            ));
+        }
         started.source_profile = native.storage().profile().to_owned();
         started.file_watch = Some(worker_state.file_watch.clone());
         crate::server::reload::merge_runtime_fields(outgoing, &mut started);
@@ -2797,7 +3219,12 @@ async fn prepare_agent_session_inner(
             },
         )?;
         drop(identity);
-        Ok(Some((generation, started, native, conversation_carry)))
+        Ok(Some((
+            generation,
+            started,
+            native,
+            (account_swap, conversation_carry),
+        )))
     })
     .await;
     drop(guard);
@@ -2817,6 +3244,7 @@ async fn prepare_agent_session_inner(
                     restart.as_ref().is_some_and(|body| body.skip_on_launch),
                     &native,
                     None,
+                    Some(generation),
                 );
                 Ok(Some((
                     generation,
@@ -2842,7 +3270,8 @@ async fn prepare_agent_session_inner(
                     started,
                     native,
                     hooks,
-                    carry,
+                    account_swap: carry.0,
+                    carry: carry.1,
                     wake: requested_wake_message,
                     reason,
                 },
@@ -2872,7 +3301,7 @@ async fn prepare_agent_session_inner(
                             crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
                         },
                         restart: true,
-                        conversation_carry,
+                        conversation_carry: conversation_carry.1,
                     },
                     generation,
                     hooks,
@@ -2894,6 +3323,8 @@ async fn prepare_agent_session_inner(
         Ok(Err(error)) => Ok(Err(error)),
         Err(error) => Err(error),
     };
+    #[cfg(all(test, unix))]
+    durable_stop_tests::pause_before_adoption(&id).await;
     let outcome = match result {
         Ok(Ok(Some((generation, started, outcome, ownership, panes)))) => {
             let adopted = {
@@ -2940,13 +3371,23 @@ async fn prepare_agent_session_inner(
             if adopted {
                 outcome.map(Some)
             } else {
-                Err(crate::session::LifecycleReservationError::Superseded.into())
+                // Adoption fences runtime replacement, not the migration failure result.
+                match outcome {
+                    Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => {
+                        Err(error)
+                    }
+                    _ => Err(crate::session::LifecycleReservationError::Superseded.into()),
+                }
             }
         }
         Ok(Ok(None)) => Ok(None),
         Ok(Err(error)) => Err(error),
         Err(error) => Err(error.into()),
     };
+    let migration_failure = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<crate::migrations::SandboxMigrationError>());
     let outcome = match outcome {
         Err(error) => {
             let response = if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -2970,6 +3411,14 @@ async fn prepare_agent_session_inner(
                     axum::http::HeaderValue::from_static(refusal.0.as_str()),
                 );
                 response
+            } else if let Some(failure) =
+                error.downcast_ref::<crate::migrations::SandboxMigrationError>()
+            {
+                let code = failure.api_code();
+                crate::server::api::api_error_with_code_header(
+                    code,
+                    code.sandbox_migration_message().unwrap(),
+                )
             } else {
                 tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
                 api_error(
@@ -2978,7 +3427,7 @@ async fn prepare_agent_session_inner(
                     "Session start failed",
                 )
             };
-            if restart_identity.is_some() {
+            if restart_identity.is_some() || migration_failure {
                 drop(guard);
                 drop(submission);
                 drop(namespace);
@@ -3103,10 +3552,351 @@ async fn prepare_agent_session_inner(
     }
 }
 
+pub(super) async fn sandbox_migration_response(
+    state: &Arc<AppState>,
+    id: &str,
+    error: &anyhow::Error,
+) -> Option<axum::response::Response> {
+    let failure = error.downcast_ref::<crate::migrations::SandboxMigrationError>()?;
+    tracing::warn!(target: "http.api.sessions", session = %id, error = %format_args!("{error:#}"), "sandbox migration did not complete");
+    let code = failure.api_code();
+    let response = crate::server::api::api_error_with_code_header(
+        code,
+        code.sandbox_migration_message().unwrap(),
+    );
+    Some(match state.runtime.publish(state).await {
+        Ok(snapshot) => crate::server::runtime::mutation_response(&snapshot.value.cursor, response),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    })
+}
+
 #[cfg(all(test, unix))]
 mod durable_stop_tests {
     use super::*;
     use crate::process::worker_registry::{self, WorkerRecord};
+    type AdoptionGate = (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    static ADOPTION_GATE: std::sync::Mutex<Option<AdoptionGate>> = std::sync::Mutex::new(None);
+
+    struct AdoptionGateGuard {
+        id: String,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for AdoptionGateGuard {
+        fn drop(&mut self) {
+            let mut gate = ADOPTION_GATE.lock().unwrap();
+            if gate.as_ref().is_some_and(|(id, _, _)| id == &self.id) {
+                gate.take();
+            }
+        }
+    }
+
+    struct MigrationFixture {
+        row: Instance,
+        private: std::path::PathBuf,
+        cause: Option<String>,
+        _path: crate::session::test_support::EnvGuard,
+        _env: crate::session::test_support::EnvGuard,
+        _home: crate::session::test_support::AppDirGuard,
+        root: tempfile::TempDir,
+    }
+
+    impl MigrationFixture {
+        fn new(case: &str) -> anyhow::Result<Self> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = tempfile::tempdir()?;
+            let home = crate::session::test_support::isolate_app_dir_at(root.path());
+            crate::migrations::run_migrations()?;
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })?;
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+                config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+            })?;
+            let env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
+                .and_set("DOCKER_HOST", "unix:///var/run/docker.sock")
+                .and_set(
+                    "AOE_DEFER_SANDBOX_MIGRATION",
+                    if case == "deferred" { "1" } else { "" },
+                )
+                .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin)?;
+            let message = if case == "other" {
+                "permission denied"
+            } else {
+                "Error: No such container (container not found)"
+            };
+            for runtime in ["docker", "podman", "container"] {
+                let path = bin.join(runtime);
+                std::fs::write(&path, format!(
+                    "#!/bin/sh\ncase \"$*\" in *inspect*) echo '{message}' >&2; exit 1;; esac\nexit 0\n"
+                ))?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let path = crate::session::test_support::path_prepended(&bin);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let mut raw =
+                serde_json::to_value(Instance::new("original", project.to_str().unwrap()))?;
+            raw["tool"] = "codex".into();
+            raw["command"] = "codex".into();
+            raw["status"] = "stopped".into();
+            raw["sandbox_store_generation"] = 0.into();
+            raw["sandbox_info"] = serde_json::json!({
+                "enabled": true, "image": "test-image", "container_name": "migration",
+            });
+            let mut row: Instance = serde_json::from_value(raw)?;
+            row.source_profile = "default".into();
+            let source = root.path().join(".codex/sandbox").join(&row.id);
+            std::fs::create_dir_all(&source)?;
+            let private = source.join("config.toml");
+            std::fs::write(&private, b"private-content")?;
+            let cause = if case == "failed" {
+                let blocker = root.path().join(".codex/sandbox-v2");
+                std::fs::write(&blocker, b"not-a-directory")?;
+                let error = std::fs::create_dir(blocker.join("child")).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+                Some(nix::errno::Errno::from_raw(error.raw_os_error().unwrap()).to_string())
+            } else {
+                None
+            };
+            Ok(Self {
+                row,
+                private,
+                cause,
+                _path: path,
+                _env: env,
+                _home: home,
+                root,
+            })
+        }
+    }
+
+    pub(super) async fn pause_before_adoption(id: &str) {
+        let gate = {
+            let mut gate = ADOPTION_GATE.lock().unwrap();
+            if gate.as_ref().is_some_and(|(session, _, _)| session == id) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn superseded_sandbox_launch_preserves_migration_failure() -> anyhow::Result<()> {
+        for case in ["deferred", "failed", "other"] {
+            let fixture = MigrationFixture::new(case)?;
+            let row = fixture.row.clone();
+            let root = &fixture.root;
+            let private = &fixture.private;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let before = state.runtime.publish(&state).await?;
+            let request_state = state.clone();
+            let id = row.id.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut gate = AdoptionGateGuard {
+                id: id.clone(),
+                release: Some(release_tx),
+            };
+            *ADOPTION_GATE.lock().unwrap() = Some((id.clone(), entered_tx, release_rx));
+            let request = start_session(State(request_state), Path(id), Ok(None));
+            tokio::pin!(request);
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::select! {
+                    entered = entered_rx => entered?,
+                    _ = &mut request => anyhow::bail!("request completed before adoption gate"),
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            let newer = {
+                let mut instances = state.instances.write().await;
+                let current = instances
+                    .iter_mut()
+                    .find(|current| current.id == row.id)
+                    .unwrap();
+                current.title = "newer title".into();
+                current.clone()
+            };
+            gate.release.take().unwrap().send(()).unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(30), &mut request)
+                .await?
+                .into_response();
+            let expected = match case {
+                "deferred" => crate::daemon::ApiErrorCode::SandboxMigrationDeferred,
+                "failed" => crate::daemon::ApiErrorCode::SandboxMigrationFailed,
+                _ => crate::daemon::ApiErrorCode::LifecycleSuperseded,
+            };
+            assert_eq!(response.status(), expected.status(), "{case}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                expected.as_str(),
+                "{case}"
+            );
+            if case != "other" {
+                assert_eq!(
+                    response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                    before.value.cursor.epoch
+                );
+                let revision: u64 = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                    .to_str()?
+                    .parse()?;
+                assert!(revision > before.value.cursor.revision);
+            } else {
+                assert!(!response
+                    .headers()
+                    .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+            }
+            let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+            let public = String::from_utf8_lossy(&body);
+            if let Some(message) = expected.sandbox_migration_message() {
+                assert!(public.contains(message), "{case}: {public}");
+            }
+            assert!(!public.contains(root.path().to_str().unwrap()));
+            assert!(!public.contains("private-content"));
+            assert_eq!(std::fs::read(private)?, b"private-content");
+            let instances = state.instances.read().await;
+            let current = instances
+                .iter()
+                .find(|current| current.id == row.id)
+                .unwrap();
+            assert_eq!(current.title, "newer title");
+            assert_eq!(current.status, newer.status);
+            assert_eq!(current.lifecycle_generation, newer.lifecycle_generation);
+            assert_eq!(current.last_error, newer.last_error);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_migration_refusals_publish_known_sanitized_failures() -> anyhow::Result<()> {
+        for (deferred, target) in [
+            (true, "start"),
+            (false, "start"),
+            (true, "restart"),
+            (false, "restart"),
+            (true, "container-terminal"),
+            (false, "container-terminal"),
+        ] {
+            let fixture = MigrationFixture::new(if deferred { "deferred" } else { "failed" })?;
+            let root = &fixture.root;
+            let private = &fixture.private;
+            let source = private.parent().unwrap();
+            let cause = &fixture.cause;
+            let mut row = fixture.row.clone();
+            if target == "restart" {
+                row.view = crate::session::View::Structured;
+                row.status = Status::Running;
+            }
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let logs = crate::session::test_support::LogCapture::start();
+            let before = state.runtime.publish(&state).await?;
+            let response = match target {
+                "restart" => {
+                    restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
+                }
+                "container-terminal" => super::super::ensure::ensure_container_terminal(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    axum::extract::Query(crate::server::live_ws::TerminalIndexQuery::default()),
+                    Ok(None),
+                )
+                .await
+                .into_response(),
+                _ => start_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await
+                    .into_response(),
+            };
+            let code = if deferred {
+                crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+            } else {
+                crate::daemon::ApiErrorCode::SandboxMigrationFailed
+            };
+            assert_eq!(response.status(), code.status());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::daemon::ERROR_CODE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(code.as_str()),
+                "{}",
+                logs.contents()
+            );
+            assert_eq!(
+                response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                before.value.cursor.epoch
+            );
+            let revision: u64 = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()?
+                .parse()?;
+            assert!(revision > before.value.cursor.revision);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
+            let public = String::from_utf8_lossy(&bytes);
+            assert!(!public.contains(root.path().to_str().unwrap()));
+            assert!(!public.contains("private-content"));
+            if let Some(cause) = cause.as_ref() {
+                assert!(!public.contains(cause));
+            }
+            if target == "container-terminal" {
+                if let Some(cause) = cause.as_ref() {
+                    let captured = logs.contents();
+                    assert!(
+                        captured.lines().any(|line| {
+                            line.contains(&row.id)
+                                && line.contains("sandbox-v2")
+                                && line.contains(cause)
+                        }),
+                        "missing correlated migration cause: {captured}"
+                    );
+                }
+            }
+            let rows = state.instances.read().await;
+            let current = rows.iter().find(|current| current.id == row.id).unwrap();
+            assert_eq!(
+                current.status,
+                if target == "container-terminal" {
+                    Status::Stopped
+                } else {
+                    Status::Error
+                }
+            );
+            assert!(current.last_error.as_ref().is_none_or(|message| {
+                !message.contains(source.to_str().unwrap())
+                    && !message.contains("private-content")
+                    && cause.as_ref().is_none_or(|cause| !message.contains(cause))
+            }));
+            assert!(current.lifecycle_reservation.is_none());
+            assert_eq!(current.sandbox_store_generation, 0);
+            assert!(private.exists());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[serial_test::serial]
