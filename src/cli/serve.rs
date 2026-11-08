@@ -1156,8 +1156,10 @@ fn clear_serve_state(expected_pid: i32) -> bool {
     ) else {
         return false;
     };
-    let recorded = std::fs::read_to_string(&pid_path)
+    let recorded = crate::session::ResolvedDataFile::open(&pid_path)
+        .and_then(|file| file.read())
         .ok()
+        .flatten()
         .and_then(|raw| parse_positive_pid(&raw));
     if recorded != Some(expected_pid) {
         return false;
@@ -1192,12 +1194,9 @@ fn daemon_status_with(
     probe: impl FnOnce(i32) -> DaemonProbeDisposition,
     inspect: impl FnOnce(i32) -> DaemonProcessIdentity,
 ) -> DaemonStatus {
-    let Ok(path) = pid_file_path() else {
-        return DaemonStatus::Unverified;
-    };
-    let pid_str = match std::fs::read_to_string(&path) {
-        Ok(pid) => pid,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DaemonStatus::Absent,
+    let pid_str = match launch_file("serve.pid").and_then(|file| file.read()) {
+        Ok(Some(pid)) => pid,
+        Ok(None) => return DaemonStatus::Absent,
         Err(_) => return DaemonStatus::Unverified,
     };
     let Some(pid) = parse_positive_pid(&pid_str) else {
@@ -2332,7 +2331,9 @@ async fn stop_daemon_locked(
         );
     }
 
-    let pid_str = tokio::fs::read_to_string(&path).await?;
+    let pid_str = crate::session::ResolvedDataFile::open(&path)?
+        .read()?
+        .with_context(|| format!("PID file disappeared at {}", path.display()))?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     if matches!(

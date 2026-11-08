@@ -1612,16 +1612,24 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
     let _home = crate::session::test_support::isolate_app_dir();
     let app = crate::session::get_app_dir().unwrap();
     let mut daemon = TestDaemon::new();
-    daemon.publish();
     std::fs::write(app.join("serve.mode"), "local").unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    for retain_writer in [false, true] {
-        let url = app.join("serve.url");
+    for (name, retain_writer) in [
+        ("serve.url", false),
+        ("serve.url", true),
+        ("serve.pid", false),
+        ("serve.pid", true),
+    ] {
+        daemon.publish();
+        let path = app.join(name);
+        if name == "serve.pid" {
+            std::fs::remove_file(&path).unwrap();
+        }
         nix::unistd::mkfifo(
-            &url,
+            &path,
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )
         .unwrap();
@@ -1630,7 +1638,7 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
                 .read(true)
                 .write(true)
                 .custom_flags(nix::libc::O_NONBLOCK)
-                .open(&url)
+                .open(&path)
                 .unwrap()
         };
         let writer = retain_writer.then(open_gate);
@@ -1640,7 +1648,11 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
         let settled = loop {
             view.tick();
             if !matches!(view.state, ServeViewState::Checking { .. }) {
-                break matches!(view.state, ServeViewState::Starting { .. });
+                break if name == "serve.pid" {
+                    matches!(view.state, ServeViewState::Error { .. })
+                } else {
+                    matches!(view.state, ServeViewState::Starting { .. })
+                };
             }
             if Instant::now() >= deadline {
                 break false;
@@ -1660,11 +1672,14 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
         let writer = writer.unwrap_or_else(open_gate);
         drop(writer);
         drop(jobs);
-        std::fs::remove_file(url).unwrap();
-        assert!(settled, "FIFO retained Open; writer={retain_writer}");
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            settled,
+            "FIFO retained Open; file={name}; writer={retain_writer}"
+        );
         assert!(
             unlocked,
-            "FIFO retained lifecycle exclusion; writer={retain_writer}"
+            "FIFO retained lifecycle exclusion; file={name}; writer={retain_writer}"
         );
     }
 }

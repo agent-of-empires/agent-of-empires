@@ -59,6 +59,8 @@ Reopening Remote Access reads the current Daemon's runtime credential, not a sav
 
 When Remote Access opens or returns to the mode picker, it re-observes the Daemon after checking availability. A dashboard started by another Client during those checks opens directly instead of offering another start.
 
+Nonregular `serve.pid` metadata is preserved as unverifiable state, not treated as an absent Daemon. Repair it before retrying control.
+
 Availability, provider and restart checks run in the background. `Esc` closes Remote Access and cancels pending checks; on the provider screen, `R` starts a fresh assessment. Closing the dialog lets an already-started stop or Funnel reset finish, but cancels provider checks that would follow. Quitting restores the terminal while an admitted recovery command finishes under runtime ownership and its existing cleanup deadline. If error recovery could not discover the Daemon identity, `P` and the available Funnel reset `R` retry discovery before making changes. Neither silently refreshes a known stale identity. `S` superseding a provider retry keeps that retry's captured identity and refuses to stop a replacement. Failure or timeout can leave changes uncertain: inspect `aoe serve --status` and, for a Funnel reset, `tailscale funnel status` before retrying.
 
 To restart, press `R`, wait for the assessment and confirmation, then press `R` again. The confirmation window applies to the second keypress, not the background assessment's duration. The second confirmation checks current effects again and asks again if they changed.
