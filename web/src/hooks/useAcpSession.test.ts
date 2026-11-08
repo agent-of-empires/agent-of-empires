@@ -445,6 +445,66 @@ describe("lightweight control projection", () => {
 });
 
 describe("mid-turn cache recovery (#4530)", () => {
+  it("keeps the cached window through delayed catch-up and reconnect without new events", async () => {
+    const sid = "sess-stable-warm";
+    const rows = Array.from({ length: 6 }, (_, index) => [
+      { id: `user-${index}`, kind: "user_prompt" as const, text: `prompt ${index}`, at: "t" },
+      { id: `reply-${index}`, kind: "message" as const, text: `reply ${index}`, at: "t" },
+    ]).flat();
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${sid}`,
+      JSON.stringify({
+        savedAt: Date.now(),
+        state: { ...emptyAcpState(), lastSeq: 1200, oldestSeq: 1, activity: rows },
+      }),
+    );
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reads = 0;
+    calls = installAcpFakes(async ({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      reads += 1;
+      await held;
+      const params = new URL(url, "http://x").searchParams;
+      let incoming: typeof rows = [];
+      if (params.get("view") === "rows") incoming = [{ ...rows[rows.length - 1]!, text: "canonical reply" }];
+      return json({ frames: [], rows: incoming, lost: false, highest_seq: 1200, next_cursor: 1200, has_more: false });
+    });
+    const renders: string[][] = [];
+    const { result, unmount } = renderHook(
+      () => {
+        const session = useAcpSession(sid);
+        renders.push(session.state.activity.map((row) => row.id));
+        return session;
+      },
+      { wrapper: profileWrapper },
+    );
+    await flushAsync();
+    expect(reads).toBe(2);
+    expect(result.current.state.activity).toEqual(rows);
+    await act(async () => release());
+    await flushAsync();
+    lastSocket().open();
+    expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
+    expect(result.current.state.activity.at(-1)?.text).toBe("canonical reply");
+    const firstSocket = lastSocket();
+    act(() => result.current.manualReconnect());
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message({ kind: "transcript_snapshot", rows: [] });
+    await flushAsync();
+    expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(sockets).toHaveLength(2);
+    expect(reads).toBe(4);
+    expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
+    expect(result.current.state.oldestSeq).toBe(1);
+    expect(new URL(lastSocket().url).searchParams.get("since")).toBe("1200");
+    for (const ids of renders) expect(ids).toEqual(rows.map((row) => row.id));
+    unmount();
+  });
+
   it("dials from the cursor the recovery caught up to, not the cached one", async () => {
     const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
     const state = { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity };

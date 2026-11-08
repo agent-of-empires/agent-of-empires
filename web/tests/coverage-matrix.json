@@ -2799,6 +2799,7 @@
     },
     {
       "id": "acp.history-window",
+      "notes": "Warm-cache tests hold catch-up after cached messages are readable, verify the same rendered window survives completion, and exercise reconnect without new events. Canonical overlap updates do not discard the loaded prefix or reset the oldest cursor.",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": [
