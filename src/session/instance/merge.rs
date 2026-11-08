@@ -22,18 +22,28 @@ impl Instance {
         self.pane_dead_observed = prior.pane_dead_observed;
         self.agent_pane = std::mem::take(&mut prior.agent_pane);
         self.auxiliary = std::mem::take(&mut prior.auxiliary);
-        self.inherit_process_runtime(prior);
+        self.capture_poller.adopt_reload(
+            &prior.capture_poller,
+            prior.held(),
+            Held::new(&self.tool, self.active_execution.as_ref()),
+            Unserved::Stop,
+        );
+        self.inherit_process_fields(prior);
     }
 
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
-        self.inherit_acp_load_capability(&prior);
         self.capture_poller.adopt_relaunch(
             &prior.capture_poller,
             prior.held(),
             prior.last_start_time != self.last_start_time,
             Held::new(&self.tool, self.active_execution.as_ref()),
         );
+        self.inherit_process_fields(prior);
+    }
+
+    fn inherit_process_fields(&mut self, prior: Self) {
+        self.inherit_acp_load_capability(&prior);
         self.last_start_time = prior.last_start_time;
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
