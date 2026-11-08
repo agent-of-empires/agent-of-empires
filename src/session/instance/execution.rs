@@ -1637,7 +1637,8 @@ pub(super) struct UnattestedCodexPolicy {
     reason: String,
     /// What an unpinned host launch runs, when a local rollout can prove its store.
     store: Option<UnpinnedCodexLaunch>,
-    /// The host directory behind a container's resolved Codex home.
+    /// The host directory behind the resolved Codex home of a container that
+    /// runs Codex directly. A wrapper's launch need not resume what was verified.
     sandbox_store: Option<PathBuf>,
 }
 
@@ -2095,7 +2096,7 @@ impl Instance {
                 }
                 let unattested_policy = |reason: &str| UnattestedCodexPolicy {
                     reason: reason.to_owned(),
-                    sandbox_store: inputs.container.is_some().then(|| location.path.clone()),
+                    sandbox_store: (inputs.container.is_some() && direct_capture).then(|| location.path.clone()),
                     store: (inputs.container.is_none() && declared.is_none())
                         .then(|| {
                             let sqlite = inputs.canonical_path(&sqlite).ok()?;

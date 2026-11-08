@@ -19,6 +19,31 @@ const CODEX_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
 /// costs one readdir per directory and opens only the rollouts of one ID.
 const CODEX_ADMISSION_SCAN_MAX_ENTRIES: usize = 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_SCAN_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(CODEX_ADMISSION_SCAN_MAX_ENTRIES) };
+}
+
+#[cfg(not(test))]
+fn admission_scan_limit() -> usize {
+    CODEX_ADMISSION_SCAN_MAX_ENTRIES
+}
+
+#[cfg(test)]
+fn admission_scan_limit() -> usize {
+    ADMISSION_SCAN_LIMIT.get()
+}
+
+/// Runs `body` with a lower admission limit than a test could reach with real files.
+#[cfg(test)]
+pub(crate) fn with_codex_admission_scan_limit<T>(limit: usize, body: impl FnOnce() -> T) -> T {
+    let previous = ADMISSION_SCAN_LIMIT.replace(limit);
+    let result = body();
+    ADMISSION_SCAN_LIMIT.set(previous);
+    result
+}
+
 /// A store too large to prove that no other rollout of a conversation exists.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("Codex store has more than {limit} entries under sessions/, over the limit AoE scans to verify a conversation")]
@@ -220,7 +245,7 @@ pub(crate) fn codex_rollout_records_cwd(
     let Ok(cwd) = cwd.canonicalize() else {
         return Ok(false);
     };
-    codex_rollouts_record(store, sid, CODEX_ADMISSION_SCAN_MAX_ENTRIES, |recorded| {
+    codex_rollouts_record(store, sid, admission_scan_limit(), |recorded| {
         Path::new(recorded)
             .canonicalize()
             .is_ok_and(|recorded| recorded == cwd)
@@ -234,7 +259,7 @@ pub(crate) fn codex_rollout_records_container_cwd(
     sid: &str,
     cwd: &str,
 ) -> Result<bool, CodexRolloutScanLimit> {
-    codex_rollouts_record(store, sid, CODEX_ADMISSION_SCAN_MAX_ENTRIES, |recorded| {
+    codex_rollouts_record(store, sid, admission_scan_limit(), |recorded| {
         recorded == cwd
     })
 }

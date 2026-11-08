@@ -3587,6 +3587,61 @@ mod tests {
         let mut explicit = inst.clone();
         explicit.resume_intent = ResumeIntent::Use(local.into());
         assert!(explicit.resolve_launch_execution().is_err());
+
+        let limited = crate::session::capture::with_codex_admission_scan_limit(2, || {
+            with_sid(local).resolve_launch_execution().err().unwrap()
+        });
+        let chain = format!("{limited:#}");
+        assert_eq!(
+            limited.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+            ManagedResumeCause::CodexConversationUnverified,
+            "{chain}"
+        );
+        assert!(chain.contains("more than 2 entries"), "{chain}");
+        assert!(!chain.contains("ChatGPT"), "{chain}");
+
+        // A declared store is still a private child; a wrapper may not resume at all.
+        let declared_dir = temp.path().join("declared");
+        let profile = "codex-5477-declared";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "[session.agent_execution_as]\nmy-codex-wrapper = \"codex\"\n\
+                 [session.agent_config_dir]\ncodex = {dir:?}\nmy-codex-wrapper = {dir:?}\n",
+                dir = declared_dir.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut declared = with_sid(local);
+        declared.source_profile = profile.into();
+        admit_sandbox_fixture(&declared);
+        let config = declared.build_container_config_for_test().unwrap();
+        let _declared_transport =
+            install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        let declared_store = declared.sandbox_capture_store_dir().unwrap();
+        assert!(declared_store.starts_with(&declared_dir));
+        let declared_day = declared_store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&declared_day).unwrap();
+        std::fs::copy(store.join("auth.json"), declared_store.join("auth.json")).unwrap();
+        let name = format!("rollout-2026-11-08T12-00-00-{local}.jsonl");
+        std::fs::copy(day.join(&name), declared_day.join(&name)).unwrap();
+        assert!(declared.resolve_launch_execution().unwrap().is_none());
+
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/my-codex-wrapper"),
+        )
+        .unwrap();
+        let mut wrapped = declared.clone();
+        wrapped.tool = "my-codex-wrapper".into();
+        wrapped.command = "my-codex-wrapper".into();
+        refused(wrapped.clone());
+        let conversation = wrapped.conversation_state();
+        assert!(wrapped.prepare_launch_command(conversation).is_err());
+        assert_eq!(wrapped.agent_session_id.as_deref(), Some(local));
     }
 
     /// A ChatGPT login and a macOS host both hit the unreadable-policy refusal.
