@@ -226,7 +226,11 @@ impl NativePreparationScope {
             row.lifecycle_generation == self.identity.lifecycle_generation
                 && (!fixed
                     || pane.is_some_and(|pane| {
-                        (self.pane.physical.is_some()
+                        ((self.pane.physical.is_some()
+                            && pane
+                                .tmux_session
+                                .as_deref()
+                                .is_some_and(|name| !name.is_empty()))
                             || pane.tmux_session == self.pane.tmux_session)
                             && pane.physical == self.pane.physical
                             && pane.legacy_tool == self.pane.legacy_tool
@@ -272,6 +276,10 @@ impl NativeInputScope {
                 };
                 pane.state == crate::session::PanePresence::Alive
                     && pane.legacy_tool.is_none()
+                    && pane
+                        .tmux_session
+                        .as_deref()
+                        .is_some_and(|name| !name.is_empty())
                     && self.target.physical.is_some()
                     && pane.physical == self.target.physical
             })
