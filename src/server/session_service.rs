@@ -4492,7 +4492,7 @@ mod tests {
     }
 
     /// The undo belongs to the blocking writer, so a caller dropped while the write is
-    /// pending still gets its memory restored.
+    /// parked behind the storage lock still gets its memory restored.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_superseding_enqueue_is_still_undone() {
@@ -4519,6 +4519,15 @@ mod tests {
             .parent()
             .expect("sessions dir")
             .to_path_buf();
+        // Hold the storage flock so the writer is parked after the in-memory mutation, then make
+        // its write fail once released.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(dir.join(crate::session::STORAGE_LOCK_FILENAME))
+            .expect("storage lock file");
+        fs2::FileExt::lock_exclusive(&lock).expect("hold the storage lock");
         let original = std::fs::metadata(&dir).unwrap().permissions();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -4532,7 +4541,12 @@ mod tests {
             None,
         ));
         let polled = futures_util::poll!(enqueue.as_mut());
+        let parked = {
+            let inst = state.instances.read().await;
+            inst[0].queued_prompts.len() == 1 && inst[0].pending_initial_turn.is_none()
+        };
         drop(enqueue);
+        fs2::FileExt::unlock(&lock).expect("release the storage lock");
 
         let restored = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -4548,8 +4562,8 @@ mod tests {
         .await;
         std::fs::set_permissions(&dir, original).unwrap();
         assert!(
-            polled.is_pending(),
-            "the write must still be in flight when the caller is dropped"
+            polled.is_pending() && parked,
+            "the writer must be parked behind the storage lock, mutation applied, when the caller is dropped"
         );
         assert!(restored.is_ok(), "the undo must run without the caller");
         assert_eq!(
