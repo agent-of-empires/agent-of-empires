@@ -4523,6 +4523,7 @@ mod tests {
         // its write fail once released.
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(dir.join(crate::session::STORAGE_LOCK_FILENAME))
