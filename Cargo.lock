@@ -103,6 +103,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "core-foundation",
+ "core-foundation-sys",
  "crossterm",
  "dirs",
  "dotenv-ng-core",
