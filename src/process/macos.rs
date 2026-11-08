@@ -1265,13 +1265,18 @@ mod tests {
                 let guard = super::super::RunnerProcessGuard::capture(pid, None).unwrap();
                 let mut words = [0; 8];
                 words[5] = pid;
-                guard.members.lock().push((
-                    super::super::PrimeProcessIdentity {
-                        pid,
-                        start_id: audit_start_id(&AuditToken { values: words }),
-                    },
-                    ProcessHandle(AuditToken { values: words }),
-                ));
+                {
+                    let mut members = guard.members.lock();
+                    let index = members.processes.len();
+                    members.active.insert(pid, index);
+                    members.processes.push((
+                        super::super::PrimeProcessIdentity {
+                            pid,
+                            start_id: audit_start_id(&AuditToken { values: words }),
+                        },
+                        ProcessHandle(AuditToken { values: words }),
+                    ));
+                }
                 let auxiliary = Command::new("cat")
                     .process_group(0)
                     .stdin(std::process::Stdio::piped())
@@ -1292,10 +1297,14 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 let mut auxiliary = Auxiliary(auxiliary);
-                guard
-                    .members
-                    .lock()
-                    .push((auxiliary_identity, auxiliary_handle));
+                {
+                    let mut members = guard.members.lock();
+                    let index = members.processes.len();
+                    members.active.insert(auxiliary_identity.pid, index);
+                    members
+                        .processes
+                        .push((auxiliary_identity, auxiliary_handle));
+                }
                 assert!(
                     guard.executing().unwrap(),
                     "a known detached member must remain owned"
@@ -1409,6 +1418,7 @@ mod tests {
             guard
                 .members
                 .lock()
+                .processes
                 .iter()
                 .filter(|(identity, _)| identity.pid == pid)
                 .count()
