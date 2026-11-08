@@ -1,6 +1,6 @@
 //! Building the shell command a session launches with.
 
-use super::execution::UnpinnedCodexLaunch;
+use super::execution::{UnattestedCodexPolicy, UnpinnedCodexLaunch};
 use super::*;
 
 pub(super) struct LaunchCommandParts {
@@ -837,11 +837,24 @@ impl Instance {
         Option<UnpinnedCodexLaunch>,
     )> {
         let target = self.conversation_target();
-        let resolved = self.resolve_native_execution(target);
+        let mut resolved = self.resolve_native_execution(target);
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
-            if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
-                tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                return Ok((None, Some(store.clone())));
+            let admitted =
+                Self::unpinned_codex_resume_store(error, sid, binding).and_then(|store| {
+                    Ok(match store {
+                        Some(store) => Some(Some(store.clone())),
+                        None => self
+                            .sandboxed_codex_resume_admitted(error, sid, binding)?
+                            .then_some(None),
+                    })
+                });
+            match admitted {
+                Ok(Some(store)) => {
+                    tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
+                    return Ok((None, store));
+                }
+                Ok(None) => {}
+                Err(limit) => resolved = Err(UnattestedCodexPolicy::from(limit).into()),
             }
         }
         let execution = match (resolved, target) {
@@ -3452,6 +3465,112 @@ mod tests {
             1,
             "the profile selects a newer install: {command}"
         );
+    }
+
+    /// Sandboxes share the host fallback only through their private store.
+    #[test]
+    #[serial_test::serial]
+    fn default_sandboxed_codex_resume_requires_a_verified_private_store() {
+        use super::super::test_helpers::{
+            admit_sandbox_fixture, install_container_transport, test_sandbox,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("codex", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("codex-5477", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/codex"),
+        )
+        .unwrap();
+        let store = inst.sandbox_capture_store_dir().unwrap();
+        std::fs::write(
+            store.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let day = store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = |sid: &str, cwd: &str| {
+            std::fs::write(
+                day.join(format!("rollout-2026-11-08T12-00-00-{sid}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":\"{cwd}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let local = "01a1bbfe-4006-73e2-849e-139baf24402c";
+        let foreign = "01a1bbfe-4006-73e2-849e-139baf24402d";
+        let unknown = "01a1bbfe-4006-73e2-849e-139baf24402e";
+        rollout(local, "/workspace/project");
+        rollout(foreign, "/workspace/other");
+        let with_sid = |sid: &str| {
+            let mut inst = inst.clone();
+            inst.agent_session_id = Some(sid.into());
+            inst
+        };
+
+        let mut admitted = with_sid(local);
+        assert!(admitted.resolve_launch_execution().unwrap().is_none());
+        admitted.preflight_resume_launch().unwrap();
+        let prepared = admitted
+            .prepare_launch_command(admitted.conversation_state())
+            .unwrap();
+        assert!(prepared.is_existing);
+        let command = prepared.command.unwrap();
+        assert!(command.contains(&format!("resume {local}")), "{command}");
+
+        let binding = |session_id: &str, agent: &str, stores: Vec<PathBuf>| {
+            let mut binding = ConversationBinding::unknown(session_id);
+            binding.execution = Some(crate::session::ExecutionBinding {
+                agent: agent.into(),
+                stores,
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: "/workspace/project".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            });
+            binding
+        };
+        let private = store.canonicalize().unwrap();
+        let mut bound = with_sid(local);
+        bound.agent_session_binding = Some(binding(local, "codex", vec![private.clone()]));
+        assert!(bound.resolve_launch_execution().unwrap().is_none());
+
+        let refused = |inst: Instance| {
+            let error = inst.resolve_launch_execution().err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                ManagedResumeCause::CodexConversationUnverified,
+                "{error:#}"
+            );
+        };
+        refused(with_sid(foreign));
+        refused(with_sid(unknown));
+        let mut elsewhere = with_sid(local);
+        elsewhere.agent_session_binding =
+            Some(binding(local, "codex", vec![temp.path().join("shared")]));
+        refused(elsewhere);
+        let mut other_agent = with_sid(local);
+        other_agent.agent_session_binding = Some(binding(local, "claude", vec![private]));
+        refused(other_agent);
+        let mut legacy = with_sid(local);
+        legacy.sandbox_store_generation = 1;
+        assert!(legacy.sandbox_capture_store_dir().is_none());
+        refused(legacy);
+        // An explicit target stays on the attested path.
+        let mut explicit = inst.clone();
+        explicit.resume_intent = ResumeIntent::Use(local.into());
+        assert!(explicit.resolve_launch_execution().is_err());
     }
 
     /// A ChatGPT login and a macOS host both hit the unreadable-policy refusal.
