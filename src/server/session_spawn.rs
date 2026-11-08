@@ -1652,7 +1652,7 @@ mod tests {
             row.id,
         );
         assert_eq!(second.status(), axum::http::StatusCode::OK);
-        assert_eq!(row.status, Status::Starting);
+        assert_eq!(row.status, crate::session::Status::Starting);
     }
 
     /// A create that answered has registered every resource the launch owns,
