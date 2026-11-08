@@ -418,19 +418,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn caches_from_the_other_channel_are_ignored() {
-        for (cached, current, usable) in [
-            ("1.22.1", "1.22.0", true),
-            ("1.22.2-nightly.20261108", "1.22.2-nightly.20261107", true),
-            ("1.22.2-nightly.20261108", "1.22.1", false),
-            ("1.22.1", "1.22.2-nightly.20261107", false),
+    /// A fresh, newer cache from the other channel must not answer the check.
+    #[tokio::test]
+    async fn check_for_update_refetches_over_a_cache_from_the_other_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let releases = serde_json::json!([
+            {
+                "tag_name": "nightly-20261109",
+                "name": "Agent of Empires v1.22.2-nightly.20261109",
+                "prerelease": true,
+            },
+            { "tag_name": "v1.22.1", "name": "Agent of Empires v1.22.1" },
+        ]);
+        let app = axum::Router::new().route(
+            "/repos/agent-of-empires/agent-of-empires/releases",
+            axum::routing::get(move || std::future::ready(axum::Json(releases.clone()))),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        for (current, cached_latest, expected) in [
+            ("1.22.0", "1.22.3-nightly.20261201", "1.22.1"),
+            (
+                "1.22.2-nightly.20261101",
+                "9.9.9",
+                "1.22.2-nightly.20261109",
+            ),
         ] {
-            assert_eq!(
-                same_channel(cached, current),
-                usable,
-                "{cached} for {current}"
-            );
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                ("HOME", home.path().as_os_str()),
+                ("XDG_CONFIG_HOME", home.path().as_os_str()),
+                ("AOE_UPDATE_API_BASE", std::ffi::OsStr::new(&base)),
+            ]);
+            save_cache(&UpdateCache {
+                checked_at: chrono::Utc::now(),
+                latest_version: cached_latest.to_string(),
+                releases: vec![],
+            })
+            .unwrap();
+
+            let info = check_for_update(current, false).await.unwrap();
+            assert_eq!(info.latest_version, expected, "{current}");
         }
     }
 
