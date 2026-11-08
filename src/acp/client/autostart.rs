@@ -249,19 +249,23 @@ mod tests {
             boot_id: "fixture-boot".to_owned(),
             start_id: "fixture-start".to_owned(),
         };
-        for (archive, physical) in [
-            (Some(1), true),
-            (Some(2), true),
-            (None, false),
-            (Some(1), false),
+        let physical_marker =
+            "[AOE_START_MARKER] pid=17 boot_id=fixture-boot start_id=fixture-start\n";
+        for (archive, marker, physical) in [
+            (Some(1), physical_marker, true),
+            (Some(2), physical_marker, true),
+            (None, "[AOE_START_MARKER] pid=17 exe=legacy\n", false),
+            (
+                Some(1),
+                "[AOE_START_MARKER] pid=17 boot_id=fixture-boot start_id=historical\n",
+                false,
+            ),
+            (
+                Some(1),
+                "[AOE_START_MARKER] pid=17 boot_id=historical start_id=fixture-start\n",
+                false,
+            ),
         ] {
-            let marker = if physical {
-                "[AOE_START_MARKER] pid=17 boot_id=fixture-boot start_id=fixture-start\n"
-            } else if archive.is_some() {
-                "[AOE_START_MARKER] pid=17 boot_id=fixture-boot start_id=historical\n"
-            } else {
-                "[AOE_START_MARKER] pid=17 exe=legacy\n"
-            };
             let earlier = if archive.is_some() {
                 "older fixture context"
             } else {
