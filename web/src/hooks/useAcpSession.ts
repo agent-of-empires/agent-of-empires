@@ -24,6 +24,7 @@ import { classifyResolveResponse, reducer, type Action } from "./acpSession/redu
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
 import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
 import {
+  confirmServerQueue,
   mutateServerQueue,
   reconcileQueueSnapshot,
   serverQueueRevision,
@@ -253,6 +254,7 @@ export function useAcpSession(
       reportAcpInteraction("prompt_queued");
       void (async () => {
         const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
+        if (row) confirmServerQueue(sessionId);
         dispatch(
           row
             ? { kind: "confirm_queued_prompt", id }
@@ -266,10 +268,14 @@ export function useAcpSession(
     [sessionId],
   );
 
-  const showServerQueued = useCallback((id: string, text: string, attachments?: PromptAttachmentInput[]) => {
-    dispatch({ kind: "enqueue_prompt", id, text, attachments });
-    dispatch({ kind: "confirm_queued_prompt", id });
-  }, []);
+  const showServerQueued = useCallback(
+    (id: string, text: string, attachments?: PromptAttachmentInput[]) => {
+      dispatch({ kind: "enqueue_prompt", id, text, attachments });
+      dispatch({ kind: "confirm_queued_prompt", id });
+      if (sessionId) confirmServerQueue(sessionId);
+    },
+    [sessionId],
+  );
 
   const sendPrompt = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]) => {
@@ -331,6 +337,7 @@ export function useAcpSession(
     if (!sessionId || status !== "open") return;
     let cancelled = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
     const refresh = async () => {
       const revision = serverQueueRevision(sessionId);
       const rows = await listServerQueue(sessionId);
@@ -341,7 +348,12 @@ export function useAcpSession(
       let deferred = hasQueuedPrompts;
       if (rows) deferred = !!rows[0]?.resume_after_compaction;
       // A steering delivery need not change turnActive. Wait for the daemon's retirement.
-      if (queueCanResume && deferred) retry = setTimeout(() => void refresh(), 1000);
+      let delay = 1000;
+      if (!rows) {
+        delay = Math.min(1000 * 2 ** failures, 10000);
+        failures += 1;
+      } else failures = 0;
+      if (!rows || (queueCanResume && deferred)) retry = setTimeout(() => void refresh(), delay);
     };
     void (async () => {
       if (!queueMigratedRef.current.has(sessionId)) {
@@ -382,9 +394,10 @@ export function useAcpSession(
   );
 
   const clearQueue = useCallback(() => {
+    const ids = queuedPromptsRef.current.map((row) => row.id);
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void mutateQueue({ kind: "clear" }, () => clearServerQueue(sessionId));
-  }, [sessionId, mutateQueue]);
+    if (sessionId) void mutateQueue({ kind: "clear", ids }, () => clearServerQueue(sessionId));
+  }, [sessionId, mutateQueue, queuedPromptsRef]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {

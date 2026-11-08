@@ -18,14 +18,35 @@ impl QueuedPromptPermit {
     }
 }
 
+pub(super) struct QueuedPromptReservation {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) commit: oneshot::Receiver<()>,
+    pub(super) committed: bool,
+}
+
+impl QueuedPromptReservation {
+    pub(super) fn new(
+        blocks: Vec<ContentBlock>,
+        ready: oneshot::Sender<Option<QueuedPromptPermit>>,
+    ) -> Option<Self> {
+        let (publish, commit) = oneshot::channel();
+        ready.send(Some(QueuedPromptPermit(publish))).ok()?;
+        Some(Self {
+            blocks,
+            commit,
+            committed: false,
+        })
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn reserve_queued_prompt(
     ready: oneshot::Sender<Option<QueuedPromptPermit>>,
 ) -> bool {
-    let (commit, committed) = oneshot::channel();
-    if ready.send(Some(QueuedPromptPermit(commit))).is_err() {
+    let Some(reservation) = QueuedPromptReservation::new(Vec::new(), ready) else {
         return false;
-    }
-    committed.await.is_ok()
+    };
+    reservation.commit.await.is_ok()
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.

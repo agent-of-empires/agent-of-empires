@@ -497,7 +497,7 @@ async fn steering_connection(
 
 #[tokio::test]
 async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
-    for outcome in ["promptRequired", "injected", "unknown"] {
+    for outcome in ["promptRequired", "injected", "unknown", "noReply"] {
         let (mut fake, mut requests) = steering_connection(false).await;
         let original = vec![ContentBlock::Text(TextContent::new("original"))];
         fake.cmd_tx.send(ClientCmd::Prompt(original)).await.unwrap();
@@ -530,22 +530,34 @@ async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
         })
         .await
         .unwrap();
-        write_line(
-            &fake.agent_write,
-            &serde_json::json!({"jsonrpc":"2.0","id":steer["id"],"result":{"outcome":outcome}})
-                .to_string(),
-        )
-        .await;
+        if outcome != "noReply" {
+            write_line(
+                &fake.agent_write,
+                &serde_json::json!({"jsonrpc":"2.0","id":steer["id"],"result":{"outcome":outcome}})
+                    .to_string(),
+            )
+            .await;
+        }
         fake.cmd_tx
             .send(ClientCmd::Prompt(vec![ContentBlock::Text(
                 TextContent::new("later"),
             )]))
             .await
             .unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(5), requests.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let request = requests.recv().await.unwrap();
+                assert_ne!(
+                    request["method"], "_session/steering",
+                    "an unknown outcome must not be resent"
+                );
+                if request["method"] == "session/prompt" {
+                    break request;
+                }
+            }
+        })
+        .await
+        .unwrap();
         if outcome == "promptRequired" {
             assert_eq!(next["params"]["prompt"], steer["params"]["prompt"]);
             write_line(&fake.agent_write, &serde_json::json!({"jsonrpc":"2.0","id":next["id"],"result":{"stopReason":"end_turn"}}).to_string()).await;
@@ -561,6 +573,67 @@ async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
         fake.connection.abort();
         let _ = tokio::join!(fake.agent, fake.connection);
     }
+}
+
+#[tokio::test]
+async fn queued_reservation_keeps_cancellation_responsive_before_publication() {
+    let (mut fake, mut requests) = steering_connection(false).await;
+    fake.cmd_tx
+        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+            TextContent::new("original"),
+        )]))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (ready, reserved) = oneshot::channel();
+    fake.cmd_tx
+        .send(ClientCmd::QueuedPrompt {
+            blocks: vec![ContentBlock::Text(TextContent::new("not published"))],
+            ready,
+        })
+        .await
+        .unwrap();
+    let permit = tokio::time::timeout(Duration::from_secs(5), reserved)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+    let cancel = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancel["method"], "session/cancel");
+    drop(permit);
+    write_line(
+        &fake.agent_write,
+        &serde_json::json!({"jsonrpc":"2.0","id":first["id"],"result":{"stopReason":"cancelled"}})
+            .to_string(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(fake.event_rx.recv().await.unwrap(), Event::Stopped { .. }) {}
+    })
+    .await
+    .unwrap();
+    fake.cmd_tx
+        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+            TextContent::new("later"),
+        )]))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next["method"], "session/prompt");
+    assert_eq!(next["params"]["prompt"][0]["text"], "later");
+    fake.agent.abort();
+    fake.connection.abort();
+    let _ = tokio::join!(fake.agent, fake.connection);
 }
 
 #[tokio::test]

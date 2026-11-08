@@ -983,12 +983,16 @@ describe("server queue", () => {
     });
     const hook = await openSession("sess-send-refresh");
     const selected = hook.result.current.state.queuedPrompts[0]!;
+    rows = [rows[0]!, { ...rows[1]!, text: "canonical other" }];
     let send!: Promise<void>;
     act(() => {
       send = hook.result.current.sendQueuedNow(selected);
     });
     await waitFor(() => expect(started).toBe(true), { timeout: 2000 });
-    expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["other"]);
+    await waitFor(
+      () => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["canonical other"]),
+      { timeout: 2000 },
+    );
     rows = [];
     act(() => hook.result.current.manualReconnect());
     await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
@@ -999,6 +1003,20 @@ describe("server queue", () => {
       await send;
     });
     expect(posts("/acp/prompt")).toHaveLength(1);
+    hook.unmount();
+  });
+
+  it("retries an unknown initial queue even when the local cache is empty", async () => {
+    vi.useFakeTimers();
+    queueReadFails = true;
+    serverQueue.set("hidden", row("hidden", "deferred", { resume_after_compaction: true }));
+    const hook = await openSession("sess-initial-queue-failure");
+    expect(calls.some((call) => call.method === "GET" && call.url.includes("/queue"))).toBe(true);
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
+    queueReadFails = false;
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["hidden"]);
     hook.unmount();
   });
 

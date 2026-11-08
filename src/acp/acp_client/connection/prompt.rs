@@ -15,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 use super::command_loop::Session;
 use super::notifications::now_ms;
 use super::CANCEL_ESCALATION_GRACE;
-use crate::acp::acp_client::commands::{reserve_queued_prompt, ClientCmd};
+use crate::acp::acp_client::commands::{ClientCmd, QueuedPromptReservation};
 use crate::acp::acp_client::control::prompt_outcome_to_response;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
@@ -189,6 +189,30 @@ impl Session {
         let simulate_orphan = simulate_orphan(&shared.session_label);
 
         loop {
+            if self
+                .queued_reservation
+                .as_ref()
+                .is_some_and(|reserved| reserved.committed)
+            {
+                for _ in 0..self.lifecycle_rx.len() {
+                    if let Ok(env) = self.lifecycle_rx.try_recv() {
+                        if env.epoch == turn.epoch {
+                            turn.apply(env.signal);
+                        }
+                    }
+                }
+                if !turn.flags.cancelling
+                    && turn.watchdog.off_protocol_work_seen()
+                        != Some(OffProtocolWorkKind::Compaction)
+                    && self.steer_fut.is_none()
+                {
+                    let reserved = self
+                        .queued_reservation
+                        .take()
+                        .expect("committed reservation");
+                    self.steer_or_backlog(reserved.blocks);
+                }
+            }
             #[cfg(test)]
             self.select_probe_gate().await;
             let flow = tokio::select! {
@@ -202,6 +226,11 @@ impl Session {
                     #[cfg(test)]
                     observe_select_win(true);
                     self.on_command(&mut turn, cmd).await?
+                }
+                committed = async { (&mut self.queued_reservation.as_mut().expect("guarded").commit).await },
+                    if self.queued_reservation.as_ref().is_some_and(|reserved| !reserved.committed) => {
+                    self.receive_queue_commit(committed);
+                    Flow::Continue
                 }
                 _ = turn.cancel_grace.as_mut(), if turn.flags.cancelling => {
                     warn!(
@@ -423,7 +452,13 @@ impl Session {
                     .resume_task_tailing(&self.acp_session_id.0, task_ids)
                     .await
             }
-            Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
+            Some(ClientCmd::Prompt(blocks)) => {
+                if self.queued_reservation.is_some() {
+                    self.pending_prompts.push_back(blocks);
+                } else {
+                    return Ok(self.on_follow_up(turn, blocks).await);
+                }
+            }
             Some(ClientCmd::QueuedPrompt { blocks, ready }) => {
                 if ready.is_closed() {
                     return Ok(Flow::Continue);
@@ -442,11 +477,12 @@ impl Session {
                 let admitted = self.steering_capable
                     && !turn.flags.cancelling
                     && !compacting
-                    && self.steer_fut.is_none();
+                    && self.steer_fut.is_none()
+                    && self.queued_reservation.is_none();
                 if !admitted {
                     let _ = ready.send(None);
-                } else if reserve_queued_prompt(ready).await {
-                    self.steer_or_backlog(blocks);
+                } else {
+                    self.queued_reservation = QueuedPromptReservation::new(blocks, ready);
                 }
             }
             Some(ClientCmd::ResetSession {
@@ -534,7 +570,14 @@ impl Session {
             blocks.clone(),
         ));
         self.steer_fut = Some(std::sync::Mutex::new(Box::pin(async move {
-            (blocks, sent.block_task().await)
+            let res = match tokio::time::timeout(Duration::from_secs(15), sent.block_task()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(target: "acp.protocol", "steering receipt timed out; delivery is unknown, not resending");
+                    Ok(serde_json::json!({"outcome": "unknown", "reason": "receiptTimeout"}))
+                }
+            };
+            (blocks, res)
         })));
     }
 
