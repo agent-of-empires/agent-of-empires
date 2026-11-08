@@ -3968,6 +3968,19 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
+      "id": "acp.story.original-tool-output-after-correlated-failure",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-transcript.spec.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/acp/ToolCardChrome.tsx",
+        "web/src/components/acp/ToolCards.tsx"
+      ],
+      "notes": "A controlled real Native emits an original tool start and partial output, then fails its current request. The actual thread and card retain that partial output across reload without inventing a tool terminal. A second explicit prompt produces the real terminal and replaces the partial output. The DOM regression also checks that streamed output stays separate from the SDK result."
+    },
+    {
       "id": "acp.todo-group-fold",
       "kind": "vitest",
       "risk": "medium",
