@@ -40,6 +40,9 @@ mod update_events;
 mod watchdog;
 
 pub use close::CloseSessionOutcome;
+pub(crate) use commands::QueuedPromptPermit;
+pub(crate) const QUEUED_PROMPT_ADMISSION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
@@ -403,8 +406,8 @@ impl AcpClient {
         let (client, event_tx) = Self::fake_with_consumer(session_id, move |cmd| {
             let name = match cmd {
                 ClientCmd::Prompt(_) => "prompt",
-                ClientCmd::QueuedPrompt { accepted, .. } => {
-                    let _ = accepted.send(true);
+                ClientCmd::QueuedPrompt { ready, .. } => {
+                    tokio::spawn(commands::reserve_queued_prompt(ready));
                     "prompt"
                 }
                 ClientCmd::Cancel => "cancel",
@@ -444,12 +447,15 @@ impl AcpClient {
         session_id: AcpSessionId,
     ) -> (
         Self,
-        mpsc::UnboundedReceiver<(Vec<ContentBlock>, Option<oneshot::Sender<bool>>)>,
+        mpsc::UnboundedReceiver<(
+            Vec<ContentBlock>,
+            Option<oneshot::Sender<Option<QueuedPromptPermit>>>,
+        )>,
     ) {
         let (sent, received) = mpsc::unbounded_channel();
         let (client, _) = Self::fake_with_consumer(session_id, move |cmd| match cmd {
-            ClientCmd::QueuedPrompt { blocks, accepted } => {
-                let _ = sent.send((blocks, Some(accepted)));
+            ClientCmd::QueuedPrompt { blocks, ready } => {
+                let _ = sent.send((blocks, Some(ready)));
             }
             ClientCmd::Prompt(blocks) => {
                 let _ = sent.send((blocks, None));
@@ -730,29 +736,36 @@ impl AcpClient {
         text: &str,
         attachments: &[AttachmentBlob],
     ) -> Result<(), AcpError> {
-        self.submit_prompt(text, attachments, false).await
+        self.send_cmd(ClientCmd::Prompt(Self::prompt_blocks(text, attachments)))
+            .await
     }
 
-    /// Wait for admission rather than merely enqueueing a command. A refusal
-    /// leaves ownership with the durable queue, including its attachment bytes.
-    pub(crate) async fn send_queued_prompt(
+    /// Reserve delivery before publication. A timed-out or dropped reservation
+    /// cannot dispatch, including when the worker processes the command late.
+    pub(crate) async fn prepare_queued_prompt(
         &self,
         text: &str,
         attachments: &[AttachmentBlob],
-    ) -> Result<(), AcpError> {
-        self.submit_prompt(text, attachments, true).await
+    ) -> Result<QueuedPromptPermit, AcpError> {
+        let (ready, admission) = oneshot::channel();
+        let reserve = async {
+            self.send_cmd(ClientCmd::QueuedPrompt {
+                blocks: Self::prompt_blocks(text, attachments),
+                ready,
+            })
+            .await?;
+            admission
+                .await
+                .map_err(|_| AcpError::AgentExited)?
+                .ok_or_else(|| AcpError::Protocol("queued prompt was not accepted".into()))
+        };
+        tokio::time::timeout(QUEUED_PROMPT_ADMISSION_TIMEOUT, reserve)
+            .await
+            .map_err(|_| AcpError::Protocol("queued prompt admission timed out".into()))?
     }
 
-    async fn submit_prompt(
-        &self,
-        text: &str,
-        attachments: &[AttachmentBlob],
-        queued: bool,
-    ) -> Result<(), AcpError> {
+    fn prompt_blocks(text: &str, attachments: &[AttachmentBlob]) -> Vec<ContentBlock> {
         use base64::Engine as _;
-        if self.cmd_tx.is_none() {
-            return Err(AcpError::NotRunning);
-        }
         let mut blocks = Vec::with_capacity(1 + attachments.len());
         blocks.push(ContentBlock::Text(TextContent::new(text)));
         for att in attachments {
@@ -771,17 +784,7 @@ impl AcpClient {
                 }
             });
         }
-        if !queued {
-            return self.send_cmd(ClientCmd::Prompt(blocks)).await;
-        }
-        let (accepted, admission) = oneshot::channel();
-        self.send_cmd(ClientCmd::QueuedPrompt { blocks, accepted })
-            .await?;
-        match admission.await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(AcpError::Protocol("queued prompt was not accepted".into())),
-            Err(_) => Err(AcpError::AgentExited),
-        }
+        blocks
     }
 
     /// Best-effort `session/cancel`; Ok even with no turn in flight.
@@ -1078,6 +1081,36 @@ impl AcpClient {
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_timeout_and_drop_cannot_commit_late() {
+        let (client, mut queued) =
+            AcpClient::fake_for_test_queued_prompt(AcpSessionId("queue-timeout".into()));
+        let client = Arc::new(client);
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.prepare_queued_prompt("late", &[]).await }
+        });
+        let (_, ready) = queued.recv().await.unwrap();
+        tokio::time::advance(QUEUED_PROMPT_ADMISSION_TIMEOUT).await;
+        assert!(request.await.unwrap().is_err());
+        assert!(!commands::reserve_queued_prompt(ready.unwrap()).await);
+        for commit in [false, true] {
+            let request = tokio::spawn({
+                let client = client.clone();
+                async move { client.prepare_queued_prompt("reserved", &[]).await }
+            });
+            let (_, ready) = queued.recv().await.unwrap();
+            let worker = tokio::spawn(commands::reserve_queued_prompt(ready.unwrap()));
+            let permit = request.await.unwrap().unwrap();
+            if commit {
+                permit.commit().unwrap();
+            } else {
+                drop(permit);
+            }
+            assert_eq!(worker.await.unwrap(), commit);
+        }
+    }
 
     struct OnDrop(Option<oneshot::Sender<()>>);
     impl Drop for OnDrop {

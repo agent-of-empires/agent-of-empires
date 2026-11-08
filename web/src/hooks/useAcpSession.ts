@@ -1,7 +1,7 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
 // Failed actions surface through `state.lastError` rather than being silently lost.
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useSyncExternalStore, type Dispatch } from "react";
 import {
   emptyAcpState,
   type AcpAttachment,
@@ -23,6 +23,13 @@ import {
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
 import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import {
+  mutateServerQueue,
+  reconcileQueueSnapshot,
+  serverQueueRevision,
+  subscribeServerQueue,
+  type QueueMutation,
+} from "./acpSession/serverQueueSync";
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
@@ -299,22 +306,23 @@ export function useAcpSession(
   // list per session re-sends rows the server never confirmed; a confirmed row missing from the
   // server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
-  const queueSync = useRef({ revision: new Map<string | null, number>(), pending: new Map<string | null, number>() });
-  const [queueRevision, refreshQueue] = useReducer((revision: number) => revision + 1, 0);
-  const mutateQueue = useCallback(
-    async <T>(mutation: () => Promise<T>): Promise<T> => {
-      const { revision, pending } = queueSync.current;
-      revision.set(sessionId, (revision.get(sessionId) ?? 0) + 1);
-      pending.set(sessionId, (pending.get(sessionId) ?? 0) + 1);
-      try {
-        return await mutation();
-      } finally {
-        pending.set(sessionId, (pending.get(sessionId) ?? 1) - 1);
-        revision.set(sessionId, (revision.get(sessionId) ?? 0) + 1);
-        if (sessionIdRef.current === sessionId) refreshQueue();
-      }
+  const subscribeQueue = useCallback(
+    (listener: () => void) => {
+      if (sessionId) return subscribeServerQueue(sessionId, listener);
+      return () => {};
     },
-    [queueSync, sessionId, sessionIdRef],
+    [sessionId],
+  );
+  const readQueueRevision = useCallback(() => {
+    if (sessionId) return serverQueueRevision(sessionId);
+    return 0;
+  }, [sessionId]);
+  const queueRevision = useSyncExternalStore(subscribeQueue, readQueueRevision);
+  const mutateQueue = useCallback(
+    async <T>(mutation: QueueMutation, request: () => Promise<T>): Promise<T | undefined> => {
+      if (sessionId) return mutateServerQueue(sessionId, mutation, request);
+    },
+    [sessionId],
   );
   const hasQueuedPrompts = state.queuedPrompts.length > 0;
   const queueCanResume =
@@ -324,17 +332,12 @@ export function useAcpSession(
     let cancelled = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const refresh = async () => {
-      if ((queueSync.current.pending.get(sessionId) ?? 0) > 0) return;
-      const revision = queueSync.current.revision.get(sessionId);
+      const revision = serverQueueRevision(sessionId);
       const rows = await listServerQueue(sessionId);
-      // A mutation invalidates even a successful GET that began before it.
-      if (
-        cancelled ||
-        (queueSync.current.pending.get(sessionId) ?? 0) > 0 ||
-        revision !== queueSync.current.revision.get(sessionId)
-      )
-        return;
-      if (rows) dispatch({ kind: "hydrate_server_queue", rows });
+      let reconciled = null;
+      if (rows) reconciled = reconcileQueueSnapshot(sessionId, revision, rows);
+      if (cancelled || (rows && !reconciled)) return;
+      if (reconciled) dispatch({ kind: "hydrate_server_queue", rows: reconciled });
       let deferred = hasQueuedPrompts;
       if (rows) deferred = !!rows[0]?.resume_after_compaction;
       // A steering delivery need not change turnActive. Wait for the daemon's retirement.
@@ -359,22 +362,13 @@ export function useAcpSession(
       cancelled = true;
       clearTimeout(retry);
     };
-  }, [
-    sessionId,
-    status,
-    state.turnActive,
-    hasQueuedPrompts,
-    queueCanResume,
-    queuedPromptsRef,
-    queueSync,
-    queueRevision,
-  ]);
+  }, [sessionId, status, state.turnActive, hasQueuedPrompts, queueCanResume, queuedPromptsRef, queueRevision]);
 
   // Reconcile after each optimistic mutation, including failures.
   const removeQueuedPrompt = useCallback(
     (id: string) => {
       dispatch({ kind: "dequeue_prompt", id });
-      if (sessionId) void mutateQueue(() => removeServerQueuedPrompt(sessionId, id));
+      if (sessionId) void mutateQueue({ kind: "remove", id }, () => removeServerQueuedPrompt(sessionId, id));
     },
     [sessionId, mutateQueue],
   );
@@ -382,14 +376,14 @@ export function useAcpSession(
   const editQueuedPrompt = useCallback(
     (id: string, text: string) => {
       dispatch({ kind: "edit_queued_prompt", id, text });
-      if (sessionId) void mutateQueue(() => editServerQueuedPrompt(sessionId, id, text));
+      if (sessionId) void mutateQueue({ kind: "edit", id, text }, () => editServerQueuedPrompt(sessionId, id, text));
     },
     [sessionId, mutateQueue],
   );
 
   const clearQueue = useCallback(() => {
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void mutateQueue(() => clearServerQueue(sessionId));
+    if (sessionId) void mutateQueue({ kind: "clear" }, () => clearServerQueue(sessionId));
   }, [sessionId, mutateQueue]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
@@ -414,7 +408,10 @@ export function useAcpSession(
       // The daemon consumes the row once it accepts the send, so the drain can't also deliver it
       // and a plugin-sent row keeps the sender it stored.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
-      const result = await mutateQueue(() => dispatchPromptNow(prompt.text, prompt.attachments, prompt.id));
+      const result = await mutateQueue({ kind: "send", id: prompt.id }, () =>
+        dispatchPromptNow(prompt.text, prompt.attachments, prompt.id),
+      );
+      if (!result) return;
       // The daemon keeps the row until it accepts the send, so a refusal or a re-park leaves it queued.
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);

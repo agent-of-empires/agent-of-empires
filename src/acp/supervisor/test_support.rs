@@ -140,7 +140,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
     ) -> mpsc::UnboundedReceiver<(
         Vec<agent_client_protocol::v1::schema::ContentBlock>,
-        Option<tokio::sync::oneshot::Sender<bool>>,
+        Option<tokio::sync::oneshot::Sender<Option<crate::acp::acp_client::QueuedPromptPermit>>>,
     )> {
         let (client, received) =
             AcpClient::fake_for_test_queued_prompt(AcpSessionId(session_id.into()));

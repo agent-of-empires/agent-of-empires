@@ -1005,6 +1005,14 @@ impl SessionService {
         {
             return Err(SendTurnError::RevivalRefused);
         }
+        let mut admission = None;
+        if queued {
+            admission = self
+                .acp_supervisor
+                .prepare_queued_prompt(id, text, attachments)
+                .await
+                .map_err(SendTurnError::Send)?;
+        }
         // Persist the admitted turn before forwarding it to the agent.
         let published = self
             .acp_supervisor
@@ -1017,12 +1025,20 @@ impl SessionService {
                 caller.message_origin().map(str::to_string),
             )
             .await;
+        if admission.is_some() && published.seq.is_none() {
+            return Err(SendTurnError::Send(
+                crate::acp::acp_client::AcpError::Protocol(
+                    "queued prompt publication failed".into(),
+                )
+                .into(),
+            ));
+        }
         let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
-                if queued {
-                    self.acp_supervisor
-                        .send_queued_prompt(id, text, attachments)
-                        .await
+                if let Some(admission) = admission {
+                    admission
+                        .commit()
+                        .map_err(crate::acp::supervisor::SupervisorError::from)
                 } else {
                     self.acp_supervisor.send_prompt(id, text, attachments).await
                 }
@@ -3125,6 +3141,7 @@ mod tests {
         {
             assert!(sink.publish_persisted(id, seq as u64 + 1, &event));
         }
+        service.acp_supervisor.hydrate_seqs([(id.to_string(), 2)]);
         let blob = AttachmentBlob {
             id: "image".into(),
             kind: PromptAttachmentKind::Image,
@@ -3176,14 +3193,27 @@ mod tests {
                 !delivery.is_finished(),
                 "channel enqueue alone cannot retire the row"
             );
-            receipt
-                .expect("queue sends require a worker receipt")
-                .send(accepted)
-                .unwrap();
+            let reply = receipt.expect("queue sends require a worker reservation");
+            if accepted {
+                let (commit, committed) = tokio::sync::oneshot::channel();
+                reply
+                    .send(Some(crate::acp::acp_client::QueuedPromptPermit(commit)))
+                    .unwrap();
+                committed.await.unwrap();
+            } else {
+                reply.send(None).unwrap();
+            }
             tokio::time::timeout(Duration::from_secs(5), delivery)
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(
+                state.acp_event_store.replay_from(id, 0).iter().filter(|(_, event)| matches!(
+                    event, Event::UserPromptSent { text, .. } if text == "inspect this screenshot"
+                )).count(),
+                usize::from(accepted),
+                "refused admissions must not publish sent events",
+            );
             assert_eq!(
                 service.queued_prompts_snapshot(id).await.is_empty(),
                 accepted

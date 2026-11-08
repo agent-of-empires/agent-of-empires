@@ -7,6 +7,27 @@ use tokio::sync::oneshot;
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
 
+/// A worker reservation. Dropping it cancels delivery; committing it follows
+/// the durable sent event, so agent output cannot overtake that event.
+#[derive(Debug)]
+pub(crate) struct QueuedPromptPermit(pub(crate) oneshot::Sender<()>);
+
+impl QueuedPromptPermit {
+    pub(crate) fn commit(self) -> Result<(), super::AcpError> {
+        self.0.send(()).map_err(|_| super::AcpError::AgentExited)
+    }
+}
+
+pub(super) async fn reserve_queued_prompt(
+    ready: oneshot::Sender<Option<QueuedPromptPermit>>,
+) -> bool {
+    let (commit, committed) = oneshot::channel();
+    if ready.send(Some(QueuedPromptPermit(commit))).is_err() {
+        return false;
+    }
+    committed.await.is_ok()
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
     /// The fully-built prompt content blocks (text first, then any
@@ -16,7 +37,7 @@ pub(super) enum ClientCmd {
     /// A durable queue keeps its rows until this task admits the content.
     QueuedPrompt {
         blocks: Vec<ContentBlock>,
-        accepted: oneshot::Sender<bool>,
+        ready: oneshot::Sender<Option<QueuedPromptPermit>>,
     },
     Cancel,
     /// Force-stop now: end the in-flight turn with `user_forced` and let

@@ -404,6 +404,186 @@ async fn spawn_fake_connection(
     }
 }
 
+async fn steering_connection(
+    adopted: bool,
+) -> (FakeConnection, mpsc::UnboundedReceiver<serde_json::Value>) {
+    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+    let agent_write = Arc::new(Mutex::new(agent_write));
+    let (event_tx, event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let mut mode = ConnectMode::Fresh {
+        stored_acp_session_id: None,
+        seed_history_replay: false,
+        prior_conversation: false,
+        fork_from: None,
+    };
+    if adopted {
+        mode = ConnectMode::Resume {
+            acp_session_id: "s-steering".into(),
+            in_flight_turn: true,
+        };
+    }
+    let params = ConnectionParams {
+        claude_home: None,
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "s-steering".into(),
+            sandbox: None,
+        },
+        mode,
+        ready_tx,
+        profile: &crate::acp::agent_profiles::GEMINI,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    let reply_write = agent_write.clone();
+    let (wire, requests) = mpsc::unbounded_channel();
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match msg["method"].as_str() {
+                Some("initialize") => Some(
+                    serde_json::json!({"protocolVersion":1,"agentCapabilities":{},"_meta":{"steering":{"supported":true}}}),
+                ),
+                Some("session/new") => Some(serde_json::json!({"sessionId":"s-steering"})),
+                _ => {
+                    wire.send(msg.clone()).unwrap();
+                    None
+                }
+            };
+            if let Some(result) = result {
+                write_line(
+                    &reply_write,
+                    &serde_json::json!({"jsonrpc":"2.0","id":msg["id"],"result":result})
+                        .to_string(),
+                )
+                .await;
+            }
+        }
+    });
+    ready_rx.await.unwrap().unwrap();
+    (
+        FakeConnection {
+            event_rx,
+            cmd_tx,
+            agent_write,
+            connection,
+            agent,
+            _cwd: temp,
+        },
+        requests,
+    )
+}
+
+#[tokio::test]
+async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
+    for outcome in ["promptRequired", "injected", "unknown"] {
+        let (mut fake, mut requests) = steering_connection(false).await;
+        let original = vec![ContentBlock::Text(TextContent::new("original"))];
+        fake.cmd_tx.send(ClientCmd::Prompt(original)).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["method"], "session/prompt");
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("deferred")),
+            ContentBlock::Image(agent_client_protocol::v1::schema::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+        ];
+        let (ready, reserved) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::QueuedPrompt { blocks, ready })
+            .await
+            .unwrap();
+        reserved.await.unwrap().unwrap().commit().unwrap();
+        let steer = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(steer["method"], "_session/steering");
+        write_line(&fake.agent_write, &serde_json::json!({"jsonrpc":"2.0","id":first["id"],"result":{"stopReason":"end_turn"}}).to_string()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(fake.event_rx.recv().await.unwrap(), Event::Stopped { .. }) {}
+        })
+        .await
+        .unwrap();
+        write_line(
+            &fake.agent_write,
+            &serde_json::json!({"jsonrpc":"2.0","id":steer["id"],"result":{"outcome":outcome}})
+                .to_string(),
+        )
+        .await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("later"),
+            )]))
+            .await
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if outcome == "promptRequired" {
+            assert_eq!(next["params"]["prompt"], steer["params"]["prompt"]);
+            write_line(&fake.agent_write, &serde_json::json!({"jsonrpc":"2.0","id":next["id"],"result":{"stopReason":"end_turn"}}).to_string()).await;
+            let later = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(later["params"]["prompt"][0]["text"], "later");
+        } else {
+            assert_eq!(next["params"]["prompt"][0]["text"], "later");
+        }
+        fake.agent.abort();
+        fake.connection.abort();
+        let _ = tokio::join!(fake.agent, fake.connection);
+    }
+}
+
+#[tokio::test]
+async fn queued_prompt_waits_for_an_adopted_turn_to_be_idle() {
+    let (fake, _) = steering_connection(true).await;
+    let (ready, reserved) = oneshot::channel();
+    fake.cmd_tx
+        .send(ClientCmd::QueuedPrompt {
+            blocks: Vec::new(),
+            ready,
+        })
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), reserved)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none());
+    fake.agent.abort();
+    fake.connection.abort();
+    let _ = tokio::join!(fake.agent, fake.connection);
+}
+
 /// A limit that ends an agent-initiated turn must end the connection, or the
 /// drain loop never drops the worker and the reaper skips it as still running
 /// (#4373).

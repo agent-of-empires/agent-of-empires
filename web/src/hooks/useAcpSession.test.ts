@@ -19,6 +19,7 @@ import {
   type Route,
 } from "./__tests__/acpHarness";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
+import * as serverQueueSync from "./acpSession/serverQueueSync";
 
 vi.mock("../lib/api", async (importActual) => ({
   ...(await importActual<typeof import("../lib/api")>()),
@@ -861,8 +862,13 @@ describe("server queue", () => {
       else result.current.clearQueue();
     });
     await waitFor(() => expect(mutations).toBe(1), { timeout: 2000 });
+    const handled = vi.spyOn(serverQueueSync, "reconcileQueueSnapshot");
     await act(async () => releaseRead());
-    await flushAsync();
+    await waitFor(() => expect(handled).toHaveBeenCalledWith(sid, expect.anything(), expect.any(Array)), {
+      timeout: 2000,
+    });
+    await act(async () => {});
+    handled.mockRestore();
     let expected: string[] = [];
     if (mutation === "edit") expected = ["edited"];
     expect(result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(expected);
@@ -921,6 +927,78 @@ describe("server queue", () => {
       () => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual([incoming.id]),
       { timeout: 2000 },
     );
+    hook.unmount();
+  });
+
+  it("reconciles an edit that settles after the originating hook unmounts", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let text = "original";
+    let started = false;
+    let reads = 0;
+    calls = installAcpFakes(async ({ url, method }) => {
+      if (!url.includes("/queue")) return undefined;
+      if (method === "PATCH") {
+        started = true;
+        await pending;
+        text = "canonical edit";
+        return new Response(null, { status: 204 });
+      }
+      reads += 1;
+      return json([row("edited", text)]);
+    });
+    const first = await openSession("sess-remount-edit");
+    act(() => first.result.current.editQueuedPrompt("edited", "edited locally"));
+    await waitFor(() => expect(started).toBe(true), { timeout: 2000 });
+    first.unmount();
+    const before = reads;
+    const next = await openSession("sess-remount-edit");
+    await waitFor(() => expect(reads).toBeGreaterThan(before), { timeout: 2000 });
+    expect(next.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["edited locally"]);
+    await act(async () => release());
+    await waitFor(
+      () => expect(next.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["canonical edit"]),
+      { timeout: 2000 },
+    );
+    next.unmount();
+  });
+
+  it("refreshes other queue rows while Send now awaits its response", async () => {
+    let rows = [row("selected", "selected"), row("other", "other")];
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    calls = installAcpFakes(async ({ url, method }) => {
+      if (url.includes("/queue") && method === "GET") return json(rows);
+      if (url.includes("/acp/prompt")) {
+        started = true;
+        await pending;
+        return json({ disposition: "sent" }, 202);
+      }
+      return undefined;
+    });
+    const hook = await openSession("sess-send-refresh");
+    const selected = hook.result.current.state.queuedPrompts[0]!;
+    let send!: Promise<void>;
+    act(() => {
+      send = hook.result.current.sendQueuedNow(selected);
+    });
+    await waitFor(() => expect(started).toBe(true), { timeout: 2000 });
+    expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["other"]);
+    rows = [];
+    act(() => hook.result.current.manualReconnect());
+    await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
+    lastSocket().open();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toEqual([]), { timeout: 2000 });
+    await act(async () => {
+      release();
+      await send;
+    });
+    expect(posts("/acp/prompt")).toHaveLength(1);
     hook.unmount();
   });
 

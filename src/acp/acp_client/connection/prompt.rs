@@ -5,7 +5,6 @@
 use crate::acp::control_protocol::PromptOutcome;
 use crate::acp::state::{Event, RateLimitInfo};
 use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -16,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 use super::command_loop::Session;
 use super::notifications::now_ms;
 use super::CANCEL_ESCALATION_GRACE;
-use crate::acp::acp_client::commands::ClientCmd;
+use crate::acp::acp_client::commands::{reserve_queued_prompt, ClientCmd};
 use crate::acp::acp_client::control::prompt_outcome_to_response;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
@@ -36,7 +35,7 @@ use crate::acp::acp_client::watchdog::{
 
 type AcpResult<T> = Result<T, agent_client_protocol::Error>;
 type PromptFut = Pin<Box<dyn Future<Output = AcpResult<PromptResponse>> + Send>>;
-type SteerFut =
+pub(super) type SteerFut =
     Pin<Box<dyn Future<Output = (Vec<ContentBlock>, AcpResult<serde_json::Value>)> + Send>>;
 
 #[cfg(test)]
@@ -97,10 +96,6 @@ struct Turn {
     orphan_check_period: Duration,
     orphan_check: Pin<Box<Sleep>>,
     cancel_grace: Pin<Box<Sleep>>,
-    /// At most one steer is outstanding so racing steers cannot reorder the
-    /// user's messages; later ones wait in the backlog.
-    steer_fut: Option<SteerFut>,
-    steer_backlog: VecDeque<Vec<ContentBlock>>,
 }
 
 impl Turn {
@@ -188,8 +183,6 @@ impl Session {
             orphan_check_period,
             orphan_check: Box::pin(tokio::time::sleep(orphan_check_period)),
             cancel_grace: Box::pin(tokio::time::sleep(CANCEL_ESCALATION_GRACE)),
-            steer_fut: None,
-            steer_backlog: VecDeque::new(),
         };
         let prompt_started_at_ms = now_ms();
         let mut prompt_fut = self.send_prompt(blocks).await;
@@ -244,9 +237,12 @@ impl Session {
                     self.on_orphan_check(&mut turn).await
                 }
                 (blocks, res) = async {
-                    turn.steer_fut.as_mut().expect("guarded by the arm condition").await
-                }, if turn.steer_fut.is_some() => {
-                    self.on_steer_result(&mut turn, blocks, res).await;
+                    self.steer_fut.as_mut().expect("guarded by the arm condition").get_mut().expect("exclusive steer").await
+                }, if self.steer_fut.is_some() => {
+                    if matches!(res.as_ref().map(SteerOutcome::from_response), Ok(SteerOutcome::Injected)) {
+                        turn.apply(LifecycleSignal::Progress);
+                    }
+                    self.on_steer_result(blocks, res).await;
                     Flow::Continue
                 }
             };
@@ -428,8 +424,8 @@ impl Session {
                     .await
             }
             Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
-            Some(ClientCmd::QueuedPrompt { blocks, accepted }) => {
-                if accepted.is_closed() {
+            Some(ClientCmd::QueuedPrompt { blocks, ready }) => {
+                if ready.is_closed() {
                     return Ok(Flow::Continue);
                 }
                 // Commands outrank lifecycle traffic; include a compaction
@@ -446,11 +442,12 @@ impl Session {
                 let admitted = self.steering_capable
                     && !turn.flags.cancelling
                     && !compacting
-                    && turn.steer_fut.is_none();
-                if admitted {
-                    self.steer_or_backlog(turn, blocks);
+                    && self.steer_fut.is_none();
+                if !admitted {
+                    let _ = ready.send(None);
+                } else if reserve_queued_prompt(ready).await {
+                    self.steer_or_backlog(blocks);
                 }
-                let _ = accepted.send(admitted);
             }
             Some(ClientCmd::ResetSession {
                 text, respond_to, ..
@@ -509,7 +506,7 @@ impl Session {
         let compacting =
             turn.watchdog.off_protocol_work_seen() == Some(OffProtocolWorkKind::Compaction);
         if self.steering_capable && !compacting {
-            self.steer_or_backlog(turn, blocks);
+            self.steer_or_backlog(blocks);
         } else {
             warn!(
                 target: "acp.protocol",
@@ -521,9 +518,9 @@ impl Session {
         Flow::Continue
     }
 
-    fn steer_or_backlog(&self, turn: &mut Turn, blocks: Vec<ContentBlock>) {
-        if turn.steer_fut.is_some() {
-            turn.steer_backlog.push_back(blocks);
+    fn steer_or_backlog(&mut self, blocks: Vec<ContentBlock>) {
+        if self.steer_fut.is_some() {
+            self.steer_backlog.push_back(blocks);
             return;
         }
         info!(
@@ -536,7 +533,9 @@ impl Session {
             self.acp_session_id.clone(),
             blocks.clone(),
         ));
-        turn.steer_fut = Some(Box::pin(async move { (blocks, sent.block_task().await) }));
+        self.steer_fut = Some(std::sync::Mutex::new(Box::pin(async move {
+            (blocks, sent.block_task().await)
+        })));
     }
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
@@ -584,21 +583,16 @@ impl Session {
         Flow::Continue
     }
 
-    async fn on_steer_result(
+    pub(super) async fn on_steer_result(
         &mut self,
-        turn: &mut Turn,
         blocks: Vec<ContentBlock>,
         res: AcpResult<serde_json::Value>,
     ) {
-        turn.steer_fut = None;
+        self.steer_fut = None;
         let label = self.shared.session_label.clone();
         match res.as_ref().map(SteerOutcome::from_response) {
             Ok(SteerOutcome::Injected) => {
                 info!(target: "acp.protocol", session = %label, "_session/steering injected into the running turn");
-                // The running turn still owns its Stopped. Injection can
-                // swallow an update the watchdog awaited, so it counts as
-                // progress.
-                turn.apply(LifecycleSignal::Progress);
             }
             Ok(SteerOutcome::PromptRequired) => {
                 // The turn settled first and the content is untouched: run it
@@ -608,8 +602,10 @@ impl Session {
                     session = %label,
                     "_session/steering raced the turn's end; re-dispatching as a normal prompt"
                 );
-                self.pending_prompts.push_back(blocks);
-                self.pending_prompts.extend(turn.steer_backlog.drain(..));
+                let mut fallback = std::collections::VecDeque::from([blocks]);
+                fallback.append(&mut self.steer_backlog);
+                fallback.append(&mut self.pending_prompts);
+                self.pending_prompts = fallback;
             }
             Ok(outcome @ (SteerOutcome::StartedNewTurn | SteerOutcome::Unknown)) => {
                 // Consumed into a detached turn: resending would duplicate it.
@@ -630,8 +626,8 @@ impl Session {
                 self.reject_busy(first_text_block(&blocks)).await;
             }
         }
-        if let Some(next) = turn.steer_backlog.pop_front() {
-            self.steer_or_backlog(turn, next);
+        if let Some(next) = self.steer_backlog.pop_front() {
+            self.steer_or_backlog(next);
         }
     }
 
