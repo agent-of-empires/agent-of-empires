@@ -234,7 +234,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
 
       {error && <p className="px-3 pb-1 text-xs text-rose-400">{error}</p>}
       {phase === "rolled-back" && (
-        <p className="px-3 pb-1 text-xs text-rose-400">Could not reach the server. Try again.</p>
+        <p className="px-3 pb-1 text-xs text-rose-400">Could not submit response. Try again.</p>
       )}
       {offline && <p className="px-3 pb-1 text-xs text-status-error">{OFFLINE_TITLE}</p>}
 

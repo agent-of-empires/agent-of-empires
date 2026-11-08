@@ -26,6 +26,109 @@ Invariants worth knowing before touching this code:
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
+## Error evidence and failed operations
+
+Runtime evidence and operation failure are independent. A terminal Error banner,
+retry exhaustion or tool failure does not establish process exit, lost history or
+permission to retry. A live pane is evidence about that pane process, not agent
+readiness. A dead pane records exit with an unknown exit code when none was
+observed; neither zero nor nonzero exit establishes a crash cause.
+
+Malformed JSON retains the SDK's existing parse-error response behavior. That
+response alone does not prove closure; real transport closure remains fatal.
+
+| Producer | Evidence and consumer behavior |
+| --- | --- |
+| Terminal detector | The winning current rule owns the diagnostic. Terminal text remains heuristic; pane metadata supplies independent liveness. Ongoing retry and newer activity retain their existing Status rules. |
+| Ordinary local prompt result | Emits `PromptRuntimeError` then one `Stopped("prompt_failed")`. SDK result provenance and reported code do not establish provider origin. The connection, native identity and history remain available for the next explicit request. |
+| Ordinary adopted runner completion | Preserves the same diagnostic and failed terminal, ordered before a new local turn. Aborted completion is not success. |
+| ACP transport or control closure | Remains a connection failure, including idle EOF and closure after a request error. It is not relabelled as a provider response or automatically retryable evidence. |
+| Rate limit / rejected stored session | Retains its existing distinct parking or `SessionContextReset` path. Error ingestion does not authorize a fresh conversation. |
+| State, Status and clients | Failed completion closes the turn and projects Error independently of the running worker. Transcript, usage and pending approvals/elicitations survive. No implicit prompt replay occurs. |
+
+An already-queued explicit follow-up may run after `prompt_failed`; it is not a
+redelivery of the failed request. A failed runtime or context reset still blocks
+that drain. The folded terminal phase owns this distinction, not optional error
+metadata. A late cancel cannot replace an already-published failed terminal.
+Retained permission and elicitation callbacks run in the SDK connection's task
+scope. An ordinary prompt error does not cancel them; a real connection close
+does. Request, resolution and synthetic tool-card events alone do not reopen the
+failed main operation or strand an explicit queued follow-up.
+Admitted requests and notifications share the identity fence for their effects.
+A pending human response therefore does not block native progress, a later
+prompt error, or EOF dispatch. Identity begin and commit/replay take exclusive
+access; candidate requests wait for commit without holding shared access.
+An explicit reset still waits for old callback replies within its existing
+deadline. Expiry leaves the conversation and unanswered cards intact; it does
+not answer or discard them.
+
+The existing terminal claim records the failed outcome of its owned main turn.
+Ambiguous later output, thinking or accounting cannot mint a second main-turn
+terminal for that failed owner. Native content and tool/background bookkeeping
+still flow, and background work keeps its own records. The main failure can
+therefore remain Error while background work continues. An explicit next prompt,
+successful intentional conversation reset, or new runtime ownership releases
+the local outcome fence. This is producer ownership, not permission to retry,
+replace a provider, or create a conversation. Rate-limit parking for owned
+outcomes is unchanged. Error and Idle alone never authorize effects.
+
+Optional `PromptRuntimeError.evidence` carries source, operation, independently
+observed runtime facts, blocking scope, reported code, ingestion time and the
+publishing worker epoch. Unknown origin or recoverability stays unknown.
+Terminal observations use the separate instance lifecycle-generation namespace.
+Publication rejects superseded workers before allocating a sequence, persisting
+or folding. Snapshot metadata is a diagnostic hint, never effect authority.
+The exact original drain may still publish its tagged tail while its current
+lease retains retirement custody, including a late native session ID needed for
+Keep handoff. This does not authorize an absent uncaptured publisher, a replaced
+lease, or publication after the retained join slot is quiesced. Retirement-only
+publication does not mutate an absent worker or replacement configuration.
+Adopted completions claim their captured turn before waiting for event capacity.
+Their enqueue and the resume-idle fallback recheck that turn under the same short
+publication exclusion used by local activation. No synchronous guard crosses an
+await. SDK EOF first fails pending requests; its close callback then lets only a
+locally-owned prompt settle before applying fatal connection policy. The SDK
+request future remains owned by that prompt, so early abandonment still cancels
+it. An adopted turn has no local owner and never enters this close wait.
+An adopted completion uses the existing private SDK completion-marker lane.
+Its self-contained payload holds only the bounded classified diagnostic and
+captured turn, not arbitrary ACP data or another local outcome's waiter.
+Publication waits until initial identity commit has applied its buffered replay.
+Initialize and Resume replies bypass that SDK pipe through the existing control
+handshake channel, so a cached completion before Initialize cannot block the
+handshake. Native notifications cannot mint these daemon completion payloads.
+Control EOF drops a pending local waiter, but does not supersede an adopted
+completion marker already ordered into the SDK pipe. That marker still checks
+explicit local supersession and its captured terminal epoch before publishing
+the diagnostic and failed terminal ahead of fatal transport handling.
+
+Old events with missing or null evidence replay as unknown. The SDK message is
+the primary public diagnostic. Only a direct string `data.details` may add a
+labelled human-diagnostic supplement; other fields, nested values and non-string
+details stay private. Both texts are scrubbed for known secret patterns and the
+combined diagnostic, label and truncation marker are capped at 2048 UTF-8 bytes.
+This allowlist is a human-diagnostic convention, not a guarantee that a string is
+safe: the scrubber does not detect arbitrary secrets. The supplement grants no
+origin, liveness or retry authority. Remaining causes stay in private tracing.
+Instance `last_error` and its typed metadata are runtime-only (`serde(skip)`), not
+a durable audit trail. No registry migration is required.
+Terminal evidence also travels through the existing session projection and
+runtime/HTTP response to TUI and web clients. Those optional response fields do
+not turn runtime observations into stored registry data or retry authority.
+Web request failures use a separate transient interaction error, with an optional
+card kind and nonce. That error temporarily takes banner precedence without
+overwriting the canonical operation diagnostic. A matching successful resolution
+or dismissal clears the transient error and reveals the retained diagnostic,
+including legacy errors without metadata. Reattach and optimistic submission do
+not retire the diagnostic; an accepted next prompt, explicit dismissal, or
+successful intentional clear/switch does. Transient request errors are not
+persisted in the browser cache.
+Approval and elicitation resolution hooks reject failed HTTP and network
+submissions so their cards restore controls for retry of the same nonce.
+HTTP failures retain HTTP diagnostics, not a network-error label. Retrying a
+destructive approval still requires a fresh complete hold.
+
+
 ## Terminal handoff
 
 Terminal handoff persists intent before retiring the original runner. It retains that intent through proven retirement, the exact Terminal commit, required terminal launch and projection cleanup. Cancellation or a committed-write adoption failure leaves recoverable debt, not a successful receipt. Recovery selects the matching intent and original authority; reservation age never permits another driver to steal it.

@@ -8,6 +8,12 @@ impl Instance {
         if preserve_errors {
             self.last_error = prior.last_error.take();
             self.last_error_check = prior.last_error_check;
+            self.last_error_evidence = prior.last_error_evidence.filter(|evidence| {
+                evidence.generation
+                    == Some(ErrorEvidenceGeneration::TerminalLifecycle(
+                        self.lifecycle_generation,
+                    ))
+            });
         }
         self.live_status_baseline = prior.live_status_baseline;
         self.ever_confirmed_present = prior.ever_confirmed_present;
@@ -61,6 +67,7 @@ impl Instance {
             self.last_accessed_at = src.last_accessed_at;
             self.last_error = src.last_error.clone();
             self.last_error_check = src.last_error_check;
+            self.last_error_evidence = src.last_error_evidence;
         }
         self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
@@ -148,6 +155,12 @@ impl Instance {
         self.detection = previous.detection;
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
+        self.last_error_evidence = previous.last_error_evidence.filter(|evidence| {
+            evidence.generation
+                == Some(ErrorEvidenceGeneration::TerminalLifecycle(
+                    self.lifecycle_generation,
+                ))
+        });
         self.last_start_time = previous.last_start_time;
         self.plugin_revival_pending = previous.plugin_revival_pending;
         self.capture_poller.adopt_reload(
@@ -1763,6 +1776,31 @@ mod tests {
         assert!(
             !live.runs(&relaunched.tool, relaunched.active_execution.as_ref()),
             "and the row does not end up on the runtime the relaunch described"
+        );
+    }
+    #[test]
+    fn terminal_error_metadata_is_transient_and_does_not_cross_generations() {
+        let mut observed = Instance::new("error-evidence", "/tmp");
+        observed.lifecycle_generation = 3;
+        observed.last_error = Some("provider request failed".into());
+        let mut evidence = OperationErrorEvidence::new(
+            ErrorEvidenceSource::TerminalText,
+            ErrorOperation::TerminalObservation,
+        );
+        evidence.runtime = RuntimeEvidence::PaneAlive;
+        evidence.generation = Some(ErrorEvidenceGeneration::TerminalLifecycle(3));
+        observed.last_error_evidence = Some(evidence);
+        let serialized = serde_json::to_string(&observed).unwrap();
+        assert!(!serialized.contains("last_error"));
+        let mut reloaded: Instance = serde_json::from_str(&serialized).unwrap();
+        assert!(reloaded.last_error.is_none() && reloaded.last_error_evidence.is_none());
+        reloaded.merge_runtime_from_reload(&observed);
+        assert_eq!(reloaded.last_error_evidence, Some(evidence));
+        reloaded.lifecycle_generation = 4;
+        reloaded.merge_runtime_from_reload(&observed);
+        assert_eq!(
+            reloaded.last_error_evidence, None,
+            "a newer launch cannot inherit stale evidence"
         );
     }
 }

@@ -129,12 +129,26 @@ describe("ApprovalCard decisions", () => {
     expect(onResolve).toHaveBeenCalledWith(decision, undefined);
   });
 
-  it("shows the rolled-back message when onResolve rejects", async () => {
-    mount(makeApproval(), vi.fn().mockRejectedValue(new Error("network")));
+  it.each([
+    ["Allow", "Allow"],
+    ["Always", "AllowAlways"],
+    ["Deny", "Deny"],
+  ])("rolls back a rejected %s and permits retry", async (button, decision) => {
+    const onResolve = mount(
+      makeApproval(),
+      vi.fn().mockRejectedValueOnce(new Error("failed request")).mockResolvedValueOnce(undefined),
+    );
     await act(async () => {
-      fireEvent.click(screen.getByText("Allow"));
+      fireEvent.click(screen.getByRole("button", { name: button }));
     });
-    expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
+    for (const name of ["Allow", "Always", "Deny"]) {
+      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false);
+    }
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: button }));
+    });
+    expect(onResolve).toHaveBeenCalledTimes(2);
+    expect(onResolve).toHaveBeenLastCalledWith(decision, undefined);
   });
 
   describe("destructive", () => {
@@ -264,6 +278,42 @@ describe("ApprovalCard option lists", () => {
       fireEvent.click(screen.getByText("Dismiss"));
       expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
     });
+  });
+});
+
+describe("ApprovalCard destructive rollback retry", () => {
+  it.each([false, true])("requires a fresh full hold after rollback (choice=%s)", async (choice) => {
+    vi.useFakeTimers();
+    const onResolve = vi.fn().mockRejectedValueOnce(new Error("failed request")).mockResolvedValueOnce(undefined);
+    mount(
+      makeApproval({
+        destructive: true,
+        ...(choice
+          ? {
+              choice: true,
+              options: [{ option_id: "retry-option", name: "Run destructive action", kind: "allow_once" }],
+            }
+          : {}),
+      }),
+      onResolve,
+    );
+    const button = () => screen.getByRole("button", { name: choice ? "Run destructive action" : "Hold to allow" });
+    await act(async () => {
+      hold(button(), 800);
+    });
+    expect((button() as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(button());
+    hold(button(), 400);
+    fireEvent.mouseUp(button());
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      hold(button(), 800);
+    });
+    expect(onResolve).toHaveBeenCalledTimes(2);
+    expect(onResolve).toHaveBeenLastCalledWith("Allow", choice ? "retry-option" : undefined);
   });
 });
 
