@@ -3,7 +3,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState } from "../lib/acpTypes";
+import { emptyAcpState, type ReducedState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
@@ -51,6 +51,27 @@ async function openSession(...args: HookArgs) {
   lastSocket().open();
   await flushAsync();
   return hook;
+}
+
+function reduced(overrides: Partial<ReducedState> = {}): ReducedState {
+  return {
+    agent: "claude",
+    model: null,
+    mode: "Default",
+    current_plan: null,
+    in_flight_tool: null,
+    pending_approvals: [],
+    pending_elicitations: [],
+    thinking: null,
+    rate_limit: null,
+    available_commands: [],
+    available_modes: [],
+    current_mode_id: null,
+    turn_active: false,
+    cancelling: false,
+    compacting: false,
+    ...overrides,
+  };
 }
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
@@ -674,6 +695,7 @@ describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
   let workerDown: boolean;
+  let queueReadFails: boolean;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -686,11 +708,15 @@ describe("server queue", () => {
     serverQueue = new Map();
     serverBusy = false;
     workerDown = false;
+    queueReadFails = false;
     vi.mocked(reportAcpInteraction).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
         const item = url.match(/\/queue\/([^/?]+)/)?.[1];
-        if (method === "GET") return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        if (method === "GET") {
+          if (queueReadFails) return new Response("unavailable", { status: 503 });
+          return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        }
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
@@ -733,8 +759,54 @@ describe("server queue", () => {
     const { result } = await openBusy("sess-busy");
     expect(posts("/acp/prompt").map((c) => JSON.parse(c.body!).text)).toEqual(["follow-up"]);
     expect(posts("/queue")).toHaveLength(0);
-    expect(result.current.state.queuedPrompts).toMatchObject([{ text: "follow-up", pending: false }]);
+    expect(result.current.state.queuedPrompts).toMatchObject([{ text: "follow-up" }]);
+    expect(result.current.state.queuedPrompts[0]!.pending ?? false).toBe(false);
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("refreshes a compaction-deferred row after the server drains it without ending the turn", async () => {
+    vi.useFakeTimers();
+    const sid = "sess-compaction-drain";
+    serverQueue.set("deferred", row("deferred", "first explain the archive plan", { resume_after_compaction: true }));
+    const { result, unmount } = await openSession(sid);
+    lastSocket().message({
+      session_id: sid,
+      seq: 1,
+      event: { PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true } },
+    });
+    lastSocket().message({ session_id: sid, seq: 2, event: { UserPromptSent: { text: "original task" } } });
+    lastSocket().message({ kind: "reduced_state", seq: 3, state: reduced({ turn_active: true, compacting: true }) });
+    await flushAsync();
+    expect(result.current.state.compacting).toBe(true);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    const postsBefore = posts("/acp/prompt").length;
+
+    lastSocket().message({ kind: "reduced_state", seq: 4, state: reduced({ turn_active: true, compacting: false }) });
+    await flushAsync();
+    expect(result.current.state.turnActive).toBe(true);
+    expect(result.current.state.compacting).toBe(false);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    queueReadFails = true;
+    const readsBeforeFailure = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(
+      readsBeforeFailure + 1,
+    );
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    queueReadFails = false;
+    serverQueue.delete("deferred");
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toEqual([]);
+    expect(result.current.state.turnActive).toBe(true);
+    expect(posts("/acp/prompt")).toHaveLength(postsBefore);
+    expect(posts("/queue")).toHaveLength(0);
+    const reads = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    await flushAsync();
+    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(reads);
+    unmount();
   });
 
   it("POSTs directly when the session is idle", async () => {

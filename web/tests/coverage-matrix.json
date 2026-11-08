@@ -3243,7 +3243,7 @@
       "id": "acp.compaction-in-progress",
       "kind": "live-playwright",
       "risk": "medium",
-      "notes": "#3219: /compact runs 90-170s with zero frames, so it trips the 30s stall watchdog every time. The spinner must name the phase instead of claiming the model is stalled, must not offer the Force-end-turn hatch (it would abort the compaction), and the composer must park a follow-up rather than steer it into a turn that never answers it. The live spec drives a fake agent that reproduces the real marker-hold-marker shape end to end; the vitest specs cover the reducer, gate and label in isolation.",
+      "notes": "#3219: /compact runs 90-170s with zero frames, so it trips the 30s stall watchdog every time. The spinner must name the phase instead of claiming the model is stalled, must not offer the Force-end-turn hatch (it would abort the compaction), and the composer must park a follow-up rather than steer it into a turn that never answers it. The live spec drives a fake agent that reproduces the real marker-hold-marker shape end to end; the vitest specs cover the reducer, gate and label in isolation. Rust prompt and reconciler regressions cover resuming compaction-deferred messages into a steerable running turn after the gate clears, retaining ordinary queued rows, solo commands and FIFO order.",
       "specs": [
         "tests/live/acp-transcript.spec.ts",
         "src/components/acp/__tests__/WorkingSpinner.test.tsx",

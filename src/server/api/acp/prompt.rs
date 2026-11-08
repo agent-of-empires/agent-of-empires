@@ -289,8 +289,11 @@ pub(crate) async fn submit_prompt(
             &prompt_id,
             req.text.to_string(),
             &attachments,
-            None,
-            origin_plugin.clone(),
+            crate::server::session_service::QueuedPromptOptions {
+                origin_plugin: origin_plugin.clone(),
+                resume_after_compaction: reason == QueueReason::Compacting,
+                ..Default::default()
+            },
         )
         .await
         {

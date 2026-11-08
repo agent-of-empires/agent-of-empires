@@ -9023,6 +9023,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
             created_at: "2026-01-01T00:00:00Z".into(),
             origin_device: None,
             origin_plugin: None,
+            resume_after_compaction: false,
         })
         .collect();
     let snapshot = RuntimeSnapshot {

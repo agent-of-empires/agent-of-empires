@@ -299,9 +299,22 @@ export function useAcpSession(
   // list per session re-sends rows the server never confirmed; a confirmed row missing from the
   // server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
+  const hasQueuedPrompts = state.queuedPrompts.length > 0;
+  const queueCanResume =
+    state.turnActive && !state.compacting && !state.cancelling && !!state.promptCapabilities?.steering;
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const refresh = async () => {
+      const rows = await listServerQueue(sessionId);
+      if (cancelled) return;
+      if (rows) dispatch({ kind: "hydrate_server_queue", rows });
+      let deferred = hasQueuedPrompts;
+      if (rows) deferred = !!rows[0]?.resume_after_compaction;
+      // A steering delivery need not change turnActive. Wait for the daemon's retirement.
+      if (queueCanResume && deferred) retry = setTimeout(() => void refresh(), 1000);
+    };
     void (async () => {
       if (!queueMigratedRef.current.has(sessionId)) {
         queueMigratedRef.current.add(sessionId);
@@ -315,13 +328,13 @@ export function useAcpSession(
           });
         }
       }
-      const rows = await listServerQueue(sessionId);
-      if (!cancelled) dispatch({ kind: "hydrate_server_queue", rows });
+      if (!cancelled) await refresh();
     })();
     return () => {
       cancelled = true;
+      clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef]);
+  }, [sessionId, status, state.turnActive, hasQueuedPrompts, queueCanResume, queuedPromptsRef]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(

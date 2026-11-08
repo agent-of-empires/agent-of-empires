@@ -778,6 +778,9 @@ pub struct QueuedPromptEntry {
     /// Server-assigned monotonic order; the queue drains by ascending `seq`.
     pub seq: u64,
     pub text: String,
+    /// A prompt parked by compaction may steer the resumed turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_after_compaction: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<PromptAttachmentRef>,
     /// RFC3339 enqueue time, for retention and provenance. Server-stamped: the

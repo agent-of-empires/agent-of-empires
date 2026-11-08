@@ -457,7 +457,7 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
     }
 }
 
-/// Delivers idle sessions' server-owned prompt queues with no client tab open.
+/// Delivers ready server-owned prompt queues with no client tab open.
 /// The drain must never hold `instance_lock` while waiting on a resume (#3621).
 async fn drain_queued_prompts(state: &Arc<AppState>) {
     let candidates: Vec<(String, bool)> = {
@@ -466,7 +466,12 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             .iter()
             .filter(|i| {
                 !i.queued_prompts.is_empty()
-                    && i.status == crate::session::Status::Idle
+                    && (i.status == crate::session::Status::Idle
+                        || (i.status == crate::session::Status::Running
+                            && i.queued_prompts
+                                .iter()
+                                .min_by_key(|row| row.seq)
+                                .is_some_and(|row| row.resume_after_compaction)))
                     && is_untriaged_structured(i)
             })
             .map(|i| (i.id.clone(), i.is_idle_dormant()))
@@ -865,6 +870,87 @@ mod tests {
             startup_errors(&state, id),
             attempts + 1,
             "the kept request respawns the session once the teardown ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_queued_prompts_resumes_a_running_session_after_compaction() {
+        use crate::acp::supervisor::BroadcastSink;
+        use crate::acp::Event;
+        use crate::session::{Instance, Status, View};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "sess-compaction-reconcile";
+        let mut inst = Instance::new("compaction", "/tmp/aoe-compaction-reconcile");
+        inst.id = id.into();
+        inst.source_profile = "default".into();
+        inst.view = View::Structured;
+        inst.status = Status::Running;
+        let mut queued = test_fixtures::queued_prompt();
+        queued.resume_after_compaction = true;
+        inst.queued_prompts.push(queued);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let _commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        for (index, event) in [
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+                steering: true,
+            },
+            Event::UserPromptSent {
+                text: "original task".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            },
+            Event::ConversationCompactionStarted,
+            Event::ConversationCompacted,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(sink.publish_persisted(id, index as u64 + 1, event));
+        }
+        state.acp_supervisor.hydrate_seqs([(id.into(), 4)]);
+        drain_queued_prompts(&state).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reconciler must drain a compaction-deferred running session");
+        assert!(state
+            .acp_event_store
+            .replay_from(id, 0)
+            .iter()
+            .any(|(_, event)| {
+                matches!(event, Event::UserPromptSent { text, .. } if text == "queued while busy")
+            }));
+        assert!(
+            state
+                .session_service
+                .fold_control_state(id)
+                .await
+                .turn_active
         );
     }
 

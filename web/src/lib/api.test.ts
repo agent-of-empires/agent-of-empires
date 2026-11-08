@@ -776,7 +776,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ],
   ["verifyToken", () => api.verifyToken(), false],
   ["enqueueServerPrompt", () => api.enqueueServerPrompt("s1", { id: "q", text: "t" }), null],
-  ["listServerQueue", () => api.listServerQueue("s1"), []],
+  ["listServerQueue", () => api.listServerQueue("s1"), null],
   ["renameSession", () => api.renameSession("s1", "x"), { ok: false }],
   ["smartRenameSession", () => api.smartRenameSession("s1"), { ok: false }],
   ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" }), { ok: false }],

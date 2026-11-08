@@ -1810,6 +1810,7 @@ export interface ServerQueuedPrompt {
   id: string;
   seq: number;
   text: string;
+  resume_after_compaction?: boolean;
   attachments?: ServerQueuedAttachmentRef[];
   created_at: string;
   origin_device?: string | null;
@@ -1855,12 +1856,11 @@ export async function enqueueServerPrompt(
   );
 }
 
-/** The session's server queue, ordered by `seq` (GET /queue). Always returns an
- *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
- *  can `.map` without guarding. */
-export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
+/** The queue ordered by `seq`; a failed read leaves its contents unknown. */
+export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[] | null> {
   const rows = await fetchJson<ServerQueuedPrompt[]>(queuePath(sessionId));
-  return Array.isArray(rows) ? rows : [];
+  if (Array.isArray(rows)) return rows;
+  return null;
 }
 
 /** Replace a queued prompt's text (PATCH /queue/{id}). */

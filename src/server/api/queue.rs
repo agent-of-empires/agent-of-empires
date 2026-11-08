@@ -21,7 +21,7 @@ use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
 use crate::server::api::sessions::cityhall_block_non_structured;
-use crate::server::session_service::EditQueuedOutcome;
+use crate::server::session_service::{EditQueuedOutcome, QueuedPromptOptions};
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session: enough for
@@ -105,8 +105,10 @@ pub async fn queue_enqueue(
         &req.id,
         req.text,
         &blobs,
-        req.origin_device,
-        None,
+        QueuedPromptOptions {
+            origin_device: req.origin_device,
+            ..Default::default()
+        },
     )
     .await
     {
@@ -140,8 +142,7 @@ pub(super) async fn buffer_and_enqueue(
     prompt_id: &str,
     text: String,
     blobs: &[crate::acp::event_store::AttachmentBlob],
-    origin_device: Option<String>,
-    origin_plugin: Option<String>,
+    options: QueuedPromptOptions,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
     validate_queued_text(&text)?;
     let queue = state.session_service.queued_prompts_snapshot(id).await;
@@ -204,14 +205,7 @@ pub(super) async fn buffer_and_enqueue(
 
     match state
         .session_service
-        .enqueue_prompt(
-            id,
-            prompt_id.to_string(),
-            text,
-            refs,
-            origin_device,
-            origin_plugin,
-        )
+        .enqueue_prompt_with_options(id, prompt_id.to_string(), text, refs, options)
         .await
     {
         Some(entry) => Ok(entry),
