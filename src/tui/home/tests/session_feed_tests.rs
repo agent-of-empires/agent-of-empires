@@ -3475,7 +3475,7 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
 
 #[test]
 #[serial]
-fn indeterminate_launch_refuses_attachment_without_resubmitting() {
+fn rejected_native_preparation_refuses_attachment_without_resubmitting() {
     use crate::tui::home::panes::{NativePane, PaneIntent};
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
@@ -3488,14 +3488,14 @@ fn indeterminate_launch_refuses_attachment_without_resubmitting() {
     env.view
         .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
         .unwrap();
-    let error = crate::daemon::DaemonClientError::Committed {
-        cursor: crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2,
-        },
-        code: crate::daemon::ApiErrorCode::LaunchIndeterminate,
-    };
-    assert_eq!(respond(Err(error.to_string())).unwrap().0, id);
+    assert_eq!(
+        respond(Err(
+            "Agent readiness is unconfirmed; runtime retained".into()
+        ))
+        .unwrap()
+        .0,
+        id,
+    );
     env.view.apply_session_feed();
     env.view.apply_restart_results();
     assert!(env.view.take_native_attachment().is_none());

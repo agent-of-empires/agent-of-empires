@@ -937,6 +937,7 @@ async fn run_queued_command(
                         .ensure_agent(&id, &StartSessionBody { expected, size }, epoch)
                         .await
                         .map(CommandReply::Terminal),
+
                     SessionRequest::CancelCreation => client
                         .cancel_creation(&id, epoch)
                         .await
@@ -954,6 +955,7 @@ async fn run_queued_command(
                         crate::daemon::ApiErrorCode::PurgeFailed
                             | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                             | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                            | crate::daemon::ApiErrorCode::LaunchIndeterminate
                             | crate::daemon::ApiErrorCode::SandboxMigrationFailed
                     ) {
                         CommandFailure::Rejected(message)
@@ -2758,6 +2760,11 @@ mod tests {
         for (request, code, known) in [
             (
                 SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "launch_indeterminate",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
                 "start_failed",
                 false,
             ),
@@ -4278,6 +4285,11 @@ mod tests {
     async fn agent_ensure_failures_preserve_refusal_quarantine_and_commit_fences() {
         use axum::response::IntoResponse;
         for (ensure_status, committed_revision, code) in [
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "launch_indeterminate",
+            ),
             (
                 axum::http::StatusCode::FORBIDDEN,
                 None,

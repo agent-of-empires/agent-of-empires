@@ -259,7 +259,15 @@ impl Instance {
             }
         };
         if physical == crate::tmux::utils::PaneProbe::Alive {
-            return Ok(EnsureReadyOutcome::AlreadyAlive);
+            return Ok(match self.positive_pane_readiness() {
+                Ok(true) => EnsureReadyOutcome::AlreadyAlive,
+                Ok(false) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                Err(_) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::ObservationFailed,
+                },
+            });
         }
         let generation = self.lifecycle_generation;
         // Sends permit resume regardless of the automatic restart setting.
@@ -294,6 +302,31 @@ impl Instance {
         } else {
             EnsureReadyOutcome::Started
         })
+    }
+
+    pub(super) fn positive_pane_readiness(&self) -> Result<bool> {
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let Some((_, pane)) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+        else {
+            return Ok(false);
+        };
+        if pane.pane_dead {
+            return Ok(false);
+        }
+        if self.expects_shell()
+            || self.has_command_override()
+            || crate::hooks::read_hook_status(&self.id).is_some()
+        {
+            return Ok(true);
+        }
+        let command = pane
+            .pane_current_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
+        Ok(!crate::tmux::utils::is_pane_running_shell_command(
+            command,
+            pane.pane_start_command_is_protected,
+        ))
     }
 
     /// Conditional equality for queued native preparation, not permission to launch.
@@ -722,6 +755,91 @@ mod tests {
         );
         assert_eq!(instance.status, Status::Running);
         assert_eq!(instance.last_start_time, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alive_boot_shell_requires_positive_readiness_before_reuse() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("unsettled-readiness", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "unsettled-readiness".into();
+        instance.status = Status::Starting;
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "/bin/sh",])
+            .status()
+            .unwrap()
+            .success());
+        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sh");
+        assert!(matches!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate { .. }
+        ));
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+        assert!(crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &pane, "exec sleep 60",])
+            .status()
+            .unwrap()
+            .success());
+        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::AlreadyAlive
+        );
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_pane_with_positive_cache_requires_a_real_launch() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let mut instance = Instance::new("missing-positive-cache", root.path().to_str().unwrap());
+        instance.tool = "bash".into();
+        instance.command = "bash".into();
+        instance.source_profile = "missing-positive-cache".into();
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let session = instance.tmux_session().unwrap();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Missing
+        );
+        let outcome = instance.ensure_pane_ready().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Alive,
+            "successful ensure must create a physical pane, not trust cached presence: {outcome:?}"
+        );
+        assert!(matches!(outcome, EnsureReadyOutcome::Started));
     }
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
