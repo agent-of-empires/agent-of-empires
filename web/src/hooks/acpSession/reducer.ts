@@ -108,10 +108,17 @@ function pruneOptimisticRows(state: AcpState): AcpState {
   return { ...state, optimisticRows: kept };
 }
 
+// A server prompt row proves the daemon has the prompt, so its own and merged ids stop being pending
+// even when the live event that would have settled them was missed.
+function settleServerPrompts(state: AcpState, rows: readonly ActivityRow[]): AcpState {
+  if (state.optimisticRows.length === 0 && state.inflightPromptIds.length === 0) return state;
+  return rows
+    .flatMap((r) => (r.kind === "user_prompt" ? [r.id, ...(r.mergedPromptIds ?? [])] : []))
+    .reduce(rollbackOptimisticPrompt, state);
+}
+
 function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
-  const next = pruneOptimisticRows({ ...state, activity });
-  if (next.optimisticRows.length === 0 && next.inflightPromptIds.length === 0) return next;
-  return activity.flatMap((r) => r.mergedPromptIds ?? []).reduce(rollbackOptimisticPrompt, next);
+  return settleServerPrompts(pruneOptimisticRows({ ...state, activity }), activity);
 }
 
 function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => QueuedPrompt): AcpState {
@@ -178,7 +185,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       const next = { ...state, oldestSeq: action.oldestSeq };
       if (action.rows.length === 0) return next;
       next.activity = mergePrependedActivity(action.rows, state.activity);
-      return next;
+      return settleServerPrompts(next, action.rows);
     }
     case "transcript_snapshot":
       if (action.rows.length === 0) return state;

@@ -195,20 +195,29 @@ describe("prompt queue", () => {
     expect(reducer(s, { kind: "clear_queue" }).queuedPrompts).toEqual([]);
   });
 
-  it("a snapshot row carrying merged ids settles their overlay rows when the live frame was missed (#5401)", () => {
-    const local = run(
-      empty(),
-      { kind: "user_prompt", id: "p2", text: "second" },
-      { kind: "user_prompt", id: "direct", text: "unrelated, echo not here yet" },
-    );
-    const next = reducer(local, {
-      kind: "transcript_snapshot",
-      rows: [
-        { id: "p1", kind: "user_prompt", at: "2026-01-01T00:00:00Z", text: "first\n\nsecond", mergedPromptIds: ["p2"] },
-      ],
+  it("server prompt rows settle their own and merged ids when the live frame was missed (#5401)", () => {
+    const row = (id: string, mergedPromptIds?: string[]) => ({
+      id,
+      kind: "user_prompt" as const,
+      at: "2026-01-01T00:00:00Z",
+      text: id,
+      ...(mergedPromptIds ? { mergedPromptIds } : {}),
     });
-    expect(next.inflightPromptIds).toEqual(["direct"]);
-    expect(next.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+    const pending = (...ids: string[]) =>
+      run(empty(), ...ids.map((id): Action => ({ kind: "user_prompt", id, text: id })));
+
+    const idle = reducer(pending("p1", "p2"), { kind: "transcript_snapshot", rows: [row("p1", ["p2"])] });
+    expect(idle.inflightPromptIds).toEqual([]);
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+
+    const busy = reducer(pending("p1", "p2", "direct"), { kind: "transcript_snapshot", rows: [row("p1", ["p2"])] });
+    expect(busy.inflightPromptIds).toEqual(["direct"]);
+    expect(busy.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+
+    const older = reducer(pending("p2"), { kind: "prepend", rows: [row("p1", ["p2"])], oldestSeq: 0 });
+    expect(older.inflightPromptIds).toEqual([]);
+    expect(older.optimisticRows).toEqual([]);
   });
 
   it("hydrate replaces confirmed rows with the server snapshot but keeps in-flight ones", () => {
