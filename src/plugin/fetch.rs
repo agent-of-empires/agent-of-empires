@@ -349,7 +349,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 fn copy_anchored_tree(source: &crate::session::AnchoredDir, dst: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
-    for name in source.read_dir(Path::new(""), usize::MAX)? {
+    for name in source.read_dir_complete(Path::new(""), usize::MAX)? {
         if name == ".git" {
             continue;
         }

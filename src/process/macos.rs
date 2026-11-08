@@ -1,6 +1,5 @@
 //! macOS-specific process utilities.
 
-pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
@@ -9,6 +8,43 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+
+pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
+const CODEX_PREFERENCES_DOMAIN: &str = "com.openai.codex";
+
+/// Whether CFPreferences holds a Codex managed configuration or requirements
+/// value. Forced or not: Codex before openai/codex#46032 read either.
+pub(crate) fn codex_managed_preferences_present() -> bool {
+    codex_managed_preferences_present_with(|key| {
+        preference_value_present(key, CODEX_PREFERENCES_DOMAIN)
+    })
+}
+
+fn codex_managed_preferences_present_with(present: impl Fn(&str) -> bool) -> bool {
+    ["config_toml_base64", "requirements_toml_base64"]
+        .into_iter()
+        .any(present)
+}
+
+fn preference_value_present(key: &str, application: &str) -> bool {
+    use core_foundation::base::{CFType, TCFType as _};
+    use core_foundation::string::CFString;
+    let (key, application) = (CFString::new(key), CFString::new(application));
+    // SAFETY: both arguments are live CFStrings.
+    let value = unsafe {
+        core_foundation_sys::preferences::CFPreferencesCopyAppValue(
+            key.as_concrete_TypeRef(),
+            application.as_concrete_TypeRef(),
+        )
+    };
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the copy rule hands ownership of a non-null result to the wrapper.
+    drop(unsafe { CFType::wrap_under_create_rule(value) });
+    true
+}
 /// Prove only the absence of the Linux scope backend on this kernel.
 /// Native process, worker and tmux custody must still pass their own guards.
 pub(super) fn legacy_scope_inventory_clear(
@@ -1157,6 +1193,24 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_managed_preferences_refuse_either_key() {
+        for (config, requirements, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let present = codex_managed_preferences_present_with(|key| match key {
+                "config_toml_base64" => config,
+                "requirements_toml_base64" => requirements,
+                _ => unreachable!("{key}"),
+            });
+            assert_eq!(present, expected, "{config} {requirements}");
+        }
+        let unused = format!("dev.aoe.test.{}", uuid::Uuid::new_v4());
+        assert!(!preference_value_present("config_toml_base64", &unused));
+    }
 
     #[test]
     fn foreign_runner_probe_requires_an_empty_original_group_and_keeps_native_tokens_strict() {

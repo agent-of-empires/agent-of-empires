@@ -198,6 +198,7 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
             b"pi_transcript_binding_required" => ManagedResumeCause::PiTranscriptBindingRequired,
             b"omp_transcript_binding_required" => ManagedResumeCause::OmpTranscriptBindingRequired,
+            b"codex_conversation_unverified" => ManagedResumeCause::CodexConversationUnverified,
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
@@ -361,6 +362,7 @@ mod tests {
                 "omp_transcript_binding_required",
                 OmpTranscriptBindingRequired,
             ),
+            ("codex_conversation_unverified", CodexConversationUnverified),
             ("execution_context_unattested", ExecutionContextUnattested),
             ("secret-token", ExecutionContextUnattested),
             (
