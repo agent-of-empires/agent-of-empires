@@ -97,9 +97,9 @@ impl ManagedResumeCause {
             Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
             Self::CodexConversationUnverified => concat!(
                 "Managed resume refused: cannot verify this Codex conversation here.\n",
-                "It needs a rollout recording this ID and project, on a host session with no\n",
-                "session.agent_config_dir, Codex profile, or alternate store routing.\n",
-                "A sandboxed session also needs a local OpenAI API key.\n",
+                "It needs a rollout recording this ID and project, in a sandbox's private store\n",
+                "or on a host session with no session.agent_config_dir, Codex profile, or\n",
+                "alternate store routing. A store over AoE's scan limit cannot be verified.\n",
                 "Conversation preserved. Restore that context, then retry.\n",
                 "Or copy agent_session_id from aoe session show <session> --json and\n",
                 "continue inside Codex (AoE drops this association):\n",

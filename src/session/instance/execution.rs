@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::Held;
+use crate::session::capture::CodexRolloutScanLimit;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1627,15 +1628,28 @@ pub(super) const CODEX_ROUTING_ENV_KEYS: [&str; 4] = [
 
 /// A Codex context AoE cannot attest. Credentials, and a macOS preference
 /// domain with no Codex configuration values, do not change where an exact id
-/// resolves, so with a `store` a Default resume may still prove its rollout
-/// there. Routing AoE cannot read, including set preference values, leaves
-/// `store` empty.
+/// resolves, so with a `store` or `sandbox_store` a Default resume may still
+/// prove its rollout there. Routing AoE cannot read, including set preference
+/// values, leaves both empty.
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
 pub(super) struct UnattestedCodexPolicy {
     reason: String,
     /// What an unpinned host launch runs, when a local rollout can prove its store.
     store: Option<UnpinnedCodexLaunch>,
+    /// The host directory behind the resolved Codex home of a container that
+    /// runs Codex directly. A wrapper's launch need not resume what was verified.
+    sandbox_store: Option<PathBuf>,
+}
+
+impl From<CodexRolloutScanLimit> for UnattestedCodexPolicy {
+    fn from(limit: CodexRolloutScanLimit) -> Self {
+        Self {
+            reason: limit.to_string(),
+            store: None,
+            sandbox_store: None,
+        }
+    }
 }
 
 /// Codex store routing: clear the remote routing keys, then pin the home and
@@ -2042,7 +2056,7 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
-                let unverifiable = |reason: String| UnattestedCodexPolicy { reason, store: None };
+                let unverifiable = |reason: String| UnattestedCodexPolicy { reason, store: None, sandbox_store: None };
                 for key in CODEX_ROUTING_ENV_KEYS {
                     anyhow::ensure!(value(key).is_none(), unverifiable(format!("managed Codex does not support {key}")));
                 }
@@ -2082,6 +2096,7 @@ impl Instance {
                 }
                 let unattested_policy = |reason: &str| UnattestedCodexPolicy {
                     reason: reason.to_owned(),
+                    sandbox_store: (inputs.container.is_some() && direct_capture).then(|| location.path.clone()),
                     store: (inputs.container.is_none() && declared.is_none())
                         .then(|| {
                             let sqlite = inputs.canonical_path(&sqlite).ok()?;
@@ -2601,22 +2616,68 @@ impl Instance {
         error: &'a anyhow::Error,
         sid: &str,
         binding: Option<&ConversationBinding>,
-    ) -> Option<&'a UnpinnedCodexLaunch> {
-        let UnattestedCodexPolicy {
+    ) -> Result<Option<&'a UnpinnedCodexLaunch>, CodexRolloutScanLimit> {
+        let Some(UnattestedCodexPolicy {
             store: Some(store), ..
-        } = error.downcast_ref()?
+        }) = error.downcast_ref()
         else {
-            return None;
+            return Ok(None);
         };
-        (binding.is_none_or(|binding| {
+        if !Self::binding_allows_codex_store(binding, sid, &store.home) {
+            return Ok(None);
+        }
+        let verified =
+            crate::session::capture::codex_rollout_records_cwd(&store.home, sid, &store.cwd)?;
+        Ok(verified.then_some(store))
+    }
+
+    /// Whether a Default resume in this sandbox may run unpinned: its resolved
+    /// Codex home is this instance's private store, and every rollout of the
+    /// exact UUID there records the container workdir. Legacy shared stores
+    /// have no capture store, so they refuse.
+    pub(super) fn sandboxed_codex_resume_admitted(
+        &self,
+        error: &anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> Result<bool, CodexRolloutScanLimit> {
+        let Some(UnattestedCodexPolicy {
+            sandbox_store: Some(resolved),
+            ..
+        }) = error.downcast_ref()
+        else {
+            return Ok(false);
+        };
+        let Some(store) = self
+            .sandbox_capture_store_dir()
+            .filter(|store| store.canonicalize().is_ok_and(|store| store == *resolved))
+        else {
+            return Ok(false);
+        };
+        if !Self::binding_allows_codex_store(binding, sid, resolved) {
+            return Ok(false);
+        }
+        crate::session::capture::codex_rollout_records_container_cwd(
+            &store,
+            sid,
+            &self.container_workdir(),
+        )
+    }
+
+    /// Whether a recorded binding, if any, names this conversation in `store`.
+    fn binding_allows_codex_store(
+        binding: Option<&ConversationBinding>,
+        sid: &str,
+        store: &std::path::Path,
+    ) -> bool {
+        binding.is_none_or(|binding| {
             binding.session_id == sid
                 && binding.execution.as_ref().is_none_or(|execution| {
                     execution.agent == "codex"
                         && execution.filesystem == "host"
-                        && execution.stores.first() == Some(&store.home)
+                        && execution.stores.first().map(PathBuf::as_path) == Some(store)
                 })
-        }) && crate::session::capture::codex_rollout_records_cwd(&store.home, sid, &store.cwd))
-        .then_some(store)
+        })
     }
 
     /// Whether two executions describe one context.

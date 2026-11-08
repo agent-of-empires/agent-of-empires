@@ -26,7 +26,12 @@ pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,
     is_default_claude_store, is_explicit_claude_store_route, ClaudeStorePin,
 };
-pub(crate) use codex::{codex_poll_fn_sandboxed_store, codex_rollout_records_cwd};
+#[cfg(test)]
+pub(crate) use codex::with_codex_admission_scan_limit;
+pub(crate) use codex::{
+    codex_poll_fn_sandboxed_store, codex_rollout_records_container_cwd, codex_rollout_records_cwd,
+    CodexRolloutScanLimit,
+};
 pub(crate) use gemini::{
     gemini_poll_fn_sandboxed_store, parse_gemini_session_json, project_hash,
     GEMINI_SCAN_MAX_CANDIDATES, GEMINI_SESSION_MAX_BYTES,
