@@ -898,15 +898,22 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     })?;
     let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    crate::session::test_support::write_stub_adapter(adapters.path(), "own-pi-acp");
     crate::session::config::update_config(|config| {
+        for (name, base) in [("my-pi", "pi"), ("own-pi", "pi")] {
+            config
+                .session
+                .custom_agents
+                .insert(name.into(), base.into());
+            config
+                .session
+                .agent_detect_as
+                .insert(name.into(), base.into());
+        }
         config
             .session
-            .custom_agents
-            .insert("my-pi".into(), "pi".into());
-        config
-            .session
-            .agent_detect_as
-            .insert("my-pi".into(), "pi".into());
+            .agent_acp_cmd
+            .insert("own-pi".into(), "own-pi-acp".into());
     })?;
     let project = tempfile::tempdir()?;
     let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
@@ -922,11 +929,14 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     let structured = |agent: &str| serde_json::json!({ "view": "structured", "agent_name": agent });
     for (tool, extra, expected) in [
         ("pi", terminal.clone(), true),
-        ("claude", terminal, false),
+        ("claude", terminal.clone(), false),
         ("pi", structured("claude"), false),
         ("claude", structured("pi"), true),
         // A custom agent without its own adapter runs the base it inherits.
         ("claude", structured("my-pi"), true),
+        // One with its own adapter runs that in a structured session, and the base CLI in a terminal.
+        ("claude", structured("own-pi"), false),
+        ("own-pi", terminal, true),
     ] {
         let label = format!("{tool} {extra}");
         let mut body = serde_json::json!({
@@ -4112,6 +4122,7 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
@@ -4150,6 +4161,7 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -4193,6 +4205,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let response = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -4240,6 +4253,7 @@ async fn list_sessions_state_filter() {
     let all = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -4252,6 +4266,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Live),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(live_only).await, ["scope-live"]);
@@ -4261,6 +4276,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Trashed),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(ids(trashed_only).await, ["scope-trashed"]);
@@ -4270,6 +4286,7 @@ async fn list_sessions_state_filter() {
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::All),
         }),
+        axum::http::HeaderMap::new(),
     )
     .await;
     assert_eq!(
@@ -5247,10 +5264,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
         )
         .unwrap();
         assert_eq!(failure.code, code);
-        assert_eq!(
-            failure.message.chars().count(),
-            crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS
-        );
+        assert_eq!(failure.message.chars().count(), 1024);
         let registry = crate::server::create_progress::CreateProgressRegistry::default();
         registry.record_failure("long", failure.clone());
         assert_eq!(registry.recent_failure("long").unwrap(), failure);
@@ -8975,6 +8989,7 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -9060,6 +9075,7 @@ async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
     let resp = list_sessions(
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
     )
     .await
     .into_response();
@@ -9748,6 +9764,112 @@ async fn a_dropped_failing_create_logs_the_reference_its_retry_replays() {
     assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
     let reference = failed["reference"].as_str().unwrap();
     assert_eq!(failure_log_lines(&log, reference), 1);
+}
+
+/// The log line behind a reference carries the whole cause chain, not just the
+/// outermost context.
+#[test]
+fn the_failure_log_names_a_context_wrapped_cause() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let error = anyhow::Error::new(GitError::NotAGitRepo).context("Worktree mode needs a repo");
+    log_create_failure(
+        &error,
+        crate::server::create_progress::CreateStage::Preparing,
+        "ref-chain",
+    );
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("Worktree mode needs a repo"), "{logged}");
+    assert!(
+        logged.contains(&GitError::NotAGitRepo.to_string()),
+        "{logged}"
+    );
+}
+
+/// A create that panics after its request is gone is still logged under its reference
+/// and recorded, so a same-key retry replays it instead of running the create again.
+#[tokio::test]
+async fn a_panicking_create_nobody_awaits_is_logged_and_replayed() {
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let failures = Arc::new(crate::server::create_progress::CreateProgressRegistry::default());
+    let progress = Arc::new(crate::server::create_progress::CreateProgress::default());
+    drop(tokio::spawn({
+        let (failures, progress) = (Arc::clone(&failures), Arc::clone(&progress));
+        async move {
+            run_create_task(
+                async { panic!("create blew up") as anyhow::Result<()> },
+                &failures,
+                &progress,
+                Some("dropped-panic"),
+                "ref-panic",
+            )
+            .await
+        }
+    }));
+
+    wait_for("the panic to be recorded", || {
+        failures.recent_failure("dropped-panic").is_some()
+    })
+    .await;
+    let failure = failures.recent_failure("dropped-panic").unwrap();
+    assert_eq!(
+        failure.status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(failure.code, "internal");
+    assert_eq!(failure.reference, "ref-panic");
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(logged.matches("reference=ref-panic").count(), 1, "{logged}");
+    assert!(logged.contains("create blew up"), "{logged}");
+}
+
+/// A create that panics after its request was dropped is replayed to a same-key retry
+/// with the reference it was logged under, and does not run again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_panicking_create_is_replayed_to_its_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let body = serde_json::json!({
+        "title": "dropped-panic", "path": "", "tool": "claude", "scratch": true,
+        "view": "structured", "profile": "test", "idempotency_key": "drop-panic",
+    });
+
+    let release = create::panic_hook::arm("drop-panic");
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the create to be registered", || {
+        state.create_progress.snapshot("drop-panic", None).is_some()
+    })
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.notify_one();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "{failed}"
+    );
+    assert_eq!(failed["error"], "internal", "{failed}");
+    let reference = failed["reference"].as_str().unwrap();
+    let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logged.matches(&format!("reference={reference}")).count(),
+        1,
+        "{logged}"
+    );
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 /// Repo approval covers only the repo's own commands, so a failing global or profile

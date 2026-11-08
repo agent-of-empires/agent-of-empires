@@ -379,7 +379,6 @@ impl Drop for RetainedView {
         }
     }
 }
-
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,

@@ -110,23 +110,17 @@ jobs:
         env:
           AOE_REQUIRE_LOCAL_NETWORK_TESTS: '1'
         run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
-      # The `web`-gated test code runs nowhere else: core-rest builds at
-      # default features and the step above names only the e2e target. Both
-      # halves need naming. The integration blocks are the dashboard-route half
-      # of daemon_core_web_optional and the aoe.web builtin assertion in
-      # plugin_install; the lib-level ones are src/server/assets.rs (the whole
-      # module is `web`-gated) and the QR seam in src/tui/dialogs/serve.rs,
-      # which would otherwise be neither compiled nor run on a PR. Keep
-      # `e2e-tests` on so the feature set matches the step above and cargo
-      # reuses its artifacts instead of rebuilding the crate; filter the lib run
-      # so it does not re-run the whole suite core-rest already covers.
+      # Run Web-only regressions omitted by core-rest. Keep e2e-tests to reuse
+      # this leg's artifacts, and filter library tests instead of rerunning
+      # the full suite.
       - name: Cargo test (web-gated test blocks)
         if: matrix.leg == 'web-e2e'
         run: |
           cargo test --features web,e2e-tests \
             --test integration -- daemon_core_web_optional plugin_install
           cargo test --features web,e2e-tests --lib -- \
-            server::assets:: tui::dialogs::serve::qr_seam
+            server::assets:: tui::dialogs::serve::qr_seam \
+            session::config::tests::web_plugin_changes_do_not_cross_lifecycle_transactions
       # macOS reaches its per-user temp root through a symlink, so a test that
       # compares `TempDir::path()` against a path that has been through
       # `canonicalize()` or a reported cwd passes on Linux and fails there.

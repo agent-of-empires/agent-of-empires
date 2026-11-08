@@ -3713,10 +3713,9 @@ mod tests {
         fn migrate_sandbox_store(
             &self,
             id: &str,
-            reporter: Option<crate::migrations::progress::Reporter>,
             runtime: &crate::containers::ContainerRuntime,
         ) -> Result<()> {
-            self.storage.migrate_sandbox_store(id, reporter, runtime)
+            self.storage.migrate_sandbox_store(id, runtime)
         }
     }
 

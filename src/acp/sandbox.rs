@@ -86,6 +86,7 @@ pub(crate) async fn ensure_container_for_session(
             .ensure_container_with_hook_in(
                 &*store,
                 &tokio_util::sync::CancellationToken::new(),
+                None,
                 |instance, config| exclusion.mint_before_start(instance, config, &store),
             )
             .context("ensuring sandbox container")?;
@@ -289,6 +290,7 @@ mod tests {
             let (container, created) = instance.ensure_container_with_hook_in(
                 &*store,
                 &tokio_util::sync::CancellationToken::new(),
+                None,
                 Instance::mint_before_start_env,
             )?;
             Ok((instance, container, created))
