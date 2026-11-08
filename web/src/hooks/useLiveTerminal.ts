@@ -16,6 +16,8 @@ const encodeControl = (message: LiveClientMessage) => JSON.stringify(message);
 // Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs.
 const CLOSE_CODE_PTY_DEAD = 4001;
 const MAX_PENDING_INPUT_BYTES = 64 * 1024;
+// A close handshake can stall for a minute on a dead network, so a redial stops waiting for it.
+const REDIAL_CLOSE_TIMEOUT_MS = 2000;
 
 export interface LiveStats {
   frames: number;
@@ -70,12 +72,17 @@ export function useLiveTerminal(
   readOnly: boolean,
   wsPath: string = "live-ws",
   onClipboard?: (text: string) => void,
+  /** The server confirmed this socket's grid transport, so it holds the pane pipe. */
+  onGridTransport?: () => void,
 ) {
   const handleClipboard = useEffectEvent((text: string) => onClipboard?.(text));
+  const handleGridTransport = useEffectEvent(() => onGridTransport?.());
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryCountRef = useRef(0);
+  // The live socket a user redial closed; its onclose reconnects instead of backing off.
+  const redialRef = useRef<WebSocket | null>(null);
   const connectRef = useRef<(() => void) | null>(null);
   const desiredRef = useRef<{
     resize: { cols: number; rows: number } | null;
@@ -142,6 +149,7 @@ export function useLiveTerminal(
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
+    redialRef.current = null;
     setState(() => INITIAL_STATE);
 
     let disposed = false;
@@ -246,6 +254,7 @@ export function useLiveTerminal(
               ? prev
               : { ...prev, transport, transportReason },
           );
+          if (msg.grid) handleGridTransport();
           return;
         }
         if (msg.type === "clipboard") {
@@ -332,9 +341,15 @@ export function useLiveTerminal(
         pendingInputRef.current = null;
         ownerKnownRef.current = false;
         const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
+        const redial = redialRef.current === ws;
+        redialRef.current = null;
+        if (redial && retryTimerRef.current) clearTimeout(retryTimerRef.current);
         setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
         if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
+        } else if (redial) {
+          connect();
+          return;
         }
         if (retryCountRef.current < MAX_RETRIES) {
           retryCountRef.current += 1;
@@ -371,6 +386,8 @@ export function useLiveTerminal(
     connect();
 
     const tryAutoReconnect = () => {
+      // A pending redial reconnects from its socket's onclose, after the server releases the old claim.
+      if (redialRef.current) return;
       const readyState = wsRef.current?.readyState;
       if (readyState === WebSocket.OPEN || readyState === WebSocket.CONNECTING) return;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -499,9 +516,24 @@ export function useLiveTerminal(
   const manualReconnect = useCallback(() => {
     pendingInputRef.current = null;
     ownerKnownRef.current = false;
+    const ws = wsRef.current;
+    if (ws && redialRef.current === ws) return;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
+    // Wait for onclose so the server releases this socket's size claim before the redial asks for it.
+    if (ws?.readyState === WebSocket.OPEN) {
+      redialRef.current = ws;
+      setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
+      retryTimerRef.current = setTimeout(() => {
+        if (redialRef.current !== ws) return;
+        redialRef.current = null;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
+        connectRef.current?.();
+      }, REDIAL_CLOSE_TIMEOUT_MS);
+      ws.close();
+      return;
+    }
     setState((prev) => ({
       ...prev,
       connected: false,
@@ -511,7 +543,6 @@ export function useLiveTerminal(
       retryCount: 0,
       retryCountdown: 0,
     }));
-    const ws = wsRef.current;
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       connectRef.current?.();
     } else {

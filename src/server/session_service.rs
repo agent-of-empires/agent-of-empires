@@ -81,10 +81,15 @@ enum IdempotentMatch {
     None,
 }
 
+/// Restores an instance when its mutation did not reach disk.
+type Undo = Box<dyn FnOnce(&mut crate::session::Instance) + Send>;
+
 /// The `Instance` fields `mutate_instance_persisted` copies from memory to
 /// disk. Deliberately explicit: the disk write no longer re-runs the caller's
 /// closure, so a field that is not listed here is simply not persisted.
 struct MirroredFields {
+    /// The mutation cleared `pending_initial_turn`, so the disk row must drop it in the same write.
+    pending_turn_cleared: bool,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -107,6 +112,62 @@ struct MirroredFields {
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Append `text` to the instance's queue, or update the row already holding `prompt_id`.
+fn enqueue_row(
+    inst: &mut crate::session::Instance,
+    prompt_id: String,
+    text: String,
+    attachments: Vec<crate::daemon::PromptAttachmentRef>,
+    origin_device: Option<String>,
+    origin_plugin: Option<String>,
+) -> crate::daemon::QueuedPromptEntry {
+    inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
+    if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+        // A repost of unchanged content (a client restoring its cache) keeps the
+        // sender; other content is the poster's.
+        if existing.text != text || existing.attachments != attachments {
+            existing.origin_plugin = origin_plugin.clone();
+        }
+        existing.text = text.clone();
+        existing.attachments = attachments.clone();
+        tracing::info!(
+            target: "acp.queue",
+            session = %inst.id,
+            prompt_id = %existing.id,
+            seq = existing.seq,
+            origin_plugin = ?existing.origin_plugin,
+            repost = true,
+            "prompt enqueued"
+        );
+        return existing.clone();
+    }
+    let seq = inst.queued_prompt_next_seq;
+    inst.queued_prompt_next_seq = seq.saturating_add(1);
+    let entry = crate::daemon::QueuedPromptEntry {
+        id: prompt_id.clone(),
+        seq,
+        text: text.clone(),
+        attachments: attachments.clone(),
+        // The server's clock, drawn in the same critical section that
+        // assigns `seq`, so row order and stamp order agree and the
+        // resume admission can order rows against the park (#4092).
+        created_at: chrono::Utc::now().to_rfc3339(),
+        origin_device: origin_device.clone(),
+        origin_plugin: origin_plugin.clone(),
+    };
+    tracing::info!(
+        target: "acp.queue",
+        session = %inst.id,
+        prompt_id = %entry.id,
+        seq,
+        origin_plugin = ?entry.origin_plugin,
+        repost = false,
+        "prompt enqueued"
+    );
+    inst.queued_prompts.push(entry.clone());
+    entry
+}
+
 /// The blocking writer owns completion and ordering even if its caller is cancelled.
 struct PersistedMutation {
     epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -119,6 +180,10 @@ impl Drop for PersistedMutation {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+/// A queue mutation could not be written to disk and was undone.
+#[derive(Debug)]
+pub(crate) struct QueuePersistFailed;
 
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,8 +369,17 @@ pub(crate) enum SendTurnError {
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
     RevivalRefused,
+    /// Post-publish: the forward found the resumed worker gone.
+    WorkerLostAfterPublish,
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
+}
+
+impl SendTurnError {
+    /// Whether the prompt reached the transcript before this error.
+    pub(crate) fn published(&self) -> bool {
+        matches!(self, Self::WorkerLostAfterPublish | Self::Send(_))
+    }
 }
 
 /// Outcome of [`SessionService::touch_and_wake_on_prompt`].
@@ -355,7 +429,7 @@ impl std::fmt::Display for SendTurnError {
             Self::NotOwner => write!(f, "session was not created by the calling plugin"),
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
-            Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
@@ -1021,7 +1095,7 @@ impl SessionService {
             Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
-                Err(SendTurnError::WorkerNotReady)
+                Err(SendTurnError::WorkerLostAfterPublish)
             }
             Err(e) => Err(SendTurnError::Send(e)),
         }
@@ -1326,10 +1400,30 @@ impl SessionService {
         T: Send + 'static,
         F: FnOnce(&mut crate::session::Instance) -> T,
     {
+        self.mutate_instance_persisted_with(id, false, |inst| (mutate(inst), None))
+            .await
+            .map(|(result, _persisted)| result)
+    }
+
+    /// [`Self::mutate_instance_persisted`] for a mutation that can be undone. Also reports
+    /// whether the write reached disk. When it did not, the `Undo` the closure returned
+    /// runs before the persist lock is released, so memory matches the durable state.
+    /// `clear_pending_turn_on_disk` drops `pending_initial_turn` from the disk row in the
+    /// same write, regardless of what memory held.
+    async fn mutate_instance_persisted_with<T, F>(
+        self: &Arc<Self>,
+        id: &str,
+        clear_pending_turn_on_disk: bool,
+        mutate: F,
+    ) -> Option<(T, bool)>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut crate::session::Instance) -> (T, Option<Undo>),
+    {
         let persist_lock = self.persist_lock(id).await;
         let ordered = persist_lock.lock_owned().await;
         let reload = Arc::clone(&self.reload_gate).read_owned().await;
-        let (profile, result, mirrored, transaction) = {
+        let (profile, result, undo, mirrored, transaction) = {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
             let transaction = PersistedMutation {
@@ -1337,12 +1431,14 @@ impl SessionService {
                 _ordered: ordered,
                 _reload: reload,
             };
-            let r = mutate(inst);
+            let (r, undo) = mutate(inst);
             self.invalidate_disk_snapshots();
             (
                 inst.source_profile.clone(),
                 r,
+                undo,
                 MirroredFields {
+                    pending_turn_cleared: clear_pending_turn_on_disk,
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
                     idle_dormant_since: inst.idle_dormant_since,
@@ -1351,13 +1447,19 @@ impl SessionService {
                 transaction,
             )
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    let _transaction = transaction;
-                    storage.update(|instances, _groups| {
+        // Write and undo run in one blocking task that owns the persist lock, so a caller
+        // dropped mid-write still gets its undo before the lock is released.
+        let service = Arc::clone(self);
+        let id_persist = id.to_string();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let _transaction = transaction;
+            let written = match crate::session::Storage::new(&profile, service.file_watch.clone()) {
+                Ok(storage) => storage
+                    .update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            if mirrored.pending_turn_cleared {
+                                inst.pending_initial_turn = None;
+                            }
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
                             inst.idle_dormant_since = mirrored.idle_dormant_since;
@@ -1367,17 +1469,31 @@ impl SessionService {
                         }
                         Ok(())
                     })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(target: "acp.queue", session = %id, "queue mutation was not persisted; a later reload may discard it");
+                    .is_ok(),
+                Err(e) => {
+                    tracing::warn!(target: "acp.queue", session = %id_persist, "failed to open storage for queue mutation: {e}");
+                    false
+                }
+            };
+            if !written {
+                tracing::warn!(target: "acp.queue", session = %id_persist, "queue mutation was not persisted; a later reload may discard it");
+                if let Some(undo) = undo {
+                    if let Some(inst) = service
+                        .instances
+                        .blocking_write()
+                        .iter_mut()
+                        .find(|i| i.id == id_persist)
+                    {
+                        undo(inst);
+                    }
+                    service.invalidate_disk_snapshots();
                 }
             }
-            Err(e) => {
-                tracing::warn!(target: "acp.queue", session = %id, "failed to open storage for queue mutation: {e}");
-            }
-        }
-        Some(result)
+            written
+        })
+        .await
+        .unwrap_or(false);
+        Some((result, persisted))
     }
 
     /// Append a prompt to the session's server-owned queue and return the
@@ -1415,53 +1531,76 @@ impl SessionService {
         origin_plugin: Option<String>,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
-            inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
-            if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
-                // A repost of unchanged content (a client restoring its cache) keeps the
-                // sender; other content is the poster's.
-                if existing.text != text || existing.attachments != attachments {
-                    existing.origin_plugin = origin_plugin.clone();
-                }
-                existing.text = text.clone();
-                existing.attachments = attachments.clone();
-                tracing::info!(
-                    target: "acp.queue",
-                    session = %inst.id,
-                    prompt_id = %existing.id,
-                    seq = existing.seq,
-                    origin_plugin = ?existing.origin_plugin,
-                    repost = true,
-                    "prompt enqueued"
-                );
-                return existing.clone();
-            }
-            let seq = inst.queued_prompt_next_seq;
-            inst.queued_prompt_next_seq = seq.saturating_add(1);
-            let entry = crate::daemon::QueuedPromptEntry {
-                id: prompt_id.clone(),
-                seq,
-                text: text.clone(),
-                attachments: attachments.clone(),
-                // The server's clock, drawn in the same critical section that
-                // assigns `seq`, so row order and stamp order agree and the
-                // resume admission can order rows against the park (#4092).
-                created_at: chrono::Utc::now().to_rfc3339(),
-                origin_device: origin_device.clone(),
-                origin_plugin: origin_plugin.clone(),
-            };
-            tracing::info!(
-                target: "acp.queue",
-                session = %inst.id,
-                prompt_id = %entry.id,
-                seq,
-                origin_plugin = ?entry.origin_plugin,
-                repost = false,
-                "prompt enqueued"
-            );
-            inst.queued_prompts.push(entry.clone());
-            entry
+            enqueue_row(
+                inst,
+                prompt_id,
+                text,
+                attachments,
+                origin_device,
+                origin_plugin,
+            )
         })
         .await
+    }
+
+    /// [`Self::enqueue_prompt`] for a fresh prompt that supersedes a queued rate-limit
+    /// continuation (#3028). The row and the continuation's removal land in one durable
+    /// write, so a restart cannot recover both. When the write fails the queue and the
+    /// continuation are restored and the error is reported, so an accepted prompt is never
+    /// left only in memory. `Ok(None)` means the session is gone.
+    pub(crate) async fn enqueue_prompt_superseding_continuation(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<crate::daemon::PromptAttachmentRef>,
+        origin_device: Option<String>,
+        origin_plugin: Option<String>,
+    ) -> Result<Option<crate::daemon::QueuedPromptEntry>, QueuePersistFailed> {
+        let outcome = self
+            .mutate_instance_persisted_with(id, true, move |inst| {
+                let continuation = inst.pending_initial_turn.take();
+                let previous_row = inst
+                    .queued_prompts
+                    .iter()
+                    .find(|q| q.id == prompt_id)
+                    .cloned();
+                let previous_seq = inst.queued_prompt_next_seq;
+                let entry = enqueue_row(
+                    inst,
+                    prompt_id,
+                    text,
+                    attachments,
+                    origin_device,
+                    origin_plugin,
+                );
+                let row_id = entry.id.clone();
+                let undo: Undo = Box::new(move |inst| {
+                    match previous_row {
+                        Some(row) => {
+                            if let Some(slot) =
+                                inst.queued_prompts.iter_mut().find(|q| q.id == row_id)
+                            {
+                                *slot = row;
+                            }
+                        }
+                        None => {
+                            inst.queued_prompts.retain(|q| q.id != row_id);
+                            inst.queued_prompt_next_seq = previous_seq;
+                        }
+                    }
+                    if inst.pending_initial_turn.is_none() {
+                        inst.pending_initial_turn = continuation;
+                    }
+                });
+                (entry, Some(undo))
+            })
+            .await;
+        match outcome {
+            None => Ok(None),
+            Some((entry, true)) => Ok(Some(entry)),
+            Some((_, false)) => Err(QueuePersistFailed),
+        }
     }
 
     /// Replace a queued prompt's text in place.
@@ -4207,6 +4346,235 @@ mod tests {
         );
         assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
         assert!(status_rx.try_recv().is_err());
+    }
+
+    /// #5253: the row and the continuation's removal reach disk in one write, so a restart
+    /// cannot recover both. A plain enqueue leaves the continuation alone.
+    #[tokio::test]
+    async fn superseding_enqueue_drops_the_continuation_in_the_same_write() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-supersede".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        let on_disk = || {
+            crate::server::test_support::load_instances_from_disk_for_test(&profile)
+                .into_iter()
+                .find(|i| i.id == "sess-supersede")
+                .expect("row on disk")
+        };
+
+        service
+            .enqueue_prompt(
+                "sess-supersede",
+                "a".into(),
+                "plain".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("session exists");
+        assert!(on_disk().pending_initial_turn.is_some());
+
+        service
+            .enqueue_prompt_superseding_continuation(
+                "sess-supersede",
+                "b".into(),
+                "fresh".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("session exists");
+        let row = on_disk();
+        assert!(row.pending_initial_turn.is_none());
+        assert_eq!(row.queued_prompts.len(), 2);
+    }
+
+    /// The disk clear follows the caller's intent, not what memory held: a continuation that
+    /// only the disk row still has (an earlier clear failed) is dropped too.
+    #[tokio::test]
+    async fn superseding_enqueue_clears_a_continuation_only_the_disk_holds() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-disk-only".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        state.instances.write().await[0].pending_initial_turn = None;
+
+        state
+            .session_service
+            .enqueue_prompt_superseding_continuation(
+                "sess-disk-only",
+                "a".into(),
+                "fresh".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("persisted")
+            .expect("session exists");
+        let row = crate::server::test_support::load_instances_from_disk_for_test(&profile)
+            .into_iter()
+            .find(|i| i.id == "sess-disk-only")
+            .expect("row on disk");
+        assert!(row.pending_initial_turn.is_none());
+    }
+
+    /// A write that fails is reported and undone: the prompt is not left queued only in
+    /// memory, and the continuation is still there to be delivered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseding_enqueue_that_cannot_persist_is_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let seeded = crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        };
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-undo".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(seeded.clone());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        let dir = crate::session::Storage::new_unwatched(&profile)
+            .expect("storage")
+            .sessions_path()
+            .parent()
+            .expect("sessions dir")
+            .to_path_buf();
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = state
+            .session_service
+            .enqueue_prompt_superseding_continuation(
+                "sess-undo",
+                "a".into(),
+                "fresh".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await;
+
+        std::fs::set_permissions(&dir, original).unwrap();
+        assert!(result.is_err(), "the failed write must be reported");
+        let inst = state.instances.read().await[0].clone();
+        assert!(inst.queued_prompts.is_empty());
+        assert_eq!(inst.pending_initial_turn, Some(seeded));
+    }
+
+    /// The undo belongs to the blocking writer, so a caller dropped while the write is
+    /// parked behind the storage lock still gets its memory restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_superseding_enqueue_is_still_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let seeded = crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        };
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-cancel".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(seeded.clone());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        let dir = crate::session::Storage::new_unwatched(&profile)
+            .expect("storage")
+            .sessions_path()
+            .parent()
+            .expect("sessions dir")
+            .to_path_buf();
+        // Hold the storage flock so the writer is parked after the in-memory mutation, then make
+        // its write fail once released.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(crate::session::STORAGE_LOCK_FILENAME))
+            .expect("storage lock file");
+        fs2::FileExt::lock_exclusive(&lock).expect("hold the storage lock");
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let service = state.session_service.clone();
+        let mut enqueue = Box::pin(service.enqueue_prompt_superseding_continuation(
+            "sess-cancel",
+            "a".into(),
+            "fresh".into(),
+            vec![],
+            None,
+            None,
+        ));
+        let polled = futures_util::poll!(enqueue.as_mut());
+        let parked = {
+            let inst = state.instances.read().await;
+            inst[0].queued_prompts.len() == 1 && inst[0].pending_initial_turn.is_none()
+        };
+        drop(enqueue);
+        fs2::FileExt::unlock(&lock).expect("release the storage lock");
+
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let inst = state.instances.read().await;
+                    if inst[0].queued_prompts.is_empty() && inst[0].pending_initial_turn.is_some() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        std::fs::set_permissions(&dir, original).unwrap();
+        assert!(
+            polled.is_pending() && parked,
+            "the writer must be parked behind the storage lock, mutation applied, when the caller is dropped"
+        );
+        assert!(restored.is_ok(), "the undo must run without the caller");
+        assert_eq!(
+            state.instances.read().await[0].pending_initial_turn,
+            Some(seeded)
+        );
     }
 
     #[tokio::test]
