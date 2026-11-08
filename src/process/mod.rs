@@ -356,9 +356,6 @@ pub fn wait_with_timeout(
     wait_with_timeout_inner(child, timeout, false, false, None)
 }
 
-/// When `kill_process_group` is true, the caller MUST have configured `child`
-/// as a process-group leader, so its process-group id equals `child.id()`.
-/// Otherwise the kill path could signal the parent's process group.
 fn wait_with_timeout_inner(
     child: &mut Child,
     timeout: Duration,
@@ -366,11 +363,32 @@ fn wait_with_timeout_inner(
     cleanup_on_exit: bool,
     cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let mut deadline = Instant::now() + timeout;
+    wait_with_timeout_inner_with_clock(
+        child,
+        timeout,
+        kill_process_group,
+        cleanup_on_exit,
+        cancel,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+/// Group signals require `child` to be its process-group leader.
+/// Injected time keeps deadline tests independent of child scheduling.
+fn wait_with_timeout_inner_with_clock(
+    child: &mut Child,
+    timeout: Duration,
+    kill_process_group: bool,
+    cleanup_on_exit: bool,
+    cancel: Option<&CancellationToken>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> std::io::Result<Option<ExitStatus>> {
+    let mut deadline = now() + timeout;
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
     let mut terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
     let mut termination_requested = false;
-    // Most children exit within a few ms; start fine and back off to the cap.
     let mut poll = Duration::from_millis(1);
     loop {
         if !termination_requested {
@@ -383,7 +401,7 @@ fn wait_with_timeout_inner(
                 return Ok(Some(status));
             }
         }
-        let now = Instant::now();
+        let now = now();
         if !termination_requested && cancel.is_some_and(CancellationToken::is_cancelled) {
             deadline = deadline.min(now + termination_grace);
             terminate_at = now;
@@ -393,9 +411,7 @@ fn wait_with_timeout_inner(
             termination_requested = true;
             continue;
         }
-        // A cancellation has already shortened the deadline above, so reaching
-        // it here is the escalation step; testing the token again would skip
-        // the SIGTERM the group is entitled to and its traps.
+        // Cancellation may shorten the deadline but must not skip group SIGTERM.
         if now >= deadline {
             if kill_process_group {
                 platform::kill_process_group(child);
@@ -404,7 +420,12 @@ fn wait_with_timeout_inner(
             let _ = child.wait();
             return Ok(None);
         }
-        std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
+        let wake_at = if kill_process_group && !termination_requested {
+            terminate_at.min(deadline)
+        } else {
+            deadline
+        };
+        sleep(poll.min(wake_at.saturating_duration_since(now)));
         poll = (poll * 2).min(WAIT_POLL_INTERVAL);
     }
 }
@@ -431,9 +452,10 @@ pub fn run_until_cancelled(
 }
 
 /// [`run_with_timeout`] variant that makes the child a process-group leader
-/// and kills the whole group on timeout on Linux and macOS. Other platforms
-/// still bound output capture independently of descendant-owned handles and
-/// fall back to killing and reaping the direct child.
+/// and kills the whole group on timeout on Linux and macOS. SIGTERM grace is
+/// best-effort within the timeout, not an additional budget. Other platforms
+/// bound output capture independently of descendant-owned handles and fall
+/// back to killing and reaping the direct child.
 pub fn run_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
@@ -2346,90 +2368,158 @@ mod tests {
         }
     }
 
+    /// Freeze logical time for real TERM acknowledgements, so OS scheduling cannot
+    /// consume the grace budget whose escalation ordering is under test.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn timeout_and_cancellation_terminate_process_group_descendants() {
-        for cancel in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let pid_path = tmp.path().join("descendant.pid");
-            let term_path = tmp.path().join("terminated");
-            let mut cmd = Command::new("sh");
-            cmd.args([
-                "-c",
-                r#"trap 'printf term > "$2"' TERM; sh -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec sleep 600' child "$1" & wait; wait"#,
-                "hook",
-            ])
-            .arg(&pid_path)
-            .arg(&term_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+    fn process_group_timeout_and_cancellation_preserve_deadlines() {
+        use std::cell::Cell;
+        use std::io::BufRead;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        struct ProcessGroupFixture {
+            child: Child,
+            group_armed: bool,
+            descendant: Option<CapturedProcess>,
+        }
+
+        impl Drop for ProcessGroupFixture {
+            /// Reaping ends the leader's PID reservation. Subsequent cleanup uses
+            /// the captured descendant identity, not the former process-group ID.
+            fn drop(&mut self) {
+                if self.group_armed {
+                    platform::kill_process_group(&self.child);
+                }
+                if let Some(descendant) = &self.descendant {
+                    let _ = descendant.signal(libc::SIGKILL);
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        let timeout = Duration::from_secs(2);
+        let grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
+        let term_at = timeout - grace;
+        let tick = Duration::from_nanos(1);
+        for (name, first_poll, cancel_before_poll, cancel_after_term, expect_ack) in [
+            ("timeout", term_at - tick, false, false, true),
+            ("early cancellation", grace, true, false, true),
+            (
+                "last instant cancellation",
+                timeout - tick,
+                true,
+                false,
+                false,
+            ),
+            ("cancellation after TERM", term_at - tick, false, true, true),
+            ("poll after deadline", timeout + tick, false, false, false),
+        ] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    r#"trap 'printf "term\n"' TERM; sh -c 'trap "" TERM; printf "%s\n" "$$"; IFS= read -r release <&1' & wait; wait"#,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null());
+            let mut group = ProcessGroupFixture {
+                child: spawn_process_group(&mut command).unwrap(),
+                group_armed: true,
+                descendant: None,
+            };
+            let mut events = std::io::BufReader::new(reader);
+            let mut ready = String::new();
+            events.read_line(&mut ready).unwrap();
+            let pid = ready.trim().parse().unwrap();
+            let birth = process_birth_identity(pid).unwrap().unwrap();
+            group.descendant = CapturedProcess::capture(pid, &birth).unwrap();
+            assert!(
+                group.descendant.is_some(),
+                "{name}: descendant must be owned"
+            );
 
             let token = CancellationToken::new();
-            // Cancel once the descendant's pid is on disk, so the wait has
-            // something to tear down. The wait runs on its own thread because
-            // the child is only spawned once the call below starts, and it is
-            // bounded so a shell that never reports its pid fails the test
-            // instead of hanging it.
-            let canceler = cancel.then(|| {
-                let token = token.clone();
-                let pid_path = pid_path.clone();
-                std::thread::spawn(move || {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while !pid_path.exists() {
-                        if Instant::now() >= deadline {
-                            return;
+            if cancel_before_poll {
+                token.cancel();
+            }
+            let origin = Instant::now();
+            let clock = Cell::new(origin + first_poll);
+            let mut initial = Some(origin);
+            let expected_term = origin
+                + if cancel_before_poll {
+                    first_poll
+                } else {
+                    term_at
+                };
+            let expected_deadline = origin
+                + if cancel_before_poll {
+                    timeout.min(first_poll + grace)
+                } else {
+                    timeout
+                };
+            let mut acknowledged_at = None;
+            let status_hook = cancel_before_poll || cancel_after_term;
+            let result = wait_with_timeout_inner_with_clock(
+                &mut group.child,
+                timeout,
+                true,
+                status_hook,
+                status_hook.then_some(&token),
+                || initial.take().unwrap_or_else(|| clock.get()),
+                |duration| {
+                    let current = clock.get();
+                    assert!(
+                        current < expected_deadline && current + duration <= expected_deadline,
+                        "{name}: waiting must not extend the interruption deadline"
+                    );
+                    if expect_ack && current >= expected_term && acknowledged_at.is_none() {
+                        let mut acknowledgement = String::new();
+                        events.read_line(&mut acknowledgement).unwrap();
+                        assert_eq!(
+                            acknowledgement, "term\n",
+                            "{name}: missing TERM acknowledgement"
+                        );
+                        acknowledged_at = Some(current);
+                        if cancel_after_term {
+                            token.cancel();
                         }
-                        std::thread::sleep(Duration::from_millis(10));
+                        clock.set(expected_deadline);
+                    } else {
+                        clock.set(current + duration);
                     }
-                    token.cancel();
-                })
-            });
-            let result = if cancel {
-                run_status_with_timeout_process_group(
-                    &mut cmd,
-                    Duration::from_secs(30),
-                    Some(&token),
-                )
-            } else {
-                run_with_timeout_process_group(&mut cmd, Duration::from_secs(2))
-                    .map(|output| output.map(|output| output.status))
-            }
-            .unwrap();
-            // The canceler has fired by the time the call returns; join it so
-            // the test does not outlive its own helper thread.
-            if let Some(canceler) = canceler {
-                canceler.join().unwrap();
-            }
-            assert!(result.is_none(), "process group must be interrupted");
-            assert_eq!(
-                std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
-                "term",
-                "the process-group leader must receive SIGTERM before escalation"
+                },
             );
-
-            let pid: i32 = std::fs::read_to_string(pid_path)
-                .expect("shell should publish descendant pid")
-                .parse()
-                .unwrap();
-            let process_is_running = |pid: i32| {
-                let output = Command::new("ps")
-                    .args(["-o", "stat=", "-p", &pid.to_string()])
-                    .output()
-                    .expect("ps should inspect descendant state");
-                let state = String::from_utf8_lossy(&output.stdout);
-                output.status.success()
-                    && !state.trim().is_empty()
-                    && !state.trim_start().starts_with('Z')
-            };
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while process_is_running(pid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
+            if result.is_ok() {
+                group.group_armed = false;
             }
             assert!(
-                !process_is_running(pid),
-                "descendant must be exited or a terminated zombie after interruption"
+                result.unwrap().is_none(),
+                "{name}: group must be interrupted"
             );
+            assert_child_reaped(group.child.id());
+            let descendant = group.descendant.as_ref().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !descendant.exited().unwrap() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{name}: descendant survived interruption"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if expect_ack {
+                assert_eq!(
+                    acknowledged_at,
+                    Some(expected_term),
+                    "{name}: polling must not sleep past the next TERM decision"
+                );
+            }
         }
     }
 

@@ -419,19 +419,18 @@ impl NativeSessionStore {
         }
         Ok(())
     }
-}
 
-impl SessionStore for NativeSessionStore {
-    fn storage(&self) -> &Storage {
-        &self.storage
+    pub(crate) fn retire_trash_reservation(&self, id: &str, generation: u64) -> Result<()> {
+        self.settle_lifecycle_reservation(id, None, |row| {
+            row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+        })
     }
 
-    fn release_lifecycle_reservation(
+    fn settle_lifecycle_reservation(
         &self,
         id: &str,
-        operation: crate::session::LifecycleOperation,
-        generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
+        settle: impl FnOnce(&mut Instance),
     ) -> Result<()> {
         // Cleanup must not depend on canonical adoption health.
         crate::migrations::ensure_schema_supported()?;
@@ -449,7 +448,7 @@ impl SessionStore for NativeSessionStore {
             self.storage.verify_bound_profile()?;
             transition.update_with_snapshot(&self.storage, |rows, _| {
                 if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                    row.release_lifecycle_reservation_if_owned(operation, generation);
+                    settle(row);
                 }
                 Ok(())
             })
@@ -476,6 +475,24 @@ impl SessionStore for NativeSessionStore {
             return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
         }
         Ok(())
+    }
+}
+
+impl SessionStore for NativeSessionStore {
+    fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    fn release_lifecycle_reservation(
+        &self,
+        id: &str,
+        operation: crate::session::LifecycleOperation,
+        generation: u64,
+        lifecycle: Option<crate::session::StorageFlock>,
+    ) -> Result<()> {
+        self.settle_lifecycle_reservation(id, lifecycle, |row| {
+            row.release_lifecycle_reservation_if_owned(operation, generation);
+        })
     }
 
     fn defer_lifecycle_release(

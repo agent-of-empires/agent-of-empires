@@ -222,10 +222,20 @@ fn run_info(id: &str) -> Result<()> {
 }
 
 async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
-    let endpoint = crate::acp::client::require_daemon().await?;
-    crate::acp::client::HttpClient::new(endpoint)?
-        .set_plugin_enabled(id, enabled)
-        .await?;
+    let result = async {
+        let endpoint = crate::acp::client::require_daemon().await?;
+        crate::acp::client::HttpClient::new(endpoint)?
+            .set_plugin_enabled(id, enabled)
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if id == "aoe.web" && result.is_err() && crate::acp::client::discovery::discover_env().is_none()
+    {
+        result.map_err(crate::plugin::install::web_toggle_error)?;
+    } else {
+        result?;
+    }
     println!("{} {id}.", if enabled { "Enabled" } else { "Disabled" });
     Ok(())
 }

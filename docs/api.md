@@ -859,6 +859,29 @@ selection. `drop_failed` removes the row only after a forced failure for the sam
 selection; it retains worktree files. Restore or a new lifecycle generation
 invalidates the failure marker.
 
+## POST /api/sessions/{id}/trash
+
+Move a session to Trash. Optional JSON fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `kill_pane` | `true` | Stop the session's terminal panes during the transition. |
+| `expected_generation` | omitted | Require the selected session's `lifecycle_generation`; a mismatch returns `409 lifecycle_superseded` without mutation. |
+
+Repeating a completed request for an already-trashed session succeeds without
+repeating teardown or relocation. A fresh lifecycle reservation returns
+`409 lifecycle_locked` rather than acknowledging an unfinished transition.
+Generation preconditions are checked before the already-trashed state.
+Restore and Purge return `409 trash_incomplete` while a Trash outcome remains
+unconfirmed. Retry `POST /api/sessions/{id}/trash`, or use `aoe rm <id>`, before
+another lifecycle action.
+For an unfinished Trash transition, `aoe rm <id>` retries Trash even when
+`session.delete_to_trash` is disabled. `--purge` never performs this recovery.
+A terminal teardown or relocation failure leaves the session in Trash without
+preventing explicit Restore or Purge. A retry also settles the transition when
+all known worktree paths are proven absent. Unverified existing paths, unknown
+original locations, and filesystem lookup errors keep the transition protected.
+
 ## Explicit structured worker stop
 
 `DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.

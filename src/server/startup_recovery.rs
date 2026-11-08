@@ -35,7 +35,7 @@ pub(super) fn repair_startup_profile_ownership(
     for (_, storage) in &storages {
         let instances = storage.load_complete_with_groups()?.0;
         let now = chrono::Utc::now();
-        // Purge owners must survive until recover_pending_purges has proved teardown.
+        // Purge and Trash owners survive until their teardown completes.
         let mut expired: Vec<String> = instances
             .iter()
             .filter(|row| {
@@ -44,6 +44,10 @@ pub(super) fn repair_startup_profile_ownership(
                     .is_some_and(|reservation| {
                         reservation.op != crate::session::LifecycleOperation::Purge
                             && row.terminal_handoff.is_none()
+                            && !row.lifecycle_reservation_is_owned(
+                                crate::session::LifecycleOperation::Trash,
+                                row.lifecycle_generation,
+                            )
                     })
                     && !row.has_fresh_lifecycle_reservation(now)
             })
@@ -66,6 +70,10 @@ pub(super) fn repair_startup_profile_ownership(
                         .is_some_and(|reservation| {
                             reservation.op != crate::session::LifecycleOperation::Purge
                                 && row.terminal_handoff.is_none()
+                                && !row.lifecycle_reservation_is_owned(
+                                    crate::session::LifecycleOperation::Trash,
+                                    row.lifecycle_generation,
+                                )
                         })
                     {
                         row.clear_expired_lifecycle_reservation(

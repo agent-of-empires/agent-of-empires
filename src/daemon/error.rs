@@ -16,6 +16,7 @@ pub enum ApiErrorCode {
     PluginPreviewFailed,
     PluginJobActive,
     LifecycleLocked,
+    TrashIncomplete,
     LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
@@ -40,6 +41,7 @@ pub enum ApiErrorCode {
     SessionNotRunning,
     SessionArchived,
     SessionTrashed,
+    AccountSwapUnavailable,
 }
 
 impl ApiErrorCode {
@@ -53,6 +55,7 @@ impl ApiErrorCode {
             Self::PluginPreviewFailed => "preview_failed",
             Self::PluginJobActive => "plugin_job_active",
             Self::LifecycleLocked => "lifecycle_locked",
+            Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
@@ -77,6 +80,7 @@ impl ApiErrorCode {
             Self::SessionNotRunning => "session_not_running",
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
+            Self::AccountSwapUnavailable => "account_swap_unavailable",
         }
     }
 
@@ -88,6 +92,7 @@ impl ApiErrorCode {
             | Self::LocalPluginSourceRequired
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
+            | Self::TrashIncomplete
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
@@ -104,7 +109,8 @@ impl ApiErrorCode {
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
-            | Self::SessionTrashed => StatusCode::CONFLICT,
+            | Self::SessionTrashed
+            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -151,6 +157,7 @@ impl ApiErrorCode {
             b"preview_failed" => Self::PluginPreviewFailed,
             b"plugin_job_active" => Self::PluginJobActive,
             b"lifecycle_locked" => Self::LifecycleLocked,
+            b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
@@ -175,6 +182,7 @@ impl ApiErrorCode {
             b"session_not_running" => Self::SessionNotRunning,
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
+            b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -317,6 +325,12 @@ mod tests {
                 Some(ApiErrorCode::PluginJobActive),
             ),
             (StatusCode::BAD_GATEWAY, "plugin_job_active", false, None),
+            (
+                StatusCode::CONFLICT,
+                "account_swap_unavailable",
+                false,
+                Some(ApiErrorCode::AccountSwapUnavailable),
+            ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

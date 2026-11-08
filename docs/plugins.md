@@ -6,13 +6,23 @@ To build one, see [Writing Plugins](development/writing-plugins.md) and the [Plu
 
 ## Managing plugins
 
-Three equivalent surfaces:
+Manage plugins through these surfaces:
 
 - **CLI**: `aoe plugin list | info <id> | logs <id> | enable <id> | disable <id> | install <source> | update <id> | uninstall <id>`.
-- **TUI**: "Manage plugins" in the command palette, or the Plugins settings tab. Space toggles enable and disable.
-- **Web**: the Plugins settings tab. Enabling or disabling needs an elevated (passphrase) session when login is enabled and is blocked in read-only mode; localhost browsers skip the passphrase, matching the CLI's same-host trust.
+- **TUI**: "Manage plugins" in the command palette applies Space toggles immediately. In the Plugins settings tab, Space stages a change and Ctrl-S saves it.
+- **Web**: the Plugins settings tab. Enabling or disabling needs an elevated (passphrase) session when login is enabled and is blocked in read-only mode.
 
 A plugin's enable-state lives under `[plugins."<id>"]` in `config.toml`.
+
+### Web plugin errors
+
+The command-palette manager can save locally when initial local-daemon discovery fails. Once discovery succeeds, any error while changing `aoe.web` is reported without retrying the write locally. This includes lifecycle-busy and read-only refusals, authentication errors, an unavailable transport, and a missing endpoint on an older daemon. Other plugins retain their local-save fallback with a stale-daemon warning.
+
+A repeated Boolean write is idempotent, but a configuration lock does not enforce daemon authorization or reconcile live workers. A failed response is not permission to bypass that daemon. For persistent local transport or HTTP 404 failures, run `aoe serve --stop`, inspect `aoe plugin info aoe.web`, then explicitly retry the desired `aoe plugin enable aoe.web` or `aoe plugin disable aoe.web` command if still needed. Stopping disconnects daemon clients; supervised daemons must be stopped through their manager. Retry may autostart using current configuration. For remote endpoints, recover the selected daemon on its host instead. Lifecycle-busy, read-only and authentication refusals remain authoritative.
+
+`aoe plugin enable` and `aoe plugin disable` also report daemon errors without a local fallback. If the CLI fails to acquire an endpoint for a live owner with a missing socket, it reports the acquisition error without adding the stop/retry hint. The command-palette manager can instead reach the failed request and show the hint.
+
+The TUI Plugins settings tab remains an explicit local configuration save, separate from the command-palette manager's immediate daemon request.
 
 Settings saves merge staged plugin toggles and settings into fresh persisted state.
 Edits for removed external entries, or entries whose source, development marker,

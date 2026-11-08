@@ -352,10 +352,13 @@ async fn native_delete_admission_does_not_take_lifecycle_flock_and_only_snapshot
         let mut drive = view.session_feed.request_driver_for_test();
         apply_published(&mut view, &state).await;
         view.selected_session = Some(victim.id.clone());
+        disable_delete_to_trash();
+        view.view_mode = ViewMode::Structured;
+        view.open_delete_for_selected();
         let storage = Storage::new_unwatched("test").unwrap();
         let lock = storage.acquire_instance_lifecycle_lock(&victim.id).unwrap();
         let before = payload_bytes("test");
-        view.delete_selected(&crate::tui::dialogs::DeleteOptions::default())
+        view.submit_session_delete(&crate::tui::dialogs::DeleteOptions::default())
             .unwrap();
         assert!(view.get_instance(&victim.id).is_some());
         assert_eq!(payload_bytes("test"), before);
