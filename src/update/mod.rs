@@ -97,9 +97,12 @@ fn load_cache() -> Option<UpdateCache> {
     serde_json::from_str(&content).ok()
 }
 
-/// A cache written by a build on the other channel describes the wrong releases.
+/// A cache written by a build on the other channel describes the wrong releases. An empty
+/// latest says nothing about either channel.
 fn load_cache_for(current_version: &str) -> Option<UpdateCache> {
-    load_cache().filter(|cache| same_channel(&cache.latest_version, current_version))
+    load_cache().filter(|cache| {
+        !cache.latest_version.is_empty() && same_channel(&cache.latest_version, current_version)
+    })
 }
 
 fn same_channel(a: &str, b: &str) -> bool {
@@ -418,7 +421,7 @@ mod tests {
         }
     }
 
-    /// A fresh, newer cache from the other channel must not answer the check.
+    /// A fresh cache from the other channel, or with no latest, must not answer the check.
     #[tokio::test]
     async fn check_for_update_refetches_over_a_cache_from_the_other_channel() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -439,6 +442,7 @@ mod tests {
 
         for (current, cached_latest, expected) in [
             ("1.22.0", "1.22.3-nightly.20261201", "1.22.1"),
+            ("1.22.0", "", "1.22.1"),
             (
                 "1.22.2-nightly.20261101",
                 "9.9.9",
