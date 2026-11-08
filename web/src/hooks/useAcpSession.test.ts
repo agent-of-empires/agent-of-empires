@@ -255,6 +255,11 @@ describe("reconnect (#1130)", () => {
     await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
     await flushAsync();
     expect(sockets).toHaveLength(2);
+    for (const socket of sockets) {
+      const params = new URL(socket.url).searchParams;
+      expect(params.get("projection")).toBe("web");
+      expect(params.has("frames")).toBe(false);
+    }
     expect(calls.some((c) => new URL(c.url, "http://x").searchParams.has("since"))).toBe(true);
     expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
   });
@@ -317,7 +322,125 @@ describe("persisted state hydration", () => {
     render("sess");
     await flushAsync();
     expect(sockets).toHaveLength(1);
-    expect(sockets[0]!.url).toContain(`/acp/ws?since=${since}`);
+    const params = new URL(sockets[0]!.url).searchParams;
+    expect(params.get("since")).toBe(String(since));
+    expect(params.get("projection")).toBe("web");
+    expect(params.has("frames")).toBe(false);
+  });
+});
+
+describe("lightweight control projection", () => {
+  it("keeps full background-agent details through reconnect without replayed agent events", async () => {
+    const sid = "sess-web-agents";
+    let highestSeq = 0;
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/replay")
+        ? json({ frames: [], rows: [], lost: false, highest_seq: highestSeq, next_cursor: highestSeq, has_more: false })
+        : undefined,
+    );
+    const { result } = await openSession(sid);
+    expect(new URL(lastSocket().url).searchParams.get("projection")).toBe("web");
+    lastSocket().message({
+      session_id: sid,
+      seq: 10,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "agent-1",
+          tool_call_id: "tool-1",
+          description: "inspect code",
+          prompt: "complete original instructions",
+          model: "test-model",
+          started_at: "2026-01-01T00:00:00Z",
+        },
+      },
+    });
+    const tools = [{ name: "Read", title: "complete/file/path", ok: true }];
+    lastSocket().message({
+      session_id: sid,
+      seq: 11,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "agent-1",
+          status: "running",
+          tool_count: 1,
+          tools,
+          last_tool: "Read",
+          last_text: "latest preview",
+        },
+      },
+    });
+    await flushAsync();
+    expect(result.current.state.backgroundAgents[0]).toMatchObject({
+      prompt: "complete original instructions",
+      tools,
+      lastText: "latest preview",
+      endedAt: null,
+    });
+    lastSocket().message({
+      session_id: sid,
+      seq: 12,
+      event: {
+        BackgroundAgentCompleted: {
+          agent_id: "agent-1",
+          status: "completed",
+          tools,
+          result: "complete final report",
+          ended_at: "2026-01-01T00:00:01Z",
+        },
+      },
+    });
+    highestSeq = 12;
+    const webSnapshot = {
+      kind: "reduced_state",
+      seq: highestSeq,
+      state: {
+        agent: "claude",
+        model: "test-model",
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+      },
+    };
+    lastSocket().message(webSnapshot);
+    await flushAsync();
+    expect(result.current.state.backgroundAgents[0]).toMatchObject({
+      prompt: "complete original instructions",
+      tools,
+      status: "completed",
+      result: "complete final report",
+      endedAt: "2026-01-01T00:00:01Z",
+    });
+    expect(result.current.state.lastSeq).toBe(highestSeq);
+    const agentsBeforeReconnect = result.current.state.backgroundAgents;
+    const firstSocket = lastSocket();
+    const replayCount = calls.filter((call) => call.url.includes("/acp/replay")).length;
+
+    act(() => result.current.manualReconnect());
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+    expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+    const params = new URL(lastSocket().url).searchParams;
+    expect(params.get("since")).toBe(String(highestSeq));
+    expect(params.get("projection")).toBe("web");
+    expect(params.has("frames")).toBe(false);
+    expect(calls.filter((call) => call.url.includes("/acp/replay")).length).toBeGreaterThan(replayCount);
+
+    lastSocket().open();
+    lastSocket().message(webSnapshot);
+    await flushAsync();
+    expect(result.current.status).toBe("open");
+    expect(result.current.state.lastSeq).toBe(highestSeq);
+    expect(result.current.state.backgroundAgents).toEqual(agentsBeforeReconnect);
   });
 });
 

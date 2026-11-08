@@ -124,8 +124,8 @@ impl BroadcastSink for ChannelSink {
     }
 }
 
-/// Run store I/O via `block_in_place` on a multi-thread runtime, inline elsewhere.
-fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+/// Run blocking work via `block_in_place` on a multi-thread runtime, inline elsewhere.
+pub(super) fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
