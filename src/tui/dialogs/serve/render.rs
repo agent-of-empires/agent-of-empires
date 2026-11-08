@@ -114,7 +114,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 &mut mouse,
                 message,
                 view.control_error.as_deref(),
-                &error_recovery_keys(message, *mode, *transport),
+                &error_recovery_keys(*mode, *transport),
             ),
         }
     }
@@ -913,16 +913,12 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(
-    message: &str,
-    mode: ServeMode,
-    transport: Option<TunnelTransport>,
-) -> Vec<&'static str> {
+fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
     let mut keys = Vec::new();
     if mode == ServeMode::Tunnel {
         keys.push("[P] Pick provider");
     }
-    if funnel_reset_applies(message, mode, transport) {
+    if funnel_reset_applies(mode, transport) {
         keys.push("[R] Reset Funnel");
     }
     keys
@@ -1556,95 +1552,5 @@ mod tests {
         let buf = draw(&view);
         let (x, y) = crate::tui::dialogs::test_render::find(&buf, "[Esc] cancel");
         assert_eq!(view.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
-    }
-
-    #[test]
-    fn the_error_footer_offers_recovery_keys_first_and_only_those_error_key_handles() {
-        use ServeMode::{Local, Tunnel};
-        use TunnelTransport::{Cloudflare, Tailscale};
-        let (p, r) = ("[P] Pick provider", "[R] Reset Funnel");
-        let rest = "[S] Force stop    [Enter] Back to sessions";
-        let funnel_msg = "Tailscale Funnel setup failed";
-        // (mode, transport, message, width, footer rows)
-        let cases = [
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            // Too wide at 80 columns: the recovery keys and the way out take a row each.
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                80,
-                vec![format!("{p}    {r}"), rest.to_string()],
-            ),
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                60,
-                vec![format!("{p}    {r}"), rest.to_string()],
-            ),
-            // At 60 columns the three hints no longer fit on one row.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                60,
-                vec![p.to_string(), rest.to_string()],
-            ),
-            // A known Cloudflare failure gets no Funnel reset, whatever the message says.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                80,
-                vec![format!("{p}    {rest}")],
-            ),
-            // A reattached daemon's transport is unknown, so the message decides.
-            (
-                Tunnel,
-                None,
-                funnel_msg,
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            (Local, None, funnel_msg, 120, vec![rest.to_string()]),
-        ];
-        for (mode, transport, message, width, want) in cases {
-            let case = format!("{mode:?} {transport:?} {message:?} at {width}");
-            let mut view = view(ServeViewState::Error {
-                message: message.to_string(),
-                mode,
-                transport,
-            });
-            let buf = draw_at(&view, width);
-            let rows: Vec<String> = (0..buf.area.height)
-                .map(|y| {
-                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-                    row.trim_matches(|c: char| c == '│' || c.is_whitespace())
-                        .to_string()
-                })
-                .filter(|row| row.contains("[S] ") || row.contains("[P] ") || row.contains("[R] "))
-                .collect();
-            assert_eq!(rows, want, "{case}");
-            // Every hint stays whole and clickable, on either row.
-            let mut hints = vec![("[S]", KeyCode::Char('S')), ("[Enter]", KeyCode::Enter)];
-            if mode == Tunnel {
-                hints.push(("[P]", KeyCode::Char('P')));
-            }
-            for (label, code) in hints {
-                let (x, y) = crate::tui::dialogs::test_render::find(&buf, label);
-                assert_eq!(
-                    view.handle_click(x, y).map(|k| k.code),
-                    Some(code),
-                    "{case}: {label}"
-                );
-            }
-        }
     }
 }

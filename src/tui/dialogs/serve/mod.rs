@@ -609,18 +609,8 @@ fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
 }
 
-/// `tailscale funnel reset` only helps a Tunnel that went through Funnel; a reattached
-/// daemon's transport is unknown, so its message decides.
-fn funnel_reset_applies(
-    message: &str,
-    mode: ServeMode,
-    transport: Option<TunnelTransport>,
-) -> bool {
-    mode == ServeMode::Tunnel
-        && transport.map_or_else(
-            || error_mentions_tailscale(message),
-            |t| t == TunnelTransport::Tailscale,
-        )
+fn funnel_reset_applies(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
+    mode == ServeMode::Tunnel && transport == Some(TunnelTransport::Tailscale)
 }
 
 /// A destructive action awaiting a second press of its key.
@@ -1295,14 +1285,12 @@ impl ServeView {
 
     fn error_key(&mut self, code: KeyCode) -> ServeAction {
         let ServeViewState::Error {
-            message,
-            mode,
-            transport,
+            mode, transport, ..
         } = &self.state
         else {
             return ServeAction::Continue;
         };
-        let reset = funnel_reset_applies(message, *mode, *transport);
+        let reset = funnel_reset_applies(*mode, *transport);
         let failed = *transport;
         match code {
             KeyCode::Char('p' | 'P') if *mode == ServeMode::Tunnel => {

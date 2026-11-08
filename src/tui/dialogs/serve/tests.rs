@@ -221,6 +221,69 @@ fn a_local_error_offers_no_provider_retry_or_funnel_reset() {
 }
 
 #[test]
+fn shared_log_context_never_grants_funnel_reset() {
+    for has_process_marker in [false, true] {
+        for transport in [
+            None,
+            Some(TunnelTransport::Cloudflare),
+            Some(TunnelTransport::Tailscale),
+        ] {
+            let known_funnel = transport == Some(TunnelTransport::Tailscale);
+            let context = if known_funnel {
+                "unrelated startup diagnostics"
+            } else {
+                "tailscale funnel failed in another process"
+            };
+            let mut view = ServeView::for_test(ServeViewState::start_failed_with(
+                ServeMode::Tunnel,
+                transport,
+                "Dashboard start failed.",
+                LogContext {
+                    lines: vec![context.to_owned()],
+                    has_process_marker,
+                },
+            ));
+            for width in [60, 110] {
+                let buffer = crate::tui::dialogs::test_render::draw(width, 40, |frame, theme| {
+                    view.render(frame, frame.area(), theme)
+                });
+                let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert_eq!(
+                    rendered.contains("[R]"),
+                    known_funnel,
+                    "transport={transport:?}; associated={has_process_marker}; width={width}"
+                );
+                for (label, code) in [
+                    ("[P]", KeyCode::Char('P')),
+                    ("[S]", KeyCode::Char('S')),
+                    ("[Enter]", KeyCode::Enter),
+                ] {
+                    let (col, row) = crate::tui::dialogs::test_render::find(&buffer, label);
+                    assert_eq!(
+                        view.handle_click(col, row).map(|event| event.code),
+                        Some(code)
+                    );
+                }
+                if known_funnel {
+                    let (col, row) = crate::tui::dialogs::test_render::find(&buffer, "[R]");
+                    assert_eq!(
+                        view.handle_click(col, row).map(|event| event.code),
+                        Some(KeyCode::Char('R'))
+                    );
+                }
+            }
+            if !known_funnel {
+                assert!(matches!(view.handle_key(key('R')), ServeAction::Continue));
+                assert!(matches!(
+                    view.handle_key(KeyEvent::from(KeyCode::Enter)),
+                    ServeAction::Close
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 #[serial_test::serial]
 fn r_g_and_help_reread_persist_sessions() {
     let _home = crate::session::test_support::isolate_app_dir();

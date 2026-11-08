@@ -201,11 +201,6 @@ fn compact_log_line(raw: &str) -> String {
     }
 }
 
-pub(super) fn error_mentions_tailscale(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("tailscale") || lower.contains("funnel")
-}
-
 pub(super) fn run_tailscale_funnel_reset(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
