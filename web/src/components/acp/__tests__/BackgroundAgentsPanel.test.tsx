@@ -181,6 +181,33 @@ describe("BackgroundAgentsPanel shell dialog", () => {
     }
   });
 
+  it("tells a failed read apart from a missing file and retries a finished shell until it lands", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      taskOutputMock.mockReset();
+      taskOutputMock
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue({ exists: true, output: "recovered", truncated: false });
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(document.body.textContent).toContain("Could not load output.");
+      expect(document.body.textContent).not.toContain("Output not available.");
+
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(view.getByRole("region", { name: "Shell output" }).textContent).toBe("recovered");
+      expect(document.body.textContent).not.toContain("Could not load output.");
+
+      const calls = taskOutputMock.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(taskOutputMock).toHaveBeenCalledTimes(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("polls a running shell one read at a time and stops once it finishes", async () => {
     vi.useFakeTimers();
     try {

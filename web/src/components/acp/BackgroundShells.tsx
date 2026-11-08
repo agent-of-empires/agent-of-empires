@@ -75,7 +75,8 @@ function ShellDetailModal({
   shell: BackgroundShell;
   onClose: () => void;
 }) {
-  const [out, setOut] = useState<TaskOutput | null | undefined>(undefined);
+  const [out, setOut] = useState<TaskOutput | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
   const [wrap, setWrap] = useState(true);
   const preRef = useRef<HTMLPreElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -110,15 +111,16 @@ function ShellDetailModal({
     };
   }, [onClose]);
 
-  // Poll while the shell runs; one last read after it ends.
+  // Poll while the shell runs, and until one read lands after it ends.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
       const next = await fetchTaskOutput(sessionId, shell.taskId);
       if (cancelled) return;
-      setOut(next);
-      if (!shell.finished) timer = setTimeout(read, OUTPUT_POLL_MS);
+      if (next) setOut(next);
+      setFailed(!next);
+      if (!next || !shell.finished) timer = setTimeout(read, OUTPUT_POLL_MS);
     };
     void read();
     return () => {
@@ -187,8 +189,8 @@ function ShellDetailModal({
               </button>
             </div>
             {out === undefined ? (
-              <span className="text-text-dim">Loading output…</span>
-            ) : !out?.exists ? (
+              <span className="text-text-dim">{failed ? "Could not load output. Retrying…" : "Loading output…"}</span>
+            ) : !out.exists ? (
               <span className="text-text-dim">Output not available.</span>
             ) : (
               <>
