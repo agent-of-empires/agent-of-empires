@@ -24,7 +24,11 @@ jobs:
   prepare:
     name: Prepare
     # Every job builds the triggering commit, so binaries and images always match.
-    if: github.repository == 'agent-of-empires/agent-of-empires' && github.ref == 'refs/heads/main'
+    # Off until NIGHTLY_ENABLED is set; see "Enabling nightlies" in docs/development/releases.md.
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.ref == 'refs/heads/main' &&
+      vars.NIGHTLY_ENABLED == 'true'
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.plan.outputs.skip }}

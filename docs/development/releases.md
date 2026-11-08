@@ -32,6 +32,16 @@ The tag stays outside `v*` so `release.yml`, `docker.yml`'s tag trigger and rele
 
 Once a migration is merged to `main`, its number and behavior are frozen: nightly users have already run it.
 
+### Enabling nightlies
+
+The workflow does nothing until the `NIGHTLY_ENABLED` repository variable is `true`. Stable clients up to v1.22.2 read the newest entry of the full release list, cannot parse a `nightly-*` tag as a version, and then report no update, so publishing a nightly hides every later stable release from them. Turn nightlies on only after a stable release with the channel-aware update check has shipped and most users have updated to it:
+
+```bash
+gh variable set NIGHTLY_ENABLED --body true
+```
+
+In the same change, delete the "not published yet" note under Nightly Channel in `docs/installation.md`.
+
 ## Skill hubs
 
 `aoe` ships a coding-agent management skill to two hubs from `contrib/`, and `cargo xtask check-skill` (run in CI) validates that both reference real CLI commands and follow each hub's frontmatter rules.

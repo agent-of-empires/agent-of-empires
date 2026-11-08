@@ -16,6 +16,8 @@ brew install aoe
 
 ## Nightly Channel
 
+Nightly builds are not published yet; the commands below find nothing until they are.
+
 Nightly builds are daily prereleases of `main`, versioned like `1.22.2-nightly.20261108` and tagged `nightly-20261108`. The newest seven stay available. Use them to try changes before the next stable release and to report regressions early.
 
 ```bash
