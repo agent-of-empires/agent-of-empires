@@ -954,10 +954,10 @@ pub struct ServeUrl {
 /// empty. The primary URL gets `label: None` for rendering; alternates
 /// carry their label.
 pub fn read_serve_urls() -> Vec<ServeUrl> {
-    let Ok(dir) = crate::session::get_app_dir() else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(dir.join("serve.url")) else {
+    let Some(raw) = launch_file("serve.url")
+        .ok()
+        .and_then(|file| file.read().ok().flatten())
+    else {
         return Vec::new();
     };
     let mut out: Vec<ServeUrl> = Vec::new();
@@ -2213,7 +2213,7 @@ async fn tui_lifecycle_transaction(
 pub(crate) struct TuiObservationLease {
     _transaction: crate::daemon::lifecycle::Transaction,
     observed: TuiObservedDaemon,
-    exited_pid: Option<u32>,
+    exited_process: Option<(u32, crate::process::ProcessBirthIdentity)>,
 }
 
 impl TuiObservationLease {
@@ -2224,15 +2224,16 @@ impl TuiObservationLease {
         let transaction = tui_lifecycle_transaction(cancel).await?;
         anyhow::ensure!(!cancel.is_cancelled(), "Serve observation cancelled");
         let observed = tui_observed_daemon()?;
-        let exited_pid = expected
-            .as_ref()
-            .map(|expected| tui_observed_exit(expected, &observed.target))
-            .transpose()?
-            .flatten();
+        let exited_process = match expected {
+            Some(expected) if tui_observed_exit(&expected, &observed.target)?.is_some() => {
+                expected.process.map(|(pid, birth, _)| (pid, birth))
+            }
+            _ => None,
+        };
         Ok(Self {
             _transaction: transaction,
             observed,
-            exited_pid,
+            exited_process,
         })
     }
 
@@ -2250,8 +2251,13 @@ impl TuiObservationLease {
 
     pub(crate) fn recheck(&mut self) -> Result<()> {
         let current = tui_control_target()?;
-        if let Some(pid) = tui_observed_exit(&self.observed.target, &current)? {
-            self.exited_pid = Some(pid);
+        if tui_observed_exit(&self.observed.target, &current)?.is_some() {
+            self.exited_process = self
+                .observed
+                .target
+                .process
+                .take()
+                .map(|(pid, birth, _)| (pid, birth));
             self.observed.dashboard = false;
             self.observed.passphrase = false;
         }
@@ -2260,8 +2266,9 @@ impl TuiObservationLease {
     }
 
     pub(crate) fn startup_tail(&self) -> Vec<String> {
-        self.exited_pid
-            .map(crate::acp::client::autostart::startup_log_tail)
+        self.exited_process
+            .as_ref()
+            .map(|(pid, birth)| crate::acp::client::autostart::startup_log_tail(*pid, birth))
             .unwrap_or_default()
     }
 

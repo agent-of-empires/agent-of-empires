@@ -1378,37 +1378,35 @@ fn open_uses_current_credentials_without_saved_default_fallback() {
 #[test]
 #[serial_test::serial]
 fn open_rejects_replacement_during_a_metadata_read() {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use super::work::BEFORE_OBSERVATION_RECHECK;
     let _home = crate::session::test_support::isolate_app_dir();
     let app = crate::session::get_app_dir().unwrap();
     let mut original = TestDaemon::new();
     original.publish();
     std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
     std::fs::write(app.join("serve.passphrase"), "original runtime credential").unwrap();
-    let url = app.join("serve.url");
-    nix::unistd::mkfifo(
-        &url,
-        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-    )
-    .unwrap();
+    std::fs::write(app.join("serve.url"), "https://original.invalid/").unwrap();
+    let (entered, received) = mpsc::sync_channel(1);
+    let (release, retained) = mpsc::sync_channel(1);
+    let mut before_recheck: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        retained.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
     let mut jobs = ServeJobs::default();
-    let mut view = ServeView::new(&mut jobs);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut writer = loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(&url)
-        {
-            Ok(writer) => break writer,
-            Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
-                assert!(Instant::now() < deadline, "Open did not reach the URL read");
-                std::thread::yield_now();
-            }
-            Err(error) => panic!("cannot open metadata gate: {error}"),
+    let submitter = jobs.with_handler(move |job, control, runtime| {
+        if matches!(job, Job::Open) {
+            BEFORE_OBSERVATION_RECHECK.with(|hook| {
+                *hook.borrow_mut() = before_recheck.take();
+            });
         }
+        run_job(job, control, runtime)
+    });
+    let mut view = ServeView::with_state(ServeViewState::Checking { attempt: 0 }, submitter);
+    view.request(Job::Open, PendingJob::Open);
+    view.state = ServeViewState::Checking {
+        attempt: view.last_attempt,
     };
+    received.recv_timeout(Duration::from_secs(10)).unwrap();
     original.exit();
     let mut replacement = TestDaemon::new();
     replacement.publish();
@@ -1418,10 +1416,8 @@ fn open_rejects_replacement_during_a_metadata_read() {
         "replacement runtime credential",
     )
     .unwrap();
-    std::fs::remove_file(&url).unwrap();
-    std::fs::write(&url, "https://replacement.invalid/").unwrap();
-    writer.write_all(b"https://replacement.invalid/\n").unwrap();
-    drop(writer);
+    std::fs::write(app.join("serve.url"), "https://replacement.invalid/").unwrap();
+    release.send(()).unwrap();
     wait_for(&mut view, |view| {
         matches!(
             view.state,
@@ -1452,6 +1448,9 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         remove_app_file("serve.url");
         let mut daemon = TestDaemon::new();
         let target = daemon.publish();
+        let birth = crate::process::process_birth_identity(daemon.child.id())
+            .unwrap()
+            .unwrap();
         let (entered, received) = mpsc::sync_channel(1);
         let (release, retained) = mpsc::sync_channel(1);
         let mut jobs = ServeJobs::default();
@@ -1486,9 +1485,19 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         std::fs::write(
             crate::cli::serve::stdio_redirect_path().unwrap(),
             format!(
-                "[AOE_START_MARKER] pid={} exe=aoe\naddress already in use\nfixture-own-startup-tail\n\
-                 [AOE_START_MARKER] pid={} exe=tui\nunrelated-later-tail\n",
-                daemon.child.id(), std::process::id()
+                "[AOE_START_MARKER] pid={} boot_id={} start_id={} exe=aoe\n\
+                 {}fixture-own-startup-tail\n\
+                 [AOE_START_MARKER] pid={} exe=tui\n\
+                 Address already in use\nfixture-late-startup-tail\n\
+                 [AOE_START_MARKER] pid={} boot_id={} start_id=departed-reuse exe=aoe\n\
+                 unrelated-later-tail\n",
+                daemon.child.id(),
+                birth.boot_id,
+                birth.start_id,
+                "earlier runtime context\n".repeat(32),
+                std::process::id(),
+                daemon.child.id(),
+                birth.boot_id,
             ),
         )
         .unwrap();
@@ -1502,7 +1511,12 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         if matches!(change, Change::Exit) {
             assert!(message.contains("exited before"), "{message}");
             assert!(message.contains("fixture-own-startup-tail"), "{message}");
-            assert!(message.contains("address already in use"), "{message}");
+            assert!(message.contains("Address already in use"), "{message}");
+            assert!(message.contains("fixture-late-startup-tail"), "{message}");
+            let buffer = crate::tui::dialogs::test_render::draw(100, 30, |frame, theme| {
+                view.render(frame, frame.area(), theme);
+            });
+            crate::tui::dialogs::test_render::find(&buffer, "fixture-late-startup-tail");
         } else {
             assert!(!message.contains("exited before"), "{message}");
             assert!(!message.contains("fixture-own-startup-tail"), "{message}");
@@ -1510,7 +1524,6 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
                 assert!(daemon.child.try_wait().unwrap().is_none());
             }
         }
-        assert!(!message.contains("unrelated-later-tail"), "{message}");
         remove_app_file("serve.pid");
     }
 }
@@ -1590,4 +1603,115 @@ fn funnel_reset_rediscovers_repaired_identity_without_replaying_the_mutation() {
         std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
         "reset\n"
     );
+}
+
+#[test]
+#[serial_test::serial]
+fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let mut daemon = TestDaemon::new();
+    daemon.publish();
+    std::fs::write(app.join("serve.mode"), "local").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for retain_writer in [false, true] {
+        let url = app.join("serve.url");
+        nix::unistd::mkfifo(
+            &url,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let open_gate = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&url)
+                .unwrap()
+        };
+        let writer = retain_writer.then(open_gate);
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::new(&mut jobs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let settled = loop {
+            view.tick();
+            if !matches!(view.state, ServeViewState::Checking { .. }) {
+                break matches!(view.state, ServeViewState::Starting { .. });
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        drop(view);
+        let unlocked = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    crate::daemon::lifecycle::Transaction::acquire(),
+                )
+                .await
+            })
+            .is_ok_and(|transaction| transaction.is_ok());
+        let writer = writer.unwrap_or_else(open_gate);
+        drop(writer);
+        drop(jobs);
+        std::fs::remove_file(url).unwrap();
+        assert!(settled, "FIFO retained Open; writer={retain_writer}");
+        assert!(
+            unlocked,
+            "FIFO retained lifecycle exclusion; writer={retain_writer}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn picker_reobserves_dashboard_after_provider_probes() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    for reopen_after_stop in [false, true] {
+        remove_app_file("serve.pid");
+        remove_app_file("serve.url");
+        let fixture = FunnelFixture::new();
+        std::fs::write(fixture.root.path().join("hold-probe"), "").unwrap();
+        let mut jobs = ServeJobs::default();
+        let mut view = if reopen_after_stop {
+            let mut view = ServeView::with_state(error_state(), jobs.submitter());
+            view.begin_stop();
+            view.finish_stop(Ok(()));
+            view
+        } else {
+            ServeView::new(&mut jobs)
+        };
+        let probe = fixture.entered();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let transaction = runtime
+            .block_on(crate::daemon::lifecycle::Transaction::acquire())
+            .unwrap();
+        let mut daemon = TestDaemon::new();
+        let target = daemon.publish();
+        std::fs::write(app.join("serve.mode"), "local").unwrap();
+        std::fs::write(app.join("serve.url"), "http://127.0.0.1:23456/").unwrap();
+        drop(transaction);
+        fixture.release();
+        wait_for(&mut view, |view| {
+            !matches!(view.state, ServeViewState::Checking { .. })
+        });
+        assert!(
+            matches!(&view.state, ServeViewState::Active { urls, .. }
+                if urls[0].url == "http://127.0.0.1:23456/"),
+            "picker missed dashboard; after_stop={reopen_after_stop}"
+        );
+        assert_eq!(view.target.as_ref(), Some(&target));
+        assert!(view.pending_launch.is_none());
+        assert!(probe.exited().unwrap());
+    }
 }

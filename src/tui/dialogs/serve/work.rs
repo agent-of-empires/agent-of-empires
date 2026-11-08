@@ -7,6 +7,11 @@ use super::jobs::Control;
 use super::{RestartProbe, ServeMode, ServeViewState, TransportStatus, TunnelTransport};
 use crate::cli::serve::{TuiControlLease, TuiControlTarget, TuiObservationLease};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_OBSERVATION_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) enum Job {
     Open,
     Passphrase,
@@ -70,25 +75,49 @@ pub(super) enum JobResult {
     Failed(String),
 }
 
-fn snapshot(
-    state: ServeViewState,
+async fn picker(
+    cancel: &CancellationToken,
     passphrase: Option<String>,
-    local_primary: Option<String>,
-) -> JobResult {
-    match crate::cli::serve::tui_control_target() {
-        Ok(target) => JobResult::Snapshot(Snapshot {
-            state,
-            target,
-            passphrase,
-            local_primary,
-        }),
-        Err(error) => JobResult::Failed(error.to_string()),
+) -> anyhow::Result<JobResult> {
+    let (state, primary) = ServeViewState::mode_picker(cancel);
+    let mut lease = TuiObservationLease::prepare(None, cancel).await?;
+    if lease.has_dashboard() {
+        return dashboard(lease, passphrase);
     }
+    lease.recheck()?;
+    Ok(JobResult::Snapshot(Snapshot {
+        state,
+        target: lease.into_target(),
+        passphrase,
+        local_primary: Some(primary),
+    }))
 }
 
-fn picker(cancel: &CancellationToken, passphrase: Option<String>) -> JobResult {
-    let (state, primary) = ServeViewState::mode_picker(cancel);
-    snapshot(state, passphrase, Some(primary))
+fn dashboard(lease: TuiObservationLease, passphrase: Option<String>) -> anyhow::Result<JobResult> {
+    let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
+    let observation = observe(lease, mode == ServeMode::Tunnel)?;
+    let state = if observation.running {
+        ServeViewState::running(
+            mode,
+            None,
+            observation.passphrase,
+            observation.urls,
+            observation.log_offset,
+        )
+    } else {
+        ServeViewState::start_failed_with(
+            mode,
+            None,
+            "The observed Daemon exited before access metadata was read.",
+            observation.tail,
+        )
+    };
+    Ok(JobResult::Snapshot(Snapshot {
+        state,
+        target: observation.target,
+        passphrase,
+        local_primary: None,
+    }))
 }
 
 fn observe(
@@ -104,6 +133,10 @@ fn observe(
         .then(current_passphrase)
         .flatten();
     let log_offset = log_file_size();
+    #[cfg(test)]
+    if let Some(before_recheck) = BEFORE_OBSERVATION_RECHECK.with(|hook| hook.borrow_mut().take()) {
+        before_recheck();
+    }
     lease.recheck()?;
     let running = lease.is_running();
     let tail = if running {
@@ -132,32 +165,9 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                 let lease = TuiObservationLease::prepare(None, cancel).await?;
                 if !lease.has_dashboard() {
                     drop(lease);
-                    return Ok::<_, anyhow::Error>(picker(cancel, Some(passphrase)));
+                    return picker(cancel, Some(passphrase)).await;
                 }
-                let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
-                let observation = observe(lease, mode == ServeMode::Tunnel)?;
-                let state = if observation.running {
-                    ServeViewState::running(
-                        mode,
-                        None,
-                        observation.passphrase,
-                        observation.urls,
-                        observation.log_offset,
-                    )
-                } else {
-                    ServeViewState::start_failed_with(
-                        mode,
-                        None,
-                        "The observed Daemon exited before access metadata was read.",
-                        observation.tail,
-                    )
-                };
-                Ok(JobResult::Snapshot(Snapshot {
-                    state,
-                    target: observation.target,
-                    passphrase: Some(passphrase),
-                    local_primary: None,
-                }))
+                dashboard(lease, Some(passphrase))
             })
             .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
         Job::Passphrase => JobResult::Passphrase(load_or_generate_passphrase()),
@@ -165,7 +175,9 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
             Ok(target) => JobResult::ErrorContext(target),
             Err(error) => JobResult::Failed(error.to_string()),
         },
-        Job::Picker => picker(cancel, None),
+        Job::Picker => runtime
+            .block_on(picker(cancel, None))
+            .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
         Job::Providers => {
             let (tailscale, cloudflare) = assess_transports(cancel);
             JobResult::Providers(tailscale, cloudflare)

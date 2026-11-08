@@ -38,44 +38,52 @@ fn random_port() -> u16 {
     rand::rng().random_range(MIN_PORT..65535)
 }
 
-/// The current run's lines: the log is shared, so start at the last `[AOE_START_MARKER]`.
+/// Shared log context after the last startup marker.
 pub(crate) fn initial_log_tail() -> Vec<String> {
     log_tail(None)
 }
 
-pub(crate) fn startup_log_tail(pid: u32) -> Vec<String> {
-    log_tail(Some(pid))
+/// Shared context anchored to this physical process, not exclusive ownership of its lines.
+pub(crate) fn startup_log_tail(
+    pid: u32,
+    birth: &crate::process::ProcessBirthIdentity,
+) -> Vec<String> {
+    log_tail(Some((pid, birth)))
 }
 
-fn log_tail(pid: Option<u32>) -> Vec<String> {
+fn log_tail(expected: Option<(u32, &crate::process::ProcessBirthIdentity)>) -> Vec<String> {
     let Some(contents) = crate::cli::serve::stdio_redirect_path()
         .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|path| crate::session::ResolvedDataFile::open(&path).ok())
+        .and_then(|file| file.read().ok().flatten())
     else {
         return Vec::new();
     };
     let all: Vec<&str> = contents.lines().collect();
-    let marker = pid.map(|pid| format!("pid={pid}"));
     let from = all.iter().rposition(|line| {
-        line.contains("[AOE_START_MARKER]")
-            && marker
-                .as_ref()
-                .is_none_or(|marker| line.split_whitespace().any(|word| word == marker))
+        if !line.contains("[AOE_START_MARKER]") {
+            return false;
+        }
+        let Some((pid, birth)) = expected else {
+            return true;
+        };
+        let (mut matches_pid, mut matches_boot, mut matches_start) = (false, false, false);
+        for word in line.split_whitespace() {
+            match word.split_once('=') {
+                Some(("pid", value)) => matches_pid = value.parse::<u32>().ok() == Some(pid),
+                Some(("boot_id", value)) => matches_boot = value == birth.boot_id,
+                Some(("start_id", value)) => matches_start = value == birth.start_id,
+                _ => {}
+            }
+        }
+        matches_pid && matches_boot && matches_start
     });
-    let from = match (from, pid) {
+    let from = match (from, expected) {
         (Some(from), _) => from,
         (None, None) => 0,
         (None, Some(_)) => return Vec::new(),
     };
-    let end = if pid.is_some() {
-        all[from + 1..]
-            .iter()
-            .position(|line| line.contains("[AOE_START_MARKER]"))
-            .map_or(all.len(), |next| from + 1 + next)
-    } else {
-        all.len()
-    };
-    let window = &all[from..end];
+    let window = &all[from..];
     let start = window.len().saturating_sub(LOG_TAIL_LINES);
     window[start..].iter().map(|s| s.to_string()).collect()
 }

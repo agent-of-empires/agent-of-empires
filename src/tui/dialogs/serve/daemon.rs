@@ -17,7 +17,8 @@ fn app_file(name: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn read_app_file(name: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(app_file(name)?).ok()?;
+    let file = crate::session::ResolvedDataFile::open(&app_file(name)?).ok()?;
+    let raw = file.read().ok()??;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -184,13 +185,19 @@ pub(super) fn log_file_size() -> u64 {
     log_file_size_opt().unwrap_or(0)
 }
 
-/// `"\n\nLast log lines:\n..."` with compacted lines, or `""` for an empty tail.
+/// Shared context with compacted lines, or `""` for an empty tail.
 pub(super) fn last_log_lines(tail: &[String]) -> String {
     if tail.is_empty() {
         return String::new();
     }
-    let compact: Vec<String> = tail.iter().map(|l| compact_log_line(l)).collect();
-    format!("\n\nLast log lines:\n{}", compact.join("\n"))
+    let compact: Vec<String> = tail[tail.len().saturating_sub(8)..]
+        .iter()
+        .map(|line| compact_log_line(line))
+        .collect();
+    format!(
+        "\n\nShared log context (other AoE processes may appear):\n{}",
+        compact.join("\n")
+    )
 }
 
 /// `2026-04-19T23:43:44Z  INFO agent_of_empires::server::tunnel: msg` becomes `INFO tunnel: msg`.
