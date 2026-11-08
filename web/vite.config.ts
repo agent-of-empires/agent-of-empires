@@ -48,8 +48,8 @@ export default defineConfig(({ mode, command }) => {
       outDir: "dist",
       emptyOutDir: true,
       chunkSizeWarningLimit: 1500,
-      // External maps by default: inline maps slow every Playwright navigation.
-      // The live suite opts into inline because `aoe serve` embeds dist/ and serves no .map files.
+      // Preserve statement locations; embedded live builds require inline maps.
+      minify: collectCoverage ? false : undefined,
       sourcemap: collectCoverage ? (env.AOE_COVERAGE_INLINE_SOURCEMAP === "1" ? "inline" : true) : false,
     },
     test: {
