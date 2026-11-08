@@ -21,7 +21,7 @@ use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
 use crate::server::api::sessions::cityhall_block_non_structured;
-use crate::server::session_service::EditQueuedOutcome;
+use crate::server::session_service::{EditQueuedOutcome, QueuePersistFailed};
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session: enough for
@@ -102,11 +102,14 @@ pub async fn queue_enqueue(
     match buffer_and_enqueue(
         &state,
         &id,
-        &req.id,
-        req.text,
-        &blobs,
-        req.origin_device,
-        None,
+        QueuedPrompt {
+            prompt_id: &req.id,
+            text: req.text,
+            blobs: &blobs,
+            origin_device: req.origin_device,
+            origin_plugin: None,
+            supersede_pending_turn: false,
+        },
     )
     .await
     {
@@ -128,6 +131,17 @@ fn validate_queued_text(text: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// A prompt for [`buffer_and_enqueue`].
+pub(super) struct QueuedPrompt<'a> {
+    pub prompt_id: &'a str,
+    pub text: String,
+    pub blobs: &'a [crate::acp::event_store::AttachmentBlob],
+    pub origin_device: Option<String>,
+    pub origin_plugin: Option<String>,
+    /// Drops a queued rate-limit continuation in the same durable write (#3028).
+    pub supersede_pending_turn: bool,
+}
+
 /// Buffer already-validated attachment blobs under `prompt_id` and append the
 /// prompt to the session's server-owned queue.
 ///
@@ -137,12 +151,16 @@ fn validate_queued_text(text: &str) -> Result<(), (StatusCode, String)> {
 pub(super) async fn buffer_and_enqueue(
     state: &Arc<AppState>,
     id: &str,
-    prompt_id: &str,
-    text: String,
-    blobs: &[crate::acp::event_store::AttachmentBlob],
-    origin_device: Option<String>,
-    origin_plugin: Option<String>,
+    prompt: QueuedPrompt<'_>,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
+    let QueuedPrompt {
+        prompt_id,
+        text,
+        blobs,
+        origin_device,
+        origin_plugin,
+        supersede_pending_turn,
+    } = prompt;
     validate_queued_text(&text)?;
     let queue = state.session_service.queued_prompts_snapshot(id).await;
     if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|row| row.id == prompt_id)
@@ -193,6 +211,14 @@ pub(super) async fn buffer_and_enqueue(
     // `enqueue_prompt` replaces the row's refs with whatever came in, so a
     // re-enqueue that drops them would orphan the prior blobs against the
     // per-session cap until the 24h sweep.
+    // A repost replaces the row's blobs; keep the old bytes to put back if the row is not kept.
+    let replaced_blobs = if queue.iter().any(|row| row.id == prompt_id) {
+        state
+            .acp_event_store
+            .load_pending_attachments_for_ref(id, prompt_id)
+    } else {
+        Vec::new()
+    };
     state
         .acp_event_store
         .delete_pending_attachments_for_ref(id, prompt_id);
@@ -202,26 +228,54 @@ pub(super) async fn buffer_and_enqueue(
             .record_pending_attachment(id, prompt_id, blob);
     }
 
-    match state
-        .session_service
-        .enqueue_prompt(
-            id,
-            prompt_id.to_string(),
-            text,
-            refs,
-            origin_device,
-            origin_plugin,
-        )
-        .await
-    {
-        Some(entry) => Ok(entry),
-        None => {
-            // Session vanished between the existence check and the enqueue;
-            // drop the blobs just buffered so they do not leak.
-            state
-                .acp_event_store
-                .delete_pending_attachments_for_ref(id, prompt_id);
+    let service = &state.session_service;
+    let entry = if supersede_pending_turn {
+        service
+            .enqueue_prompt_superseding_continuation(
+                id,
+                prompt_id.to_string(),
+                text,
+                refs,
+                origin_device,
+                origin_plugin,
+            )
+            .await
+    } else {
+        Ok(service
+            .enqueue_prompt(
+                id,
+                prompt_id.to_string(),
+                text,
+                refs,
+                origin_device,
+                origin_plugin,
+            )
+            .await)
+    };
+    // The blobs just buffered must not outlive a row that was never kept.
+    let drop_blobs = || {
+        state
+            .acp_event_store
+            .delete_pending_attachments_for_ref(id, prompt_id)
+    };
+    match entry {
+        Ok(Some(entry)) => Ok(entry),
+        // Session vanished between the existence check and the enqueue.
+        Ok(None) => {
+            drop_blobs();
             Err((StatusCode::NOT_FOUND, "session not found".to_string()))
+        }
+        Err(QueuePersistFailed) => {
+            drop_blobs();
+            for blob in &replaced_blobs {
+                state
+                    .acp_event_store
+                    .record_pending_attachment(id, prompt_id, blob);
+            }
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the prompt could not be saved; try again".to_string(),
+            ))
         }
     }
 }
