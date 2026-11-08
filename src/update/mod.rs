@@ -164,6 +164,8 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 
     let releases = match fetch_releases(&client, current_version).await {
         Ok(r) => r,
+        // Nightlies have no fallback; caching an empty list would report "up to date".
+        Err(e) if is_nightly(current_version) => return Err(e),
         Err(e) => {
             tracing::debug!(target: "update.fetch", "Failed to fetch releases: {e}");
             Vec::new()
