@@ -190,6 +190,7 @@ describe("SessionWizard structured view payload", () => {
   });
 
   it.each([
+    ["auto", "structured"],
     ["terminal", "terminal"],
     ["structured", "structured"],
     ["off", "terminal"],
@@ -1196,6 +1197,21 @@ describe("SessionWizard Yolo mode", () => {
     expect(yolo().getAttribute("aria-checked")).toBe("true");
   });
 
+  it("locks on for a custom agent with its own adapter only in the view that runs its always-Yolo base", async () => {
+    // A structured session runs own-pi's adapter; a terminal one runs the Pi CLI it detects as.
+    const ownPi = agent("own-pi", { kind: "custom", always_yolo: true, acp_always_yolo: false });
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("claude"), ownPi]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "own-pi" });
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
+    await waitFor(() => expect(yoloRow()).toContain("always on for own-pi"));
+    expect(yolo().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "Structured view" }));
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+  });
+
   const AGENTS = [agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })];
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
 
@@ -1207,7 +1223,12 @@ describe("SessionWizard Yolo mode", () => {
     // Alpha's `wrapper` runs Pi and Beta's runs Claude. Beta's first answer is held.
     const wrapper = (always_yolo: boolean) => [
       agent("claude"),
-      agent("wrapper", { kind: "custom", always_yolo, display_name: always_yolo ? "Pi wrapper" : "Claude wrapper" }),
+      agent("wrapper", {
+        kind: "custom",
+        always_yolo,
+        acp_always_yolo: always_yolo,
+        display_name: always_yolo ? "Pi wrapper" : "Claude wrapper",
+      }),
     ];
     let answerBeta: (agents: AgentInfo[]) => void = () => {};
     let betaCalls = 0;

@@ -17,7 +17,7 @@ const FAILURE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Live failures remembered at once. A live one is never evicted, since a client may still
 /// retry its key; at the cap, new keyed creates are refused until entries expire.
 const MAX_FAILURES: usize = 4096;
-pub(crate) const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
+const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +124,25 @@ pub struct CreateFailure {
     pub reference: String,
 }
 
+impl CreateFailure {
+    /// The one place a failure message is capped.
+    pub fn new(
+        status: axum::http::StatusCode,
+        code: &'static str,
+        message: &str,
+        stage: CreateStage,
+        reference: &str,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.chars().take(MAX_FAILURE_MESSAGE_CHARS).collect(),
+            stage,
+            reference: reference.to_owned(),
+        }
+    }
+}
+
 impl axum::response::IntoResponse for CreateFailure {
     fn into_response(self) -> axum::response::Response {
         (
@@ -220,12 +239,7 @@ impl CreateProgressRegistry {
 
     /// Record before the create releases its idempotency lock, so a waiting retry sees it.
     /// The cap is soft: creates admitted by `has_failure_capacity` still record.
-    pub fn record_failure(&self, key: &str, mut failure: CreateFailure) {
-        failure.message = failure
-            .message
-            .chars()
-            .take(MAX_FAILURE_MESSAGE_CHARS)
-            .collect();
+    pub fn record_failure(&self, key: &str, failure: CreateFailure) {
         let mut failures = self.failures.lock().expect("create failures poisoned");
         if failures.len() >= MAX_FAILURES {
             failures.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
@@ -276,17 +290,14 @@ mod tests {
         assert_eq!(registry.recent_failure("k0"), Some(failure(0)));
         assert_eq!(registry.recent_failure("late"), Some(failure(MAX_FAILURES)));
 
-        registry.record_failure(
-            "long",
-            CreateFailure {
-                message: "x".repeat(5000),
-                ..failure(0)
-            },
+        let long = CreateFailure::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "create_failed",
+            &"x".repeat(5000),
+            CreateStage::Preparing,
+            "ref",
         );
-        assert_eq!(
-            registry.recent_failure("long").unwrap().message.len(),
-            MAX_FAILURE_MESSAGE_CHARS
-        );
+        assert_eq!(long.message.len(), MAX_FAILURE_MESSAGE_CHARS);
     }
 
     #[test]

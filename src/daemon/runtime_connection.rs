@@ -41,6 +41,7 @@ pub enum RuntimeEvent {
     Snapshot(Arc<RuntimeSnapshot>),
     Progress(Vec<CreationProgress>),
     OwnerDiagnostics(Vec<super::OwnerLoadDiagnostic>),
+    Sandbox(Vec<super::SandboxProgress>),
 }
 
 impl RuntimeConnection {
@@ -158,7 +159,9 @@ impl RuntimeConnection {
         loop {
             match self.next_event().await? {
                 RuntimeEvent::Snapshot(snapshot) => return Ok(snapshot),
-                RuntimeEvent::Progress(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
+                RuntimeEvent::Progress(_)
+                | RuntimeEvent::Sandbox(_)
+                | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
         }
     }
@@ -181,6 +184,12 @@ impl RuntimeConnection {
                 RuntimeFrame::Creation(progress) => {
                     self.creation_progress = progress;
                     return Ok(RuntimeEvent::Progress(self.creation_progress.clone()));
+                }
+                RuntimeFrame::Sandbox { epoch, progress } => {
+                    if !self.info.local_owner || epoch != self.info.epoch {
+                        return Err(RuntimeConnectionError::Protocol);
+                    }
+                    return Ok(RuntimeEvent::Sandbox(progress));
                 }
                 RuntimeFrame::OwnerDiagnostics { epoch, diagnostics } => {
                     if !self.info.local_owner || epoch != self.info.epoch {

@@ -57,7 +57,6 @@ pub(crate) struct RetainedReplay {
     pub incomplete: bool,
     pub history_identity: String,
 }
-
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,

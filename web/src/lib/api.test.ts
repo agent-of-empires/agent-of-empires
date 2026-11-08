@@ -72,7 +72,11 @@ describe("project container override serialization", () => {
 });
 
 const requestCases: RequestCase[] = [
-  ["GET /api/sessions", () => api.fetchSessions(), { respond: runtimeJson(sessions), result: { ...sessions, cursor } }],
+  [
+    "GET /api/sessions?state=untrashed",
+    () => api.fetchSessions(),
+    { respond: runtimeJson(sessions), result: { ...sessions, cursor } },
+  ],
   [
     "GET /api/sessions/search?q=foo%20bar",
     () => api.searchConversations("foo bar"),
