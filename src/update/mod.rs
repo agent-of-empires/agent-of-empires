@@ -97,6 +97,15 @@ fn load_cache() -> Option<UpdateCache> {
     serde_json::from_str(&content).ok()
 }
 
+/// A cache written by a build on the other channel describes the wrong releases.
+fn load_cache_for(current_version: &str) -> Option<UpdateCache> {
+    load_cache().filter(|cache| same_channel(&cache.latest_version, current_version))
+}
+
+fn same_channel(a: &str, b: &str) -> bool {
+    is_nightly(a) == is_nightly(b)
+}
+
 fn save_cache(cache: &UpdateCache) -> Result<()> {
     let path = cache_path()?;
     let content = serde_json::to_string_pretty(cache)?;
@@ -117,15 +126,14 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     }
 
     if !force {
-        if let Some(cache) = load_cache() {
+        if let Some(cache) = load_cache_for(current_version) {
             let age = chrono::Utc::now() - cache.checked_at;
             let max_age = chrono::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS as i64);
 
             // The user upgraded past the cached latest, so the cache is stale.
             let current_is_newer = is_newer_version(current_version, &cache.latest_version);
-            let same_channel = is_nightly(&cache.latest_version) == is_nightly(current_version);
 
-            if age < max_age && !current_is_newer && same_channel {
+            if age < max_age && !current_is_newer {
                 tracing::debug!(
                     target: "update.cache",
                     age_hours = age.num_hours(),
@@ -259,7 +267,7 @@ fn release_info_from(release: crate::github::GitHubRelease) -> ReleaseInfo {
 }
 
 pub fn get_cached_releases(from_version: Option<&str>) -> Vec<ReleaseInfo> {
-    let cache = match load_cache() {
+    let cache = match load_cache_for(env!("CARGO_PKG_VERSION")) {
         Some(c) => c,
         None => return vec![],
     };
@@ -332,7 +340,7 @@ fn classify_releases_behind(
 }
 
 pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
-    let cache = load_cache();
+    let cache = load_cache_for(current);
     let latest = cache.as_ref().map(|c| c.latest_version.as_str());
     let releases: &[ReleaseInfo] = cache.as_ref().map(|c| c.releases.as_slice()).unwrap_or(&[]);
     (
@@ -401,6 +409,22 @@ mod tests {
             ("1.22.2-nightly.20261108", "nightly-20261108"),
         ] {
             assert_eq!(release_tag(version), tag, "{version}");
+        }
+    }
+
+    #[test]
+    fn caches_from_the_other_channel_are_ignored() {
+        for (cached, current, usable) in [
+            ("1.22.1", "1.22.0", true),
+            ("1.22.2-nightly.20261108", "1.22.2-nightly.20261107", true),
+            ("1.22.2-nightly.20261108", "1.22.1", false),
+            ("1.22.1", "1.22.2-nightly.20261107", false),
+        ] {
+            assert_eq!(
+                same_channel(cached, current),
+                usable,
+                "{cached} for {current}"
+            );
         }
     }
 
