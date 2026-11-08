@@ -2095,6 +2095,49 @@ mod pane_probe_tests {
 
     #[test]
     #[serial_test::serial]
+    fn live_pane_guard_refuses_a_captured_pane_that_exited() {
+        use crate::tmux::test_helpers::{pane_field, wait_for_pane_dead, TmuxTestSession};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let instance =
+            crate::session::Instance::new("live-to-corpse", root.path().to_str().unwrap());
+        let session = instance.tmux_session().unwrap();
+        let _pane = TmuxTestSession::from_name(session.name());
+        let expected = create_observed_test_pane(&instance, root.path());
+        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "0");
+        assert!(expected.identity.pane_pid.is_some());
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &expected.identity.pane_id,
+                "remain-on-exit",
+                "on",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(crate::tmux::tmux_command()
+            .args(["send-keys", "-t", &expected.identity.pane_id, "C-c"])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(&expected.identity.pane_id);
+
+        let removed = remove_owned_pane(&expected, false);
+        assert!(
+            removed.is_err(),
+            "a live-process authorization must not consume a corpse: {removed:?}"
+        );
+        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "1");
+        assert!(session.exists_live());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn dead_pane_cleanup_never_kills_a_peer_pane() {
         use crate::tmux::test_helpers::{
             pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,

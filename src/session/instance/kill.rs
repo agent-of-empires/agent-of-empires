@@ -603,6 +603,94 @@ impl Instance {
 mod tests {
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn revival_refuses_a_window_linked_to_another_session() {
+        use crate::tmux::test_helpers::{pane_field, wait_for_pane_command, TmuxTestSession};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let owner = Instance::new("revival-linked-owner", root.path().to_str().unwrap());
+        let alias = Instance::new("revival-linked-alias", root.path().to_str().unwrap());
+        let owner_session = owner.tmux_session().unwrap();
+        let alias_session = alias.tmux_session().unwrap();
+        let _owner = TmuxTestSession::from_name(owner_session.name());
+        let _alias = TmuxTestSession::from_name(alias_session.name());
+        let physical = owner_session
+            .create_with_size_env_and_container_env(
+                root.path().to_str().unwrap(),
+                Some("exec sleep 120"),
+                None,
+                "default",
+                &[],
+                &[],
+                None,
+            )
+            .unwrap()
+            .expect("managed live pane");
+        let pane = &physical.identity.pane_id;
+        wait_for_pane_command(pane, "sleep");
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                alias_session.name(),
+                "-t",
+                &physical.identity.session_id,
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            pane_field(
+                pane,
+                "#{session_windows}|#{window_panes}|#{window_linked_sessions}"
+            ),
+            "1|1|2",
+            "one pane/window is shared by two real sessions"
+        );
+        let context = pane_field(pane, "#{session_id}");
+        let alias_id = pane_field(&format!("={}:", alias_session.name()), "#{session_id}");
+        let instance = if context == physical.identity.session_id {
+            &owner
+        } else {
+            assert_eq!(context, alias_id);
+            &alias
+        };
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock(&instance.id)
+            .unwrap();
+        let pid = pane_field(pane, "#{pane_pid}").parse().unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        let releases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = releases.clone();
+        let _release = crate::process::systemd::release_probe::install(move |_| {
+            observed.set(observed.get() + 1);
+        });
+
+        let result = instance.kill_for_revival_locked();
+        assert!(
+            result.is_err(),
+            "revival must not kill the process shared by another session: {result:?}"
+        );
+        assert!(owner_session.exists_live());
+        assert!(alias_session.exists_live());
+        assert_eq!(pane_field(pane, "#{pane_dead}"), "0");
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+        assert_eq!(releases.get(), 0);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::serial]
