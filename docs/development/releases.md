@@ -37,10 +37,10 @@ Once a migration is merged to `main`, its number and behavior are frozen: nightl
 The workflow does nothing until the `NIGHTLY_ENABLED` repository variable is `true`. Stable clients up to v1.22.2 read the newest entry of the full release list, cannot parse a `nightly-*` tag as a version, and then report no update, so publishing a nightly hides every later stable release from them. Turn nightlies on only after a stable release with the channel-aware update check has shipped and most users have updated to it:
 
 ```bash
-gh variable set NIGHTLY_ENABLED --body true
+gh variable set NIGHTLY_ENABLED --body true -R agent-of-empires/agent-of-empires
 ```
 
-In the same change, delete the "not published yet" note under Nightly Channel in `docs/installation.md`.
+The first nightly appears after the next scheduled run, or `gh workflow run nightly.yml -R agent-of-empires/agent-of-empires`. Once it is published, delete the "not published yet" note under Nightly Channel in `docs/installation.md`.
 
 ## Skill hubs
 
