@@ -452,34 +452,37 @@ mod tests {
             return;
         }
 
-        let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
-        inst.tool = "bash".into();
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        let mut inst = Instance::new("ensure_alive_test", cwd);
+        inst.tool = "claude".into();
         inst.command = "sleep 60".into();
-        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
-        let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &tmux_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "60",
-            ])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
+        assert_eq!(
+            crate::agents::get_agent(&inst.tool).map(|agent| agent.binary),
+            Some("claude")
+        );
+        assert!(inst.has_command_override());
+        let session = inst.tmux_session().unwrap();
+        let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        session
+            .create_with_size(
+                cwd,
+                Some(&inst.command),
+                Some((80, 24)),
+                &inst.source_profile,
+            )
+            .expect("managed agent pane");
         crate::tmux::refresh_session_cache();
-        let pane = crate::tmux::test_helpers::only_pane_id(&tmux_name);
+        let pane = crate::tmux::test_helpers::only_pane_id(session.name());
         crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, before) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .expect("unambiguous managed agent target")
+            .expect("managed agent pane appears in the readiness batch");
+        assert_eq!(before.pane_id, pane);
+        assert_eq!(before.pane_current_command.as_deref(), Some("sleep"));
+        assert!(!before.pane_dead);
+        let pid = before.pane_pid.expect("live pane has a PID");
 
         inst.status = Status::Running;
         let prev_start = inst.last_start_time;
@@ -489,10 +492,11 @@ mod tests {
         assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
-        assert_eq!(crate::tmux::test_helpers::only_pane_id(&tmux_name), pane);
-
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, after) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .unwrap()
+            .expect("same managed agent after ensure");
+        assert_eq!(after.pane_id, pane);
+        assert_eq!(after.pane_pid, Some(pid));
     }
 }
