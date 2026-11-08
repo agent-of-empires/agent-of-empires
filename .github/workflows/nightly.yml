@@ -118,7 +118,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' \
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' \
             | grep '^nightly-' | sort -r | tail -n +"$((NIGHTLY_KEEP + 1))" \
             | while read -r tag; do
                 gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
