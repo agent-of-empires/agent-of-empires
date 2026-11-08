@@ -445,7 +445,7 @@ pub struct AcpConfig {
         label = "New Sessions open in",
         widget = "select",
         options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view",
-        summary = "Auto opens new Sessions in Structured view in the Web dashboard and Terminal view in the terminal app. Off removes Structured view from the new Session dialog and the view switch; you can still switch a Structured view Session to Terminal view."
+        summary = "Auto preselects Structured view for new Sessions in the Web dashboard and Terminal view in the terminal app. Off removes Structured view from the new Session dialog and the view switch; you can still switch a Structured view Session to Terminal view."
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
@@ -1147,39 +1147,42 @@ pub struct SessionConfig {
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
     #[setting(
-        label = "Split Terminal Height (%)",
+        label = "Paired terminal share of the split (%)",
         widget = "number",
         min = 1,
         max = 99,
         validate = "range:1:99",
         tui_only,
-        global_only
+        global_only,
+        summary = "In the terminal app's split preview, how much of the height the paired terminal gets."
     )]
     pub split_terminal_height_percent: u16,
 
     /// Minimum whole-window width for the paired terminal split.
     #[serde(default = "default_split_terminal_min_width")]
     #[setting(
-        label = "Split Terminal Minimum Width",
+        label = "Split only when at least this wide",
         widget = "number",
         min = 0,
         max = 1000,
         validate = "range:0:1000",
         tui_only,
-        global_only
+        global_only,
+        summary = "Window width in columns. A narrower terminal app window shows the preview without the paired terminal. 0 never hides it for width."
     )]
     pub split_terminal_min_width: u16,
 
     /// Minimum whole-window height for the paired terminal split.
     #[serde(default = "default_split_terminal_min_height")]
     #[setting(
-        label = "Split Terminal Minimum Height",
+        label = "Split only when at least this tall",
         widget = "number",
         min = 0,
         max = 1000,
         validate = "range:0:1000",
         tui_only,
-        global_only
+        global_only,
+        summary = "Window height in rows. A shorter terminal app window shows the preview without the paired terminal. 0 never hides it for height."
     )]
     pub split_terminal_min_height: u16,
 
@@ -3468,7 +3471,7 @@ pub struct SystemdSettings {
         widget = "text",
         validate = "systemd_slice",
         global_only,
-        summary = "Must end in .slice. {profile} becomes the Profile name."
+        summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
     )]
     pub slice: String,
 
