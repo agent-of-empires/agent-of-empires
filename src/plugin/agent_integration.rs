@@ -279,15 +279,12 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     provider_snapshot(instance, &instance.tool)
 }
 
-/// The provider snapshot that owns this session's status, read through the same
-/// detection identity as its configured rules and status ownership.
+/// The provider snapshot that owns this session's status.
 pub fn status_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrationSnapshot> {
     provider_snapshot(instance, tool)
 }
 
-/// The integration status a poll applies. Carrying the detection identity it
-/// derived keeps the poll and its test on one identity: a custom tool aliased to
-/// a provider tool reads that provider's report.
+/// The integration status a poll applies, carrying the identity it derived.
 pub(crate) struct IntegrationStatus {
     pub(crate) tool: String,
     pub(crate) configured: bool,
@@ -435,8 +432,7 @@ fn declared_agent_in(
     resolved
 }
 
-/// Whether an approved provider integration owns status for `tool`, the
-/// effective detection identity of the session.
+/// Whether an approved provider integration owns status for `tool`, a detection identity.
 pub(crate) fn status_owned(tool: &str) -> bool {
     let registry = super::registry();
     let owned = registry.active().any(|plugin| {
@@ -1928,8 +1924,6 @@ deny = [{ kind = "literal", value = "n" }]
         assert!(!same_prompt(&snapshot(), &changed));
     }
 
-    /// A custom tool aliased to a provider-owned tool must read that provider's
-    /// report rather than fail closed on the missing report.
     #[test]
     #[serial_test::serial(hook_base)]
     fn aliased_custom_tool_reads_the_owning_provider_report() {
@@ -1969,8 +1963,6 @@ deny = [{ kind = "literal", value = "n" }]
         )
         .unwrap();
 
-        // The poll applies this same derivation, so the aliased identity is what
-        // owns status and selects the snapshot.
         let integration = integration_status(&instance);
         assert!(integration.configured);
         assert_eq!(
@@ -1983,8 +1975,7 @@ deny = [{ kind = "literal", value = "n" }]
             "the custom name owns nothing"
         );
 
-        // The alias still owns status with no report, so the poll reads Unknown
-        // rather than falling back to the custom name.
+        // With no report the alias still owns status, so the poll reads Unknown.
         let mut unreported = Instance::new("alias-status-unreported", "/tmp");
         unreported.tool = "my-acme".into();
         unreported.source_profile = PROFILE.into();
