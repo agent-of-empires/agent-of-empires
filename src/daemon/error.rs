@@ -191,6 +191,8 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
             b"pi_transcript_binding_required" => ManagedResumeCause::PiTranscriptBindingRequired,
             b"omp_transcript_binding_required" => ManagedResumeCause::OmpTranscriptBindingRequired,
+            b"previous_probe_failed" => ManagedResumeCause::PreviousProbeFailed,
+            b"automatic_resume_disabled" => ManagedResumeCause::AutomaticResumeDisabled,
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
@@ -341,6 +343,8 @@ mod tests {
                 OmpTranscriptBindingRequired,
             ),
             ("execution_context_unattested", ExecutionContextUnattested),
+            ("previous_probe_failed", PreviousProbeFailed),
+            ("automatic_resume_disabled", AutomaticResumeDisabled),
             ("secret-token", ExecutionContextUnattested),
             (
                 "wrapper_contract_required, secret-token",

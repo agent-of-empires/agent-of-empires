@@ -2704,6 +2704,7 @@ fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
     account_swap: bool,
+    resume_policy: crate::session::ResumeAttemptPolicy,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     if let Err(blocked) = row.ensure_startable() {
@@ -2713,6 +2714,9 @@ fn admit_restart(
         || row.has_fresh_lifecycle_reservation(now)
     {
         return Err(LifecycleTargetError::Busy.into());
+    }
+    if !row.is_structured() {
+        row.check_resume_attempt(resume_policy)?;
     }
     row.try_acquire_lifecycle_reservation(
         LifecycleOperation::Launch,
@@ -2791,7 +2795,12 @@ fn reserve_structured_restart(
             .map_err(LifecycleTargetError::Blocked)?;
         return Err(LifecycleTargetError::Busy.into());
     }
-    admit_restart(&mut probe, body, false)?;
+    admit_restart(
+        &mut probe,
+        body,
+        false,
+        crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+    )?;
     if let Some(target) = body
         .profile
         .as_deref()
@@ -3297,6 +3306,11 @@ async fn prepare_agent_session_inner(
     expected_generation: Option<u64>,
     restart_origin: RestartOrigin,
 ) -> axum::response::Response {
+    let resume_policy = match (restart_origin, preparation) {
+        (RestartOrigin::StartupRecovery, _) => crate::session::ResumeAttemptPolicy::Automatic,
+        (_, AgentPreparation::Ensure) => crate::session::ResumeAttemptPolicy::Allow,
+        _ => crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+    };
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
     }
@@ -3627,7 +3641,7 @@ async fn prepare_agent_session_inner(
             if let Some(target) = target {
                 probe.source_profile = target.into();
             }
-            admit_restart(&mut probe, body, account_swap)?;
+            admit_restart(&mut probe, body, account_swap, resume_policy)?;
             if let Some(target_native) = &target_native {
                 let rows = target_native.storage().load()?;
                 if rows.iter().any(|row| row.id == outgoing.id)
@@ -3661,7 +3675,7 @@ async fn prepare_agent_session_inner(
                     ) {
                         return Err(duplicate_session_error(&candidate.title));
                     }
-                    admit_restart(candidate, body, account_swap)?;
+                    admit_restart(candidate, body, account_swap, resume_policy)?;
                     moved = Some(candidate.clone());
                     Ok(())
                 },
@@ -3689,7 +3703,7 @@ async fn prepare_agent_session_inner(
                 }
                 if let Some(body) = &worker_restart {
                     row.source_profile.clone_from(&profile);
-                    admit_restart(row, body, account_swap)?;
+                    admit_restart(row, body, account_swap, resume_policy)?;
                     row.rebase_acp_generation(native.storage())?;
                     return Ok(Some(row.clone()));
                 }
@@ -3745,6 +3759,9 @@ async fn prepare_agent_session_inner(
                         crate::session::LifecycleReservationError::Superseded
                     );
                     start_admission = Some(admission);
+                }
+                if !row.is_structured() {
+                    row.check_resume_attempt(resume_policy)?;
                 }
                 let generation = row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
@@ -3918,11 +3935,7 @@ async fn prepare_agent_session_inner(
                     &native,
                     size,
                     crate::session::ResumeLaunchOptions {
-                        resume_policy: if preparation == AgentPreparation::Ensure {
-                            crate::session::ResumeAttemptPolicy::Allow
-                        } else {
-                            crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
-                        },
+                        resume_policy,
                         restart: preparation == AgentPreparation::Restart,
                         conversation_carry: conversation_carry.1,
                         start_admission,
@@ -4157,11 +4170,7 @@ async fn prepare_agent_session_inner(
         };
         if matches!(
             outcome,
-            Some(
-                crate::session::StartOutcome::Fresh
-                    | crate::session::StartOutcome::Resumed
-                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
-            )
+            Some(crate::session::StartOutcome::Fresh | crate::session::StartOutcome::Resumed)
         ) {
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
