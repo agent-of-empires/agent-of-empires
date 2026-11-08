@@ -13,6 +13,11 @@ pub(super) enum ClientCmd {
     /// attachments). Built in `send_prompt` so the connection task just
     /// forwards them to `session/prompt`. See #1000.
     Prompt(Vec<ContentBlock>),
+    /// A durable queue keeps its rows until this task admits the content.
+    QueuedPrompt {
+        blocks: Vec<ContentBlock>,
+        accepted: oneshot::Sender<bool>,
+    },
     Cancel,
     /// Force-stop now: end the in-flight turn with `user_forced` and let
     /// the drain task kill the worker process group + respawn. See #1727.

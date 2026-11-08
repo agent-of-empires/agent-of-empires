@@ -2493,6 +2493,7 @@ async fn finish_structured_restart(
                                     prompt_id: None,
                                     synthesized: true,
                                     no_revive: true,
+                                    queued: false,
                                 },
                             )
                             .await;

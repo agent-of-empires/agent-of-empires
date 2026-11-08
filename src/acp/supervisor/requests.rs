@@ -105,6 +105,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// Confirm worker admission before a durable queue retires its rows.
+    pub(crate) async fn send_queued_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), SupervisorError> {
+        let client = self.ready_client(session_id).await?;
+        client.send_queued_prompt(text, attachments).await?;
+        Ok(())
+    }
+
     /// Drive a conversation reset (a fresh `session/new`) for a clear command,
     /// then re-assert the session's mode.
     pub async fn reset_session_context(

@@ -299,6 +299,23 @@ export function useAcpSession(
   // list per session re-sends rows the server never confirmed; a confirmed row missing from the
   // server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
+  const queueSync = useRef({ revision: new Map<string | null, number>(), pending: new Map<string | null, number>() });
+  const [queueRevision, refreshQueue] = useReducer((revision: number) => revision + 1, 0);
+  const mutateQueue = useCallback(
+    async <T>(mutation: () => Promise<T>): Promise<T> => {
+      const { revision, pending } = queueSync.current;
+      revision.set(sessionId, (revision.get(sessionId) ?? 0) + 1);
+      pending.set(sessionId, (pending.get(sessionId) ?? 0) + 1);
+      try {
+        return await mutation();
+      } finally {
+        pending.set(sessionId, (pending.get(sessionId) ?? 1) - 1);
+        revision.set(sessionId, (revision.get(sessionId) ?? 0) + 1);
+        if (sessionIdRef.current === sessionId) refreshQueue();
+      }
+    },
+    [queueSync, sessionId, sessionIdRef],
+  );
   const hasQueuedPrompts = state.queuedPrompts.length > 0;
   const queueCanResume =
     state.turnActive && !state.compacting && !state.cancelling && !!state.promptCapabilities?.steering;
@@ -307,8 +324,16 @@ export function useAcpSession(
     let cancelled = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const refresh = async () => {
+      if ((queueSync.current.pending.get(sessionId) ?? 0) > 0) return;
+      const revision = queueSync.current.revision.get(sessionId);
       const rows = await listServerQueue(sessionId);
-      if (cancelled) return;
+      // A mutation invalidates even a successful GET that began before it.
+      if (
+        cancelled ||
+        (queueSync.current.pending.get(sessionId) ?? 0) > 0 ||
+        revision !== queueSync.current.revision.get(sessionId)
+      )
+        return;
       if (rows) dispatch({ kind: "hydrate_server_queue", rows });
       let deferred = hasQueuedPrompts;
       if (rows) deferred = !!rows[0]?.resume_after_compaction;
@@ -334,29 +359,38 @@ export function useAcpSession(
       cancelled = true;
       clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, hasQueuedPrompts, queueCanResume, queuedPromptsRef]);
+  }, [
+    sessionId,
+    status,
+    state.turnActive,
+    hasQueuedPrompts,
+    queueCanResume,
+    queuedPromptsRef,
+    queueSync,
+    queueRevision,
+  ]);
 
-  // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
+  // Reconcile after each optimistic mutation, including failures.
   const removeQueuedPrompt = useCallback(
     (id: string) => {
       dispatch({ kind: "dequeue_prompt", id });
-      if (sessionId) void removeServerQueuedPrompt(sessionId, id);
+      if (sessionId) void mutateQueue(() => removeServerQueuedPrompt(sessionId, id));
     },
-    [sessionId],
+    [sessionId, mutateQueue],
   );
 
   const editQueuedPrompt = useCallback(
     (id: string, text: string) => {
       dispatch({ kind: "edit_queued_prompt", id, text });
-      if (sessionId) void editServerQueuedPrompt(sessionId, id, text);
+      if (sessionId) void mutateQueue(() => editServerQueuedPrompt(sessionId, id, text));
     },
-    [sessionId],
+    [sessionId, mutateQueue],
   );
 
   const clearQueue = useCallback(() => {
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void clearServerQueue(sessionId);
-  }, [sessionId]);
+    if (sessionId) void mutateQueue(() => clearServerQueue(sessionId));
+  }, [sessionId, mutateQueue]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {
@@ -380,7 +414,7 @@ export function useAcpSession(
       // The daemon consumes the row once it accepts the send, so the drain can't also deliver it
       // and a plugin-sent row keeps the sender it stored.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
-      const result = await dispatchPromptNow(prompt.text, prompt.attachments, prompt.id);
+      const result = await mutateQueue(() => dispatchPromptNow(prompt.text, prompt.attachments, prompt.id));
       // The daemon keeps the row until it accepts the send, so a refusal or a re-park leaves it queued.
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);
@@ -392,7 +426,7 @@ export function useAcpSession(
         showServerQueued(prompt.id, prompt.text, prompt.attachments);
       }
     },
-    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued],
+    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued, mutateQueue],
   );
 
   // Pessimistic: the value changes when the adapter confirms; pending only dims the clicked option.

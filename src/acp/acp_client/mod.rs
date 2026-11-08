@@ -403,6 +403,10 @@ impl AcpClient {
         let (client, event_tx) = Self::fake_with_consumer(session_id, move |cmd| {
             let name = match cmd {
                 ClientCmd::Prompt(_) => "prompt",
+                ClientCmd::QueuedPrompt { accepted, .. } => {
+                    let _ = accepted.send(true);
+                    "prompt"
+                }
                 ClientCmd::Cancel => "cancel",
                 ClientCmd::ForceStop => "force_stop",
                 ClientCmd::SetMode(_) => "set_mode",
@@ -432,6 +436,27 @@ impl AcpClient {
             record.lock().expect("cmd record mutex").push(name);
         });
         (client, event_tx, cmds)
+    }
+
+    /// Holds queue admission so server tests can inspect durable ownership.
+    #[cfg(test)]
+    pub(crate) fn fake_for_test_queued_prompt(
+        session_id: AcpSessionId,
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<(Vec<ContentBlock>, Option<oneshot::Sender<bool>>)>,
+    ) {
+        let (sent, received) = mpsc::unbounded_channel();
+        let (client, _) = Self::fake_with_consumer(session_id, move |cmd| match cmd {
+            ClientCmd::QueuedPrompt { blocks, accepted } => {
+                let _ = sent.send((blocks, Some(accepted)));
+            }
+            ClientCmd::Prompt(blocks) => {
+                let _ = sent.send((blocks, None));
+            }
+            _ => {}
+        });
+        (client, received)
     }
 
     /// Fails every driven reset with `message`.
@@ -705,6 +730,25 @@ impl AcpClient {
         text: &str,
         attachments: &[AttachmentBlob],
     ) -> Result<(), AcpError> {
+        self.submit_prompt(text, attachments, false).await
+    }
+
+    /// Wait for admission rather than merely enqueueing a command. A refusal
+    /// leaves ownership with the durable queue, including its attachment bytes.
+    pub(crate) async fn send_queued_prompt(
+        &self,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), AcpError> {
+        self.submit_prompt(text, attachments, true).await
+    }
+
+    async fn submit_prompt(
+        &self,
+        text: &str,
+        attachments: &[AttachmentBlob],
+        queued: bool,
+    ) -> Result<(), AcpError> {
         use base64::Engine as _;
         if self.cmd_tx.is_none() {
             return Err(AcpError::NotRunning);
@@ -727,7 +771,17 @@ impl AcpClient {
                 }
             });
         }
-        self.send_cmd(ClientCmd::Prompt(blocks)).await
+        if !queued {
+            return self.send_cmd(ClientCmd::Prompt(blocks)).await;
+        }
+        let (accepted, admission) = oneshot::channel();
+        self.send_cmd(ClientCmd::QueuedPrompt { blocks, accepted })
+            .await?;
+        match admission.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AcpError::Protocol("queued prompt was not accepted".into())),
+            Err(_) => Err(AcpError::AgentExited),
+        }
     }
 
     /// Best-effort `session/cancel`; Ok even with no turn in flight.

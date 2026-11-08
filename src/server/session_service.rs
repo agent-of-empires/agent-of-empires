@@ -353,6 +353,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// whether to resume, rather than by a separate liveness probe that
     /// would race it.
     pub no_revive: bool,
+    /// Queue rows stay durable until the worker admits their content.
+    pub queued: bool,
 }
 
 impl std::fmt::Display for SendTurnError {
@@ -935,6 +937,7 @@ impl SessionService {
             prompt_id,
             synthesized,
             no_revive,
+            queued,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish, or forward for
@@ -1016,7 +1019,13 @@ impl SessionService {
             .await;
         let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
-                self.acp_supervisor.send_prompt(id, text, attachments).await
+                if queued {
+                    self.acp_supervisor
+                        .send_queued_prompt(id, text, attachments)
+                        .await
+                } else {
+                    self.acp_supervisor.send_prompt(id, text, attachments).await
+                }
             }
             crate::acp::supervisor::PromptDisposition::ResetContext => {
                 self.acp_supervisor
@@ -1132,6 +1141,7 @@ impl SessionService {
                     prompt_id: None,
                     synthesized,
                     no_revive: false,
+                    queued: false,
                 },
             )
             .await
@@ -1387,31 +1397,8 @@ impl SessionService {
         Some(result)
     }
 
-    /// Append a prompt to the session's server-owned queue and return the
-    /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
-    /// re-enqueuing an existing id updates its text/attachments in place instead
-    /// of adding a duplicate, so an optimistic client retry cannot double-queue.
-    ///
-    /// Queueing is a user gesture, so it advances `last_accessed_at`. Both
-    /// enqueue routes land here (`POST /queue` from the web composer, and
-    /// `/acp/prompt`'s Tier 3 `Queued` disposition, which the TUI takes because
-    /// it always posts the prompt endpoint), so the two clients stay symmetric
-    /// without either endpoint plumbing recency itself. It is only a recency
-    /// advance, never a wake: the respawn kick a real wake needs lives on the
-    /// prompt endpoint, and a client queues behind a live turn, so there is no
-    /// sunk row to lift here.
-    ///
-    /// Until #3465 this was invisible. `apply_status_intent` restamped the
-    /// field on every worker-event transition, so a queued turn's Running/Idle
-    /// edges kept recency fresh by accident; dropping that stamp is what made
-    /// the missing gesture-side write observable in the attention sort and the
-    /// TUI activity column.
-    ///
-    /// Deliberately does NOT take [`Self::prompt_submission`]: `acp_prompt`
-    /// calls this through `buffer_and_enqueue` while already holding it, and
-    /// the guard is not reentrant. The `queue_enqueue` handler claims it
-    /// instead, so the row rewrite this does for an existing id still cannot
-    /// land inside a drain's snapshot-to-send window.
+    /// Convenience for tests enqueueing an ordinary next-turn prompt.
+    #[cfg(test)]
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -1435,6 +1422,8 @@ impl SessionService {
         .await
     }
 
+    /// Idempotently enqueue by prompt id and advance recency without waking.
+    /// The caller holds the submission guard across queue admission.
     pub(crate) async fn enqueue_prompt_with_options(
         self: &Arc<Self>,
         id: &str,
@@ -1874,6 +1863,7 @@ impl SessionService {
                     prompt_id: None,
                     synthesized: false,
                     no_revive: false,
+                    queued: true,
                 },
             )
             .await
@@ -2922,6 +2912,7 @@ mod tests {
                         prompt_id: None,
                         synthesized: false,
                         no_revive: false,
+                        queued: false,
                     },
                 )
                 .await,
@@ -2941,6 +2932,7 @@ mod tests {
                         prompt_id: None,
                         synthesized: false,
                         no_revive: false,
+                        queued: false,
                     },
                 )
                 .await,
@@ -2960,6 +2952,7 @@ mod tests {
                         prompt_id: None,
                         synthesized: false,
                         no_revive: false,
+                        queued: false,
                     },
                 )
                 .await,
@@ -2983,6 +2976,7 @@ mod tests {
                         prompt_id: None,
                         synthesized: false,
                         no_revive: false,
+                        queued: false,
                     },
                 )
                 .await,
@@ -3002,6 +2996,7 @@ mod tests {
                         prompt_id: None,
                         synthesized: false,
                         no_revive: false,
+                        queued: false,
                     },
                 )
                 .await,
@@ -3084,6 +3079,125 @@ mod tests {
         );
         assert!(commands.lock().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn queued_delivery_keeps_rows_and_bytes_until_worker_acceptance() {
+        use crate::acp::event_store::AttachmentBlob;
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+        use crate::daemon::{PromptAttachmentKind, PromptAttachmentRef};
+        use std::time::Duration;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "queue-admission";
+        let mut inst = Instance::new("queue-admission", "/tmp/aoe-queue-admission");
+        inst.id = id.into();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Running;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        let mut received = service
+            .acp_supervisor
+            .test_insert_worker_queued_prompt(id)
+            .await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        for (seq, event) in [
+            Event::PromptCapabilities {
+                image: true,
+                audio: false,
+                embedded_context: false,
+                steering: true,
+                load_session: None,
+            },
+            Event::UserPromptSent {
+                text: "running task".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(sink.publish_persisted(id, seq as u64 + 1, &event));
+        }
+        let blob = AttachmentBlob {
+            id: "image".into(),
+            kind: PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: Some("screenshot.png".into()),
+            data: vec![1, 2, 3, 4],
+        };
+        assert!(state
+            .acp_event_store
+            .record_pending_attachment(id, "queued", &blob));
+        service
+            .enqueue_prompt_with_options(
+                id,
+                "queued".into(),
+                "inspect this screenshot".into(),
+                vec![PromptAttachmentRef {
+                    id: blob.id.clone(),
+                    kind: blob.kind,
+                    mime_type: blob.mime_type.clone(),
+                    name: blob.name.clone(),
+                    size: blob.data.len() as u64,
+                }],
+                QueuedPromptOptions {
+                    resume_after_compaction: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for accepted in [false, true] {
+            let delivery = tokio::spawn({
+                let service = service.clone();
+                async move { service.drain_queued_prompts_once(id).await }
+            });
+            let (blocks, receipt) = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(service.queued_prompts_snapshot(id).await.len(), 1);
+            assert_eq!(
+                state
+                    .acp_event_store
+                    .load_pending_attachments_for_ref(id, "queued")[0]
+                    .data,
+                blob.data
+            );
+            assert!(
+                !delivery.is_finished(),
+                "channel enqueue alone cannot retire the row"
+            );
+            receipt
+                .expect("queue sends require a worker receipt")
+                .send(accepted)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), delivery)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                service.queued_prompts_snapshot(id).await.is_empty(),
+                accepted
+            );
+            assert_eq!(
+                state
+                    .acp_event_store
+                    .load_pending_attachments_for_ref(id, "queued")
+                    .is_empty(),
+                accepted
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compaction_deferred_prompts_keep_fifo_and_command_gates() {
         use crate::acp::state::Event;

@@ -362,6 +362,7 @@ pub(crate) async fn submit_prompt(
                 prompt_id: req.prompt_id.clone(),
                 synthesized: false,
                 no_revive: req.no_revive,
+                queued: queued_row.is_some(),
             },
         )
         .await;

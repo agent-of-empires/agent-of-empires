@@ -137,6 +137,15 @@ impl Session {
                         break;
                     }
                 }
+                Some(ClientCmd::QueuedPrompt { blocks, accepted }) => {
+                    if accepted.is_closed() {
+                        continue;
+                    }
+                    let _ = accepted.send(true);
+                    if self.run_prompt(blocks).await? {
+                        break;
+                    }
+                }
                 Some(ClientCmd::Cancel) => {
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
                     // Not `?`: a dead connection is when the UI most needs

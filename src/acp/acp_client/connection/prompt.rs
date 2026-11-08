@@ -428,6 +428,30 @@ impl Session {
                     .await
             }
             Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
+            Some(ClientCmd::QueuedPrompt { blocks, accepted }) => {
+                if accepted.is_closed() {
+                    return Ok(Flow::Continue);
+                }
+                // Commands outrank lifecycle traffic; include a compaction
+                // notification already received before admitting a queued steer.
+                for _ in 0..self.lifecycle_rx.len() {
+                    if let Ok(env) = self.lifecycle_rx.try_recv() {
+                        if env.epoch == turn.epoch {
+                            turn.apply(env.signal);
+                        }
+                    }
+                }
+                let compacting =
+                    turn.watchdog.off_protocol_work_seen() == Some(OffProtocolWorkKind::Compaction);
+                let admitted = self.steering_capable
+                    && !turn.flags.cancelling
+                    && !compacting
+                    && turn.steer_fut.is_none();
+                if admitted {
+                    self.steer_or_backlog(turn, blocks);
+                }
+                let _ = accepted.send(admitted);
+            }
             Some(ClientCmd::ResetSession {
                 text, respond_to, ..
             }) => {
