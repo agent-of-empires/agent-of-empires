@@ -4,6 +4,41 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.22.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.2) - 2026-11-08
+
+
+
+### Bug Fixes
+
+- **session:** Accept --thinking for managed pi conversations in [#5435](https://github.com/agent-of-empires/agent-of-empires/pull/5435) by [@Seluj78](https://github.com/Seluj78) ([`89ce02e`](https://github.com/agent-of-empires/agent-of-empires/commit/89ce02e7822d6a0fe2023e644e53d3997a6eaa0c))
+- **web:** Release stale terminal focus after an iOS app switch in [#5445](https://github.com/agent-of-empires/agent-of-empires/pull/5445) by [@njbrake](https://github.com/njbrake) ([`6d35cd7`](https://github.com/agent-of-empires/agent-of-empires/commit/6d35cd744f4e8e82859dcf9ad4f888918122dc3f))
+- **acp:** Close replayed tool calls that arrive with a final status in [#5431](https://github.com/agent-of-empires/agent-of-empires/pull/5431) by [@Seluj78](https://github.com/Seluj78) ([`a090197`](https://github.com/agent-of-empires/agent-of-empires/commit/a0901976e9e88f87fdba49c80de18d2d2d0ef0cd))
+- **server:** Log the full create-failure chain and record unawaited panics in [#5438](https://github.com/agent-of-empires/agent-of-empires/pull/5438) by [@Seluj78](https://github.com/Seluj78) ([`8d526b7`](https://github.com/agent-of-empires/agent-of-empires/commit/8d526b7c73e364c057ab0f4c3dc838c18cc926fe))
+- **serve:** Release spawn guards before post-launch creation rollback in [#5433](https://github.com/agent-of-empires/agent-of-empires/pull/5433) by [@Seluj78](https://github.com/Seluj78) ([`5600c20`](https://github.com/agent-of-empires/agent-of-empires/commit/5600c2028cbf9a9f210e95d13c744a4ba23790f6))
+- **test:** Root integration temp home in /tmp so Daemon socket fits on macOS in [#5437](https://github.com/agent-of-empires/agent-of-empires/pull/5437) by [@Seluj78](https://github.com/Seluj78) ([`1974d5a`](https://github.com/agent-of-empires/agent-of-empires/commit/1974d5ac35c956188a2de7433f3f47e9b6b27bec))
+- **hooks:** Drop Claude status events from another conversation in [#5439](https://github.com/agent-of-empires/agent-of-empires/pull/5439) by [@Seluj78](https://github.com/Seluj78) ([`3d70848`](https://github.com/agent-of-empires/agent-of-empires/commit/3d70848feb8944a9d0384f4fa5818dcaa5caa766))
+- **acp:** Broadcast each session's events in seq order in [#5416](https://github.com/agent-of-empires/agent-of-empires/pull/5416) by [@klubrake](https://github.com/klubrake) ([`460ac94`](https://github.com/agent-of-empires/agent-of-empires/commit/460ac94b5c7b76392e99bec0d3860f24ee704b0d))
+- **web:** List every registered Project when grouping By group in [#5420](https://github.com/agent-of-empires/agent-of-empires/pull/5420) by [@klubrake](https://github.com/klubrake) ([`49b1f25`](https://github.com/agent-of-empires/agent-of-empires/commit/49b1f259cbe8564041ca4db88471e8c9dfbe0598))
+- **process:** Cap polling at SIGTERM boundary in [#5457](https://github.com/agent-of-empires/agent-of-empires/pull/5457) by [@jerome-benoit](https://github.com/jerome-benoit) ([`d22ddf8`](https://github.com/agent-of-empires/agent-of-empires/commit/d22ddf81eefa3d9e656c68f82c2fc1c0acab92be))
+- **daemon:** Honor configured services during autostart in [#5283](https://github.com/agent-of-empires/agent-of-empires/pull/5283) by [@jerome-benoit](https://github.com/jerome-benoit) ([`0d105f7`](https://github.com/agent-of-empires/agent-of-empires/commit/0d105f7a6bee8c97464caf943bf64081ea725991))
+- **tui:** Share and align plugin status badges in [#5349](https://github.com/agent-of-empires/agent-of-empires/pull/5349) by [@athal7](https://github.com/athal7) ([`b6ac206`](https://github.com/agent-of-empires/agent-of-empires/commit/b6ac206de2dae8d9aacd5373f22fefaedcee6d8d))
+- **tui:** Inspect trash transcripts read-only in [#5143](https://github.com/agent-of-empires/agent-of-empires/pull/5143) by [@jerome-benoit](https://github.com/jerome-benoit) ([`75b33e9`](https://github.com/agent-of-empires/agent-of-empires/commit/75b33e90347e3736a2440da1ae24ed87e43f02f4))
+- **core:** Keep idle auto-stop from killing a newly admitted prompt in [#5473](https://github.com/agent-of-empires/agent-of-empires/pull/5473) by [@cwrau](https://github.com/cwrau) ([`81f0668`](https://github.com/agent-of-empires/agent-of-empires/commit/81f066867f36b2e04851c82aa7ed85ecd365b641))
+- **web:** Show a retryable error when the Trash read for an opened session fails in [#5460](https://github.com/agent-of-empires/agent-of-empires/pull/5460) by [@cwrau](https://github.com/cwrau) ([`aff41ca`](https://github.com/agent-of-empires/agent-of-empires/commit/aff41ca6f4c0c202b86462539e91e73f6b70cf54))
+
+
+### Features
+
+- **plugin:** Dev installs for reserved-namespace plugins and AOE_NODE for build steps in [#5363](https://github.com/agent-of-empires/agent-of-empires/pull/5363) by [@Seluj78](https://github.com/Seluj78) ([`abe012d`](https://github.com/agent-of-empires/agent-of-empires/commit/abe012db5fc845e00fb9c7f354ff5c5ad78cbbbb))
+- **web:** Expand shared-worktree sidebar rows into their sessions in [#5128](https://github.com/agent-of-empires/agent-of-empires/pull/5128) by [@cwrau](https://github.com/cwrau) ([`8b1a7cc`](https://github.com/agent-of-empires/agent-of-empires/commit/8b1a7cc8525cc4be8949c9c6077b70cd42c265e4))
+
+
+### Performance
+
+- **acp:** Omit redundant background-agent snapshots for web in [#5443](https://github.com/agent-of-empires/agent-of-empires/pull/5443) by [@kaimo455](https://github.com/kaimo455) ([`33b3a60`](https://github.com/agent-of-empires/agent-of-empires/commit/33b3a60e8d8ebac2ff6ff3f674bd726ac66cd55b))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.22.1...v1.22.2
 ## [1.22.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.1) - 2026-11-06
 
 
