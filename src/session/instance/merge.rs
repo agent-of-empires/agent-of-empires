@@ -617,6 +617,14 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let mut canonical = Instance::new("canonical-poller", "/tmp/test");
         canonical.tool = "claude".into();
+        canonical.source_profile = "compatible-canonical-poller".into();
+        let storage = crate::session::Storage::new_unwatched(&canonical.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(canonical.clone());
+                Ok(())
+            })
+            .unwrap();
         let launched = canonical.clone();
         let poller = running_poller(
             &canonical.id,
@@ -646,7 +654,18 @@ mod tests {
             .latest_observation()
             .unwrap();
         assert_eq!(observed.1.sid, sid);
-        stop(&poller);
+        crate::session::sync::capture_launched_session_id_blocking(
+            &mut canonical,
+            &crate::file_watch::FileWatchService::noop(),
+            std::time::Duration::ZERO,
+            false,
+        );
+        assert_eq!(canonical.agent_session_id.as_deref(), Some(sid));
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(sid),
+            "the retained canonical watcher must persist its next observation",
+        );
     }
 
     #[test]
