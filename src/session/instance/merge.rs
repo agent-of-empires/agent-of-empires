@@ -607,6 +607,44 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn empty_launch_adoption_preserves_canonical_poller_and_next_observation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut canonical = Instance::new("canonical-poller", "/tmp/test");
+        canonical.tool = "claude".into();
+        let launched = canonical.clone();
+        let poller = running_poller(
+            &canonical.id,
+            &canonical.tool,
+            canonical.active_execution.clone(),
+        );
+        canonical.capture_poller.set_handle(Some(poller.clone()));
+        canonical.inherit_process_runtime(launched);
+        assert!(
+            canonical
+                .capture_poller
+                .handle()
+                .is_some_and(|held| Arc::ptr_eq(held, &poller)),
+            "an empty launch slot must not discard a compatible canonical watcher"
+        );
+        let sid = "11111111-2222-4333-8444-555555555555";
+        poller
+            .lock()
+            .unwrap()
+            .inject_test_update(&canonical.id, sid);
+        let observed = canonical
+            .capture_poller
+            .handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_observation()
+            .unwrap();
+        assert_eq!(observed.1.sid, sid);
+        stop(&poller);
+    }
+
+    #[test]
     fn user_action_diff_propagates_set_and_clear() {
         type Action = fn(&mut Instance);
         type Check = fn(&Instance) -> bool;

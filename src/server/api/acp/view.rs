@@ -2827,6 +2827,80 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     #[cfg(unix)]
+    async fn unproven_terminal_birth_keeps_handoff_and_projection() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            crate::tmux::test_helpers::tmux_available(),
+            "tmux is required"
+        );
+        let real_tmux = which::which("tmux")?;
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })?;
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let shim = bin.join("tmux");
+        let quote = crate::session::environment::shell_escape_script_word;
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\nif [ \"$arg\" = new-session ]; then {} \"$@\" >/dev/null; exit $?; fi\ndone\nexec {} \"$@\"\n",
+            quote(&real_tmux.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        ))?;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let mut source = Instance::new("unproven-terminal-handoff", root.path().to_str().unwrap());
+        source.source_profile = "default".into();
+        source.view = View::Structured;
+        source.command = "exec sleep 60".into();
+        let name = crate::tmux::Session::generate_name(&source.id, &source.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        let events = Arc::new(crate::acp::event_store::EventStore::open(
+            &root.path().join("events.db"),
+            100,
+        )?);
+        let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+        let sentinel = events.highest_seq_checked(&source.id)? + 1;
+        events.record(
+            &source.id,
+            sentinel,
+            &crate::acp::Event::Stopped {
+                reason: "projection sentinel".into(),
+            },
+        )?;
+        let response = terminal_handoff_request(state, source.id.clone()).await;
+        let durable = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|row| row.id == source.id)
+            .unwrap();
+        assert!(
+            crate::tmux::Session::from_name(&name).exists_live(),
+            "unproven birth must preserve the actual terminal"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            durable.terminal_handoff.as_ref().unwrap().stage,
+            HandoffStage::TerminalLaunchOwed
+        );
+        assert!(
+            events
+                .replay_from(&source.id, 0)
+                .iter()
+                .any(|(seq, _)| *seq == sentinel),
+            "unproven terminal ownership must not erase the retained projection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
     async fn durable_handoff_reconstruction_preserves_launch_and_checked_cleanup(
     ) -> anyhow::Result<()> {
         use clap::Parser;

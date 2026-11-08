@@ -1001,6 +1001,70 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     #[serial]
+    fn unpinned_fresh_refuses_a_lost_conversation_cas() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = isolate_resume_environment(root.path());
+        let mut instance = Instance::new("fresh-cas-diverged", root.path().to_str().unwrap());
+        instance.source_profile = "fresh-cas-diverged".into();
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let (_pane, observation) = observed_dead_resume_fixture(&instance);
+        let probe = LaunchProbe {
+            tmux_session: instance.tmux_session().unwrap().name().to_owned(),
+            pane: Some(observation),
+            expected: instance.conversation_state(),
+        };
+        storage
+            .update(|rows, _| {
+                rows[0].agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            instance
+                .finish_resume_launch(
+                    LaunchSidOutcome::Fresh {
+                        pinned_prior_sid: None
+                    },
+                    None,
+                    &storage,
+                    generation,
+                    &probe,
+                )
+                .unwrap(),
+            StartOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::OwnershipUnproven,
+            }
+        );
+        assert_eq!(
+            crate::tmux::test_helpers::pane_field(
+                &probe.pane.as_ref().unwrap().identity.pane_id,
+                "#{pane_dead}"
+            ),
+            "1"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    #[test]
+    #[serial]
     #[serial(hook_base)]
     fn fresh_publication_keeps_the_durable_cas_baseline() {
         use crate::session::instance::test_helpers::write_sidecar;
@@ -3236,6 +3300,8 @@ mod tests {
             instance.source_profile = "shared-dead-probe".into();
             let sid = "11111111-2222-4333-8444-555555555555";
             instance.agent_session_id = Some(sid.into());
+            seed_claude_transcript(&mut instance, sid);
+            let _agent = install_fake_claude(root.path(), "#!/bin/sh\nexec sleep 60\n");
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
             storage
                 .update(|rows, _| {
@@ -3305,8 +3371,8 @@ mod tests {
                 ),
                 "1"
             );
-            let peer = peer.borrow();
-            let (pane, pid, birth) = peer.as_ref().expect("peer must have been created");
+            let borrowed_peer = peer.borrow();
+            let (pane, pid, birth) = borrowed_peer.as_ref().expect("peer must have been created");
             assert_eq!(
                 crate::tmux::test_helpers::pane_field(pane, "#{pane_dead}"),
                 "0"
@@ -3316,6 +3382,27 @@ mod tests {
                 crate::tmux::test_helpers::pane_field(pane, "#{session_id}"),
                 probe.pane.as_ref().unwrap().identity.session_id
             );
+            drop(borrowed_peer);
+            drop(_removal);
+            instance
+                .release_indeterminate_launch(&storage, generation, &probe, None)
+                .unwrap();
+            let revived = instance.ensure_pane_ready();
+            let peer = peer.borrow();
+            let (pane, pid, birth) = peer.as_ref().unwrap();
+            assert!(
+                crate::process::process_birth_is_live(*pid, birth).unwrap(),
+                "revival killed an unrelated peer: {revived:?}"
+            );
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(pane, "#{pane_dead}"),
+                "0"
+            );
+            assert_eq!(releases.get(), 0);
+            assert!(matches!(
+                revived,
+                Ok(super::super::EnsureReadyOutcome::Indeterminate { .. })
+            ));
         }
     }
 
@@ -3479,6 +3566,46 @@ mod tests {
                 std::fs::read_to_string(&transcript).unwrap(),
                 original_transcript
             );
+            if change == "confirmed" {
+                instance.capture_poller.stop();
+                let active = instance.active_execution.clone().unwrap();
+                let next_path = store.join("next.jsonl");
+                std::fs::write(
+                    &next_path,
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"type":"session", "id":PEER_SID, "cwd":project}),
+                    ),
+                )
+                .unwrap();
+                let mut observation = crate::session::poller::SessionIdObservation::omp(
+                    PEER_SID.into(),
+                    instance.omp_capture_generation.clone().unwrap(),
+                );
+                observation.scope_to(active.binding.clone());
+                observation.execution = Some(active.clone());
+                observation.transcript_path = Some(next_path);
+                let poller = crate::session::poller::SessionPoller::new(
+                    session.name().to_owned(),
+                    instance.tool.clone(),
+                    Some(active),
+                );
+                poller.inject_test_observation(&instance.id, observation);
+                instance
+                    .capture_poller
+                    .set_handle(Some(std::sync::Arc::new(std::sync::Mutex::new(poller))));
+                crate::session::sync::capture_launched_session_id_blocking(
+                    &mut instance,
+                    &crate::file_watch::FileWatchService::noop(),
+                    std::time::Duration::ZERO,
+                    false,
+                );
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some(PEER_SID),
+                    "the first CLI drain must persist B after A was confirmed during grace"
+                );
+            }
             instance.kill_clean_in(&storage).unwrap();
         }
     }
