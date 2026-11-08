@@ -82,6 +82,12 @@ platforms = ["linux", "macos"]
 
 Build steps run once, at install and update, in the user's interactive shell, where `PATH` is reliable. A compiled plugin can instead ship a release asset with `kind = "release-binary"`.
 
+Git and approved build commands share a fixed two-hour budget for each
+preparation/application. On exhaustion the host settles its owned process group
+before rollback; closing an observer does not cancel accepted work. Commands
+remain unsandboxed, and escaping processes or arbitrary filesystem stalls are
+not covered by a malicious-code containment guarantee.
+
 ## Install and test locally
 
 ```sh

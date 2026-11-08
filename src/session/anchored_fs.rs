@@ -498,9 +498,7 @@ impl AnchoredDir {
         let mut dir = Dir::from_fd(fd)?;
         let mut names = Vec::with_capacity(max_entries.min(64));
         for entry in dir.iter() {
-            let Ok(entry) = entry else {
-                continue;
-            };
+            let entry = entry.context("reading anchored directory entry")?;
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;
@@ -883,14 +881,22 @@ impl AnchoredDir {
         let mut current = openat(
             &self.fd,
             ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK,
             Mode::empty(),
         )?;
         for component in normal_components(relative)? {
             current = openat(
                 &current,
                 component.as_os_str(),
-                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                OFlag::O_DIRECTORY
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_RDONLY
+                    | OFlag::O_NONBLOCK,
                 Mode::empty(),
             )
             .context("opening anchored directory component")?;

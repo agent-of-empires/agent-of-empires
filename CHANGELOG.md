@@ -4,6 +4,17 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **plugin:** Reject special-file staging races, retain release-asset staging and
+  exclusion through blocking preparation, and supervise Git/build commands with
+  a shared two-hour budget and exit-before-rollback ownership.
+- **tui:** Discard stale plugin settings edits after lifecycle replacement or
+  removal, and keep update apply/restart in a pinned local Daemon job after TUI exit.
+
+
 ## [1.22.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.1) - 2026-11-06
 
 

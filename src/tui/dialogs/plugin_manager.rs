@@ -18,7 +18,7 @@ use super::{centered_rect, DialogResult};
 use crate::plugin::changelog::{ChangelogEntry, UpdateChangelog};
 use crate::plugin::discover::{DiscoveryBadge, DiscoveryResult};
 use crate::plugin::install::{
-    InstallConsent, LiveRestart, LiveToggle, ReapproveConsent, UpdateConsent, UpdatePreview,
+    InstallConsent, LiveToggle, ReapproveConsent, UpdateConsent, UpdatePreview,
 };
 use crate::plugin::update_check::UpdateStatus;
 use crate::tui::components::hint_buttons::ListMouse;
@@ -50,6 +50,8 @@ struct Details {
 struct Progress {
     title: String,
     log_path: PathBuf,
+    daemon_job: Option<String>,
+    daemon_log: Option<String>,
     /// `None` while running; the final outcome line once done.
     done: Option<Result<String, String>>,
 }
@@ -85,13 +87,73 @@ enum Mode {
 enum Pending {
     Updates(oneshot::Receiver<Vec<UpdateStatus>>),
     Discover(oneshot::Receiver<Result<Vec<DiscoveryResult>, String>>),
-    Preview(oneshot::Receiver<Result<UpdatePreview, String>>),
-    Apply(oneshot::Receiver<Result<String, String>>),
+    Preview(oneshot::Receiver<Result<(crate::acp::client::HttpClient, UpdatePreview), String>>),
+    Apply(tokio::sync::mpsc::UnboundedReceiver<UpdateEvent>),
     /// An enable/disable; the Ok string says whether the daemon reconciled.
     Toggle(oneshot::Receiver<Result<String, String>>),
     InstallPreview(oneshot::Receiver<Result<InstallConsent, String>>),
     InstallApply(oneshot::Receiver<Result<String, String>>),
     Uninstall(oneshot::Receiver<Result<String, String>>),
+}
+
+enum UpdateEvent {
+    Accepted(String),
+    Log(String),
+    Finished(Result<String, String>),
+}
+
+/// Submit exactly once, then observe on the client that produced consent.
+async fn observe_update(
+    client: &crate::acp::client::HttpClient,
+    id: &str,
+    fingerprint: Option<String>,
+    events: &tokio::sync::mpsc::UnboundedSender<UpdateEvent>,
+) -> Result<String, String> {
+    use crate::acp::client::HttpError;
+    let accepted = match client
+        .update_plugin(
+            id,
+            &crate::daemon::ApplyUpdateBody {
+                expected_fingerprint: fingerprint,
+            },
+        )
+        .await
+    {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            let refused = matches!(
+                &error,
+                HttpError::Unauthorized
+                    | HttpError::ReadOnly
+                    | HttpError::LocalPluginSourceRequired
+                    | HttpError::PluginJobActive
+                    | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
+            ) || matches!(&error, HttpError::Server { status, .. }
+                if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT);
+            return Err(if refused {
+                format!("Update refused: {error}")
+            } else {
+                format!("Update outcome unknown: {error}. Inspect the same local Daemon; no operation was resubmitted.")
+            });
+        }
+    };
+    let job = accepted.job_id;
+    let _ = events.send(UpdateEvent::Accepted(job.clone()));
+    loop {
+        let response = client.plugin_job(&job).await.map_err(|error| format!(
+            "Job {job} outcome unknown: {error}. Run `env -u AOE_DAEMON_URL aoe plugin job {job}` on the same local Daemon host; no operation was resubmitted."
+        ))?;
+        let _ = events.send(UpdateEvent::Log(response.log.tail));
+        match response.job.status {
+            crate::daemon::PluginJobStatus::Running => {}
+            crate::daemon::PluginJobStatus::Succeeded => return Ok(format!(
+                "Updated {id}; Daemon job {job} finished. Worker restart requested; readiness is not implied."
+            )),
+            crate::daemon::PluginJobStatus::Failed { error } =>
+                return Err(format!("Daemon job {job} failed: {error}")),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 pub struct PluginManagerDialog {
@@ -122,6 +184,7 @@ pub struct PluginManagerDialog {
     /// The plugin a preview or apply is running for, so `tick` can place it.
     pending_plugin: Option<String>,
     popup: Option<Popup>,
+    update_client: Option<crate::acp::client::HttpClient>,
     /// Scroll offset into the popup body. A `Cell` so render can clamp it to
     /// the content height only render knows.
     popup_scroll: Cell<u16>,
@@ -348,6 +411,7 @@ impl PluginManagerDialog {
             query_editing: false,
             pending_plugin: None,
             popup: None,
+            update_client: None,
             popup_scroll: Cell::new(0),
             popup_user_scrolled: false,
             mouse: RefCell::default(),
@@ -853,11 +917,20 @@ impl PluginManagerDialog {
         let (tx, rx) = oneshot::channel();
         let preview_id = id.clone();
         tokio::spawn(async move {
-            let _ = tx.send(
-                crate::plugin::install::preview_update(&preview_id, true)
+            let result = async {
+                let endpoint = crate::acp::client::daemon_manager::require_local_read_daemon()
                     .await
-                    .map_err(|e| format!("{e:#}")),
-            );
+                    .map_err(|e| format!("Update refused: {e}"))?;
+                let client = crate::acp::client::HttpClient::new(endpoint)
+                    .map_err(|e| format!("Update refused: {e}"))?;
+                let preview = client
+                    .preview_plugin_update(&preview_id)
+                    .await
+                    .map_err(|e| format!("Update preview refused: {e}"))?;
+                Ok((client, preview))
+            }
+            .await;
+            let _ = tx.send(result);
         });
         self.pending_plugin = Some(id);
         self.pending = Some(Pending::Preview(rx));
@@ -869,43 +942,23 @@ impl PluginManagerDialog {
         if self.pending.is_some() {
             return;
         }
-        let log_path = match tui_job_log("update", &id) {
-            Ok(path) => path,
-            Err(e) => {
-                self.error = Some(format!("{e:#}"));
-                return;
-            }
+        let Some(client) = self.update_client.clone() else {
+            self.error = Some("Update refused: review it again on the local Daemon.".into());
+            return;
         };
-        let _ = std::fs::remove_file(&log_path);
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let apply_id = id.clone();
-        let task_log = log_path.clone();
         tokio::spawn(async move {
-            let result = async {
-                let log = crate::plugin::install::OperationLog::file(&task_log)
-                    .map_err(|e| format!("{e:#}"))?;
-                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, true, log)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                let updated = format!("Updated {} to {}", report.id, report.version);
-                Ok(
-                    match crate::plugin::install::restart_worker_live(&apply_id).await {
-                        LiveRestart::Daemon => format!("{updated}; the daemon reloaded it."),
-                        LiveRestart::NoDaemon => format!("{updated}."),
-                        LiveRestart::DaemonStale { reason } => format!(
-                            "{updated}. Daemon not reloaded ({reason}); restart it to run the new build."
-                        ),
-                    },
-                )
-            }
-            .await;
-            let _ = tx.send(result);
+            let result = observe_update(&client, &apply_id, fingerprint, &tx).await;
+            let _ = tx.send(UpdateEvent::Finished(result));
         });
         self.pending_plugin = Some(id.clone());
         self.pending = Some(Pending::Apply(rx));
         self.open_popup(Popup::Progress(Progress {
             title: format!(" Updating {id} "),
-            log_path,
+            log_path: PathBuf::new(),
+            daemon_job: None,
+            daemon_log: Some(String::new()),
             done: None,
         }));
         self.loading = Some("Updating…");
@@ -992,6 +1045,8 @@ impl PluginManagerDialog {
         self.open_popup(Popup::Progress(Progress {
             title: format!(" Installing {} ", consent.id),
             log_path,
+            daemon_job: None,
+            daemon_log: None,
             done: None,
         }));
         self.loading = Some("Installing…");
@@ -1099,6 +1154,10 @@ impl PluginManagerDialog {
                 Ok(result) => {
                     self.pending = None;
                     self.loading = None;
+                    let result = result.map(|(client, preview)| {
+                        self.update_client = Some(client);
+                        preview
+                    });
                     match result {
                         Ok(UpdatePreview::NoUpdate { .. }) => {
                             self.info = Some("Already up to date.".to_string());
@@ -1160,7 +1219,7 @@ impl PluginManagerDialog {
                 }
             },
             Pending::Apply(rx) => match rx.try_recv() {
-                Ok(result) => {
+                Ok(UpdateEvent::Finished(result)) => {
                     self.pending = None;
                     self.loading = None;
                     if result.is_ok() {
@@ -1171,11 +1230,24 @@ impl PluginManagerDialog {
                     self.finish_operation(result);
                     true
                 }
-                Err(TryRecvError::Empty) => false,
-                Err(TryRecvError::Closed) => {
+                Ok(UpdateEvent::Accepted(id)) => {
+                    self.info = Some(format!("Accepted job {id}; observe with `env -u AOE_DAEMON_URL aoe plugin job {id}` on the local host."));
+                    if let Some(Popup::Progress(progress)) = &mut self.popup {
+                        progress.daemon_job = Some(id);
+                    }
+                    true
+                }
+                Ok(UpdateEvent::Log(tail)) => {
+                    if let Some(Popup::Progress(progress)) = &mut self.popup {
+                        progress.daemon_log = Some(tail);
+                    }
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     self.pending = None;
                     self.loading = None;
-                    self.finish_operation(Err("Update failed.".to_string()));
+                    self.finish_operation(Err("Update outcome unknown; inspect jobs on the same local Daemon. No operation was resubmitted.".to_string()));
                     true
                 }
             },
@@ -1820,7 +1892,16 @@ impl PluginManagerDialog {
 
     fn render_progress(&self, f: &mut Frame, area: Rect, theme: &Theme, progress: &Progress) {
         let mut lines: Vec<Line> = Vec::new();
-        for line in read_log_tail(&progress.log_path, PROGRESS_TAIL_LINES) {
+        if let Some(id) = &progress.daemon_job {
+            lines.push(Line::from(format!(
+                "Accepted job {id}; `env -u AOE_DAEMON_URL aoe plugin job {id}`"
+            )));
+        }
+        let tail = match &progress.daemon_log {
+            Some(tail) => tail.lines().map(str::to_owned).collect(),
+            None => read_log_tail(&progress.log_path, PROGRESS_TAIL_LINES),
+        };
+        for line in tail {
             lines.push(Line::from(Span::styled(
                 line,
                 Style::default().fg(theme.dimmed),
@@ -1837,7 +1918,11 @@ impl PluginManagerDialog {
                 footer.push(Line::from(Span::styled(
                     format!(
                         "esc hide (keeps running) · log: {}",
-                        progress.log_path.display()
+                        progress
+                            .daemon_job
+                            .as_deref()
+                            .map(|_| "local Daemon job".to_owned())
+                            .unwrap_or_else(|| progress.log_path.display().to_string())
                     ),
                     Style::default().fg(theme.dimmed),
                 )));
@@ -1858,7 +1943,16 @@ impl PluginManagerDialog {
                     Style::default().fg(theme.error),
                 )));
                 footer.push(Line::from(Span::styled(
-                    format!("Full log: {}", progress.log_path.display()),
+                    format!(
+                        "Full log: {}",
+                        progress
+                            .daemon_job
+                            .as_deref()
+                            .map(|id| format!(
+                                "env -u AOE_DAEMON_URL aoe plugin job {id} (same local host)"
+                            ))
+                            .unwrap_or_else(|| progress.log_path.display().to_string())
+                    ),
                     Style::default().fg(theme.dimmed),
                 )));
                 footer.push(Line::from(Span::styled(
@@ -2325,5 +2419,257 @@ mod mouse_tests {
         // The command renders with visible escapes and its plain text intact,
         // not with a raw escape sequence the manifest could hide text behind.
         let _ = find(&buffer, "session-helper: x\\u{1b}[2Jtail");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod daemon_update_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    async fn wait_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_update_survives_tui_runtime_shutdown_during_build_and_restart() {
+        use futures_util::FutureExt;
+        use std::os::unix::fs::PermissionsExt;
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(effects.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_file = effects.path().join("worker-pid");
+        let receipt = effects.path().join("worker-receipt");
+        let node = crate::plugin::write_fake_node(effects.path(), "node");
+        let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let write_manifest = |version: &str, build: &str| {
+            let command = serde_json::to_string(&[
+                "sh", "-c",
+                "printf '%s' $$ > \"$1\"; while IFS= read -r line; do printf '%s' \"$3\" > \"$2\"; done",
+                "worker", pid_file.to_str().unwrap(), receipt.to_str().unwrap(), version,
+            ]).unwrap();
+            std::fs::write(source.path().join("aoe-plugin.toml"), format!(
+                "id = \"acme.tui-job\"\nname = \"TUI job\"\nversion = \"{version}\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = {command}\nsystem = true\n{build}"
+            )).unwrap();
+        };
+        write_manifest("1.0.0", "");
+        crate::plugin::install::install(source.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| {
+                state.plugin_host = Some(
+                    crate::plugin::host::PluginHost::new(
+                        &crate::session::get_app_dir().unwrap(),
+                        "default",
+                        None,
+                        state.runtime.work.clone(),
+                    )
+                    .unwrap(),
+                );
+            },
+        );
+        let host = state.plugin_host.as_ref().unwrap();
+        host.reconcile(&crate::plugin::registry()).await;
+        let socket = effects.path().join("daemon.sock");
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let server = crate::server::test_support::serve_local_plugin_fixture(
+            state.clone(),
+            &socket,
+            submissions.clone(),
+        )
+        .await;
+        let client = crate::acp::client::HttpClient::new(
+            crate::daemon::DaemonEndpoint::local_unix(socket, None),
+        )
+        .unwrap();
+        let outcome = std::panic::AssertUnwindSafe(async {
+            for (index, phase) in ["build", "restart"].into_iter().enumerate() {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        host.notify_worker("acme.tui-job", "fixture.ping", serde_json::json!({}))
+                            .await;
+                        if receipt.exists() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let old_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+                assert!(crate::process::worker::is_process_group_alive(old_pid));
+                let ready = effects.path().join(format!("build-{index}-ready"));
+                let release = effects.path().join(format!("build-{index}-release"));
+                let build_command = serde_json::to_string(&[
+                    "sh",
+                    "-c",
+                    "printf building; : > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done",
+                    "build",
+                    ready.to_str().unwrap(),
+                    release.to_str().unwrap(),
+                ])
+                .unwrap();
+                let version = format!("{}.0.0", index + 2);
+                write_manifest(
+                    &version,
+                    &format!("\n[[runtime.build]]\ncommand = {build_command}\n"),
+                );
+                let preview = client.preview_plugin_update("acme.tui-job").await.unwrap();
+                let fingerprint = match preview {
+                    UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+                    UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+                    UpdatePreview::NoUpdate { .. } => panic!("fixture must update"),
+                };
+                let installed = crate::plugin::plugins_dir().unwrap().join("acme.tui-job");
+                let mut restart_gate =
+                    crate::plugin::fetch::test_gate::install(&installed, "restart");
+                let (accepted_tx, accepted_rx) = oneshot::channel();
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let (stopped_tx, stopped_rx) = oneshot::channel();
+                let pinned = client.clone();
+                let observer = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        let mut dialog = PluginManagerDialog::new();
+                        dialog.update_client = Some(pinned);
+                        dialog.start_apply("acme.tui-job".into(), Some(fingerprint));
+                        loop {
+                            dialog.tick();
+                            if let Some(Popup::Progress(progress)) = &dialog.popup {
+                                if let Some(job) = &progress.daemon_job {
+                                    let _ = accepted_tx.send(job.clone());
+                                    break;
+                                }
+                                if let Some(Err(error)) = &progress.done {
+                                    panic!("{error}");
+                                }
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        // Hiding the popup must not cancel its accepted mutation.
+                        dialog.popup = None;
+                        let _ = shutdown_rx.await;
+                        drop(dialog);
+                    });
+                    drop(runtime);
+                    let _ = stopped_tx.send(());
+                });
+                let job = tokio::time::timeout(Duration::from_secs(10), accepted_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                wait_file(&ready).await;
+                if phase == "restart" {
+                    std::fs::write(&release, b"release").unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), &mut restart_gate.entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                assert!(matches!(
+                    client.plugin_job(&job).await.unwrap().job.status,
+                    crate::daemon::PluginJobStatus::Running
+                ));
+                shutdown_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                observer.join().unwrap();
+                assert_eq!(submissions.load(Ordering::SeqCst), index + 1);
+                assert!(matches!(
+                    client.plugin_job(&job).await.unwrap().job.status,
+                    crate::daemon::PluginJobStatus::Running
+                ));
+                if phase == "build" {
+                    std::fs::write(&release, b"release").unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), &mut restart_gate.entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                std::fs::remove_file(&receipt).unwrap();
+                restart_gate.release();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let response = client.plugin_job(&job).await.unwrap();
+                        match response.job.status {
+                            crate::daemon::PluginJobStatus::Running => {
+                                tokio::task::yield_now().await
+                            }
+                            crate::daemon::PluginJobStatus::Succeeded => {
+                                assert!(response.log.tail.contains("building"));
+                                break;
+                            }
+                            crate::daemon::PluginJobStatus::Failed { error } => panic!("{error}"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!crate::process::worker::is_process_group_alive(old_pid));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        host.notify_worker("acme.tui-job", "fixture.ping", serde_json::json!({}))
+                            .await;
+                        if std::fs::read_to_string(&receipt).ok().as_deref()
+                            == Some(version.as_str())
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let new_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+                assert_ne!(new_pid, old_pid);
+                assert!(crate::process::worker::is_process_group_alive(new_pid));
+                assert_eq!(
+                    crate::plugin::lockfile::Lockfile::load()
+                        .unwrap()
+                        .get("acme.tui-job")
+                        .unwrap()
+                        .version,
+                    version
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        for index in 0..2 {
+            std::fs::write(
+                effects.path().join(format!("build-{index}-release")),
+                b"cleanup",
+            )
+            .unwrap();
+        }
+        state.runtime.work.drain().await;
+        host.shutdown().await;
+        server.abort();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

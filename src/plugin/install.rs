@@ -66,9 +66,27 @@ impl OperationLog {
     }
 }
 
+pub(super) fn log_recovery<T>(result: &Result<T>) {
+    if let Err(error) = result {
+        tracing::error!(error = %format!("{error:#}"), "plugin mutation ownership retained for recovery");
+        if let Ok(root) = crate::session::get_app_dir() {
+            if let Err(persist_error) = std::fs::write(
+                root.join(".plugin-recovery-required"),
+                format!("{error:#}\n"),
+            ) {
+                tracing::error!(%persist_error, "plugin recovery marker could not be persisted; manual recovery is required before restarting");
+            }
+        }
+    }
+}
+
 const OPERATION_LOCK: &str = ".plugin-operation.lock";
 
-fn begin_operation() -> Result<Arc<StorageFlock>> {
+pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
+    let evidence = crate::session::get_app_dir()?.join(".plugin-recovery-required");
+    if evidence.exists() {
+        bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display());
+    }
     crate::session::try_acquire_storage_flock(&crate::session::get_app_dir()?, OPERATION_LOCK)
         .context("acquiring plugin operation lock")?
         .map(Arc::new)
@@ -293,37 +311,44 @@ async fn prepare_install(
         bail!("--dev requires a local plugin directory");
     }
     let resolved = resolve_source(source, true).await?;
-    let fetched = fetch::fetch(&resolved.source, operation).await?;
+    let mut staged = Some(fetch::fetch(&resolved.source, operation).await?);
+    let result = (|| {
+        let fetched = staged.as_ref().unwrap();
 
-    let id = fetched.manifest.id.as_str().to_string();
-    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
-    reject_incompatible_host(&fetched.manifest)?;
+        let id = fetched.manifest.id.as_str().to_string();
+        let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, fetched)?;
+        reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
+        reject_incompatible_host(&fetched.manifest)?;
 
-    if super::plugins_dir()?.join(&id).exists() {
-        bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
+        if super::plugins_dir()?.join(&id).exists() {
+            bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
+        }
+
+        let capabilities = capability_strings(fetched)?;
+        let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
+        let trust = trust_label(featured_verified, dev);
+        let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
+        let persisted_source = persisted_source(&resolved.source, input);
+        let validation = install_validation(featured_verified, dev, &persisted_source);
+
+        Ok(PreparedInstall {
+            persisted_source,
+            unverified: resolved.unverified,
+            notice: resolved.notice,
+            fetched: staged.take().unwrap(),
+            featured_verified,
+            dev,
+            id,
+            capabilities,
+            manifest_hash,
+            fingerprint,
+            validation,
+        })
+    })();
+    if let Some(fetched) = staged {
+        fetched.cleanup().await?;
     }
-
-    let capabilities = capability_strings(&fetched)?;
-    let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let trust = trust_label(featured_verified, dev);
-    let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
-    let persisted_source = persisted_source(&resolved.source, input);
-    let validation = install_validation(featured_verified, dev, &persisted_source);
-
-    Ok(PreparedInstall {
-        persisted_source,
-        unverified: resolved.unverified,
-        notice: resolved.notice,
-        fetched,
-        featured_verified,
-        dev,
-        id,
-        capabilities,
-        manifest_hash,
-        fingerprint,
-        validation,
-    })
+    result
 }
 
 fn apply_prepared_install(
@@ -345,8 +370,25 @@ fn apply_prepared_install(
         p.id, p.fetched.manifest.version
     ));
     move_into_place(&p.fetched, &final_dir)?;
-    if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, node_env, log) {
-        let _ = std::fs::remove_dir_all(&final_dir);
+    if let Err(e) = build_in_place(
+        &p.id,
+        &final_dir,
+        &p.fetched.manifest,
+        node_env,
+        log,
+        p.fetched.budget,
+    ) {
+        if e.downcast_ref::<super::execution::RecoveryRequired>()
+            .is_some()
+        {
+            return Err(e);
+        }
+        std::fs::remove_dir_all(&final_dir).map_err(|error| {
+            super::execution::RecoveryRequired(format!(
+                "removing failed install {}: {error}; original failure: {e:#}",
+                final_dir.display()
+            ))
+        })?;
         return Err(e);
     }
 
@@ -404,35 +446,48 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
     let operation = begin_operation()?;
     let prepared = prepare_install(input, dev, Some(operation.clone())).await?;
     eprintln!("{}", prepared.notice);
-    if prepared.unverified && !assume_yes && !confirm_unverified()? {
-        bail!("install cancelled; the unverified source was not approved");
-    }
-    let build = build_steps(&prepared.fetched.manifest);
-    let granted = if assume_yes
-        || !install_needs_consent(
-            &prepared.capabilities,
-            build,
-            &prepared.fetched.manifest.ui,
-            &prepared.fetched.manifest.agent_integrations,
-        ) {
-        true
-    } else {
-        confirm_capabilities(
-            &prepared.id,
-            &prepared.capabilities,
-            &prepared.fetched.manifest.ui,
-            build,
-            &prepared.fetched.manifest.agent_integrations,
-        )?
-    };
-    if !granted {
-        bail!("install cancelled; no capabilities were granted");
+    let approval = (|| -> Result<()> {
+        if prepared.unverified && !assume_yes && !confirm_unverified()? {
+            bail!("install cancelled; the unverified source was not approved");
+        }
+        let build = build_steps(&prepared.fetched.manifest);
+        let granted = if assume_yes
+            || !install_needs_consent(
+                &prepared.capabilities,
+                build,
+                &prepared.fetched.manifest.ui,
+                &prepared.fetched.manifest.agent_integrations,
+            ) {
+            true
+        } else {
+            confirm_capabilities(
+                &prepared.id,
+                &prepared.capabilities,
+                &prepared.fetched.manifest.ui,
+                build,
+                &prepared.fetched.manifest.agent_integrations,
+            )?
+        };
+        if !granted {
+            bail!("install cancelled; no capabilities were granted");
+        }
+        Ok(())
+    })();
+    if let Err(error) = approval {
+        prepared.fetched.cleanup().await?;
+        return Err(error);
     }
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
         let result = apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit);
-        prepared.fetched.close();
+        if super::execution::needs_recovery(&result) {
+            log_recovery(&result);
+            std::mem::forget(prepared);
+            std::mem::forget(_operation);
+        } else {
+            prepared.fetched.close();
+        }
         result
     })
     .await
@@ -479,6 +534,7 @@ pub async fn apply_install(
     let operation = begin_operation()?;
     let prepared = prepare_install(input, dev, Some(operation.clone())).await?;
     if prepared.fingerprint != expected_fingerprint {
+        prepared.fetched.cleanup().await?;
         bail!(
             "the plugin at {input} changed since it was shown; review it again before installing"
         );
@@ -487,7 +543,13 @@ pub async fn apply_install(
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
         let result = apply_prepared_install(&prepared, &node_env, &log);
-        prepared.fetched.close();
+        if super::execution::needs_recovery(&result) {
+            log_recovery(&result);
+            std::mem::forget(prepared);
+            std::mem::forget(_operation);
+        } else {
+            prepared.fetched.close();
+        }
         result
     })
     .await
@@ -612,145 +674,155 @@ async fn prepare_update(
         bail!("local plugin directories and --dev require a verified local Unix socket peer");
     }
     let resolved = resolve_source(source, false).await?;
-    let fetched = fetch::fetch(&resolved.source, operation).await?;
-    if fetched.manifest.id.as_str() != id {
-        bail!(
-            "source {source_str:?} now resolves to plugin {:?}, not {id}",
-            fetched.manifest.id.as_str()
-        );
-    }
-    let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, &fetched)?;
-    reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
-    reject_incompatible_host(&fetched.manifest)?;
+    let mut staged = Some(fetch::fetch(&resolved.source, operation).await?);
+    let result = (|| {
+        let fetched = staged.as_ref().unwrap();
+        if fetched.manifest.id.as_str() != id {
+            bail!(
+                "source {source_str:?} now resolves to plugin {:?}, not {id}",
+                fetched.manifest.id.as_str()
+            );
+        }
+        let featured_verified = !dev && verify_featured(&FeaturedIndex::load()?, fetched)?;
+        reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
+        reject_incompatible_host(&fetched.manifest)?;
 
-    let capabilities = capability_strings(&fetched)?;
-    let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
-    let installed = prior_grant.as_ref().and_then(|_| installed_manifest(id));
-    let grant_valid = installed.as_ref().is_some_and(|(manifest, hash)| {
-        prior_grant
-            .as_ref()
-            .is_some_and(|grant| super::registry::grant_covers(grant, manifest, hash))
-    });
-    let prior_grant = prior_grant.filter(|_| grant_valid);
-    let installed_matches_source = grant_valid
-        && installed
-            .as_ref()
-            .is_some_and(|(_, hash)| hash == &manifest_hash);
-    let previous_agent_integrations = installed
-        .as_ref()
-        .filter(|(_, hash)| {
+        let capabilities = capability_strings(fetched)?;
+        let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
+        let installed = prior_grant.as_ref().and_then(|_| installed_manifest(id));
+        let grant_valid = installed.as_ref().is_some_and(|(manifest, hash)| {
             prior_grant
                 .as_ref()
-                .is_some_and(|grant| &grant.manifest_hash == hash)
+                .is_some_and(|grant| super::registry::grant_covers(grant, manifest, hash))
+        });
+        let prior_grant = prior_grant.filter(|_| grant_valid);
+        let installed_matches_source = grant_valid
+            && installed
+                .as_ref()
+                .is_some_and(|(_, hash)| hash == &manifest_hash);
+        let previous_agent_integrations = installed
+            .as_ref()
+            .filter(|(_, hash)| {
+                prior_grant
+                    .as_ref()
+                    .is_some_and(|grant| &grant.manifest_hash == hash)
+            })
+            .map(|(manifest, _)| manifest.agent_integrations.as_slice());
+        let stays_active_if_declined = grant_valid
+            && plugin_config.enabled
+            && super::registry()
+                .get(id)
+                .is_some_and(|plugin| plugin.active());
+
+        let lock = Lockfile::load()?;
+        let prior_locked = lock.get(id);
+        let prior_tree_hash = prior_locked
+            .map(|l| l.tree_hash.clone())
+            .unwrap_or_default();
+        let prior_was_release_binary = prior_locked.is_some_and(|l| l.asset_sha256.is_some());
+        let prior_trust = prior_locked.map(|l| l.trust.clone()).unwrap_or_default();
+        let from_version = prior_locked
+            .map(|l| l.version.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let prior_requested_ref = prior_locked.and_then(|l| l.requested_ref.clone());
+        let prior_resolved_commit = prior_locked.and_then(|l| l.resolved_commit.clone());
+        let target_requested_ref = fetched.requested_ref.clone();
+        let target_resolved_commit = fetched.resolved_commit.clone();
+
+        let trust = trust_label(featured_verified, dev);
+        let prior_fingerprint =
+            prior_locked.map(|l| fingerprint(&l.tree_hash, l.asset_sha256.as_deref(), &l.trust));
+        let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
+
+        let prior_caps: BTreeSet<&str> = prior_grant
+            .as_ref()
+            .map(|g| g.capabilities.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let new_caps: BTreeSet<&str> = capabilities.iter().map(String::as_str).collect();
+        let caps_changed = prior_caps != new_caps;
+        let added_capabilities: Vec<String> = new_caps
+            .difference(&prior_caps)
+            .map(|s| s.to_string())
+            .collect();
+        let removed_capabilities: Vec<String> = prior_caps
+            .difference(&new_caps)
+            .map(|s| s.to_string())
+            .collect();
+
+        let manifest_changed =
+            prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
+        let tree_changed = if prior_tree_hash.is_empty() {
+            manifest_changed
+        } else {
+            prior_tree_hash != fetched.tree_hash
+        };
+        let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
+        let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
+        let agents_changed = agent_integrations_changed(
+            previous_agent_integrations,
+            &fetched.manifest.agent_integrations,
+        );
+        let new_is_release_binary = matches!(
+            fetched.manifest.runtime,
+            Some(RuntimeSpec::ReleaseBinary { .. })
+        );
+        let runtime_change = if new_is_release_binary && !prior_was_release_binary {
+            Some(
+                "the worker is now a downloaded release binary (opaque, not source-auditable)"
+                    .to_string(),
+            )
+        } else if prior_was_release_binary && !new_is_release_binary {
+            Some(
+                "the worker is now an in-tree command (was a downloaded release binary)"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        let trust_downgrade = prior_trust == "featured" && !featured_verified;
+
+        let needs_consent = (!capabilities.is_empty() && caps_changed)
+            || build_changed
+            || ui_changed
+            || agents_changed
+            || runtime_change.is_some()
+            || trust_downgrade
+            || !grant_valid;
+
+        Ok(Prepared {
+            id: id.to_string(),
+            source_str,
+            notice: resolved.notice,
+            fetched: staged.take().unwrap(),
+            featured_verified,
+            dev,
+            prior_grant,
+            capabilities,
+            manifest_hash,
+            fingerprint,
+            prior_fingerprint,
+            prior_requested_ref,
+            prior_resolved_commit,
+            target_requested_ref,
+            target_resolved_commit,
+            from_version,
+            caps_changed,
+            added_capabilities,
+            removed_capabilities,
+            build_changed,
+            ui_changed,
+            agents_changed,
+            runtime_change,
+            trust_downgrade,
+            needs_consent,
+            installed_matches_source,
+            stays_active_if_declined,
         })
-        .map(|(manifest, _)| manifest.agent_integrations.as_slice());
-    let stays_active_if_declined = grant_valid
-        && plugin_config.enabled
-        && super::registry()
-            .get(id)
-            .is_some_and(|plugin| plugin.active());
-
-    let lock = Lockfile::load()?;
-    let prior_locked = lock.get(id);
-    let prior_tree_hash = prior_locked
-        .map(|l| l.tree_hash.clone())
-        .unwrap_or_default();
-    let prior_was_release_binary = prior_locked.is_some_and(|l| l.asset_sha256.is_some());
-    let prior_trust = prior_locked.map(|l| l.trust.clone()).unwrap_or_default();
-    let from_version = prior_locked
-        .map(|l| l.version.clone())
-        .unwrap_or_else(|| "?".to_string());
-    let prior_requested_ref = prior_locked.and_then(|l| l.requested_ref.clone());
-    let prior_resolved_commit = prior_locked.and_then(|l| l.resolved_commit.clone());
-    let target_requested_ref = fetched.requested_ref.clone();
-    let target_resolved_commit = fetched.resolved_commit.clone();
-
-    let trust = trust_label(featured_verified, dev);
-    let prior_fingerprint =
-        prior_locked.map(|l| fingerprint(&l.tree_hash, l.asset_sha256.as_deref(), &l.trust));
-    let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
-
-    let prior_caps: BTreeSet<&str> = prior_grant
-        .as_ref()
-        .map(|g| g.capabilities.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-    let new_caps: BTreeSet<&str> = capabilities.iter().map(String::as_str).collect();
-    let caps_changed = prior_caps != new_caps;
-    let added_capabilities: Vec<String> = new_caps
-        .difference(&prior_caps)
-        .map(|s| s.to_string())
-        .collect();
-    let removed_capabilities: Vec<String> = prior_caps
-        .difference(&new_caps)
-        .map(|s| s.to_string())
-        .collect();
-
-    let manifest_changed =
-        prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
-    let tree_changed = if prior_tree_hash.is_empty() {
-        manifest_changed
-    } else {
-        prior_tree_hash != fetched.tree_hash
-    };
-    let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
-    let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
-    let agents_changed = agent_integrations_changed(
-        previous_agent_integrations,
-        &fetched.manifest.agent_integrations,
-    );
-    let new_is_release_binary = matches!(
-        fetched.manifest.runtime,
-        Some(RuntimeSpec::ReleaseBinary { .. })
-    );
-    let runtime_change = if new_is_release_binary && !prior_was_release_binary {
-        Some(
-            "the worker is now a downloaded release binary (opaque, not source-auditable)"
-                .to_string(),
-        )
-    } else if prior_was_release_binary && !new_is_release_binary {
-        Some("the worker is now an in-tree command (was a downloaded release binary)".to_string())
-    } else {
-        None
-    };
-    let trust_downgrade = prior_trust == "featured" && !featured_verified;
-
-    let needs_consent = (!capabilities.is_empty() && caps_changed)
-        || build_changed
-        || ui_changed
-        || agents_changed
-        || runtime_change.is_some()
-        || trust_downgrade
-        || !grant_valid;
-
-    Ok(Prepared {
-        id: id.to_string(),
-        source_str,
-        notice: resolved.notice,
-        fetched,
-        featured_verified,
-        dev,
-        prior_grant,
-        capabilities,
-        manifest_hash,
-        fingerprint,
-        prior_fingerprint,
-        prior_requested_ref,
-        prior_resolved_commit,
-        target_requested_ref,
-        target_resolved_commit,
-        from_version,
-        caps_changed,
-        added_capabilities,
-        removed_capabilities,
-        build_changed,
-        ui_changed,
-        agents_changed,
-        runtime_change,
-        trust_downgrade,
-        needs_consent,
-        installed_matches_source,
-        stays_active_if_declined,
-    })
+    })();
+    if let Some(fetched) = staged {
+        fetched.cleanup().await?;
+    }
+    result
 }
 
 fn ensure_approved(id: &str, needs_consent: bool, grant: Option<&CapabilityGrant>) -> Result<()> {
@@ -811,44 +883,55 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
     if mode != ConsentMode::CleanOnlyNonInteractive {
         eprintln!("{}", prepared.notice);
     }
+    if prepared.needs_consent && mode == ConsentMode::CleanOnlyNonInteractive {
+        let skipped = UpdateOutcome::Skipped {
+            id: id.to_string(),
+            reason: skip_reason(&prepared),
+            fingerprint: prepared.fingerprint.clone(),
+        };
+        prepared.fetched.cleanup().await?;
+        return Ok(skipped);
+    }
 
-    let grant = if prepared.needs_consent {
-        if mode == ConsentMode::CleanOnlyNonInteractive {
-            return Ok(UpdateOutcome::Skipped {
-                id: id.to_string(),
-                reason: skip_reason(&prepared),
-                fingerprint: prepared.fingerprint.clone(),
-            });
-        }
-        if mode == ConsentMode::AssumeYes
-            || confirm_capabilities(
-                id,
-                &prepared.capabilities,
-                &prepared.fetched.manifest.ui,
-                build_steps(&prepared.fetched.manifest),
-                &prepared.fetched.manifest.agent_integrations,
-            )?
-        {
+    let grant = (|| -> Result<Option<CapabilityGrant>> {
+        Ok(if prepared.needs_consent {
+            if mode == ConsentMode::AssumeYes
+                || confirm_capabilities(
+                    id,
+                    &prepared.capabilities,
+                    &prepared.fetched.manifest.ui,
+                    build_steps(&prepared.fetched.manifest),
+                    &prepared.fetched.manifest.agent_integrations,
+                )?
+            {
+                Some(CapabilityGrant {
+                    manifest_hash: prepared.manifest_hash.clone(),
+                    capabilities: prepared.capabilities.clone(),
+                    granted_at: chrono::Utc::now(),
+                })
+            } else {
+                None
+            }
+        } else if prepared.capabilities.is_empty() {
             Some(CapabilityGrant {
                 manifest_hash: prepared.manifest_hash.clone(),
-                capabilities: prepared.capabilities.clone(),
+                capabilities: vec![],
                 granted_at: chrono::Utc::now(),
             })
         } else {
-            None
+            prepared.prior_grant.clone().map(|g| CapabilityGrant {
+                manifest_hash: prepared.manifest_hash.clone(),
+                capabilities: g.capabilities,
+                granted_at: g.granted_at,
+            })
+        })
+    })();
+    let grant = match grant {
+        Ok(grant) => grant,
+        Err(error) => {
+            prepared.fetched.cleanup().await?;
+            return Err(error);
         }
-    } else if prepared.capabilities.is_empty() {
-        Some(CapabilityGrant {
-            manifest_hash: prepared.manifest_hash.clone(),
-            capabilities: vec![],
-            granted_at: chrono::Utc::now(),
-        })
-    } else {
-        prepared.prior_grant.clone().map(|g| CapabilityGrant {
-            manifest_hash: prepared.manifest_hash.clone(),
-            capabilities: g.capabilities,
-            granted_at: g.granted_at,
-        })
     };
 
     finish_update(prepared, grant, operation, |manifest| async move {
@@ -869,12 +952,21 @@ where
     F: FnOnce(PluginManifest) -> Fut,
     Fut: std::future::Future<Output = NodeEnv>,
 {
-    ensure_approved(&prepared.id, prepared.needs_consent, grant.as_ref())?;
+    if let Err(error) = ensure_approved(&prepared.id, prepared.needs_consent, grant.as_ref()) {
+        prepared.fetched.cleanup().await?;
+        return Err(error);
+    }
     let node_env = provision(prepared.fetched.manifest.clone()).await;
     let report = tokio::task::spawn_blocking(move || {
         let _operation = operation;
         let result = apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit);
-        prepared.fetched.close();
+        if super::execution::needs_recovery(&result) {
+            log_recovery(&result);
+            std::mem::forget(prepared);
+            std::mem::forget(_operation);
+        } else {
+            prepared.fetched.close();
+        }
         result
     })
     .await
@@ -978,11 +1070,13 @@ pub async fn apply_update(
     let prepared = prepare_update(id, allow_local_source, Some(operation.clone())).await?;
     match &expected_fingerprint {
         Some(expected) if *expected != prepared.fingerprint => {
+            prepared.fetched.cleanup().await?;
             bail!(
                 "the available update for {id} changed since it was shown; review it again before approving"
             );
         }
         None if prepared.needs_consent => {
+            prepared.fetched.cleanup().await?;
             bail!("approving the update for {id} requires the fingerprint it was previewed with");
         }
         _ => {}
@@ -996,7 +1090,13 @@ pub async fn apply_update(
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
         let result = apply_prepared(&prepared, grant, &node_env, &log);
-        prepared.fetched.close();
+        if super::execution::needs_recovery(&result) {
+            log_recovery(&result);
+            std::mem::forget(prepared);
+            std::mem::forget(_operation);
+        } else {
+            prepared.fetched.close();
+        }
         result
     })
     .await
@@ -1112,10 +1212,11 @@ pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
             if GENERATION.load(Ordering::SeqCst) != generation {
                 return;
             }
-            if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
+            // Re-read persisted intent; never replay an enabled value after
+            // releasing the settings operation lease.
+            if let Err(e) = client.restart_plugin_worker(&id).await {
                 tracing::warn!(
-                    "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
-                         restart the daemon or toggle from the dashboard"
+                    "plugin toggle: daemon did not refresh {id} (saved enabled={enabled}): {e}; restart the daemon or toggle from the dashboard"
                 );
             }
         }
@@ -1458,8 +1559,9 @@ fn build_in_place(
     manifest: &PluginManifest,
     node_env: &NodeEnv,
     log: &OperationLog,
+    budget: super::execution::Budget,
 ) -> Result<()> {
-    run_build(plugin_id, dir, build_steps(manifest), node_env, log)?;
+    run_build(plugin_id, dir, build_steps(manifest), node_env, log, budget)?;
     if let Some(RuntimeSpec::Command {
         command,
         system: false,
@@ -1483,6 +1585,7 @@ fn run_build(
     steps: &[BuildStep],
     node_env: &NodeEnv,
     log: &OperationLog,
+    budget: super::execution::Budget,
 ) -> Result<()> {
     let os = std::env::consts::OS;
     let resolver = super::launch::OsLaunchResolver::new(node_env.clone());
@@ -1496,16 +1599,19 @@ fn run_build(
                 .with_context(|| format!("resolving build step {} ({pretty})", i + 1))?;
         log.line(&format!("  building {plugin_id}: {pretty}"));
         let (stdout, stderr) = log.child_stdio()?;
-        let status = std::process::Command::new(&program)
+        let mut command = std::process::Command::new(&program);
+        command
             .args(&args)
             .current_dir(dir)
             .env("AOE_PLUGIN_ID", plugin_id)
             .envs(node_env.iter().map(|(k, v)| (*k, v)))
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(stderr)
-            .status()
-            .with_context(|| format!("spawning build step {} ({pretty})", i + 1))?;
+            .stderr(stderr);
+        let status = budget
+            .run(&mut command)
+            .with_context(|| format!("running build step {} ({pretty})", i + 1))?
+            .status;
         if !status.success() {
             bail!("build step {} ({pretty}) failed with {status}", i + 1);
         }
@@ -1524,10 +1630,20 @@ fn replace_and_build(
 
     if backup_dir.exists() {
         if final_dir.exists() {
-            let _ = std::fs::remove_dir_all(final_dir);
+            std::fs::remove_dir_all(final_dir).map_err(|error| {
+                super::execution::RecoveryRequired(format!(
+                    "removing interrupted update {}: {error}",
+                    final_dir.display()
+                ))
+            })?;
         }
-        std::fs::rename(&backup_dir, final_dir)
-            .with_context(|| format!("recovering interrupted update backup for {plugin_id}"))?;
+        std::fs::rename(&backup_dir, final_dir).map_err(|error| {
+            super::execution::RecoveryRequired(format!(
+                "recovering interrupted update backup {} to {}: {error}",
+                backup_dir.display(),
+                final_dir.display()
+            ))
+        })?;
     }
 
     let had_prior = final_dir.exists();
@@ -1543,7 +1659,14 @@ fn replace_and_build(
                 final_dir.display()
             )
         })?;
-        build_in_place(plugin_id, final_dir, &fetched.manifest, node_env, log)
+        build_in_place(
+            plugin_id,
+            final_dir,
+            &fetched.manifest,
+            node_env,
+            log,
+            fetched.budget,
+        )
     })();
 
     match place_and_build {
@@ -1556,13 +1679,29 @@ fn replace_and_build(
             Ok(())
         }
         Err(e) => {
-            if let Err(error) = std::fs::remove_dir_all(final_dir) {
-                tracing::warn!(target: "plugin.install", plugin = %plugin_id, %error, "could not remove failed update tree");
+            if e.downcast_ref::<super::execution::RecoveryRequired>()
+                .is_some()
+            {
+                return Err(e);
+            }
+            #[cfg(test)]
+            fetch::test_gate::reach(final_dir, "rollback");
+            if final_dir.exists() {
+                std::fs::remove_dir_all(final_dir).map_err(|error| {
+                    super::execution::RecoveryRequired(format!(
+                        "removing failed update {}: {error}; original failure: {e:#}",
+                        final_dir.display()
+                    ))
+                })?;
             }
             if had_prior {
-                if let Err(error) = std::fs::rename(&backup_dir, final_dir) {
-                    tracing::error!(target: "plugin.install", plugin = %plugin_id, %error, "failed to restore previous plugin from backup");
-                }
+                std::fs::rename(&backup_dir, final_dir).map_err(|error| {
+                    super::execution::RecoveryRequired(format!(
+                        "restoring {} from {}: {error}; original failure: {e:#}",
+                        final_dir.display(),
+                        backup_dir.display()
+                    ))
+                })?;
             }
             Err(e)
         }
@@ -2074,34 +2213,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn source_preparation_keeps_runtime_and_exclusion_through_cancellation() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
-
-        struct ReleasePreparation {
-            release: Option<mpsc::Sender<()>>,
-            controller: Option<std::thread::JoinHandle<bool>>,
-            abort: Option<tokio::task::AbortHandle>,
-        }
-        impl ReleasePreparation {
-            fn finish(mut self) -> bool {
-                let _ = self.release.take().unwrap().send(());
-                self.controller.take().unwrap().join().unwrap()
-            }
-        }
-        impl Drop for ReleasePreparation {
-            fn drop(&mut self) {
-                if let Some(abort) = self.abort.take() {
-                    abort.abort();
-                }
-                if let Some(release) = self.release.take() {
-                    let _ = release.send(());
-                }
-                if let Some(controller) = self.controller.take() {
-                    let _ = controller.join();
-                }
-            }
-        }
-
         let _reload = super::super::ReloadRegistryOnDrop;
         let _home = isolate_app_dir();
         let source = tempfile::tempdir().unwrap();
@@ -2112,70 +2223,19 @@ mod tests {
         )
         .unwrap();
         let consent = preview_install(&input, false).await.unwrap();
-        let fifo = source.path().join("held-source");
-        nix::unistd::mkfifo(
-            &fifo,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .unwrap();
-        let root = super::super::plugins_dir().unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let controller = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let tree = loop {
-                let tree = std::fs::read_dir(&root)
-                    .unwrap()
-                    .filter_map(|entry| entry.ok())
-                    .find_map(|entry| {
-                        let tree = entry.path().join("tree");
-                        (entry.file_name().to_string_lossy().starts_with(".staging-")
-                            && tree.is_dir())
-                        .then_some(tree)
-                    });
-                if let Some(tree) = tree {
-                    break tree;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            };
-            let _ = started_tx.send(());
-            let requested = release_rx.recv_timeout(Duration::from_secs(30)).is_ok();
-            let writer = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&fifo)
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while tree.exists() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            drop(writer);
-            requested
-        });
-        let mut release = ReleasePreparation {
-            release: Some(release_tx),
-            controller: Some(controller),
-            abort: None,
-        };
+        let mut gate = fetch::test_gate::install(&source.path().join("aoe-plugin.toml"), "copy");
         let operation = tokio::spawn(async move {
             apply_install(&input, &consent.fingerprint, false, OperationLog::Inherit).await
         });
-        release.abort = Some(operation.abort_handle());
-        tokio::time::timeout(Duration::from_secs(35), started_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
             .await
             .unwrap()
             .unwrap();
         operation.abort();
         assert!(operation.await.unwrap_err().is_cancelled());
         assert!(begin_operation().is_err());
-        assert!(
-            release.finish(),
-            "runtime made no progress before the preparation watchdog released"
-        );
-        let _operation = tokio::time::timeout(Duration::from_secs(5), async {
+        gate.release();
+        let _operation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(operation) = begin_operation() {
                     break operation;
@@ -2193,5 +2253,260 @@ mod tests {
             .unwrap()
             .join("acme.preparation")
             .exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn special_source_added_after_preview_fails_without_publication() {
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().to_str().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.special\"\nname = \"Special\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let consent = preview_install(input, false).await.unwrap();
+        nix::unistd::mkfifo(&source.path().join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            apply_install(input, &consent.fingerprint, false, OperationLog::Inherit),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("special file"));
+        assert!(!Config::load().unwrap().plugins.contains_key("acme.special"));
+        assert!(Lockfile::load().unwrap().get("acme.special").is_none());
+        assert!(!super::super::plugins_dir()
+            .unwrap()
+            .join("acme.special")
+            .exists());
+        assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn budget_timeout_settles_descendant_before_rollback_and_lease_release() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        static EXPIRED: AtomicBool = AtomicBool::new(false);
+        EXPIRED.store(false, Ordering::SeqCst);
+        struct ExpireOnDrop;
+        impl Drop for ExpireOnDrop {
+            fn drop(&mut self) {
+                EXPIRED.store(true, Ordering::SeqCst);
+            }
+        }
+        let _expire = ExpireOnDrop;
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let manifest = source.path().join("aoe-plugin.toml");
+        let base = "id = \"acme.budget\"\nname = \"Budget\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"sh\"]\nsystem = true\n";
+        std::fs::write(&manifest, base).unwrap();
+        std::fs::write(source.path().join("original"), b"previous bytes").unwrap();
+        install(source.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let final_dir = super::super::plugins_dir().unwrap().join("acme.budget");
+        let config_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        let before_config = std::fs::read(&config_path).unwrap();
+        let lock_path = crate::session::get_app_dir().unwrap().join("plugins.lock");
+        let before_lock = std::fs::read(&lock_path).unwrap();
+        let before_hash = super::super::integrity::tree_hash(&final_dir).unwrap();
+        let pid_file = effects.path().join("descendant-pid");
+        let ready = effects.path().join("descendant-ready");
+        let writer = r#"import os, pathlib, signal, sys, time
+if os.fork() == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+    with open(sys.argv[3], "ab", buffering=0) as output:
+        output.write(b"writer")
+        pathlib.Path(sys.argv[2]).touch()
+        while True:
+            output.write(b"writer")
+            time.sleep(0.01)
+else:
+    os.wait()
+"#;
+        let command = serde_json::to_string(&[
+            "python3",
+            "-c",
+            writer,
+            pid_file.to_str().unwrap(),
+            ready.to_str().unwrap(),
+            final_dir.join("writer-output").to_str().unwrap(),
+        ])
+        .unwrap();
+        std::fs::write(
+            &manifest,
+            format!(
+                "{}\n[[runtime.build]]\ncommand = {command}\n",
+                base.replace("1.0.0", "2.0.0")
+            ),
+        )
+        .unwrap();
+        let operation = begin_operation().unwrap();
+        let mut prepared = prepare_update("acme.budget", true, Some(operation.clone()))
+            .await
+            .unwrap();
+        prepared.fetched.budget = super::super::execution::Budget::controlled_for_test(&EXPIRED);
+        let mut rollback = fetch::test_gate::install(&final_dir, "rollback");
+        let log_path = effects.path().join("operation.log");
+        let log = OperationLog::file(&log_path).unwrap();
+        let task = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            let result = apply_prepared(
+                &prepared,
+                prepared.prior_grant.clone(),
+                &NodeEnv::new(),
+                &log,
+            );
+            prepared.fetched.close();
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "writer readiness: {error}; build finished={}; log={}",
+                task.is_finished(),
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            )
+        });
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .expect("live descendant");
+        let process = crate::process::CapturedProcess::capture(pid, &birth)
+            .unwrap()
+            .expect("live descendant");
+        struct Cleanup(Option<crate::process::CapturedProcessTree>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().settle(std::time::Duration::ZERO);
+            }
+        }
+        let _cleanup = Cleanup(Some(
+            crate::process::CapturedProcessTree::capture(pid).unwrap(),
+        ));
+        assert!(begin_operation().is_err());
+        // Trigger deadline only after the controlled descendant has begun writing.
+        EXPIRED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), &mut rollback.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            process.exited().unwrap(),
+            "physical exit must precede rollback"
+        );
+        assert!(
+            final_dir.join("writer-output").exists(),
+            "rollback is still gated"
+        );
+        assert!(
+            begin_operation().is_err(),
+            "exclusion must span restoration"
+        );
+        rollback.release();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::execution::Exhausted>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            super::super::integrity::tree_hash(&final_dir).unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            std::fs::read(final_dir.join("original")).unwrap(),
+            b"previous bytes"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), before_config);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), before_lock);
+        assert!(std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("building acme.budget"));
+        assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_restoration_retains_exclusion_and_recovery_evidence() {
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let node = super::super::write_fake_node(effects.path(), "node");
+        let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let base = "id = \"acme.recovery\"\nname = \"Recovery\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"sh\"]\nsystem = true\n";
+        std::fs::write(source.path().join("aoe-plugin.toml"), base).unwrap();
+        install(source.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        let before = serde_json::to_value(Config::load().unwrap().plugins).unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            format!(
+                "{}\n[[runtime.build]]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n",
+                base.replace("1.0.0", "2.0.0")
+            ),
+        )
+        .unwrap();
+        let preview = preview_update("acme.recovery", true).await.unwrap();
+        let fingerprint = match preview {
+            UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+            UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+            UpdatePreview::NoUpdate { .. } => panic!("fixture must update"),
+        };
+        let final_dir = super::super::plugins_dir().unwrap().join("acme.recovery");
+        let backup = final_dir.with_file_name("acme.recovery.bak");
+        let rescue = effects.path().join("prior-installation");
+        let mut gate = fetch::test_gate::install(&final_dir, "rollback");
+        let task = tokio::spawn(async move {
+            apply_update(
+                "acme.recovery",
+                Some(fingerprint),
+                true,
+                OperationLog::Inherit,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(begin_operation().is_err());
+        std::fs::rename(&backup, &rescue).unwrap();
+        gate.release();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error
+            .downcast_ref::<super::super::execution::RecoveryRequired>()
+            .is_some());
+        let evidence = crate::session::get_app_dir()
+            .unwrap()
+            .join(".plugin-recovery-required");
+        assert!(std::fs::read_to_string(evidence)
+            .unwrap()
+            .contains("restoring"));
+        assert!(begin_operation().is_err(), "failure must retain exclusion");
+        assert_eq!(
+            serde_json::to_value(Config::load().unwrap().plugins).unwrap(),
+            before
+        );
+        assert!(
+            rescue.join("aoe-plugin.toml").exists(),
+            "prior installation remains available for recovery"
+        );
     }
 }

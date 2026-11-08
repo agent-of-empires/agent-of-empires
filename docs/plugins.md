@@ -14,6 +14,13 @@ Three equivalent surfaces:
 
 A plugin's enable-state lives under `[plugins."<id>"]` in `config.toml`.
 
+Settings saves merge staged plugin toggles and settings into fresh persisted state.
+Edits for removed external entries, or entries whose source, development marker,
+or complete capability grant changed, are discarded without losing unrelated edits.
+This conservative snapshot check is not a persisted installation-generation token.
+The standalone manager still applies toggles immediately; embedded settings retain
+staged edits when another plugin operation makes saving busy.
+
 ## Worker logs
 
 A plugin worker's stderr goes to `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per worker start. `aoe plugin logs <id>` prints the path of the most recent one, which is the live worker's while it runs, so `tail -f "$(aoe plugin logs <id>)"` follows it. Workers only run under `aoe serve`, so a plugin that never ran has no log.
@@ -61,8 +68,11 @@ Git URLs. Updates retain the recorded source and development marker.
 Preview may fetch into temporary staging but never builds, provisions Node,
 grants capabilities, or publishes the plugin. Approval pins the fetched content;
 `--yes` skips prompts, not the fingerprint check.
-Source-tree preparation and cleanup run off Daemon runtime workers. Cancellation
-keeps mutation exclusion until an already-running preparation finishes.
+Source-tree preparation, release-asset hashing/extraction, and cleanup run off
+Daemon runtime workers. Started blocking work owns staging and mutation exclusion
+until it finishes, even when its observer disappears. Local staging rejects
+symlinks and special files through descriptor-anchored, nonblocking reads;
+`.git` is excluded, while empty directories and executable file modes survive.
 Explicit CLI updates reapply even unchanged sources, so they can restore missing
 plugin files. They use the preview fingerprint and preserve the enabled state.
 
@@ -86,11 +96,43 @@ operations and startup sweeps. Contention is refused, never queued. A competing
 process can make an accepted job fail before preparation; wait for that operation
 and inspect current state before submitting another request.
 
+Each preparation/application has one fixed **two-hour budget**, shared by its
+Git commands and approved build steps. Exhaustion does not start Git fallback.
+The host terminates its owned command group and retained descendant handles,
+even after those descendants change group, before rollback and exclusion release.
+It verifies their physical exit. Observation ending does
+not cancel an accepted mutation. This policy adds no cancellation endpoint,
+flag, or configurable timeout, and commands remain unsandboxed: it is not a
+guarantee against malicious commands escaping their owned process scope or
+arbitrary filesystem I/O stalls.
+
+If command settlement or restoration cannot be proven, the host retains
+exclusion and installation/backup or staging evidence rather than rolling back
+against potentially live writers. It attempts to write
+`<app_dir>/.plugin-recovery-required`, logging any persistence failure.
+Further mutations refuse while that marker exists.
+The job reports an explicit recovery-required failure, not a completed rollback.
+Stop the Daemon without removing the marker. Verify the recorded commands and
+owned workers have physically exited, then restore the intended installation.
+Remove the marker only after recovery, then restart the Daemon to release any
+retained in-process ownership. Restart alone is not recovery.
+
 A plugin lands in `<app_dir>/plugins/<id>/`, with a GitHub source pinned to its exact commit and any release-binary worker downloaded for your platform. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 
 Build steps and workers run with `AOE_NODE` set to the resolved Node and its directory first on `PATH`. If no Node is found when a plugin declares a build step or a non-system worker, install downloads the pinned one on Linux and macOS. Elsewhere, put Node on `PATH` or set `AOE_ACP_NODE`.
 
-Every update, including the opt-in auto-update, restarts the plugin's worker in a running `aoe serve`. CLI updates apply and reload the worker within the Daemon job. The TUI's local update path warns if it cannot reach the Daemon; the worker then keeps the previous build until the Daemon restarts.
+Every update, including opt-in auto-update, requests a worker restart in a running
+`aoe serve`. CLI and TUI updates apply and request that restart inside the existing
+Daemon lifecycle job. The local TUI plugin manager pins its verified local Unix
+Daemon through review, approval, and job observation; it does not redirect local
+plugin mutations to an unrelated explicit endpoint. Setting `AOE_DAEMON_URL`
+still selects remote-home mode, which does not add remote plugin management.
+`--no-autostart` refusal has no local-mutation fallback. Hiding the
+popup or exiting the TUI does not stop an accepted update or its restart.
+Progress shows the accepted job id and Daemon log; refusal, unknown outcome, and
+terminal failure remain distinct. Job success does not prove worker readiness.
+For a TUI-local job, use `env -u AOE_DAEMON_URL aoe plugin job <job_id>` on
+that host so an unrelated explicit endpoint cannot redirect recovery reads.
 
 The web dashboard's Plugins settings does the same things, with a marketplace searching the `aoe-plugin` GitHub topic; every mutating action confirms the plugin's capabilities first.
 

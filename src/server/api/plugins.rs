@@ -750,6 +750,12 @@ pub async fn apply_plugin_update(
     let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Update, id, move |log| async move {
         plugin::install::apply_update(&plugin_id, fingerprint, allow_local_source, log).await?;
+        #[cfg(test)]
+        {
+            let path = plugin::plugins_dir()?.join(&plugin_id);
+            tokio::task::spawn_blocking(move || plugin::fetch::test_gate::reach(&path, "restart"))
+                .await?;
+        }
         if let Some(host) = host {
             host.restart_worker(&plugin_id, &plugin::registry()).await;
         }

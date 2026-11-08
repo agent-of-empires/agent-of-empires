@@ -670,3 +670,26 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
 }
+
+/// Serve the production router through the kernel-verified owner Unix acceptor.
+#[cfg(all(test, unix))]
+pub(crate) async fn serve_local_plugin_fixture(
+    state: Arc<AppState>,
+    path: &std::path::Path,
+    submissions: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    let app = build_router_for_test(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let submissions = submissions.clone();
+            async move {
+                if request.method() == axum::http::Method::POST
+                    && request.uri().path().ends_with("/update/apply")
+                {
+                    submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    serve_owner_router_for_test(path, app).await
+}

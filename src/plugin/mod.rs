@@ -5,6 +5,7 @@ pub mod auto_update;
 pub mod changelog;
 pub mod contributions;
 pub mod discover;
+mod execution;
 pub mod featured;
 pub mod fetch;
 pub mod install;

@@ -1311,6 +1311,41 @@ impl CapturedProcessTree {
         }
     }
 
+    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root = &self.receipt.processes[0];
+            if !self.receipt.root_is_current()? {
+                return Ok(());
+            }
+            let samples = match platform::process_tree_samples(root) {
+                Ok(samples) => samples,
+                Err(_) if !self.receipt.root_is_current()? => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if !self.receipt.root_is_current()? {
+                return Ok(());
+            }
+            for index in (0..self.handles.len()).rev() {
+                if self.handles[index].exited()? {
+                    self.handles.swap_remove(index);
+                }
+            }
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(root));
+            for (sample, selected) in samples.into_iter().zip(selected) {
+                if selected && !self.receipt.processes.contains(&sample.identity) {
+                    if let Some(handle) = platform::ProcessHandle::capture(&sample.identity)? {
+                        self.handles.push(handle);
+                        self.receipt.processes.push(sample.identity);
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+    }
+
     pub(crate) fn receipt(&self) -> &CapturedProcessTreeReceipt {
         &self.receipt
     }
@@ -1351,7 +1386,7 @@ impl CapturedProcessTree {
         Ok(true)
     }
 
-    pub(crate) fn settle(self, grace: Duration) -> anyhow::Result<()> {
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(test)]
@@ -1852,7 +1887,9 @@ mod tests {
         let current = CapturedProcessTree::capture(std::process::id()).unwrap();
         let mut receipt = current.receipt().clone();
         receipt.boot_id = format!("different-{}", receipt.boot_id);
-        let obsolete = CapturedProcessTree::resume(receipt.clone(), std::process::id()).unwrap();
+        let mut obsolete =
+            CapturedProcessTree::resume(receipt.clone(), std::process::id()).unwrap();
+        obsolete.refresh().unwrap();
         assert!(obsolete.all_exited().unwrap());
         obsolete.settle(Duration::ZERO).unwrap();
         receipt.processes.push(receipt.processes[0].clone());
