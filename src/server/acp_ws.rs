@@ -1279,6 +1279,111 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_prefix_preserves_partial_output_across_a_correlated_stop() {
+        use crate::acp::establishment::NativeOperationCorrelation;
+        use crate::acp::event_sender::EventMetadata;
+        use crate::acp::protocol::{AcpOperationMetadata, AcpOriginalRequestResult};
+        use crate::acp::state::ToolCall;
+        use crate::acp::transcript::TranscriptRowKind;
+        let at = chrono::Utc::now();
+        let history = [
+            (
+                Event::ToolCallStarted {
+                    tool_call: ToolCall {
+                        id: "native-tool".into(),
+                        name: "Bash".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: at,
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                },
+                EventMetadata::history(),
+            ),
+            (
+                Event::ToolCallContent {
+                    tool_call_id: "native-tool".into(),
+                    content: "partial native output".into(),
+                },
+                EventMetadata::history(),
+            ),
+            (
+                Event::Stopped {
+                    reason: "prompt_failed".into(),
+                },
+                EventMetadata {
+                    operation: Some(AcpOperationMetadata {
+                        correlation: NativeOperationCorrelation::new(None),
+                        outcome: Some(AcpOriginalRequestResult::Failed),
+                    }),
+                    ..EventMetadata::history()
+                },
+            ),
+            (
+                Event::ToolCallCompleted {
+                    tool_call_id: "native-tool".into(),
+                    content: String::new(),
+                    is_error: false,
+                    output: Vec::new(),
+                    completed_at: at,
+                    async_subagent: false,
+                },
+                EventMetadata::history(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (event, metadata))| crate::acp::event_store::StoredEvent {
+                seq: index as u64 + 1,
+                event: Arc::new(event),
+                metadata,
+            },
+        )
+        .collect::<Vec<_>>();
+        for since in 0..=3 {
+            let mut reduced =
+                AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+            let mut transcript = TranscriptModel::new();
+            let mut cold = ColdFieldCache::default();
+            let mut folds = ConnectionFolds {
+                reduced: &mut reduced,
+                transcript: &mut transcript,
+                cold: &mut cold,
+                last_applied_seq: 0,
+            };
+            let forwarded = fold_connect_history(history.clone(), since, &mut folds, true).unwrap();
+            assert!(forwarded.iter().all(|stored| stored.seq > since));
+            let completed: Vec<_> = folds
+                .transcript
+                .rows()
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::ToolComplete)
+                .collect();
+            assert_eq!(completed.len(), 1, "cursor {since}");
+            assert_eq!(completed[0].text, "partial native output", "cursor {since}");
+            assert!(folds
+                .transcript
+                .rows()
+                .iter()
+                .all(|row| row.kind != TranscriptRowKind::ToolStopped));
+            let original = folds.transcript.rows().to_vec();
+            for stored in &history {
+                assert!(
+                    folds
+                        .transcript
+                        .apply_scoped_event(stored.seq, &stored.event, &stored.metadata,)
+                        .is_empty(),
+                    "overlap must not reapply lifecycle"
+                );
+            }
+            assert_eq!(folds.transcript.rows(), original.as_slice());
+        }
+    }
+
+    #[test]
     fn cursor_bootstrap_keeps_prefix_tools_for_stored_and_live_terminals() {
         use crate::acp::state::test_support::{prompt, stopped};
         use crate::acp::state::ToolCall;

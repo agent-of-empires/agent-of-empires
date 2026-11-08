@@ -1290,7 +1290,11 @@ mod tests {
                     if index < split {
                         model.observe_prior(index as u64 + 1, event);
                     } else {
-                        model.apply_event(index as u64 + 1, event);
+                        model.apply_scoped_event(
+                            index as u64 + 1,
+                            event,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        );
                     }
                 }
                 assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 0);
@@ -1304,7 +1308,11 @@ mod tests {
                     [("t", "orphan text")],
                     "split at {split}: {events:?}"
                 );
-                model.apply_event(3, &completed("t", false, ""));
+                model.apply_scoped_event(
+                    3,
+                    &completed("t", false, ""),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
                 assert_eq!(row(&model, "done-t").text, "completed");
                 let retained = model.into_retained();
                 assert_eq!(retained.unfinished_outputs[0].text, "orphan text");
@@ -1370,7 +1378,11 @@ mod tests {
                     if index < split {
                         model.observe_prior(seq, event);
                     } else {
-                        model.apply_event(seq, event);
+                        model.apply_scoped_event(
+                            seq,
+                            event,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        );
                     }
                 }
                 let snapshot = model.into_retained();
@@ -2802,7 +2814,11 @@ mod tests {
             completed("a", false, ""),
             stopped("user_stopped"),
         ]);
-        m.apply_event(10, &stopped("prompt_complete"));
+        m.apply_scoped_event(
+            10,
+            &stopped("prompt_complete"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         let swept: Vec<&str> = m
             .rows()
             .iter()
@@ -2837,7 +2853,11 @@ mod tests {
             partial.observe_prior(1, &started(tool("t1", "T")));
             partial.observe_prior(2, &content("t1", "buffered before cursor"));
             assert!(partial.rows().is_empty(), "{label}");
-            partial.apply_event(10, &closer);
+            partial.apply_scoped_event(
+                10,
+                &closer,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             let stopped_rows = partial
                 .rows()
                 .iter()
@@ -2861,7 +2881,11 @@ mod tests {
             assert!(closed_prefix.rows().is_empty(), "{label}");
             assert!(
                 closed_prefix
-                    .apply_event(10, &stopped("cancelled"))
+                    .apply_scoped_event(
+                        10,
+                        &stopped("cancelled"),
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
                     .is_empty(),
                 "{label}"
             );
