@@ -1719,6 +1719,7 @@ work-opencode = "opencode"
         const SID: &str = "11111111-2222-4333-8444-555555555555";
         let root = tempdir().unwrap();
         let _env = crate::server::test_support::RuntimeEnvGuard::set(root.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let (_hooks, hook_base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

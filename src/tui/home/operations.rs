@@ -856,17 +856,42 @@ impl HomeView {
             return;
         };
         let generation = instance.lifecycle_generation;
+        let profile = instance.source_profile.clone();
         if let Err(error) = self.session_feed.submit_request(
             id.to_owned(),
             crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
+                expected_profile: Some(profile),
             }),
         ) {
             self.info_dialog = Some(InfoDialog::new(
                 "Could Not Trash Session",
                 &error.to_string(),
             ));
+        }
+    }
+
+    pub(super) fn retry_selected_trash(&mut self) {
+        let Some(instance) = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|instance| instance.has_pending_trash())
+        else {
+            return;
+        };
+        let id = instance.id.clone();
+        let body = crate::daemon::TrashSessionBody {
+            kill_pane: true,
+            expected_generation: Some(instance.lifecycle_generation),
+            expected_profile: Some(instance.source_profile.clone()),
+        };
+        if let Err(error) = self
+            .session_feed
+            .submit_request(id, crate::tui::session_feed::SessionRequest::Trash(body))
+        {
+            self.info_dialog = Some(InfoDialog::new("Could Not Retry Trash", &error.to_string()));
         }
     }
 

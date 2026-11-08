@@ -317,14 +317,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Removes the confirmed worktrees that no session in any profile sits on or inside. The rows are
-/// read, and the removal done, while every store is locked, so no session can adopt a path in
-/// between. Fails closed: if a store cannot be read, nothing is removed.
+fn retained_worktree_owner(
+    owners: &crate::session::purge_owners::CleanupOwners,
+    git_wt: &GitWorktree,
+    worktree: &WorktreeEntry,
+) -> bool {
+    owners.protections().any(|protection| {
+        protection.references_path(&worktree.path)
+            || worktree
+                .branch
+                .as_deref()
+                .is_some_and(|branch| protection.references_branch(&git_wt.repo_path, branch))
+    })
+}
+
+/// Remove confirmed orphans under identity and registry exclusion.
 pub(crate) fn remove_confirmed_worktrees(
     git_wt: &GitWorktree,
     orphans: &[WorktreeEntry],
     purging: &HashSet<PathBuf>,
 ) -> Result<usize> {
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let _transition = crate::session::StorageTransition::acquire()?;
     let storages = crate::session::list_profiles()?
         .iter()
@@ -335,6 +348,8 @@ pub(crate) fn remove_confirmed_worktrees(
         hook();
     }
     crate::session::with_storages_locked(&storages, || {
+        let owners =
+            crate::session::purge_owners::CleanupOwners::load(&crate::session::get_app_dir()?)?;
         let mut session_paths = Vec::new();
         for storage in &storages {
             for inst in storage.load_instances_complete()? {
@@ -343,12 +358,15 @@ pub(crate) fn remove_confirmed_worktrees(
                 session_paths.push(path);
             }
         }
-        let (kept, free): (Vec<_>, Vec<_>) = orphans
-            .iter()
-            .cloned()
-            .partition(|wt| session_paths.iter().any(|path| path.starts_with(&wt.path)));
+        let (kept, free): (Vec<_>, Vec<_>) = orphans.iter().cloned().partition(|wt| {
+            session_paths.iter().any(|path| path.starts_with(&wt.path))
+                || retained_worktree_owner(&owners, git_wt, wt)
+        });
         for wt in &kept {
-            eprintln!("✗ Skipped {}: a session now uses it", wt.path.display());
+            eprintln!(
+                "✗ Skipped {}: retained ownership protects it",
+                wt.path.display()
+            );
         }
         Ok(remove_orphaned_worktrees(git_wt, &free, purging))
     })?
@@ -366,6 +384,18 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
         (orphaned_worktrees, protected_worktrees) = find_orphaned_worktrees(&instances, &git_wt)?;
+        let owners =
+            crate::session::purge_owners::CleanupOwners::load(&crate::session::get_app_dir()?)?;
+        orphaned_worktrees.retain(|worktree| {
+            let retained = retained_worktree_owner(&owners, &git_wt, worktree);
+            if retained {
+                eprintln!(
+                    "Skipped {}: retained ownership protects it",
+                    worktree.path.display()
+                );
+            }
+            !retained
+        });
     }
     let purging = purging_paths(&orphaned_worktrees);
 
@@ -579,6 +609,7 @@ mod tests {
     fn cleanup_spares_candidates_a_session_adopted_after_listing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -594,14 +625,14 @@ mod tests {
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         let git_wt = GitWorktree::new(repo.clone()).unwrap();
         let mut paths = Vec::new();
-        for name in ["inside", "equal", "free"] {
+        for name in ["inside", "equal", "forgotten", "free"] {
             let path = tmp.path().join(name);
             git_wt.create_worktree(name, &path, true, None).unwrap();
             paths.push(path.canonicalize().unwrap());
         }
 
         let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
-        assert_eq!(orphans.len(), 3);
+        assert_eq!(orphans.len(), 4);
         let purging = purging_paths(&orphans);
 
         let nested = paths[0].join("sub");
@@ -615,11 +646,41 @@ mod tests {
                 })
                 .unwrap();
         }
+        {
+            let _identity = crate::session::acquire_session_identity_lock().unwrap();
+            let storage = Storage::new_unwatched("forgotten").unwrap();
+            let mut row = Instance::new("forgotten", paths[2].to_str().unwrap());
+            row.source_profile = "forgotten".into();
+            row.terminal_scopes = Some(Vec::new());
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now()
+                    - Instance::LIFECYCLE_RESERVATION_TTL
+                    - chrono::Duration::seconds(1),
+            )
+            .unwrap();
+            row.trash();
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&row.id).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            crate::session::purge_owners::retain_forgotten_trash(&storage, &row).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.clear();
+                    Ok(())
+                })
+                .unwrap();
+        }
 
         let removed = remove_confirmed_worktrees(&git_wt, &orphans, &purging).unwrap();
         assert_eq!(removed, 1);
-        assert!(paths[0].exists() && paths[1].exists());
-        assert!(!paths[2].exists());
+        assert!(paths[..3].iter().all(|path| path.exists()));
+        assert!(!paths[3].exists());
     }
 
     /// Cleanup holds the catalogue lock across the profile listing, so a profile cannot be created
@@ -629,6 +690,7 @@ mod tests {
     fn cleanup_blocks_profile_creation_after_listing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         Storage::new_unwatched("main").unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();

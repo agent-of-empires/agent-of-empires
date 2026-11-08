@@ -902,7 +902,7 @@ impl Instance {
             let mut handoff_prior = None;
             let execution = self.resolve_launch_execution()?;
             if let Some(execution) = execution.as_ref() {
-                handoff_prior = self.hand_off_prime_fork_parent(execution)?;
+                handoff_prior = self.hand_off_prime_fork_parent(execution, stores)?;
                 if validate_target {
                     self.validate_conversation_target(
                         &execution.binding,

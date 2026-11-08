@@ -97,6 +97,12 @@ pub(super) struct SessionDeleteDialog {
     request: crate::daemon::DeleteSessionBody,
 }
 
+pub(super) struct ForgetTrashTarget {
+    session_id: String,
+    consent: crate::daemon::ForgetTrashBody,
+    epoch: String,
+}
+
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
     Structured {
@@ -372,6 +378,7 @@ pub struct HomeView {
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
     pub(super) pending_trash_session: Option<SessionDialogTarget>,
+    pub(super) pending_forget_trash: Option<ForgetTrashTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,

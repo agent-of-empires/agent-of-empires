@@ -807,6 +807,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -893,6 +894,7 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -1202,6 +1204,111 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 
 #[tokio::test]
 #[serial_test::serial]
+async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> anyhow::Result<()> {
+    for case in [
+        "valid",
+        "profile",
+        "generation",
+        "timestamp",
+        "identity",
+        "fresh",
+        "restored",
+        "purging",
+    ] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        let project = tempfile::tempdir()?;
+        let sentinel = project.path().join("kept.txt");
+        std::fs::write(&sentinel, b"must survive forgetting")?;
+        let mut row = Instance::new("unfinished Trash", project.path().to_str().unwrap());
+        row.source_profile = "receipt".into();
+        row.terminal_scopes = Some(Vec::new());
+        let now = chrono::Utc::now();
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            if case == "fresh" {
+                now
+            } else {
+                now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1)
+            },
+        )?;
+        row.trash();
+        let mut consent = crate::daemon::ForgetTrashBody {
+            expected_profile: "receipt".into(),
+            expected_generation: row.lifecycle_generation,
+            expected_trashed_at: row.trashed_at.unwrap(),
+            expected_trash_lifecycle_id: row.trash_lifecycle_id.clone().unwrap(),
+        };
+        match case {
+            "profile" => consent.expected_profile = "other".into(),
+            "generation" => consent.expected_generation -= 1,
+            "timestamp" => consent.expected_trashed_at -= chrono::Duration::seconds(1),
+            "identity" => consent.expected_trash_lifecycle_id = uuid::Uuid::new_v4().to_string(),
+            "restored" => {
+                row.untrash();
+            }
+            "purging" => {
+                row.lifecycle_reservation.as_mut().unwrap().op =
+                    crate::session::LifecycleOperation::Purge
+            }
+            _ => {}
+        }
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let storage = Storage::new("receipt", state.file_watch.clone())?;
+        storage.update(|rows, _| {
+            rows.push(row);
+            Ok(())
+        })?;
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let registry_before = std::fs::read(storage.sessions_path())?;
+        let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
+        let journal_before = std::fs::read(&journal_path)?;
+        let response = forget_trash_record(State(state), Path(id), Ok(Json(consent)))
+            .await
+            .into_response();
+        if case == "valid" {
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{case}");
+            assert!(response
+                .headers()
+                .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+            assert!(storage.load()?.is_empty());
+            assert!(crate::session::purge_owners::CleanupOwners::load(&root)?
+                .protections()
+                .any(|owner| owner.references_path(project.path())));
+        } else {
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{case}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                if case == "fresh" {
+                    crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
+                } else {
+                    crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
+                },
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(storage.sessions_path())?,
+                registry_before,
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&journal_path)?, journal_before, "{case}");
+        }
+        assert_eq!(
+            std::fs::read(&sentinel)?,
+            b"must survive forgetting",
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
     use crate::session::LifecycleOperation;
     for (already_trashed, precondition, omit_body, peer) in [
@@ -1243,6 +1350,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             (!omit_body).then_some(Json(TrashSessionBody {
                 kill_pane: true,
                 expected_generation: precondition.then_some(expected_generation),
+                expected_profile: None,
             })),
         )
         .await
@@ -1714,6 +1822,7 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             Some(Json(TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
+                expected_profile: None,
             })),
         )
         .await
@@ -2904,6 +3013,7 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
 #[serial_test::serial]
 async fn workspace_purge_keeps_owner_when_a_sibling_was_restored() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     let mut owner = Instance::new("owner", "/tmp/workspace-purge");
     owner.source_profile = "workspace-purge".into();
     owner.status = Status::Stopped;
@@ -4932,23 +5042,6 @@ fn create_sources_are_mutually_exclusive() {
         }));
         assert_eq!(create_body_has_conflicting_sources(&body), conflicts);
     }
-}
-
-#[test]
-fn trash_body_default_keeps_kill_pane_true() {
-    // #2523: a no-body trash request resolves through `unwrap_or_default()`,
-    // and the derived `Default` would leave the pane running, so the hand impl
-    // must match the serde field default.
-    assert!(TrashSessionBody::default().kill_pane);
-
-    // An empty JSON object goes through serde, which honors the field
-    // default helper.
-    let from_empty: TrashSessionBody = serde_json::from_str("{}").unwrap();
-    assert!(from_empty.kill_pane);
-
-    // An explicit `false` is still respected.
-    let explicit: TrashSessionBody = serde_json::from_str(r#"{"kill_pane": false}"#).unwrap();
-    assert!(!explicit.kill_pane);
 }
 
 // Regression for #2363: a multi-repo workspace session carries
@@ -9531,6 +9624,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
     use crate::server::test_support as support;
     for native_origin in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
@@ -9668,6 +9762,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
 async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -10025,6 +10120,7 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -10149,6 +10245,7 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
 async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -11479,6 +11576,7 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
 async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -11522,6 +11620,7 @@ async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
 async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let project = tempfile::tempdir().unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
@@ -11554,6 +11653,7 @@ async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
 async fn cli_generated_worktree_avoids_existing_directories_without_renaming_branch() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let (project, repo) = crate::git::test_support::init_repo();
     let root = tempfile::tempdir().unwrap();
     crate::session::config::update_config(|config| {
@@ -11620,6 +11720,7 @@ async fn cli_generated_worktree_avoids_existing_directories_without_renaming_bra
 async fn cli_concurrent_duplicate_creation_runs_hooks_only_for_the_winner() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -11830,6 +11931,7 @@ async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
 async fn cli_post_commit_failure_preserves_creation_and_reports_unknown_on_replay() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -11902,6 +12004,7 @@ async fn cli_shell_validation_preserves_owner_literals_and_remote_word_boundarie
     use std::os::unix::fs::{symlink, PermissionsExt};
     use tower::ServiceExt;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("agent");
     let observed = root.path().join("arguments");

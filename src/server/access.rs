@@ -402,6 +402,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/summarize"),
     ("POST", "/api/sessions/{id}/smart-rename"),
     ("POST", "/api/sessions/{id}/trash"),
+    ("POST", "/api/sessions/{id}/trash/forget"),
     // Composer.
     ("POST", "/api/sessions/{id}/paste-image"),
     ("POST", "/api/sessions/{id}/acp/prompt"),

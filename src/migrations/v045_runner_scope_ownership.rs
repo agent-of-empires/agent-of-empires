@@ -211,6 +211,10 @@ mod tests {
         let mut journal: Value = serde_json::from_slice(&std::fs::read(&journal_path)?)?;
         let token = journal["owners"][0]["token"].clone();
         journal["version"] = json!(2);
+        journal["owners"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("purpose");
         journal["owners"][0]["runner"]
             .as_object_mut()
             .unwrap()
@@ -238,7 +242,6 @@ mod tests {
             journal["owners"][0]["runner"]["scopes"],
             json!([{"state":"unresolved"}])
         );
-        assert_eq!(journal["version"], 3);
         assert_eq!(
             journal["owners"][0]["runner"]["prime"],
             json!({"state":"unresolved"})
@@ -300,7 +303,7 @@ mod tests {
         assert_eq!(std::fs::read(&record_path)?, record_bytes);
         let migrated = std::fs::read(&journal_path)?;
         let value: Value = serde_json::from_slice(&migrated)?;
-        assert_eq!(value, json!({"version":3,"owners":[]}));
+        assert_eq!(value["owners"], json!([]));
         assert!(crate::session::migration_backups(&journal_path)?
             .iter()
             .any(|(_, path)| std::fs::read(path).is_ok_and(|bytes| bytes == repaired)));

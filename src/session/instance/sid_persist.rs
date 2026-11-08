@@ -1,6 +1,9 @@
 //! CAS-guarded persistence of `agent_session_id` and `resume_intent`.
 
 use super::*;
+use crate::session::purge_owners::{
+    CleanupOwners, ConversationOwnershipBusy, ConversationReadLock,
+};
 
 #[cfg(test)]
 pub(super) mod test_support {
@@ -124,6 +127,23 @@ pub(crate) fn persist_session_to_storage(
 }
 
 impl Instance {
+    pub(super) fn guard_retained_native_conversation(
+        &self,
+        stores: crate::session::storage::CaptureStorage<'_>,
+        session_id: &str,
+        source: Option<&crate::session::ExecutionBinding>,
+    ) -> Result<ConversationReadLock> {
+        stores.with_store(&self.source_profile, |storage| {
+            let guard = ConversationReadLock::acquire(storage.storage(), session_id)?;
+            anyhow::ensure!(
+                !CleanupOwners::load_for(storage.storage())?
+                    .blocks_conversation(&self.id, session_id, source),
+                crate::session::purge_owners::ConversationOwnershipRetained
+            );
+            Ok(guard)
+        })
+    }
+
     /// Consume an explicit OMP resume pin only after the matching launch
     /// reports the already-durable sid. All three facts are checked under the
     /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
@@ -184,6 +204,14 @@ impl Instance {
         {
             return SidPersistOutcome::Skip;
         }
+        let _conversation_lock = match new_sid
+            .as_deref()
+            .map(|sid| ConversationReadLock::acquire(storage.storage(), sid))
+            .transpose()
+        {
+            Ok(guard) => guard,
+            Err(_) => return SidPersistOutcome::Skip,
+        };
         // Cleared and Fork are one-shot launch directives. Use stays durable
         // only when no pane-scoped capture backend can observe a later `/new`;
         // capture-backed agents hand ownership back to their poller.
@@ -266,6 +294,13 @@ impl Instance {
                                 .filter(|binding| binding.session_id == sid)
                                 .is_some_and(ConversationBinding::is_known))
                 };
+                if CleanupOwners::load_for(storage.storage())?.blocks_conversation(
+                    &instance_id,
+                    sid,
+                    source,
+                ) {
+                    return Ok(SidWrite::Skipped);
+                }
                 if instances
                     .iter()
                     .filter(|peer| peer.id != instance_id)
@@ -498,6 +533,17 @@ pub(super) fn persist_session_with_storage(
     if observation.execution != expected.active {
         return CaptureCommit::unapplied(SidWrite::Skipped);
     }
+    let _conversation_lock = match ConversationReadLock::acquire(storage.storage(), session_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let outcome = if error.is::<ConversationOwnershipBusy>() {
+                SidWrite::Skipped
+            } else {
+                SidWrite::Failed
+            };
+            return CaptureCommit::unapplied(outcome);
+        }
+    };
     let binding = observation.conversation_binding();
     let result = storage.update(|instances, _groups| {
         let Some(index) = instances
@@ -547,7 +593,11 @@ pub(super) fn persist_session_with_storage(
             sid == Some(session_id)
                 && crate::session::capture::owner_excludes(observation.source(), owner, session_id)
         };
-        let conflict = instances.iter().any(|peer| {
+        let conflict = CleanupOwners::load_for(storage.storage())?.blocks_conversation(
+            instance_id,
+            session_id,
+            observation.source(),
+        ) || instances.iter().any(|peer| {
             peer.id != instance_id
                 && (owns(
                     peer.agent_session_id.as_deref(),
@@ -559,13 +609,8 @@ pub(super) fn persist_session_with_storage(
                     )
                 }))
         });
-        // Read before the conflict verdict: a pin confirmation is not a fresh
-        // claim, so it keeps the retryable outcome instead of becoming one.
         let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         if conflict {
-            // A peer durably owns this sid, so the publication is a conflict to
-            // retry rather than a divergence to abandon. A pin confirmation is
-            // exempt: the row armed the pin and must be able to re-prove it.
             return Ok(CaptureCommit::unapplied(if confirms_pin {
                 SidWrite::Skipped
             } else {
@@ -638,6 +683,7 @@ mod tests {
     }
 
     fn seed(profile: &str, insts: &[&Instance]) {
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
         Storage::new_unwatched(profile)
             .unwrap()
@@ -1989,6 +2035,90 @@ mod tests {
                 assert_eq!(captured_env(tmux.name()).as_deref(), want_env, "{label}");
                 assert_eq!(inst.agent_session_id.as_deref(), want_sid, "{label}");
                 assert_eq!(inst.resume_intent, want_intent, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn forgotten_conversations_refuse_capture_and_resume_pin_transfer() {
+        use crate::session::instance::PriorToolSession;
+        use crate::session::{LifecycleOperation, LifecycleReservation};
+        for parked in [false, true] {
+            for pin in [false, true] {
+                let profile = "forgotten-conversation";
+                let (temp, _home, storage) = seeded(profile, &[]);
+                let root = crate::session::get_app_dir().unwrap();
+                crate::session::purge_owners::initialize(&root).unwrap();
+                crate::tmux::tool_retirement::initialize(&root).unwrap();
+                let mut owner = make_inst(profile, "forgotten");
+                owner.project_path = temp.path().join("owner").to_str().unwrap().into();
+                std::fs::create_dir(&owner.project_path).unwrap();
+                owner.terminal_scopes = Some(Vec::new());
+                if parked {
+                    owner.prior_tool_session_ids.insert(
+                        "claude".into(),
+                        PriorToolSession {
+                            agent_session_id: Some(VALID_SID.into()),
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    owner.agent_session_id = Some(VALID_SID.into());
+                }
+                owner.trash();
+                owner.lifecycle_generation = 4;
+                owner.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Trash,
+                    generation: 4,
+                    at: chrono::Utc::now() - chrono::Duration::hours(1),
+                });
+                let mut claimant = make_inst(profile, "claimant");
+                claimant.project_path = temp.path().join("claimant").to_str().unwrap().into();
+                std::fs::create_dir(&claimant.project_path).unwrap();
+                seed(profile, &[&owner, &claimant]);
+                let registry_before = std::fs::read(storage.sessions_path()).unwrap();
+                let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
+                let journal_before = std::fs::read(&journal_path).unwrap();
+                let held = ConversationReadLock::acquire(&storage, VALID_SID).unwrap();
+                let refused =
+                    crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
+                        .unwrap_err();
+                assert!(refused.is::<ConversationOwnershipBusy>());
+                assert_eq!(
+                    std::fs::read(storage.sessions_path()).unwrap(),
+                    registry_before
+                );
+                assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+                drop(held);
+                crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows.retain(|row| row.id != owner.id);
+                        Ok(())
+                    })
+                    .unwrap();
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                let expected = claimant.conversation_state();
+                if pin {
+                    claimant.agent_session_id = Some(VALID_SID.into());
+                    claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
+                    let _ = claimant.persist_session_id_with_storage(&storage, &expected);
+                    assert!(claimant.agent_session_id.is_none());
+                    assert_eq!(claimant.resume_intent, expected.intent);
+                } else {
+                    assert_eq!(
+                        persist_session_with_storage(
+                            &storage,
+                            &claimant.id,
+                            &observation(VALID_SID),
+                            &expected
+                        )
+                        .outcome,
+                        SidWrite::OwnershipConflict
+                    );
+                }
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
             }
         }
     }

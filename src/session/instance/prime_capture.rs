@@ -604,6 +604,7 @@ impl Instance {
     pub(super) fn hand_off_prime_fork_parent(
         &mut self,
         execution: &super::execution::NativeExecution,
+        stores: CaptureStorage<'_>,
     ) -> anyhow::Result<Option<ConversationState>> {
         let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
             return Ok(None);
@@ -611,6 +612,11 @@ impl Instance {
         let Some((parent, parent_sessions)) = self.prime_fork_parent_handoff(execution)? else {
             return Ok(None);
         };
+        let _conversation_lock = self.guard_retained_native_conversation(
+            stores,
+            &parent.session_id,
+            Some(&execution.binding),
+        )?;
         crate::session::capture::hand_off_prime_root_transcript(
             parent_sessions,
             &plan.store,
@@ -935,6 +941,7 @@ mod tests {
     fn prepared_prime_launch_refreshes_resident_root_without_overwriting_peer() {
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
@@ -1025,6 +1032,7 @@ mod tests {
     fn a_sandboxed_prime_fork_child_launches_from_its_own_store_and_resumes_there() {
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let (parent_id, child_id) = (

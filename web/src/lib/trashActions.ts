@@ -1,7 +1,7 @@
 // Trash, restore, and confirmed-deletion transitions.
 
 import { deleteWorkspace, restoreSession, trashSession } from "./api";
-import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashPurgeConsent } from "./api";
+import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashForgetConsent, TrashPurgeConsent } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
 const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
@@ -15,6 +15,62 @@ export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: s
 export interface Notifier {
   error?: (message: string) => void;
   info?: (message: string) => void;
+}
+
+export interface TrashRecoveryTarget extends TrashForgetConsent {
+  id: string;
+  title: string;
+  created_at: string;
+  epoch: string;
+}
+
+export function hasPendingTrash(session: SessionResponse): boolean {
+  return Boolean(
+    session.trashed_at &&
+    session.lifecycle_reservation?.op === "trash" &&
+    session.lifecycle_reservation.generation === session.lifecycle_generation,
+  );
+}
+
+export function trashRecoveryTarget(session: SessionResponse, epoch: string | null): TrashRecoveryTarget | null {
+  if (
+    !epoch ||
+    !hasPendingTrash(session) ||
+    !session.trashed_at ||
+    !session.trash_lifecycle_id ||
+    !session.profile ||
+    !Number.isSafeInteger(session.lifecycle_generation) ||
+    session.lifecycle_generation < 0
+  )
+    return null;
+  return {
+    id: session.id,
+    title: session.title,
+    created_at: session.created_at,
+    epoch,
+    expected_profile: session.profile,
+    expected_generation: session.lifecycle_generation,
+    expected_trashed_at: session.trashed_at,
+    expected_trash_lifecycle_id: session.trash_lifecycle_id,
+  };
+}
+
+export function trashRecoveryTargetIsCurrent(
+  session: SessionResponse | undefined,
+  target: TrashRecoveryTarget,
+  epoch: string | null,
+): boolean {
+  return Boolean(
+    session &&
+    hasPendingTrash(session) &&
+    epoch === target.epoch &&
+    session.id === target.id &&
+    session.profile === target.expected_profile &&
+    session.created_at === target.created_at &&
+    session.lifecycle_generation === target.expected_generation &&
+    session.trashed_at === target.expected_trashed_at &&
+    session.trash_lifecycle_id === target.expected_trash_lifecycle_id,
+  );
 }
 
 /** Cleanup flags are on when any session in the workspace opts in; shared by the delete dialog and Empty Trash. */

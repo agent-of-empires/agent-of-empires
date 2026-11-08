@@ -60,6 +60,8 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
     onEmptyTrash: vi.fn(),
+    onRetryTrash: vi.fn(async () => {}),
+    onForgetTrash: vi.fn(),
     sortMode: "lastActivity",
     onSortModeChange: noop,
     pluginSortRef: null,
@@ -234,6 +236,9 @@ describe("WorkspaceSidebar Trash control", () => {
         trashedCount={workspaces.length}
         loaded
         onLoad={noop}
+        runtimeEpoch="boot"
+        onRetryTrash={async () => {}}
+        onForgetTrash={noop}
         onOpen={noop}
         onRestore={noop}
         onDelete={noop}

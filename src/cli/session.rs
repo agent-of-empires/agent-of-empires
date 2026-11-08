@@ -3002,6 +3002,7 @@ mod restart_args_tests {
         inst.agent_session_id = Some("d38740e4-bd1f-43d7-8727-485652e4678e".to_string());
         inst.mark_pi_extension_launched_for_test();
         let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         storage
             .update(|instances, _| {
                 *instances = vec![inst.clone()];

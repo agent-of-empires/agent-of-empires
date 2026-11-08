@@ -75,6 +75,9 @@ import {
   trashSessions,
   sessionsSharingWorktree,
   workspaceCleanupDefaults,
+  hasPendingTrash,
+  trashRecoveryTargetIsCurrent,
+  type TrashRecoveryTarget,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -102,6 +105,8 @@ import {
   setSessionSnooze,
   trashSession,
   restoreSession,
+  retryTrashSession,
+  forgetTrashRecord,
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
@@ -133,6 +138,7 @@ import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
+import { ForgetTrashDialog } from "./components/ForgetTrashDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { TopBar } from "./components/TopBar";
@@ -1170,6 +1176,18 @@ function AppContent({
   // A background create's failure to reopen on; the count remounts a wizard already open.
   const [wizardRestore, setWizardRestore] = useState<{ restore: WizardRestore; n: number } | null>(null);
   const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
+  const [forgetTrashTarget, setForgetTrashTarget] = useState<TrashRecoveryTarget | null>(null);
+  if (
+    forgetTrashTarget &&
+    (caps.readOnly ||
+      !trashRecoveryTargetIsCurrent(
+        sessions.find((session) => session.id === forgetTrashTarget.id),
+        forgetTrashTarget,
+        runtimeEpoch,
+      ))
+  ) {
+    setForgetTrashTarget(null);
+  }
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
@@ -1386,6 +1404,77 @@ function AppContent({
     (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
     [applySession],
   );
+
+  const handleRetryTrash = useCallback(
+    async (target: TrashRecoveryTarget) => {
+      if (
+        caps.readOnly ||
+        !trashRecoveryTargetIsCurrent(
+          sessions.find((session) => session.id === target.id),
+          target,
+          runtimeEpoch,
+        )
+      ) {
+        toastBus.handler?.error("The Trash session changed. Reopen its recovery actions.");
+        return;
+      }
+      const result = await retryTrashSession(target.id, target, target.epoch);
+      if (result.outcome !== "committed") {
+        toastBus.handler?.error(result.message ?? "Trash retry was not confirmed. Refresh before retrying.");
+        refreshSessions();
+        return;
+      }
+      applySessionMutation(result.mutation);
+      if (hasPendingTrash(result.mutation.session)) {
+        toastBus.handler?.error(
+          result.message ?? "Trash remains unfinished. Its files and cleanup ownership are preserved.",
+        );
+      } else if (result.message) {
+        toastBus.handler?.info(result.message);
+      }
+    },
+    [caps.readOnly, sessions, runtimeEpoch, applySessionMutation, refreshSessions],
+  );
+
+  const handleForgetTrash = useCallback(
+    (target: TrashRecoveryTarget) => {
+      if (
+        caps.readOnly ||
+        !trashRecoveryTargetIsCurrent(
+          sessions.find((session) => session.id === target.id),
+          target,
+          runtimeEpoch,
+        )
+      ) {
+        toastBus.handler?.error("The Trash session changed. Reopen its recovery actions.");
+        return;
+      }
+      setForgetTrashTarget(target);
+    },
+    [caps.readOnly, sessions, runtimeEpoch],
+  );
+
+  const handleConfirmForgetTrash = useCallback(async () => {
+    const target = forgetTrashTarget;
+    setForgetTrashTarget(null);
+    if (!target) return;
+    if (
+      caps.readOnly ||
+      !trashRecoveryTargetIsCurrent(
+        sessions.find((session) => session.id === target.id),
+        target,
+        runtimeEpoch,
+      )
+    ) {
+      toastBus.handler?.error("The Trash session changed. Nothing was forgotten.");
+      return;
+    }
+    // Leave before awaiting so late replies cannot redirect a replacement selection.
+    if (activeSessionId === target.id) leaveActiveSession();
+    const result = await forgetTrashRecord(target.id, target, target.epoch);
+    refreshSessions();
+    if (result.outcome !== "committed") toastBus.handler?.error(result.message);
+  }, [forgetTrashTarget, caps.readOnly, sessions, runtimeEpoch, activeSessionId, leaveActiveSession, refreshSessions]);
 
   const stoppingSession = stoppingSessionId ? (sessions.find((s) => s.id === stoppingSessionId) ?? null) : null;
 
@@ -2654,6 +2743,8 @@ function AppContent({
                 onDeleteSession={handleDeleteSession}
                 onRestoreSession={handleRestoreSession}
                 onEmptyTrash={handleEmptyTrash}
+                onRetryTrash={handleRetryTrash}
+                onForgetTrash={handleForgetTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
                 onRestartForUpdate={restartForUpdate}
@@ -2767,6 +2858,15 @@ function AppContent({
               onConfirm={handleConfirmDelete}
               onTrash={handleConfirmTrash}
               onCancel={() => setDeletingSessions([])}
+            />
+          )}
+
+          {forgetTrashTarget && (
+            <ForgetTrashDialog
+              sessionTitle={forgetTrashTarget.title}
+              profile={forgetTrashTarget.expected_profile}
+              onConfirm={handleConfirmForgetTrash}
+              onCancel={() => setForgetTrashTarget(null)}
             />
           )}
 

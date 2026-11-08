@@ -812,6 +812,8 @@ mod tests {
         for conflict in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let project = temp.path().join("project");
             let store = temp.path().join("prime-store");
             let sessions = store.join("sessions");
@@ -949,6 +951,7 @@ mod tests {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
         for (tool, command, already_current) in [
             ("pi", "", false),

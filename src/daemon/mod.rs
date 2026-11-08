@@ -39,15 +39,15 @@ pub use wire::{
     CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
     CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
-    GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
-    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
-    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
-    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
-    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    ForgetTrashBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
+    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
+    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
+    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
+    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
+    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
+    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
+    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
+    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
     WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
@@ -696,6 +696,21 @@ impl DaemonClient {
             cursor: receipt.cursor,
             outcome: receipt.outcome.outcome,
         })
+    }
+
+    pub async fn forget_trash_record(
+        &self,
+        session_id: &str,
+        body: &ForgetTrashBody,
+        epoch: &str,
+    ) -> Result<RuntimeCursor, DaemonClientError> {
+        let url = format!(
+            "{}/{}/trash/forget",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        self.request_mutation(self.http.post(url).json(body), epoch)
+            .await
     }
 
     /// Request daemon-owned naming; apply the receipt snapshot before using changed titles.

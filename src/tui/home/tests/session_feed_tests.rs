@@ -1621,95 +1621,53 @@ fn publish_canonical_snapshot(
 
 #[test]
 #[serial]
-fn canonical_peer_addition_preserves_live_send_and_drafts_when_active_row_is_hidden() {
-    let mut env = create_test_env_empty();
-    let active = local_row(&mut env, "active-live", "/tmp/active-live");
-    let active_id = active.id.clone();
-    seed_profile("test", std::slice::from_ref(&active));
-    let _native_driver = env.view.session_feed.terminal_driver_for_test();
-    publish_canonical_snapshot(
-        &mut env,
-        vec![canonical_row(&active, serde_json::json!({}))],
-        vec![],
-        1,
-    );
-    let native_lease = env.view.session_feed.native_lease_for_test();
-    assert!(native_lease.is_valid());
-    env.view.select_session_by_id(&active_id);
-    let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
-    env.view.live_send = Some(live_send_state(&active_id, "active-live", &tmux_name));
-    env.view.pending_paste = Some("queued paste".into());
-    env.view.preview_capture_target = Some(tmux_name.clone());
-    env.view.live_send_last_resize = Some((100, 30));
-    env.view.trashed_section_collapsed = true;
-    env.view.search_active = true;
-    env.view.search_query = Input::new("peer-added".into());
+fn canonical_trash_disarms_live_input_without_revoking_peer_authority() {
+    for trashed in [false, true] {
+        let mut env = create_test_env_empty();
+        let mut row = local_row(&mut env, "live", "/tmp/live");
+        let id = row.id.clone();
+        seed_profile("test", std::slice::from_ref(&row));
+        let _native_driver = env.view.session_feed.terminal_driver_for_test();
+        publish_canonical_snapshot(
+            &mut env,
+            vec![canonical_row(&row, serde_json::json!({}))],
+            vec![],
+            1,
+        );
+        let native_lease = env.view.session_feed.native_lease_for_test();
+        env.view.select_session_by_id(&id);
+        let tmux_name = crate::tmux::Session::resolve_name(&id, "live");
+        env.view.live_send = Some(live_send_state(&id, "live", &tmux_name));
+        env.view.pending_paste = Some("queued paste".into());
+        env.view.preview_capture_target = Some(tmux_name);
+        env.view.trashed_section_collapsed = false;
+        if trashed {
+            row.trash();
+        }
+        let mut peer = Instance::new("peer", "/tmp/peer");
+        peer.source_profile = "test".into();
+        seed_profile("test", &[row.clone(), peer.clone()]);
+        publish_canonical_snapshot(
+            &mut env,
+            vec![
+                canonical_row(&row, serde_json::json!({})),
+                canonical_row(&peer, serde_json::json!({})),
+            ],
+            vec![],
+            2,
+        );
 
-    let mut hidden = active.clone();
-    hidden.trash();
-    let mut peer = Instance::new("peer-added", "/tmp/peer-added");
-    peer.source_profile = "test".into();
-    seed_profile("test", &[hidden.clone(), peer.clone()]);
-    publish_canonical_snapshot(
-        &mut env,
-        vec![
-            canonical_row(&hidden, serde_json::json!({})),
-            canonical_row(&peer, serde_json::json!({})),
-        ],
-        vec![],
-        2,
-    );
-
-    let view = &env.view;
-    assert!(
-        native_lease.is_valid(),
-        "unchanged native authority remains live"
-    );
-    assert!(view
-        .get_instance(&active_id)
-        .is_some_and(Instance::is_trashed));
-    assert!(
-        !view
-            .flat_items
-            .iter()
-            .any(|item| matches!(item, Item::Session { id, .. } if id == &active_id)),
-        "precondition: the active row moved under the collapsed trash shelf"
-    );
-    assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
-    assert_eq!(view.pending_paste.as_deref(), Some("queued paste"));
-    assert_eq!(
-        view.preview_capture_target.as_deref(),
-        Some(tmux_name.as_str())
-    );
-    assert_eq!(view.live_send_last_resize, Some((100, 30)));
-    assert_eq!(
-        view.displayed_pane_tmux_name().as_deref(),
-        Some(tmux_name.as_str()),
-        "preview capture must stay pinned to the live-send pane"
-    );
-    let peer_index = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { id, .. } if id == &peer.id))
-        .expect("peer row remains visible");
-    assert!(view.search_matches.contains(&peer_index));
-    assert!(
-        !view.is_sidebar_item_selected(&view.flat_items[peer_index], peer_index),
-        "cursor fallback must not visibly retarget selection during live-send"
-    );
-    let live = view.live_send.as_ref().expect("live-send remains active");
-    assert_eq!(
-        (
-            live.session_id.as_str(),
-            live.title.as_str(),
-            live.tmux_name.as_str()
-        ),
-        (active_id.as_str(), "active-live", tmux_name.as_str())
-    );
-    assert_eq!(
-        live.target,
-        crate::tui::home::live_send::LiveSendTarget::Agent
-    );
+        assert!(native_lease.is_valid(), "peer authority stays available");
+        assert_eq!(env.view.live_send.is_some(), !trashed);
+        if trashed {
+            assert!(env.view.pending_paste.is_none());
+            assert!(env.view.preview_capture_target.is_none());
+            assert!(env.view.take_native_attachment().is_none());
+        } else {
+            assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+            assert_eq!(env.view.pending_paste.as_deref(), Some("queued paste"));
+        }
+    }
 }
 
 #[test]
@@ -3649,4 +3607,49 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
             );
         }
     }
+}
+
+#[test]
+#[serial]
+fn forget_confirmation_does_not_survive_runtime_epoch_replacement() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+    use crate::tui::dialogs::ContextMenuAction;
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.mutate_instance(&id, |row| {
+        row.trash();
+        row.lifecycle_generation = 4;
+        row.lifecycle_reservation = Some(LifecycleReservation {
+            op: LifecycleOperation::Trash,
+            generation: 4,
+            at: chrono::Utc::now() - chrono::Duration::hours(1),
+        });
+    });
+    env.view.trashed_section_collapsed = false;
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view
+        .session_feed
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+    env.view.apply_session_feed();
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ForgetTrash);
+    assert!(env.view.confirm_dialog.is_some());
+    let SessionFeedResult::Snapshot(mut next) = daemon_snapshot(&env.view, &id, "Stopped") else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut next).cursor.epoch = "replacement".into();
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(next));
+    env.view.apply_session_feed();
+    assert!(
+        env.view.pending_forget_trash.is_none(),
+        "old consent must not authorize forgetting the same durable row in a new runtime"
+    );
+    assert!(env.view.confirm_dialog.is_none());
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    assert!(commands(Err("old consent was submitted".into())).is_none());
+    assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
 }

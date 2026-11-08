@@ -699,6 +699,34 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
+        let _conversation_lock = if prepared.is_existing || prepared.fork_mints_child {
+            let target = prepared
+                .canonical_conversation
+                .as_ref()
+                .and_then(|conversation| conversation.session_id.as_deref())
+                .or_else(|| {
+                    prepared.execution.as_ref().and_then(|execution| {
+                        execution
+                            .resolved_target_session_id
+                            .as_deref()
+                            .or(execution.target_session_id.as_deref())
+                    })
+                })
+                .or(self.agent_session_id.as_deref())
+                .context("Native conversation target is unavailable")?;
+            Some(
+                self.guard_retained_native_conversation(
+                    CaptureStorage::Scoped(storage),
+                    target,
+                    prepared
+                        .execution
+                        .as_ref()
+                        .map(|execution| &execution.binding),
+                )?,
+            )
+        } else {
+            None
+        };
         let profile = storage.storage().profile();
         let handoff_key = self
             .terminal_handoff
@@ -1291,6 +1319,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(root.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _env = crate::session::test_support::EnvGuard::unset(&[
             "TMUX",
             "TMUX_PANE",
@@ -2011,6 +2040,93 @@ else:
         assert_eq!(
             instance.attested_claude_store_route(&container_launch),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn forgotten_conversation_cannot_be_launched_by_another_terminal_session() {
+        use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
+        use crate::session::{LifecycleReservation, Storage};
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "TMUX",
+            "TMUX_PANE",
+            "CLAUDE_CONFIG_DIR",
+            "AOE_DAEMON_URL",
+        ])
+        .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let marker = root.path().join("agent-started");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf started > {}\n",
+            crate::session::environment::shell_escape(marker.to_str().unwrap())
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            &script,
+        );
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let profile = "forgotten-launch";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let owner_path = root.path().join("owner");
+        let claimant_path = root.path().join("claimant");
+        std::fs::create_dir(&owner_path).unwrap();
+        std::fs::create_dir(&claimant_path).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let mut owner = tool_instance("claude", owner_path.to_str().unwrap());
+        owner.source_profile = profile.into();
+        owner.agent_session_id = Some(sid.into());
+        owner.terminal_scopes = Some(Vec::new());
+        owner.trash();
+        owner.lifecycle_generation = 4;
+        owner.lifecycle_reservation = Some(LifecycleReservation {
+            op: LifecycleOperation::Trash,
+            generation: 4,
+            at: chrono::Utc::now() - chrono::Duration::hours(1),
+        });
+        let mut claimant = tool_instance("claude", claimant_path.to_str().unwrap());
+        claimant.source_profile = profile.into();
+        seed_claude_transcript(&mut claimant, sid);
+        claimant.resume_intent = ResumeIntent::Use(sid.into());
+        claimant.resume_binding = claimant.agent_session_binding.clone();
+        storage
+            .update(|rows, _| {
+                rows.extend([owner.clone(), claimant.clone()]);
+                Ok(())
+            })
+            .unwrap();
+        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.retain(|row| row.id != owner.id);
+                Ok(())
+            })
+            .unwrap();
+        let error = claimant
+            .start_with_size_opts_in(None, true, &storage, true, None)
+            .unwrap_err();
+        assert!(
+            error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
+            "unexpected launch refusal: {error:#}"
+        );
+        assert!(!marker.exists());
+        assert!(!claimant.tmux_session().unwrap().exists_live());
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(sid)
         );
     }
 }

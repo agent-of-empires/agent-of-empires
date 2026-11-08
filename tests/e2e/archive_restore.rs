@@ -1302,3 +1302,352 @@ fn trash_retry_ignores_permanent_delete_policy() {
         .iter()
         .any(|row| row["id"] == id));
 }
+
+fn pending_trash_row(
+    h: &TuiTestHarness,
+    title: &str,
+    unverified: bool,
+) -> (serde_json::Value, String, std::path::PathBuf) {
+    use agent_of_empires::session::{Instance, LifecycleOperation, Status, WorktreeInfo};
+    let checkout = h.home_path().join(title);
+    std::fs::create_dir(&checkout).unwrap();
+    let sentinel = checkout.join("kept.txt");
+    std::fs::write(&sentinel, b"retained files").unwrap();
+    let mut row = Instance::new(title, checkout.to_str().unwrap());
+    row.status = Status::Stopped;
+    if unverified {
+        row.worktree_info = Some(WorktreeInfo {
+            branch: "unverified".into(),
+            main_repo_path: h.project_path().to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+    }
+    row.try_acquire_lifecycle_reservation(
+        LifecycleOperation::Trash,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+    )
+    .unwrap();
+    row.trash();
+    let id = row.id.clone();
+    let mut value = serde_json::to_value(row).unwrap();
+    value["terminal_scopes"] = serde_json::json!([]);
+    (value, id, sentinel)
+}
+
+fn trash_management_click(h: &mut TuiTestHarness, text: &str) {
+    let (x, y) =
+        crate::harness::wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            let screen = h.capture_screen();
+            screen
+                .lines()
+                .enumerate()
+                .find_map(|(y, line)| {
+                    line.find(text).map(|byte| {
+                        (
+                            unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1,
+                            y as u16 + 1,
+                        )
+                    })
+                })
+                .ok_or_else(|| format!("waiting for {text}\n{screen}"))
+        });
+    h.send_mouse_click(0, x, y);
+}
+
+fn trash_management_menu(h: &mut TuiTestHarness, title: &str) {
+    let y = crate::harness::wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let screen = h.capture_screen();
+        screen
+            .lines()
+            .position(|line| {
+                line.find(title)
+                    .is_some_and(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]) < 24)
+            })
+            .map(|y| y as u16 + 1)
+            .ok_or_else(|| format!("waiting for Trash row {title}\n{screen}"))
+    });
+    h.send_mouse_click(0, 7, y);
+    h.wait_for("Trash · read-only");
+    h.send_mouse_click(2, 7, y);
+    h.wait_for("Retry Trash");
+}
+
+fn record_trash_management(h: &TuiTestHarness, name: &str) {
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/e2e-recordings");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.ansi")),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join(format!("{name}.txt")), h.capture_screen()).unwrap();
+    }
+}
+
+#[test]
+#[parallel]
+fn trash_management_retry_finishes_or_keeps_unverified_files() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_management_retry");
+    h.stop_daemon_on_drop();
+    let (complete, complete_id, complete_file) = pending_trash_row(&h, "RetryComplete", false);
+    let (failed, failed_id, failed_file) = pending_trash_row(&h, "RetryUnverified", true);
+    let generation = complete["lifecycle_generation"].as_u64().unwrap();
+    let failed_generation = failed["lifecycle_generation"].as_u64().unwrap();
+    std::fs::write(
+        h.sessions_path(),
+        serde_json::to_vec(&[complete, failed]).unwrap(),
+    )
+    .unwrap();
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Enter");
+    trash_management_menu(&mut h, "RetryComplete");
+    record_trash_management(&h, "trash-retry-menu");
+    h.send_keys("Enter");
+    crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == complete_id)
+            .unwrap();
+        (row["lifecycle_generation"] == generation + 1 && row["lifecycle_reservation"].is_null())
+            .then_some(())
+            .ok_or_else(|| format!("retry not completed: {row}"))
+    });
+    trash_management_menu(&mut h, "RetryUnverified");
+    trash_management_click(&mut h, "Retry Trash");
+    crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == failed_id)
+            .unwrap();
+        (row["lifecycle_generation"] == failed_generation + 1
+            && row["lifecycle_reservation"]["op"] == "trash")
+            .then_some(())
+            .ok_or_else(|| format!("unverified retry not settled: {row}"))
+    });
+    record_trash_management(&h, "trash-retry-unverified");
+    for path in [complete_file, failed_file] {
+        assert_eq!(std::fs::read(path).unwrap(), b"retained files");
+    }
+}
+
+#[test]
+#[parallel]
+fn trash_forget_record_preserves_unverified_files_with_keyboard_and_mouse() {
+    require_tmux!();
+    for mouse in [false, true] {
+        let mut h = TuiTestHarness::new("trash_forget_record");
+        h.stop_daemon_on_drop();
+        let (row, id, sentinel) = pending_trash_row(&h, "ForgetUnverified", true);
+        std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+        h.start_daemon();
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        h.wait_for("Trash (");
+        h.send_keys("End");
+        h.send_keys("Enter");
+        trash_management_menu(&mut h, "ForgetUnverified");
+        if mouse {
+            trash_management_click(&mut h, "Forget record");
+        } else {
+            h.send_keys("Down");
+            h.send_keys("Enter");
+        }
+        h.wait_for("Forget Trash Record");
+        record_trash_management(
+            &h,
+            if mouse {
+                "trash-forget-mouse"
+            } else {
+                "trash-forget-keyboard"
+            },
+        );
+        if mouse {
+            trash_management_click(&mut h, "Forget record");
+        } else {
+            h.send_keys("Left");
+            h.send_keys("Enter");
+        }
+        crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            let rows = h.read_sessions();
+            (!rows.as_array().unwrap().iter().any(|row| row["id"] == id))
+                .then_some(())
+                .ok_or_else(|| "forgotten row still present".into())
+        });
+        h.wait_for_absent("ForgetUnverified", Duration::from_secs(5));
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"retained files");
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                crate::harness::app_dir_in(h.home_path()).join("pending-purge-owners.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(journal["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| { owner["session_id"] == id && owner["purpose"]["kind"] == "retained" }));
+    }
+}
+
+#[test]
+#[parallel]
+fn trash_forget_confirmation_rejects_concurrent_retry_before_keyboard_or_mouse_consent() {
+    require_tmux!();
+    for mouse in [false, true] {
+        let mut h = TuiTestHarness::new("trash_forget_stale");
+        h.stop_daemon_on_drop();
+        let (row, id, sentinel) = pending_trash_row(&h, "ForgetStale", true);
+        let generation = row["lifecycle_generation"].as_u64().unwrap();
+        std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+        h.start_daemon();
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        h.wait_for("Trash (");
+        h.send_keys("End");
+        h.send_keys("Enter");
+        trash_management_menu(&mut h, "ForgetStale");
+        trash_management_click(&mut h, "Forget record");
+        h.wait_for("Forget Trash Record");
+        h.send_keys("Escape");
+        h.wait_for_absent("Forget Trash Record", Duration::from_secs(5));
+        trash_management_menu(&mut h, "ForgetStale");
+        trash_management_click(&mut h, "Forget record");
+        h.wait_for("Forget Trash Record");
+        let screen = h.capture_screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Forget record"))
+            .unwrap();
+        let x = unicode_width::UnicodeWidthStr::width(&line[..line.find("Forget record").unwrap()])
+            as u16
+            + 1;
+        let y = y as u16 + 1;
+        let _retry = h.run_cli(&["rm", &id]);
+        h.wait_for("Session Changed");
+        if mouse {
+            h.send_mouse_click(0, x, y);
+        } else {
+            h.send_keys("Left");
+            h.send_keys("Enter");
+        }
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(row["lifecycle_generation"], generation + 1);
+        assert_eq!(row["lifecycle_reservation"]["op"], "trash");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"retained files");
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                crate::harness::app_dir_in(h.home_path()).join("pending-purge-owners.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!journal["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| { owner["session_id"] == id && owner["purpose"]["kind"] == "retained" }));
+    }
+}
+
+#[test]
+#[parallel]
+fn trash_forget_confirmation_expires_across_daemon_restart_with_unchanged_row() {
+    require_tmux!();
+    for mouse in [false, true] {
+        let mut h = TuiTestHarness::new("trash_forget_epoch");
+        h.stop_daemon_on_drop();
+        let (original, id, sentinel) = pending_trash_row(&h, "ForgetEpoch", true);
+        std::fs::write(
+            h.sessions_path(),
+            serde_json::to_vec(std::slice::from_ref(&original)).unwrap(),
+        )
+        .unwrap();
+        let port = h.start_daemon();
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        h.wait_for("Trash (");
+        h.send_keys("End");
+        h.send_keys("Enter");
+        trash_management_menu(&mut h, "ForgetEpoch");
+        trash_management_click(&mut h, "Forget record");
+        h.wait_for("Forget Trash Record");
+        let screen = h.capture_screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Forget record"))
+            .unwrap();
+        let x = unicode_width::UnicodeWidthStr::width(&line[..line.find("Forget record").unwrap()])
+            as u16
+            + 1;
+        let y = y as u16 + 1;
+
+        h.run_cli_ok(&["serve", "--stop"]);
+        h.run_cli_ok(&[
+            "serve",
+            "--daemon",
+            "--port",
+            &port.to_string(),
+            "--no-auth",
+        ]);
+        assert!(crate::harness::wait_for_port(port, Duration::from_secs(10)));
+        h.wait_for("Reconnect");
+        h.send_keys("r");
+        h.wait_for("Session Changed");
+        record_trash_management(&h, "trash-forget-epoch-cancelled");
+        if mouse {
+            h.send_mouse_click(0, x, y);
+        } else {
+            h.send_keys("Left");
+            h.send_keys("Enter");
+        }
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        for key in ["trashed_at", "trash_lifecycle_id", "lifecycle_generation"] {
+            assert_eq!(row[key], original[key], "restart changed {key}");
+        }
+        assert_eq!(row["lifecycle_reservation"]["op"], "trash");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"retained files");
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                crate::harness::app_dir_in(h.home_path()).join("pending-purge-owners.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!journal["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| owner["session_id"] == id && owner["purpose"]["kind"] == "retained"));
+    }
+}

@@ -23,6 +23,7 @@ pub(super) fn structured_instance(id: &str, project_path: &str) -> Instance {
 /// worker registry cannot see real entries.
 pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::TempDir) {
     let home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let inst = structured_instance(id, &project.path().to_string_lossy());
     crate::server::test_support::seed_instances_on_disk_for_test(

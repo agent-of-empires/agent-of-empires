@@ -3,6 +3,7 @@ import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
+import type { TrashRecoveryTarget } from "../lib/trashActions";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
 import { axisDrawsRepoHeaders, type SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -90,6 +91,8 @@ interface Props {
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
   onEmptyTrash?: (workspaces: Workspace[]) => void;
+  onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
+  onForgetTrash: (target: TrashRecoveryTarget) => void;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
   onRestartForUpdate?: (sessionId: string) => void;
@@ -417,6 +420,9 @@ export function WorkspaceSidebar(props: Props) {
               loaded={props.trashLoaded ?? true}
               onLoad={() => props.onLoadTrash?.()}
               readOnly={readOnly}
+              runtimeEpoch={props.runtimeEpoch}
+              onRetryTrash={props.onRetryTrash}
+              onForgetTrash={props.onForgetTrash}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
               onDelete={(ids) => props.onDeleteSession?.(ids)}

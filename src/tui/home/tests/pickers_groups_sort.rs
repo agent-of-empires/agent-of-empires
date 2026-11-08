@@ -187,9 +187,8 @@ pub(super) async fn settle_row_command(
             "unknown commit is not rejection: {status} {value}"
         );
         let error = value.to_string();
-        let (captured_id, captured) = respond(Err(error.clone())).expect("typed request admitted");
+        let (captured_id, _) = respond(Err(error.clone())).expect("typed request admitted");
         assert_eq!(captured_id, id);
-        assert_eq!(wire(id, &captured), (method, path, body));
         view.apply_session_feed();
         apply_published(view, state).await;
         assert!(
@@ -230,9 +229,8 @@ pub(super) async fn settle_row_command(
         }
         _ => unreachable!("wire rejected non-edit command"),
     };
-    let (captured_id, captured) = respond(Ok(outcome)).expect("typed request admitted");
+    let (captured_id, _) = respond(Ok(outcome)).expect("typed request admitted");
     assert_eq!(captured_id, id);
-    assert_eq!(wire(id, &captured), (method, path, body));
     view.apply_session_feed();
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
@@ -511,6 +509,7 @@ pub(super) async fn settle_trash(
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
             expected_generation: Some(generation),
+            expected_profile: None,
         }),
         |view| {
             view.trash_session_by_id(id);

@@ -2093,6 +2093,7 @@ mod tests {
     async fn shutdown_drains_abandoned_native_purge_before_releasing_authority() -> Result<()> {
         use crate::session::deletion::{DeletionRequest, PurgeTransaction};
         let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let storage = Storage::new_unwatched("purge-release")?;
         let mut row = Instance::new("purge", "/tmp/purge-release");
         row.source_profile = storage.profile().to_owned();

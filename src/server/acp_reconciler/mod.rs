@@ -528,7 +528,7 @@ impl Drop for OrphanCleanupClaim {
 
 /// Reaps registry entries whose session no longer exists.
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
-    let Ok(records) = crate::process::worker_registry::list() else {
+    let Ok(mut records) = crate::process::worker_registry::list() else {
         return;
     };
     let pending_handoffs: HashSet<String> = state
@@ -539,37 +539,81 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
         .filter(|row| row.terminal_handoff.is_some())
         .map(|row| row.id.clone())
         .collect();
-    for record in records {
+    let mut index = 0;
+    while index < records.len() {
+        let record = &records[index];
         if pending_handoffs.contains(&record.session_id)
             || live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
-            continue;
+            records.swap_remove(index);
+        } else {
+            index += 1;
         }
-        let identity = (record.session_id.clone(), record.pid, record.generation);
-        if !state
+    }
+    {
+        let claims = state
             .acp_orphan_cleanups
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(identity.clone())
-        {
-            continue;
-        }
-        let claim = Arc::new(OrphanCleanupClaim {
-            state: Arc::clone(state),
-            identity,
+            .unwrap_or_else(|error| error.into_inner());
+        records.retain_mut(|record| {
+            let identity = (
+                std::mem::take(&mut record.session_id),
+                record.pid,
+                record.generation,
+            );
+            let claimed = claims.contains(&identity);
+            record.session_id = identity.0;
+            !claimed
         });
-        tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid,
-            "orphan acp worker; settling owned native runtime");
-        tokio::spawn(async move {
-            let session_id = record.session_id.clone();
-            if let Err(error) =
-                crate::process::worker_registry::terminate_record_and_wait(record, claim).await
-            {
-                tracing::warn!(target: "acp.supervisor", session = %session_id, %error,
-                    "orphan native cleanup unproven; retaining registry route");
+    }
+    if records.is_empty() {
+        return;
+    }
+    let cleanup_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // Serialize cleanup claims with the forget-record ownership handoff.
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        let owners =
+            crate::session::purge_owners::CleanupOwners::load(&crate::session::get_app_dir()?)?;
+        let protected: HashSet<&str> = owners.session_ids().collect();
+        for record in records {
+            if protected.contains(record.session_id.as_str()) {
+                continue;
             }
-        });
+            let identity = (record.session_id.clone(), record.pid, record.generation);
+            if !cleanup_state
+                .acp_orphan_cleanups
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(identity.clone())
+            {
+                continue;
+            }
+            let claim = Arc::new(OrphanCleanupClaim {
+                state: Arc::clone(&cleanup_state),
+                identity,
+            });
+            tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid,
+                "orphan acp worker; settling owned native runtime");
+            tokio::spawn(async move {
+                let session_id = record.session_id.clone();
+                if let Err(error) =
+                    crate::process::worker_registry::terminate_record_and_wait(record, claim).await
+                {
+                    tracing::warn!(target: "acp.supervisor", session = %session_id, %error,
+                        "orphan native cleanup unproven; retaining registry route");
+                }
+            });
+        }
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    if let Err(error) = result {
+        tracing::warn!(target: "acp.supervisor", %error,
+            "cleanup ownership unavailable; orphan workers retained");
     }
 }
 

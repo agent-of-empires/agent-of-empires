@@ -255,19 +255,23 @@ pub(crate) async fn spawn_structured_session(
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
         let identity = crate::session::acquire_session_identity_lock()?;
+        let cleanup_owners = crate::session::purge_owners::CleanupOwners::load(
+            &crate::session::get_app_dir()?,
+        )?;
         let (existing_titles, existing_branches): (Vec<String>, Vec<String>) = {
             let rows = worker_state.instances.blocking_read();
+            let owned_rows = || rows.iter().chain(cleanup_owners.frozen_instances());
             if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
                 anyhow::ensure!(
-                    !rows.iter().any(|row| {
+                    !owned_rows().any(|row| {
                         row.acp_session_id.as_deref() == Some(import_id)
                             || row.agent_session_id.as_deref() == Some(import_id)
                     }),
                     "import source is already owned by an AoE session"
                 );
             }
-            (rows.iter().map(|row| row.title.clone()).collect(),
-             rows.iter().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
+            (owned_rows().map(|row| row.title.clone()).collect(),
+             owned_rows().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
         };
         let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
@@ -280,6 +284,10 @@ pub(crate) async fn spawn_structured_session(
         )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        anyhow::ensure!(
+            !cleanup_owners.session_ids().any(|id| id == instance.id),
+            "session identity retains protected cleanup ownership"
+        );
         // HTTP's `parent_session_id`, checked by the handler; a CLI create names its parent below.
         instance.parent_session_id = parent_session_id;
         if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
@@ -1426,6 +1434,7 @@ mod tests {
         use axum::Json;
 
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })
@@ -1493,6 +1502,7 @@ mod tests {
         use axum::Json;
 
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

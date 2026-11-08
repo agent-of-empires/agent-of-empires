@@ -1389,9 +1389,7 @@ mod tests {
         // needs its own app dir: HOME is process-global, and running the full suite races this
         // against every other test that installs or restores it.
         let _home = crate::session::test_support::isolate_app_dir();
-        // The daemon resolves the profile through its canonical metadata before
-        // it spawns, so the profile this dispatch targets has to exist on disk
-        // and in the metadata the state was built with.
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::create_profile("test").expect("profile");
         // Past runs default to `Status::Idle` and are kept around, unarchived, for the user
         // to review; they must not count against the concurrency limit like `sess-1` does.

@@ -644,14 +644,119 @@ impl HomeView {
         }
     }
 
+    fn forget_confirmation_is_current(&self, target: &super::ForgetTrashTarget) -> bool {
+        let id = target.session_id.as_str();
+        let consent = &target.consent;
+        self.session_feed.applied_epoch() == Some(target.epoch.as_str())
+            && self.selected_session.as_deref() == Some(id)
+            && self.get_instance(id).is_some_and(|instance| {
+                instance.has_pending_trash()
+                    && instance.source_profile == consent.expected_profile
+                    && instance.lifecycle_generation == consent.expected_generation
+                    && instance.trashed_at == Some(consent.expected_trashed_at)
+                    && instance.trash_lifecycle_id.as_deref()
+                        == Some(consent.expected_trash_lifecycle_id.as_str())
+            })
+            && self.session_feed.applied_session(id).is_some_and(|row| {
+                row.profile == consent.expected_profile
+                    && row.lifecycle_generation == consent.expected_generation
+                    && row.trash_lifecycle_id.as_deref()
+                        == Some(consent.expected_trash_lifecycle_id.as_str())
+                    && row
+                        .trashed_at
+                        .as_deref()
+                        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                        .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                        == Some(consent.expected_trashed_at)
+                    && row
+                        .lifecycle_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.op == crate::session::LifecycleOperation::Trash
+                                && reservation.generation == consent.expected_generation
+                        })
+            })
+    }
+
+    fn reconcile_forget_confirmation(&mut self) {
+        if self
+            .pending_forget_trash
+            .as_ref()
+            .is_none_or(|target| self.forget_confirmation_is_current(target))
+        {
+            return;
+        }
+        self.pending_forget_trash = None;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.action() == "forget_trash_record")
+        {
+            self.confirm_dialog = None;
+            self.info_dialog = Some(InfoDialog::new(
+                "Session Changed",
+                "The session changed. The pending forget-record action was cancelled.",
+            ));
+        }
+    }
+
+    fn open_forget_trash_confirmation(&mut self) {
+        let Some(instance) = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|instance| instance.has_pending_trash())
+        else {
+            return;
+        };
+        let Some(trashed_at) = instance.trashed_at else {
+            return;
+        };
+        let Some(trash_id) = instance.trash_lifecycle_id.clone() else {
+            self.flash_status("Canonical Trash identity is unavailable");
+            return;
+        };
+        let id = instance.id.clone();
+        let consent = crate::daemon::ForgetTrashBody {
+            expected_profile: instance.source_profile.clone(),
+            expected_generation: instance.lifecycle_generation,
+            expected_trashed_at: trashed_at,
+            expected_trash_lifecycle_id: trash_id,
+        };
+        let message = format!(
+            "Forget the unfinished Trash record for '{}'?\n\nFiles remain on disk. AoE keeps cleanup protection and unresolved runtime ownership. This action does not stop processes or run cleanup hooks. Retained ownership blocks profile rename/deletion. You cannot restore this session through Trash afterward.",
+            instance.title,
+        );
+        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
+            self.flash_status("Canonical runtime is unavailable");
+            return;
+        };
+        let target = super::ForgetTrashTarget {
+            session_id: id,
+            consent,
+            epoch,
+        };
+        if !self.forget_confirmation_is_current(&target) {
+            self.flash_status("Session changed; reopen the Forget record confirmation");
+            return;
+        }
+        self.pending_forget_trash = Some(target);
+        self.confirm_dialog = Some(
+            ConfirmDialog::new("Forget Trash Record", &message, "forget_trash_record")
+                .buttons("Forget record", "Cancel"),
+        );
+    }
+
     pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
         self.reconcile_trash_confirmation();
+        self.reconcile_forget_confirmation();
         self.reconcile_session_dialog();
         self.reconcile_delete_confirmation();
         if !self.selected_is_trashed() {
             return;
         }
         self.exit_live_send_if_active();
+        self.pending_paste = None;
         self.cancel_native_attachment();
         if self.preview_capture_target.is_some() {
             self.sync_preview_capture_worker(None);
@@ -1499,6 +1604,24 @@ impl HomeView {
                 }
                 None
             }
+            "forget_trash_record" => {
+                self.reconcile_forget_confirmation();
+                if let Some(target) = self.pending_forget_trash.take() {
+                    if let Err(error) = self.session_feed.submit_request(
+                        target.session_id,
+                        crate::tui::session_feed::SessionRequest::ForgetTrash {
+                            body: target.consent,
+                            expected_epoch: target.epoch,
+                        },
+                    ) {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Forget Record",
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                None
+            }
             "empty_trash" => {
                 let checked = std::mem::take(&mut self.confirm_checked);
                 self.empty_trash_all(
@@ -1827,6 +1950,7 @@ impl HomeView {
                         self.pending_legacy_tool_preparation = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
+                        self.pending_forget_trash = None;
                         self.pending_image_pull = None;
                         // Mirrors the keyboard route: Cancel means "don't discard", so
                         // settings stays open and `settings_close_confirm` resets.
@@ -2630,6 +2754,7 @@ impl HomeView {
                     self.pending_legacy_tool_preparation = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
+                    self.pending_forget_trash = None;
                     self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
@@ -5438,11 +5563,12 @@ impl HomeView {
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
                 if let Some(inst) = self.get_instance(id).filter(|inst| inst.is_trashed()) {
                     self.context_menu = Some(
-                        ContextMenuDialog::for_trashed_session(anchor).with_session_target(
-                            &inst.id,
-                            &inst.source_profile,
-                            inst.lifecycle_generation,
-                        ),
+                        ContextMenuDialog::for_trashed_session(anchor, inst.has_pending_trash())
+                            .with_session_target(
+                                &inst.id,
+                                &inst.source_profile,
+                                inst.lifecycle_generation,
+                            ),
                     );
                     return true;
                 }
@@ -5587,6 +5713,8 @@ impl HomeView {
                 action,
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
+                    | ContextMenuAction::RetryTrash
+                    | ContextMenuAction::ForgetTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker
@@ -5657,6 +5785,8 @@ impl HomeView {
                 None => {}
             },
             ContextMenuAction::Restore => self.restore_selected_from_trash(),
+            ContextMenuAction::RetryTrash => self.retry_selected_trash(),
+            ContextMenuAction::ForgetTrash => self.open_forget_trash_confirmation(),
             ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
                 Some(SidebarSection::Trash) => self.toggle_trashed_section(),
                 Some(SidebarSection::Archived) => self.toggle_archived_section(),

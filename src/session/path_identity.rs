@@ -207,6 +207,18 @@ impl CleanupProtection {
             if let Some(path) = owner.pre_trash_project_path.as_deref() {
                 self.add_path(path)?;
             }
+            if owner.has_pending_trash() {
+                let original = owner
+                    .pre_trash_project_path
+                    .as_deref()
+                    .unwrap_or(&owner.project_path);
+                if let Some(holding) =
+                    super::trash::trash_holding_path(Path::new(original), &owner.id)
+                {
+                    let path = PathIdentity::checked(&holding, &mut self.paths)?;
+                    self.paths.push(path);
+                }
+            }
             if let Some(worktree) = &owner.worktree_info {
                 self.add_branch(&worktree.main_repo_path, &worktree.branch)?;
             }

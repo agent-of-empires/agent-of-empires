@@ -718,6 +718,8 @@ mod tests {
             let _app = crate::session::test_support::isolate_app_dir_at(home.path());
             std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             support::seed_instances_on_disk_for_test("test", Vec::new());
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let state = support::build_test_app_state_with_policy(
                 Vec::new(),
                 vec!["localhost".into()],

@@ -1816,6 +1816,7 @@ async fn d_then_d_confirms_the_trash_and_persists_the_marker() {
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
             expected_generation: Some(generation),
+            expected_profile: None,
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1869,6 +1870,7 @@ async fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
             expected_generation: Some(generation),
+            expected_profile: None,
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1911,6 +1913,7 @@ async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
             expected_generation: Some(generation),
+            expected_profile: None,
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1977,6 +1980,7 @@ async fn d_with_confirm_delete_prompts_before_trashing() {
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
             expected_generation: Some(generation),
+            expected_profile: None,
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);

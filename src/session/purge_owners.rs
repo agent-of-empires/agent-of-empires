@@ -1,10 +1,11 @@
-//! Frozen resource ownership retained across irreversible purge failures.
+//! Frozen cleanup ownership for failed purges and non-destructive forgetting.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::anchored_fs::ResolvedDataFile;
 use super::deletion::DeletionRequest;
@@ -473,6 +474,16 @@ pub(crate) fn capture_runner(session_id: &str) -> RunnerCapture {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerPurpose {
+    Purge,
+    Retained {
+        instance: Box<Instance>,
+        terminal_scopes: Option<Vec<crate::process::worker_registry::ScopeOwnership>>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
 struct Owner {
     token: String,
     session_id: String,
@@ -484,6 +495,8 @@ struct Owner {
     request: Option<DeletionRequest>,
     #[serde(default)]
     additional_protection: Option<CleanupProtection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purpose: Option<OwnerPurpose>,
 }
 
 pub(super) struct RecoveryPlan {
@@ -501,6 +514,120 @@ struct Journal {
     owners: Vec<Owner>,
 }
 
+pub(crate) struct CleanupOwners(Journal);
+
+impl CleanupOwners {
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        Ok(Self(decode(open(root)?.read()?.as_deref())?))
+    }
+
+    pub(crate) fn load_for(storage: &Storage) -> Result<Self> {
+        Ok(Self(decode(open_for(storage)?.read()?.as_deref())?))
+    }
+
+    pub(crate) fn retains_session(&self, session_id: &str) -> bool {
+        retains_session(&self.0, session_id)
+    }
+
+    pub(crate) fn session_ids(&self) -> impl Iterator<Item = &str> {
+        self.0.owners.iter().map(|owner| owner.session_id.as_str())
+    }
+
+    pub(crate) fn frozen_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.0
+            .owners
+            .iter()
+            .filter_map(|owner| match &owner.purpose {
+                Some(OwnerPurpose::Retained { instance, .. }) => Some(instance.as_ref()),
+                Some(OwnerPurpose::Purge) => {
+                    owner.request.as_ref().map(|request| &request.instance)
+                }
+                None => None,
+            })
+    }
+
+    pub(crate) fn blocks_conversation(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        source: Option<&super::ExecutionBinding>,
+    ) -> bool {
+        let owns = |id: Option<&str>, binding: Option<&super::ConversationBinding>| {
+            id == Some(session_id) && super::capture::owner_excludes(source, binding, session_id)
+        };
+        self.frozen_instances().any(|peer| {
+            peer.id != instance_id
+                && (owns(
+                    peer.agent_session_id.as_deref(),
+                    peer.agent_session_binding.as_ref(),
+                ) || peer.prior_tool_session_ids.values().any(|parked| {
+                    owns(
+                        parked.agent_session_id.as_deref(),
+                        parked.agent_session_binding.as_ref(),
+                    )
+                }))
+        })
+    }
+
+    pub(crate) fn protections(&self) -> impl Iterator<Item = &CleanupProtection> {
+        self.0.owners.iter().map(|owner| &owner.protection)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Native conversation ownership is busy")]
+pub(crate) struct ConversationOwnershipBusy;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Native conversation is protected by retained cleanup ownership")]
+pub(crate) struct ConversationOwnershipRetained;
+
+pub(crate) struct ConversationReadLock {
+    _file: std::fs::File,
+}
+
+impl ConversationReadLock {
+    pub(crate) fn acquire(storage: &Storage, session_id: &str) -> Result<Self> {
+        Ok(Self {
+            _file: lock_conversation(storage, session_id, false)?,
+        })
+    }
+}
+
+// Callers can hold lifecycle and registry locks; never wait here.
+fn lock_conversation(
+    storage: &Storage,
+    session_id: &str,
+    exclusive: bool,
+) -> Result<std::fs::File> {
+    use std::fmt::Write;
+    let profile = storage
+        .sessions_path()
+        .parent()
+        .context("profile directory missing")?;
+    let root = AnchoredDir::open(app_dir_for_profile_dir(profile))?;
+    const PREFIX: &str = ".native-conversation-";
+    let digest = Sha256::digest(session_id.as_bytes());
+    let mut name = String::with_capacity(PREFIX.len() + digest.len() * 2);
+    name.push_str(PREFIX);
+    for byte in digest {
+        write!(&mut name, "{byte:02x}").expect("writing to String");
+    }
+    let (file, _) = root.bind_file(name.as_ref())?.open_sidecar()?;
+    let result = if exclusive {
+        fs2::FileExt::try_lock_exclusive(&file)
+    } else {
+        fs2::FileExt::try_lock_shared(&file)
+    };
+    if let Err(error) = result {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(ConversationOwnershipBusy.into());
+        }
+        return Err(error.into());
+    }
+    Ok(file)
+}
+
 fn open(root: &Path) -> Result<ResolvedDataFile> {
     AnchoredDir::open(root)?.bind_file(FILE_NAME.as_ref())
 }
@@ -514,11 +641,15 @@ fn open_for(storage: &Storage) -> Result<ResolvedDataFile> {
 }
 
 fn decode(content: Option<&str>) -> Result<Journal> {
+    decode_version(content, 4)
+}
+
+fn decode_version(content: Option<&str>, version: u32) -> Result<Journal> {
     let content = content.context("Pending purge ownership journal is missing")?;
     let journal =
         serde_json::from_str::<Journal>(content).context("reading pending purge ownership")?;
     anyhow::ensure!(
-        journal.version == 3,
+        journal.version == version,
         "Unsupported pending purge ownership version"
     );
     let mut tokens = HashSet::with_capacity(journal.owners.len());
@@ -530,6 +661,23 @@ fn decode(content: Option<&str>) -> Result<Journal> {
                 && !owner.profile.is_empty(),
             "Invalid pending purge owner"
         );
+        match (version, &owner.purpose) {
+            (3, None) | (4, Some(OwnerPurpose::Purge)) => {}
+            (4, Some(OwnerPurpose::Retained { instance, .. })) => {
+                anyhow::ensure!(
+                    owner.request.is_none()
+                        && owner.additional_protection.is_none()
+                        && instance.id == owner.session_id
+                        && (instance.source_profile.is_empty()
+                            || instance.source_profile == owner.profile)
+                        && instance.lifecycle_generation == owner.generation
+                        && instance.has_pending_trash()
+                        && instance.failed_purge_forced().is_none(),
+                    "Invalid retained cleanup ownership"
+                );
+            }
+            _ => anyhow::bail!("Invalid cleanup ownership purpose"),
+        }
         owner.protection.validate()?;
         if let RunnerCapture::CancelledBeforeBirth {
             producer_epoch,
@@ -583,7 +731,7 @@ fn decode_sibling(content: Option<&str>) -> Result<Journal> {
     match content {
         Some(_) => decode(content),
         None => Ok(Journal {
-            version: 3,
+            version: 4,
             owners: Vec::new(),
         }),
     }
@@ -595,7 +743,7 @@ fn save(file: &ResolvedDataFile, journal: &Journal) -> Result<()> {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Profile '{profile}' has pending purges; complete purge recovery before renaming or deleting it")]
+#[error("Profile '{profile}' has protected resources; resolve retained cleanup ownership before renaming or deleting it")]
 pub(crate) struct ProfileHasPendingPurges {
     profile: String,
 }
@@ -649,12 +797,12 @@ pub(crate) fn initialize(root: &Path) -> Result<()> {
     let content = file.read()?;
     match content.as_deref() {
         Some(content) => {
-            decode(Some(content))?;
+            upcast_journal(content, JournalInput::Migration)?;
         }
         None => save(
             &file,
             &Journal {
-                version: 3,
+                version: 4,
                 owners: Vec::new(),
             },
         )?,
@@ -689,7 +837,7 @@ pub(crate) fn upcast_journal(
     let mut value: serde_json::Value =
         serde_json::from_str(content).context("Reading pending purge ownership backup")?;
     match value.get("version").and_then(serde_json::Value::as_u64) {
-        Some(3) => {
+        Some(3 | 4) => {
             if matches!(input, JournalInput::CompleteBackup) {
                 let owners = value
                     .get("owners")
@@ -701,7 +849,15 @@ pub(crate) fn upcast_journal(
                     "Incomplete purge backup omits frozen cleanup request or protection"
                 );
             }
-            decode(Some(content))?;
+            match value.get("version").and_then(serde_json::Value::as_u64) {
+                Some(3) => {
+                    decode_version(Some(content), 3)?;
+                }
+                Some(4) => {
+                    decode(Some(content))?;
+                }
+                _ => unreachable!(),
+            }
             return Ok(std::borrow::Cow::Borrowed(content.as_bytes()));
         }
         Some(2) => {}
@@ -753,8 +909,95 @@ pub(crate) fn upcast_journal(
     }
     value["version"] = serde_json::json!(3);
     let bytes = serde_json::to_vec(&value)?;
-    decode(Some(std::str::from_utf8(&bytes)?))?;
+    decode_version(Some(std::str::from_utf8(&bytes)?), 3)?;
     Ok(std::borrow::Cow::Owned(bytes))
+}
+
+fn upcast_retained_journal(
+    content: &str,
+    input: JournalInput,
+) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let encoded = upcast_journal(content, input)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&encoded)?;
+    if value["version"] == 4 {
+        return Ok(encoded);
+    }
+    for owner in value["owners"]
+        .as_array_mut()
+        .context("Invalid cleanup ownership journal")?
+    {
+        owner
+            .as_object_mut()
+            .context("Invalid cleanup owner")?
+            .insert("purpose".into(), serde_json::json!({"kind": "purge"}));
+    }
+    value["version"] = serde_json::json!(4);
+    let encoded = serde_json::to_vec(&value)?;
+    decode(Some(std::str::from_utf8(&encoded)?))?;
+    Ok(std::borrow::Cow::Owned(encoded))
+}
+
+pub(crate) fn migrate_retained_ownership(root: &Path) -> Result<()> {
+    let file = open(root)?;
+    let (lock, path) = file.open_sidecar()?;
+    let _guard = acquire_open_storage_flock(lock, &path)?;
+    let Some(content) = file.read()? else {
+        // Preserve missing authority; admissions still refuse to use it.
+        return Ok(());
+    };
+    let encoded = upcast_retained_journal(&content, JournalInput::Migration)?;
+    if encoded.as_ref() != content.as_bytes() {
+        super::backup_before_migration(&root.join(FILE_NAME))?;
+        file.replace(&encoded)?;
+        file.sync_parent()?;
+    }
+    Ok(())
+}
+
+/// The caller holds identity and lifecycle exclusion through removal of the visible row.
+pub(crate) fn retain_forgotten_trash(storage: &Storage, row: &Instance) -> Result<()> {
+    anyhow::ensure!(
+        row.has_pending_trash() && row.failed_purge_forced().is_none(),
+        "Trash transition is not an unfinished Trash-only record"
+    );
+    let mut conversations: Vec<_> = row
+        .agent_session_id
+        .as_deref()
+        .into_iter()
+        .chain(
+            row.prior_tool_session_ids
+                .values()
+                .filter_map(|parked| parked.agent_session_id.as_deref()),
+        )
+        .collect();
+    conversations.sort_unstable();
+    conversations.dedup();
+    let _conversation_locks: Vec<_> = conversations
+        .into_iter()
+        .map(|id| lock_conversation(storage, id, true))
+        .collect::<Result<_>>()?;
+    let capture = PurgeCapture::new(row)?;
+    let file = open_for(storage)?;
+    let (lock, path) = file.open_sidecar()?;
+    let _guard = acquire_open_storage_flock(lock, &path)?;
+    let mut journal = decode(file.read()?.as_deref())?;
+    let mut instance = row.clone();
+    instance.source_profile = storage.profile().to_owned();
+    journal.owners.push(Owner {
+        token: uuid::Uuid::new_v4().to_string(),
+        session_id: row.id.clone(),
+        profile: storage.profile().to_owned(),
+        generation: row.lifecycle_generation,
+        protection: capture.protection,
+        runner: capture.runner,
+        request: None,
+        additional_protection: None,
+        purpose: Some(OwnerPurpose::Retained {
+            instance: Box::new(instance),
+            terminal_scopes: capture.terminal_scopes,
+        }),
+    });
+    save(&file, &journal)
 }
 
 pub(crate) fn restore_from_complete_backup(
@@ -773,7 +1016,7 @@ pub(crate) fn restore_from_complete_backup(
     let original = source
         .read_recovery_bytes()?
         .context("Purge backup is missing")?;
-    let encoded = upcast_journal(
+    let encoded = upcast_retained_journal(
         std::str::from_utf8(&original)?,
         JournalInput::CompleteBackup,
     )?;
@@ -786,12 +1029,12 @@ pub(crate) fn restore_from_complete_backup(
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
                 let version = value.get("version").and_then(serde_json::Value::as_u64);
                 anyhow::ensure!(
-                    matches!(version, Some(2 | 3)),
+                    matches!(version, Some(2..=4)),
                     "Unsupported destination purge journal version; refusing replacement"
                 );
             }
             anyhow::ensure!(
-                upcast_journal(text, JournalInput::CompleteBackup).is_err(),
+                upcast_retained_journal(text, JournalInput::CompleteBackup).is_err(),
                 "Destination purge journal is healthy; refusing replacement"
             );
         }
@@ -873,6 +1116,14 @@ pub(crate) fn plan_scope_recovery(inventory: ScopeRecoveryInventory) -> Result<S
                 ..
             }
         );
+        if matches!(owner.purpose, Some(OwnerPurpose::Retained { .. })) {
+            anyhow::ensure!(
+                !unfinished && !matches!(owner.runner, RunnerCapture::Unresolved { .. }),
+                "Protected owner {} has unresolved runtime construction; scope recovery refused",
+                owner.token
+            );
+            continue;
+        }
         let scopes = match &mut owner.runner {
             RunnerCapture::Captured { scopes, .. }
             | RunnerCapture::Uncaptured { scopes, .. }
@@ -1017,6 +1268,10 @@ impl PurgeOwner {
         let (lock, path) = file.open_sidecar()?;
         let _guard = acquire_open_storage_flock(lock, &path)?;
         let mut journal = decode(file.read()?.as_deref())?;
+        anyhow::ensure!(
+            !retains_session(&journal, &row.id),
+            "Retained cleanup ownership prevents purge admission"
+        );
         let mut request = request.cloned();
         if let Some(request) = &mut request {
             request.session_id = row.id.clone();
@@ -1034,6 +1289,7 @@ impl PurgeOwner {
             runner: capture.runner,
             request,
             additional_protection: additional_protection.cloned(),
+            purpose: Some(OwnerPurpose::Purge),
         });
         save(&file, &journal)?;
         let recorded = journal.owners.pop().expect("recorded owner");
@@ -1049,12 +1305,22 @@ impl PurgeOwner {
         let file = open_for(storage)?;
         let (lock, path) = file.open_sidecar()?;
         let _guard = acquire_open_storage_flock(lock, &path)?;
-        let journal = decode(file.read()?.as_deref())?;
-        let owner = journal
+        let mut journal = decode(file.read()?.as_deref())?;
+        let index = journal
             .owners
-            .into_iter()
-            .find(|owner| owner.token == token)
+            .iter()
+            .position(|owner| owner.token == token)
             .context("Pending purge owner disappeared during recovery")?;
+        let owner = &journal.owners[index];
+        anyhow::ensure!(
+            matches!(owner.purpose, Some(OwnerPurpose::Purge)),
+            "Retained cleanup ownership cannot authorize purge recovery"
+        );
+        anyhow::ensure!(
+            !retains_session(&journal, &owner.session_id),
+            "Retained cleanup ownership prevents purge recovery"
+        );
+        let owner = journal.owners.swap_remove(index);
         Ok(Self {
             file,
             token: owner.token,
@@ -1094,9 +1360,15 @@ impl PurgeOwner {
             .iter()
             .position(|owner| owner.token == self.token)
             .context("Pending purge owner disappeared before producer settlement")?;
+        anyhow::ensure!(
+            !retains_session(&journal, &journal.owners[index].session_id),
+            "Retained cleanup ownership prevents producer settlement"
+        );
         let owner = &mut journal.owners[index];
         anyhow::ensure!(
-            owner.runner == self.runner && Some(&owner.session_id) == self.session_id.as_ref(),
+            matches!(owner.purpose, Some(OwnerPurpose::Purge))
+                && owner.runner == self.runner
+                && Some(&owner.session_id) == self.session_id.as_ref(),
             "Pending purge owner changed before producer settlement"
         );
         owner.runner = runner;
@@ -1119,14 +1391,25 @@ impl PurgeOwner {
     }
 }
 
-/// Drop one owner from the journal under its sidecar lock, the single edit
-/// path shared by an explicit release and by reaping an uncommitted plan.
 fn remove_token(file: &ResolvedDataFile, token: &str) -> Result<()> {
     let (lock, path) = file.open_sidecar()?;
     let _guard = acquire_open_storage_flock(lock, &path)?;
     let mut journal = decode(file.read()?.as_deref())?;
+    if let Some(owner) = journal.owners.iter().find(|owner| owner.token == token) {
+        anyhow::ensure!(
+            !retains_session(&journal, &owner.session_id),
+            "Retained cleanup ownership cannot be released by purge recovery"
+        );
+    }
     journal.owners.retain(|owner| owner.token != token);
     save(file, &journal)
+}
+
+fn retains_session(journal: &Journal, session_id: &str) -> bool {
+    journal.owners.iter().any(|owner| {
+        owner.session_id == session_id
+            && matches!(owner.purpose, Some(OwnerPurpose::Retained { .. }))
+    })
 }
 
 pub(crate) fn protection(
@@ -1134,6 +1417,13 @@ pub(crate) fn protection(
     except: Option<&str>,
 ) -> Result<Vec<CleanupProtection>> {
     let journal = decode(open_for(storage)?.read()?.as_deref())?;
+    let except = except.filter(|token| {
+        journal
+            .owners
+            .iter()
+            .find(|owner| owner.token == *token)
+            .is_some_and(|owner| !retains_session(&journal, &owner.session_id))
+    });
     Ok(journal
         .owners
         .into_iter()
@@ -1151,37 +1441,29 @@ pub(super) fn session_ids(root: &Path) -> Result<impl Iterator<Item = String>> {
 
 pub(super) fn recovery_plans() -> Result<Vec<RecoveryPlan>> {
     let root = crate::session::get_app_dir()?;
-    Ok(decode(open(&root)?.read()?.as_deref())?
-        .owners
-        .into_iter()
-        .map(|owner| RecoveryPlan {
-            token: owner.token,
-            session_id: owner.session_id,
-            profile: owner.profile,
-            request: owner.request,
-            additional_protection: owner.additional_protection,
-            protection: owner.protection,
-        })
-        .collect())
+    let journal = decode(open(&root)?.read()?.as_deref())?;
+    let mut retained = HashSet::new();
+    let mut plans = Vec::new();
+    for owner in journal.owners {
+        match owner.purpose {
+            Some(OwnerPurpose::Retained { .. }) => {
+                retained.insert(owner.session_id);
+            }
+            Some(OwnerPurpose::Purge) => plans.push(RecoveryPlan {
+                token: owner.token,
+                session_id: owner.session_id,
+                profile: owner.profile,
+                request: owner.request,
+                additional_protection: owner.additional_protection,
+                protection: owner.protection,
+            }),
+            None => unreachable!("validated owner purpose"),
+        }
+    }
+    plans.retain(|plan| !retained.contains(&plan.session_id));
+    Ok(plans)
 }
 
-/// Drop a plan whose row never left the registry.
-///
-/// A plan is journalled before its row is removed, so a crash in that window,
-/// or a failed release, leaves an owner that recovery refuses forever: the
-/// row is still there, so the identity guard rejects it on every pass, and
-/// nothing ever releases the token. Meanwhile the phantom freezes the
-/// resources of the very session it was recorded for, which is the row
-/// itself, so its worktree and branch survive its next deletion with a
-/// misleading "another session references" message. Reaping restores the
-/// invariant that an entry can only be retired while the registry still
-/// claims every reference it froze.
-///
-/// Returns `false` whenever the plan is not provably the still-registered
-/// row repeating itself, which keeps the identity-reuse guard fail-closed:
-/// an absent row is a real recovery handled by the caller, and a plan holding
-/// more than the live row claims (a create rollback reclaims branches no live
-/// row ever owned) stays.
 pub(super) fn release_uncommitted(plan: &RecoveryPlan) -> Result<bool> {
     let store = Storage::open_unwatched(&plan.profile)?;
     let profile_dir = store
@@ -1219,6 +1501,176 @@ pub(super) fn release_uncommitted(plan: &RecoveryPlan) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_ownership_migration_preserves_original_authority_and_rejects_missing_purpose(
+    ) -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let legacy = serde_json::json!({
+            "version": 3,
+            "future_namespace_proof": {"original": true},
+            "owners": [{
+                "token": token,
+                "session_id": id,
+                "profile": "default",
+                "generation": 7,
+                "protection": {
+                    "paths": [{"lexical": "/retained", "traversal": null, "resolved": null}],
+                    "branches": [[0, "saved-work"]]
+                },
+                "runner": {
+                    "state": "uncaptured",
+                    "scopes": [],
+                    "producer_epoch": 77,
+                    "producer_id": uuid::Uuid::new_v4(),
+                    "prime": {"state": "unresolved"}
+                },
+                "future_constructor_proof": {"must_survive": [7, 77]}
+            }]
+        });
+        let path = root.join(FILE_NAME);
+        std::fs::write(&path, serde_json::to_vec(&legacy)?)?;
+        assert!(CleanupOwners::load(&root).is_err());
+        migrate_retained_ownership(&root)?;
+        let migrated = std::fs::read(&path)?;
+        let actual: serde_json::Value = serde_json::from_slice(&migrated)?;
+        let mut expected = legacy;
+        expected["version"] = serde_json::json!(4);
+        expected["owners"][0]["purpose"] = serde_json::json!({"kind": "purge"});
+        assert_eq!(actual, expected);
+        assert!(decode_version(std::str::from_utf8(&migrated).ok(), 3).is_err());
+        let storage = Storage::new_unwatched("default")?;
+        let owner = PurgeOwner::recover(&storage, &token)?;
+        assert!(owner.ensure_captured_runner_stopped().is_err());
+        migrate_retained_ownership(&root)?;
+        assert_eq!(std::fs::read(&path)?, migrated);
+
+        let mut invalid = actual;
+        invalid["owners"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("purpose");
+        let invalid = serde_json::to_vec(&invalid)?;
+        std::fs::write(&path, &invalid)?;
+        assert!(CleanupOwners::load(&root).is_err());
+        assert!(migrate_retained_ownership(&root).is_err());
+        assert_eq!(std::fs::read(&path)?, invalid);
+        std::fs::remove_file(&path)?;
+        migrate_retained_ownership(&root)?;
+        assert!(CleanupOwners::load(&root).is_err());
+        assert!(PurgeOwner::recover(&storage, &token).is_err());
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn forgotten_trash_keeps_files_profile_and_runtime_authority_without_authorizing_purge(
+    ) -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        for profile in ["kept", "other"] {
+            crate::session::create_profile(profile)?;
+        }
+        crate::session::set_default_profile("other")?;
+        let storage = Storage::new_unwatched("kept")?;
+        let checkout = root.join("unverified-checkout");
+        let main_repo = root.join("unverified-main");
+        std::fs::create_dir(&checkout)?;
+        std::fs::create_dir(&main_repo)?;
+        let sentinel = checkout.join("kept.txt");
+        std::fs::write(&sentinel, b"original files")?;
+        let mut row = Instance::new("forgotten", checkout.to_str().unwrap());
+        row.source_profile = "kept".into();
+        row.terminal_scopes = Some(Vec::new());
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "saved-work".into(),
+            main_repo_path: main_repo.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        row.trash();
+        row.lifecycle_generation = 7;
+        row.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Trash,
+            generation: 7,
+            at: chrono::Utc::now() - chrono::Duration::hours(1),
+        });
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let older_checkout = root.join("older-owned-checkout");
+        std::fs::create_dir(&older_checkout)?;
+        let mut prior_row = row.clone();
+        prior_row.project_path = older_checkout.to_str().unwrap().into();
+        let prior = PurgeOwner::record(&storage, &prior_row, PurgeCapture::new(&prior_row)?)?;
+        let prior_token = prior.token().to_owned();
+        let safe_capture = PurgeCapture::new(&row)?;
+        let worker_path = crate::process::worker_registry::record_path(&row.id)?;
+        std::fs::create_dir_all(worker_path.parent().unwrap())?;
+        let worker_bytes = b"{\"incomplete\":true}";
+        std::fs::write(&worker_path, worker_bytes)?;
+        retain_forgotten_trash(&storage, &row)?;
+        assert!(
+            PurgeOwner::record(&storage, &row, safe_capture).is_err(),
+            "retained ownership must also fence ordinary purge admission"
+        );
+        assert!(prior.release().is_err());
+        storage.update(|rows, _| {
+            rows.clear();
+            Ok(())
+        })?;
+        let journal_bytes = std::fs::read(root.join(FILE_NAME))?;
+        let journal = decode(std::str::from_utf8(&journal_bytes).ok())?;
+        let token = &journal
+            .owners
+            .iter()
+            .find(|owner| matches!(owner.purpose, Some(OwnerPurpose::Retained { .. })))
+            .unwrap()
+            .token;
+        assert!(PurgeOwner::recover(&storage, &prior_token).is_err());
+        assert!(PurgeOwner::recover(&storage, token).is_err());
+        assert!(recovery_plans()?.is_empty());
+        assert!(protection(&storage, Some(token))?
+            .iter()
+            .any(|owner| owner.references_path(&checkout)));
+        assert!(protection(&storage, Some(&prior_token))?
+            .iter()
+            .any(|owner| owner.references_path(&older_checkout)));
+        let owners = CleanupOwners::load(&root)?;
+        assert!(owners
+            .protections()
+            .any(|owner| owner.references_path(&checkout)));
+        assert!(owners
+            .protections()
+            .any(|owner| owner.references_branch(&main_repo, "saved-work")));
+        let holding = super::super::trash::trash_holding_path(&checkout, &row.id).unwrap();
+        assert!(owners
+            .protections()
+            .any(|owner| owner.references_path(&holding)));
+        for error in [
+            crate::session::delete_profile("kept").unwrap_err(),
+            crate::session::rename_profile("kept", "renamed").unwrap_err(),
+        ] {
+            assert!(
+                error.downcast_ref::<ProfileHasPendingPurges>().is_some(),
+                "{error:#}"
+            );
+        }
+        assert!(plan_scope_recovery(scope_recovery_inventory()?).is_err());
+        assert_eq!(std::fs::read(root.join(FILE_NAME))?, journal_bytes);
+        assert_eq!(std::fs::read(&worker_path)?, worker_bytes);
+        assert_eq!(std::fs::read(&sentinel)?, b"original files");
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1382,6 +1834,10 @@ mod tests {
         let journal_path = app.join(FILE_NAME);
         let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(&journal_path)?)?;
         legacy["version"] = serde_json::json!(2);
+        legacy["owners"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("purpose");
         let runner = legacy["owners"][0]["runner"].as_object_mut().unwrap();
         runner.remove("prime");
         runner.remove("birth_fingerprint");
@@ -1402,7 +1858,6 @@ mod tests {
         crate::migrations::run_migrations()?;
         let migrated_bytes = std::fs::read(&journal_path)?;
         let migrated: serde_json::Value = serde_json::from_slice(&migrated_bytes)?;
-        assert_eq!(migrated["version"], 3);
         assert_eq!(migrated["owners"][0]["runner"]["generation"], 7);
         assert_eq!(
             migrated["owners"][0]["runner"]["prime"],
@@ -1786,6 +2241,7 @@ mod tests {
         let mut old: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app.join(FILE_NAME))?)?;
         old["version"] = serde_json::json!(2);
+        old["owners"][0].as_object_mut().unwrap().remove("purpose");
         old["owners"][0].as_object_mut().unwrap().remove("request");
         old["owners"][0]
             .as_object_mut()

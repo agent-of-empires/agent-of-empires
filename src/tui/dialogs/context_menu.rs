@@ -1,5 +1,4 @@
-//! Small popup menu anchored at a screen position, used for right-click
-//! context actions on the sidebar list (Rename / Delete).
+//! Context actions anchored to a sidebar row.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -49,6 +48,8 @@ pub enum ContextMenuAction {
     ToggleSectionCollapse,
     /// Restore a trashed session.
     Restore,
+    RetryTrash,
+    ForgetTrash,
 }
 
 pub struct ContextMenuDialog {
@@ -142,14 +143,20 @@ impl ContextMenuDialog {
         self
     }
 
-    /// A trashed row can only come back out or be deleted for good.
-    pub fn for_trashed_session(anchor: (u16, u16)) -> Self {
+    pub fn for_trashed_session(anchor: (u16, u16), unfinished: bool) -> Self {
         Self::new(
             anchor,
-            vec![
-                (ContextMenuAction::Restore, "Restore"),
-                (ContextMenuAction::Delete, "Delete"),
-            ],
+            if unfinished {
+                vec![
+                    (ContextMenuAction::RetryTrash, "Retry Trash"),
+                    (ContextMenuAction::ForgetTrash, "Forget record…"),
+                ]
+            } else {
+                vec![
+                    (ContextMenuAction::Restore, "Restore"),
+                    (ContextMenuAction::Delete, "Delete"),
+                ]
+            },
         )
     }
 
@@ -168,6 +175,8 @@ impl ContextMenuDialog {
                 action,
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
+                    | ContextMenuAction::RetryTrash
+                    | ContextMenuAction::ForgetTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker

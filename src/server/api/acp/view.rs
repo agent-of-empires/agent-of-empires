@@ -2336,6 +2336,7 @@ mod tests {
 
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let _ambient = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         crate::session::config::update_app_state(|s| s.has_acknowledged_agent_hooks = true)?;
         let project = home.path().join("project");

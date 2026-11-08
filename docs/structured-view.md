@@ -185,6 +185,18 @@ Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation
 changes. Restore and permanent deletion never target a replacement selection.
 
+An unfinished Trash transition offers **Retry Trash** in the TUI context menu and
+web Trash controls. A fresh owner remains busy; an unverified retained checkout
+can still prevent completion. Retry is an explicit management action, never part
+of opening the transcript.
+
+If the location cannot be verified, **Forget record…** opens a separate
+confirmation. A daemon restart or concurrent Trash transition invalidates that
+confirmation. Files remain on disk, and AoE retains runtime evidence and cleanup
+protection without running hooks or stopping processes. Retained ownership blocks
+profile rename/deletion. The forgotten session cannot be restored through Trash.
+See the [forget-record contract](api.md#post-apisessionsidtrashforget).
+
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges
 trigger a global incomplete-history warning, even when no readable transcript

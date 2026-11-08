@@ -31,6 +31,38 @@ const runtimeJson = (body: unknown) =>
 const empty = (status = 200) => new Response("", { status });
 const offline = () => fetchSpy.mockRejectedValueOnce(new Error("offline"));
 
+describe("non-destructive Trash confirmation", () => {
+  it("requires an explicit native removal receipt and preserves uncertain outcomes", async () => {
+    const consent = {
+      expected_profile: "default",
+      expected_generation: 7,
+      expected_trashed_at: "2026-01-01T00:00:00Z",
+      expected_trash_lifecycle_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const proof = {
+      "aoe-runtime-epoch": cursor.epoch,
+      "aoe-runtime-revision": cursor.revision.toString(),
+    };
+    const cases: Array<[string, number, HeadersInit, api.SaveOutcome]> = [
+      ["confirmed", 204, proof, "committed"],
+      ["missing proof", 204, {}, "uncertain"],
+      ["abandoned epoch", 204, { ...proof, "aoe-runtime-epoch": "old" }, "uncertain"],
+      ["zero revision", 204, { ...proof, "aoe-runtime-revision": "0" }, "uncertain"],
+      ["wrong response contract", 200, proof, "uncertain"],
+      ["fresh lifecycle owner", 409, {}, "rejected"],
+      ["unconfirmed persistence", 503, {}, "uncertain"],
+    ];
+    for (const [label, status, headers, expected] of cases) {
+      fetchSpy.mockResolvedValueOnce(new Response(null, { status, headers }));
+      const result = await api.forgetTrashRecord("s1", consent, cursor.epoch);
+      expect(result.outcome, label).toBe(expected);
+      if (result.outcome === "committed") expect(result.cursor).toEqual(cursor);
+    }
+    offline();
+    expect((await api.forgetTrashRecord("s1", consent, cursor.epoch)).outcome).toBe("uncertain");
+  });
+});
+
 function lastCall() {
   const [url, init] = fetchSpy.mock.calls.at(-1)!;
   return { url: String(url), init };

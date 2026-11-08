@@ -1325,6 +1325,7 @@ mod tests {
             ("CLAUDE_CONFIG_DIR", root.join(".claude")),
         ];
         let guard = crate::session::test_support::EnvGuard::set(&roots);
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

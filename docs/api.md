@@ -854,6 +854,7 @@ Move a session to Trash. Optional JSON fields:
 | --- | --- | --- |
 | `kill_pane` | `true` | Stop the session's terminal panes during the transition. |
 | `expected_generation` | omitted | Require the selected session's `lifecycle_generation`; a mismatch returns `409 lifecycle_superseded` without mutation. |
+| `expected_profile` | omitted | Require the selected profile as well as the generation; a mismatch returns `409 lifecycle_superseded` without mutation. |
 
 Repeating a completed request for an already-trashed session succeeds without
 repeating teardown or relocation. A fresh lifecycle reservation returns
@@ -868,6 +869,30 @@ A terminal teardown or relocation failure leaves the session in Trash without
 preventing explicit Restore or Purge. A retry also settles the transition when
 all known worktree paths are proven absent. Unverified existing paths, unknown
 original locations, and filesystem lookup errors keep the transition protected.
+
+## POST /api/sessions/{id}/trash/forget
+
+Forget an expired, unfinished Trash record without deleting retained resources.
+Send all original consent fields: `expected_profile`, `expected_generation`,
+`expected_trashed_at`, and `expected_trash_lifecycle_id`. Changed consent returns
+`409 lifecycle_superseded`; a fresh lifecycle owner or an already admitted orphan
+cleanup returns `409 lifecycle_locked`. Completed Trash and failed-purge records
+are not eligible.
+Keep the original native runtime epoch with the consent fields. A replacement
+runtime requires fresh confirmation.
+
+Before removing the visible row, the daemon durably retains its original runtime
+evidence and cleanup protection. This ownership does not authorize purge recovery,
+hooks, process termination, filesystem deletion, or resource reclamation. Later
+purge attempts cannot bypass it if removal of the visible row was interrupted.
+Other sessions cannot adopt its captured current or parked native conversations.
+Retained ownership blocks profile rename/deletion, even after the row is gone.
+The session cannot be restored through Trash afterward.
+
+Success returns `204` with a native runtime cursor. Refresh the canonical session
+list; do not treat an unconfirmed response as proof that the row was removed.
+This management operation survives HTTP cancellation and is unavailable in
+read-only mode.
 
 ## Explicit structured worker stop
 
