@@ -1275,6 +1275,8 @@ mod tests {
         let mut child = OwnedChild(
             Command::new("sh")
                 .args(["-c", "printf 'ready\n'; IFS= read -r line"])
+                .arg("sh")
+                .arg(&socket)
                 .env("TMPDIR", root.path())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

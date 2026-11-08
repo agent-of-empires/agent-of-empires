@@ -645,7 +645,7 @@ mod tests {
     use crate::hooks::test_support::{make_correct_base, BaseGuard};
     use serial_test::serial;
     use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     #[cfg(target_os = "macos")]
     use tempfile::TempDir;
 
@@ -740,7 +740,15 @@ mod tests {
         ] {
             let (_g, base, _tmp) = BaseGuard::fresh();
             std::fs::create_dir(&base).unwrap();
+            let gid = nix::unistd::getegid().as_raw();
+            if std::fs::metadata(&base).unwrap().gid() != gid {
+                std::os::unix::fs::chown(&base, None, Some(gid)).unwrap();
+            }
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
             let err = with_hook_base(|_| Ok(())).unwrap_err();
             let rendered = format!("{err:#}");
             assert!(rendered.contains(expected), "{mode:o}: {rendered}");
