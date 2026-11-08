@@ -99,6 +99,7 @@ test("original Native partial tool output survives a correlated prompt failure u
   await page.reload();
   await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("native-partial-after-local-failure.png"), fullPage: true });
+  await page.getByRole("button", { name: /printf native-stream/ }).click();
   await postPrompt(serve.baseUrl, sessionId, "finish the same original tool explicitly");
   await expect(page.getByText(final, { exact: true }).first()).toBeVisible();
   await expect(page.getByText(partial, { exact: true })).toHaveCount(0);
