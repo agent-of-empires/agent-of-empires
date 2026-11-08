@@ -1,10 +1,5 @@
 //! Linux-specific process utilities.
 
-pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
-
-pub(crate) fn codex_managed_preferences_present() -> bool {
-    false
-}
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::fs;
@@ -15,6 +10,12 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+
+pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+
+pub(crate) fn codex_managed_preferences_present() -> bool {
+    false
+}
 
 struct LegacyRuntimeDirectories {
     run: std::os::fd::OwnedFd,

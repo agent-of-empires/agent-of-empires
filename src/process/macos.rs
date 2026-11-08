@@ -1,5 +1,14 @@
 //! macOS-specific process utilities.
 
+use anyhow::Context as _;
+use std::collections::HashMap;
+use std::process::Command;
+
+pub(super) use super::unix::{
+    close_frozen_payload, configure_process_group, exec_command, kill_process_group,
+    restore_environment_value, terminate_process_group, try_wait_status_hook,
+};
+
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
 const CODEX_PREFERENCES_DOMAIN: &str = "com.openai.codex";
@@ -36,15 +45,6 @@ fn preference_value_present(key: &str, application: &str) -> bool {
     drop(unsafe { CFType::wrap_under_create_rule(value) });
     true
 }
-
-use anyhow::Context as _;
-use std::collections::HashMap;
-use std::process::Command;
-
-pub(super) use super::unix::{
-    close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
-};
 /// Prove only the absence of the Linux scope backend on this kernel.
 /// Native process, worker and tmux custody must still pass their own guards.
 pub(super) fn legacy_scope_inventory_clear(
