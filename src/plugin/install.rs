@@ -1975,7 +1975,7 @@ mod tests {
                     .unwrap();
                 let mut started = [0];
                 stream.read_exact(&mut started).unwrap();
-                if started != [b'B'] {
+                if started != *b"B" {
                     return false;
                 }
                 let _ = started_tx.send(());
