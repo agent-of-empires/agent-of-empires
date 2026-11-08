@@ -2,6 +2,7 @@
 
 use super::execution::{UnattestedCodexPolicy, UnpinnedCodexLaunch};
 use super::*;
+use crate::session::capture::CodexRolloutScanLimit;
 
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
@@ -31,6 +32,11 @@ pub(super) struct PreparedLaunch {
     /// Relocated and store-adopted conversations require durable confirmation.
     pub(super) require_conversation_publication: bool,
 }
+
+type LaunchRouting = (
+    Option<super::execution::NativeExecution>,
+    Option<UnpinnedCodexLaunch>,
+);
 
 fn prepared_fork_mints_child(
     agent: Option<&'static crate::agents::AgentDef>,
@@ -828,30 +834,32 @@ impl Instance {
             .map(|(execution, _)| execution)
     }
 
-    /// The execution to pin, or for an unpinned launch the executable and
-    /// routing that keep it on the store its conversation was verified in.
-    fn resolve_launch_routing(
+    /// The unpinned routing a verified rollout admits despite `error`, if any.
+    fn verified_codex_resume_routing(
         &self,
-    ) -> Result<(
-        Option<super::execution::NativeExecution>,
-        Option<UnpinnedCodexLaunch>,
-    )> {
+        error: &anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> Result<Option<LaunchRouting>, CodexRolloutScanLimit> {
+        if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding)? {
+            return Ok(Some((None, Some(store.clone()))));
+        }
+        Ok(self
+            .sandboxed_codex_resume_admitted(error, sid, binding)?
+            .then_some((None, None)))
+    }
+
+    /// The execution to pin, or for an unpinned launch the executable and
+    /// routing that keep it on the store its conversation was verified in. An
+    /// admitted sandbox has neither: its container already routes to its store.
+    fn resolve_launch_routing(&self) -> Result<LaunchRouting> {
         let target = self.conversation_target();
         let mut resolved = self.resolve_native_execution(target);
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
-            let admitted =
-                Self::unpinned_codex_resume_store(error, sid, binding).and_then(|store| {
-                    Ok(match store {
-                        Some(store) => Some(Some(store.clone())),
-                        None => self
-                            .sandboxed_codex_resume_admitted(error, sid, binding)?
-                            .then_some(None),
-                    })
-                });
-            match admitted {
-                Ok(Some(store)) => {
+            match self.verified_codex_resume_routing(error, sid, binding) {
+                Ok(Some(routing)) => {
                     tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                    return Ok((None, store));
+                    return Ok(routing);
                 }
                 Ok(None) => {}
                 Err(limit) => resolved = Err(UnattestedCodexPolicy::from(limit).into()),
@@ -3567,6 +3575,14 @@ mod tests {
         legacy.sandbox_store_generation = 1;
         assert!(legacy.sandbox_capture_store_dir().is_none());
         refused(legacy);
+        // A resolved home outside the private store refuses, though the rollout is there.
+        let routed_home = project.join(".codex");
+        std::fs::create_dir_all(&routed_home).unwrap();
+        std::fs::copy(store.join("auth.json"), routed_home.join("auth.json")).unwrap();
+        let mut routed = with_sid(local);
+        routed.sandbox_info.as_mut().unwrap().extra_env =
+            Some(vec!["CODEX_HOME=/workspace/project/.codex".into()]);
+        refused(routed);
         // An explicit target stays on the attested path.
         let mut explicit = inst.clone();
         explicit.resume_intent = ResumeIntent::Use(local.into());
