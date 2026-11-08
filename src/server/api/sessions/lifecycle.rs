@@ -3808,6 +3808,10 @@ async fn prepare_agent_session_inner(
                         &started.id, super::tests::terminal_custody::Boundary::LaunchFinished,
                     ),
                 );
+                #[cfg(all(test, unix))]
+                tokio::runtime::Handle::current().block_on(
+                    durable_stop_tests::pause_before_adoption(&started.id),
+                );
                 let adoption = (|| -> anyhow::Result<_> {
                 let _title = crate::session::acquire_session_title_lock(&started.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
@@ -3881,8 +3885,6 @@ async fn prepare_agent_session_inner(
         Ok(Err(error)) => Ok(Err(error)),
         Err(error) => Err(error),
     };
-    #[cfg(all(test, unix))]
-    durable_stop_tests::pause_before_adoption(&id).await;
     let outcome = match result {
         Ok(Ok(Some((generation, profile, outcome, prepared)))) => {
             restart_identity = Some((generation, profile));
