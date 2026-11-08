@@ -108,7 +108,7 @@ enum Held {
     Starting,
     Passphrase,
     ErrorContext,
-    ActiveLog,
+    Active,
     Copy,
 }
 
@@ -125,7 +125,7 @@ fn operation(job: &Job) -> Held {
         Job::ObserveStarting(_) => Held::Starting,
         Job::Passphrase => Held::Passphrase,
         Job::ErrorContext => Held::ErrorContext,
-        Job::ObserveActive => Held::ActiveLog,
+        Job::ObserveActive(_) => Held::Active,
         Job::Copy(..) => Held::Copy,
     }
 }
@@ -161,7 +161,10 @@ fn gated(jobs: &mut ServeJobs, held: Held) -> (Submitter, Gate) {
         }
         match job {
             Job::Open | Job::Picker => snapshot(),
-            Job::ObserveActive => JobResult::ActiveLog(0),
+            Job::ObserveActive(_) => JobResult::Active {
+                log_offset: 0,
+                passphrase: None,
+            },
             _ => run_job(job, control, runtime),
         }
     });
@@ -436,6 +439,7 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
         (Held::Restart, Some('G')),
         (Held::Restart, Some('R')),
         (Held::Restart, Some('?')),
+        (Held::Active, None),
     ] {
         let mut jobs = ServeJobs::default();
         let (submitter, gate) = gated(&mut jobs, held);
@@ -448,6 +452,12 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
         };
         let mut view = ServeView::with_state(state, submitter);
         view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+        if held == Held::Active {
+            let ServeViewState::Active { passphrase, .. } = &mut view.state else {
+                unreachable!()
+            };
+            *passphrase = None;
+        }
         let (exercise, exercise_rx) = mpsc::sync_channel(1);
         let (finished, finished_rx) = mpsc::sync_channel(1);
         let ui = std::thread::spawn(move || {
@@ -456,6 +466,9 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
                 Held::Picker => {
                     view.begin_stop();
                     view.finish_stop(Ok(()));
+                }
+                Held::Active => {
+                    view.tick();
                 }
                 _ => {
                     view.handle_key(key(code.unwrap()));
@@ -470,7 +483,12 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
             let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
                 view.render(frame, frame.area(), theme)
             });
-            let (col, row) = crate::tui::dialogs::test_render::find(&buffer, "[Esc] cancel");
+            let close_hint = if held == Held::Active {
+                "Esc: close"
+            } else {
+                "[Esc] cancel"
+            };
+            let (col, row) = crate::tui::dialogs::test_render::find(&buffer, close_hint);
             let close = view
                 .handle_click(col, row)
                 .expect("pending view retains its cancel target");
@@ -484,7 +502,14 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
             .recv_timeout(Duration::from_secs(2))
             .expect("UI waited for held work");
         let mut reopened = ServeView::new(&mut jobs);
-        gate.release(JobResult::Failed("late old failure".to_owned()));
+        gate.release(if held == Held::Active {
+            JobResult::Active {
+                log_offset: 0,
+                passphrase: Some("late old credential".to_owned()),
+            }
+        } else {
+            JobResult::Failed("late old failure".to_owned())
+        });
         if held == Held::Open {
             gate.entered(Held::Open);
             gate.release(snapshot());
@@ -625,7 +650,7 @@ fn every_pending_state_leaves_a_closed_worker() {
         (Held::ErrorContext, None),
         (Held::ErrorContext, Some('P')),
         (Held::ErrorContext, Some('R')),
-        (Held::ActiveLog, None),
+        (Held::Active, None),
         (Held::Copy, None),
     ] {
         let mut view = ServeView::for_test(if held == Held::ErrorContext {
@@ -633,6 +658,12 @@ fn every_pending_state_leaves_a_closed_worker() {
         } else {
             active_state(ServeMode::Tunnel)
         });
+        if held == Held::Active {
+            let ServeViewState::Active { passphrase, .. } = &mut view.state else {
+                unreachable!()
+            };
+            *passphrase = None;
+        }
         let target = crate::cli::serve::tui_control_target().unwrap();
         let (job, pending) = match held {
             Held::Open => (Job::Open, PendingJob::Open),
@@ -691,7 +722,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                     _ => PendingJob::ErrorContext,
                 },
             ),
-            Held::ActiveLog => (Job::ObserveActive, PendingJob::ActiveLog),
+            Held::Active => (Job::ObserveActive(Some(target)), PendingJob::Active),
             Held::Copy => (Job::Copy("URL", "fixture".to_owned()), PendingJob::Copy),
         };
         view.request(job, pending);
@@ -1452,6 +1483,185 @@ fn open_uses_current_credentials_without_saved_default_fallback() {
         };
         assert_eq!(passphrase.as_deref(), current);
         assert_eq!(view.pending_passphrase, "previous saved default");
+        if current.is_none() {
+            crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            });
+            assert!(view
+                .mouse
+                .borrow()
+                .copies
+                .iter()
+                .all(|((label, _), _)| *label != "Passphrase"));
+            let ServeViewState::Active { opened_at, .. } = view.state else {
+                unreachable!()
+            };
+            std::fs::write(app.join("serve.passphrase"), "recovered runtime credential").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let changed = view.tick();
+                if let ServeViewState::Active {
+                    passphrase: Some(passphrase),
+                    opened_at: current_opened_at,
+                    ..
+                } = &view.state
+                {
+                    assert_eq!(passphrase, "recovered runtime credential");
+                    assert_eq!(*current_opened_at, opened_at);
+                    assert!(changed, "credential recovery did not request repaint");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "published runtime credential never became available without reopening"
+                );
+                std::thread::yield_now();
+            }
+            crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            });
+            assert!(view
+                .mouse
+                .borrow()
+                .copies
+                .iter()
+                .any(|((label, value), _)| {
+                    *label == "Passphrase" && value == "recovered runtime credential"
+                }));
+            assert_eq!(view.pending_passphrase, "previous saved default");
+            assert_eq!(
+                read_app_file("serve.saved_passphrase").as_deref(),
+                Some("previous saved default")
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn active_credential_recovery_rejects_replacements_exit_and_disabled_gate() {
+    use super::work::BEFORE_OBSERVATION_RECHECK;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    #[derive(Clone, Copy)]
+    enum Change {
+        ReplaceBeforeRead,
+        ReplaceDuringRead,
+        ExitDuringRead,
+        NoPassphrase,
+    }
+    for change in [
+        Change::ReplaceBeforeRead,
+        Change::ReplaceDuringRead,
+        Change::ExitDuringRead,
+        Change::NoPassphrase,
+    ] {
+        remove_app_file("serve.launch");
+        remove_app_file("serve.passphrase");
+        let mut original = TestDaemon::new();
+        original.publish();
+        std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+        std::fs::write(app.join("serve.url"), "https://original.invalid/").unwrap();
+        let (entered, received) = mpsc::sync_channel(1);
+        let (release, retained) = mpsc::sync_channel(1);
+        let (observed, next_observation) = mpsc::sync_channel(1);
+        let runtime_passphrase = app.join("serve.passphrase");
+        let mut pause: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            retained.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let mut jobs = ServeJobs::default();
+        let submitter = jobs.with_handler(move |job, control, runtime| {
+            if matches!(job, Job::ObserveActive(_)) {
+                if let Some(pause) = pause.take() {
+                    std::fs::write(&runtime_passphrase, "original runtime credential").unwrap();
+                    if matches!(change, Change::ReplaceDuringRead | Change::ExitDuringRead) {
+                        BEFORE_OBSERVATION_RECHECK.with(|hook| *hook.borrow_mut() = Some(pause));
+                    } else {
+                        pause();
+                    }
+                    if matches!(change, Change::NoPassphrase) {
+                        let Job::ObserveActive(Some(target)) = &job else {
+                            panic!("missing captured target for credential recovery");
+                        };
+                        let lease = runtime
+                            .block_on(crate::cli::serve::TuiObservationLease::prepare(
+                                Some(target.clone()),
+                                &control.cancel,
+                            ))
+                            .unwrap();
+                        assert!(lease.is_running());
+                        assert!(!lease.has_passphrase());
+                    }
+                } else {
+                    let _ = observed.try_send(());
+                }
+            }
+            run_job(job, control, runtime)
+        });
+        let mut view = ServeView::with_state(ServeViewState::Checking { attempt: 0 }, submitter);
+        view.request(Job::Open, PendingJob::Open);
+        view.state = ServeViewState::Checking {
+            attempt: view.last_attempt,
+        };
+        wait_for(&mut view, |view| {
+            matches!(view.state, ServeViewState::Active { .. })
+        });
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Active {
+                passphrase: None,
+                ..
+            }
+        ));
+        wait_for(&mut view, |_| received.try_recv().is_ok());
+        let mut replacement = None;
+        match change {
+            Change::ReplaceBeforeRead | Change::ReplaceDuringRead => {
+                original.exit();
+                let mut successor = TestDaemon::new();
+                successor.publish();
+                std::fs::write(app.join("serve.passphrase"), "successor runtime credential")
+                    .unwrap();
+                replacement = Some(successor);
+            }
+            Change::ExitDuringRead => original.exit(),
+            Change::NoPassphrase => {
+                std::fs::write(
+                    app.join("serve.launch"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": 1,
+                        "pid": original.child.id(),
+                        "profile": "default",
+                        "host": "127.0.0.1",
+                        "port": 8081,
+                        "auth_mode": "none",
+                        "has_passphrase": false,
+                        "behind_proxy": false,
+                        "read_only": false,
+                        "remote": true,
+                        "tunnel_name": null,
+                        "tunnel_url": null,
+                        "no_tailscale": false
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        release.send(()).unwrap();
+        wait_for(&mut view, |_| next_observation.try_recv().is_ok());
+        let ServeViewState::Active {
+            passphrase, urls, ..
+        } = &view.state
+        else {
+            panic!("optional credential recovery discarded the Active view");
+        };
+        assert!(passphrase.is_none());
+        assert_eq!(urls[0].url, "https://original.invalid/");
+        if let Some(successor) = &mut replacement {
+            assert!(successor.child.try_wait().unwrap().is_none());
+        }
     }
 }
 

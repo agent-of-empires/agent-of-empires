@@ -57,6 +57,8 @@ When the TUI starts or restarts a dashboard, Remote Access stays responsive and 
 
 Reopening Remote Access reads the current Daemon's runtime credential, not a saved launch default. Observations reject replacement Daemons. A verified startup exit searches current and retained rotated logs for that process's physical start marker. Without a match, recent context is labelled unattributed and may include earlier runs. The context is shared with other AoE processes, not exclusively that Daemon's output. It does not establish a bind failure or invalidate the saved port for future launches. Error recovery offers Funnel reset only for a known Tailscale transport, never based on shared text. Use `aoe logs` to inspect the shared log.
 
+If a Tunnel runtime credential is temporarily unavailable, Remote Access retries in the background for the same Daemon incarnation. Published URLs stay usable; recovering the credential does not require closing the dialog.
+
 When Remote Access opens or returns to the mode picker, it re-observes the Daemon after checking availability. A dashboard started by another Client during those checks opens directly instead of offering another start.
 
 Nonregular `serve.pid` metadata is preserved as unverifiable state, not treated as an absent Daemon. Repair it before retrying control.

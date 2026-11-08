@@ -653,7 +653,7 @@ enum PendingJob {
     LaunchContext(ServeLaunchRequest),
     LaunchOutcome,
     Starting,
-    ActiveLog,
+    Active,
     Copy,
 }
 
@@ -964,7 +964,7 @@ impl ServeView {
             | PendingJob::LaunchOutcome => true,
             PendingJob::Passphrase
             | PendingJob::Starting
-            | PendingJob::ActiveLog
+            | PendingJob::Active
             | PendingJob::Copy => {
                 self.pending = None;
                 false
@@ -1414,8 +1414,17 @@ impl ServeView {
                         changed = true;
                     }
                 }
-                ServeViewState::Active { .. } => {
-                    self.request(Job::ObserveActive, PendingJob::ActiveLog)
+                ServeViewState::Active {
+                    mode,
+                    ref passphrase,
+                    ..
+                } => {
+                    let target = if mode == ServeMode::Tunnel && passphrase.is_none() {
+                        self.target.clone()
+                    } else {
+                        None
+                    };
+                    self.request(Job::ObserveActive(target), PendingJob::Active)
                 }
                 _ => {}
             }
@@ -1653,11 +1662,29 @@ impl ServeView {
                     return grew;
                 }
             }
-            (PendingJob::ActiveLog, JobResult::ActiveLog(offset)) => {
-                if let ServeViewState::Active { log_offset, .. } = &mut self.state {
+            (
+                PendingJob::Active,
+                JobResult::Active {
+                    log_offset: offset,
+                    passphrase: observed_passphrase,
+                },
+            ) => {
+                if let ServeViewState::Active {
+                    mode,
+                    passphrase,
+                    log_offset,
+                    ..
+                } = &mut self.state
+                {
                     let grew = *log_offset != offset;
                     *log_offset = offset;
-                    return grew;
+                    let recovered = *mode == ServeMode::Tunnel
+                        && passphrase.is_none()
+                        && observed_passphrase.is_some();
+                    if recovered {
+                        *passphrase = observed_passphrase;
+                    }
+                    return grew || recovered;
                 }
                 return false;
             }

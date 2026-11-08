@@ -32,7 +32,7 @@ pub(super) enum Job {
         log_offset: u64,
     },
     ObserveStarting(TuiControlTarget),
-    ObserveActive,
+    ObserveActive(Option<TuiControlTarget>),
     Copy(&'static str, String),
 }
 
@@ -70,7 +70,10 @@ pub(super) enum JobResult {
         passphrase: Option<String>,
     },
     Starting(StartingObservation),
-    ActiveLog(u64),
+    Active {
+        log_offset: u64,
+        passphrase: Option<String>,
+    },
     Copied(&'static str),
     Failed(String),
 }
@@ -124,6 +127,22 @@ fn dashboard(
     }))
 }
 
+fn observe_passphrase(
+    lease: &mut TuiObservationLease,
+    read: bool,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<String>> {
+    let passphrase = (read && lease.has_dashboard() && lease.has_passphrase())
+        .then(current_passphrase)
+        .flatten();
+    #[cfg(test)]
+    if let Some(before_recheck) = BEFORE_OBSERVATION_RECHECK.with(|hook| hook.borrow_mut().take()) {
+        before_recheck();
+    }
+    lease.recheck()?;
+    Ok(passphrase.filter(|_| lease.is_running() && !cancel.is_cancelled()))
+}
+
 fn observe(
     mut lease: TuiObservationLease,
     read_passphrase: bool,
@@ -134,19 +153,11 @@ fn observe(
     } else {
         Vec::new()
     };
-    let mut passphrase = (read_passphrase && lease.has_passphrase() && !urls.is_empty())
-        .then(current_passphrase)
-        .flatten();
     let log_offset = log_file_size();
-    #[cfg(test)]
-    if let Some(before_recheck) = BEFORE_OBSERVATION_RECHECK.with(|hook| hook.borrow_mut().take()) {
-        before_recheck();
-    }
-    lease.recheck()?;
+    let passphrase = observe_passphrase(&mut lease, read_passphrase && !urls.is_empty(), cancel)?;
     let running = lease.is_running();
     if !running {
         urls.clear();
-        passphrase = None;
     }
     let (target, tail) = lease.into_target_and_tail(cancel);
     Ok(StartingObservation {
@@ -267,7 +278,21 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                 observe(lease, true, cancel).map(JobResult::Starting)
             })
             .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
-        Job::ObserveActive => JobResult::ActiveLog(log_file_size()),
+        Job::ObserveActive(target) => {
+            let passphrase = target.and_then(|target| {
+                runtime
+                    .block_on(async {
+                        let mut lease = TuiObservationLease::prepare(Some(target), cancel).await?;
+                        observe_passphrase(&mut lease, true, cancel)
+                    })
+                    .ok()
+                    .flatten()
+            });
+            JobResult::Active {
+                log_offset: log_file_size(),
+                passphrase,
+            }
+        }
         Job::Copy(label, value) => {
             if !control.admit() {
                 return JobResult::Failed("Clipboard copy cancelled before admission".to_owned());
