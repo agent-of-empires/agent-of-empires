@@ -113,7 +113,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
           {job?.log.tail || (state === "running" ? "Starting…" : "")}
         </pre>
         {job?.log.path && (
-          <p className="mt-2 break-all text-xs text-text-dim" data-testid="plugin-job-host-path">
+          <p className="mt-2 break-all font-mono text-xs text-text-dim" data-testid="plugin-job-host-path">
             Full log on Daemon host: {job.log.path}
           </p>
         )}
