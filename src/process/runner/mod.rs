@@ -212,8 +212,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
-    let (control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
-        register_and_spawn_agent(&args, &record)?;
+    let shutdown_signal = wait_for_shutdown();
+    tokio::pin!(shutdown_signal);
+    let Some((control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr)) =
+        register_and_spawn_agent(&args, &record, shutdown_signal.as_mut()).await?
+    else {
+        return Ok(());
+    };
     let agent_started_at = std::time::Instant::now();
 
     // Drain stderr so the child cannot block on a full pipe.
@@ -243,7 +248,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         args.session_id.clone(),
     ));
 
-    let shutdown_signal = wait_for_shutdown();
     let session_id = args.session_id.clone();
     let detached_since: Arc<DetachedSince> = Arc::new(AtomicU64::new(now_secs()));
     let (watchdog_tx, mut watchdog_rx) = tokio::sync::oneshot::channel::<WatchdogShutdown>();
@@ -327,7 +331,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         ),
                     }
                 }
-                _ = shutdown_signal => {
+                _ = shutdown_signal.as_mut() => {
                     info!(
                         target: "acp.runner",
                         session = %session_id,
@@ -509,28 +513,44 @@ async fn self_terminate_agent_tree(
     }
 }
 
-fn register_and_spawn_agent(
+async fn register_and_spawn_agent(
     args: &AcpRunnerArgs,
     record: &WorkerRecord,
-) -> Result<(
-    tokio::net::UnixListener,
-    Child,
-    tokio::process::ChildStdin,
-    tokio::process::ChildStdout,
-    Option<tokio::process::ChildStderr>,
-)> {
-    // Stop commits either before registration or after the complete agent birth.
-    let _native_admission = native_registration_guard(args)?;
-    let listener =
-        worker_registry::register_runner(record).context("registering runner ownership")?;
-    match spawn_agent(args) {
-        Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
-        Err(error) => {
-            if let Err(delete_error) = worker_registry::delete(&args.session_id) {
-                warn!(target: "acp.runner", session = %args.session_id, error = %delete_error, "failed to delete worker record");
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<
+    Option<(
+        tokio::net::UnixListener,
+        Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+        Option<tokio::process::ChildStderr>,
+    )>,
+> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let registration = async {
+        // Stop commits before registration or after the complete native birth.
+        let _native_admission = native_registration_guard(args)?;
+        let listener = {
+            let registry = worker_registry::registry_lock_until(&record.session_id, deadline)
+                .await
+                .context("waiting for runner ownership admission")?;
+            worker_registry::register_runner(record, &registry)
+                .context("registering runner ownership")?
+        };
+        match spawn_agent(args) {
+            Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
+            Err(error) => {
+                if let Err(delete_error) = worker_registry::delete(&args.session_id) {
+                    warn!(target: "acp.runner", session = %args.session_id, error = %delete_error, "failed to delete worker record");
+                }
+                Err(error).with_context(|| format!("spawning agent {:?}", args.agent_argv))
             }
-            Err(error).with_context(|| format!("spawning agent {:?}", args.agent_argv))
         }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown => Ok(None),
+        result = registration => result.map(Some),
     }
 }
 
@@ -727,7 +747,11 @@ mod tests {
             lifecycle_generation: Some(5),
             systemd_scope: None,
             prime_runtime: None,
-            agent_argv: vec!["sh".into(), "-c".into(), "printf born > agent-born".into()],
+            agent_argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '%s\\n' \"$$\" >> agent-born".into(),
+            ],
         };
         let record = WorkerRecord::new(
             row.id.clone(),
@@ -752,7 +776,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(
+            register_and_spawn_agent(&args, &record, std::future::pending())
+                .await
+                .is_err()
+        );
         assert!(!marker.exists());
         assert!(worker_registry::load(&row.id).unwrap().is_none());
         assert!(!crate::process::worker::control_socket_sibling(&args.socket).exists());
@@ -766,21 +794,203 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(
+            register_and_spawn_agent(&args, &record, std::future::pending())
+                .await
+                .is_err()
+        );
         assert!(!marker.exists());
         args.lifecycle_generation = Some(7);
         let stop_path = worker_registry::workers_dir()
             .unwrap()
             .join(format!("{}.stop", row.id));
         std::fs::write(&stop_path, b"undecodable stop intent").unwrap();
-        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(
+            register_and_spawn_agent(&args, &record, std::future::pending())
+                .await
+                .is_err()
+        );
         assert!(!marker.exists());
-        std::fs::remove_file(stop_path).unwrap();
+        std::fs::remove_file(&stop_path).unwrap();
+        let record_path = worker_registry::record_path(&row.id).unwrap();
+        let control_path = crate::process::worker::control_socket_sibling(&args.socket);
+        let unpublished = || {
+            assert!(!marker.exists());
+            assert!(!record_path.exists());
+            assert!(!control_path.exists());
+        };
 
+        // Every refusal is checked after the same pending operation acquires the entry.
+        for case in [
+            "stop",
+            "replacement",
+            "corrupt_stop",
+            "live_control",
+            "weak_birth",
+        ] {
+            let stop = if case == "stop" {
+                worker_registry::save(&record).unwrap();
+                let stop = worker_registry::request_stop(&record).unwrap();
+                worker_registry::retire_selected(&record).unwrap();
+                Some(stop)
+            } else {
+                None
+            };
+            let mut selected = record.clone();
+            if case == "weak_birth" {
+                selected.runner_identity = None;
+            }
+            let holder = worker_registry::acquire_registry_lock(&row.id).unwrap();
+            let startup = register_and_spawn_agent(&args, &selected, std::future::pending());
+            tokio::pin!(startup);
+            assert!(
+                matches!(
+                    futures_util::poll!(startup.as_mut()),
+                    std::task::Poll::Pending
+                ),
+                "{case}"
+            );
+            unpublished();
+            assert!(storage
+                .try_acquire_instance_lifecycle_lock(&row.id)
+                .unwrap()
+                .is_none());
+            drop(holder);
+            let replacement = record.clone().with_generation(record.generation + 1);
+            if case == "replacement" {
+                worker_registry::save(&replacement).unwrap();
+            } else if case == "corrupt_stop" {
+                std::fs::write(&stop_path, b"undecodable stop intent").unwrap();
+            }
+            let listener = (case == "live_control")
+                .then(|| tokio::net::UnixListener::bind(&control_path).unwrap());
+            let outcome = tokio::time::timeout(Duration::from_secs(5), startup.as_mut())
+                .await
+                .expect("registration refusal remains bounded");
+            assert!(outcome.is_err(), "{case} must refuse native birth");
+            assert!(!marker.exists(), "{case}");
+            assert!(storage
+                .try_acquire_instance_lifecycle_lock(&row.id)
+                .unwrap()
+                .is_some());
+            if case == "replacement" {
+                let current = worker_registry::load_strict(&row.id).unwrap().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&current).unwrap(),
+                    serde_json::to_value(&replacement).unwrap()
+                );
+                worker_registry::retire_selected(&replacement).unwrap();
+            } else {
+                assert!(!record_path.exists(), "{case}");
+            }
+            if let Some(stop) = stop {
+                assert_eq!(
+                    worker_registry::stop_intent(&row.id).unwrap(),
+                    Some(stop.clone())
+                );
+                worker_registry::admit_resume(
+                    &row.id,
+                    worker_registry::ResumeAuthority::Explicit,
+                    &Some(stop),
+                )
+                .unwrap();
+            } else if case == "corrupt_stop" {
+                assert_eq!(
+                    std::fs::read(&stop_path).unwrap(),
+                    b"undecodable stop intent"
+                );
+                std::fs::remove_file(&stop_path).unwrap();
+            }
+            if listener.is_some() {
+                assert_eq!(
+                    crate::process::worker::peer_pid_from_socket(&control_path),
+                    Some(std::process::id())
+                );
+                drop(listener);
+                std::fs::remove_file(&control_path).unwrap();
+            }
+            unpublished();
+        }
+
+        for case in ["expiry", "cancel", "drop"] {
+            let holder = worker_registry::acquire_registry_lock(&row.id).unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            {
+                let startup = register_and_spawn_agent(&args, &record, shutdown.cancelled());
+                tokio::pin!(startup);
+                assert!(
+                    matches!(
+                        futures_util::poll!(startup.as_mut()),
+                        std::task::Poll::Pending
+                    ),
+                    "{case}"
+                );
+                unpublished();
+                assert!(storage
+                    .try_acquire_instance_lifecycle_lock(&row.id)
+                    .unwrap()
+                    .is_none());
+                if case == "cancel" {
+                    shutdown.cancel();
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(5), startup.as_mut())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_none()
+                    );
+                } else if case == "expiry" {
+                    let error = tokio::time::timeout(Duration::from_secs(5), startup.as_mut())
+                        .await
+                        .unwrap()
+                        .unwrap_err();
+                    assert!(error.is::<worker_registry::RegistryBusy>(), "{error:#}");
+                }
+            }
+            // No registration task remains to mutate after the holder releases.
+            assert!(storage
+                .try_acquire_instance_lifecycle_lock(&row.id)
+                .unwrap()
+                .is_some());
+            drop(holder);
+            unpublished();
+            drop(
+                worker_registry::try_registry_lock(&row.id)
+                    .unwrap()
+                    .unwrap(),
+            );
+            unpublished();
+        }
+
+        let holder = worker_registry::acquire_registry_lock(&row.id).unwrap();
+        let startup = register_and_spawn_agent(&args, &record, std::future::pending());
+        tokio::pin!(startup);
+        assert!(matches!(
+            futures_util::poll!(startup.as_mut()),
+            std::task::Poll::Pending
+        ));
+        unpublished();
+        assert!(storage
+            .try_acquire_instance_lifecycle_lock(&row.id)
+            .unwrap()
+            .is_none());
+        drop(holder);
         let (listener, mut child, stdin, stdout, stderr) =
-            register_and_spawn_agent(&args, &record).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), startup.as_mut())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("same original registration completes");
+        let native_pid = child.id().unwrap();
         assert!(child.wait().await.unwrap().success());
-        assert_eq!(std::fs::read(marker).unwrap(), b"born");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{native_pid}\n")
+        );
+        let published = worker_registry::load_strict(&row.id).unwrap().unwrap();
+        assert_eq!(published.pid, record.pid);
+        assert_eq!(published.generation, record.generation);
+        assert_eq!(published.runner_identity, record.runner_identity);
         drop((listener, stdin, stdout, stderr));
         worker_registry::retire_selected(&record).unwrap();
     }
@@ -813,7 +1023,11 @@ mod tests {
             if case == "untracked-prime" {
                 record.agent_key = "prime-agent".into();
             }
-            let _listener = worker_registry::register_runner(&record).unwrap();
+            let _listener = worker_registry::register_runner(
+                &record,
+                &worker_registry::try_registry_lock(id).unwrap().unwrap(),
+            )
+            .unwrap();
             let mut agent = Command::new("cat")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

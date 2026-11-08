@@ -339,6 +339,7 @@ async fn edit_session(
         }
     };
     // Never call the supervisor while a storage/publication lock is held.
+    drop(lifecycle);
     if moves || after.source_profile != before.source_profile {
         quiesce_structured_worker(state, id, before.is_structured()).await?;
     }
@@ -352,7 +353,26 @@ async fn edit_session(
     let structured = before.is_structured();
     let profiles = vec![before.source_profile.clone(), after.source_profile.clone()];
     let committed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let changes = [(before, after)];
+        let lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&before.id)?;
+        let current = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .ok_or(crate::session::SessionGone)?;
+        anyhow::ensure!(
+            edit_identity_matches(&current, &before),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let mut after = after;
+        after.acp_session_id = current.acp_session_id.clone();
+        after.agent_session_id = current.agent_session_id.clone();
+        after.agent_session_binding = current.agent_session_binding.clone();
+        after.resume_binding = current.resume_binding.clone();
+        after.fork_pending = current.fork_pending.clone();
+        after.import_pending = current.import_pending;
+        let changes = [(current, after)];
         let (before, after) = (&changes[0].0, &changes[0].1);
         let effect = |candidate: &Instance| -> anyhow::Result<()> {
             let Some(name) = name.as_deref() else {
@@ -582,12 +602,14 @@ async fn quiesce_structured_worker(
     if !is_structured {
         return Ok(());
     }
-    match state
-        .acp_supervisor
-        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
-        .await
+    match crate::server::acp_events::retire_native_worker(
+        state,
+        id,
+        std::time::Duration::from_secs(5),
+    )
+    .await
     {
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(
                 target: "http.api.sessions",

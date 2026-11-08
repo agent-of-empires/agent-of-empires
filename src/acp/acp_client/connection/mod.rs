@@ -78,6 +78,16 @@ pub(super) struct ConnectionState {
     ordered_loss_wake: tokio::sync::Notify,
     completed_outcomes: std::sync::atomic::AtomicUsize,
     completed_outcomes_wake: tokio::sync::Notify,
+    pub(super) fork_response: std::sync::Mutex<super::control::OriginalForkResponse>,
+    #[cfg(test)]
+    pub(super) fork_emit_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    pub(super) fork_emitted: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ConnectionState {

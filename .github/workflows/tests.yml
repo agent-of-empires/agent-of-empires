@@ -188,6 +188,8 @@ jobs:
       - name: Cargo test (bare core, no default features)
         if: matrix.leg == 'bare-core'
         run: |
+          # Owned-runner unit fixtures launch the matching normal binary, not a test harness.
+          cargo build --no-default-features --features vendored --bin aoe
           cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
           cargo test --no-default-features --features vendored,e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
@@ -341,7 +343,10 @@ jobs:
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
-        run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
+        run: |
+          # Owned-runner unit fixtures launch the matching normal binary, not a test harness.
+          cargo build --features e2e-tests --bin aoe
+          cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
         run: cargo nextest run --features e2e-tests --test integration -E 'test(cli_read_daemon::)' --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)

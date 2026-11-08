@@ -163,6 +163,11 @@ fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
     )))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static TEST_RUNNER_EXECUTABLE: std::path::PathBuf;
+}
+
 /// The runner owns the agent subprocess and outlives the daemon; its Child is
 /// transferred to the launch lease so teardown remains owned across cancellation.
 pub(super) async fn spawn_runner_detached(
@@ -179,6 +184,10 @@ pub(super) async fn spawn_runner_detached(
 > {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    #[cfg(test)]
+    let current_exe = TEST_RUNNER_EXECUTABLE
+        .try_with(Clone::clone)
+        .unwrap_or(current_exe);
     ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e:#}")))?;

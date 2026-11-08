@@ -75,6 +75,53 @@ pub(super) enum ControlPromptResult {
     NativeLost,
 }
 
+#[derive(Default)]
+pub(super) enum OriginalForkResponse {
+    #[default]
+    Unused,
+    Requested(String),
+    Finished(Option<Arc<crate::acp::state::NativeForkRejection>>),
+}
+
+impl OriginalForkResponse {
+    fn register(&mut self, parent: Option<&str>) -> bool {
+        if !matches!(self, Self::Unused) {
+            return false;
+        }
+        *self = parent.map_or(Self::Finished(None), |parent| {
+            Self::Requested(parent.to_owned())
+        });
+        parent.is_some()
+    }
+
+    fn receive(&mut self, body: &ControlBody, owner: crate::acp::runner_lifecycle::RunnerIdentity) {
+        match std::mem::take(self) {
+            Self::Requested(parent) => {
+                let rejection = matches!(body, ControlBody::HandshakeFailed {
+                    method, origin: control_protocol::HandshakeFailureOrigin::NativeResponse, ..
+                } if method == "session/fork")
+                .then(|| Arc::new(crate::acp::state::NativeForkRejection { owner, parent }));
+                *self = Self::Finished(rejection);
+            }
+            previous => *self = previous,
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        match self {
+            Self::Finished(rejection) => rejection.clone(),
+            Self::Unused | Self::Requested(_) => None,
+        }
+    }
+
+    pub(super) fn seal(&mut self) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        if !matches!(self, Self::Finished(_)) {
+            *self = Self::Finished(None);
+        }
+        self.snapshot()
+    }
+}
+
 struct HandshakeReply {
     body: ControlBody,
     application: Option<HandshakeApplication>,
@@ -100,6 +147,7 @@ impl Drop for HandshakeApplication {
 pub(super) struct EstablishmentFailure {
     pub(super) origin: control_protocol::HandshakeFailureOrigin,
     pub(super) error: agent_client_protocol::Error,
+    pub(super) fork_rejection: Option<Arc<crate::acp::state::NativeForkRejection>>,
     _application: Option<HandshakeApplication>,
 }
 
@@ -108,6 +156,7 @@ impl From<agent_client_protocol::Error> for EstablishmentFailure {
         Self {
             origin: control_protocol::HandshakeFailureOrigin::Unknown,
             error,
+            fork_rejection: None,
             _application: None,
         }
     }
@@ -357,6 +406,16 @@ impl DaemonControlClient {
         self.peer_identity
     }
 
+    pub(super) fn original_fork_rejection(
+        &self,
+    ) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        self.connection_state
+            .fork_response
+            .lock()
+            .expect("fork response custody")
+            .snapshot()
+    }
+
     /// A lost connection does not assert process death or authorize a signal.
     pub(super) async fn wait_peer_exit(&self) {
         loop {
@@ -396,6 +455,13 @@ impl DaemonControlClient {
         method: &str,
         request: serde_json::Value,
     ) -> Result<(String, serde_json::Value), EstablishmentFailure> {
+        let original_fork = method == "session/fork"
+            && self
+                .connection_state
+                .fork_response
+                .lock()
+                .expect("fork response custody")
+                .register(request.get("sessionId").and_then(serde_json::Value::as_str));
         self.send(ControlBody::EstablishSession {
             method: method.to_string(),
             request,
@@ -404,6 +470,7 @@ impl DaemonControlClient {
         .map_err(|e| EstablishmentFailure {
             origin: control_protocol::HandshakeFailureOrigin::LocalTransport,
             error: acp_internal_error(format!("control write failed: {e}")),
+            fork_rejection: None,
             _application: None,
         })?;
         let Some(HandshakeReply { body, application }) = self.receive_handshake().await else {
@@ -412,6 +479,7 @@ impl DaemonControlClient {
                 error: acp_internal_error(
                     "control channel closed during session establishment".into(),
                 ),
+                fork_rejection: None,
                 _application: None,
             });
         };
@@ -430,6 +498,13 @@ impl DaemonControlClient {
                 origin,
                 error,
             } if failed == method => Err(EstablishmentFailure {
+                fork_rejection: if original_fork
+                    && origin == control_protocol::HandshakeFailureOrigin::NativeResponse
+                {
+                    self.original_fork_rejection()
+                } else {
+                    None
+                },
                 origin,
                 error: acp_error_from_value(error),
                 _application: application,
@@ -439,6 +514,7 @@ impl DaemonControlClient {
                 error: acp_internal_error(
                     "control handshake did not match session establishment".into(),
                 ),
+                fork_rejection: None,
                 _application: None,
             }),
         }
@@ -575,7 +651,20 @@ pub(super) async fn wait_runner_registration(
         ))
     };
     loop {
-        match crate::process::worker_registry::load_strict(session_id) {
+        let observed = {
+            let registry =
+                crate::process::worker_registry::registry_lock_until(session_id, deadline)
+                    .await
+                    .map_err(|error| {
+                        if error.is::<crate::process::worker_registry::RegistryBusy>() {
+                            AcpError::RegistryBusy
+                        } else {
+                            unconfirmed()
+                        }
+                    })?;
+            registry.record()
+        };
+        match observed {
             Ok(Some(record)) if expected_owner.owns_record(&record) => {
                 if let Some(refusal) =
                     crate::process::worker_registry::control_protocol_refusal(&record)
@@ -776,6 +865,8 @@ pub(super) async fn connect_runner_control_v5(
                         | ControlBody::HandshakeFailed { .. }),
                         _,
                     ))) => {
+                        reader_connection_state.fork_response.lock()
+                            .expect("fork response custody").receive(&frame, expected_owner);
                         if let ControlBody::SessionReady {
                             acp_session_id,
                             native_channel,
@@ -1383,12 +1474,14 @@ pub(super) async fn establish_session_v5<Resp: serde::de::DeserializeOwned>(
     let params = serde_json::to_value(request).map_err(|e| EstablishmentFailure {
         origin: control_protocol::HandshakeFailureOrigin::LocalResult,
         error: acp_internal_error(format!("serialize {method} params: {e}")),
+        fork_rejection: None,
         _application: None,
     })?;
     let (_id, result) = control.establish_session(method, params).await?;
     serde_json::from_value(result).map_err(|e| EstablishmentFailure {
         origin: control_protocol::HandshakeFailureOrigin::LocalResult,
         error: acp_internal_error(format!("deserialize {method} result: {e}")),
+        fork_rejection: None,
         _application: None,
     })
 }

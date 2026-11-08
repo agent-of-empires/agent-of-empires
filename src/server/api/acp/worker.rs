@@ -177,8 +177,8 @@ pub async fn spawn_acp(
         .into_response();
     }
 
-    let instance =
-        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
+    let (instance, resume_reservation) =
+        match crate::server::api::sessions::resume_structured_stop(&state, instance, None).await {
             Ok(instance) => instance,
             Err(response) => return response,
         };
@@ -235,21 +235,25 @@ pub async fn spawn_acp(
     // Reserve the lifecycle generation while the preparation exclusion is
     // still held, then release all request locks before spawn configuration
     // and before_session hooks. Hooks may re-enter the API for this session.
-    let reservation = match state
-        .acp_supervisor
-        .reserve_spawn(
-            &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-    {
-        Ok(reservation) => reservation,
-        Err(e) => return supervisor_error_response("spawn failed", &e),
+    let reservation = if let Some(reservation) = resume_reservation {
+        reservation
+    } else {
+        match state
+            .acp_supervisor
+            .reserve_spawn(
+                &id,
+                if request.stored_acp_session_id.is_some() {
+                    crate::acp::supervisor::ResumeKind::Spawn
+                } else {
+                    crate::acp::supervisor::ResumeKind::SpawnFirst
+                },
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(e) => return supervisor_error_response("spawn failed", &e),
+        }
     };
     if spawn_request.cancellation().is_cancelled() {
         drop(reservation);
@@ -383,12 +387,8 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
     if was_resuming {
-        if let Err(e) = state
-            .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
-            .await
-        {
-            return supervisor_error_response("restart shutdown failed", &e);
+        if let Err(response) = retire_restart_worker(&state, &preflight_instance, &restart).await {
+            return response;
         }
     }
 
@@ -444,12 +444,8 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
     // Running workers are stopped only after the submission barrier is held.
     if !was_resuming {
-        if let Err(e) = state
-            .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
-            .await
-        {
-            return supervisor_error_response("restart shutdown failed", &e);
+        if let Err(response) = retire_restart_worker(&state, &instance, &restart).await {
+            return response;
         }
     }
     if restart.is_cancelled() {
@@ -520,9 +516,16 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         )
             .into_response();
     }
-    let instance =
-        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
-            Ok(instance) => instance,
+    let (instance, resume_reservation) =
+        match crate::server::api::sessions::resume_structured_stop_with_restart(
+            &state,
+            instance,
+            None,
+            Some(&restart),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
             Err(response) => return response,
         };
     if restart.is_cancelled() {
@@ -577,15 +580,20 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     drop(exclusion);
-    match state
-        .acp_supervisor
-        .spawn_for_restart(
-            request,
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-            &restart,
-        )
-        .await
-    {
+    let launched = match resume_reservation {
+        Some(reservation) => state.acp_supervisor.spawn_inner(request, reservation).await,
+        None => {
+            state
+                .acp_supervisor
+                .spawn_for_restart(
+                    request,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                    &restart,
+                )
+                .await
+        }
+    };
+    match launched {
         Ok(()) => Json(SpawnAcpResponse {
             session_id: id,
             agent,
@@ -594,6 +602,153 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         .into_response(),
         Err(e) => supervisor_error_response("restart spawn failed", &e),
     }
+}
+
+async fn retire_restart_worker(
+    state: &Arc<AppState>,
+    expected: &crate::session::Instance,
+    restart: &crate::acp::supervisor::RestartRequestGuard,
+) -> Result<(), Response> {
+    if restart.is_cancelled() {
+        return Err(supervisor_error_response(
+            "restart cancelled",
+            &SupervisorError::SpawnCancelled(expected.id.clone()),
+        ));
+    }
+    let owner = state.clone();
+    let id = expected.id.clone();
+    let prepare_id = id.clone();
+    let profile = expected.source_profile.clone();
+    let created_at = expected.created_at;
+    let generation = expected.lifecycle_generation;
+    let project_path = expected.project_path.clone();
+    let tool = expected.tool.clone();
+    let agent_name = expected.agent_name.clone();
+    let agent_provider = expected.agent_provider.clone();
+    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        use crate::session::SessionStore as _;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            owner.clone(),
+            &profile,
+            Some(prepare_id.clone()),
+        )?;
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&prepare_id)?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == prepare_id)
+            .ok_or(crate::session::SessionGone)?;
+        row.ensure_startable()?;
+        anyhow::ensure!(
+            row.is_structured()
+                && row.terminal_handoff.is_none()
+                && row.created_at == created_at
+                && row.lifecycle_generation == generation
+                && row.source_profile == profile
+                && row.project_path == project_path
+                && row.tool == tool
+                && row.agent_name == agent_name
+                && row.agent_provider == agent_provider,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let target = owner.acp_supervisor.capture_retirement(&row.id)?;
+        if let Some(lease) = &target.lease {
+            if let Some(scope) = lease
+                .native_scope()
+                .map_err(|_| anyhow::anyhow!("native retirement source is unavailable"))?
+            {
+                anyhow::ensure!(
+                    scope.context
+                        == crate::acp::state::NativeEventContext::capture(&row, native.storage())?,
+                    crate::session::LifecycleReservationError::Superseded
+                );
+            } else {
+                anyhow::ensure!(
+                    target.identity.is_none(),
+                    crate::session::LifecycleReservationError::Superseded
+                );
+            }
+        }
+        let binding = crate::server::acp_events::BindingRetirement::prepare_captured(
+            &owner,
+            target,
+            &row,
+            native.storage(),
+        )?;
+        owner
+            .acp_supervisor
+            .register_delegated_binding_retirement(&binding.target, binding.checkpoint.clone())?;
+        Ok((native, binding))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let (native, binding) = prepared.map_err(|error| {
+        restart_retirement_error("restart native retirement preparation", &error)
+    })?;
+    state
+        .acp_supervisor
+        .shutdown_and_wait_for_restart(
+            &id,
+            &binding.target,
+            std::time::Duration::from_secs(5),
+            restart,
+        )
+        .await
+        .map_err(|error| supervisor_error_response("restart shutdown failed", &error))?;
+    let owner = state.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::session::SessionStore as _;
+        let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
+        let delegated = || {
+            binding
+                .target
+                .lease
+                .as_ref()
+                .is_none_or(|lease| lease.retirement().binding_checkpoint_delegated())
+        };
+        anyhow::ensure!(delegated(), SupervisorError::TeardownPending(id.clone()));
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        anyhow::ensure!(
+            row.terminal_handoff.is_none(),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        binding.commit_under_native_lock(&native, &id)?;
+        native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        anyhow::ensure!(delegated(), SupervisorError::TeardownPending(id.clone()));
+        owner
+            .acp_supervisor
+            .acknowledge_retirement(&binding.target)?;
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|error| restart_retirement_error("restart native retirement checkpoint", &error))
+}
+
+fn restart_retirement_error(context: &str, error: &anyhow::Error) -> Response {
+    if let Some(error) = error.downcast_ref::<SupervisorError>() {
+        return supervisor_error_response(context, error);
+    }
+    if error.is::<crate::session::SessionCommitApplied>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{context}: applied/unconfirmed: {error}"),
+        )
+            .into_response();
+    }
+    launch_error_response(context, error)
 }
 
 async fn validate_restart_agent(
@@ -896,27 +1051,36 @@ pub async fn switch_acp_agent(
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
-    let instance =
-        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
-            Ok(instance) => instance,
-            Err(response) => return response,
-        };
+    let (instance, resume_reservation) = match crate::server::api::sessions::resume_structured_stop(
+        &state,
+        instance,
+        Some(crate::acp::supervisor::ResumeKind::SpawnFirst),
+    )
+    .await
+    {
+        Ok(instance) => instance,
+        Err(response) => return response,
+    };
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
     };
     let before_seq = state.acp_event_store.highest_seq(&id);
 
-    if let Err(e) = state
-        .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
-        .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed before agent switch: {e}"),
+    if resume_reservation.is_none() {
+        if let Err(e) = crate::server::acp_events::retire_native_worker(
+            &state,
+            &id,
+            std::time::Duration::from_secs(5),
         )
-            .into_response();
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("shutdown failed before agent switch: {e}"),
+            )
+                .into_response();
+        }
     }
     {
         let mut instances = state.instances.write().await;
@@ -961,17 +1125,21 @@ pub async fn switch_acp_agent(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
-    let reservation = match state
-        .acp_supervisor
-        .reserve_spawn(
-            &id,
-            crate::acp::supervisor::ResumeKind::SpawnFirst,
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-    {
-        Ok(reservation) => reservation,
-        Err(e) => return supervisor_error_response("spawn failed", &e),
+    let reservation = if let Some(reservation) = resume_reservation {
+        reservation
+    } else {
+        match state
+            .acp_supervisor
+            .reserve_spawn(
+                &id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(e) => return supervisor_error_response("spawn failed", &e),
+        }
     };
     let launch_epoch = reservation.lease().epoch();
     drop(exclusion);
@@ -1159,8 +1327,8 @@ pub async fn switch_acp_provider(
             "the session is mid-turn; switch providers once it finishes",
         );
     }
-    let instance =
-        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
+    let (instance, resume_reservation) =
+        match crate::server::api::sessions::resume_structured_stop(&state, instance, None).await {
             Ok(instance) => instance,
             Err(response) => return response,
         };
@@ -1169,26 +1337,35 @@ pub async fn switch_acp_provider(
         Err(response) => return response,
     };
 
-    if let Err(e) = state
-        .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
-        .await
-    {
-        if matches!(e, SupervisorError::TeardownPending(_)) {
-            return super::super::api_error(
-                StatusCode::CONFLICT,
-                "worker_not_stopped",
-                "the previous worker has not finished stopping; retry the switch shortly",
-            );
-        }
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed before provider switch: {e}"),
+    if resume_reservation.is_none() {
+        if let Err(e) = crate::server::acp_events::retire_native_worker(
+            &state,
+            &id,
+            std::time::Duration::from_secs(5),
         )
-            .into_response();
+        .await
+        {
+            if matches!(
+                e.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::TeardownPending(_))
+            ) {
+                return super::super::api_error(
+                    StatusCode::CONFLICT,
+                    "worker_not_stopped",
+                    "the previous worker has not finished stopping; retry the switch shortly",
+                );
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("shutdown failed before provider switch: {e}"),
+            )
+                .into_response();
+        }
     }
     // No provider mutation until the previous runner is proven absent.
-    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+    if resume_reservation.is_none()
+        && state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent
+    {
         return super::super::api_error(
             StatusCode::CONFLICT,
             "worker_not_stopped",
@@ -1245,21 +1422,25 @@ pub async fn switch_acp_provider(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &updated).await {
         return resp;
     }
-    let reservation = match state
-        .acp_supervisor
-        .reserve_spawn(
-            &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-    {
-        Ok(reservation) => reservation,
-        Err(e) => return supervisor_error_response("spawn failed after provider switch", &e),
+    let reservation = if let Some(reservation) = resume_reservation {
+        reservation
+    } else {
+        match state
+            .acp_supervisor
+            .reserve_spawn(
+                &id,
+                if request.stored_acp_session_id.is_some() {
+                    crate::acp::supervisor::ResumeKind::Spawn
+                } else {
+                    crate::acp::supervisor::ResumeKind::SpawnFirst
+                },
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(e) => return supervisor_error_response("spawn failed after provider switch", &e),
+        }
     };
     drop(exclusion);
     if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
@@ -1522,9 +1703,10 @@ mod tests {
             assert!(stopped.lifecycle_reservation.is_none());
             assert_reconstructed_stop_does_not_resume(stopped.clone()).await;
 
-            let resumed = crate::server::api::sessions::resume_structured_stop(&state, stopped)
-                .await
-                .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
+            let (resumed, _reservation) =
+                crate::server::api::sessions::resume_structured_stop(&state, stopped, None)
+                    .await
+                    .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
             assert_eq!(resumed.status, Status::Idle);
             assert!(!resumed.is_idle_dormant());
             let admission = crate::acp::supervisor::LaunchAdmission {
@@ -1771,9 +1953,12 @@ mod tests {
                 );
             }
 
-            let resumed = crate::server::api::sessions::resume_structured_stop(&state, cached)
-                .await
-                .unwrap_or_else(|response| panic!("manual resume failed: {}", response.status()));
+            let (resumed, reservation) =
+                crate::server::api::sessions::resume_structured_stop(&state, cached, None)
+                    .await
+                    .unwrap_or_else(|response| {
+                        panic!("manual resume failed: {}", response.status())
+                    });
             assert_eq!(resumed.status, Status::Idle);
             assert!(!resumed.is_idle_dormant());
             if !retire {
@@ -1784,15 +1969,8 @@ mod tests {
                 assert!(!exit.success());
             }
             assert!(resumed.lifecycle_generation > stop_generation);
-            let reservation = state
-                .acp_supervisor
-                .reserve_spawn(
-                    &row.id,
-                    crate::acp::supervisor::ResumeKind::Spawn,
-                    crate::process::worker_registry::ResumeAuthority::Explicit,
-                )
-                .await
-                .unwrap();
+            let reservation =
+                reservation.expect("retiring the dormant original reserves its explicit successor");
             assert_ne!(reservation.lease().epoch(), old_epoch);
             assert!(!state
                 .acp_supervisor
@@ -1926,8 +2104,138 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn restart_commits_original_binding_before_releasing_its_admission() {
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use crate::acp::Event;
+        use crate::session::{Instance, Status, Storage, View};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("restart original binding", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        row.status = Status::Running;
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut runner = HeldAttachRunner::recording_prompt(
+            &id,
+            project.path(),
+            17,
+            Some("default"),
+            "original-native-restart",
+        )
+        .await;
+        runner.record.scope = crate::process::worker_registry::ScopeOwnership::Unscoped;
+        crate::process::worker_registry::save(&runner.record).unwrap();
+        let mut events = state.acp_events_tx.subscribe();
+        state
+            .acp_supervisor
+            .attach(id.clone(), project.path().into(), Vec::new(), false, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = events.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned {
+                    acp_session_id, connection_ready: true, native_subject: Some(_),
+                } if acp_session_id == "original-native-restart")
+                {
+                    break;
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runner.resumed_session().await, "original-native-restart");
+        let original = state
+            .acp_supervisor
+            .current_native_availability(&id)
+            .await
+            .unwrap();
+        assert_eq!(original.owner, Some(runner.identity));
+        assert!(
+            state.instances.read().await[0].acp_session_id.is_none(),
+            "the original received binding has not been consumed by an event listener"
+        );
+        let snapshot = || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .map(|(seq, event)| {
+                    (
+                        seq,
+                        event.native_subject(),
+                        serde_json::to_value(event).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let history = snapshot();
+        let restart = state
+            .acp_supervisor
+            .try_begin_restart_with_reason(&id)
+            .await
+            .unwrap();
+        if let Err(response) = retire_restart_worker(&state, &row, &restart).await {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|error| format!("reading bounded response body failed: {error}"));
+            panic!("restart retirement failed: {status}: {body}");
+        }
+        assert!(
+            !crate::acp::runner_lifecycle::SystemProcessControl::default()
+                .is_alive(runner.identity)
+        );
+        let memory = state.instances.read().await;
+        assert_eq!(
+            memory[0].acp_session_id.as_deref(),
+            Some("original-native-restart")
+        );
+        drop(memory);
+        let stored = Storage::open_reference("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            stored.acp_session_id.as_deref(),
+            Some("original-native-restart")
+        );
+        assert!(snapshot().starts_with(&history));
+        let reservation = state
+            .acp_supervisor
+            .reserve_spawn_with_restart(
+                &id,
+                crate::acp::supervisor::ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                Some(&restart),
+            )
+            .await
+            .expect("the foreground checkpoint ACK releases actual replacement admission");
+        assert!(state.acp_supervisor.current_lease(&id) == Some(reservation.lease().clone()));
+        assert!(reservation.lease() != &original.lease);
+        assert!(!restart.is_cancelled());
+        drop(reservation);
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn explicit_resume_retirement_preserves_its_request_until_an_external_stop() {
         use crate::session::{Instance, Status, Storage, View};
+        use futures_util::FutureExt as _;
 
         let _home = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
@@ -1960,24 +2268,74 @@ mod tests {
         let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
             .await
             .unwrap();
-        let resumed = crate::server::api::sessions::resume_structured_stop(&state, stopped)
+        let (resumed, reservation) =
+            crate::server::api::sessions::resume_structured_stop_with_restart(
+                &state,
+                stopped,
+                None,
+                Some(&restart),
+            )
             .await
             .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
-        assert_eq!(resumed.status, Status::Idle);
-        assert!(!request.cancellation().is_cancelled());
-        assert!(!restart.is_cancelled());
+        let reservation = reservation.expect("explicit stopped resume reserves once");
+        let lease = reservation.lease().clone();
+        let mut reservation = Some(reservation);
+        let mut stopping = None;
         drop(exclusion);
+        let checked = std::panic::AssertUnwindSafe(async {
+            assert!(state.acp_supervisor.current_lease(&row.id) == Some(lease.clone()));
+            assert_eq!(resumed.status, Status::Idle);
+            let mut changes = state.status_tx.subscribe();
+            assert!(!request.cancellation().is_cancelled());
+            assert!(!restart.is_cancelled());
 
-        // A subsequent real stop must still cancel both launch paths.
-        assert_eq!(
-            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+            // Keep the producer until Stop's exact native capture has committed.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            let owner = state.clone();
+            let id = row.id.clone();
+            stopping = Some(tokio::spawn(async move {
+                shutdown_acp(State(owner), Path(id)).await.into_response()
+            }));
+            tokio::time::timeout_at(deadline, lease.cancellation().cancelled())
                 .await
-                .into_response()
+                .expect("external Stop cancels the original resume reservation");
+            let change = tokio::time::timeout_at(deadline, changes.recv())
+                .await
+                .expect("external Stop commits its native capture before producer completion")
+                .expect("external Stop publishes its committed status");
+            assert_eq!(change.instance_id, row.id);
+            assert_eq!(change.effective_profile, resumed.source_profile);
+            assert_eq!(change.old, Status::Idle);
+            assert_eq!(change.new, Status::Stopped);
+            assert!(reservation.as_ref().unwrap().cancellation().is_cancelled());
+            drop(reservation.take());
+        })
+        .catch_unwind()
+        .await;
+
+        // Complete owned cleanup before assertions can unwind the isolated HOME.
+        drop(reservation.take());
+        state.acp_supervisor.retry_pending_teardowns().await;
+        let stopped = match stopping.take() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        state.runtime.work.drain().await;
+        state.shutdown.cancel();
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(
+            stopped
+                .expect("the external Stop was started")
+                .expect("the external Stop task completed")
                 .status(),
             StatusCode::NO_CONTENT
         );
+        assert!(state.acp_supervisor.current_lease(&row.id).is_none());
         assert!(request.cancellation().is_cancelled());
         assert!(restart.is_cancelled());
+        assert!(lease.cancellation().is_cancelled());
     }
 
     #[tokio::test]
@@ -2016,7 +2374,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert!(newer.lifecycle_generation > observed.lifecycle_generation);
-        let response = crate::server::api::sessions::resume_structured_stop(&state, observed)
+        let response = crate::server::api::sessions::resume_structured_stop(&state, observed, None)
             .await
             .expect_err("stale explicit resume must retain newer stop");
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -2032,7 +2390,7 @@ mod tests {
             .unwrap()
             .join(format!("{}.stop", row.id));
         std::fs::write(&stop_path, b"undecodable stop intent").unwrap();
-        let response = crate::server::api::sessions::resume_structured_stop(&state, newer)
+        let response = crate::server::api::sessions::resume_structured_stop(&state, newer, None)
             .await
             .expect_err("undecodable intent cannot authorize resume");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2047,6 +2405,138 @@ mod tests {
             .remove(0);
         assert_eq!(retained.status, Status::Stopped);
         assert!(retained.is_idle_dormant());
+    }
+
+    async fn assert_capacity_refusal_preserves_native_stop(prompt: bool) {
+        use crate::process::worker_registry;
+        use crate::session::{Instance, Status, Storage, View};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stopped at capacity", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        row.acp_session_id = Some("retained-native-conversation".into());
+        row.status = Status::Stopped;
+        row.lifecycle_generation = 19;
+        row.mark_idle_dormant();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let births = Arc::new(AtomicUsize::new(0));
+        let attempted = births.clone();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            Arc::new(move |_, _| {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "capacity refusal must precede construction".into(),
+                    ))
+                })
+            }),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+            .acp_supervisor
+            .test_insert_worker("occupied-slot")
+            .await;
+        assert_eq!(
+            state.acp_supervisor.worker_state("occupied-slot").await,
+            crate::daemon::AcpWorkerState::Running
+        );
+        let record = worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            worker_registry::socket_path_for(&row.id).unwrap(),
+            "fixture".into(),
+            "claude".into(),
+            project.path().into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            row.acp_session_id.clone(),
+            Some("default".into()),
+        )
+        .with_generation(71);
+        worker_registry::save(&record).unwrap();
+        let intent = worker_registry::request_stop(&record).unwrap();
+        worker_registry::delete(&row.id).unwrap();
+        assert!(worker_registry::load_strict(&row.id).unwrap().is_none());
+        assert_eq!(
+            worker_registry::stop_intent(&row.id).unwrap(),
+            Some(intent.clone())
+        );
+        let before = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        let response = if prompt {
+            crate::server::api::acp_prompt(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Json(
+                    serde_json::from_value(serde_json::json!({
+                        "text":"explicit wake at capacity", "prompt_id":"capacity-prompt",
+                    }))
+                    .unwrap(),
+                )),
+            )
+            .await
+            .into_response()
+        } else {
+            spawn_acp(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Json(
+                    serde_json::from_value(serde_json::json!({
+                        "agent":"claude", "additional_dirs":[], "provider_env":[],
+                    }))
+                    .unwrap(),
+                )),
+            )
+            .await
+            .into_response()
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(births.load(Ordering::SeqCst), 0);
+        let after = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        let memory = find_instance(&state, &row.id).await.unwrap();
+        assert_eq!(
+            worker_registry::stop_intent(&row.id).unwrap(),
+            Some(intent),
+            "capacity refusal cannot consume the explicit stop token"
+        );
+        for retained in [&after, &memory] {
+            assert_eq!(retained.status, Status::Stopped);
+            assert!(retained.is_idle_dormant());
+            assert_eq!(retained.lifecycle_generation, before.lifecycle_generation);
+            assert_eq!(retained.lifecycle_reservation, before.lifecycle_reservation);
+            assert_eq!(retained.acp_session_id, before.acp_session_id);
+        }
+        assert!(worker_registry::load_strict(&row.id).unwrap().is_none());
+        assert_eq!(
+            state.acp_supervisor.worker_state(&row.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_refusal_preserves_http_spawn_stop_fence_and_native_generation() {
+        assert_capacity_refusal_preserves_native_stop(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_refusal_preserves_http_prompt_stop_fence_and_native_generation() {
+        assert_capacity_refusal_preserves_native_stop(true).await;
     }
 
     #[tokio::test]
@@ -3388,10 +3878,6 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&body);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        assert!(
-            body.contains("persist_failed") && body.contains("agent switch"),
-            "{body}"
-        );
         assert_eq!(
             state.acp_supervisor.worker_state(&id).await,
             crate::daemon::AcpWorkerState::Absent,

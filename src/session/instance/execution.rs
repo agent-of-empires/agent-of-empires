@@ -2934,6 +2934,12 @@ impl ConversationState {
         ]
     }
 
+    pub(crate) fn same_checkpoint(&self, other: &Self) -> bool {
+        self == other
+            && Self::checkpoint_routes(&self.binding, &self.resume_binding, &self.active)
+                == Self::checkpoint_routes(&other.binding, &other.resume_binding, &other.active)
+    }
+
     pub(crate) fn matches_checkpoint(&self, row: &Instance) -> bool {
         self.matches(row)
             && Self::checkpoint_routes(&self.binding, &self.resume_binding, &self.active)

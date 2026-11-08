@@ -469,18 +469,14 @@ impl Session {
                     }
                     Ok(new_id)
                 }
-                Err(e) => {
-                    let rejection = (e.origin
-                        == crate::acp::control_protocol::HandshakeFailureOrigin::NativeResponse)
-                        .then(|| {
-                            self.control.as_ref().map(|control| {
-                                std::sync::Arc::new(crate::acp::state::NativeForkRejection {
-                                    owner: control.peer_identity(),
-                                    parent: parent.clone(),
-                                })
-                            })
-                        })
-                        .flatten();
+                Err(mut e) => {
+                    let rejection = if e.origin
+                        == crate::acp::control_protocol::HandshakeFailureOrigin::NativeResponse
+                    {
+                        e.fork_rejection.take()
+                    } else {
+                        None
+                    };
                     warn!(
                         target: "acp.protocol",
                         session = %label,
@@ -488,6 +484,20 @@ impl Session {
                         "session/fork failed; failing spawn (no session/new fallback): {e}"
                     );
                     if let Some(rejection) = rejection {
+                        #[cfg(test)]
+                        {
+                            let gate = self
+                                .shared
+                                .connection_state
+                                .fork_emit_gate
+                                .lock()
+                                .unwrap()
+                                .take();
+                            if let Some((entered, release)) = gate {
+                                let _ = entered.send(());
+                                let _ = release.await;
+                            }
+                        }
                         self.shared
                             .emit(Event::SessionContextReset {
                                 reason: format!(
@@ -497,6 +507,17 @@ impl Session {
                                 fork_rejection: Some(rejection),
                             })
                             .await;
+                        #[cfg(test)]
+                        if let Some(emitted) = self
+                            .shared
+                            .connection_state
+                            .fork_emitted
+                            .lock()
+                            .unwrap()
+                            .take()
+                        {
+                            let _ = emitted.send(());
+                        }
                     }
                     Err(e.into())
                 }

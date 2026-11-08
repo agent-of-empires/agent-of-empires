@@ -27,6 +27,8 @@ pub enum AcpError {
     Transport(String),
     #[error("runner attach handshake timed out")]
     AttachTimedOut,
+    #[error("worker registry admission busy")]
+    RegistryBusy,
     #[error("protocol violation: {0}")]
     Protocol(String),
     #[error("agent process exited unexpectedly")]

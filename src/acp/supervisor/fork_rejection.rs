@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use super::{BroadcastSink, Lease, LifecycleTable, Supervisor, SupervisorError};
+use super::{lock_recover, BroadcastSink, Lease, LifecycleTable, Supervisor, SupervisorError};
 use crate::acp::state::{
     NativeEventContext, NativeForkRejection, NativeObservationScope, NativeObservationWait,
 };
@@ -57,7 +57,8 @@ impl ForkCustody {
         proof: &Arc<NativeForkRejection>,
     ) -> Option<Arc<QualifiedForkRejection>> {
         let seed = self.seed.as_ref()?;
-        if proof.owner.birth_fingerprint.is_none()
+        if lease.is_borrowed_attach()
+            || proof.owner.birth_fingerprint.is_none()
             || lease.spawned_runner() != Some(proof.owner)
             || proof.parent != seed.parent
         {
@@ -73,6 +74,8 @@ impl ForkCustody {
             producer: lease.producer_id(),
             settlement: AtomicU8::new(0),
             settled: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            drain_observer: std::sync::Mutex::new(None),
         });
         self.receipt = Some(receipt.clone());
         Some(receipt)
@@ -90,6 +93,8 @@ pub(crate) struct QualifiedForkRejection {
     producer: uuid::Uuid,
     settlement: AtomicU8,
     settled: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) drain_observer: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl std::fmt::Debug for QualifiedForkRejection {
@@ -101,6 +106,10 @@ impl std::fmt::Debug for QualifiedForkRejection {
 }
 
 impl QualifiedForkRejection {
+    pub(super) fn pending(&self) -> bool {
+        self.settlement.load(Ordering::Acquire) == 0
+    }
+
     fn finish(&self, committed: bool) {
         let _ = self.settlement.compare_exchange(
             0,
@@ -187,7 +196,7 @@ pub(super) async fn prepare_fork_seed(
     Ok(())
 }
 
-fn try_checkpoint(
+pub(super) fn try_checkpoint(
     lifecycle: &Arc<std::sync::Mutex<LifecycleTable>>,
     lease: &Lease,
     receipt: &QualifiedForkRejection,
@@ -337,16 +346,15 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     pub(crate) async fn settle_fork_rejections(&self) {
         let pending: Vec<_> = {
-            let workers = self.workers.lock().await;
-            workers
-                .values()
-                .filter_map(|handle| {
-                    handle
-                        .lease
+            lock_recover(&self.lifecycle)
+                .owned_leases()
+                .into_iter()
+                .filter_map(|lease| {
+                    lease
                         .retirement()
                         .fork_rejection()
-                        .filter(|receipt| receipt.settlement.load(Ordering::Acquire) == 0)
-                        .map(|receipt| (handle.lease.clone(), receipt))
+                        .filter(|receipt| receipt.pending())
+                        .map(|receipt| (lease, receipt))
                 })
                 .collect()
         };
@@ -367,6 +375,47 @@ mod tests {
     use crate::session::{
         ConversationBinding, ConversationProvenance, ExecutionBinding, SessionStore,
     };
+
+    async fn seeded_fork(
+        project: &std::path::Path,
+    ) -> (
+        Arc<crate::server::AppState>,
+        Instance,
+        Arc<crate::server::session_store::NativeSessionStore>,
+        NativeObservationScope,
+    ) {
+        let mut row = Instance::new("original fork", project.to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.fork_pending = Some("original-parent".into());
+        row.import_pending = Some(true);
+        row.resume_binding = Some(ConversationBinding {
+            session_id: "original-parent".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![project.join("native")],
+                configuration: Vec::new(),
+                cwd: project.into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: Some(true),
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
+            state.clone(),
+            &row,
+            (),
+        )
+        .await
+        .unwrap();
+        let scope = NativeObservationScope::capture(&row, store.storage()).unwrap();
+        (state, row, store, scope)
+    }
 
     /// Producer correlation has its own runner test. This boundary starts with
     /// an already captured private receipt, then lets its real original child
@@ -403,39 +452,7 @@ mod tests {
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let project = tempfile::TempDir::new().unwrap();
-            let mut row = Instance::new("original fork", project.path().to_str().unwrap());
-            row.source_profile = "default".into();
-            row.view = crate::session::View::Structured;
-            row.fork_pending = Some("original-parent".into());
-            row.import_pending = Some(true);
-            row.resume_binding = Some(ConversationBinding {
-                session_id: "original-parent".into(),
-                execution: Some(ExecutionBinding {
-                    agent: "claude".into(),
-                    stores: vec![project.path().join("native")],
-                    configuration: Vec::new(),
-                    cwd: project.path().into(),
-                    cwd_filesystem: "host".into(),
-                    filesystem: "host".into(),
-                    exported_default_store: Some(true),
-                }),
-                provenance: ConversationProvenance::Observed,
-                transcript_path: None,
-            });
-            crate::server::test_support::seed_instances_on_disk_for_test(
-                "default",
-                vec![row.clone()],
-            );
-            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
-                state.clone(),
-                &row,
-                (),
-            )
-            .await
-            .unwrap();
-            let scope = NativeObservationScope::capture(&row, store.storage()).unwrap();
+            let (state, row, store, scope) = seeded_fork(project.path()).await;
             let lifecycle = Arc::new(std::sync::Mutex::new(LifecycleTable::new(1)));
             let lease = lifecycle
                 .lock()
@@ -633,5 +650,490 @@ mod tests {
             }
             state.shutdown.cancel();
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn original_wire_fork_failure_survives_transfer_without_acknowledging_other_debt() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::runner_lifecycle::{AdmitError, ProcessControl};
+        use crate::acp::supervisor::WorkerKind;
+        use std::time::Duration;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Reply {
+            Native,
+            Local,
+            Unanswered,
+        }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Journal {
+            None,
+            BeforeFork,
+            AfterFork,
+        }
+
+        for (reply, journal, supersede, buffered) in [
+            (Reply::Native, Journal::None, false, false),
+            (Reply::Native, Journal::None, false, true),
+            (Reply::Native, Journal::None, true, false),
+            (Reply::Native, Journal::BeforeFork, false, false),
+            (Reply::Native, Journal::AfterFork, false, false),
+            (Reply::Local, Journal::None, false, false),
+            (Reply::Unanswered, Journal::None, false, false),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::TempDir::new().unwrap();
+            let (state, row, store, scope) = seeded_fork(project.path()).await;
+            let supervisor = &state.acp_supervisor;
+            let lease = supervisor
+                .lifecycle
+                .lock()
+                .unwrap()
+                .admit(&row.id, ResumeKind::SpawnFirst)
+                .unwrap();
+            lease.set_admission(Some(LaunchAdmission {
+                store: store.clone(),
+                generation: row.lifecycle_generation,
+                namespace: None,
+                native_scope: Some(scope),
+            }));
+            prepare_fork_seed(&lease, Some("original-parent"))
+                .await
+                .unwrap();
+            let mut runner = HeldAttachRunner::rejected_fork(
+                &row.id,
+                project.path(),
+                901,
+                reply != Reply::Local,
+            )
+            .await;
+            runner.record.scope = crate::process::worker_registry::ScopeOwnership::Unscoped;
+            crate::process::worker_registry::save(&runner.record).unwrap();
+            assert!(lease.record_runner(runner.identity));
+            lease.record_scope(runner.record.scope.clone());
+            lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+            let mut client =
+                AcpClient::original_fork_for_test(&runner.record, &row, "original-parent").await;
+            // Native-result delivery stays buffered in the original receiver
+            // across transfer, rather than being replayed through a new channel.
+            let mut original_inbound = client.take_inbound().unwrap();
+            let original_client = Arc::new(client);
+            supervisor
+                .lifecycle
+                .lock()
+                .unwrap()
+                .install(&lease, Some(runner.identity))
+                .unwrap();
+            supervisor.workers.lock().await.insert(
+                row.id.clone(),
+                crate::acp::supervisor::WorkerHandle {
+                    client: original_client.clone(),
+                    native_session_id: None,
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: Vec::new(),
+                    kind: WorkerKind::Attached,
+                    launch_epoch: lease.epoch(),
+                    lease: lease.clone(),
+                },
+            );
+            let request = tokio::time::timeout(Duration::from_secs(10), runner.next_prompt())
+                .await
+                .unwrap();
+            assert_eq!(request["sessionId"], "original-parent");
+            let mut emit_observer = (reply == Reply::Native)
+                .then(|| original_client.original_fork_emit_for_test(!buffered));
+            let original_proof = if reply != Reply::Unanswered {
+                runner.complete_turn();
+                if reply == Reply::Native {
+                    let (observed, _) = emit_observer.as_mut().unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), observed)
+                        .await
+                        .expect("original fork reached its selected emission boundary")
+                        .unwrap();
+                    Some(
+                        original_client
+                            .captured_fork_response_for_test()
+                            .expect("reader captured the exact original response before emission"),
+                    )
+                } else {
+                    // Wait for the actual SDK diagnostic, not a manufactured
+                    // receipt for a local/native-I/O failure.
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = original_inbound
+                                .recv()
+                                .await
+                                .expect("real SDK startup failure");
+                            if matches!(event, crate::acp::state::Event::AgentStartupError { .. }) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(original_client.captured_fork_response_for_test().is_none());
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut target = supervisor.capture_retirement(&row.id).unwrap();
+            if journal != Journal::None {
+                target.claim_journal_ack();
+            }
+            let (locked, acquired) = tokio::sync::oneshot::channel();
+            let (release, unlocked) = std::sync::mpsc::channel();
+            let locked_store = store.clone();
+            let id = row.id.clone();
+            let holder = tokio::task::spawn_blocking(move || {
+                let guard = locked_store
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&id)
+                    .unwrap();
+                locked.send(()).unwrap();
+                if let Ok(Some(supersede)) = unlocked.recv() {
+                    locked_store
+                        .commit(&mut |rows, _| {
+                            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                            if supersede {
+                                row.fork_pending = Some("replacement-parent".into());
+                            } else {
+                                row.title = "controller checkpoint committed first".into();
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                drop(guard);
+            });
+            acquired.await.unwrap();
+
+            if reply == Reply::Unanswered {
+                // A live peer held before any response must not make shutdown
+                // wait for an impossible negative result.
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    supervisor.shutdown_captured_and_wait(&row.id, &target, Duration::from_secs(5)),
+                )
+                .await
+                .expect("no response-dependent retirement wait")
+                .unwrap();
+            } else {
+                runner.exit_peer();
+                crate::process::worker_registry::retire_selected(&runner.record).unwrap();
+                if journal == Journal::None {
+                    tokio::time::timeout(Duration::from_secs(5), supervisor.reap_user_stopped())
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        supervisor.shutdown_captured_and_wait(
+                            &row.id,
+                            &target,
+                            Duration::from_secs(5),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                }
+            }
+            assert!(!supervisor.workers.lock().await.contains_key(&row.id));
+            assert!(
+                !crate::acp::runner_lifecycle::SystemProcessControl::default()
+                    .is_alive(runner.identity)
+            );
+            if let Some(original_proof) = &original_proof {
+                let captured = lease
+                    .retirement()
+                    .fork_rejection()
+                    .expect("original reply retained");
+                assert!(
+                    Arc::ptr_eq(original_proof, &captured.proof),
+                    "one original proof"
+                );
+                assert_eq!(
+                    supervisor
+                        .lifecycle
+                        .lock()
+                        .unwrap()
+                        .admit(&row.id, ResumeKind::SpawnFirst)
+                        .unwrap_err(),
+                    AdmitError::TeardownPending
+                );
+                assert!(
+                    supervisor.acknowledge_retirement(&target).is_err(),
+                    "even a controller ACK cannot discard the pending original response"
+                );
+            } else {
+                assert!(lease.retirement().fork_rejection().is_none());
+            }
+            if buffered {
+                // The exact original SDK receiver is first driven after the
+                // real reaper has removed its worker and cleared its client.
+                let (drained, observed) = tokio::sync::oneshot::channel();
+                *lease
+                    .retirement()
+                    .fork_rejection()
+                    .unwrap()
+                    .drain_observer
+                    .lock()
+                    .unwrap() = Some(drained);
+                supervisor.start_retiring_drain(
+                    row.id.clone(),
+                    lease.clone(),
+                    original_inbound,
+                    None,
+                );
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crate::acp::supervisor::teardown::settle_retained_drain(&lease, false),
+                )
+                .await
+                .expect("late original drain reaches its natural EOF");
+                tokio::time::timeout(Duration::from_secs(5), observed)
+                    .await
+                    .expect("buffered original typed rejection is received after handle transfer")
+                    .unwrap();
+            }
+            let rejection = lease.retirement().fork_rejection();
+            release
+                .send(if journal == Journal::BeforeFork || supersede {
+                    Some(supersede)
+                } else {
+                    None
+                })
+                .unwrap();
+            holder.await.unwrap();
+
+            if journal == Journal::BeforeFork {
+                assert!(supervisor.acknowledge_retirement(&target).is_err());
+            }
+            supervisor.settle_fork_rejections().await;
+            if let Some(receipt) = rejection {
+                // Buffered replay's joined drain has already started this proof's driver.
+                tokio::time::timeout(Duration::from_secs(5), receipt.wait())
+                    .await
+                    .unwrap_or_else(|_| panic!(
+                        "fork checkpoint unfinished: reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered} state={}",
+                        receipt.settlement.load(Ordering::Acquire),
+                    ));
+                assert_eq!(
+                    receipt.committed(),
+                    !supersede,
+                    "reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered}",
+                );
+            }
+            crate::server::acp_events::commit_background_bindings(&state).await;
+            if journal != Journal::None {
+                let captured = target.clone();
+                let owner = Arc::clone(supervisor);
+                let native = store.clone();
+                let id = row.id.clone();
+                let takeover = tokio::task::spawn_blocking(move || {
+                    let _native = native
+                        .storage()
+                        .acquire_instance_lifecycle_lock(&id)
+                        .unwrap();
+                    owner.register_delegated_binding_retirement(&captured, None)
+                })
+                .await
+                .unwrap();
+                assert!(
+                    matches!(takeover, Err(SupervisorError::TeardownPending(_))),
+                    "a restart checkpoint cannot take a journal's existing ACK"
+                );
+                crate::server::acp_events::commit_background_bindings(&state).await;
+                assert_eq!(
+                    supervisor
+                        .lifecycle
+                        .lock()
+                        .unwrap()
+                        .admit(&row.id, ResumeKind::SpawnFirst)
+                        .unwrap_err(),
+                    AdmitError::TeardownPending,
+                    "fork completion cannot acknowledge a controller-owned journal"
+                );
+                if journal == Journal::AfterFork {
+                    let native = store.clone();
+                    let id = row.id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        native.commit(&mut |rows, _| {
+                            rows.iter_mut().find(|row| row.id == id).unwrap().title =
+                                "controller checkpoint committed after fork".into();
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                }
+                supervisor.acknowledge_retirement(&target).unwrap();
+            }
+            let disk = tokio::task::spawn_blocking(move || store.storage().load())
+                .await
+                .unwrap()
+                .unwrap();
+            let disk = disk.iter().find(|item| item.id == row.id).unwrap();
+            let expected_parent = if supersede {
+                Some("replacement-parent")
+            } else if reply == Reply::Native {
+                None
+            } else {
+                Some("original-parent")
+            };
+            assert_eq!(
+                disk.fork_pending.as_deref(),
+                expected_parent,
+                "reply={reply:?} journal={journal:?} supersede={supersede} buffered={buffered}"
+            );
+            assert_eq!(
+                disk.import_pending,
+                if reply == Reply::Native && !supersede {
+                    None
+                } else {
+                    Some(true)
+                }
+            );
+            assert_eq!(disk.acp_session_id, row.acp_session_id);
+            assert_eq!(disk.resume_binding, row.resume_binding);
+            assert_eq!(
+                disk.resume_binding
+                    .as_ref()
+                    .unwrap()
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .exported_default_store,
+                Some(true)
+            );
+            assert!(
+                supervisor
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .admit(&row.id, ResumeKind::SpawnFirst)
+                    .is_ok(),
+                "fork-only commit/supersession and both controller ACK orders release admission"
+            );
+            state.shutdown.cancel();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rejected_fork_seed_before_birth_has_no_response_retirement_debt() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::TempDir::new().unwrap();
+        let (state, row, store, scope) = seeded_fork(project.path()).await;
+        let supervisor = &state.acp_supervisor;
+        let reservation = supervisor
+            .reserve_spawn(
+                &row.id,
+                ResumeKind::SpawnFirst,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .unwrap();
+        let lease = reservation.lease().clone();
+        lease.set_admission(Some(LaunchAdmission {
+            store: store.clone(),
+            generation: row.lifecycle_generation,
+            namespace: None,
+            native_scope: Some(scope),
+        }));
+        assert!(matches!(
+            prepare_fork_seed(&lease, Some("unselected-parent")).await,
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+        drop(reservation);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            supervisor.shutdown_and_wait(&row.id, Duration::from_secs(5)),
+        )
+        .await
+        .expect("no original request exists to wait for")
+        .unwrap();
+        assert!(crate::process::worker_registry::load_strict(&row.id)
+            .unwrap()
+            .is_none());
+        let disk = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .unwrap()
+            .unwrap();
+        let disk = disk.iter().find(|value| value.id == row.id).unwrap();
+        assert_eq!(disk.fork_pending, row.fork_pending);
+        assert_eq!(disk.import_pending, row.import_pending);
+        assert_eq!(disk.resume_binding, row.resume_binding);
+        assert!(supervisor
+            .lifecycle
+            .lock()
+            .unwrap()
+            .admit(&row.id, ResumeKind::SpawnFirst)
+            .is_ok());
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn borrowed_observer_cannot_consume_fork_seed_or_gain_retirement_authority() {
+        use crate::acp::runner_lifecycle::ProcessControl;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::TempDir::new().unwrap();
+        let (state, row, store, scope) = seeded_fork(project.path()).await;
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(&row.id, ResumeKind::Attach).unwrap();
+        lease.set_admission(Some(LaunchAdmission {
+            store: store.clone(),
+            generation: row.lifecycle_generation,
+            namespace: None,
+            native_scope: Some(scope),
+        }));
+        prepare_fork_seed(&lease, Some("original-parent"))
+            .await
+            .unwrap();
+        let runner = HeldAttachRunner::ready(
+            &row.id,
+            project.path(),
+            902,
+            Some("default"),
+            Some("original-parent"),
+        )
+        .await;
+        assert!(lease.record_runner(runner.identity));
+        assert!(lease.is_borrowed_attach());
+        let mut weak = runner.identity;
+        weak.birth_fingerprint = None;
+        for owner in [runner.identity, weak] {
+            assert!(lease
+                .retirement()
+                .receive_fork_rejection(
+                    &lease,
+                    &Arc::new(NativeForkRejection {
+                        owner,
+                        parent: "original-parent".into()
+                    })
+                )
+                .is_none());
+        }
+        assert!(table.abandon(&lease));
+        assert!(
+            crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(runner.identity),
+            "releasing an observer must preserve its original healthy peer"
+        );
+        let disk = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .unwrap()
+            .unwrap();
+        let disk = disk.iter().find(|value| value.id == row.id).unwrap();
+        assert_eq!(disk.fork_pending, row.fork_pending);
+        assert_eq!(disk.import_pending, row.import_pending);
+        assert_eq!(disk.resume_binding, row.resume_binding);
+        assert!(table.admit(&row.id, ResumeKind::Attach).is_ok());
+        state.shutdown.cancel();
     }
 }
