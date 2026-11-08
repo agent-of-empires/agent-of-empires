@@ -58,6 +58,17 @@ fn serve_url_parts(url: &str) -> Result<(u16, String), String> {
     Ok((port, token))
 }
 
+fn loopback_serve_endpoint(h: &TuiTestHarness) -> Result<(u16, String), String> {
+    let raw = std::fs::read_to_string(app_dir_in(h.home_path()).join("serve.url"))
+        .map_err(|error| error.to_string())?;
+    let url = raw
+        .lines()
+        .map(|line| line.split_once('\t').map_or(line, |(_, url)| url).trim())
+        .find(|url| url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:"))
+        .ok_or("successor loopback URL not published")?;
+    serve_url_parts(url)
+}
+
 /// Ask the running daemon whether it still requires the passphrase gate.
 fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
     let url = format!("http://127.0.0.1:{port}/api/login/status?token={token}");
@@ -87,8 +98,7 @@ fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
-    let url = primary_serve_url(h).expect("successor URL");
-    let (port, token) = serve_url_parts(&url).expect("successor endpoint");
+    let (port, token) = loopback_serve_endpoint(h).expect("successor endpoint");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let response = reqwest::Client::builder()
@@ -4230,7 +4240,11 @@ exit 0
             );
         }
         let started = h.run_cli(&[
+            "--profile",
+            "default",
             "serve",
+            "--auth",
+            "token",
             "--remote",
             "--daemon",
             "--port",
@@ -4269,26 +4283,43 @@ exit 0
         h.wait_for("Press G again for a new passphrase.");
         h.send_keys_unfenced("G");
         if replacement_succeeds {
-            let running = wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
-                let successor = daemon_pid(&h).ok_or("replacement PID not published")?;
-                let running = std::fs::read_to_string(app.join("serve.passphrase"))
-                    .map_err(|error| error.to_string())?;
-                if successor != predecessor && pid_alive(successor as i32) && running != original {
-                    Ok(running)
-                } else {
-                    Err("replacement has not published its credential".to_owned())
-                }
-            });
+            let (successor, running) =
+                wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
+                    let successor = daemon_pid(&h).ok_or("replacement PID not published")?;
+                    let running = std::fs::read_to_string(app.join("serve.passphrase"))
+                        .map_err(|error| error.to_string())?;
+                    if successor != predecessor
+                        && pid_alive(successor as i32)
+                        && !running.trim().is_empty()
+                        && running != original
+                    {
+                        let (port, token) = loopback_serve_endpoint(&h)?;
+                        if !login_status_required(port, &token)? {
+                            return Err("successor passphrase gate is not ready".to_owned());
+                        }
+                        Ok((successor, running))
+                    } else {
+                        Err("replacement has not published its credential".to_owned())
+                    }
+                });
             if reconnect_fails {
                 h.wait_for("Serve failed");
                 assert!(!app.join("profiles/client-only").exists());
                 assert!(h.home_path().join("hidden-profile").is_dir());
-                assert!(pid_alive(daemon_pid(&h).unwrap() as i32));
+                assert_eq!(
+                    daemon_pid(&h),
+                    Some(successor),
+                    "ready successor disappeared after reconnect failure; screen:\n{}\nlog:\n{}",
+                    h.capture_screen(),
+                    std::fs::read_to_string(app.join("debug.log")).unwrap_or_default(),
+                );
+                assert!(pid_alive(successor as i32));
             } else {
                 h.wait_for(&running);
                 h.wait_for("R: restart");
             }
             assert_eq!(std::fs::read_to_string(&saved).unwrap(), running);
+            assert_original_passphrase_login(&h, &running);
         } else {
             h.wait_for("Serve failed");
             h.run_cli_err(&["serve", "--status"]);
