@@ -56,7 +56,7 @@ afterEach(() => {
 });
 
 describe("AssistantMessage nonterminal native tool output", () => {
-  it("renders streamed output after a correlated local failure without inventing a terminal", () => {
+  it("renders streamed output after a correlated local failure without inventing a terminal", async () => {
     const at = "2026-05-12T00:00:00Z";
     const rows: ActivityRow[] = [
       { id: "prompt", kind: "user_prompt", text: "run", at },
@@ -77,17 +77,37 @@ describe("AssistantMessage nonterminal native tool output", () => {
       },
     ];
     const messages = activityToThreadMessages(rows, false);
-    const parts = messages.flatMap((message) => typeof message.content === "string" ? [] : message.content);
+    const parts = messages.flatMap((message) => (typeof message.content === "string" ? [] : message.content));
     const tool = parts.find((part) => part.type === "tool-call");
     expect(tool).toBeDefined();
     expect(tool && "result" in tool ? tool.result : undefined).toBeUndefined();
-    const { container } = render(<Harness messages={messages} />);
+    const { container, rerender } = render(<Harness messages={messages} />);
     fireEvent.click(screen.getByRole("button", { name: /printf streaming/ }));
     expect(screen.getByText("partial native output")).toBeTruthy();
     expect(container.textContent).toContain("running");
     expect(screen.queryByText("done")).toBeNull();
     expect(screen.queryByText("stopped")).toBeNull();
     expect(screen.queryByText("failed")).toBeNull();
+    rerender(
+      <Harness
+        messages={activityToThreadMessages(
+          [
+            ...rows,
+            {
+              id: "done-native-tool",
+              kind: "tool_complete",
+              text: "native final output",
+              at,
+              toolCallId: "native-tool",
+            },
+          ],
+          false,
+        )}
+      />,
+    );
+    await waitFor(() => expect(container.textContent).toContain("native final output"));
+    expect(screen.queryByText("partial native output")).toBeNull();
+    expect(screen.getByText("done")).toBeTruthy();
   });
 });
 
