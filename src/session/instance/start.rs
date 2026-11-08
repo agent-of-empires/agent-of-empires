@@ -1011,12 +1011,18 @@ impl Instance {
             .pane
             .as_ref()
             .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-        let (state, _, current_pid) = crate::tmux::utils::probe_owned_pane(
+        let crate::tmux::utils::OwnedPaneProbe {
+            state,
+            pane_pid: current_pid,
+            exclusive,
+            ..
+        } = crate::tmux::utils::probe_owned_pane(
             &probe.tmux_session,
             pane,
             &crate::tmux::TmuxCommandDeadline::new(),
         )?
         .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+        anyhow::ensure!(exclusive, LaunchIndeterminateCause::OwnershipUnproven);
         anyhow::ensure!(
             matches!(
                 state,

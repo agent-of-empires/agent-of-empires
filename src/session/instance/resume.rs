@@ -207,7 +207,8 @@ impl NativeStartAdmission {
                 crate::tmux::utils::probe_owned_pane(&self.tmux_session, pane, &deadline)
                     .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?,
                 Some(crate::tmux::utils::OwnedPaneProbe {
-                    state: crate::tmux::utils::PaneProbe::Dead | crate::tmux::utils::PaneProbe::Missing,
+                    state: crate::tmux::utils::PaneProbe::Dead
+                        | crate::tmux::utils::PaneProbe::Missing,
                     exclusive: true,
                     ..
                 })

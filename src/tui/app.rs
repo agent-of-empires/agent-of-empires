@@ -2992,7 +2992,6 @@ impl App {
                     }
                 }
             }
-
         }
 
         self.prepare_native_attachment(session_id, crate::tui::home::panes::NativePane::Agent);

@@ -56,9 +56,7 @@ struct PassiveNativeAuthority {
 }
 
 /// Passive input has the same native custody prerequisites as real preview input.
-fn passive_env_with_cursor(
-    cursor: crate::tmux::PaneCursor,
-) -> PreviewFixture {
+fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> PreviewFixture {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;
@@ -436,10 +434,14 @@ fn preview_mouse_gestures_never_retarget_after_a_rejected_press() {
 fn queued_preview_input_cannot_inherit_a_regranted_native_capability() {
     require_tmux!();
     let (env, _native_driver) = passive_env_with_cursor(alt_screen_cursor(true, true, true));
-    let lease = env.view.session_feed.preview_input_lease(
-        env.view.selected_session.as_deref().unwrap(),
-        env.view.preview_capture_target.as_deref().unwrap(),
-    ).unwrap();
+    let lease = env
+        .view
+        .session_feed
+        .preview_input_lease(
+            env.view.selected_session.as_deref().unwrap(),
+            env.view.preview_capture_target.as_deref().unwrap(),
+        )
+        .unwrap();
     env.view.session_feed.set_native_permission_for_test(false);
     env.view.session_feed.set_native_permission_for_test(true);
     assert!(env.view.session_feed.native_interaction_available());

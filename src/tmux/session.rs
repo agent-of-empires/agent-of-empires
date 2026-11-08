@@ -1179,7 +1179,10 @@ impl Session {
                         physical,
                         &crate::tmux::TmuxCommandDeadline::new(),
                     )?,
-                    Some((super::utils::PaneProbe::Alive, _, _))
+                    Some(super::utils::OwnedPaneProbe {
+                        state: super::utils::PaneProbe::Alive,
+                        ..
+                    })
                 ),
                 "Native attachment target is no longer physically available"
             );

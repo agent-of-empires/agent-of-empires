@@ -2735,7 +2735,10 @@ impl VtChannel {
         if seed_result != VtRefreshResult::Refreshed
             || !matches!(
                 super::utils::probe_owned_pane(name, &physical, deadline),
-                Ok(Some((crate::tmux::utils::PaneProbe::Alive, _, _)))
+                Ok(Some(super::utils::OwnedPaneProbe {
+                    state: crate::tmux::utils::PaneProbe::Alive,
+                    ..
+                }))
             )
         {
             tracing::warn!(

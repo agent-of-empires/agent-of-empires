@@ -820,25 +820,28 @@ async fn run_queued_command(
     );
     let expected = if allowed {
         request.native.as_ref().and_then(|native| {
-            native.preparation.as_ref().map(|preparation| preparation.identity.clone())
+            native
+                .preparation
+                .as_ref()
+                .map(|preparation| preparation.identity.clone())
         })
     } else {
         None
     };
-    let result = if !allowed {
-        Err(CommandFailure::Rejected(
-            "Request not submitted: runtime permission changed or continuation was cancelled"
-                .into(),
-        ))
-    } else {
-        match request.request {
-            CommandRequest::Create(_) => unreachable!(),
-            CommandRequest::Namespace(mutation) => run_namespace(client, mutation, epoch)
-                .await
-                .map(CommandReply::Namespace),
-            CommandRequest::Session { id, request } => match request {
-                SessionRequest::SmartRename => {
-                    client
+    let result =
+        if !allowed {
+            Err(CommandFailure::Rejected(
+                "Request not submitted: runtime permission changed or continuation was cancelled"
+                    .into(),
+            ))
+        } else {
+            match request.request {
+                CommandRequest::Create(_) => unreachable!(),
+                CommandRequest::Namespace(mutation) => run_namespace(client, mutation, epoch)
+                    .await
+                    .map(CommandReply::Namespace),
+                CommandRequest::Session { id, request } => match request {
+                    SessionRequest::SmartRename => client
                         .smart_rename_session(&id, epoch)
                         .await
                         .map(|receipt| {
@@ -846,110 +849,114 @@ async fn run_queued_command(
                                 cursor: receipt.cursor,
                                 outcome: (),
                             })
-                        })
-                }
-                SessionRequest::Trash(body) => client
-                    .trash_session(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::Trash),
-                SessionRequest::Purge(body) => client
-                    .purge_session(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::Purge),
-                SessionRequest::Restore => client
-                    .restore_session(&id, epoch)
-                    .await
-                    .map(CommandReply::Restore),
-                SessionRequest::Rename(body) => client
-                    .rename_session(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::Rename),
-                SessionRequest::SetWorktreeName(body) => client
-                    .set_worktree_name(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::WorktreeName),
-                SessionRequest::AttachProject(body) => client
-                    .attach_session_project(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::AttachProject),
-                SessionRequest::Mutation(SessionMutation::Restart(body)) => client
-                    .restart_session(&id, &body, epoch)
-                    .await
-                    .map(CommandReply::Restart),
-                SessionRequest::Mutation(mutation) => client
-                    .mutate_session(&id, &mutation, epoch)
-                    .await
-                    .map(CommandReply::Mutation),
-                SessionRequest::EnsureAuxiliary {
-                    target,
-                    size,
-                    adoption,
-                } => {
-                    let receipt = match target {
-                        AuxiliaryTarget::Host { index } => {
-                            client
-                                .ensure_terminal(&id, index, &StartSessionBody { expected, size }, epoch)
-                                .await
-                        }
-                        AuxiliaryTarget::Container { index } => {
-                            client
-                                .ensure_container_terminal(
-                                    &id,
-                                    index,
-                                    &StartSessionBody { expected, size },
-                                    epoch,
-                                )
-                                .await
-                        }
-                        AuxiliaryTarget::Tool { tool_name } => {
-                            client
-                                .ensure_tool(
-                                    &id,
-                                    &EnsureToolBody {
-                                        expected,
-                                        tool_name,
-                                        size,
-                                        adoption,
-                                    },
-                                    epoch,
-                                )
-                                .await
-                        }
-                    };
-                    receipt.map(CommandReply::Terminal)
-                }
-                SessionRequest::EnsureAgent { size } => client
-                    .ensure_agent(&id, &StartSessionBody { expected, size }, epoch)
-                    .await
-                    .map(CommandReply::Terminal),
-                SessionRequest::CancelCreation => client
-                    .cancel_creation(&id, epoch)
-                    .await
-                    .map(CommandReply::Mutation),
-            },
-        }
-        .or_else(|error| match error {
-            error @ crate::daemon::DaemonClientError::Committed { .. } => {
-                let message = error.to_string();
-                let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
-                    unreachable!();
-                };
-                let failure = if matches!(
-                    code,
-                    crate::daemon::ApiErrorCode::PurgeFailed
-                        | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
-                        | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
-                        | crate::daemon::ApiErrorCode::SandboxMigrationFailed
-                ) {
-                    CommandFailure::Rejected(message)
-                } else {
-                    CommandFailure::Unknown(message)
-                };
-                Ok(CommandReply::CommittedFailure { cursor, failure })
+                        }),
+                    SessionRequest::Trash(body) => client
+                        .trash_session(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::Trash),
+                    SessionRequest::Purge(body) => client
+                        .purge_session(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::Purge),
+                    SessionRequest::Restore => client
+                        .restore_session(&id, epoch)
+                        .await
+                        .map(CommandReply::Restore),
+                    SessionRequest::Rename(body) => client
+                        .rename_session(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::Rename),
+                    SessionRequest::SetWorktreeName(body) => client
+                        .set_worktree_name(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::WorktreeName),
+                    SessionRequest::AttachProject(body) => client
+                        .attach_session_project(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::AttachProject),
+                    SessionRequest::Mutation(SessionMutation::Restart(body)) => client
+                        .restart_session(&id, &body, epoch)
+                        .await
+                        .map(CommandReply::Restart),
+                    SessionRequest::Mutation(mutation) => client
+                        .mutate_session(&id, &mutation, epoch)
+                        .await
+                        .map(CommandReply::Mutation),
+                    SessionRequest::EnsureAuxiliary {
+                        target,
+                        size,
+                        adoption,
+                    } => {
+                        let receipt = match target {
+                            AuxiliaryTarget::Host { index } => {
+                                client
+                                    .ensure_terminal(
+                                        &id,
+                                        index,
+                                        &StartSessionBody { expected, size },
+                                        epoch,
+                                    )
+                                    .await
+                            }
+                            AuxiliaryTarget::Container { index } => {
+                                client
+                                    .ensure_container_terminal(
+                                        &id,
+                                        index,
+                                        &StartSessionBody { expected, size },
+                                        epoch,
+                                    )
+                                    .await
+                            }
+                            AuxiliaryTarget::Tool { tool_name } => {
+                                client
+                                    .ensure_tool(
+                                        &id,
+                                        &EnsureToolBody {
+                                            expected,
+                                            tool_name,
+                                            size,
+                                            adoption,
+                                        },
+                                        epoch,
+                                    )
+                                    .await
+                            }
+                        };
+                        receipt.map(CommandReply::Terminal)
+                    }
+                    SessionRequest::EnsureAgent { size } => client
+                        .ensure_agent(&id, &StartSessionBody { expected, size }, epoch)
+                        .await
+                        .map(CommandReply::Terminal),
+                    SessionRequest::CancelCreation => client
+                        .cancel_creation(&id, epoch)
+                        .await
+                        .map(CommandReply::Mutation),
+                },
             }
-            error => Err(CommandFailure::submitted(error)),
-        })
-    };
+            .or_else(|error| match error {
+                error @ crate::daemon::DaemonClientError::Committed { .. } => {
+                    let message = error.to_string();
+                    let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
+                        unreachable!();
+                    };
+                    let failure = if matches!(
+                        code,
+                        crate::daemon::ApiErrorCode::PurgeFailed
+                            | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
+                            | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                            | crate::daemon::ApiErrorCode::SandboxMigrationFailed
+                    ) {
+                        CommandFailure::Rejected(message)
+                    } else {
+                        CommandFailure::Unknown(message)
+                    };
+                    Ok(CommandReply::CommittedFailure { cursor, failure })
+                }
+                error => Err(CommandFailure::submitted(error)),
+            })
+        };
     let _ = request.result.send(result);
 }
 
@@ -4260,15 +4267,47 @@ mod tests {
     async fn agent_ensure_failures_preserve_refusal_quarantine_and_commit_fences() {
         use axum::response::IntoResponse;
         for (ensure_status, committed_revision, code) in [
-            (axum::http::StatusCode::FORBIDDEN, None, "managed_resume_refused"),
-            (axum::http::StatusCode::CONFLICT, None, "managed_resume_refused"),
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, None, "managed_resume_refused"),
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                "managed_resume_refused",
+            ),
             (axum::http::StatusCode::OK, None, "managed_resume_refused"),
-            (axum::http::StatusCode::CONFLICT, Some("1"), "managed_resume_refused"),
-            (axum::http::StatusCode::CONFLICT, Some("2"), "managed_resume_refused"),
-            (axum::http::StatusCode::CONFLICT, Some("3"), "managed_resume_refused"),
-            (axum::http::StatusCode::CONFLICT, Some("3"), "sandbox_migration_deferred"),
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Some("3"), "sandbox_migration_failed"),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("1"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("2"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "sandbox_migration_deferred",
+            ),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Some("3"),
+                "sandbox_migration_failed",
+            ),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let app = axum::Router::new().route(
@@ -4282,10 +4321,7 @@ mod tests {
                                 return (
                                     ensure_status,
                                     [
-                                        (
-                                            crate::daemon::ERROR_CODE_HEADER,
-                                            code,
-                                        ),
+                                        (crate::daemon::ERROR_CODE_HEADER, code),
                                         (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
                                         (crate::daemon::RUNTIME_REVISION_HEADER, revision),
                                     ],

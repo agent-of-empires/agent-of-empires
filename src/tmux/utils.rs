@@ -399,7 +399,8 @@ pub(crate) fn observe_pane(
         .ok_or_else(|| anyhow::anyhow!("malformed tmux socket field"))?;
     let mut parts = suffix.splitn(7, '|');
     let fields: [Option<&str>; 7] = std::array::from_fn(|_| parts.next());
-    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(current_command), Some(start_command)] = fields
+    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(current_command), Some(start_command)] =
+        fields
     else {
         bail!("malformed physical pane observation");
     };

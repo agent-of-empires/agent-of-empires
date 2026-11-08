@@ -263,7 +263,8 @@ impl Instance {
         }
         let generation = self.lifecycle_generation;
         // Sends permit resume regardless of the automatic restart setting.
-        let outcome = match self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow) {
+        let outcome = match self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Some(cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
