@@ -84,7 +84,8 @@ potentially incomplete file data; when adding macOS-specific code or tests
 outside its covered paths, extend its sensitive-file list. To force a run, add
 `ci-macos` and re-run the `macOS gate` job.
 
-Releases are staged weekly. Maintainer instructions live in
+Releases ship from a release-plz PR, with daily nightlies of `main`.
+Maintainer instructions live in
 [docs/development/releases.md](docs/development/releases.md).
 
 Merge rules and area owners are in [MAINTAINERS.md](MAINTAINERS.md).

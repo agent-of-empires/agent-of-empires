@@ -256,6 +256,7 @@ id = "nolabel"
     assert_eq!(m.status[1].label, "");
 
     assert!(m.host_compat("0.11.0").is_ok());
+    assert!(m.host_compat("0.11.1-nightly.20261108").is_ok());
     let err = m.host_compat("0.13.0").unwrap_err();
     assert!(
         err.contains("plugin requires aoe") && err.contains("0.13.0"),

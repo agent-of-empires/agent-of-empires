@@ -22,15 +22,26 @@ fn github_api_base() -> String {
 }
 
 pub fn release_page_url(version: &str) -> String {
-    let tag = if version.starts_with('v') {
-        version.to_string()
-    } else {
-        format!("v{}", version)
-    };
     format!(
         "https://github.com/agent-of-empires/agent-of-empires/releases/tag/{}",
-        tag
+        release_tag(version)
     )
+}
+
+const NIGHTLY_TAG_PREFIX: &str = "nightly-";
+
+/// Nightly builds are versioned `X.Y.Z-nightly.YYYYMMDD` and tagged `nightly-YYYYMMDD`,
+/// outside `v*` so release tooling never mistakes one for a stable release.
+pub fn release_tag(version: &str) -> String {
+    let version = version.trim_start_matches('v');
+    match version.split_once("-nightly.") {
+        Some((_, date)) => format!("{NIGHTLY_TAG_PREFIX}{date}"),
+        None => format!("v{version}"),
+    }
+}
+
+fn is_nightly(version: &str) -> bool {
+    version.contains("-nightly.")
 }
 
 #[derive(Debug, Clone)]
@@ -112,8 +123,9 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 
             // The user upgraded past the cached latest, so the cache is stale.
             let current_is_newer = is_newer_version(current_version, &cache.latest_version);
+            let same_channel = is_nightly(&cache.latest_version) == is_nightly(current_version);
 
-            if age < max_age && !current_is_newer {
+            if age < max_age && !current_is_newer && same_channel {
                 tracing::debug!(
                     target: "update.cache",
                     age_hours = age.num_hours(),
@@ -142,7 +154,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         timeout: std::time::Duration::from_secs(5),
     })?;
 
-    let releases = match fetch_releases(&client).await {
+    let releases = match fetch_releases(&client, current_version).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(target: "update.fetch", "Failed to fetch releases: {e}");
@@ -155,7 +167,8 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         .map(|r| r.version.clone())
         .unwrap_or_default();
 
-    if latest_version.is_empty() {
+    // `releases/latest` never returns a prerelease, so it cannot stand in for a nightly.
+    if latest_version.is_empty() && !is_nightly(current_version) {
         let release = client.latest_release(GITHUB_OWNER, GITHUB_REPO).await?;
         let release_info = release_info_from(release);
         let version = release_info.version.clone();
@@ -202,14 +215,44 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 }
 
 #[tracing::instrument(target = "update.fetch", skip_all)]
-async fn fetch_releases(client: &crate::github::GitHubClient) -> Result<Vec<ReleaseInfo>> {
+async fn fetch_releases(
+    client: &crate::github::GitHubClient,
+    current_version: &str,
+) -> Result<Vec<ReleaseInfo>> {
     let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 20).await?;
-    Ok(releases.into_iter().map(release_info_from).collect())
+    Ok(channel_releases(releases, current_version))
+}
+
+/// Stable builds only see stable releases, nightly builds only nightlies.
+fn channel_releases(
+    releases: Vec<crate::github::GitHubRelease>,
+    current_version: &str,
+) -> Vec<ReleaseInfo> {
+    let nightly = is_nightly(current_version);
+    releases
+        .into_iter()
+        .filter(|r| {
+            !r.draft
+                && r.prerelease == nightly
+                && r.tag_name.starts_with(NIGHTLY_TAG_PREFIX) == nightly
+        })
+        .map(release_info_from)
+        .collect()
 }
 
 fn release_info_from(release: crate::github::GitHubRelease) -> ReleaseInfo {
+    // A nightly tag only carries its date, so the version comes from the release name.
+    let version = if release.tag_name.starts_with(NIGHTLY_TAG_PREFIX) {
+        release
+            .name
+            .as_deref()
+            .and_then(|name| name.split_whitespace().last())
+            .unwrap_or_default()
+    } else {
+        release.tag_name.as_str()
+    };
     ReleaseInfo {
-        version: release.tag_name.trim_start_matches('v').to_string(),
+        version: version.trim_start_matches('v').to_string(),
         body: release.body.unwrap_or_default(),
         published_at: release.published_at,
     }
@@ -235,43 +278,30 @@ fn filter_releases(releases: Vec<ReleaseInfo>, from_version: Option<&str>) -> Ve
 }
 
 pub(crate) fn is_newer_version(latest: &str, current: &str) -> bool {
-    let latest_parts = version_parts(latest);
-    let current_parts = version_parts(current);
-
-    for i in 0..latest_parts.len().max(current_parts.len()) {
-        let l = latest_parts.get(i).copied().unwrap_or(0);
-        let c = current_parts.get(i).copied().unwrap_or(0);
-        if l > c {
-            return true;
-        }
-        if l < c {
-            return false;
-        }
+    match (parse_version(latest), parse_version(current)) {
+        (Some(latest), Some(current)) => latest.cmp_precedence(&current).is_gt(),
+        _ => false,
     }
-    false
 }
 
-fn version_parts(v: &str) -> Vec<u32> {
-    v.split('.').filter_map(|s| s.parse().ok()).collect()
+fn parse_version(v: &str) -> Option<semver::Version> {
+    semver::Version::parse(v.trim().trim_start_matches('v')).ok()
 }
 
 /// An empty or unparsable latest is `Unknown`, never `Current`.
 fn classify_update_status(current: &str, cached_latest: Option<&str>) -> UpdateStatus {
-    let Some(latest) = cached_latest.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(latest) = cached_latest.and_then(parse_version) else {
         return UpdateStatus::Unknown;
     };
-    let latest_parts = version_parts(latest);
-    if latest_parts.is_empty() {
+    let Some(current) = parse_version(current) else {
         return UpdateStatus::Unknown;
-    }
-    if !is_newer_version(latest, current) {
+    };
+    if latest.cmp_precedence(&current).is_le() {
         return UpdateStatus::Current;
     }
-    let current_parts = version_parts(current);
-    let part = |parts: &[u32], i: usize| parts.get(i).copied().unwrap_or(0);
-    if part(&latest_parts, 0) > part(&current_parts, 0) {
+    if latest.major > current.major {
         UpdateStatus::MajorBehind
-    } else if part(&latest_parts, 1) > part(&current_parts, 1) {
+    } else if latest.minor > current.minor {
         UpdateStatus::MinorBehind
     } else {
         UpdateStatus::PatchBehind
@@ -284,12 +314,9 @@ fn classify_releases_behind(
     cached_latest: Option<&str>,
     releases: &[ReleaseInfo],
 ) -> ReleasesBehind {
-    let Some(latest) = cached_latest.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(latest) = cached_latest.filter(|v| parse_version(v).is_some()) else {
         return ReleasesBehind::Unknown;
     };
-    if version_parts(latest).is_empty() {
-        return ReleasesBehind::Unknown;
-    }
     if !is_newer_version(latest, current) {
         return ReleasesBehind::Current;
     }
@@ -353,12 +380,73 @@ mod tests {
             ("0.4.5", "0.4.5", false),
             ("1.0.0", "1.0.1", false),
             ("0.4.0", "0.4.5", false),
+            ("1.22.2-nightly.20261108", "1.22.1", true),
+            ("1.22.2-nightly.20261109", "1.22.2-nightly.20261108", true),
+            ("1.22.2", "1.22.2-nightly.20261108", true),
+            ("1.22.2-nightly.20261108", "1.22.2", false),
         ] {
             assert_eq!(
                 is_newer_version(candidate, baseline),
                 newer,
                 "{candidate} vs {baseline}"
             );
+        }
+    }
+
+    #[test]
+    fn nightly_versions_map_to_dated_tags() {
+        for (version, tag) in [
+            ("1.22.1", "v1.22.1"),
+            ("v1.22.1", "v1.22.1"),
+            ("1.22.2-nightly.20261108", "nightly-20261108"),
+        ] {
+            assert_eq!(release_tag(version), tag, "{version}");
+        }
+    }
+
+    #[test]
+    fn each_channel_only_sees_its_own_releases() {
+        let gh =
+            |tag: &str, name: &str, prerelease: bool, draft: bool| crate::github::GitHubRelease {
+                tag_name: tag.to_string(),
+                name: Some(name.to_string()),
+                body: None,
+                published_at: None,
+                draft,
+                prerelease,
+                assets: vec![],
+            };
+        let releases = || {
+            vec![
+                gh(
+                    "nightly-20261109",
+                    "Agent of Empires v1.22.2-nightly.20261109",
+                    true,
+                    false,
+                ),
+                gh("v1.22.1", "Agent of Empires v1.22.1", false, false),
+                gh(
+                    "nightly-20261108",
+                    "Agent of Empires v1.22.2-nightly.20261108",
+                    true,
+                    false,
+                ),
+                gh("v1.23.0-rc.1", "rc", true, false),
+                gh("v1.23.0", "draft", false, true),
+            ]
+        };
+        for (current, expected) in [
+            ("1.22.0", &["1.22.1"][..]),
+            (
+                "1.22.2-nightly.20261107",
+                &["1.22.2-nightly.20261109", "1.22.2-nightly.20261108"][..],
+            ),
+        ] {
+            let versions: Vec<String> = channel_releases(releases(), current)
+                .into_iter()
+                .map(|r| r.version)
+                .collect();
+            assert_eq!(versions, expected, "{current}");
         }
     }
 
@@ -404,6 +492,10 @@ mod tests {
         assert_eq!(classify_update_status("1.2.3", Some("1.2.4")), PatchBehind);
         assert_eq!(classify_update_status("1.2.3", Some("1.3.0")), MinorBehind);
         assert_eq!(classify_update_status("1.2.3", Some("2.0.0")), MajorBehind);
+        assert_eq!(
+            classify_update_status("1.2.3", Some("1.2.4-nightly.20261108")),
+            PatchBehind
+        );
 
         let releases = [
             make_release("1.3.0"),

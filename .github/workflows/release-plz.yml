@@ -1,0 +1,57 @@
+name: Release-plz
+
+# Keeps the release PR current and tags `vX.Y.Z` when it merges; release.yml takes it
+# from there. Config: release-plz.toml. RELEASE_TOKEN is required because pushes and PRs
+# made with GITHUB_TOKEN start no workflows (neither CI on the PR nor release.yml on the tag).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Tag release
+    if: github.repository == 'agent-of-empires/agent-of-empires'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Run release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  release-pr:
+    name: Update release PR
+    if: github.repository == 'agent-of-empires/agent-of-empires'
+    runs-on: ubuntu-latest
+    # Never cancel: a cancelled run can leave the release PR half-updated.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Run release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

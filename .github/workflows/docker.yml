@@ -10,6 +10,12 @@ on:
         description: 'Tag for the image (e.g., v0.1.0 or latest)'
         required: false
         default: 'latest'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag for the image (e.g., nightly)'
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -47,8 +53,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && '{{is_default_branch}}' || 'false' }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -95,8 +101,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && '{{is_default_branch}}' || 'false' }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0

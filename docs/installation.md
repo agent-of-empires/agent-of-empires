@@ -14,6 +14,35 @@ curl -fsSL \
 brew install aoe
 ```
 
+## Nightly Channel
+
+Nightly builds are daily prereleases of `main`, versioned like `1.22.2-nightly.20261108` and tagged `nightly-20261108`. The newest seven stay available. Use them to try changes before the next stable release and to report regressions early.
+
+```bash
+# Latest nightly
+curl -fsSL \
+  https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh \
+  | bash -s -- --channel nightly
+
+# A specific nightly or stable release, e.g. to step back a day
+curl -fsSL \
+  https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh \
+  | bash -s -- --version nightly-20261107
+```
+
+A nightly build's update check and `aoe update` only offer newer nightlies; reinstall with the script's default channel to return to stable.
+
+Moving to a nightly can be one-way until the next stable release. If a nightly includes a data migration, an older stable binary refuses to start against the migrated data and says so. Stepping back to an earlier nightly has the same limit. Back up your app directory first if you need a way back.
+
+Other install methods:
+
+- **Nix:** `nix run github:agent-of-empires/agent-of-empires/nightly-20261108`, or `/main` for the latest commit.
+- **Cargo:** `cargo install --locked --git https://github.com/agent-of-empires/agent-of-empires --tag nightly-20261108`.
+- **Homebrew:** no nightly formula yet; `brew install --HEAD aoe` builds the latest `main` from source.
+- **Sandbox images:** `ghcr.io/agent-of-empires/aoe-sandbox:nightly` and `aoe-dev-sandbox:nightly`.
+
+Nix, Cargo and Homebrew `--HEAD` builds report the stable version they build on, so their update check follows the stable channel.
+
 ## Build from Source
 
 ```bash

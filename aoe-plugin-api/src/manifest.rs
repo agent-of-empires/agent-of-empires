@@ -731,8 +731,10 @@ impl PluginManifest {
         };
         let req = semver::VersionReq::parse(req)
             .map_err(|e| format!("aoe_version {req:?} is not a valid semver requirement: {e}"))?;
-        let host_version = semver::Version::parse(host)
+        let mut host_version = semver::Version::parse(host)
             .map_err(|e| format!("host aoe version {host:?} is not valid semver: {e}"))?;
+        // A nightly host would otherwise fail every plain requirement such as `>=1.20`.
+        host_version.pre = semver::Prerelease::EMPTY;
         if req.matches(&host_version) {
             Ok(())
         } else {
