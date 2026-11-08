@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../lib/acpTypes";
@@ -481,23 +481,20 @@ describe("mid-turn cache recovery (#4530)", () => {
       },
       { wrapper: profileWrapper },
     );
-    await flushAsync();
-    expect(reads).toBe(2);
+    await waitFor(() => expect(reads).toBe(2), { timeout: 2000 });
     expect(result.current.state.activity).toEqual(rows);
     await act(async () => release());
-    await flushAsync();
+    await waitFor(() => expect(result.current.state.activity.at(-1)?.text).toBe("canonical reply"), { timeout: 2000 });
+    await waitFor(() => expect(sockets).toHaveLength(1), { timeout: 2000 });
     lastSocket().open();
     expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
-    expect(result.current.state.activity.at(-1)?.text).toBe("canonical reply");
     const firstSocket = lastSocket();
     act(() => result.current.manualReconnect());
-    await flushAsync();
+    await waitFor(() => expect(reads).toBe(4), { timeout: 2000 });
+    await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
     lastSocket().open();
     lastSocket().message({ kind: "transcript_snapshot", rows: [] });
-    await flushAsync();
     expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(sockets).toHaveLength(2);
-    expect(reads).toBe(4);
     expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
     expect(result.current.state.oldestSeq).toBe(1);
     expect(new URL(lastSocket().url).searchParams.get("since")).toBe("1200");
