@@ -12,13 +12,6 @@ use tracing::warn;
 
 use super::errors::AcpError;
 
-/// A fork needs both a requested parent and the agent's fork capability;
-/// otherwise the normal new/load handshake runs, which surfaces an unfulfilled
-/// fork as an empty session rather than corrupting the parent.
-pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
-    fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
-}
-
 /// `client_info` is mandatory: a strict backend rejects the empty strings that
 /// omitting it serializes to (#2767).
 pub(super) fn build_initialize_request() -> InitializeRequest {

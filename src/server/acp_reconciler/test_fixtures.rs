@@ -34,12 +34,10 @@ pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::Tem
 }
 
 pub(super) fn enable_auto_resume(enabled: bool) {
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::write(
-        app_dir.join("config.toml"),
-        format!("[acp]\nrate_limit_auto_resume = {enabled}\n"),
-    )
-    .expect("write config");
+    crate::session::config::update_config(|config| {
+        config.acp.rate_limit_auto_resume = enabled;
+    })
+    .expect("write isolated config");
 }
 
 pub(super) fn queued_prompt() -> crate::daemon::QueuedPromptEntry {
@@ -87,9 +85,9 @@ impl Tick {
 fn count_startup_errors(state: &AppState, id: &str, filter: impl Fn(&str) -> bool) -> usize {
     state
         .acp_event_store
-        .replay_from(id, 0)
+        .replay_from(id, 0).expect("read retained events")
         .into_iter()
-        .filter(|(_, e)| matches!(e, Event::AgentStartupError { message, .. } if filter(message)))
+        .filter(|stored| matches!(stored.event.as_ref(), Event::AgentStartupError { message, .. } if filter(message)))
         .count()
 }
 

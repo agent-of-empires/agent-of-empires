@@ -52,6 +52,10 @@ fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
 
+pub(super) fn control_state_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "control_state_unavailable").into_response()
+}
+
 /// `no_revive` refused: reviving (snoozed/idle-dormant wake, or a
 /// stopped worker) was required to accept this prompt and the caller asked
 /// not to. Distinct from `worker_not_ready`, which is transient and worth
@@ -144,6 +148,7 @@ pub async fn acp_prompt(
             SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
                 worker_not_ready()
             }
+            SendTurnError::ControlStateUnavailable => control_state_unavailable(),
             SendTurnError::RevivalRefused => no_revive_refused(),
             SendTurnError::Unavailable(unavailability)
             | SendTurnError::UnavailableAfterPublish(unavailability) => (
@@ -229,6 +234,11 @@ pub(crate) async fn submit_prompt(
             idle_dormant,
             resume_reservation,
         } => (idle_dormant, resume_reservation),
+        PromptTouch::Establishment(refusal) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::ResumeFailed(
+                refusal.into(),
+            )));
+        }
         PromptTouch::AdmissionRefused(response) => {
             return Err(PromptSubmitError::AdmissionRefused(response))
         }
@@ -239,6 +249,11 @@ pub(crate) async fn submit_prompt(
         }
         PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
         PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
+        PromptTouch::ControlStateUnavailable => {
+            return Err(PromptSubmitError::Turn(
+                SendTurnError::ControlStateUnavailable,
+            ))
+        }
         PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
@@ -279,7 +294,8 @@ pub(crate) async fn submit_prompt(
     let dispatch = state
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
-        .await;
+        .await
+        .map_err(|_| PromptSubmitError::Turn(SendTurnError::ControlStateUnavailable))?;
     if let PromptDispatch::Unavailable { unavailability } = dispatch {
         return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
             unavailability,
@@ -485,6 +501,9 @@ pub async fn acp_prompt_diff_comments(
             idle_dormant,
             resume_reservation,
         } => (idle_dormant, resume_reservation),
+        PromptTouch::Establishment(refusal) => {
+            return supervisor_error_response("prompt refused", &refusal.into());
+        }
         PromptTouch::AdmissionRefused(response) => return response,
         PromptTouch::Unavailable(unavailability) => {
             return (
@@ -495,6 +514,7 @@ pub async fn acp_prompt_diff_comments(
         }
         PromptTouch::RevivalRefused => return no_revive_refused(),
         PromptTouch::WorkerNotReady => return worker_not_ready(),
+        PromptTouch::ControlStateUnavailable => return control_state_unavailable(),
         PromptTouch::Blocked(blocked) => {
             return crate::server::api::start_blocked_response(blocked)
         }
@@ -503,6 +523,10 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .prompt_dispatch_under_submission(&id, "", woke_idle_dormant, false)
         .await;
+    let dispatch = match dispatch {
+        Ok(dispatch) => dispatch,
+        Err(_) => return control_state_unavailable(),
+    };
     if matches!(dispatch, PromptDispatch::Unavailable { .. }) {
         return (StatusCode::CONFLICT, Json(dispatch)).into_response();
     }
@@ -662,13 +686,33 @@ pub async fn resolve_approval(
     let nonce = Nonce(nonce_str.clone());
     // A dismissal must not go through option matching, which would send the
     // first reject option as the user's answer (#3741).
-    let outcome = match req.decision {
-        ApprovalDecisionWire::Cancelled => state.acp_supervisor.cancel_permission(&id, nonce).await,
-        decision => {
-            state
-                .acp_supervisor
-                .resolve_permission(&id, nonce, decision.into(), req.option_id)
-                .await
+    let outcome = if let Some(pending) = state
+        .session_service
+        .acp_control_cache
+        .original_responders(&id)
+    {
+        use crate::acp::acp_client::pending::{self, ApprovalResolutionMessage};
+        let message = match req.decision {
+            ApprovalDecisionWire::Cancelled => ApprovalResolutionMessage::Cancelled,
+            decision => ApprovalResolutionMessage::Decision {
+                decision: decision.into(),
+                option_id: req.option_id,
+            },
+        };
+        pending::resolve_approval(&pending, &nonce, message)
+            .await
+            .map_err(SupervisorError::Acp)
+    } else {
+        match req.decision {
+            ApprovalDecisionWire::Cancelled => {
+                state.acp_supervisor.cancel_permission(&id, nonce).await
+            }
+            decision => {
+                state
+                    .acp_supervisor
+                    .resolve_permission(&id, nonce, decision.into(), req.option_id)
+                    .await
+            }
         }
     };
     match outcome {
@@ -701,11 +745,21 @@ pub async fn resolve_elicitation(
         Err(rej) => return rej.into_response(),
     };
     let nonce = Nonce(nonce_str.clone());
-    match state
-        .acp_supervisor
-        .resolve_elicitation(&id, nonce, resolution)
-        .await
+    let outcome = if let Some(pending) = state
+        .session_service
+        .acp_control_cache
+        .original_responders(&id)
     {
+        crate::acp::acp_client::pending::resolve_elicitation(&pending, &nonce, resolution)
+            .await
+            .map_err(SupervisorError::Acp)
+    } else {
+        state
+            .acp_supervisor
+            .resolve_elicitation(&id, nonce, resolution)
+            .await
+    };
+    match outcome {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,

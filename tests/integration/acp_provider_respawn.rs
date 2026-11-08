@@ -13,11 +13,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
-use agent_of_empires::acp::agent_registry::AgentSpec;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::SpawnConfig;
+use crate::acp::agent_registry::AgentSpec;
+use crate::acp::state::Event;
 
-use crate::common::{shim_path, shim_ready, EnvGuard};
+use super::managed::{shim_path, shim_ready, ManagedScope};
 
 /// The flags `provider_override_env` produces, restated here because the
 /// crate does not export it. Its own table test covers the mapping; what this
@@ -54,7 +54,7 @@ fn spawn_config(
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: super::managed::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -88,10 +88,12 @@ fn spawn_config(
 
 /// The handshake is complete once a prompt round-trips, and the shim records
 /// its environment at startup, so the record is written by then.
-async fn run(config: SpawnConfig, label: &str) {
-    let mut client = AcpClient::spawn(config, AcpSessionId(label.into()))
+async fn run(scope: &mut ManagedScope, config: SpawnConfig, label: &str) {
+    let mut client = scope
+        .spawn(config, label)
         .await
         .unwrap_or_else(|e| panic!("{label}: spawn shim: {e}"));
+    client.ready().await;
     client
         .send_prompt("hello", &[])
         .await
@@ -129,48 +131,58 @@ fn pair(value: &str) -> Vec<(String, String)> {
 #[tokio::test]
 #[serial_test::serial]
 async fn provider_pick_reaches_the_adapter_on_load_and_new() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    // A profile with `inherit_host_environment` forwards the host's own
-    // routing flags, so the unpinned case would read whatever the developer's
-    // shell exports. Cleared here and restored on drop, which is why this test
-    // is serial.
-    let _env = EnvGuard::new(&["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
-    std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
-    std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-    // (pick, expected bedrock flag, expected vertex flag)
-    let picks = [
-        (Some("api"), Some(""), Some("")),
-        (Some("bedrock"), Some("1"), Some("")),
-        (Some("vertex"), Some(""), Some("1")),
-        (None, None, None),
-    ];
-    for load in [false, true] {
-        for (pick, bedrock, vertex) in picks {
-            let label = format!(
-                "{}-{}",
-                pick.unwrap_or("unpinned"),
-                if load { "load" } else { "new" }
-            );
-            let temp = tempfile::tempdir().expect("tempdir");
-            let record_path = temp.path().join("env.json");
-            run(spawn_config(&record_path, load, pick, vec![]), &label).await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            // A profile with `inherit_host_environment` forwards the host's own
+            // routing flags, so the unpinned case would read whatever the developer's
+            // shell exports. Cleared here and restored on drop, which is why this test
+            // is serial.
+            scope.save_environment(&["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
+            std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
+            std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+            // (pick, expected bedrock flag, expected vertex flag)
+            let picks = [
+                (Some("api"), Some(""), Some("")),
+                (Some("bedrock"), Some("1"), Some("")),
+                (Some("vertex"), Some(""), Some("1")),
+                (None, None, None),
+            ];
+            for load in [false, true] {
+                for (pick, bedrock, vertex) in picks {
+                    let label = format!(
+                        "{}-{}",
+                        pick.unwrap_or("unpinned"),
+                        if load { "load" } else { "new" }
+                    );
+                    let temp = scope.tempdir();
+                    let record_path = temp.path().join("env.json");
+                    run(
+                        scope,
+                        spawn_config(&record_path, load, pick, vec![]),
+                        &label,
+                    )
+                    .await;
 
-            let env = recorded(&record_path);
-            assert_eq!(
-                env["CLAUDE_CODE_USE_BEDROCK"].as_deref(),
-                bedrock,
-                "{label}: {env:?}"
-            );
-            assert_eq!(
-                env["CLAUDE_CODE_USE_VERTEX"].as_deref(),
-                vertex,
-                "{label}: {env:?}"
-            );
-        }
-    }
+                    let env = recorded(&record_path);
+                    assert_eq!(
+                        env["CLAUDE_CODE_USE_BEDROCK"].as_deref(),
+                        bedrock,
+                        "{label}: {env:?}"
+                    );
+                    assert_eq!(
+                        env["CLAUDE_CODE_USE_VERTEX"].as_deref(),
+                        vertex,
+                        "{label}: {env:?}"
+                    );
+                }
+            }
+        })
+    })
+    .await;
 }
 
 /// Trusted `Config.environment` is applied after the request's own env
@@ -178,33 +190,39 @@ async fn provider_pick_reaches_the_adapter_on_load_and_new() {
 /// beaten by an operator who pinned Vertex globally. The pick has to win, or a
 /// session can never be moved off whatever the config says.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn provider_pick_beats_configured_host_environment() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    // (pick, configured CLAUDE_CODE_USE_VERTEX, what the adapter must see)
-    let cases = [
-        (Some("api"), "1", ""),
-        (Some("vertex"), "", "1"),
-        (None, "1", "1"),
-    ];
-    for (pick, configured, expected) in cases {
-        let label = format!("{}-over-{configured:?}", pick.unwrap_or("unpinned"));
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("env.json");
-        run(
-            spawn_config(&record_path, false, pick, pair(configured)),
-            &label,
-        )
-        .await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            // (pick, configured CLAUDE_CODE_USE_VERTEX, what the adapter must see)
+            let cases = [
+                (Some("api"), "1", ""),
+                (Some("vertex"), "", "1"),
+                (None, "1", "1"),
+            ];
+            for (pick, configured, expected) in cases {
+                let label = format!("{}-over-{configured:?}", pick.unwrap_or("unpinned"));
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("env.json");
+                run(
+                    scope,
+                    spawn_config(&record_path, false, pick, pair(configured)),
+                    &label,
+                )
+                .await;
 
-        let env = recorded(&record_path);
-        assert_eq!(
-            env["CLAUDE_CODE_USE_VERTEX"].as_deref(),
-            Some(expected),
-            "{label}: {env:?}"
-        );
-    }
+                let env = recorded(&record_path);
+                assert_eq!(
+                    env["CLAUDE_CODE_USE_VERTEX"].as_deref(),
+                    Some(expected),
+                    "{label}: {env:?}"
+                );
+            }
+        })
+    })
+    .await;
 }

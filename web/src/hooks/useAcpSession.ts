@@ -5,6 +5,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, t
 import {
   emptyAcpState,
   nativeInputAvailable,
+  canDecideRequest,
   canSubmitPromptIntent,
   type AcpAttachment,
   type AcpState,
@@ -134,27 +135,29 @@ export function useAcpSession(
   const requireNativeInput = useCallback(
     (
       target?: NonNullable<AcpState["interactionError"]>["target"],
-      mode: "native" | "prompt_intent" | "authorized_snooze_wake" = "native",
+      mode: "native" | "decision" | "prompt_intent" | "authorized_snooze_wake" = "native",
     ): boolean => {
       const current = inputStateRef.current;
       const allowed =
-        mode === "native"
-          ? nativeInputAvailable(current)
-          : mode === "prompt_intent"
-            ? canSubmitPromptIntent(current)
-            : current.nativeSnapshotSeq != null && current.connectionUnavailable === null;
+        mode === "decision"
+          ? !!target && !archivedAtRef.current && canDecideRequest(current, target.nonce)
+          : mode === "native"
+            ? nativeInputAvailable(current)
+            : mode === "prompt_intent"
+              ? canSubmitPromptIntent(current)
+              : current.nativeSnapshotSeq != null && current.connectionUnavailable === null;
       if (connectionStatusRef.current === "open" && allowed) return true;
       dispatch({ kind: "error", message: NATIVE_INPUT_UNCONFIRMED, target });
       return false;
     },
-    [inputStateRef, connectionStatusRef],
+    [inputStateRef, connectionStatusRef, archivedAtRef],
   );
 
   // Reject failures so the card rolls back and the same nonce remains retryable.
   const resolveApproval = useCallback(
     async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
-      if (!requireNativeInput({ kind: "approval", nonce })) throw new Error(NATIVE_INPUT_UNCONFIRMED);
+      if (!requireNativeInput({ kind: "approval", nonce }, "decision")) throw new Error(NATIVE_INPUT_UNCONFIRMED);
       let res: Response;
       try {
         res = await fetch(
@@ -185,7 +188,7 @@ export function useAcpSession(
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;
-      if (!requireNativeInput({ kind: "elicitation", nonce })) throw new Error(NATIVE_INPUT_UNCONFIRMED);
+      if (!requireNativeInput({ kind: "elicitation", nonce }, "decision")) throw new Error(NATIVE_INPUT_UNCONFIRMED);
       let res: Response;
       try {
         res = await fetch(acpUrl(sessionId, `elicitations/${encodeURIComponent(nonce)}`), jsonPost(resolution));

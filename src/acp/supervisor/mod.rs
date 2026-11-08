@@ -3,7 +3,6 @@
 
 mod agents;
 mod drain;
-mod fork_rejection;
 mod launch;
 mod publish;
 mod requests;
@@ -13,6 +12,7 @@ mod teardown;
 pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,9 +34,7 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
-pub(crate) use teardown::{
-    NativeBindingCheckpoint, QualifiedBindingReceipt, RetirementResources, RetirementTarget,
-};
+pub(crate) use teardown::{NativeBindingCheckpoint, RetirementResources, RetirementTarget};
 
 pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
@@ -72,9 +70,15 @@ pub(crate) type Launcher = Arc<
 >;
 
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
-/// Per-session seq counter; outlives workers so every publisher shares one sequence.
-/// Each session's last allocated seq, under its own lock so sessions publish independently.
-type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>;
+pub(crate) use launch::LiveFreshProposal;
+/// Per-session publication order, retained across worker replacement.
+type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<SessionSequence>>>>;
+
+#[derive(Default)]
+struct SessionSequence {
+    seq: u64,
+    retired: bool,
+}
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
@@ -126,6 +130,10 @@ pub enum SupervisorError {
     SessionGone(String),
     #[error("native session authority unavailable")]
     NativeStoreUnavailable,
+    #[error("session control state could not be read")]
+    ControlStateUnavailable,
+    #[error(transparent)]
+    Establishment(#[from] crate::acp::establishment::EstablishmentRefusal),
     #[error("worker registry admission busy")]
     RegistryBusy,
 }
@@ -206,33 +214,9 @@ impl From<WorkerPhase> for AcpWorkerState {
     }
 }
 
-pub(crate) enum ResumeReservationOutcome {
-    Reserved(ResumeReservation),
-    /// The session is already running or mid-resume.
-    AlreadyPresent,
-}
-
 #[derive(Debug, Error)]
 #[error("native observation epoch is busy")]
 pub(crate) struct NativeObservationBusy;
-
-#[derive(Debug)]
-pub(crate) enum StartupFailure {
-    Retry,
-    ForkRejected(Arc<fork_rejection::QualifiedForkRejection>),
-}
-
-impl PartialEq for StartupFailure {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Retry, Self::Retry) => true,
-            (Self::ForkRejected(left), Self::ForkRejected(right)) => Arc::ptr_eq(left, right),
-            _ => false,
-        }
-    }
-}
-
-impl Eq for StartupFailure {}
 
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
@@ -264,8 +248,8 @@ pub struct Supervisor<S: BroadcastSink> {
     incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Sessions the reconciler must fresh-spawn next tick, bypassing its `attempted` guard.
     force_respawn: SharedSet,
-    /// Sessions whose worker failed before establishing a session.
-    startup_failures: Arc<std::sync::Mutex<HashMap<String, StartupFailure>>>,
+    /// Reconsider canonical admission next tick without resetting budgets or granting creation.
+    startup_requeues: SharedSet,
     /// Sessions whose isolated native identity is not durable yet.
     pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
@@ -301,23 +285,38 @@ impl ConstructionFinish {
 
 pub(crate) struct ConstructionInstallation {
     client: Arc<AcpClient>,
-    inbound: tokio::sync::mpsc::Receiver<crate::acp::state::Event>,
+    inbound: tokio::sync::mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
     identity: Option<RunnerIdentity>,
     finish: ConstructionFinish,
+    constructor: Option<crate::acp::runner_lifecycle::OriginalConstructionObligation>,
 }
 
 pub(crate) enum DeferredConstruction {
     Registration {
         connection: Box<crate::acp::acp_client::PendingRunnerConnection>,
         finish: Option<Box<ConstructionFinish>>,
+        constructor: Option<crate::acp::runner_lifecycle::OriginalConstructionObligation>,
     },
     Installation(Box<ConstructionInstallation>),
-    PostInstall(std::pin::Pin<Box<dyn std::future::Future<Output = Arc<AcpClient>> + Send>>),
+    PostInstall(
+        std::pin::Pin<Box<dyn Future<Output = Arc<AcpClient>> + Send>>,
+        Option<crate::acp::runner_lifecycle::OriginalConstructionObligation>,
+    ),
 }
 
 impl DeferredConstruction {
     fn complete(&self) -> bool {
         !matches!(self, Self::Registration { finish: None, .. })
+    }
+
+    fn take_constructor(
+        &mut self,
+    ) -> Option<crate::acp::runner_lifecycle::OriginalConstructionObligation> {
+        match self {
+            Self::Registration { constructor, .. } => constructor.take(),
+            Self::Installation(installation) => installation.constructor.take(),
+            Self::PostInstall(_, constructor) => constructor.take(),
+        }
     }
 }
 
@@ -326,6 +325,7 @@ impl DeferredConstruction {
 pub(crate) struct ResumeReservation {
     lease: Lease,
     pub(crate) expected_lifecycle_generation: Option<u64>,
+    pub(crate) establishment: Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
     attach_record: Option<Box<crate::process::worker_registry::WorkerRecord>>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
@@ -336,6 +336,7 @@ pub(crate) struct ResumeReservation {
     deferred: Option<DeferredConstruction>,
     deferred_claim: bool,
     deferred_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    constructor: Option<crate::acp::runner_lifecycle::OriginalConstructionObligation>,
 }
 
 impl std::fmt::Debug for ResumeReservation {
@@ -431,10 +432,6 @@ impl Drop for StopRequestGuard {
 impl StopRequestGuard {
     pub(crate) fn cancelled_target(&self) -> bool {
         self.cancelled_pending > 0 || self.cancelled_launch
-    }
-
-    pub(crate) fn cancelled_launch(&self) -> bool {
-        self.cancelled_launch
     }
 }
 
@@ -532,6 +529,10 @@ impl Drop for ResumeReservation {
             self.notify.notify_waiters();
             return;
         }
+        if lifecycle.finish_installed_construction(&self.lease) {
+            self.notify.notify_waiters();
+            return;
+        }
         if !lifecycle.construction_is_pending(&self.lease) {
             return;
         }
@@ -615,6 +616,7 @@ pub(crate) struct LaunchAdmission {
     pub generation: u64,
     pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
     pub native_scope: Option<crate::acp::state::NativeObservationScope>,
+    pub establishment: Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
 }
 
 impl std::fmt::Debug for LaunchAdmission {
@@ -656,7 +658,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             respawn_pending: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
-            startup_failures: Arc::default(),
+            startup_requeues: Arc::default(),
             pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
@@ -706,8 +708,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.force_respawn).drain().collect()
     }
 
-    pub(crate) fn take_startup_failures(&self) -> Vec<(String, StartupFailure)> {
-        lock_recover(&self.startup_failures).drain().collect()
+    pub(crate) fn take_startup_requeues(&self) -> Vec<String> {
+        lock_recover(&self.startup_requeues).drain().collect()
     }
 
     pub fn take_respawned_in_place(&self) -> Vec<String> {
@@ -751,12 +753,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).phase(session_id).into()
     }
 
-    /// Drop bookkeeping only after the matching runner retirement is proven.
+    /// Erase the retired session's journal before releasing its publication sequence.
     pub fn forget_session(&self, session_id: &str) -> Result<(), SupervisorError> {
         let mut lifecycle = lock_recover(&self.lifecycle);
         if lifecycle.phase(session_id) == WorkerPhase::Resuming {
-            // Keep the lease until its cancelled producer has retired any runner
-            // and scope it created; the launch path will settle this stop debt.
+            // Retain the cancelled producer until its runner and scope settle.
             let _ = lifecycle.begin_stop(session_id, "user_stopped", false);
             drop(lifecycle);
             self.worker_notify.notify_waiters();
@@ -766,22 +767,45 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.into()));
         }
         drop(lifecycle);
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.remove(session_id);
+        loop {
+            let sequence = sequence_slot(&self.next_seqs, session_id);
+            let mut current = lock_recover(&sequence);
+            if current.retired {
+                continue;
+            }
+            self.sink
+                .clear_session_events(session_id)
+                .map_err(|error| {
+                    warn!(target: "acp.supervisor", session = %session_id, %error,
+                    "could not clear the retired session journal");
+                    SupervisorError::NativeStoreUnavailable
+                })?;
+            current.retired = true;
+            let mut sequences = lock_recover(&self.next_seqs);
+            if sequences
+                .get(session_id)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &sequence))
+            {
+                sequences.remove(session_id);
+            }
+            break;
         }
-        lock_recover(&self.startup_failures).remove(session_id);
+        lock_recover(&self.startup_requeues).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
         Ok(())
     }
 
     /// Seed seq counters from the event store's stored maxima.
     pub fn hydrate_seqs(&self, pairs: impl IntoIterator<Item = (String, u64)>) {
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.extend(
-                pairs
-                    .into_iter()
-                    .map(|(id, seq)| (id, Arc::new(std::sync::Mutex::new(seq)))),
-            );
+        for (session_id, stored) in pairs {
+            let slot = {
+                let mut sequences = lock_recover(&self.next_seqs);
+                Arc::clone(sequences.entry(session_id).or_default())
+            };
+            let mut sequence = lock_recover(&slot);
+            if !sequence.retired {
+                sequence.seq = sequence.seq.max(stored);
+            }
         }
     }
 
@@ -792,13 +816,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) fn idle_observation(&self, session_id: &str) -> Option<(Lease, u64)> {
         let lifecycle = lock_recover(&self.lifecycle);
         let (lease, _) = lifecycle.running(session_id)?;
-        let activity = self
-            .next_seqs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
-            .copied()
-            .unwrap_or(0);
+        let sequence = lock_recover(&self.next_seqs).get(session_id).cloned();
+        let activity = sequence
+            .as_ref()
+            .map_or(0, |sequence| lock_recover(sequence).seq);
         Some((lease, activity))
     }
 
@@ -1059,28 +1080,42 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<u64>> {
-    Arc::clone(
-        lock_recover(next_seqs)
-            .entry(session_id.to_string())
-            .or_default(),
-    )
+fn sequence_slot(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<SessionSequence>> {
+    let mut sequences = lock_recover(next_seqs);
+    match sequences.get(session_id) {
+        Some(slot) => Arc::clone(slot),
+        None => {
+            let slot = Arc::new(std::sync::Mutex::new(SessionSequence::default()));
+            sequences.insert(session_id.to_owned(), Arc::clone(&slot));
+            slot
+        }
+    }
 }
 
-/// Allocate the session's next seq and publish with it under that session's
-/// counter lock, so subscribers receive each session's events in seq order.
-/// `publish` must not allocate a seq for the same session.
-fn publish_with_next_seq<R>(
+fn with_session_sequence<T>(
     next_seqs: &SeqMap,
     session_id: &str,
-    publish: impl FnOnce(u64) -> R,
-) -> R {
-    let counter = session_seq(next_seqs, session_id);
-    // A holder blocks on store I/O, so waiters and the holder both run off the async worker.
-    sink::blocking_io(|| {
-        let mut last = lock_recover(&counter);
-        *last = last.saturating_add(1);
-        publish(*last)
+    publish: impl FnOnce(&mut u64) -> T,
+) -> T {
+    // Both store I/O and waiters leave the async worker while publication is serialized.
+    sink::blocking_io(|| loop {
+        let slot = sequence_slot(next_seqs, session_id);
+        let mut sequence = lock_recover(&slot);
+        if sequence.retired {
+            continue;
+        }
+        return publish(&mut sequence.seq);
+    })
+}
+
+fn with_publication_seq<T>(
+    next_seqs: &SeqMap,
+    session_id: &str,
+    publish: impl FnOnce(u64) -> T,
+) -> T {
+    with_session_sequence(next_seqs, session_id, |current| {
+        *current = current.saturating_add(1);
+        publish(*current)
     })
 }
 

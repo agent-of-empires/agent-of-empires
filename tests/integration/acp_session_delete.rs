@@ -15,11 +15,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
-use agent_of_empires::acp::agent_registry::AgentSpec;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::SpawnConfig;
+use crate::acp::agent_registry::AgentSpec;
+use crate::acp::state::Event;
 
-use crate::common::{shim_path, shim_ready};
+use super::managed::{shim_path, shim_ready, ManagedClient};
 
 fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
@@ -29,7 +29,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: super::managed::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -64,9 +64,10 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
 /// the ACP session id assigned during the handshake so subsequent
 /// `delete_session` calls can target it.
 async fn drive_handshake_and_capture_session_id(
-    client: &mut AcpClient,
+    client: &mut ManagedClient,
     deadline: std::time::Instant,
 ) -> Option<String> {
+    client.ready().await;
     client
         .send_prompt("hello", &[])
         .await
@@ -95,63 +96,69 @@ async fn drive_handshake_and_capture_session_id(
 /// `ACP_SESSION_DELETE_TIMEOUT` plus a 500ms outer guard, so every call must
 /// return before the 3.4s bound.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn session_delete_outcome_follows_the_adapter() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let cases: [(&str, &[(&str, &str)], &str); 3] = [
-        ("advertised", &[("SHIM_DELETE_CAPABILITY", "1")], "Deleted"),
-        // Without the capability the SDK dispatcher returns -32601, the
-        // steady-state shape for aoe-agent, codex and opencode.
-        ("absent", &[], "UnsupportedMethod"),
-        (
-            "slow",
-            &[
-                ("SHIM_DELETE_CAPABILITY", "1"),
-                ("SHIM_DELETE_MODE", "slow"),
-            ],
-            "TimedOut",
-        ),
-    ];
-    for (case, shim_env, expected) in cases {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("delete-calls.log");
-        let mut env: Vec<(String, String)> = shim_env
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        env.push((
-            "SHIM_DELETE_RECORD_FILE".into(),
-            record_path.to_string_lossy().to_string(),
-        ));
-        let config = spawn_config_with_shim_env(shim_path(), env);
-        let mut client = AcpClient::spawn(config, AcpSessionId(format!("delete-{case}")))
-            .await
-            .expect("spawn shim");
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let cases: [(&str, &[(&str, &str)], &str); 3] = [
+                ("advertised", &[("SHIM_DELETE_CAPABILITY", "1")], "Deleted"),
+                // Without the capability the SDK dispatcher returns -32601, the
+                // steady-state shape for aoe-agent, codex and opencode.
+                ("absent", &[], "UnsupportedMethod"),
+                (
+                    "slow",
+                    &[
+                        ("SHIM_DELETE_CAPABILITY", "1"),
+                        ("SHIM_DELETE_MODE", "slow"),
+                    ],
+                    "TimedOut",
+                ),
+            ];
+            for (case, shim_env, expected) in cases {
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("delete-calls.log");
+                let mut env: Vec<(String, String)> = shim_env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                env.push((
+                    "SHIM_DELETE_RECORD_FILE".into(),
+                    record_path.to_string_lossy().to_string(),
+                ));
+                let config = spawn_config_with_shim_env(shim_path(), env);
+                let mut client = scope
+                    .spawn(config, format!("delete-{case}"))
+                    .await
+                    .expect("spawn shim");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let acp_id = drive_handshake_and_capture_session_id(&mut client, deadline)
-            .await
-            .expect("shim should assign an ACP session id during handshake");
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let acp_id = drive_handshake_and_capture_session_id(&mut client, deadline)
+                    .await
+                    .expect("shim should assign an ACP session id during handshake");
 
-        let started = std::time::Instant::now();
-        let outcome = client.delete_session(acp_id.clone()).await;
-        let elapsed = started.elapsed();
-        let _ = client.shutdown().await;
+                let started = std::time::Instant::now();
+                let outcome = client.delete_session(acp_id.clone()).await;
+                let elapsed = started.elapsed();
+                let _ = client.shutdown().await;
 
-        assert_eq!(format!("{outcome:?}"), expected, "{case}");
-        assert!(
-            elapsed < Duration::from_millis(3400),
-            "{case}: delete_session should bound the wait; took {elapsed:?}"
-        );
-        if expected == "Deleted" {
-            let recorded = std::fs::read_to_string(&record_path).expect("record file");
-            assert!(
-                recorded.lines().any(|line| line == acp_id),
-                "shim should record the deleted id {acp_id}: {recorded:?}"
-            );
-        }
-    }
+                assert_eq!(format!("{outcome:?}"), expected, "{case}");
+                assert!(
+                    elapsed < Duration::from_millis(3400),
+                    "{case}: delete_session should bound the wait; took {elapsed:?}"
+                );
+                if expected == "Deleted" {
+                    let recorded = std::fs::read_to_string(&record_path).expect("record file");
+                    assert!(
+                        recorded.lines().any(|line| line == acp_id),
+                        "shim should record the deleted id {acp_id}: {recorded:?}"
+                    );
+                }
+            }
+        })
+    })
+    .await;
 }

@@ -10,6 +10,7 @@ import {
   replayFrames,
   script,
   sessionIdByTitle,
+  spawnAcpAgent,
   startAcpSession,
   waitForReplayContains,
 } from "../../helpers/acp";
@@ -147,12 +148,11 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
         },
       },
     },
-    seedFn: seedSessionViaAoeAdd({ title: "story-native-binary" }),
   });
+  seedSessionViaAoeAdd({ title: "story-native-binary", structuredView: true })(serve);
   const sessionId = await sessionIdByTitle(serve.baseUrl, "story-native-binary");
-  // enableStructuredViewAndWait throws on the AgentStartupError this test wants.
-  const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
-  expect(enableRes.ok).toBe(true);
+  // Spawn without waiting for readiness so the startup error remains observable.
+  await spawnAcpAgent(serve.baseUrl, sessionId);
   const startupError = async () =>
     ((await replayFrames(serve.baseUrl, sessionId)) as { event?: { AgentStartupError?: { message?: string } } }[])
       .map((f) => f.event?.AgentStartupError?.message)
@@ -171,10 +171,8 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   const toggle = page.getByTestId("acp-agent-log-toggle");
   await expect(toggle).toBeVisible();
   await toggle.click();
-  // Any terminal state of the disclosure proves the log endpoint round-tripped.
   const body = page.getByTestId("acp-agent-log-body");
   await expect(body).toBeVisible({ timeout: 10_000 });
-  await expect(body).toHaveText(/Loading log|Could not load log|No log output yet|Log file exists but is empty|.+/);
   await page.getByTestId("acp-agent-log-refresh").click();
   await expect(body).toBeVisible({ timeout: 5_000 });
 });

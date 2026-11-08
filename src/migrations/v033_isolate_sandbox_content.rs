@@ -349,7 +349,7 @@ pub(crate) fn prepare_terminal_launch_context(
 }
 
 pub(crate) fn acknowledge_context_reset(
-    profile: &str,
+    storage: &crate::session::Storage,
     id: &str,
     view: NativeContextView,
     generation: u64,
@@ -359,7 +359,7 @@ pub(crate) fn acknowledge_context_reset(
     if slots.is_empty() {
         return Ok(());
     }
-    crate::session::Storage::new_unwatched(profile)?.update(|instances, _| {
+    storage.update(|instances, _| {
         let instance = instances
             .iter_mut()
             .find(|instance| instance.id == id)

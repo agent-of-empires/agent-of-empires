@@ -3,6 +3,8 @@
 mod connection;
 mod jsonrpc;
 mod shared;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use self::connection::{fanout_agent_stdout, handle_control_connection};
 use self::shared::RunnerShared;
@@ -106,6 +108,10 @@ pub struct AcpRunnerArgs {
     /// Native row generation authorized at physical birth; distinct from runner epoch.
     #[arg(long)]
     pub lifecycle_generation: Option<u64>,
+    #[arg(long)]
+    pub establishment_attempt: crate::acp::establishment::AttemptId,
+    #[arg(long)]
+    pub establishment_producer: uuid::Uuid,
     /// Exact transient unit created by this launch, absent for an unscoped runner.
     #[arg(long)]
     pub systemd_scope: Option<String>,
@@ -118,10 +124,10 @@ pub struct AcpRunnerArgs {
 
 fn native_registration_guard(
     args: &AcpRunnerArgs,
-) -> Result<Option<(crate::session::Storage, crate::session::StorageFlock)>> {
-    let Some(expected_generation) = args.lifecycle_generation else {
-        return Ok(None);
-    };
+) -> Result<(crate::session::Storage, crate::session::StorageFlock)> {
+    let expected_generation = args
+        .lifecycle_generation
+        .ok_or(crate::acp::establishment::EstablishmentRefusal::NoSelection)?;
     anyhow::ensure!(
         !args.source_profile.is_empty(),
         "native runner has no source profile"
@@ -134,6 +140,18 @@ fn native_registration_guard(
         .find(|row| row.id == args.session_id)
         .ok_or(crate::session::SessionGone)?;
     row.ensure_startable()?;
+    let Some(crate::acp::establishment::AcpEstablishment::Pending { attempt }) =
+        &row.acp_establishment
+    else {
+        anyhow::bail!(crate::acp::establishment::EstablishmentRefusal::Unresolved);
+    };
+    anyhow::ensure!(
+        attempt.id == args.establishment_attempt
+            && attempt.producer == Some(args.establishment_producer)
+            && attempt.allows_effects()
+            && attempt.matches_pending(&row, &storage)?,
+        crate::acp::establishment::EstablishmentRefusal::Superseded
+    );
     anyhow::ensure!(
         row.lifecycle_generation == expected_generation
             && row.is_structured()
@@ -143,7 +161,7 @@ fn native_registration_guard(
             && !row.is_idle_dormant(),
         crate::session::LifecycleReservationError::Superseded
     );
-    Ok(Some((storage, lifecycle)))
+    Ok((storage, lifecycle))
 }
 
 pub async fn run(args: AcpRunnerArgs) -> Result<()> {
@@ -240,6 +258,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     // Shared, never split: closing stdin makes aoe-agent exit.
     let agent_stdin = Arc::new(Mutex::new(agent_stdin));
+    #[cfg(test)]
+    let _ = test_support::managed_runner::OBSERVE_RUNNER
+        .try_with(|observer| observer.send((Arc::clone(&shared), Arc::clone(&agent_stdin))));
 
     let agent_stdout_task = tokio::spawn(fanout_agent_stdout(
         agent_stdout,
@@ -307,8 +328,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     {
         let lifetime = async {
             tokio::select! {
-                status = agent_child.wait() => {
+                (status, elapsed) = async {
+                    let status = agent_child.wait().await;
                     let elapsed = agent_started_at.elapsed();
+                    shared.wait_native_delivery().await;
+                    (status, elapsed)
+                } => {
                     match status {
                         Ok(s) if elapsed < FAST_EXIT_THRESHOLD => warn!(
                             target: "acp.runner",
@@ -538,7 +563,21 @@ async fn register_and_spawn_agent(
                 .context("registering runner ownership")?
         };
         match spawn_agent(args) {
-            Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
+            Ok((child, stdin, stdout, stderr)) => {
+                #[cfg(test)]
+                let mut child = child;
+                #[cfg(test)]
+                if let Err(error) =
+                    test_support::managed_runner::observe_native_spawn(args, record, &child)
+                {
+                    child
+                        .kill()
+                        .await
+                        .context("settling owned native after fixture birth observation failure")?;
+                    return Err(error);
+                }
+                Ok((listener, child, stdin, stdout, stderr))
+            }
             Err(error) => {
                 if let Err(delete_error) = worker_registry::delete(&args.session_id) {
                     warn!(target: "acp.runner", session = %args.session_id, error = %delete_error, "failed to delete worker record");
@@ -731,7 +770,11 @@ mod tests {
         row.view = View::Structured;
         row.status = Status::Running;
         row.lifecycle_generation = 5;
+        row.acp_session_id = Some("registration-native".into());
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let storage = Storage::open_unwatched("default").unwrap();
+        let producer = uuid::Uuid::new_v4();
+        let attempt = super::test_support::arm_selected(&storage, &row.id, producer, None);
         let mut args = AcpRunnerArgs {
             socket: worker_registry::socket_path_for(&row.id).unwrap(),
             session_id: row.id.clone(),
@@ -741,10 +784,12 @@ mod tests {
             model: None,
             additional_dirs: Vec::new(),
             provider_env_keys: Vec::new(),
-            stored_acp_session_id: None,
+            stored_acp_session_id: row.acp_session_id.clone(),
             source_profile: "default".into(),
             generation: 97,
             lifecycle_generation: Some(5),
+            establishment_attempt: attempt.id,
+            establishment_producer: producer,
             systemd_scope: None,
             prime_runtime: None,
             agent_argv: vec![
@@ -763,14 +808,14 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
-            None,
+            row.acp_session_id.clone(),
             Some("default".into()),
         )
         .with_generation(args.generation);
-        let storage = Storage::open_unwatched("default").unwrap();
         storage
             .update(|rows, _| {
                 rows[0].lifecycle_generation = 6;
+                rows[0].rebase_acp_generation(&storage)?;
                 rows[0].status = Status::Stopped;
                 rows[0].mark_idle_dormant();
                 Ok(())
@@ -789,6 +834,7 @@ mod tests {
         storage
             .update(|rows, _| {
                 rows[0].lifecycle_generation = 7;
+                rows[0].rebase_acp_generation(&storage)?;
                 rows[0].status = Status::Idle;
                 rows[0].idle_dormant_since = None;
                 Ok(())
@@ -801,6 +847,22 @@ mod tests {
         );
         assert!(!marker.exists());
         args.lifecycle_generation = Some(7);
+        let current = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.id == row.id)
+            .unwrap();
+        let recovery = crate::acp::establishment::EstablishmentRecovery {
+            expected: crate::acp::establishment::EstablishmentExpected::capture(&current, &storage)
+                .unwrap(),
+            action: crate::acp::establishment::EstablishmentRecoveryAction::Same,
+        };
+        let producer = uuid::Uuid::new_v4();
+        let current_attempt =
+            super::test_support::arm_selected(&storage, &row.id, producer, Some(&recovery));
+        args.establishment_attempt = current_attempt.id;
+        args.establishment_producer = producer;
         let stop_path = worker_registry::workers_dir()
             .unwrap()
             .join(format!("{}.stop", row.id));

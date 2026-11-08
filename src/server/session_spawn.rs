@@ -365,7 +365,9 @@ pub(crate) async fn spawn_structured_session(
                 if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
                     return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
                 }
-                rows.push(instance.clone());
+                crate::acp::establishment::insert_created_instance(
+                    rows, instance, native.storage(),
+                )?;
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
                 Ok(())
             })?;
@@ -387,133 +389,138 @@ pub(crate) async fn spawn_structured_session(
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let mut validation_error = None;
+        let mut adapter_refusal = None;
         let agent_effort = if provision_error.is_none() {
-            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                &instance.source_profile,
-                std::path::Path::new(&instance.project_path),
+        let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        );
+        let acp_registry = crate::acp::AgentRegistry::with_defaults();
+        // The defaults, and the pin, are keyed by the agent the spawn
+        // runs, resolved the way the supervisor resolves it.
+        let agent_key = crate::acp::pick_acp_agent_name(
+            &acp_registry,
+            &resolved_config.session,
+            &resolved_config.acp,
+            &instance.tool,
+            instance.agent_name.as_deref(),
+        );
+        let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
+        // Preserve the explicit request model separately (trimmed to match the
+        // resolver's normalization) so a terminal fallback below can keep it while
+        // dropping any ACP-derived default; agent_model is ACP-only.
+        let explicit_model = agent_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // A profile pin wins, else the explicit request, else the per-agent default;
+        // effort is keyed on the resolved model.
+        let explicit_effort = agent_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (resolved_model, mut agent_effort) =
+            crate::session::config::resolve_spawn_model_effort(
+                defaults,
+                explicit_model.clone(),
+                agent_effort,
             );
-            let acp_registry = crate::acp::AgentRegistry::with_defaults();
-            // The defaults, and the pin, are keyed by the agent the spawn
-            // runs, resolved the way the supervisor resolves it.
-            let agent_key = crate::acp::pick_acp_agent_name(
-                &acp_registry,
-                &resolved_config.session,
-                &resolved_config.acp,
-                &instance.tool,
-                instance.agent_name.as_deref(),
-            );
-            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            // Preserve the explicit request model separately (trimmed to match the
-            // resolver's normalization) so a terminal fallback below can keep it while
-            // dropping any ACP-derived default; agent_model is ACP-only.
-            let explicit_model = agent_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            // A profile pin wins, else the explicit request, else the per-agent default;
-            // effort is keyed on the resolved model.
-            let explicit_effort = agent_effort
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let (resolved_model, mut agent_effort) =
-                crate::session::config::resolve_spawn_model_effort(
-                    defaults,
-                    explicit_model.clone(),
-                    agent_effort,
-                );
-            instance.agent_model = resolved_model;
-            instance.acp_effort = explicit_effort;
-            if cli.is_some() && instance.is_structured() {
-                use crate::session::builder::structured::{
-                    preparation_hooks_apply, validate_structured_choice, StructuredChoice,
-                    StructuredChoiceError,
-                };
-                let choice = StructuredChoice {
-                    tool: &instance.tool,
-                    agent_name: instance.agent_name.as_deref(),
-                    command_override: &instance.command,
-                    sandboxed: instance.is_sandboxed(),
-                    project_path: Some(std::path::Path::new(&instance.project_path)),
-                    preparation_hooks: &|| preparation_hooks_apply(
-                        &config.hooks,
-                        std::path::Path::new(&original_path),
-                        scratch,
-                        trust_hooks,
-                    ),
-                };
-                if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
-                    if matches!(error, StructuredChoiceError::NotCapable(_))
-                        || instance.agent_name.is_some()
-                        || instance.acp_effort.is_some()
-                    {
-                        validation_error = Some(anyhow::Error::new(error));
-                    } else {
-                        build_warnings.push(format!("{error}; using terminal view"));
-                        instance.view = crate::session::View::Terminal;
-                    }
-                }
-            }
-            // Don't trust the client's capability decision.
-            if instance.is_structured() {
-                let resolved = instance
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(instance.tool.as_str());
-                let resolved_session = &resolved_config.session;
-                // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
-                // precondition uses.
-                let acp_capable_key = |key: &str| {
-                    acp_registry.get(key).is_some()
-                        || resolved_session
-                            .agent_acp_cmd
-                            .get(key)
-                            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
-                        // A custom agent that inherits a registry-backed base (e.g.
-                        || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
-                            .is_some()
-                };
-                let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
-                if capable {
-                    instance.view = crate::session::View::Structured;
-                } else {
-                    instance.view = crate::session::View::Terminal;
-                    // A non-ACP tool cannot run the structured session/fork handshake.
-                    instance.fork_pending = None;
-                    instance.import_pending = None;
-                }
-            }
-
-            // An always-Yolo agent skips permission prompts whatever the client asked, so record
-            // that for the agent this session actually runs.
-            let runs = if instance.is_structured() {
-                agent_key.as_str()
-            } else {
-                instance.tool.as_str()
+        instance.agent_model = resolved_model;
+        instance.acp_effort = explicit_effort;
+        if cli.is_some() && instance.is_structured() {
+            use crate::session::builder::structured::{
+                preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                StructuredChoiceError,
             };
-            instance.yolo_mode |= crate::acp::runs_always_yolo(
-                runs,
-                instance.view,
-                &resolved_config.session.agent_acp_cmd,
-                &resolved_config.session.agent_detect_as,
-            );
-
-            if !instance.is_structured() {
-                agent_effort = None;
-                // Terminal sessions keep only an explicitly requested model,
-                // never an ACP-derived default (agent_model is ACP-only).
-                instance.agent_model = explicit_model;
-                // acp_effort is ACP-only too: nothing applies it in tmux mode.
-                instance.acp_effort = None;
+            let choice = StructuredChoice {
+                tool: &instance.tool,
+                agent_name: instance.agent_name.as_deref(),
+                command_override: &instance.command,
+                sandboxed: instance.is_sandboxed(),
+                project_path: Some(std::path::Path::new(&instance.project_path)),
+                preparation_hooks: &|| preparation_hooks_apply(
+                    &config.hooks,
+                    std::path::Path::new(&original_path),
+                    scratch,
+                    trust_hooks,
+                ),
+            };
+            if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
+                if matches!(error, StructuredChoiceError::NotCapable(_))
+                    || instance.agent_name.is_some()
+                    || instance.acp_effort.is_some()
+                {
+                    validation_error = Some(anyhow::Error::new(error));
+                } else {
+                    build_warnings.push(format!("{error}; using terminal view"));
+                    instance.view = crate::session::View::Terminal;
+                }
             }
+        }
+        // Don't trust the client's capability decision.
+        if instance.is_structured() {
+            let resolved = instance
+                .agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(instance.tool.as_str());
+            let resolved_session = &resolved_config.session;
+            // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
+            // precondition uses.
+            let acp_capable_key = |key: &str| {
+                acp_registry.get(key).is_some()
+                    || resolved_session
+                        .agent_acp_cmd
+                        .get(key)
+                        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
+                    // A custom agent that inherits a registry-backed base (e.g.
+                    || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
+                        .is_some()
+            };
+            let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
+            if capable {
+                instance.view = crate::session::View::Structured;
+            } else if instance.acp_establishment.as_ref()
+                .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                .is_some_and(|attempt| attempt.target != crate::acp::establishment::EstablishmentTarget::New)
+            {
+                adapter_refusal = Some(anyhow::anyhow!(
+                    "the selected agent cannot establish the requested structured conversation"
+                ));
+            } else {
+                instance.view = crate::session::View::Terminal;
+            }
+        }
 
-            agent_effort
+        // An always-Yolo agent skips permission prompts whatever the client asked, so record
+        // that for the agent this session actually runs.
+        let runs = if instance.is_structured() {
+            agent_key.as_str()
         } else {
-            None
+            instance.tool.as_str()
         };
+        instance.yolo_mode |= crate::acp::runs_always_yolo(
+            runs,
+            instance.view,
+            &resolved_config.session.agent_acp_cmd,
+            &resolved_config.session.agent_detect_as,
+        );
+
+        if !instance.is_structured() {
+            agent_effort = None;
+            // Terminal sessions keep only an explicitly requested model,
+            // never an ACP-derived default (agent_model is ACP-only).
+            instance.agent_model = explicit_model;
+            // acp_effort is ACP-only too: nothing applies it in tmux mode.
+            instance.acp_effort = None;
+        }
+
+        agent_effort
+            } else {
+        None
+    };
 
         let provisioning_failed = provision_error.is_some();
         let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeTransaction};
@@ -595,6 +602,18 @@ pub(crate) async fn spawn_structured_session(
                     (None, None) => {}
                     _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
                 }
+                if !instance.is_structured() {
+                    if let Some(original) = instance.acp_establishment.as_ref()
+                        .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    {
+                        let expected = row.acp_establishment.as_ref()
+                            .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                            .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+                        anyhow::ensure!(expected.same_source(original),
+                            crate::acp::establishment::EstablishmentRefusal::Superseded);
+                        row.discard_acp_creation(native.storage(), &expected)?;
+                    }
+                }
                 row.view = instance.view;
                 row.yolo_mode = instance.yolo_mode;
                 row.agent_model = instance.agent_model.clone();
@@ -609,7 +628,7 @@ pub(crate) async fn spawn_structured_session(
             rollback(native, instance, provisioning_failed);
             return Err(error);
         }
-        let creation = match provision_error.or(validation_error) {
+        let creation = match provision_error.or(validation_error).or(adapter_refusal) {
             Some(error) => Err(error),
             None => creation_guard
                 .check()
@@ -740,10 +759,29 @@ pub(crate) async fn spawn_structured_session(
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
                 let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))?;
+                let original = instance.acp_establishment.as_ref()
+                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+                let mut authority = None;
+                store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == instance.id)
+                        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        crate::session::LifecycleReservationError::Superseded);
+                    let expected = row.acp_establishment.as_ref()
+                        .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                        .cloned().ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+                    anyhow::ensure!(expected.same_source(&original),
+                        crate::acp::establishment::EstablishmentRefusal::Superseded);
+                    row.finish_acp_creation(native.storage(), &expected)?;
+                    authority = row.acp_establishment.clone();
+                    Ok(())
+                })?;
+                instance.acp_establishment = authority;
                 acp_reservation = match runtime.block_on(worker_state.acp_supervisor.begin_resume(&instance.id, crate::acp::supervisor::ResumeKind::Spawn, crate::process::worker_registry::ResumeAuthority::Explicit)) {
-                    Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease)) => Some(lease),
+                    Ok(Some(lease)) => Some(lease),
                     Err(crate::acp::supervisor::SupervisorError::CapacityFull { .. }) => None,
-                    Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+                    Ok(None) => {
                         anyhow::bail!("creation worker already claimed before finalization")
                     }
                     Err(error) => return Err(error.into()),
@@ -894,6 +932,12 @@ pub(crate) async fn spawn_structured_session(
                 let launch_native = native.clone();
                 let sandbox_info = response_instance.sandbox_info.clone();
                 let generation = response_instance.lifecycle_generation;
+                let establishment = response_instance
+                    .acp_establishment
+                    .as_ref()
+                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                    .cloned()
+                    .map(Arc::new);
                 let spawn_state = state.clone();
                 let claude_store_pin = response_instance.selected_claude_store_pin();
                 service.work.spawn("acp.create_spawn", async move {
@@ -960,6 +1004,7 @@ pub(crate) async fn spawn_structured_session(
                                 crate::acp::supervisor::SpawnRequest {
                                     launch_admission: Some(
                                         crate::acp::supervisor::LaunchAdmission {
+                                            establishment,
                                             store: launch_native,
                                             generation,
                                             namespace: Some(spawn_state.profile_namespace.clone()),
@@ -1731,8 +1776,14 @@ mod tests {
             while !state
                 .acp_event_store
                 .replay_from(&id, 0)
+                .expect("read retained events")
                 .iter()
-                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+                .any(|stored| {
+                    matches!(
+                        stored.event.as_ref(),
+                        crate::acp::Event::AgentStartupError { .. }
+                    )
+                })
             {
                 tokio::task::yield_now().await;
             }

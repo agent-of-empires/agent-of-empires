@@ -704,10 +704,16 @@ async fn apply_intent(
                     .is_some_and(|recall| state.queue.id_at(recall.index).is_some())
                 || state.can_submit_prompt_intent()
         }
-        Intent::ResolveApproval(_)
-        | Intent::SkipElicitation
-        | Intent::CancelElicitation
-        | Intent::CancelInFlight => state.native_input_available(),
+        Intent::ResolveApproval(_) => state
+            .selected_approval
+            .as_deref()
+            .is_some_and(|nonce| state.can_decide(nonce)),
+        Intent::SkipElicitation | Intent::CancelElicitation | Intent::AnswerElicitation => state
+            .transcript
+            .pending_elicitations
+            .first()
+            .is_some_and(|pending| state.can_decide(&pending.nonce)),
+        Intent::CancelInFlight => state.native_input_available(),
         Intent::ChoicePick(_) | Intent::ChoiceAccept => state.can_accept_choice(),
         _ => true,
     };
@@ -2080,6 +2086,159 @@ mod tests {
         state
     }
 
+    fn original_pending_snapshot() -> crate::acp::state::AcpState {
+        use crate::acp::approvals::Nonce;
+        let mut snapshot = native_snapshot(false, None);
+        let mut approval = crate::acp::permissions::build_approval(
+            crate::acp::state::ToolCall {
+                id: "original-plan".into(),
+                name: "Pick a plan".into(),
+                kind: "other".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            answer_options(ApprovalOptionKind::AllowOnce),
+        );
+        approval.nonce = Nonce("original-plan".into());
+        approval.choice = true;
+        let mut unrelated = approval.clone();
+        unrelated.nonce = Nonce("unrelated".into());
+        snapshot.pending_approvals = vec![approval, unrelated];
+        snapshot.pending_elicitations = vec![crate::acp::elicitations::Elicitation {
+            nonce: Nonce("original-question".into()),
+            message: "Choose".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: vec![select_question("answer", "Proceed?", true, &["Yes", "No"])],
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        }];
+        snapshot.original_decision_nonces = vec![
+            Nonce("original-plan".into()),
+            Nonce("original-question".into()),
+        ];
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn original_plan_decision_before_applied_is_exact_and_revokes_during_choice() {
+        let mut fixture = NativeInputFixture::new().await;
+        fixture.snapshot(1, original_pending_snapshot(), None).await;
+        assert!(!fixture.view.native_input_available());
+        fixture.view.set_composer_text("retained main input");
+        fixture.act(Intent::SubmitPrompt).await;
+        fixture.act(Intent::CancelInFlight).await;
+        fixture.view.choice = Some(native_mode_choice());
+        fixture.act(Intent::ChoiceAccept).await;
+        assert!(matches!(
+            fixture.view.choice.as_ref().unwrap().purpose,
+            ChoicePurpose::Mode
+        ));
+        fixture.view.choice = None;
+        fixture.view.selected_approval = Some("unrelated".into());
+        let _ = native_footer(&fixture.view);
+        assert!(fixture.view.mouse_targets.borrow().buttons.is_empty());
+        fixture
+            .act(Intent::ResolveApproval(ApprovalDecisionWire::Allow))
+            .await;
+        assert!(fixture.view.choice.is_none());
+        assert!(fixture.native_requests().is_empty());
+        assert_eq!(
+            fixture.view.composer.lines().join("\n"),
+            "retained main input"
+        );
+
+        fixture.view.selected_approval = Some("original-plan".into());
+        let _ = native_footer(&fixture.view);
+        assert!(!fixture.view.mouse_targets.borrow().buttons.is_empty());
+        fixture
+            .act(Intent::ResolveApproval(ApprovalDecisionWire::Allow))
+            .await;
+        assert!(fixture.view.can_accept_choice());
+        let mut revoked = original_pending_snapshot();
+        revoked.original_decision_nonces.clear();
+        fixture.snapshot(2, revoked, None).await;
+        fixture.act(Intent::ChoicePick(1)).await;
+        assert_eq!(fixture.view.choice.as_ref().unwrap().selected, 0);
+        assert!(!fixture.view.can_accept_choice());
+        let _ = native_footer(&fixture.view);
+        assert!(fixture.view.mouse_targets.borrow().picker.is_none());
+        fixture.snapshot(1, original_pending_snapshot(), None).await;
+        fixture.act(Intent::ChoiceAccept).await;
+        assert!(
+            fixture.native_requests().is_empty(),
+            "stale snapshot cannot revive a choice"
+        );
+        fixture.snapshot(3, original_pending_snapshot(), None).await;
+        fixture.act(Intent::ChoicePick(1)).await;
+        let requests = fixture.native_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/approvals/original-plan"));
+        assert_eq!(requests[0].1["option_id"], "choice-1");
+        assert!(!fixture.view.native_input_available());
+    }
+
+    #[tokio::test]
+    async fn original_elicitation_send_skip_cancel_require_live_exact_nonce() {
+        for intent in [
+            Intent::ChoiceAccept,
+            Intent::SkipElicitation,
+            Intent::CancelElicitation,
+        ] {
+            let mut fixture = NativeInputFixture::new().await;
+            let mut snapshot = original_pending_snapshot();
+            snapshot.pending_approvals.clear();
+            fixture.snapshot(1, snapshot.clone(), None).await;
+            assert!(fixture.view.can_accept_choice());
+            let mut revoked = snapshot.clone();
+            revoked.original_decision_nonces.clear();
+            fixture.snapshot(2, revoked, None).await;
+            fixture.act(Intent::ChoiceAccept).await;
+            fixture.act(Intent::SkipElicitation).await;
+            fixture.act(Intent::CancelElicitation).await;
+            assert!(fixture.native_requests().is_empty());
+            assert!(
+                fixture.view.choice.is_some(),
+                "revocation retains unfinished answer"
+            );
+            fixture.snapshot(3, snapshot.clone(), None).await;
+            fixture.view.disconnect_management();
+            fixture.act(Intent::ChoiceAccept).await;
+            assert!(fixture.native_requests().is_empty());
+            fixture.view.ws = Some(
+                ws_connect_projections_only(&fixture.view.endpoint, "s-1", 3)
+                    .await
+                    .unwrap(),
+            );
+            fixture.act(Intent::ChoiceAccept).await;
+            assert!(
+                fixture.native_requests().is_empty(),
+                "transport alone grants no decision"
+            );
+            fixture.snapshot(4, snapshot, None).await;
+            let action = match &intent {
+                Intent::ChoiceAccept => "accept",
+                Intent::SkipElicitation => "decline",
+                Intent::CancelElicitation => "cancel",
+                _ => unreachable!(),
+            };
+            fixture.act(intent).await;
+            let requests = fixture.native_requests();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].0.ends_with("/elicitations/original-question"));
+            assert_eq!(requests[0].1["action"], action);
+            if action == "accept" {
+                assert_eq!(requests[0].1["answers"]["answer"], "Yes");
+            }
+            assert!(fixture.view.transcript.pending_elicitations.is_empty());
+            assert!(!fixture.view.native_input_available());
+        }
+    }
+
     fn native_mode_choice() -> ChoicePicker {
         ChoicePicker {
             title: "Mode".into(),
@@ -2115,6 +2274,7 @@ mod tests {
         fixture.view.set_composer_text("retained draft");
         fixture.ingest(serde_json::json!({
             "session_id":"s-1", "seq":100,
+            "scope":"history_only",
             "event":{"AcpSessionAssigned":{"acp_session_id":"historical","connection_ready":true}},
         })).await;
         fixture.act(Intent::SubmitPrompt).await;
@@ -2167,13 +2327,14 @@ mod tests {
 
         let mut healthy_failure = native_snapshot(true, None);
         healthy_failure
-            .apply_event(
+            .apply_scoped_event(
                 2,
-                Event::PromptRuntimeError {
+                &Event::PromptRuntimeError {
                     message: "ordinary request failed".into(),
                     evidence: None,
                     native_subject: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         fixture.snapshot(2, healthy_failure, None).await;
@@ -2274,13 +2435,14 @@ mod tests {
                 });
             if healthy {
                 snapshot
-                    .apply_event(
+                    .apply_scoped_event(
                         1,
-                        Event::PromptRuntimeError {
+                        &Event::PromptRuntimeError {
                             message: "request failed, channel healthy".into(),
                             evidence: None,
                             native_subject: None,
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .unwrap();
             }

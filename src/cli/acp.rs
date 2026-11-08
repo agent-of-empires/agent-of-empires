@@ -1069,7 +1069,7 @@ async fn history(session: &str, since: u64, json: bool) -> Result<()> {
         return Ok(());
     }
     for frame in &resp.frames {
-        println!("seq {:>6}  {}", frame.seq, event_kind(&frame.event));
+        println!("seq {:>6}  {}", frame.seq, event_kind(&frame.event)?);
     }
     Ok(())
 }
@@ -1259,9 +1259,9 @@ fn map_http(e: HttpError) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
-fn event_kind(event: &crate::acp::Event) -> &'static str {
+fn event_kind(event: &crate::acp::Event) -> Result<&'static str> {
     use crate::acp::Event;
-    match event {
+    Ok(match event {
         Event::PlanUpdated { .. } => "plan_updated",
         Event::TodoListUpdated { .. } => "todo_list_updated",
         Event::SessionTitleSuggested { .. } => "session_title_suggested",
@@ -1317,7 +1317,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
         Event::SessionNotice { .. } => "session_notice",
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1339,6 +1339,7 @@ mod tests {
             let mut row = Instance::new("native CLI restart", project.path().to_str().unwrap());
             row.source_profile = "default".into();
             row.view = View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
             row.status = Status::Stopped;
             row.mark_idle_dormant();
             let observed = row
@@ -1432,6 +1433,7 @@ mod tests {
                 assert!(stored.lifecycle_reservation.is_none());
                 assert!(worker_registry::stop_intent(&row.id).unwrap().is_none());
                 let admission = crate::acp::supervisor::LaunchAdmission {
+                    establishment: None,
                     store: std::sync::Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,

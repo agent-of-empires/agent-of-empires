@@ -12,7 +12,6 @@ import {
   HOLD,
   chunk,
   endTurn,
-  enableStructuredViewAndWait,
   openSession,
   openStructuredView,
   postAcp,
@@ -22,6 +21,7 @@ import {
   replayJson,
   script,
   sessionIdByTitle,
+  spawnAcpAgentAndWait,
   startAcpSession,
   stopButton,
   waitForStructuredView,
@@ -33,7 +33,9 @@ const PNG_1X1_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mN
 const IMAGE_CAPABLE = { promptCapabilities: { image: true } };
 
 function aoeAdd(env: NodeJS.ProcessEnv, projectDir: string, title: string) {
-  const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });
+  const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude", "--structured-view"], {
+    env,
+  });
   if (res.status !== 0)
     throw new Error(`aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
 }
@@ -141,15 +143,13 @@ test("staged composer image survives session switch and reload", async ({ page, 
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "draft-source");
-      aoeAdd(env, initWorkingRepo(join(home, "project-b"), env).path, "draft-target");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "draft-source");
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-b"), serve.env).path, "draft-target");
   const source = await sessionIdByTitle(serve.baseUrl, "draft-source");
   const target = await sessionIdByTitle(serve.baseUrl, "draft-target");
-  await enableStructuredViewAndWait(serve.baseUrl, source, 30_000, serve.home);
-  await enableStructuredViewAndWait(serve.baseUrl, target, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, source, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, target, 30_000, serve.home);
 
   await openStructuredView(page, serve, source);
   // Attach stays disabled until the agent's image capability arrives.
@@ -216,12 +216,10 @@ test("staged photo past the localStorage quota survives reload without a storage
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "photo-draft");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "photo-draft");
   const id = await sessionIdByTitle(serve.baseUrl, "photo-draft");
-  await enableStructuredViewAndWait(serve.baseUrl, id, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, id, 30_000, serve.home);
 
   await openStructuredView(page, serve, id);
   await expect(page.getByRole("button", { name: /Attach files/ })).toBeEnabled({ timeout: 30_000 });
@@ -266,11 +264,11 @@ test("structured view transcript file links open in-app, scroll to cited line, a
       // project_path is the working tree, so absolute links under it resolve to repo files.
       const text = `See [a.ts](${projectDir}/src/a.ts:1), [b.ts](${projectDir}/src/b.ts:1), [deep](${projectDir}/src/long.ts:80) and [missing](/tmp/aoe-1718-not-a-repo/missing.ts:1).`;
       writeFileSync(fakeAcpScriptPath(home), JSON.stringify(script(endTurn(chunk(text)))));
-      aoeAdd(env, projectDir, "acp-filelink");
     },
   });
+  aoeAdd(serve.env, join(serve.home, "project"), "acp-filelink");
   const sessionId = await sessionIdByTitle(serve.baseUrl, "acp-filelink");
-  await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+  await spawnAcpAgentAndWait(serve.baseUrl, sessionId);
   await openStructuredView(page, serve, sessionId);
   expect2xx(await postPrompt(serve.baseUrl, sessionId, "show me the file"));
 

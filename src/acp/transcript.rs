@@ -18,6 +18,12 @@ pub(crate) const LOAD_FAILED_PREFIX: &str = "session/load failed";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptRow {
     pub id: String,
+    /// Journal sequence that created this row; patches retain this position.
+    #[serde(default)]
+    pub seq: u64,
+    /// Certified history boundary on a session-clear row, absent for legacy clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_after_seq: Option<u64>,
     pub group_id: String,
     pub kind: TranscriptRowKind,
     pub at: DateTime<Utc>,
@@ -186,6 +192,7 @@ pub struct TranscriptModel {
     turn_has_output: bool,
     /// Whether a mid-turn prompt steers the running turn rather than opening a new one.
     steering: bool,
+    active_operation: Option<crate::acp::establishment::NativeOperationId>,
 }
 
 impl TranscriptModel {
@@ -293,7 +300,12 @@ impl TranscriptModel {
     }
 
     /// Apply one event at `seq`, returning the row changes it produced.
-    pub fn apply_event(&mut self, seq: u64, event: &Event) -> Vec<TranscriptDelta> {
+    pub(crate) fn apply_scoped_event(
+        &mut self,
+        seq: u64,
+        event: &Event,
+        metadata: &crate::acp::event_sender::EventMetadata,
+    ) -> Vec<TranscriptDelta> {
         if seq <= self.last_seq {
             return Vec::new();
         }
@@ -303,6 +315,22 @@ impl TranscriptModel {
         }
         if !matches!(event, Event::AgentThoughtChunk { .. }) {
             self.open_thought_group = None;
+        }
+        use crate::acp::event_sender::EventScope;
+        let current = matches!(
+            metadata.scope,
+            EventScope::SessionCurrent | EventScope::OperationCurrent
+        );
+        let original_result = metadata
+            .operation
+            .filter(|operation| operation.outcome.is_some());
+        if matches!(
+            event,
+            Event::Stopped { .. } | Event::PromptRuntimeError { .. }
+        ) && metadata.operation.is_some_and(|operation| {
+            self.active_operation == Some(operation.correlation.operation_id)
+        }) {
+            self.active_operation = None;
         }
 
         match event {
@@ -318,7 +346,6 @@ impl TranscriptModel {
                     self.open_message_group = None;
                 }
                 let group_id = self.message_group();
-                self.turn_has_output = true;
                 let mut row = TranscriptRow::new(
                     format!("msg-{seq}"),
                     group_id,
@@ -439,9 +466,20 @@ impl TranscriptModel {
                 tool_call_id,
                 content,
             } => {
-                // Each content frame replaces the previous snapshot.
+                // Each content frame replaces the previous snapshot without inventing an orphan start.
                 self.buffer_tool_output(tool_call_id, content);
-                Vec::new()
+                if !matches!(self.tools.get(tool_call_id), Some(ToolLifecycle::Open(_))) {
+                    return Vec::new();
+                }
+                if let Some(index) = self.find_tool_start(tool_call_id) {
+                    let row = &mut self.rows[index];
+                    row.output = vec![ToolOutputBlock::Text {
+                        text: content.clone(),
+                    }];
+                    vec![patch(row)]
+                } else {
+                    Vec::new()
+                }
             }
             Event::ToolCallUpdated {
                 tool_call_id,
@@ -481,44 +519,48 @@ impl TranscriptModel {
                 vec![self.append(row)]
             }
             Event::Stopped { .. } => {
-                let empty = self.turn_active && !self.turn_has_output;
-                let mut deltas = self.sweep_open_tools(seq);
-                // Some slash commands produce neither a chunk nor a tool call.
-                if empty {
-                    deltas.push(self.push(
-                        format!("empty-{seq}"),
-                        TranscriptRowKind::EmptyOutput,
-                        "Command produced no output.".to_string(),
+                let mut deltas = if metadata.operation.is_none() {
+                    self.turn_active = false;
+                    self.sweep_open_tools(seq)
+                } else {
+                    Vec::new()
+                };
+                let uncertain = matches!(
+                    (metadata.prompt_observation, metadata.output_uncertainty),
+                    (Some(crate::acp::protocol::AcpPromptObservation::Written { window_id }), Some(uncertain))
+                        if window_id == uncertain
+                );
+                if original_result.is_some() && uncertain {
+                    deltas.push(self.notice(
+                        seq,
+                        "Output attribution is uncertain for this prompt.".into(),
                     ));
                 }
-                self.turn_active = false;
                 deltas
             }
-            // The failure itself is the turn's visible product, so no empty-output notice.
             Event::AgentStartupError { message, .. } => {
                 let mut deltas = self.sweep_open_tools(seq);
                 self.turn_active = false;
-                self.turn_has_output = true;
                 deltas.push(self.notice(seq, format!("agent startup failed: {message}")));
                 deltas
             }
             Event::AcpConnectionUnavailable { source, cause, .. } => {
-                let mut deltas = self.sweep_open_tools(seq);
-                self.turn_active = false;
-                self.turn_has_output = true;
-                deltas.push(self.notice(
+                if current {
+                    self.active_operation = None;
+                }
+                vec![self.notice(
                     seq,
                     format!("ACP connection unavailable ({source:?}, {cause:?})"),
-                ));
-                deltas
+                )]
             }
-            // A dedicated remediation screen renders this, so the timeline stays quiet.
             Event::IncompatibleAgent { .. } => {
-                let deltas = self.sweep_open_tools(seq);
                 self.turn_active = false;
-                deltas
+                self.sweep_open_tools(seq)
             }
             Event::AgentSwitched { from, to, reason } => {
+                if current {
+                    self.active_operation = None;
+                }
                 let mut deltas = self.sweep_open_tools(seq);
                 // Clients render the handoff with the session_cleared divider.
                 deltas.push(self.push(
@@ -528,18 +570,22 @@ impl TranscriptModel {
                 ));
                 deltas
             }
-            Event::SessionCleared => vec![self.push(
-                format!("cleared-{seq}"),
-                TranscriptRowKind::SessionCleared,
-                "Conversation cleared, the model no longer remembers earlier turns.".to_string(),
-            )],
+            Event::SessionCleared => {
+                let mut row = self.grouped_row(
+                    format!("cleared-{seq}"),
+                    TranscriptRowKind::SessionCleared,
+                    "Conversation cleared, the model no longer remembers earlier turns."
+                        .to_string(),
+                );
+                row.clear_after_seq = metadata.clear_after_seq;
+                vec![self.append(row)]
+            }
             Event::ConversationCompacted => {
-                self.turn_has_output = true;
                 vec![self.push(
                     format!("compacted-{seq}"),
                     TranscriptRowKind::Compacted,
                     "Conversation compacted; earlier turns above are summarised in the model's \
-                     context."
+                 context."
                         .to_string(),
                 )]
             }
@@ -575,7 +621,6 @@ impl TranscriptModel {
                 } else {
                     reason.clone()
                 };
-                self.turn_has_output = true;
                 vec![self.push(
                     format!("reset-{seq}"),
                     TranscriptRowKind::ContextReset,
@@ -583,7 +628,6 @@ impl TranscriptModel {
                 )]
             }
             Event::PromptRuntimeError { message, .. } => {
-                self.turn_has_output = true;
                 vec![self.notice(seq, format!("prompt failed: {message}"))]
             }
             Event::ModeSwitchFailed { mode_id, reason } => vec![self.notice(
@@ -596,7 +640,6 @@ impl TranscriptModel {
                 description,
                 key,
             } => {
-                self.turn_has_output = true;
                 let id = notice_id(key.as_deref(), seq);
                 let text = session_notice_text(severity, title, description);
                 match self.rows.iter().position(|r| r.id == id) {
@@ -619,6 +662,11 @@ impl TranscriptModel {
             Event::ThinkingStarted => {
                 self.turn_active = true;
                 self.turn_has_output = true;
+                if current {
+                    self.active_operation = metadata
+                        .operation
+                        .map(|operation| operation.correlation.operation_id);
+                }
                 Vec::new()
             }
             Event::PromptCapabilities { steering, .. } => {
@@ -804,7 +852,7 @@ impl TranscriptModel {
         let text = if !content.is_empty() {
             content.to_string()
         } else if !buffered.is_empty() {
-            buffered
+            buffered.to_owned()
         } else if is_error {
             "tool failed".to_string()
         } else {
@@ -872,7 +920,8 @@ impl TranscriptModel {
         removed
     }
 
-    fn append(&mut self, row: TranscriptRow) -> TranscriptDelta {
+    fn append(&mut self, mut row: TranscriptRow) -> TranscriptDelta {
+        row.seq = self.last_seq;
         self.row_ids.insert(row.id.clone());
         self.rows.push(row.clone());
         TranscriptDelta::Append(row)
@@ -926,10 +975,35 @@ impl TranscriptModel {
     }
 }
 
+/// Place each certified clear before its retained prefix without copying rows.
+///
+/// Unknown legacy positions and earlier clear markers remain barriers. Repeated
+/// projection is idempotent, including histories containing multiple clears.
+pub fn project_transcript_clear_boundaries(rows: &mut [TranscriptRow]) {
+    for index in 0..rows.len() {
+        if rows[index].kind != TranscriptRowKind::SessionCleared {
+            continue;
+        }
+        let Some(cut) = rows[index].clear_after_seq else {
+            continue;
+        };
+        let mut start = index;
+        while start > 0
+            && rows[start - 1].kind != TranscriptRowKind::SessionCleared
+            && rows[start - 1].seq > cut
+        {
+            start -= 1;
+        }
+        rows[start..=index].rotate_right(1);
+    }
+}
+
 impl TranscriptRow {
     fn new(id: String, group_id: String, kind: TranscriptRowKind, text: String) -> Self {
         Self {
             id,
+            seq: 0,
+            clear_after_seq: None,
             group_id,
             kind,
             at: Utc::now(),
@@ -1036,6 +1110,74 @@ mod tests {
     use super::*;
     use crate::acp::approvals::Nonce;
     use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
+
+    #[test]
+    fn certified_clear_projects_retained_prefix_and_keeps_creation_sequences() {
+        let mut model = fold([prompt("old"), started(tool("call", "work"))]);
+        model.apply_scoped_event(
+            3,
+            &content("call", "patched"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        assert_eq!(row(&model, "start-call").seq, 2);
+        let metadata = crate::acp::event_sender::EventMetadata {
+            clear_after_seq: Some(1),
+            ..crate::acp::event_sender::EventMetadata::history()
+        };
+        model.apply_scoped_event(4, &Event::SessionCleared, &metadata);
+        let mut rows = model.rows().to_vec();
+        project_transcript_clear_boundaries(&mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1, 4, 2]
+        );
+        assert_eq!(rows[1].clear_after_seq, Some(1));
+        let once = rows.clone();
+        project_transcript_clear_boundaries(&mut rows);
+        assert_eq!(rows, once);
+    }
+
+    #[test]
+    fn certified_clear_handles_empty_prefix_cold_ranges_and_multiple_clears() {
+        let mut model = fold([prompt("old")]);
+        for (seq, cut) in [(2, 1), (3, 2)] {
+            model.apply_scoped_event(
+                seq,
+                &Event::SessionCleared,
+                &crate::acp::event_sender::EventMetadata {
+                    clear_after_seq: Some(cut),
+                    ..crate::acp::event_sender::EventMetadata::history()
+                },
+            );
+        }
+        model.apply_scoped_event(
+            4,
+            &prompt("new"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        model.apply_scoped_event(
+            5,
+            &Event::SessionCleared,
+            &crate::acp::event_sender::EventMetadata {
+                clear_after_seq: Some(3),
+                ..crate::acp::event_sender::EventMetadata::history()
+            },
+        );
+        let mut rows = model.rows().to_vec();
+        project_transcript_clear_boundaries(&mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 5, 4]
+        );
+        let mut cold = model.rows()[3..].to_vec();
+        project_transcript_clear_boundaries(&mut cold);
+        assert_eq!(cold.iter().map(|row| row.seq).collect::<Vec<_>>(), [5, 4]);
+        cold[0].clear_after_seq = None;
+        cold.reverse();
+        let legacy = cold.clone();
+        project_transcript_clear_boundaries(&mut cold);
+        assert_eq!(cold, legacy);
+    }
     use crate::acp::state::test_support::{chunk, prompt, stopped};
     use crate::acp::state::MemoryRecall;
     use crate::daemon::PromptAttachmentKind;
@@ -1113,7 +1255,11 @@ mod tests {
     fn fold(events: impl IntoIterator<Item = Event>) -> TranscriptModel {
         let mut m = TranscriptModel::new();
         for (i, e) in events.into_iter().enumerate() {
-            m.apply_event(i as u64 + 1, &e);
+            m.apply_scoped_event(
+                i as u64 + 1,
+                &e,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
         }
         m
     }
@@ -1460,7 +1606,6 @@ mod tests {
         // A context-reset divider needs a reason or a prior prompt.
         let reset = |reason: &str| Event::SessionContextReset {
             reason: reason.into(),
-            fork_rejection: None,
         };
         assert!(fold([reset("")]).rows().is_empty());
         assert!(fold([reset("session/load failed: bad id")])
@@ -1497,9 +1642,29 @@ mod tests {
     #[test]
     fn prompts_append_keyed_rows_and_replays_are_dropped() {
         let mut m = TranscriptModel::new();
-        assert_eq!(m.apply_event(1, &prompt("hi")).len(), 1);
-        assert!(m.apply_event(1, &prompt("ignored")).is_empty());
-        assert!(m.apply_event(0, &prompt("older")).is_empty());
+        assert_eq!(
+            m.apply_scoped_event(
+                1,
+                &prompt("hi"),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .len(),
+            1
+        );
+        assert!(m
+            .apply_scoped_event(
+                1,
+                &prompt("ignored"),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .is_empty());
+        assert!(m
+            .apply_scoped_event(
+                0,
+                &prompt("older"),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .is_empty());
         assert_eq!((m.rows().len(), m.last_seq()), (1, 1));
 
         let with_attachment = Event::UserPromptSent {
@@ -1516,7 +1681,11 @@ mod tests {
             origin_plugin: None,
         };
         let mut m = TranscriptModel::new();
-        let deltas = m.apply_event(3, &with_attachment);
+        let deltas = m.apply_scoped_event(
+            3,
+            &with_attachment,
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Append(_)]));
         let prompt_row = row(&m, "user-seq-3");
         assert_eq!(prompt_row.kind, TranscriptRowKind::UserPrompt);
@@ -1528,7 +1697,7 @@ mod tests {
             (Some(""), "user-seq-7"),
         ] {
             let mut m = TranscriptModel::new();
-            m.apply_event(
+            m.apply_scoped_event(
                 7,
                 &Event::UserPromptSent {
                     text: "hi".into(),
@@ -1537,6 +1706,7 @@ mod tests {
                     synthesized: false,
                     origin_plugin: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
         }
@@ -1573,8 +1743,7 @@ mod tests {
         assert_eq!(msgs[0].group_id, msgs[1].group_id);
         assert_ne!(msgs[1].group_id, msgs[2].group_id);
 
-        // A synthesized resume prompt (#3028, #4040) renders no row but still
-        // opens the turn.
+        // Synthesized resume prompts are not transcript rows.
         let ev = Event::UserPromptSent {
             text: "run the nightly task".into(),
             attachments: Vec::new(),
@@ -1583,11 +1752,10 @@ mod tests {
             origin_plugin: None,
         };
         let mut m = TranscriptModel::new();
-        let deltas = m.apply_event(1, &ev);
+        let deltas =
+            m.apply_scoped_event(1, &ev, &crate::acp::event_sender::EventMetadata::history());
         assert!(deltas.is_empty());
         assert!(m.rows().is_empty());
-        assert!(m.turn_active);
-        assert!(!m.turn_has_output);
 
         // A plugin-sent message keeps its sender on the row.
         let ev = Event::UserPromptSent {
@@ -1598,7 +1766,7 @@ mod tests {
             origin_plugin: Some("cron".into()),
         };
         let mut m = TranscriptModel::new();
-        m.apply_event(1, &ev);
+        m.apply_scoped_event(1, &ev, &crate::acp::event_sender::EventMetadata::history());
         assert_eq!(m.rows()[0].origin_plugin.as_deref(), Some("cron"));
     }
 
@@ -1674,11 +1842,16 @@ mod tests {
         assert_eq!(count(&m, TranscriptRowKind::ToolComplete), 2);
 
         let mut m = fold([started(tool("task-1", "Task"))]);
-        assert!(
-            m.apply_event(2, &content("task-1", "streaming")).is_empty(),
-            "buffering emits nothing"
+        let deltas = m.apply_scoped_event(
+            2,
+            &content("task-1", "streaming"),
+            &crate::acp::event_sender::EventMetadata::history(),
         );
-        m.apply_event(
+        assert!(
+            matches!(deltas.as_slice(), [TranscriptDelta::Patch { row, .. }]
+            if matches!(row.output.as_slice(), [ToolOutputBlock::Text { text }] if text == "streaming"))
+        );
+        m.apply_scoped_event(
             3,
             &Event::ToolCallCompleted {
                 tool_call_id: "task-1".into(),
@@ -1688,6 +1861,7 @@ mod tests {
                 completed_at: at(200),
                 async_subagent: true,
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         assert!(row(&m, "done-task-1").async_subagent);
 
@@ -1701,10 +1875,6 @@ mod tests {
             ]
         );
         assert_eq!(tool_of(&m, "start-orphan-1").name, "tool call");
-        assert!(
-            m.turn_has_output,
-            "a synthesized card counts as turn output"
-        );
 
         let m = fold([updated(
             "orphan-2",
@@ -1737,7 +1907,7 @@ mod tests {
             }),
             started(tool("other", "Other")),
         ]);
-        let deltas = m.apply_event(
+        let deltas = m.apply_scoped_event(
             3,
             &started(ToolCall {
                 kind: "other".into(),
@@ -1751,6 +1921,7 @@ mod tests {
                 }),
                 ..tool("dup", "Bash")
             }),
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         assert!(
             matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "start-dup")
@@ -1766,7 +1937,7 @@ mod tests {
         assert_eq!(merged.parent_tool_call_id.as_deref(), Some("parent-9"));
         assert_eq!(merged.memory_recall.as_ref().unwrap().mode, "recall");
 
-        let deltas = m.apply_event(
+        let deltas = m.apply_scoped_event(
             4,
             &updated(
                 "dup",
@@ -1774,6 +1945,7 @@ mod tests {
                 Some(r#"{"command":"git log"}"#),
                 None,
             ),
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         assert!(
             matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "start-dup")
@@ -1789,7 +1961,11 @@ mod tests {
             "{}",
             "other rows untouched"
         );
-        m.apply_event(5, &updated("dup", None, None, Some(vec![diff("b.rs")])));
+        m.apply_scoped_event(
+            5,
+            &updated("dup", None, None, Some(vec![diff("b.rs")])),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert_eq!(
             tool_of(&m, "start-dup").diffs,
             [diff("b.rs")],
@@ -1945,7 +2121,11 @@ mod tests {
         );
         let mut m = TranscriptModel::new();
         m.observe_prior(1, &thought("earlier", a));
-        m.apply_event(2, &thought("later", b));
+        m.apply_scoped_event(
+            2,
+            &thought("later", b),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert!(m.rows()[0].message_start);
     }
 
@@ -1967,7 +2147,11 @@ mod tests {
             for (index, event) in prior.iter().enumerate() {
                 m.observe_prior(index as u64 + 1, event);
             }
-            m.apply_event(10, &chunk("", "m-b"));
+            m.apply_scoped_event(
+                10,
+                &chunk("", "m-b"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(m.rows().len() == 1, "{prior:?}");
             assert_eq!(m.rows()[0].message_start, expected, "{prior:?}");
         }
@@ -1994,7 +2178,11 @@ mod tests {
                 if i < split {
                     m.observe_prior(i as u64 + 1, e);
                 } else {
-                    m.apply_event(i as u64 + 1, e);
+                    m.apply_scoped_event(
+                        i as u64 + 1,
+                        e,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    );
                 }
             }
             let expected = if split == events.len() - 1 {
@@ -2111,9 +2299,19 @@ mod tests {
             }
             for (index, event) in suffix.iter().enumerate() {
                 let seq = 100 + index as u64;
-                model.apply_event(seq, event);
+                model.apply_scoped_event(
+                    seq,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
                 assert!(
-                    model.apply_event(seq, event).is_empty(),
+                    model
+                        .apply_scoped_event(
+                            seq,
+                            event,
+                            &crate::acp::event_sender::EventMetadata::history()
+                        )
+                        .is_empty(),
                     "{label}: replay overlap"
                 );
             }
@@ -2135,7 +2333,11 @@ mod tests {
                 .iter()
                 .map(|row| (row.id.clone(), row.at))
                 .collect();
-            model.apply_event(1000, &stopped("prompt_complete"));
+            model.apply_scoped_event(
+                1000,
+                &stopped("prompt_complete"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert_eq!(
                 model
                     .rows()
@@ -2169,7 +2371,7 @@ mod tests {
             let output = vec![ToolOutputBlock::Text {
                 text: "structured output".into(),
             }];
-            let deltas = model.apply_event(
+            let deltas = model.apply_scoped_event(
                 10,
                 &Event::ToolCallCompleted {
                     tool_call_id: "t".into(),
@@ -2179,6 +2381,7 @@ mod tests {
                     completed_at: at(200),
                     async_subagent: true,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             );
             assert!(matches!(deltas.as_slice(), [TranscriptDelta::Append(_)]));
             let terminal = &model.rows()[0];
@@ -2196,7 +2399,11 @@ mod tests {
             assert_eq!(terminal.output, output);
             assert!(terminal.async_subagent);
             assert!(model
-                .apply_event(11, &stopped("prompt_complete"))
+                .apply_scoped_event(
+                    11,
+                    &stopped("prompt_complete"),
+                    &crate::acp::event_sender::EventMetadata::history()
+                )
                 .is_empty());
         }
     }
@@ -2226,7 +2433,16 @@ mod tests {
             model.observe_prior(seq, event);
             assert_eq!(model.last_seq(), seq, "{event:?}");
             assert!(model.rows().is_empty(), "{event:?}");
-            assert!(model.apply_event(seq, event).is_empty(), "{event:?}");
+            assert!(
+                model
+                    .apply_scoped_event(
+                        seq,
+                        event,
+                        &crate::acp::event_sender::EventMetadata::history()
+                    )
+                    .is_empty(),
+                "{event:?}"
+            );
         }
     }
 
@@ -2239,16 +2455,32 @@ mod tests {
         assert_eq!(model.last_seq(), 2, "stale observation keeps the watermark");
         assert!(model.rows().is_empty());
         assert!(
-            model.apply_event(1, &stopped("prompt_complete")).is_empty(),
+            model
+                .apply_scoped_event(
+                    1,
+                    &stopped("prompt_complete"),
+                    &crate::acp::event_sender::EventMetadata::history()
+                )
+                .is_empty(),
             "a queued prefix stop must not close a tool opened later in the prefix"
         );
-        model.apply_event(3, &stopped("cancelled"));
+        model.apply_scoped_event(
+            3,
+            &stopped("cancelled"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
         assert_eq!(
             row(&model, "stopped-later-3").tool_call_id.as_deref(),
             Some("later")
         );
-        assert!(model.apply_event(4, &stopped("cancelled")).is_empty());
+        assert!(model
+            .apply_scoped_event(
+                4,
+                &stopped("cancelled"),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .is_empty());
     }
 
     #[test]
@@ -2275,8 +2507,16 @@ mod tests {
             model.observe_prior(1, &content("reused", "old orphan output"));
             model.observe_prior(2, &closer);
             assert!(model.rows().is_empty(), "{closer:?}: prefix stays hidden");
-            model.apply_event(10, &started(tool("reused", "New call")));
-            model.apply_event(11, &stopped("cancelled"));
+            model.apply_scoped_event(
+                10,
+                &started(tool("reused", "New call")),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            model.apply_scoped_event(
+                11,
+                &stopped("cancelled"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert_eq!(
                 count(&model, TranscriptRowKind::ToolStopped),
                 1,
@@ -2287,7 +2527,13 @@ mod tests {
                 "",
                 "{closer:?}: a reused ID must not inherit orphan output"
             );
-            assert!(model.apply_event(12, &stopped("cancelled")).is_empty());
+            assert!(model
+                .apply_scoped_event(
+                    12,
+                    &stopped("cancelled"),
+                    &crate::acp::event_sender::EventMetadata::history()
+                )
+                .is_empty());
         }
     }
 
@@ -2316,16 +2562,32 @@ mod tests {
                 if observed_content {
                     model.observe_prior(1, &content("reused", "old orphan output"));
                 } else {
-                    model.apply_event(1, &content("reused", "old orphan output"));
+                    model.apply_scoped_event(
+                        1,
+                        &content("reused", "old orphan output"),
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    );
                 }
-                model.apply_event(2, &closer);
+                model.apply_scoped_event(
+                    2,
+                    &closer,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
                 assert_eq!(
                     count(&model, TranscriptRowKind::ToolStopped),
                     0,
                     "{closer:?}: content alone must not invent a stopped tool"
                 );
-                model.apply_event(3, &started(tool("reused", "New call")));
-                model.apply_event(4, &stopped("cancelled"));
+                model.apply_scoped_event(
+                    3,
+                    &started(tool("reused", "New call")),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
+                model.apply_scoped_event(
+                    4,
+                    &stopped("cancelled"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
                 assert_eq!(
                     count(&model, TranscriptRowKind::ToolStopped),
                     1,
@@ -2336,7 +2598,13 @@ mod tests {
                     "",
                     "{closer:?}: a reused ID must not inherit orphan output"
                 );
-                assert!(model.apply_event(5, &stopped("cancelled")).is_empty());
+                assert!(model
+                    .apply_scoped_event(
+                        5,
+                        &stopped("cancelled"),
+                        &crate::acp::event_sender::EventMetadata::history()
+                    )
+                    .is_empty());
             }
         }
     }
@@ -2351,17 +2619,32 @@ mod tests {
             model.observe_prior(2, &completed("done", false, "finished before cursor"));
             assert!(
                 model
-                    .apply_event(
+                    .apply_scoped_event(
                         10,
-                        &updated("done", Some("Late title"), Some("new args"), None)
+                        &updated("done", Some("Late title"), Some("new args"), None),
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .is_empty(),
                 "metadata alone must not render a running card for a terminal prefix tool"
             );
             assert!(model.rows().is_empty());
-            assert!(model.apply_event(11, &stopped("cancelled")).is_empty());
-            model.apply_event(12, &started(tool("done", "New call")));
-            model.apply_event(13, &stopped("cancelled"));
+            assert!(model
+                .apply_scoped_event(
+                    11,
+                    &stopped("cancelled"),
+                    &crate::acp::event_sender::EventMetadata::history()
+                )
+                .is_empty());
+            model.apply_scoped_event(
+                12,
+                &started(tool("done", "New call")),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            model.apply_scoped_event(
+                13,
+                &stopped("cancelled"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert_eq!(count(&model, TranscriptRowKind::ToolStart), 1);
             assert_eq!(count(&model, TranscriptRowKind::ToolStopped), 1);
             assert_eq!(row(&model, "start-done").text, "New call");
@@ -2390,7 +2673,11 @@ mod tests {
         };
         let layout = ids(&m);
         for (seq, text) in [(5, "late"), (6, ""), (7, "restored")] {
-            let deltas = m.apply_event(seq, &summary("a", text));
+            let deltas = m.apply_scoped_event(
+                seq,
+                &summary("a", text),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(
                 matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "compaction-summary-a" && row.text == text),
                 "{text:?}"
@@ -2416,7 +2703,11 @@ mod tests {
                 message_id: None,
             },
         ]);
-        let deltas = m.apply_event(3, &failed("out of tokens"));
+        let deltas = m.apply_scoped_event(
+            3,
+            &failed("out of tokens"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert!(
             matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "notice-compaction-a" && row.text == "error: Compaction failed: out of tokens")
         );
@@ -2426,16 +2717,28 @@ mod tests {
     #[test]
     fn ask_user_question_cards_are_suppressed_in_either_order() {
         let mut m = fold([started(tool("tc-ask", "Asking"))]);
-        let deltas = m.apply_event(2, &elicitation_requested("tc-ask"));
+        let deltas = m.apply_scoped_event(
+            2,
+            &elicitation_requested("tc-ask"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Remove(id)] if id == "start-tc-ask"));
         assert!(m
-            .apply_event(3, &completed("tc-ask", false, "x"))
+            .apply_scoped_event(
+                3,
+                &completed("tc-ask", false, "x"),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
             .is_empty());
         assert!(m.rows().is_empty());
 
         let mut m = fold([elicitation_requested("tc-ask")]);
         assert!(m
-            .apply_event(2, &started(tool("tc-ask", "Asking")))
+            .apply_scoped_event(
+                2,
+                &started(tool("tc-ask", "Asking")),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
             .is_empty());
         assert!(m.rows().is_empty());
 
@@ -2458,11 +2761,21 @@ mod tests {
         );
         assert_eq!(answered.elicitation_answers.len(), 1);
         assert!(
-            m.apply_event(2, &answer("el-1", yes())).is_empty(),
+            m.apply_scoped_event(
+                2,
+                &answer("el-1", yes()),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .is_empty(),
             "re-broadcast deduped"
         );
         assert!(
-            m.apply_event(3, &answer("el-2", Vec::new())).is_empty(),
+            m.apply_scoped_event(
+                3,
+                &answer("el-2", Vec::new()),
+                &crate::acp::event_sender::EventMetadata::history()
+            )
+            .is_empty(),
             "no answers, no row"
         );
     }
@@ -2483,7 +2796,6 @@ mod tests {
         assert!(
             matches!(m.tools.get("open-1"), Some(ToolLifecycle::Terminal(output)) if output.text.is_empty())
         );
-
         let mut m = fold([
             started(tool("a", "A")),
             started(tool("b", "B")),
@@ -2616,5 +2928,48 @@ mod tests {
             "a steered prompt keeps the turn's output"
         );
         assert_eq!(count(&m, TranscriptRowKind::UserPrompt), 2);
+    }
+
+    #[test]
+    fn matching_local_terminal_settles_only_its_operation_and_keeps_partial_tools() {
+        use crate::acp::establishment::NativeOperationCorrelation;
+        use crate::acp::event_sender::{EventMetadata, EventScope};
+        use crate::acp::protocol::AcpOperationMetadata;
+        let metadata = |correlation| EventMetadata {
+            scope: EventScope::OperationCurrent,
+            operation: Some(AcpOperationMetadata {
+                correlation,
+                outcome: None,
+            }),
+            ..EventMetadata::history()
+        };
+        let mut first = metadata(NativeOperationCorrelation::new(None));
+        let mut second = metadata(NativeOperationCorrelation::new(None));
+        let mut m = fold([
+            started(tool("open", "Task")),
+            content("open", "partial output"),
+        ]);
+        m.apply_scoped_event(3, &Event::ThinkingStarted, &first);
+        m.apply_scoped_event(4, &Event::ThinkingStarted, &second);
+        first.make_historical();
+        m.apply_scoped_event(5, &stopped("prompt_failed"), &first);
+        assert_eq!(
+            m.active_operation,
+            second
+                .operation
+                .map(|operation| operation.correlation.operation_id)
+        );
+        second.make_historical();
+        m.apply_scoped_event(6, &stopped("prompt_failed"), &second);
+        assert_eq!(m.active_operation, None);
+        assert_eq!(
+            m.rows().len(),
+            1,
+            "local terminals must not synthesize tool endings or output notices"
+        );
+        let partial = row(&m, "start-open");
+        assert_eq!(partial.kind, TranscriptRowKind::ToolStart);
+        assert!(matches!(partial.output.as_slice(),
+            [ToolOutputBlock::Text { text }] if text == "partial output"));
     }
 }

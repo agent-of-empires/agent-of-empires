@@ -76,9 +76,18 @@ pub(crate) async fn attach_project(
         let probe_id = id.to_owned();
         let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&probe_id))
             .await
-            .map_err(|error| AttachError::Rejected(error.into()))?;
-        if in_flight {
-            return Err(AttachError::TurnInFlight);
+            .map_err(|error| AttachError::Rejected(error.into()))?
+            .map_err(AttachError::Rejected)?;
+        match in_flight {
+            crate::acp::event_store::ControlKnowledge::Known(false) => {}
+            crate::acp::event_store::ControlKnowledge::Known(true) => {
+                return Err(AttachError::TurnInFlight)
+            }
+            crate::acp::event_store::ControlKnowledge::Indeterminate => {
+                return Err(AttachError::Rejected(anyhow::anyhow!(
+                    "Conversation control history is unconfirmed"
+                )))
+            }
         }
     }
     // Plan through the bound native store. Validation happens before stopping
@@ -110,11 +119,16 @@ pub(crate) async fn attach_project(
         }
     })?;
     if restarts && was_running {
-        crate::server::acp_events::retire_native_worker(
-            state,
-            id,
-            std::time::Duration::from_secs(5),
-        )
+        async {
+            let target = state.acp_supervisor.capture_retirement(id)?;
+            crate::server::acp_events::retire_native_worker(
+                state,
+                id,
+                target,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        }
         .await
         .map_err(|error| {
             AttachError::Rejected(anyhow::anyhow!(
@@ -334,11 +348,13 @@ mod tests {
             crate::session::Instance::new("attach-4116", barrier.path().to_str().unwrap());
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
+        inst.resume_intent = crate::session::ResumeIntent::Use("retained-attach-hook".into());
         let id = inst.id.clone();
         let profile = inst.source_profile.clone();
         support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
         let (launcher, launches) = support::counting_failing_launcher();
         let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
 
         let restart = tokio::spawn({
             let state = Arc::clone(&state);

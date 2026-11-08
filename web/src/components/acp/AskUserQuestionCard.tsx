@@ -15,6 +15,7 @@ import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 
 interface Props {
   elicitation: Elicitation;
+  canDecide: boolean;
   onResolve: (resolution: ElicitationResolution) => Promise<void>;
 }
 
@@ -151,7 +152,7 @@ function toResolution(questions: ElicitationQuestion[], answers: AnswerMap): Eli
   return { action: "accept", answers: payload };
 }
 
-export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
+export function AskUserQuestionCard({ elicitation, canDecide, onResolve }: Props) {
   const offline = useServerDown();
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [answers, setAnswers] = useState<AnswerMap>(() => initialAnswers(elicitation.questions));
@@ -173,6 +174,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
 
   const run = useCallback(
     async (resolution: ElicitationResolution) => {
+      if (!canDecide || offline || phase === "submitting") return;
       setPhase("submitting");
       try {
         await onResolve(resolution);
@@ -180,7 +182,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
         setPhase("rolled-back");
       }
     },
-    [onResolve],
+    [onResolve, canDecide, offline, phase],
   );
 
   const submit = useCallback(() => {
@@ -193,7 +195,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
     void run(toResolution(elicitation.questions, answers));
   }, [elicitation.questions, answers, run]);
 
-  const disabled = offline || phase === "submitting";
+  const disabled = !canDecide || offline || phase === "submitting";
 
   return (
     <form

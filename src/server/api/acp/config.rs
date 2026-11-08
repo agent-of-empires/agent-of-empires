@@ -9,12 +9,14 @@ use super::*;
 #[derive(Debug, Deserialize)]
 pub struct SetModeRequest {
     pub mode_id: String,
+    pub request_nonce: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SetConfigOptionRequest {
     pub config_id: String,
     pub value: String,
+    pub request_nonce: Option<uuid::Uuid>,
 }
 
 /// Tally plan-mode adoption. `"plan"` is the plan value on both the mode and
@@ -50,16 +52,20 @@ pub async fn acp_set_mode(
     else {
         return session_not_found();
     };
-    match state.acp_supervisor.set_mode(&id, &req.mode_id).await {
-        Ok(()) => {
+    match state
+        .acp_supervisor
+        .set_mode(&id, &req.mode_id, req.request_nonce)
+        .await
+    {
+        Ok(operation) => {
             tracing::info!(
                 target: "acp.protocol",
                 session = %id,
                 mode_id = %req.mode_id,
-                "mode set"
+                "mode request accepted"
             );
             count_plan_mode(&state, &req.mode_id);
-            StatusCode::ACCEPTED.into_response()
+            (StatusCode::ACCEPTED, Json(operation)).into_response()
         }
         Err(e) => supervisor_error_response("set_mode failed", &e),
     }
@@ -207,18 +213,20 @@ pub async fn acp_set_config_option(
             );
         }
     }
-    if let Err(e) = state
+    let (operation, lease) = match state
         .acp_supervisor
-        .set_config_option(&id, &req.config_id, &req.value)
+        .set_config_option(&id, &req.config_id, &req.value, req.request_nonce)
         .await
     {
-        return supervisor_error_response("set_config_option failed", &e);
-    }
+        Ok(operation) => operation,
+        Err(e) => return supervisor_error_response("set_config_option failed", &e),
+    };
     if let Some(selector) = selector {
         if let Err(e) = persist_selector(&state, &id, selector, &req.value).await {
             return persist_failure_response(
                 &state,
                 &id,
+                &lease,
                 &format!("config-option pick for {}", selector.field()),
                 &e,
             )
@@ -236,16 +244,17 @@ pub async fn acp_set_config_option(
         session = %id,
         config_id = %req.config_id,
         value = %req.value,
-        "config option set"
+        "config option request accepted"
     );
     count_plan_mode(&state, &req.value);
-    StatusCode::ACCEPTED.into_response()
+    (StatusCode::ACCEPTED, Json(operation)).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp::state::{ConfigOptionChoice, ConfigOptionDescriptor};
+    use crate::server::api::find_instance;
     use crate::session::test_support::isolate_app_dir;
 
     /// The reconciler's per-process state across ticks.
@@ -405,59 +414,128 @@ mod tests {
         }
     }
 
+    async fn fail_write_after_native_pick(
+        session: &crate::server::test_support::ManagedControlSession,
+        value: &str,
+    ) -> (Response, impl Drop) {
+        let state = &session.state;
+        let persistence = state.session_service.disk_reload_guard().await;
+        let (response, failure) = tokio::join!(
+            acp_set_config_option(
+                State(state.clone()),
+                Path(session.id().to_owned()),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "model".into(),
+                    value: value.into(),
+                    request_nonce: None,
+                })),
+            ),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !session
+                        .native
+                        .requests()
+                        .iter()
+                        .any(|method| method == "session/set_config_option")
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the actual Native takes the pick before selector persistence");
+                let failure = crate::server::test_support::fail_session_writes_for_test("test");
+                drop(persistence);
+                failure
+            }
+        );
+        assert_eq!(
+            session
+                .native
+                .requests()
+                .iter()
+                .filter(|method| *method == "session/set_config_option")
+                .count(),
+            1,
+        );
+        (response.into_response(), failure)
+    }
+
     /// The worker takes the pick, the stored write fails: the caller gets the
     /// 500, the worker is stopped, and neither the plan-mode tally nor memory
     /// records the pick.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failed_pick_write_stops_the_worker_and_reports_it() {
-        let _tmp = isolate_app_dir();
-        let mut inst = crate::session::Instance::new("t", "/tmp");
-        inst.source_profile = "blocked".to_string();
-        inst.agent_model = Some("old-model".to_string());
-        let id = inst.id.clone();
-        crate::server::test_support::block_profile_storage_for_test("blocked");
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let cmds = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
-
-        let resp = acp_set_config_option(
-            State(state.clone()),
-            Path(id.clone()),
-            Ok(Json(SetConfigOptionRequest {
-                config_id: "model".to_string(),
-                value: "plan".to_string(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
-        assert!(
-            !cmds.lock().unwrap().is_empty(),
-            "the worker took the pick before the write failed"
-        );
-        assert_eq!(
-            state.acp_supervisor.worker_state(&id).await,
-            crate::daemon::AcpWorkerState::Absent
-        );
-        assert_eq!(
-            state
-                .telemetry_structured
-                .plan_mode_seen
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            state.instances.read().await[0].agent_model.as_deref(),
-            Some("old-model")
-        );
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::server::test_support as support;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let session = support::managed_control_session(scope, "failed-config-write").await;
+                let id = session.id().to_owned();
+                let state = session.state.clone();
+                persist_selector(&state, &id, PersistedSelector::Model, "old-model")
+                    .await
+                    .unwrap();
+                let owner = session
+                    .client
+                    .lease
+                    .spawned_runner()
+                    .expect("actual original runner");
+                let (response, failure) = fail_write_after_native_pick(&session, "plan").await;
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
+                assert!(
+                    session
+                        .native
+                        .requests()
+                        .iter()
+                        .any(|method| method == "session/set_config_option"),
+                    "the actual Native worker took the pick before persistence failed"
+                );
+                assert!(
+                    !crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(owner),
+                    "the unsaved selection must not remain usable on the original runner"
+                );
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                assert_eq!(
+                    state
+                        .telemetry_structured
+                        .plan_mode_seen
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    find_instance(&state, &id)
+                        .await
+                        .unwrap()
+                        .agent_model
+                        .as_deref(),
+                    Some("old-model")
+                );
+                assert_eq!(
+                    support::load_instances_from_disk_for_test("test")[0]
+                        .agent_model
+                        .as_deref(),
+                    Some("old-model")
+                );
+                drop(failure);
+                support::accept_runtime_read_cache_for_test(&state).await;
+                session
+                    .client
+                    .shutdown()
+                    .await
+                    .expect("finish the original checkpoint after storage recovers");
+                assert_eq!(
+                    state.acp_supervisor.worker_state(&id).await,
+                    crate::daemon::AcpWorkerState::Absent
+                );
+            })
+        })
+        .await;
     }
 
     /// The write fails on a valid stored row (not an unopenable profile): the
@@ -466,67 +544,121 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_pick_write_failing_on_a_valid_row_recovers_on_retry() {
+        use crate::acp::runner_lifecycle::ProcessControl as _;
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::server::test_support as support;
-        let _tmp = isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let mut inst = crate::session::Instance::new("t", project.path().to_str().unwrap());
-        inst.view = crate::session::View::Structured;
-        inst.status = crate::session::Status::Idle;
-        inst.source_profile = "default".to_string();
-        inst.agent_name = Some("claude".to_string());
-        inst.agent_model = Some("old-model".to_string());
-        let id = inst.id.clone();
-        support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
-        let state =
-            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
-        support::refresh_canonical_metadata_for_test(&state).await;
-        let pick = || async {
-            acp_set_config_option(
-                State(state.clone()),
-                Path(id.clone()),
-                Ok(Json(SetConfigOptionRequest {
-                    config_id: "model".to_string(),
-                    value: "new-model".to_string(),
-                })),
-            )
-            .await
-            .into_response()
-        };
-        let mut tick = ReconcilerTick::default();
-        let running = || async {
-            state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Running
-        };
-
-        tick.run(&state).await;
-        assert!(running().await, "the reconciler starts the worker");
-        let failure = support::fail_session_writes_for_test("default");
-        assert_eq!(pick().await.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!running().await);
-        assert_eq!(
-            state.instances.read().await[0].agent_model.as_deref(),
-            Some("old-model")
-        );
-        assert_eq!(
-            support::load_instances_from_disk_for_test("default")[0]
-                .agent_model
-                .as_deref(),
-            Some("old-model")
-        );
-
-        drop(failure);
-        tick.run(&state).await;
-        assert!(running().await, "the stopped worker is respawned");
-        assert_eq!(pick().await.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            state.instances.read().await[0].agent_model.as_deref(),
-            Some("new-model")
-        );
-        assert_eq!(
-            support::load_instances_from_disk_for_test("default")[0]
-                .agent_model
-                .as_deref(),
-            Some("new-model")
-        );
+        with_managed(|scope| Box::pin(async move {
+            let session = support::managed_control_session(scope, "retry-config-write").await;
+            let id = session.id().to_owned();
+            let state = session.state.clone();
+            let original = session.client.lease.spawned_runner().expect("actual original runner");
+            persist_selector(&state, &id, PersistedSelector::Model, "old-model").await.unwrap();
+            let pick = || async {
+                acp_set_config_option(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SetConfigOptionRequest {
+                        config_id: "model".into(),
+                        value: "new-model".into(),
+                        request_nonce: None,
+                    })),
+                ).await.into_response()
+            };
+            let mut tick = ReconcilerTick::default();
+            tick.attempted.insert(id.clone());
+            let (response, failure) = fail_write_after_native_pick(&session, "new-model").await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
+            assert!(!crate::acp::runner_lifecycle::SystemProcessControl::default().is_alive(original));
+            assert!(!state.acp_supervisor.is_running(&id).await);
+            for row in [
+                find_instance(&state, &id).await.unwrap(),
+                support::load_instances_from_disk_for_test("test").into_iter().find(|row| row.id == id).unwrap(),
+            ] {
+                assert_eq!(row.agent_model.as_deref(), Some("old-model"));
+                assert_eq!(row.acp_session_id.as_deref(), Some(session.sid.as_str()));
+            }
+            drop(failure);
+            support::accept_runtime_read_cache_for_test(&state).await;
+            session.client.shutdown().await.expect("finish the failed pick's exact retirement");
+            assert_eq!(
+                state.acp_supervisor.worker_state(&id).await,
+                crate::daemon::AcpWorkerState::Absent,
+            );
+            let row = find_instance(&state, &id).await.unwrap();
+            let sid = session.sid.clone();
+            let expected_sid = sid.clone();
+            let (config, native) = scope.native_peer(
+                PathBuf::from(&row.project_path), "claude", "claude",
+                move |request| Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                        "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+                    "session/load" => {
+                        assert_eq!(request["params"]["sessionId"], expected_sid);
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                            "configOptions":[{"id":"model","name":"Model","type":"select",
+                                "category":"model","currentValue":"old-model","options":[
+                                    {"value":"old-model","name":"Old model"},
+                                    {"value":"new-model","name":"New model"}]}]
+                        }})
+                    },
+                    "session/set_config_option" => {
+                        assert_eq!(request["params"]["sessionId"], expected_sid);
+                        assert_eq!(request["params"]["configId"], "model");
+                        assert_eq!(request["params"]["value"], "new-model");
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                            "configOptions":[{"id":"model","name":"Model","type":"select",
+                                "category":"model","currentValue":"new-model","options":[
+                                    {"value":"old-model","name":"Old model"},
+                                    {"value":"new-model","name":"New model"}]}]
+                        }})
+                    },
+                    other => panic!("retry must only load the selected Native and apply the pick: {other}"),
+                }),
+            );
+            let events = scope.bind_external_launch(&id, config);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    tick.run(&state).await;
+                    if native.requests().iter().any(|method| method == "initialize") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap_or_else(|_| panic!(
+                "stored-pick recovery never reached its actual Native: attempted={}, parked={}, deferred={}",
+                tick.attempted.contains(&id), tick.parked.contains(&id),
+                tick.resume_deferred.contains_key(&id),
+            ));
+            let mut replacement = scope.observe_external_resume(id.clone(), events).await;
+            replacement.ready().await;
+            assert_ne!(replacement.lease.spawned_runner(), Some(original));
+            assert_eq!(pick().await.status(), StatusCode::ACCEPTED);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let event = replacement.next_event().await.expect("actual retry response");
+                    if matches!(event, crate::acp::Event::ConfigOptionsUpdated { options }
+                        if options.iter().any(|option|
+                            option.id == "model" && option.current_value == "new-model"))
+                    {
+                        break;
+                    }
+                }
+            }).await.expect("the actual Native confirms the retried model");
+            for row in [
+                find_instance(&state, &id).await.unwrap(),
+                support::load_instances_from_disk_for_test("test").into_iter().find(|row| row.id == id).unwrap(),
+            ] {
+                assert_eq!(row.agent_model.as_deref(), Some("new-model"));
+                assert_eq!(row.acp_session_id.as_deref(), Some(sid.as_str()));
+            }
+            assert_eq!(native.requests().iter()
+                .filter(|method| *method == "session/set_config_option").count(), 1);
+            assert_eq!(native.requests().iter()
+                .filter(|method| *method == "session/load").count(), 1);
+            assert!(!native.requests().iter().any(|method| method == "session/new"));
+        })).await;
     }
 
     /// An unknown effort is refused before the worker or storage see it. A
@@ -579,6 +711,7 @@ mod tests {
                 Ok(Json(SetConfigOptionRequest {
                     config_id: "effort".to_string(),
                     value: value.to_string(),
+                    request_nonce: None,
                 })),
             )
             .await

@@ -12,8 +12,6 @@ import { Duplex, Readable, Writable } from "node:stream";
 
 // One shim process serves one ACP connection, so module state is per connection.
 const sessions = new Map();
-// Resolves a parked prompt when session/cancel arrives.
-let parkedPromptResolve = null;
 // Current value of the SHIM_THOUGHT_LEVEL config option.
 let thoughtLevel = "medium";
 
@@ -57,13 +55,6 @@ await record(
   ) + "\n",
 );
 
-function park() {
-  return new Promise((resolve) => {
-    parkedPromptResolve = resolve;
-  }).then(() => ({ stopReason: "cancelled" }));
-}
-
-const textContent = (text) => [{ type: "content", content: { type: "text", text } }];
 const usage = (used, cost) => ({
   sessionUpdate: "usage_update",
   used,
@@ -235,62 +226,6 @@ async function handleNewSession(params) {
   return withConfigOptions({ sessionId });
 }
 
-/** Scenarios whose turn parks until session/cancel. */
-const PARKED_SCENARIOS = {
-  // Wraps up its accounting (cost usage), then never answers: ends as prompt_complete.
-  COST_THEN_SILENCE: [
-    { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wedged response complete" } },
-    usage(300, true),
-  ],
-  // Goes silent with no cost marker: the watchdog orphans the turn.
-  SILENCE_NO_COST: [
-    { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wedged mid-response" } },
-    usage(120, false),
-  ],
-  // A Claude async agent launch: the watchdog stays suppressed.
-  ASYNC_AGENT_ORPHAN: [
-    {
-      sessionUpdate: "tool_call",
-      toolCallId: "tc-async-agent-1",
-      title: "Research async target",
-      kind: "other",
-      status: "pending",
-      rawInput: { description: "Research target", prompt: "..." },
-    },
-    {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tc-async-agent-1",
-      status: "completed",
-      content: textContent("Async agent launched successfully.\nagentId: async-test-1 (internal ID)"),
-    },
-  ],
-  // A ScheduleWakeup whose interim update carries raw_input, then a cost marker
-  // the wakeup suppression must override.
-  WAKEUP_ORPHAN: [
-    {
-      sessionUpdate: "tool_call",
-      toolCallId: "tc-wakeup-1",
-      title: "ScheduleWakeup",
-      kind: "other",
-      status: "pending",
-      rawInput: { delaySeconds: 60, reason: "test scheduled wakeup", prompt: "continue" },
-    },
-    {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tc-wakeup-1",
-      status: "in_progress",
-      title: "ScheduleWakeup",
-      rawInput: { delaySeconds: 60, reason: "test scheduled wakeup", prompt: "continue" },
-    },
-    {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tc-wakeup-1",
-      status: "completed",
-      content: textContent("Next wakeup scheduled."),
-    },
-    usage(1200, true),
-  ],
-};
 
 async function handlePrompt(params, client) {
   if (!sessions.has(params.sessionId)) {
@@ -305,41 +240,6 @@ async function handlePrompt(params, client) {
   const chunk = (text) =>
     notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
 
-  // Checked in this order, as the scenarios' keywords are distinct.
-  for (const keyword of ["COST_THEN_SILENCE", "SILENCE_NO_COST", "ASYNC_AGENT_ORPHAN"]) {
-    if (userText.includes(keyword)) {
-      for (const update of PARKED_SCENARIOS[keyword]) await notify(update);
-      return park();
-    }
-  }
-
-  // A run_in_background Bash; WRAP_UP adds the cost marker that ends the
-  // turn's accounting, so the turn recovers instead of staying suppressed.
-  if (userText.includes("BACKGROUND_BASH_ORPHAN")) {
-    await notify({
-      sessionUpdate: "tool_call",
-      toolCallId: "tc-bg-orphan-1",
-      title: "Bash",
-      kind: "execute",
-      status: "pending",
-      rawInput: { command: "sleep 600", run_in_background: true },
-    });
-    await notify({
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tc-bg-orphan-1",
-      status: "completed",
-      content: textContent(
-        "Command running in background with ID: btest-orphan-1. Output is being written to: /tmp/x",
-      ),
-    });
-    if (userText.includes("WRAP_UP")) await notify(usage(1200, true));
-    return park();
-  }
-
-  if (userText.includes("WAKEUP_ORPHAN")) {
-    for (const update of PARKED_SCENARIOS.WAKEUP_ORPHAN) await notify(update);
-    return park();
-  }
 
   // SLOW spaces the events so a test can observe mid-turn UI.
   const pause = () => (userText.includes("SLOW") ? sleep(800) : undefined);
@@ -380,9 +280,6 @@ async function handlePrompt(params, client) {
 
   if (userText.includes("USAGE_AFTER_NO_COST")) {
     await notify({ sessionUpdate: "usage_update", used: 300, size: 200000 });
-  }
-  if (userText.includes("USAGE_OBSERVATION")) {
-    return park();
   }
 
   if (userText.includes("FS_READ_WRITE")) {
@@ -474,13 +371,6 @@ async function handlePrompt(params, client) {
   };
 }
 
-function handleCancel() {
-  if (parkedPromptResolve) {
-    const resolve = parkedPromptResolve;
-    parkedPromptResolve = null;
-    resolve();
-  }
-}
 
 async function bootstrap() {
   let inputWeb;
@@ -508,7 +398,6 @@ async function bootstrap() {
     .onRequest("session/set_mode", () => ({}))
     .onRequest("session/set_config_option", ({ params }) => handleSetConfigOption(params))
     .onRequest("session/prompt", ({ params, client }) => handlePrompt(params, client))
-    .onNotification("session/cancel", () => handleCancel())
     .onConnect((connection) => emitUnsolicitedNotifIfRequested(connection.client));
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {
     app.onRequest("session/delete", ({ params }) => handleDeleteSession(params));

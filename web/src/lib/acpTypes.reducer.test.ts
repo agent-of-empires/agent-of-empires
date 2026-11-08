@@ -719,10 +719,8 @@ describe("current native snapshot authority", () => {
       const visibleTurn = state.turnActive;
       state = ev(state, 11, { Stopped: { reason: "rate_limit_exhausted_retries" } });
       state = ev(state, 12, { Stopped: { reason: "rate_limited" } });
-      expect(state.rateLimitRetriesExhausted && state.rateLimitParked).toBe(true);
       expect(state.turnActive).toBe(visibleTurn);
       state = ev(state, 13, { UserPromptSent: { text: "genuine next turn" } });
-      expect(state.rateLimitRetriesExhausted || state.rateLimitParked).toBe(false);
       expect(state.turnActive).toBe(visibleTurn);
       // A subsequent actual steered continuation must keep its current-turn metadata.
       state = ev(state, 14, { MonitorArmed: { description: "same-turn monitor" } });

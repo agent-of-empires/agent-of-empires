@@ -5,70 +5,107 @@ use anyhow::Result;
 use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-#[derive(Deserialize)]
-pub(super) struct JsonRpcPeek {
-    #[serde(default)]
-    pub(super) id: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(super) method: Option<String>,
-}
+/// Decode once at framing acceptance. In particular, a duplicate correlation
+/// field must not gain last-wins semantics through `serde_json::Value`.
+struct NativeEnvelope(serde_json::Map<String, serde_json::Value>);
 
-/// The id is returned as its JSON value so the response echoes it verbatim (number vs string).
-pub(super) fn parse_request_value_id(line: &[u8]) -> Option<(serde_json::Value, String)> {
-    let peek: JsonRpcPeek = serde_json::from_slice(line).ok()?;
-    let id = peek.id?;
-    let method = peek.method?;
-    Some((id, method))
-}
+impl<'de> Deserialize<'de> for NativeEnvelope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EnvelopeVisitor;
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = NativeEnvelope;
 
-pub(super) fn parse_notification(line: &[u8]) -> Option<(String, serde_json::Value)> {
-    let mut value: serde_json::Value = serde_json::from_slice(line).ok()?;
-    if value.get("id").is_some_and(|id| !id.is_null()) {
-        return None;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a native JSON-RPC object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let reserved = match key.as_str() {
+                        "id" => Some("id"),
+                        "method" => Some("method"),
+                        "params" => Some("params"),
+                        "result" => Some("result"),
+                        "error" => Some("error"),
+                        _ => None,
+                    };
+                    if let Some(field) = reserved.filter(|_| fields.contains_key(&key)) {
+                        return Err(serde::de::Error::duplicate_field(field));
+                    }
+                    let value = map.next_value::<serde_json::Value>()?;
+                    fields.insert(key, value);
+                }
+                Ok(NativeEnvelope(fields))
+            }
+        }
+        deserializer.deserialize_map(EnvelopeVisitor)
     }
-    let method = value.get("method")?.as_str()?.to_string();
-    let params = value
-        .get_mut("params")
-        .map(std::mem::take)
-        .unwrap_or(serde_json::Value::Null);
-    Some((method, params))
 }
 
-/// A response with neither result nor error is a null result (`session/set_mode` answers `{}`).
+pub(super) enum NativeMessage {
+    Request {
+        agent_id: serde_json::Value,
+        method: String,
+        params: serde_json::Value,
+    },
+    Notification {
+        method: String,
+        params: serde_json::Value,
+    },
+    Response {
+        id: i64,
+        value: serde_json::Value,
+    },
+}
+
+pub(super) fn parse_native_message(line: &[u8]) -> Option<NativeMessage> {
+    let NativeEnvelope(mut fields) = serde_json::from_slice(line).ok()?;
+    match fields.get("method") {
+        Some(serde_json::Value::String(_)) => {
+            let serde_json::Value::String(method) = fields.remove("method")? else {
+                unreachable!()
+            };
+            let params = fields.remove("params").unwrap_or(serde_json::Value::Null);
+            match fields.remove("id").filter(|id| !id.is_null()) {
+                Some(agent_id) => Some(NativeMessage::Request {
+                    agent_id,
+                    method,
+                    params,
+                }),
+                None => Some(NativeMessage::Notification { method, params }),
+            }
+        }
+        Some(serde_json::Value::Null) | None => {
+            let id = fields.get("id")?.as_i64()?;
+            Some(NativeMessage::Response {
+                id,
+                value: serde_json::Value::Object(fields),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Missing result/error remains a null generic result, as in the existing
+/// set-mode transport. A malformed error stays unknown, never a fake success.
 pub(super) fn parse_agent_call_outcome(
-    line: &[u8],
-) -> Result<serde_json::Value, control_protocol::JsonRpcError> {
-    let mut value: serde_json::Value = match serde_json::from_slice(line) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(control_protocol::JsonRpcError::new(
-                control_protocol::DAEMON_GONE,
-                format!("agent response was not JSON: {e}"),
-            ))
-        }
-    };
-    if let Some(error) = value.get_mut("error").map(std::mem::take) {
-        if !error.is_null() {
-            return Err(serde_json::from_value(error.clone()).unwrap_or_else(|_| {
-                control_protocol::JsonRpcError::new(
-                    control_protocol::DAEMON_GONE,
-                    format!("agent error envelope was malformed: {error}"),
-                )
-            }));
-        }
+    mut value: serde_json::Value,
+) -> Result<Result<serde_json::Value, control_protocol::JsonRpcError>, serde_json::Error> {
+    if let Some(error) = value
+        .get_mut("error")
+        .map(std::mem::take)
+        .filter(|error| !error.is_null())
+    {
+        return Ok(Err(serde_json::from_value(error)?));
     }
-    Ok(value
+    Ok(Ok(value
         .get_mut("result")
         .map(std::mem::take)
-        .unwrap_or(serde_json::Value::Null))
-}
-
-pub(super) fn parse_response_id(line: &[u8]) -> Option<i64> {
-    let peek: JsonRpcPeek = serde_json::from_slice(line).ok()?;
-    if peek.method.is_some() {
-        return None;
-    }
-    peek.id?.as_i64()
+        .unwrap_or(serde_json::Value::Null)))
 }
 
 pub(super) const MAX_FRAME_BYTES: usize = control_protocol::MAX_AGENT_FRAME_BYTES;
@@ -100,18 +137,6 @@ pub(super) async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
 }
 
 #[derive(Deserialize)]
-pub(super) struct JsonRpcResponsePeek {
-    #[serde(default)]
-    pub(super) id: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(super) method: Option<String>,
-    #[serde(default)]
-    pub(super) result: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(super) error: Option<JsonRpcErrorPeek>,
-}
-
-#[derive(Deserialize)]
 pub(super) struct JsonRpcErrorPeek {
     #[serde(default)]
     pub(super) code: i32,
@@ -121,28 +146,30 @@ pub(super) struct JsonRpcErrorPeek {
     pub(super) data: Option<serde_json::Value>,
 }
 
-pub(super) fn parse_response(line: &[u8]) -> Option<(i64, PromptOutcome)> {
-    let peek: JsonRpcResponsePeek = serde_json::from_slice(line).ok()?;
-    if peek.method.is_some() {
-        return None;
+pub(super) fn parse_prompt_outcome(
+    mut value: serde_json::Value,
+) -> Result<PromptOutcome, serde_json::Error> {
+    if let Some(error) = value
+        .get_mut("error")
+        .map(std::mem::take)
+        .filter(|error| !error.is_null())
+    {
+        let error: JsonRpcErrorPeek = serde_json::from_value(error)?;
+        return Ok(PromptOutcome::Error {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        });
     }
-    let id = peek.id?.as_i64()?;
-    let outcome = if let Some(err) = peek.error {
-        PromptOutcome::Error {
-            code: err.code,
-            message: err.message,
-            data: err.data,
-        }
-    } else {
-        let stop_reason = peek
-            .result
-            .as_ref()
-            .and_then(|r| r.get("stopReason"))
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        PromptOutcome::Completed { stop_reason }
-    };
-    Some((id, outcome))
+    let stop_reason = value
+        .get_mut("result")
+        .and_then(|result| result.get_mut("stopReason"))
+        .map(std::mem::take)
+        .and_then(|reason| match reason {
+            serde_json::Value::String(reason) => Some(reason),
+            _ => None,
+        });
+    Ok(PromptOutcome::Completed { stop_reason })
 }
 
 #[cfg(test)]
@@ -150,7 +177,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_request_value_id_preserves_id_shape() {
+    fn native_request_preserves_id_shape() {
         let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
         type Case = (&'static [u8], Option<(serde_json::Value, String)>);
         let cases: Vec<Case> = vec![
@@ -171,7 +198,12 @@ mod tests {
         ];
         for (line, expected) in cases {
             assert_eq!(
-                parse_request_value_id(line),
+                parse_native_message(line).and_then(|message| match message {
+                    NativeMessage::Request {
+                        agent_id, method, ..
+                    } => Some((agent_id, method)),
+                    _ => None,
+                }),
                 expected,
                 "{}",
                 String::from_utf8_lossy(line)
@@ -180,11 +212,11 @@ mod tests {
     }
 
     #[test]
-    fn response_parsers_classify_lines() {
+    fn native_responses_classify_lines() {
         let completed = |reason: &str| PromptOutcome::Completed {
             stop_reason: Some(reason.into()),
         };
-        let cases: [(&[u8], Option<i64>, Option<(i64, PromptOutcome)>); 6] = [
+        let cases: [(&[u8], Option<i64>, Option<(i64, PromptOutcome)>); 9] = [
             (
                 br#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#,
                 Some(3),
@@ -210,11 +242,40 @@ mod tests {
             ),
             (br#"{"jsonrpc":"2.0","id":"x","result":{}}"#, None, None),
             (b"not json", None, None),
+            (br#"{"id":3,"id":4,"result":{}}"#, None, None),
+            (br#"{"id":3,"method":null,"method":null,"result":{}}"#, None, None),
+            (br#"{"id":3,"result":{},"result":{"stopReason":"end_turn"}}"#, None, None),
         ];
         for (line, id, response) in cases {
             let text = String::from_utf8_lossy(line);
-            assert_eq!(parse_response_id(line), id, "{text}");
-            assert_eq!(parse_response(line), response, "{text}");
+            let parsed = parse_native_message(line);
+            let actual_id = match &parsed {
+                Some(NativeMessage::Response { id, .. }) => Some(*id),
+                _ => None,
+            };
+            assert_eq!(actual_id, id, "{text}");
+            let actual_response = parsed.and_then(|message| match message {
+                NativeMessage::Response { id, value } => Some((
+                    id,
+                    parse_prompt_outcome(value).expect("canonical prompt outcome"),
+                )),
+                _ => None,
+            });
+            assert_eq!(actual_response, response, "{text}");
+        }
+    }
+
+    #[test]
+    fn malformed_native_error_is_unknown_for_prompt_and_agent_calls() {
+        for line in [
+            br#"{"id":3,"error":"not an error object"}"#.as_slice(),
+            br#"{"id":3,"error":{"code":"not a number","message":"failure"}}"#.as_slice(),
+        ] {
+            let Some(NativeMessage::Response { value, .. }) = parse_native_message(line) else {
+                panic!("numeric original response remains correlated");
+            };
+            assert!(parse_prompt_outcome(value.clone()).is_err());
+            assert!(parse_agent_call_outcome(value).is_err());
         }
     }
 }

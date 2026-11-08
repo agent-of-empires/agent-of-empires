@@ -888,288 +888,158 @@ fn mark_checkpoint_failure(
 mod tests {
     use super::*;
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn creation_boundary_preserves_negotiated_acp_capability() {
-        use crate::acp::{protocol::AcpBroadcastFrame, Event};
-        use crate::session::{Status, View};
-        let _home = crate::session::test_support::isolate_app_dir();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .unwrap()
-            .block_on(async {
+    async fn creation_boundary_preserves_negotiated_acp_capability() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::session::Status;
+        use std::time::Duration;
+
+        with_managed(|scope| {
+            Box::pin(async move {
                 for (initial, capable) in [(None, true), (Some(true), false)] {
-                    let mut row = Instance::new("capability race", "/tmp");
-                    row.source_profile = "default".into();
-                    row.tool = "claude".into();
-                    row.view = View::Structured;
-                    row.status = Status::Starting;
-                    row.lifecycle_generation = 7;
-                    row.acp_load_session_capable = initial;
-                    let id = row.id.clone();
-                    Storage::new_unwatched("default")
-                        .unwrap()
-                        .update(|rows, _| {
-                            *rows = vec![row.clone()];
-                            Ok(())
-                        })
-                        .unwrap();
-                    let state = crate::server::test_support::build_test_app_state(vec![row]);
-                    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-                    let generation = state.acp_supervisor.test_insert_worker(&id).await;
-                    let listener =
-                        tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
-                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                        while state.acp_events_tx.receiver_count() == 0 {
+                    let project = scope.tempdir();
+                    let (new_session, requested) = tokio::sync::oneshot::channel();
+                    let mut new_session = Some(new_session);
+                    let (config, peer) = scope.native_peer(project.path().into(), "claude", "claude", move |request| {
+                        let id = request.get("id")?;
+                        match request["method"].as_str()? {
+                            "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":capable}}})),
+                            "session/new" => {
+                                new_session.take().unwrap().send(id.clone()).unwrap();
+                                None
+                            }
+                            other => panic!("unexpected native request: {other}"),
+                        }
+                    });
+                    let managed = scope.spawn(config, "capability-race").await.unwrap();
+                    let request = tokio::time::timeout(Duration::from_secs(10), requested).await.unwrap().unwrap();
+                    let id = managed.id.clone();
+                    let state = scope.state.clone();
+                    let mut launching = {
+                        let mut rows = state.instances.write().await;
+                        let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                        row.acp_load_session_capable = initial;
+                        row.clone()
+                    };
+                    let generation = launching.lifecycle_generation;
+                    let listener = tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while state.acp_events_tx.receiver_count() < 2 {
                             tokio::task::yield_now().await;
                         }
-                    })
-                    .await
-                    .unwrap();
-                    assert_eq!(state.acp_events_tx.receiver_count(), 1);
-                    let (entered, observed) = tokio::sync::oneshot::channel();
-                    let (release, blocked) = std::sync::mpsc::channel();
+                    }).await.unwrap();
+                    peer.send(serde_json::json!({"jsonrpc":"2.0","id":request,"result":{"sessionId":format!("capability-{capable}")}})).await;
+                    managed.ready().await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while state.instances.read().await.iter().find(|row| row.id == id).unwrap().acp_load_session_capable != Some(capable) {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.unwrap();
                     let producer_state = state.clone();
                     let producer_id = id.clone();
-                    let native = tokio::task::spawn_blocking(move || {
-                        let native =
-                            NativeSessionStore::open(producer_state, "default", Some(producer_id))
-                                .unwrap();
-                        before_next_adoption_for_test(move || {
-                            entered.send(()).unwrap();
-                            blocked
-                                .recv_timeout(std::time::Duration::from_secs(10))
-                                .unwrap();
-                        });
-                        Arc::new(native)
-                    })
-                    .await
-                    .unwrap();
-                    let finalizer_state = state.clone();
-                    let finalizer_id = id.clone();
-                    let finalizer = tokio::spawn(async move {
-                        super::super::session_spawn::finish_structured_launch(
-                            &finalizer_state,
-                            native,
-                            &finalizer_id,
-                            7,
-                            Ok(()),
-                        )
-                        .await
-                    });
-                    tokio::time::timeout(std::time::Duration::from_secs(10), observed)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    state
-                        .acp_events_tx
-                        .send(AcpBroadcastFrame {
-                            native_subject: None,
-                            session_id: id.clone(),
-                            seq: 1,
-                            event: Arc::new(Event::PromptCapabilities {
-                                image: false,
-                                audio: false,
-                                embedded_context: false,
-                                load_session: Some(capable),
-                                steering: false,
-                            }),
-                            worker_generation: Some(generation),
-                            sidebar_status: None,
-                        })
-                        .unwrap();
-                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                        while !state.acp_events_tx.is_empty() {
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    let during = state.instances.read().await[0].acp_load_session_capable;
-                    release.send(()).unwrap();
-                    finalizer.await.unwrap().unwrap();
-                    assert_eq!(during, initial);
-                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                        while state.instances.read().await[0].acp_load_session_capable
-                            != Some(capable)
-                        {
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await
-                    .unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        let native = NativeSessionStore::open(producer_state, "test", Some(producer_id)).unwrap();
+                        launching.commit_created_launch(&native, generation, Status::Idle)
+                    }).await.unwrap().unwrap();
+                    assert_eq!(state.instances.read().await.iter().find(|row| row.id == id).unwrap().acp_load_session_capable, Some(capable));
                     listener.abort();
                     let _ = listener.await;
+                    managed.stop_and_forget().await;
                 }
-            });
+            })
+        }).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn created_launch_readiness_preserves_an_admitted_turn_and_newer_generation() {
-        use crate::acp::{protocol::AcpBroadcastFrame, Event};
-        use crate::session::{LifecycleReservationError, Status, View};
-        let _home = crate::session::test_support::isolate_app_dir();
-        for active in [false, true] {
-            let mut row = Instance::new("handshake race", "/tmp");
-            row.source_profile = "default".into();
-            row.view = View::Structured;
-            row.status = Status::Starting;
-            row.lifecycle_generation = 7;
-            let id = row.id.clone();
-            let storage = Storage::new_unwatched("default").unwrap();
-            storage
-                .update(|rows, _| {
-                    *rows = vec![row.clone()];
-                    Ok(())
-                })
-                .unwrap();
-            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            let listener =
-                tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while state.acp_events_tx.receiver_count() == 0 {
-                    tokio::task::yield_now().await;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::session::{LifecycleReservationError, Status};
+        use std::time::Duration;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for active in [false, true] {
+                    let project = scope.tempdir();
+                    let (prompt, requested) = tokio::sync::oneshot::channel();
+                    let mut prompt = Some(prompt);
+                    let (config, peer) = scope.native_peer(project.path().into(), "claude", "claude", move |request| {
+                        let id = request.get("id")?;
+                        match request["method"].as_str()? {
+                            "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}})),
+                            "session/new" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":format!("adoption-{active}")}})),
+                            "session/prompt" => { prompt.take().unwrap().send(id.clone()).unwrap(); None }
+                            other => panic!("unexpected native request: {other}"),
+                        }
+                    });
+                    let managed = scope.spawn(config, "handshake-race").await.unwrap();
+                    managed.ready().await;
+                    let state = scope.state.clone();
+                    let id = managed.id.clone();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while state.instances.read().await.iter().find(|row| row.id == id).unwrap().status != Status::Idle { tokio::task::yield_now().await; }
+                    }).await.unwrap();
+                    drop(state.session_service.prompt_submission(&id).await);
+                    let storage = Storage::open_unwatched("test").unwrap();
+                    storage.update(|rows, _| { rows.iter_mut().find(|row| row.id == id).unwrap().status = Status::Starting; Ok(()) }).unwrap();
+                    let mut row = {
+                        let mut rows = state.instances.write().await;
+                        let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                        row.status = Status::Starting;
+                        row.clone()
+                    };
+                    let generation = row.lifecycle_generation;
+                    let listener = tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while state.acp_events_tx.receiver_count() < 2 {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.unwrap();
+                    let producer_state = state.clone();
+                    let mut launching = row.clone();
+                    let request = if active {
+                        managed.send_prompt("hold this turn", &[]).await.unwrap();
+                        let request = tokio::time::timeout(Duration::from_secs(10), requested).await.unwrap().unwrap();
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            while !state.session_service.fold_control_state(&id).await.unwrap().turn_active { tokio::task::yield_now().await; }
+                        }).await.unwrap();
+                        Some(request)
+                    } else { None };
+                    tokio::task::spawn_blocking(move || {
+                        let native = NativeSessionStore::open(producer_state, "test", Some(launching.id.clone())).unwrap();
+                        launching.commit_created_launch(&native, generation, Status::Idle)
+                    }).await.unwrap().unwrap();
+                    let expected = if active { Status::Running } else { Status::Idle };
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while state.instances.read().await.iter().find(|row| row.id == id).unwrap().status != expected { tokio::task::yield_now().await; }
+                    }).await.unwrap();
+                    assert_eq!(state.session_service.fold_control_state(&id).await.unwrap().turn_active, active);
+                    if let Some(request) = request {
+                        peer.send(serde_json::json!({"jsonrpc":"2.0","id":request,"result":{"stopReason":"end_turn"}})).await;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            while state.session_service.fold_control_state(&id).await.unwrap().turn_active || state.instances.read().await.iter().find(|row| row.id == id).unwrap().status != Status::Idle { tokio::task::yield_now().await; }
+                        }).await.unwrap();
+                    }
+                    managed.stop_session().await;
+                    let stopped = storage.load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                    assert!(stopped.lifecycle_generation > generation);
+                    assert_eq!(stopped.status, Status::Stopped);
+                    let stopped_generation = stopped.lifecycle_generation;
+                    listener.abort();
+                    let _ = listener.await;
+                    let error = tokio::task::spawn_blocking(move || {
+                        let native = NativeSessionStore::open(state, "test", Some(id)).unwrap();
+                        row.commit_created_launch(&native, generation, Status::Idle)
+                    }).await.unwrap().unwrap_err();
+                    assert_eq!(error.downcast_ref::<LifecycleReservationError>(), Some(&LifecycleReservationError::Superseded));
+                    let persisted = storage.load().unwrap().into_iter().find(|stored| stored.id == managed.id).unwrap();
+                    assert_eq!(persisted.lifecycle_generation, stopped_generation);
+                    assert_eq!(persisted.status, Status::Stopped);
+                    scope.finish_conversation_case().await;
                 }
             })
-            .await
-            .unwrap();
-            let (committed, observed) = tokio::sync::oneshot::channel();
-            let (release, blocked) = std::sync::mpsc::channel();
-            let producer_state = state.clone();
-            let mut launching = row.clone();
-            let producer = tokio::task::spawn_blocking(move || {
-                let native =
-                    NativeSessionStore::open(producer_state, "default", Some(launching.id.clone()))
-                        .unwrap();
-                before_next_adoption_for_test(move || {
-                    committed.send(()).unwrap();
-                    blocked
-                        .recv_timeout(std::time::Duration::from_secs(10))
-                        .unwrap();
-                });
-                launching.commit_created_launch(&native, 7, Status::Idle)
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(10), observed)
-                .await
-                .unwrap()
-                .unwrap();
-            if active {
-                let event = Event::UserPromptSent {
-                    text: "hold this turn".into(),
-                    attachments: vec![],
-                    prompt_id: None,
-                    synthesized: false,
-                    origin_plugin: None,
-                };
-                state.acp_event_store.record(&id, 1, &event).unwrap();
-                state
-                    .acp_events_tx
-                    .send(AcpBroadcastFrame {
-                        session_id: id.clone(),
-                        seq: 1,
-                        event: Arc::new(event),
-                        worker_generation: None,
-                        native_subject: None,
-                        sidebar_status: None,
-                    })
-                    .unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while state.instances.read().await[0].status != Status::Running {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-                assert!(
-                    state
-                        .session_service
-                        .fold_control_state(&id)
-                        .await
-                        .turn_active
-                );
-            }
-            release.send(()).unwrap();
-            producer.await.unwrap().unwrap();
-            assert_eq!(
-                state.instances.read().await[0].status,
-                if active {
-                    Status::Running
-                } else {
-                    Status::Idle
-                },
-            );
-            if active {
-                assert!(
-                    state
-                        .session_service
-                        .fold_control_state(&id)
-                        .await
-                        .turn_active
-                );
-                let event = Event::Stopped {
-                    reason: "prompt_complete".into(),
-                };
-                state.acp_event_store.record(&id, 2, &event).unwrap();
-                let sidebar_status = state.acp_control_cache.apply_if_cached(&id, 2, &event);
-                state
-                    .acp_events_tx
-                    .send(AcpBroadcastFrame {
-                        session_id: id.clone(),
-                        seq: 2,
-                        event: Arc::new(event),
-                        worker_generation: None,
-                        native_subject: None,
-                        sidebar_status,
-                    })
-                    .unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while state.instances.read().await[0].status != Status::Idle {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-                assert!(
-                    !state
-                        .session_service
-                        .fold_control_state(&id)
-                        .await
-                        .turn_active
-                );
-            }
-            listener.abort();
-            let _ = listener.await;
-            storage
-                .update(|rows, _| {
-                    rows[0].lifecycle_generation = 8;
-                    rows[0].status = Status::Stopped;
-                    Ok(())
-                })
-                .unwrap();
-            {
-                let mut rows = state.instances.write().await;
-                rows[0].lifecycle_generation = 8;
-                rows[0].status = Status::Stopped;
-            }
-            let error = tokio::task::spawn_blocking(move || {
-                let native = NativeSessionStore::open(state, "default", Some(id)).unwrap();
-                row.commit_created_launch(&native, 7, Status::Idle)
-            })
-            .await
-            .unwrap()
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<LifecycleReservationError>(),
-                Some(&LifecycleReservationError::Superseded)
-            );
-            let persisted = storage.load().unwrap();
-            assert_eq!(persisted[0].lifecycle_generation, 8);
-            assert_eq!(persisted[0].status, Status::Stopped);
-        }
+        }).await;
     }
 
     #[tokio::test]
@@ -1383,6 +1253,7 @@ mod tests {
             let mut row = Instance::new("live structured", "/tmp");
             row.source_profile = "default".into();
             row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
             let prior_access = chrono::Utc::now() - chrono::Duration::days(2);
             row.last_accessed_at = Some(prior_access);
             row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));

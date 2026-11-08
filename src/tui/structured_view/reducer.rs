@@ -118,6 +118,9 @@ pub struct AcpTranscript {
     /// Authority belongs only to an accepted live snapshot, never transcript
     /// replay or management transport presence. Revoked across reconnect.
     pub native_snapshot_seq: Option<u64>,
+    /// Exact Original requests certified by the latest canonical live snapshot.
+    /// These allow only a reply to that nonce, never general native input.
+    pub original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
     pub connection_ready: bool,
     pub connection_unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
     pub prompt_wake_eligible: bool,
@@ -234,6 +237,7 @@ impl AcpTranscript {
             lagged: false,
             last_seq: 0,
             native_snapshot_seq: None,
+            original_decision_nonces: Vec::new(),
             connection_ready: false,
             connection_unavailable: None,
             prompt_wake_eligible: false,
@@ -242,6 +246,7 @@ impl AcpTranscript {
 
     pub fn revoke_native_authority(&mut self) {
         self.native_snapshot_seq = None;
+        self.original_decision_nonces.clear();
         self.connection_ready = false;
         self.connection_unavailable = None;
         self.prompt_wake_eligible = false;
@@ -255,6 +260,7 @@ impl AcpTranscript {
         for row in rows {
             upsert_transcript_row(&mut self.server_rows, row);
         }
+        crate::acp::transcript::project_transcript_clear_boundaries(&mut self.server_rows);
     }
 
     /// Apply one incremental transcript row change (a WS `transcript_delta`):
@@ -267,6 +273,7 @@ impl AcpTranscript {
             TranscriptDelta::Patch { row, .. } => patch_transcript_row(&mut self.server_rows, row),
             TranscriptDelta::Remove(id) => self.server_rows.retain(|r| r.id != id),
         }
+        crate::acp::transcript::project_transcript_clear_boundaries(&mut self.server_rows);
     }
 
     /// Drop the transcript rows ahead of a `?view=rows` rebuild, used when the
@@ -326,6 +333,7 @@ impl AcpTranscript {
         }
         self.last_seq = seq;
         self.native_snapshot_seq = Some(seq);
+        self.original_decision_nonces = state.original_decision_nonces;
         self.connection_unavailable = state.connection_unavailable;
         self.connection_ready = state.connection_ready && self.connection_unavailable.is_none();
         self.prompt_wake_eligible =
@@ -457,6 +465,7 @@ impl AcpTranscript {
 mod tests {
     use super::*;
     use crate::acp::approvals::{Approval, Nonce};
+    use crate::acp::event_sender::EventMetadata;
     use crate::acp::state::{
         AcpSessionId, AgentName, AuthStatusKind, Event, ThinkingSignal, ToolCall,
     };
@@ -476,61 +485,47 @@ mod tests {
         }
     }
 
-    /// Build the server's transcript rows for a sequence of events, the way
-    /// the daemon does before shipping them over the WS transcript channel /
-    /// `?view=rows`. Lets a test feed realistic rows without hand-writing
-    /// `TranscriptRow` literals.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
-        let mut m = TranscriptModel::new();
-        for (i, e) in events.iter().enumerate() {
-            m.apply_event(i as u64 + 1, e);
+        let mut model = TranscriptModel::new();
+        let metadata = EventMetadata::history();
+        for (index, event) in events.iter().enumerate() {
+            model.apply_scoped_event(index as u64 + 1, event, &metadata);
         }
-        m.rows().to_vec()
+        model.rows().to_vec()
     }
 
-    /// The daemon's control state, folded from `events` exactly as the WS
-    /// handler does before emitting a `reduced_state` frame.
     fn reduced(events: &[Event]) -> AcpState {
-        let mut s = AcpState::new(
+        let mut state = AcpState::new(
             AcpSessionId("s-1".into()),
             AgentName("claude".into()),
             Some("claude-opus-5".into()),
         );
-        for e in events {
-            s.apply_event(s.last_seq.saturating_add(1), e.clone())
+        let metadata = EventMetadata::history();
+        for event in events {
+            state
+                .apply_scoped_event(state.last_seq.saturating_add(1), event, &metadata)
                 .expect("apply ok");
         }
-        s
+        state
     }
 
-    /// The status bar reads `auth_status` straight off the transcript, so a
-    /// report and its clear must both survive `apply_reduced_state`.
     #[test]
     fn reduced_state_carries_auth_status_and_its_clear() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply_reduced_state(
-            1,
-            reduced(&[Event::AuthStatusUpdated {
-                status: Some(AuthStatus {
-                    kind: AuthStatusKind::Account,
-                    label: "Claude Max".into(),
-                    detail: None,
-                    account: None,
-                }),
-            }]),
-            &[],
-        );
-        let status = t.auth_status.as_ref().expect("reported");
+        let mut transcript = AcpTranscript::new("s-1");
+        let mut state = reduced(&[]);
+        state.auth_status = Some(AuthStatus {
+            kind: AuthStatusKind::Account,
+            label: "Claude Max".into(),
+            detail: None,
+            account: None,
+        });
+        transcript.apply_reduced_state(1, state, &[]);
+        let status = transcript.auth_status.as_ref().expect("reported");
         assert_eq!(status.label, "Claude Max");
         assert_eq!(status.kind, AuthStatusKind::Account);
 
-        // An adapter that cannot report clears it rather than going stale.
-        t.apply_reduced_state(
-            2,
-            reduced(&[Event::AuthStatusUpdated { status: None }]),
-            &[],
-        );
-        assert!(t.auth_status.is_none());
+        transcript.apply_reduced_state(2, reduced(&[]), &[]);
+        assert!(transcript.auth_status.is_none());
     }
 
     fn approval(nonce: &str) -> Approval {
@@ -581,36 +576,26 @@ mod tests {
         }
     }
 
-    /// The server omits cold fields this connection already holds (a ~30 KB
-    /// command list re-sent after every event dominated the socket). They
-    /// arrive as empty defaults, so adopting them blindly would blank the
-    /// slash and mode pickers mid-session.
     #[test]
     fn omitted_cold_fields_keep_their_current_value() {
-        let mut t = AcpTranscript::new("s-1");
-        let full = reduced(&[
-            Event::AvailableCommandsUpdated {
-                commands: vec![AvailableCommand {
-                    name: "review".into(),
-                    description: "Review".into(),
-                    accepts_input: false,
-                }],
-            },
-            Event::ModesAvailable {
-                current_mode_id: "plan".into(),
-                modes: vec![ModeInfo {
-                    id: "plan".into(),
-                    name: "Plan".into(),
-                    description: None,
-                }],
-            },
-        ]);
-        t.apply_reduced_state(1, full, &[]);
-        assert_eq!(t.available_commands.len(), 1);
-        assert_eq!(t.available_modes.len(), 1);
+        let mut transcript = AcpTranscript::new("s-1");
+        let mut full = reduced(&[]);
+        full.available_commands = vec![AvailableCommand {
+            name: "review".into(),
+            description: "Review".into(),
+            accepts_input: false,
+        }];
+        full.current_mode_id = Some("plan".into());
+        full.available_modes = vec![ModeInfo {
+            id: "plan".into(),
+            name: "Plan".into(),
+            description: None,
+        }];
+        transcript.apply_reduced_state(1, full, &[]);
+        assert_eq!(transcript.available_commands.len(), 1);
+        assert_eq!(transcript.available_modes.len(), 1);
 
-        // The next frame omits both, naming them as unchanged.
-        t.apply_reduced_state(
+        transcript.apply_reduced_state(
             2,
             reduced(&[]),
             &[
@@ -618,13 +603,12 @@ mod tests {
                 "available_modes".to_string(),
             ],
         );
-        assert_eq!(t.available_commands.len(), 1, "commands survived");
-        assert_eq!(t.available_modes.len(), 1, "modes survived");
+        assert_eq!(transcript.available_commands.len(), 1, "commands survived");
+        assert_eq!(transcript.available_modes.len(), 1, "modes survived");
 
-        // A frame that does NOT name them is authoritative, including empty.
-        t.apply_reduced_state(3, reduced(&[]), &[]);
-        assert!(t.available_commands.is_empty());
-        assert!(t.available_modes.is_empty());
+        transcript.apply_reduced_state(3, reduced(&[]), &[]);
+        assert!(transcript.available_commands.is_empty());
+        assert!(transcript.available_modes.is_empty());
     }
 
     /// #4001: a live background sub-agent must reach the TUI's busy
@@ -684,10 +668,15 @@ mod tests {
     fn task_activity_updates_when_the_subagent_list_is_omitted() {
         let mut transcript = AcpTranscript::new("s-1");
         transcript.apply_reduced_state(1, reduced(&[]), &[]);
-        let mut busy = reduced(&[]);
-        busy.background_tasks.push("task-1".into());
+        let busy = reduced(&[Event::BackgroundTaskStarted {
+            task_id: "task-1".into(),
+            tool_call_id: None,
+            description: "background task".into(),
+            workflow: None,
+        }]);
         transcript.apply_reduced_state(2, busy.clone(), &["background_agents".into()]);
         assert!(transcript.background_agent_active);
+        assert!(!transcript.turn_active);
         transcript.apply_reduced_state(3, reduced(&[]), &["background_agents".into()]);
         assert!(!transcript.background_agent_active);
         transcript.apply_reduced_state(4, busy, &[]);
@@ -758,7 +747,6 @@ mod tests {
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
-            fork_rejection: None,
         };
         let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),
@@ -813,43 +801,34 @@ mod tests {
 
     #[test]
     fn merge_server_rows_upserts_by_id_and_guards_rich_tool_start() {
-        // The snapshot / `?view=rows` reconcile is idempotent by id and must
-        // not let a sparse synth `tool_start` clobber a richer one already
-        // buffered (the #1713/#2711 seam, mirrored from web `mergeServerRows`).
-        let mut t = AcpTranscript::new("s-1");
-        let rich = TranscriptModel::new();
-        let mut m = rich;
-        let mut tc = tool("dup", "Bash");
-        tc.args_preview = r#"{"x":1}"#.into();
-        m.apply_event(1, &Event::ToolCallStarted { tool_call: tc });
-        let rich_rows = m.rows().to_vec();
-        t.merge_server_rows(rich_rows.clone());
-        // Re-applying the same rows is a no-op (idempotent overlap).
-        t.merge_server_rows(rich_rows);
+        let mut transcript = AcpTranscript::new("s-1");
+        let mut rich_tool = tool("dup", "Bash");
+        rich_tool.args_preview = r#"{"x":1}"#.into();
+        let rich_rows = server_rows(&[Event::ToolCallStarted {
+            tool_call: rich_tool,
+        }]);
+        transcript.merge_server_rows(rich_rows.clone());
+        transcript.merge_server_rows(rich_rows);
         assert_eq!(
-            t.server_rows
+            transcript
+                .server_rows
                 .iter()
-                .filter(|r| r.kind == TranscriptRowKind::ToolStart)
+                .filter(|row| row.kind == TranscriptRowKind::ToolStart)
                 .count(),
             1
         );
-        // A sparse synth start for the same id must not overwrite the args.
-        let mut sparse = TranscriptModel::new();
-        sparse.apply_event(
-            1,
-            &Event::ToolCallStarted {
-                tool_call: ToolCall {
-                    kind: "other".into(),
-                    args_preview: String::new(),
-                    ..tool("dup", "Bash")
-                },
+
+        transcript.merge_server_rows(server_rows(&[Event::ToolCallStarted {
+            tool_call: ToolCall {
+                kind: "other".into(),
+                args_preview: String::new(),
+                ..tool("dup", "Bash")
             },
-        );
-        t.merge_server_rows(sparse.rows().to_vec());
-        let start = t
+        }]));
+        let start = transcript
             .server_rows
             .iter()
-            .find(|r| r.kind == TranscriptRowKind::ToolStart)
+            .find(|row| row.kind == TranscriptRowKind::ToolStart)
             .unwrap();
         assert_eq!(
             start.tool.as_ref().unwrap().args_preview,

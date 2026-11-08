@@ -1,12 +1,13 @@
-//! Control protocol v5 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`.
 
+use crate::acp::establishment::NativeReplayClosure;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -14,14 +15,15 @@ pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Hard cap on a single control frame.
 pub const MAX_CONTROL_FRAME_BYTES: u32 = MAX_AGENT_FRAME_BYTES as u32 + 64 * 1024;
 
-/// Bound on the runner-to-daemon control queue. A detached runner buffers
-/// outbound frames until a daemon reattaches, so it must never retain an
-/// unbounded number of large JSON values, yet one maximum-sized ACP frame
-/// must still fit. This backlog is exactly what a reattaching daemon replays,
-/// so the daemon's pending-replay buffer is sized against the same contract:
-/// a legitimate reattach must be able to accept the whole flushed queue.
+/// Detached ordinary queue bound; SDK replay also covers bounded bootstrap
+/// slots and retained completion/loss items. Original wire bytes, not expanded
+/// typed JSON, determine its byte charge.
 pub const MAX_CONTROL_QUEUE_FRAMES: usize = 4096;
 pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Actual cached handshake replies and replay fences may borrow these slots.
+/// Further management waits for real writes; the byte bound is unchanged.
+pub(crate) const CONTROL_BOOTSTRAP_RESERVED_FRAMES: usize = 2;
 
 /// Retained completion and sticky loss each add one replay item outside the
 /// ordinary queue. Completion bytes use the actual cached wire length; only
@@ -29,6 +31,22 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const CONTROL_REPLAY_RESERVED_FRAMES: usize = 2;
 pub(super) const MAX_COMPLETION_MARKER_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_LOSS_FRAME_BYTES: usize = 256;
+
+pub(crate) fn session_scoped_callback(method: &str, params: &serde_json::Value) -> bool {
+    params.get("sessionId").is_some()
+        || (params.get(0).is_some()
+            && matches!(
+                method,
+                "session/request_permission"
+                    | "fs/read_text_file"
+                    | "fs/write_text_file"
+                    | "terminal/create"
+                    | "terminal/output"
+                    | "terminal/release"
+                    | "terminal/wait_for_exit"
+                    | "terminal/kill"
+            ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,8 +58,8 @@ pub enum HandshakeFailureOrigin {
     Unknown,
 }
 
-#[derive(Debug)]
-pub(crate) struct HandshakeFailure {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandshakeFailure {
     pub origin: HandshakeFailureOrigin,
     pub error: serde_json::Value,
 }
@@ -90,11 +108,84 @@ pub(crate) struct NativeChannelLostMarker {}
 /// session's [`ControlBody::SessionReady`]. Frames go out handshake first, so
 /// it follows the updates the agent sent before its reply; the daemon handles
 /// it only once that replay has been applied.
-#[derive(
-    Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
 #[notification(method = "_aoe/session_replayed")]
-pub struct SessionReplayed {}
+pub struct SessionReplayed {
+    pub attempt_id: crate::acp::establishment::AttemptId,
+    pub closure: crate::acp::establishment::NativeReplayClosure,
+    pub delivery: NativeReplayDelivery,
+}
+
+/// The fixed portion of the original notification range this attachment owes.
+/// It is not a replacement for the original closure or its historical commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReplayDelivery {
+    pub after: u64,
+    pub through: u64,
+    pub lost: bool,
+}
+
+impl NativeReplayDelivery {
+    pub(crate) fn original(closure: NativeReplayClosure) -> Self {
+        Self {
+            after: 0,
+            through: closure.notifications,
+            lost: closure.lost,
+        }
+    }
+
+    pub(crate) fn matches(self, closure: NativeReplayClosure) -> bool {
+        self.after <= self.through
+            && self.through == closure.notifications
+            && !self.lost
+            && closure.closed
+            && !closure.lost
+    }
+}
+
+/// Original native notification ordinal, private to the owned control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReplayFrame {
+    pub attempt_id: crate::acp::establishment::AttemptId,
+    pub ordinal: u64,
+}
+
+/// Native ingress evidence, captured before any control or SDK queue wait.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeNotifyEvidence {
+    /// Physical transport/row provenance, never content authorship or an ACK.
+    pub(crate) physical_source: Option<crate::acp::state::NativePhysicalSource>,
+    pub(crate) session_stamp: Option<crate::acp::establishment::NativeSessionStamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) original_request_stamp: Option<crate::acp::establishment::OriginalRequestStamp>,
+    /// Sparse resource START authority only; never public Session scope or RPC correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resource_start_stamp: Option<crate::acp::establishment::NativeSessionStamp>,
+    pub(crate) prompt_observation: Option<crate::acp::protocol::AcpPromptObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePromptHead {
+    pub(crate) prompt_req_id: i64,
+    pub(crate) scope: crate::acp::establishment::NativeRequestScope,
+    pub(crate) window_id: crate::acp::protocol::AcpPromptWindowId,
+}
+
+/// Exact original RPC evidence, not permission for another business request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePromptCompletionEvidence {
+    pub(crate) origin: crate::acp::state::NativeEventOrigin,
+    pub(crate) prompt_req_id: i64,
+    pub(crate) scope: crate::acp::establishment::NativeRequestScope,
+    pub(crate) receipt: std::sync::Arc<crate::acp::establishment::NativeEstablishmentReceipt>,
+    pub(crate) window_id: crate::acp::protocol::AcpPromptWindowId,
+    pub(crate) uncertain_output: bool,
+}
 
 /// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
 /// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
@@ -105,13 +196,28 @@ pub struct SessionReplayed {}
 pub(crate) struct PromptCompletedMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted: Option<Box<AdoptedPromptCompletion>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_req_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AdoptedPromptCompletion {
-    pub turn: u64,
+    pub turn: Option<u64>,
+    pub prompt_req_id: i64,
+    pub outcome_kind: AdoptedPromptOutcomeKind,
     pub diagnostic: Option<AdoptedPromptDiagnostic>,
     pub reason: String,
+    pub evidence: Option<Box<NativePromptCompletionEvidence>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdoptedPromptOutcomeKind {
+    Completed,
+    Error,
+    Aborted,
 }
 
 /// Private ingress markers admit only prompt diagnostics, never arbitrary
@@ -128,6 +234,17 @@ impl AdoptedPromptDiagnostic {
                 | crate::acp::state::Event::RateLimit { .. }
         )
         .then_some(Self(event))
+    }
+
+    pub(crate) fn inherit_rate_limit_hint(
+        &mut self,
+        hint: impl FnOnce() -> Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        if let crate::acp::state::Event::RateLimit { info } = &mut self.0 {
+            if info.resets_at.is_none() {
+                info.resets_at = hint();
+            }
+        }
     }
 
     pub(crate) fn into_event(self) -> crate::acp::state::Event {
@@ -151,14 +268,24 @@ pub enum ControlBody {
     Hello {
         control_protocol_version: u32,
         session_id: String,
+        prompt_head: Option<NativePromptHead>,
     },
     /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
     /// `initialize` result (an `InitializeResponse` serialized to JSON).
     Initialized { result: serde_json::Value },
+    /// Observational custody of the one original invocation, not its outcome.
+    OriginalEstablishment {
+        invocation: std::sync::Arc<crate::acp::establishment::NativeEstablishmentReceipt>,
+    },
     SessionReady {
         acp_session_id: String,
-        result: serde_json::Value,
+        result: std::sync::Arc<serde_json::Value>,
         native_channel: NativeChannelAvailability,
+        receipt: std::sync::Arc<crate::acp::establishment::NativeEstablishmentReceipt>,
+        postimage: Option<std::sync::Arc<crate::acp::establishment::EstablishmentPostimage>>,
+        original_delivery: bool,
+        delivery: NativeReplayDelivery,
+        local_failure: Option<std::sync::Arc<HandshakeFailure>>,
     },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
@@ -167,14 +294,26 @@ pub enum ControlBody {
         origin: HandshakeFailureOrigin,
         error: serde_json::Value,
     },
+    EstablishmentFailed {
+        receipt: std::sync::Arc<crate::acp::establishment::NativeEstablishmentReceipt>,
+        error: std::sync::Arc<serde_json::Value>,
+        origin: HandshakeFailureOrigin,
+        original_delivery: bool,
+        delivery: NativeReplayDelivery,
+    },
     /// The runner assigned the canonical JSON-RPC id for this attachment's
     /// [`ControlBody::Prompt`].
-    PromptStarted { prompt_req_id: i64 },
+    PromptStarted {
+        prompt_req_id: i64,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+        window_id: crate::acp::protocol::AcpPromptWindowId,
+    },
     /// The runner observed the agent's response to the `session/prompt`
     /// request it issued.
     PromptCompleted {
         prompt_req_id: i64,
         outcome: PromptOutcome,
+        evidence: Option<Box<NativePromptCompletionEvidence>>,
     },
     /// Sticky runner-owned native I/O loss. Management and process ownership
     /// survive; this is neither a peer JSON-RPC error nor a prompt outcome.
@@ -190,11 +329,18 @@ pub enum ControlBody {
         call_id: u64,
         method: String,
         params: serde_json::Value,
+        evidence: NativeNotifyEvidence,
     },
+    /// The attachment's reverse-call write attempt has terminated locally.
+    /// This does not claim Native delivery, success, or a peer response.
+    ServerCallSettled { call_id: u64 },
     /// A fire-and-forget agent notification, forwarded verbatim.
     Notify {
         method: String,
         params: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replay: Option<NativeReplayFrame>,
+        evidence: NativeNotifyEvidence,
     },
     /// The runner's answer to a [`ControlBody::AgentCall`]: the agent's
     /// raw JSON-RPC `result`.
@@ -220,20 +366,27 @@ pub enum ControlBody {
     EstablishSession {
         method: String,
         request: serde_json::Value,
+        attempt: std::sync::Arc<crate::acp::establishment::EstablishmentAttempt>,
+        store: Option<crate::session::ExecutionBinding>,
     },
     /// Return the established session without sending an ACP load/new request.
     ResumeSession,
     /// Run a turn.
-    Prompt { request: serde_json::Value },
+    Prompt {
+        request: serde_json::Value,
+        scope: crate::acp::establishment::NativeRequestScope,
+    },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
-    Cancel,
-    /// A client-to-agent request the runner does not own: `session/set_mode`,
-    /// `session/set_config_option`, `session/delete`, `_session/steering`,
-    /// or a conversation-reset `session/new`.
+    Cancel {
+        scope: crate::acp::establishment::NativeRequestScope,
+    },
+    /// A non-establishing client-to-agent request. `session/new`, load and fork
+    /// must use the correlated EstablishSession operation.
     AgentCall {
         call_id: u64,
         method: String,
         params: serde_json::Value,
+        scope: crate::acp::establishment::NativeRequestScope,
     },
     /// The daemon's answer to a [`ControlBody::ServerCall`]: the JSON-RPC
     /// `result` to hand back to the agent.
@@ -256,6 +409,9 @@ pub struct JsonRpcError {
 
 /// JSON-RPC "internal error".
 pub const INTERNAL_ERROR: i64 = -32603;
+
+/// JSON-RPC invalid parameters, including missing establishment authority.
+pub const INVALID_PARAMS: i64 = -32602;
 
 /// Reserved-range code for "the daemon went away before answering".
 pub const DAEMON_GONE: i64 = -32001;
@@ -363,120 +519,82 @@ pub(crate) async fn read_frame_with_size<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::JsonRpcMessage;
     use std::io::Cursor;
 
-    fn roundtrip(body: ControlBody) -> ControlBody {
-        let encoded = encode_frame(&body).expect("encode");
-        // Length prefix plus a body that deserializes back to the same value.
-        let len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
-        assert_eq!(len as usize, encoded.len() - 4);
-        serde_json::from_slice(&encoded[4..]).expect("decode")
-    }
-
-    /// Every frame the two sides exchange survives the length-prefixed encoding.
-    #[test]
-    fn control_frames_roundtrip() {
-        for body in [
-            ControlBody::Hello {
-                control_protocol_version: CONTROL_PROTOCOL_VERSION,
-                session_id: "abc-123".into(),
-            },
-            ControlBody::Attach {
-                control_protocol_version: CONTROL_PROTOCOL_VERSION,
-            },
-            ControlBody::Initialize {
-                request: serde_json::json!({"protocolVersion": 1}),
-            },
-            ControlBody::Initialized {
-                result: serde_json::json!({"agentCapabilities": {}}),
-            },
-            ControlBody::EstablishSession {
-                method: "session/new".into(),
-                request: serde_json::json!({"cwd": "/tmp"}),
-            },
-            ControlBody::SessionReady {
-                acp_session_id: "sess-1".into(),
-                result: serde_json::json!({"sessionId": "sess-1"}),
-                native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available,
-            },
-            ControlBody::ResumeSession,
-            ControlBody::HandshakeFailed {
-                method: "initialize".into(),
-                origin: HandshakeFailureOrigin::NativeResponse,
-                error: serde_json::json!({"code": -32603, "message": "incompatible"}),
-            },
-            ControlBody::Prompt {
-                request: serde_json::json!({"sessionId": "sess-1", "prompt": []}),
-            },
-            ControlBody::PromptStarted { prompt_req_id: 42 },
-            ControlBody::Cancel,
-            ControlBody::PromptCompleted {
-                prompt_req_id: 42,
-                outcome: PromptOutcome::Completed {
-                    stop_reason: Some("end_turn".into()),
-                },
-            },
-            ControlBody::PromptCompleted {
-                prompt_req_id: 1,
-                outcome: PromptOutcome::Completed { stop_reason: None },
-            },
-            ControlBody::PromptCompleted {
-                prompt_req_id: 1,
-                outcome: PromptOutcome::Error {
-                    code: -32000,
-                    message: "boom".into(),
-                    data: Some(serde_json::json!({"errorKind": "rate_limit"})),
-                },
-            },
-            ControlBody::PromptCompleted {
-                prompt_req_id: 1,
-                outcome: PromptOutcome::Aborted,
-            },
-            ControlBody::ServerCall {
-                call_id: 1,
-                method: "session/request_permission".into(),
-                params: serde_json::json!({"sessionId": "s"}),
-            },
-            ControlBody::ServerResult {
-                call_id: 1,
-                result: serde_json::json!({"outcome": {"outcome": "cancelled"}}),
-            },
-            ControlBody::ServerError {
-                call_id: 1,
-                error: JsonRpcError::new(INTERNAL_ERROR, "no handler"),
-            },
-            ControlBody::Notify {
-                method: "session/update".into(),
-                params: serde_json::json!({"sessionId": "s"}),
-            },
-            ControlBody::AgentCall {
-                call_id: 2,
-                method: "session/set_mode".into(),
-                params: serde_json::json!({"modeId": "default"}),
-            },
-            ControlBody::AgentResult {
-                call_id: 2,
-                result: serde_json::json!({}),
-            },
-            ControlBody::AgentError {
-                call_id: 2,
-                error: JsonRpcError {
-                    code: DAEMON_GONE,
-                    message: "gone".into(),
-                    data: Some(serde_json::json!({"errorKind": "rate_limit"})),
-                },
-            },
-        ] {
-            assert_eq!(roundtrip(body.clone()), body);
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn original_replay_closes_on_a_native_result_or_error() {
+        use crate::process::runner::test_support::OwnedNativeFixture;
+        {
+            let mut native = OwnedNativeFixture::load("sess-1");
+            native.begin().await;
+            let request = native.read_request().await;
+            let descriptor = native.original_descriptor().await;
+            assert!(matches!(descriptor,
+                ControlBody::OriginalEstablishment { invocation }
+                    if invocation.attempt.as_ref() == native.attempt.as_ref()
+                        && !invocation.replay.closed
+            ));
+            native
+                .deliver(&serde_json::json!({
+                    "jsonrpc":"2.0","method":"session/update",
+                    "params":{"sessionId":"sess-1","update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"original native bootstrap"}
+                    }}
+                }))
+                .await;
+            native
+                .deliver(&serde_json::json!({
+                    "jsonrpc":"2.0","id":request["id"],
+                    "result":{"sessionId":"sess-1"}
+                }))
+                .await;
+            native.wait_for_frame(|frame| matches!(frame,
+                ControlBody::Notify { method, .. } if SessionReplayed::matches_method(method)
+            )).await;
+            native.join_observer().await;
+            let frames = native.frames().await;
+            assert!(frames.iter().any(|frame| matches!(frame,
+                ControlBody::SessionReady { receipt, postimage: Some(_), .. }
+                    if receipt.attempt.as_ref() == native.attempt.as_ref()
+                        && receipt.replay.closed && receipt.replay.notifications == 1
+            )));
+            assert!(frames.iter().any(|frame| matches!(frame,
+                ControlBody::Notify { replay: Some(replay), .. }
+                    if replay.attempt_id == native.attempt.id && replay.ordinal == 1
+            )));
+        }
+        {
+            let mut native = OwnedNativeFixture::fork("original-parent");
+            native.begin().await;
+            let request = native.read_request().await;
+            native
+                .deliver(&serde_json::json!({
+                    "jsonrpc":"2.0","id":request["id"],
+                    "error":{"code":-32603,"message":"native fork rejected"}
+                }))
+                .await;
+            native.wait_for_frame(|frame| matches!(frame,
+                ControlBody::Notify { method, .. } if SessionReplayed::matches_method(method)
+            )).await;
+            let frames = native.frames().await;
+            assert!(frames.iter().any(|frame| matches!(frame,
+                ControlBody::EstablishmentFailed {
+                    origin: HandshakeFailureOrigin::NativeResponse, receipt, ..
+                } if receipt.attempt.as_ref() == native.attempt.as_ref()
+            )));
         }
     }
 
     #[tokio::test]
     async fn frames_read_in_order_within_bounds() {
-        let body = ControlBody::AgentCall {
-            call_id: 1,
-            method: "session/prompt".into(),
+        let body = ControlBody::Notify {
+            method: "session/update".into(),
             params: serde_json::json!({"blob": "x".repeat(17 * 1024 * 1024)}),
+            replay: None,
+            evidence: NativeNotifyEvidence::default(),
         };
         let encoded = encode_frame(&body).expect("17 MiB agent payload fits the shared cap");
         assert!(encoded.len() > 17 * 1024 * 1024);
@@ -497,12 +615,14 @@ mod tests {
         let a = ControlBody::Hello {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
+            prompt_head: None,
         };
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,
             outcome: PromptOutcome::Completed {
                 stop_reason: Some("cancelled".into()),
             },
+            evidence: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &a).await.unwrap();

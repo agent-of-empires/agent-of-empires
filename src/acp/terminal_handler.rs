@@ -2,13 +2,13 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::acp::establishment::NativeRequestContext;
 use crate::containers::container_interface::{docker_env_args, EnvEntry};
 
 /// Routing target for a terminal command.
@@ -25,10 +25,12 @@ pub enum TerminalError {
     Io(#[from] std::io::Error),
     #[error("terminal {0} does not exist")]
     UnknownTerminal(String),
+    #[error("terminal authority refused: {0}")]
+    Authority(String),
 }
 
 /// Identifier returned to the agent on `terminal/create`.
-pub type TerminalId = String;
+pub type TerminalId = Arc<str>;
 
 /// One terminal's captured output and exit status.
 #[derive(Debug, Clone)]
@@ -46,7 +48,36 @@ pub struct TerminalManager {
 
 #[derive(Debug, Default)]
 struct TerminalManagerInner {
-    outputs: std::collections::HashMap<TerminalId, TerminalOutput>,
+    outputs: std::collections::HashMap<TerminalId, Arc<TerminalEntry>>,
+}
+
+#[derive(Debug)]
+struct TerminalEntry {
+    id: TerminalId,
+    output: TerminalOutput,
+    source: Option<Arc<NativeRequestContext>>,
+}
+
+/// Pins the actual allocation, not a terminal ID to look up after waiting.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedTerminal {
+    entry: Arc<TerminalEntry>,
+}
+
+impl CapturedTerminal {
+    pub(crate) fn with_output<T>(
+        &self,
+        read: impl FnOnce(&TerminalOutput) -> T,
+    ) -> Result<T, TerminalError> {
+        let _source = self
+            .entry
+            .source
+            .as_deref()
+            .map(NativeRequestContext::try_owned_resource_guard)
+            .transpose()
+            .map_err(|error| TerminalError::Authority(error.to_string()))?;
+        Ok(read(&self.entry.output))
+    }
 }
 
 /// Build the `docker exec` argv and inherit-env pairs for a sandboxed
@@ -77,15 +108,17 @@ impl TerminalManager {
 
     /// Spawn a one-shot terminal: run a command, wait for exit, capture
     /// stdout/stderr.
-    pub async fn create_and_run(
+    pub(crate) async fn create_and_run(
         &self,
         session_id: &str,
-        command: &str,
-        args: Vec<String>,
+        command: (&str, Vec<String>),
         cwd: PathBuf,
         sandbox: Option<&TerminalSandbox>,
+        source: Option<Arc<NativeRequestContext>>,
+        spawn: impl FnOnce(&mut Command) -> Result<tokio::process::Child, TerminalError>,
     ) -> Result<TerminalId, TerminalError> {
-        let id = format!("term-{}", uuid::Uuid::new_v4().simple());
+        let (command, args) = command;
+        let id: TerminalId = format!("term-{}", uuid::Uuid::new_v4().simple()).into();
         info!(
             target: "acp.terminal",
             session = %session_id,
@@ -96,32 +129,37 @@ impl TerminalManager {
             "terminal/create"
         );
 
-        let child = match sandbox {
-            Some(s) => {
-                let runtime = crate::containers::get_container_runtime();
-                let binary = runtime.base.binary;
-                let (full_args, inherit_pairs) = build_sandbox_exec_args(s, &cwd, command, &args);
-                let mut cmd = Command::new(binary);
-                cmd.args(&full_args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
-                for (k, v) in inherit_pairs {
-                    cmd.env(k, v);
+        let child = {
+            let _current = source
+                .as_deref()
+                .map(NativeRequestContext::try_original_io_guard)
+                .transpose()
+                .map_err(|error| TerminalError::Authority(error.to_string()))?;
+            let mut command = match sandbox {
+                Some(s) => {
+                    let runtime = crate::containers::get_container_runtime();
+                    let (full_args, inherit_pairs) =
+                        build_sandbox_exec_args(s, &cwd, command, &args);
+                    let mut command = Command::new(runtime.base.binary);
+                    command.args(full_args);
+                    for (key, value) in inherit_pairs {
+                        command.env(key, value);
+                    }
+                    command
                 }
-                cmd.spawn()?
-            }
-            None => Command::new(command)
-                .args(&args)
-                .current_dir(&cwd)
+                None => {
+                    let mut command = Command::new(command);
+                    command.args(args).current_dir(cwd);
+                    command
+                }
+            };
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                // Kill the child if the prompt task is dropped on a
-                // force-stop / cancel-escalation worker teardown.
-                .kill_on_drop(true)
-                .spawn()?,
+                .kill_on_drop(true);
+            // Original I/O and connection admission cover spawn, never the output await.
+            spawn(&mut command)?
         };
 
         // Drain stdout, stderr, and wait() concurrently; sequential reads deadlock on a full pipe.
@@ -132,23 +170,64 @@ impl TerminalManager {
             exit_code: raw.status.code(),
         };
 
-        self.inner.lock().await.outputs.insert(id.clone(), output);
+        let entry = Arc::new(TerminalEntry {
+            id: Arc::clone(&id),
+            output,
+            source,
+        });
+        self.inner
+            .lock()
+            .expect("terminal manager lock")
+            .outputs
+            .insert(Arc::clone(&id), entry);
         Ok(id)
     }
 
-    /// Returns the captured output of a terminal.
-    pub async fn output(&self, terminal_id: &str) -> Result<TerminalOutput, TerminalError> {
-        let inner = self.inner.lock().await;
-        inner
+    /// Capture the original entry before a callback can suspend.
+    pub(crate) fn capture(
+        &self,
+        terminal_id: &str,
+        caller: Option<&NativeRequestContext>,
+    ) -> Result<CapturedTerminal, TerminalError> {
+        let entry = self
+            .inner
+            .lock()
+            .expect("terminal manager lock")
             .outputs
             .get(terminal_id)
             .cloned()
-            .ok_or_else(|| TerminalError::UnknownTerminal(terminal_id.into()))
+            .ok_or_else(|| TerminalError::UnknownTerminal(terminal_id.into()))?;
+        let owned = match (entry.source.as_deref(), caller) {
+            (Some(source), Some(caller)) => source.same_callback_source(caller),
+            (None, None) => true,
+            _ => false,
+        };
+        if !owned {
+            return Err(TerminalError::Authority(
+                "terminal original source changed".into(),
+            ));
+        }
+        Ok(CapturedTerminal { entry })
     }
 
-    /// Drop captured output.
-    pub async fn release(&self, terminal_id: &str) {
-        self.inner.lock().await.outputs.remove(terminal_id);
+    /// Remove only the captured allocation. Repeated cleanup stays idempotent.
+    pub(crate) fn release(&self, terminal: &CapturedTerminal) -> Result<(), TerminalError> {
+        let _source = terminal
+            .entry
+            .source
+            .as_deref()
+            .map(NativeRequestContext::try_owned_resource_guard)
+            .transpose()
+            .map_err(|error| TerminalError::Authority(error.to_string()))?;
+        let mut inner = self.inner.lock().expect("terminal manager lock");
+        if inner
+            .outputs
+            .get(terminal.entry.id.as_ref())
+            .is_some_and(|entry| Arc::ptr_eq(entry, &terminal.entry))
+        {
+            inner.outputs.remove(terminal.entry.id.as_ref());
+        }
+        Ok(())
     }
 }
 
@@ -162,18 +241,32 @@ mod tests {
         let mgr = TerminalManager::new();
         let cwd = std::env::temp_dir();
         let id = mgr
-            .create_and_run("s-1", "echo", vec!["hello".into()], cwd, None)
+            .create_and_run(
+                "s-1",
+                ("echo", vec!["hello".into()]),
+                cwd,
+                None,
+                None,
+                |command| Ok(command.spawn()?),
+            )
             .await
             .unwrap();
-        let out = mgr.output(&id).await.unwrap();
-        assert!(out.stdout.contains("hello"));
-        assert_eq!(out.exit_code, Some(0));
+        let terminal = mgr.capture(&id, None).unwrap();
+        terminal
+            .with_output(|out| {
+                assert!(out.stdout.contains("hello"));
+                assert_eq!(out.exit_code, Some(0));
+            })
+            .unwrap();
 
-        mgr.release(&id).await;
-        mgr.release(&id).await;
-        mgr.release("never-existed").await;
+        mgr.release(&terminal).unwrap();
+        mgr.release(&terminal).unwrap();
         assert!(matches!(
-            mgr.output(&id).await,
+            mgr.capture("never-existed", None),
+            Err(TerminalError::UnknownTerminal(_))
+        ));
+        assert!(matches!(
+            mgr.capture(&id, None),
             Err(TerminalError::UnknownTerminal(_))
         ));
     }
@@ -204,10 +297,11 @@ mod tests {
             let mgr = TerminalManager::new();
             let run = mgr.create_and_run(
                 session,
-                "sh",
-                vec!["-c".into(), script.into()],
+                ("sh", vec!["-c".into(), script.into()]),
                 std::env::temp_dir(),
                 None,
+                None,
+                |command| Ok(command.spawn()?),
             );
             let id = tokio::time::timeout(std::time::Duration::from_secs(5), run)
                 .await
@@ -215,10 +309,14 @@ mod tests {
                     panic!("{session}: create_and_run hung; pipe deadlock regressed")
                 })
                 .expect("create_and_run failed");
-            let out = mgr.output(&id).await.unwrap();
-            assert_eq!(out.stdout.trim_end().len(), stdout_len, "{session}");
-            assert_eq!(out.stderr.len(), stderr_len, "{session}");
-            assert_eq!(out.exit_code, Some(0), "{session}");
+            mgr.capture(&id, None)
+                .unwrap()
+                .with_output(|out| {
+                    assert_eq!(out.stdout.trim_end().len(), stdout_len, "{session}");
+                    assert_eq!(out.stderr.len(), stderr_len, "{session}");
+                    assert_eq!(out.exit_code, Some(0), "{session}");
+                })
+                .unwrap();
         }
     }
 

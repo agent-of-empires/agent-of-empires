@@ -4,6 +4,9 @@ import { reducer as acpHookReducer } from "../hooks/useAcpSession";
 import {
   applyEvent,
   applyReducedState,
+  canDecideRequest,
+  nativeInputAvailable,
+  revokeNativeAuthority,
   deriveTurnActive,
   emptyAcpState,
   hasActiveBackgroundAgent,
@@ -72,7 +75,6 @@ describe("applyEvent control state", () => {
       workerIdleStopped: true,
       agentUnresponsive: true,
       agentOrphaned: true,
-      rateLimitRetriesExhausted: true,
       contextPrimerAvailable: { resetSeq: 1, reason: "x" },
       monitorArmed: true,
       monitorDescription: "watch",
@@ -85,7 +87,6 @@ describe("applyEvent control state", () => {
       workerIdleStopped: false,
       agentUnresponsive: false,
       agentOrphaned: false,
-      rateLimitRetriesExhausted: false,
       contextPrimerAvailable: null,
       monitorArmed: false,
       monitorDescription: null,
@@ -111,27 +112,6 @@ describe("applyEvent control state", () => {
       "idle_auto_stop",
       [stopped("idle_auto_stop")],
       { workerIdleStopped: true, workerStopped: false, workerRestarting: false, turnActive: false },
-    ],
-    ["rate_limit_exhausted_retries", [stopped("rate_limit_exhausted_retries")], { rateLimitRetriesExhausted: true }],
-    [
-      "RateLimitAutoResumed ends the exhausted park",
-      [stopped("rate_limit_exhausted_retries"), { RateLimitAutoResumed: { resets_at: future } }],
-      { rateLimitRetriesExhausted: false },
-    ],
-    [
-      "AgentSwitched ends the exhausted park",
-      [stopped("rate_limit_exhausted_retries"), switched],
-      { rateLimitRetriesExhausted: false },
-    ],
-    // The armed park: the composer treats a worker-down 503 as re-queueable
-    // wherever the daemon would have sent, so this flag has to track the park
-    // the daemon actually sends into, not only the cap.
-    ["rate_limited", [stopped("rate_limited")], { rateLimitParked: true, rateLimitRetriesExhausted: false }],
-    ["a prompt landing ends the armed park", [stopped("rate_limited"), prompt()], { rateLimitParked: false }],
-    [
-      "an auto-resume attempt does not end the armed park, matching the daemon",
-      [stopped("rate_limited"), { RateLimitAutoResumed: { resets_at: future } }],
-      { rateLimitParked: true },
     ],
     [
       "prompt_orphaned",
@@ -434,6 +414,21 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     turn_active,
     cancelling: false,
     compacting: false,
+  });
+
+  it("authorizes only canonical Original nonces before Applied and revokes them on snapshot or disconnect", () => {
+    const snapshot = { ...reduced(false), original_decision_nonces: ["original"] };
+    const live = applyReducedState(emptyAcpState(), snapshot, [], 10);
+    expect(canDecideRequest(live, "original")).toBe(true);
+    expect(canDecideRequest(live, "historical")).toBe(false);
+    expect(nativeInputAvailable(live)).toBe(false);
+    expect(canDecideRequest(applyReducedState(live, reduced(false), [], 11), "original")).toBe(false);
+    expect(canDecideRequest(revokeNativeAuthority(live), "original")).toBe(false);
+    expect(canDecideRequest(normaliseTurnState(live), "original")).toBe(false);
+    expect(canDecideRequest(applyReducedState(emptyAcpState(), snapshot), "original")).toBe(false);
+    const current = applyReducedState(live, { ...reduced(false), connection_ready: true }, [], 11);
+    expect(nativeInputAvailable(current)).toBe(true);
+    expect(canDecideRequest(current, "current")).toBe(true);
   });
   const steering: AcpEvent = {
     PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true },

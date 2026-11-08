@@ -1,7 +1,7 @@
 //! Between-prompt idle detection: ending agent-initiated turns (a Monitor
 //! or scheduled wake resuming the agent) that no aoe prompt owns (#2325).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,7 +134,7 @@ pub(super) struct BetweenPromptTracker {
     state: Mutex<TrackerState>,
     /// Async background agents with a live tailer, which removes its id on
     /// completion. Tracked precisely, so they never latch the floor.
-    pub(super) bg_agents: Arc<Mutex<HashSet<String>>>,
+    pub(super) bg_agents: Arc<crate::acp::background_agent::ActiveAgents>,
 }
 
 impl BetweenPromptTracker {
@@ -193,14 +193,22 @@ impl BetweenPromptTracker {
         armed
     }
 
+    /// Native tool activity blocks Fresh without arming idle recovery.
+    pub(super) fn record_native_tool(&self, id: &str, in_flight: bool) {
+        let mut state = self.state();
+        if in_flight {
+            if !state.tools.contains_key(id) {
+                state.tools.insert(id.to_owned(), false);
+            }
+        } else {
+            state.tools.remove(id);
+        }
+    }
+
     pub(super) fn work_state(&self) -> BetweenPromptWorkState {
         BetweenPromptWorkState {
             tool_calls: !self.state().tools.is_empty(),
-            background_agents: !self
-                .bg_agents
-                .lock()
-                .expect("between-prompt bg-agents mutex poisoned")
-                .is_empty(),
+            background_agents: !self.bg_agents.is_empty(),
         }
     }
 
@@ -243,10 +251,7 @@ impl BetweenPromptTracker {
         let cost_seen = state.cost_seen;
         state.reset();
         drop(state);
-        self.bg_agents
-            .lock()
-            .expect("between-prompt bg-agents mutex poisoned")
-            .clear();
+        self.bg_agents.clear();
         Some(cost_seen)
     }
 }

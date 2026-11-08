@@ -6,7 +6,7 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
 
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { lastClearIndex } from "../../lib/acpHistoryWindow";
+import { clearHistoryProjection, lastClearIndex } from "../../lib/acpHistoryWindow";
 import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
 
@@ -24,8 +24,9 @@ const TOOL_GROUP_MAX_RUN = 10;
 /** React key for the fold point: the last `/clear` id, "none" before one, "all" when unfolded. */
 export function clearFoldGeneration(rows: readonly ActivityRow[], showClearedTurns: boolean): string {
   if (showClearedTurns) return "all";
-  const i = lastClearIndex(rows);
-  return i < 0 ? "none" : rows[i]!.id;
+  const projected = clearHistoryProjection(rows);
+  const i = lastClearIndex(projected);
+  return i < 0 ? "none" : projected[i]!.id;
 }
 
 function parseDate(iso: string): Date | undefined {
@@ -56,8 +57,9 @@ export function activityToThreadMessages(
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
 ): ThreadMessageLike[] {
   // Turns before the last /clear are forgotten by the model, so they fold by default.
-  const start = showClearedTurns ? -1 : lastClearIndex(rows);
-  const effectiveRows = start >= 0 ? rows.slice(start) : rows;
+  const projected = clearHistoryProjection(rows);
+  const start = showClearedTurns ? -1 : lastClearIndex(projected);
+  const effectiveRows = start >= 0 ? projected.slice(start) : projected;
 
   // Builders stay open until the end so background subagent children can land in their parent's message.
   const messages: (ThreadMessageLike | AssistantBuilder)[] = [];
