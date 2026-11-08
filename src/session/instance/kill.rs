@@ -213,7 +213,6 @@ impl Instance {
             if let Some(processes) = processes {
                 processes.settle(std::time::Duration::from_millis(100))?;
             }
-            self.release_scope()?;
             Ok(())
         })();
         if let Err(error) = removed {
