@@ -548,6 +548,10 @@ Operation-scoped terminals settle only their original waiter. They do not prove
 that unrelated or background Native tools ended. Without exact tool ownership,
 the transcript preserves partial tools until their own Native terminal event.
 
+Hidden-prefix folding retains the same journal metadata as visible folding, including HTTP message markers. Both use one tool-closure predicate: an operation-scoped `Stopped` never globally closes tools or consumes their buffered output. Replaying overlapping sequences remains idempotent.
+
+The web carries a `tool_start` row's streaming output separately from its eventual tool result. Ordinary and subagent cards render that partial output while leaving the tool part open; no completion, stopped flag, or end timestamp is fabricated. An actual terminal replaces the partial display. This retained-prefix handling does not recover starts already removed by journal retention.
+
 Trash inspection orders unfinished snapshots by their first content event rather
 than tool start order. Replacement snapshots keep that order. Turn endings move
 orphan snapshots into read-only history without inventing stopped rows or feeding
