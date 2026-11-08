@@ -1667,62 +1667,108 @@ pub(crate) struct TuiDashboardLaunch {
     pub(crate) target: TuiControlTarget,
 }
 
+#[derive(Debug)]
+pub(crate) struct TuiDashboardLaunchFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) target: Option<TuiControlTarget>,
+}
+
 pub(crate) async fn start_dashboard_for_tui(
     profile: &str,
     mut args: ServeArgs,
     predecessor_epoch: Option<&str>,
     restart: bool,
-) -> Result<TuiDashboardLaunch> {
-    let launch = if restart {
-        restart_daemon_with_receipt(Some(args), false).await?
-    } else {
-        let startup = lock_for_startup(profile, &mut args)
-            .await?
-            .context("Dashboard startup guard is unavailable")?;
-        let startup = tokio::task::spawn_blocking(move || {
-            startup.run_migrations(None)?;
-            Ok::<_, anyhow::Error>(startup)
-        })
-        .await??;
-        let ServeStartup { lock, transaction } = startup;
-        validate_launch_args(profile, &args).await?;
-        drop(lock);
-        start_daemon(profile, &args, &transaction, false).await?;
-        managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
-    };
-    anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
-    let instance = launch
-        .instance_id
-        .context("Successor instance proof is missing")?;
-    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-        crate::daemon::transport::local_socket_path()?,
-    );
-    let connection = crate::daemon::RuntimeConnection::connect(
-        &endpoint,
-        (!profile.is_empty()).then_some(profile),
-    )
-    .await?;
-    anyhow::ensure!(
-        connection.info().owner_instance_id.as_deref() == Some(instance.as_str()),
-        "Dashboard successor identity changed before reconnect"
-    );
-    anyhow::ensure!(
-        predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
-        "Dashboard successor reused the predecessor epoch"
-    );
-    let client = endpoint.daemon_client()?;
-    let target = tui_control_target()?;
-    anyhow::ensure!(
-        target
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let launch = async {
+        let launch = if restart {
+            restart_daemon_with_receipt(Some(args), false).await?
+        } else {
+            let startup = lock_for_startup(profile, &mut args)
+                .await?
+                .context("Dashboard startup guard is unavailable")?;
+            let startup = tokio::task::spawn_blocking(move || {
+                startup.run_migrations(None)?;
+                Ok::<_, anyhow::Error>(startup)
+            })
+            .await??;
+            let ServeStartup { lock, transaction } = startup;
+            validate_launch_args(profile, &args).await?;
+            drop(lock);
+            start_daemon(profile, &args, &transaction, false).await?;
+            managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
+        };
+        Ok::<_, anyhow::Error>(launch)
+    }
+    .await
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    connect_owned_dashboard(profile, predecessor_epoch, launch).await
+}
+
+async fn connect_owned_dashboard(
+    profile: &str,
+    predecessor_epoch: Option<&str>,
+    launch: ServeLaunch,
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let target = (|| {
+        anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
+        let instance = launch
+            .instance_id
+            .as_deref()
+            .context("Successor instance proof is missing")?;
+        let target = tui_control_target()?;
+        anyhow::ensure!(
+            target.process.as_ref().is_some_and(|(pid, _, owner)| {
+                *pid == launch.pid && owner.as_deref() == Some(instance)
+            }),
+            "Dashboard successor identity changed before reconnect"
+        );
+        Ok::<_, anyhow::Error>(target)
+    })()
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    drop(launch);
+    let runtime = async {
+        let instance = target
             .process
             .as_ref()
-            .is_some_and(|(_, _, owner)| { owner.as_deref() == Some(instance.as_str()) }),
-        "Dashboard successor identity changed before observation"
-    );
-    Ok(TuiDashboardLaunch {
-        runtime: (connection, client),
-        target,
-    })
+            .and_then(|(_, _, owner)| owner.as_deref())
+            .context("Successor instance proof is missing")?;
+        let endpoint = crate::acp::client::discovery::local_unix_endpoint(
+            crate::daemon::transport::local_socket_path()?,
+        );
+        let connection = crate::daemon::RuntimeConnection::connect(
+            &endpoint,
+            (!profile.is_empty()).then_some(profile),
+        )
+        .await?;
+        anyhow::ensure!(
+            connection.info().owner_instance_id.as_deref() == Some(instance),
+            "Dashboard successor identity changed before reconnect"
+        );
+        anyhow::ensure!(
+            predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
+            "Dashboard successor reused the predecessor epoch"
+        );
+        let client = endpoint.daemon_client()?;
+        anyhow::ensure!(
+            tui_control_target()? == target,
+            "Dashboard successor identity changed before observation"
+        );
+        Ok::<_, anyhow::Error>((connection, client))
+    }
+    .await;
+    match runtime {
+        Ok(runtime) => Ok(TuiDashboardLaunch { runtime, target }),
+        Err(error) => Err(TuiDashboardLaunchFailure {
+            error,
+            target: Some(target),
+        }),
+    }
 }
 
 async fn start_daemon(
@@ -2971,6 +3017,102 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_dashboard_reconnect_retains_only_the_receipt_owner() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let spawn = |instance: &str| {
+            ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .env(SERVE_INSTANCE_ENV, instance)
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let publish = |child: &mut ChildGuard, instance: &str| {
+            let mut launch = sample_launch();
+            launch.pid = child.0.id();
+            launch.instance_id = Some(instance.to_owned());
+            write_serve_launch(&launch).unwrap();
+            std::fs::write(
+                crate::session::get_app_dir().unwrap().join("serve.pid"),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            let target = wait_for_test_daemon(&mut child.0);
+            (launch, target)
+        };
+        let mut original = spawn("receipt-owner");
+        let (receipt, original_target) = publish(&mut original, "receipt-owner");
+        let socket = crate::daemon::transport::local_socket_path().unwrap();
+        assert!(socket.starts_with(
+            crate::session::get_app_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        ));
+        assert!(
+            !socket.exists(),
+            "Reconnect must hit the isolated missing socket"
+        );
+        let failure = match connect_owned_dashboard("work", None, receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("A missing runtime socket cannot establish a Client"),
+        };
+        let owned_target = failure
+            .target
+            .expect("Client reconnect failure must retain the verified launch owner");
+        assert_eq!(owned_target, original_target);
+
+        original.0.kill().unwrap();
+        original.0.wait().unwrap();
+        let mut successor = spawn("unrelated-successor");
+        let (_, successor_target) = publish(&mut successor, "unrelated-successor");
+        assert_ne!(owned_target, successor_target);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(TuiControlLease::prepare(owned_target, &cancel)
+            .await
+            .is_err());
+        let mut stale_receipt = sample_launch();
+        stale_receipt.pid = original.0.id();
+        stale_receipt.instance_id = Some("receipt-owner".to_owned());
+        let rejected = match connect_owned_dashboard("work", None, stale_receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("An unrelated Daemon cannot satisfy the launch receipt"),
+        };
+        assert!(
+            rejected.target.is_none(),
+            "A receipt mismatch cannot grant authority over the successor"
+        );
+        assert!(successor.0.try_wait().unwrap().is_none());
+        assert_eq!(tui_control_target().unwrap(), successor_target);
     }
 
     #[test]

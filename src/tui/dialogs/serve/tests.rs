@@ -799,6 +799,15 @@ fn a_reopened_view_waits_for_its_owned_launch_and_ignores_an_old_stop() {
         matches!(view.state, ServeViewState::Starting { started_at, .. } if started_at == started)
     );
     assert!(view.launch_in_flight);
+    view.resume_owned_stop(started + Duration::from_secs(1));
+    view.finish_stop(Err("another launch stopped".to_owned()));
+    assert!(
+        matches!(view.state, ServeViewState::Starting { started_at, .. } if started_at == started)
+    );
+    view.resume_owned_stop(started);
+    view.finish_stop(Err("owned launch stop failed".to_owned()));
+    assert!(matches!(view.state, ServeViewState::Error { .. }));
+    assert!(!view.launch_in_flight);
 }
 
 #[test]
@@ -842,6 +851,30 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
                 if message.contains("fixture reset outcome unknown")));
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_without_verified_identity_refuses_an_unowned_daemon() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut successor = TestDaemon::new();
+    let target = successor.publish();
+    let mut view = ServeView::for_test(starting());
+    let ServeAction::Stop(request) = view.handle_key(key('S')) else {
+        panic!("S must return the App-owned stop request");
+    };
+    let result = request.run().await;
+    assert!(
+        result.is_err(),
+        "Missing observed or owned identity cannot authorize a namespace stop"
+    );
+    view.finish_stop(result.map_err(|error| format!("{error:#}")));
+    assert!(
+        matches!(view.state, ServeViewState::Error { .. }),
+        "An unverified stop must remain a visible failure"
+    );
+    assert!(successor.child.try_wait().unwrap().is_none());
+    assert_eq!(crate::cli::serve::tui_control_target().unwrap(), target);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

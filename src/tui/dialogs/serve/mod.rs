@@ -31,21 +31,49 @@ pub enum ServeAction {
     Continue,
     Close,
 }
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServeStopRequest {
-    target: Option<TuiControlTarget>,
+    intent: ServeStopIntent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ServeStopIntent {
+    Observed(TuiControlTarget),
+    Dashboard(TuiControlTarget),
+    OwnedLaunch,
 }
 
 impl ServeStopRequest {
-    pub(crate) async fn run(self) -> anyhow::Result<()> {
-        match self.target {
-            Some(target) => {
-                let cancel = tokio_util::sync::CancellationToken::new();
-                let lease = TuiControlLease::prepare(target, &cancel).await?;
-                lease.stop().await
-            }
-            None => crate::cli::serve::stop_daemon().await,
+    pub(crate) fn after_launch() -> Self {
+        Self {
+            intent: ServeStopIntent::OwnedLaunch,
         }
+    }
+
+    pub(crate) fn settle_launch(
+        &mut self,
+        target: Option<TuiControlTarget>,
+    ) -> Option<&TuiControlTarget> {
+        if matches!(&self.intent, ServeStopIntent::Observed(_)) {
+            return None;
+        }
+        self.intent = target.map_or(ServeStopIntent::OwnedLaunch, ServeStopIntent::Observed);
+        match &self.intent {
+            ServeStopIntent::Observed(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn run(self) -> anyhow::Result<()> {
+        let target = match self.intent {
+            ServeStopIntent::Observed(target) | ServeStopIntent::Dashboard(target) => target,
+            ServeStopIntent::OwnedLaunch => anyhow::bail!(
+                "The owned dashboard launch has no verified Daemon identity; stop was not performed. Inspect `aoe serve --status` before retrying."
+            ),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lease = TuiControlLease::prepare(target, &cancel).await?;
+        lease.stop().await
     }
 }
 
@@ -60,6 +88,7 @@ pub struct ServeLaunchRequest {
 pub struct ServeLaunchFailure {
     pub(crate) message: String,
     pub(crate) log_tail: LogContext,
+    pub(crate) target: Option<TuiControlTarget>,
 }
 
 impl ServeLaunchFailure {
@@ -68,6 +97,7 @@ impl ServeLaunchFailure {
         Self {
             message,
             log_tail: initial_log_tail(),
+            target: None,
         }
     }
 }
@@ -136,23 +166,27 @@ impl ServeLaunchRequest {
         let parsed = crate::cli::Cli::try_parse_from(argv).map_err(|error| ServeLaunchFailure {
             message: error.to_string(),
             log_tail: LogContext::default(),
+            target: None,
         })?;
         let Some(crate::cli::Commands::Serve(mut args)) = parsed.command else {
             unreachable!();
         };
         args.passphrase = self.passphrase.clone();
         let result = crate::cli::serve::start_dashboard_for_tui(&profile, args, predecessor_epoch.as_deref(), self.restart).await
-            .map_err(|error| {
-                if error.downcast_ref::<crate::session::LoadSource>().is_some()
+            .map_err(|failure| {
+                let error = failure.error;
+                let message = if error.downcast_ref::<crate::session::LoadSource>().is_some()
                     || matches!(error.downcast_ref::<crate::daemon::RuntimeConnectionError>(), Some(crate::daemon::RuntimeConnectionError::Protocol))
                 {
                     crate::session::sanitized_load_failure(&error)
                 } else {
                     tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
                     "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
-                }
+                };
+                let mut captured = ServeLaunchFailure::capture(message);
+                captured.target = failure.target;
+                captured
             });
-        let result = result.map_err(ServeLaunchFailure::capture);
         if result.is_ok() {
             remember_last_mode(self.mode);
         }
@@ -725,7 +759,7 @@ impl ServeView {
     }
 
     pub(crate) fn for_launch(launch: DashboardLaunch, jobs: &mut ServeJobs) -> Self {
-        let (state, running) = match launch {
+        let (state, running, observed_target) = match launch {
             DashboardLaunch::Running { target, started_at } => (
                 ServeViewState::Starting {
                     mode: target.mode,
@@ -735,6 +769,7 @@ impl ServeView {
                     log_offset: 0,
                 },
                 true,
+                None,
             ),
             DashboardLaunch::Failed { target, failure } => (
                 ServeViewState::start_failed_with(
@@ -744,13 +779,15 @@ impl ServeView {
                     failure.log_tail,
                 ),
                 false,
+                failure.target,
             ),
         };
         let mut view = Self::with_state(state, jobs.submitter());
         view.launch_in_flight = running;
+        view.target = observed_target;
         if running {
             view.request(Job::Passphrase, PendingJob::Passphrase);
-        } else {
+        } else if view.target.is_none() {
             view.request(Job::ErrorContext, PendingJob::ErrorContext);
         }
         view
@@ -864,18 +901,25 @@ impl ServeView {
             if self.stop_requested {
                 return ServeAction::Continue;
             }
-            let target = match self.pending.take() {
+            let request = match self.pending.take() {
                 Some(PendingWork {
                     kind: PendingJob::Retry { target, .. },
                     ..
                 }) => {
                     self.target = Some(target.clone());
-                    Some(target)
+                    ServeStopRequest {
+                        intent: ServeStopIntent::Observed(target),
+                    }
                 }
-                _ => None,
+                _ => self
+                    .target
+                    .clone()
+                    .map_or_else(ServeStopRequest::after_launch, |target| ServeStopRequest {
+                        intent: ServeStopIntent::Dashboard(target),
+                    }),
             };
             self.begin_stop();
-            return ServeAction::Stop(ServeStopRequest { target });
+            return ServeAction::Stop(request);
         }
         if self.stop_requested {
             return if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -1178,14 +1222,16 @@ impl ServeView {
             }
             Err(failure) => {
                 self.launch_in_flight = false;
-                self.target = None;
+                self.target = failure.target;
                 self.state = ServeViewState::start_failed_with(
                     mode,
                     transport,
                     &failure.message,
                     failure.log_tail,
                 );
-                self.request(Job::ErrorContext, PendingJob::ErrorContext);
+                if self.target.is_none() {
+                    self.request(Job::ErrorContext, PendingJob::ErrorContext);
+                }
             }
         }
     }
@@ -1197,6 +1243,24 @@ impl ServeView {
         self.show_help = false;
         self.stop_requested = true;
         self.launch_in_flight = true;
+    }
+
+    pub(crate) fn resume_owned_stop(&mut self, launch_started_at: Instant) {
+        if self.stop_requested || !self.launch_in_flight {
+            return;
+        }
+        if matches!(
+            self.state,
+            ServeViewState::Starting { started_at, .. } if started_at == launch_started_at
+        ) {
+            self.begin_stop();
+        }
+    }
+
+    pub(crate) fn bind_stop_target(&mut self, target: &TuiControlTarget) {
+        if self.stop_requested {
+            self.target = Some(target.clone());
+        }
     }
 
     pub(crate) fn finish_stop(&mut self, result: Result<(), String>) {

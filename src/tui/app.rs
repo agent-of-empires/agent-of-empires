@@ -2595,13 +2595,31 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(crate::tui::dialogs::ServeLaunchFailure {
                 message: "Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned(),
                 log_tail: Default::default(),
+                target: None,
             }),
         };
         self.dashboard_launch = None;
         let launch = self.home.dashboard_launch.take();
+        if self.dashboard_stop_request.is_some() {
+            if let (
+                Some(crate::tui::dialogs::DashboardLaunch::Running { started_at, .. }),
+                Some(serve),
+            ) = (&launch, &mut self.home.serve_view)
+            {
+                serve.resume_owned_stop(*started_at);
+            }
+        }
         match result {
             Ok(prepared) if self.dashboard_stop_request.is_some() => {
-                drop(prepared);
+                let target = self
+                    .dashboard_stop_request
+                    .as_mut()
+                    .expect("pending dashboard stop")
+                    .settle_launch(Some(prepared.target));
+                if let (Some(target), Some(serve)) = (target, &mut self.home.serve_view) {
+                    serve.bind_stop_target(target);
+                }
+                drop(prepared.runtime);
             }
             Ok(prepared) => {
                 if let Some(serve) = &mut self.home.serve_view {
@@ -2612,7 +2630,16 @@ impl App {
                     Some(prepared.runtime),
                 );
             }
-            Err(_) if self.dashboard_stop_request.is_some() => {}
+            Err(failure) if self.dashboard_stop_request.is_some() => {
+                let target = self
+                    .dashboard_stop_request
+                    .as_mut()
+                    .expect("pending dashboard stop")
+                    .settle_launch(failure.target);
+                if let (Some(target), Some(serve)) = (target, &mut self.home.serve_view) {
+                    serve.bind_stop_target(target);
+                }
+            }
             Err(failure) => {
                 let message = failure.message.clone();
                 if let Some(serve) = &mut self.home.serve_view {
@@ -4480,7 +4507,7 @@ mod tests {
             .unwrap();
         let (settle_launch, owned_launch) = tokio::sync::oneshot::channel();
         app.dashboard_launch = Some(owned_launch);
-        app.request_dashboard_stop(Default::default());
+        app.request_dashboard_stop(crate::tui::dialogs::ServeStopRequest::after_launch());
         assert!(app.dashboard_stop_request.is_some());
         assert!(
             app.dashboard_stop.is_none(),
@@ -4561,7 +4588,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn stop_superseding_provider_retry_preserves_the_successor() {
+    async fn dashboard_stop_preserves_the_observed_incarnation() {
         use std::os::unix::process::CommandExt;
 
         struct ChildGuard(std::process::Child);
@@ -4595,76 +4622,160 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut original = spawn();
-        let pid = crate::session::get_app_dir().unwrap().join("serve.pid");
-        std::fs::write(&pid, original.0.id().to_string()).unwrap();
-        crate::cli::serve::wait_for_test_daemon(&mut original.0);
-        let mut app = App::new(
-            "test",
-            AvailableTools::with_tools(&[]),
-            true,
-            false,
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        use crate::tui::dialogs::{DashboardLaunch, ServeLaunchFailure, ServeView};
-        let DashboardLaunch::Running { target, .. } =
-            DashboardLaunch::tunnel_for_test(std::time::Instant::now())
-        else {
-            unreachable!();
-        };
-        let mut view = ServeView::for_launch(
-            DashboardLaunch::Failed {
-                target,
-                failure: ServeLaunchFailure {
-                    message: "tailscale funnel failed".to_owned(),
-                    log_tail: Default::default(),
-                },
-            },
-            &mut app.home.serve_jobs,
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !view.tick() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        app.home.serve_view = Some(view);
-        let transaction = crate::daemon::lifecycle::Transaction::acquire()
-            .await
+        for state in [
+            "retry",
+            "active",
+            "starting",
+            "error",
+            "owned-failed",
+            "owned-unverified",
+            "owned-closed",
+            "active-unchanged",
+            "owned-failed-unchanged",
+            "owned-unverified-unchanged",
+        ] {
+            let mut original = spawn();
+            let pid = crate::session::get_app_dir().unwrap().join("serve.pid");
+            std::fs::write(&pid, original.0.id().to_string()).unwrap();
+            let observed = crate::cli::serve::wait_for_test_daemon(&mut original.0);
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
             .unwrap();
-        assert!(app
-            .home
-            .handle_key(KeyEvent::from(KeyCode::Char('P')), None)
-            .is_none());
-        let action = app
-            .home
-            .handle_key(KeyEvent::from(KeyCode::Char('S')), None)
-            .expect("S returns the App-owned stop");
-        let Action::StopDashboard(request) = action else {
-            panic!("S must hand its stop request to the App");
-        };
-        app.request_dashboard_stop(request);
-        original.0.kill().unwrap();
-        original.0.wait().unwrap();
-        let mut successor = spawn();
-        std::fs::write(&pid, successor.0.id().to_string()).unwrap();
-        crate::cli::serve::wait_for_test_daemon(&mut successor.0);
-        drop(transaction);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while app.dashboard_stop.is_some() {
-                app.poll_dashboard_stop();
-                tokio::task::yield_now().await;
+            use crate::tui::dialogs::{DashboardLaunch, ServeLaunchFailure, ServeView};
+            let DashboardLaunch::Running { target, .. } =
+                DashboardLaunch::tunnel_for_test(std::time::Instant::now())
+            else {
+                unreachable!();
+            };
+            let app_dir = crate::session::get_app_dir().unwrap();
+            std::fs::write(app_dir.join("serve.mode"), "local").unwrap();
+            let _ = std::fs::remove_file(app_dir.join("serve.url"));
+            let owned = state.starts_with("owned-");
+            let mut view = if owned {
+                app.home.dashboard_launch =
+                    Some(DashboardLaunch::tunnel_for_test(std::time::Instant::now()));
+                app.home.open_serve();
+                app.home.serve_view.take().unwrap()
+            } else if matches!(state, "retry" | "error") {
+                ServeView::for_launch(
+                    DashboardLaunch::Failed {
+                        target,
+                        failure: ServeLaunchFailure {
+                            message: "tailscale funnel failed".to_owned(),
+                            log_tail: Default::default(),
+                            target: None,
+                        },
+                    },
+                    &mut app.home.serve_jobs,
+                )
+            } else {
+                if state.starts_with("active") {
+                    std::fs::write(app_dir.join("serve.url"), "http://127.0.0.1:8081").unwrap();
+                }
+                ServeView::settled(&mut app.home.serve_jobs)
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            if matches!(state, "retry" | "error") {
+                while !view.tick() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
             }
-        })
-        .await
-        .expect("App stop did not settle");
-        assert!(
-            successor.0.try_wait().unwrap().is_none(),
-            "S must not redirect captured recovery authority to a successor"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&pid).unwrap(),
-            successor.0.id().to_string()
-        );
+            app.home.serve_view = Some(view);
+            let settle_launch = owned.then(|| {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                app.dashboard_launch = Some(receiver);
+                sender
+            });
+            let transaction = crate::daemon::lifecycle::Transaction::acquire()
+                .await
+                .unwrap();
+            if state == "retry" {
+                assert!(app
+                    .home
+                    .handle_key(KeyEvent::from(KeyCode::Char('P')), None)
+                    .is_none());
+            }
+            let action = app
+                .home
+                .handle_key(KeyEvent::from(KeyCode::Char('S')), None)
+                .expect("S returns the App-owned stop");
+            let Action::StopDashboard(request) = action else {
+                panic!("S must hand its stop request to the App");
+            };
+            app.request_dashboard_stop(request);
+            if owned {
+                app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+                assert!(app.home.serve_view.is_none());
+                app.home.open_serve();
+            }
+            let replaced = !state.ends_with("-unchanged");
+            let mut successor = if replaced {
+                original.0.kill().unwrap();
+                original.0.wait().unwrap();
+                let mut successor = spawn();
+                std::fs::write(&pid, successor.0.id().to_string()).unwrap();
+                crate::cli::serve::wait_for_test_daemon(&mut successor.0);
+                Some(successor)
+            } else {
+                None
+            };
+            if let Some(settle) = settle_launch {
+                assert!(app.dashboard_stop.is_none());
+                if state == "owned-closed" {
+                    drop(settle);
+                } else {
+                    assert!(settle
+                        .send(Err(ServeLaunchFailure {
+                            message: "Client reconnect failed".to_owned(),
+                            log_tail: Default::default(),
+                            target: state.starts_with("owned-failed").then_some(observed),
+                        }))
+                        .is_ok());
+                }
+                assert!(app.poll_dashboard_launch());
+            }
+            drop(transaction);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.dashboard_stop.is_some() {
+                    app.poll_dashboard_stop();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("App stop did not settle");
+            let should_stop = !replaced && !state.contains("unverified");
+            if should_stop {
+                assert!(
+                    original.0.try_wait().unwrap().is_some(),
+                    "S from {state} must still stop its verified owner"
+                );
+                assert!(!pid.exists());
+            } else {
+                let survivor = successor.as_mut().unwrap_or(&mut original);
+                assert!(
+                    survivor.0.try_wait().unwrap().is_none(),
+                    "S from {state} must not redirect authority to an unowned Daemon"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&pid).unwrap(),
+                    survivor.0.id().to_string()
+                );
+            }
+            let view = app.home.serve_view.as_mut().unwrap();
+            let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            });
+            let contents: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(
+                !contents.contains("Elapsed:"),
+                "S from {state} left a reopened view waiting for a settled launch"
+            );
+        }
     }
 }
