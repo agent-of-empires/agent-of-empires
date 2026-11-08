@@ -129,21 +129,26 @@ fn collect_codex_sessions_anchored(
     Ok(())
 }
 
-/// Rollouts named for `target`. Unlike the capture scan, the budget is per
-/// directory, and anything that could hide a rollout fails: an unreadable
-/// entry, a directory over budget, or a date entry that is not a real directory.
+/// Rollouts named for `target`. Unlike the capture scan, anything that could
+/// hide a rollout fails: an unreadable entry, a walk over the shared `visited`
+/// budget, or a date entry that is not a real directory. Non-numeric entries
+/// under `sessions/` are ignored: Codex resolves an exact UUID only under
+/// `YYYY/MM/DD`.
 fn find_codex_rollouts(
     root: &AnchoredDir,
     relative: &Path,
     depth: usize,
     target: Uuid,
+    visited: &mut usize,
     found: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let names = root.read_dir_complete(relative, CODEX_SCAN_MAX_ENTRIES + 1)?;
+    let remaining = CODEX_SCAN_MAX_ENTRIES.saturating_sub(*visited);
+    let names = root.read_dir_complete(relative, remaining + 1)?;
     anyhow::ensure!(
-        names.len() <= CODEX_SCAN_MAX_ENTRIES,
-        "Codex rollout directory exceeds its scan budget"
+        names.len() <= remaining,
+        "Codex rollout scan exceeds its budget"
     );
+    *visited += names.len();
     for name in names {
         let path = relative.join(&name);
         let numeric = name
@@ -152,7 +157,7 @@ fn find_codex_rollouts(
         if numeric && depth < CODEX_SCAN_MAX_DEPTH {
             root.directory_modified(&path)?
                 .context("Codex rollout date entry is not a directory")?;
-            find_codex_rollouts(root, &path, depth + 1, target, found)?;
+            find_codex_rollouts(root, &path, depth + 1, target, visited, found)?;
         } else if is_codex_rollout(&path)
             && extract_codex_uuid_from_filename(&path)
                 .and_then(|id| Uuid::parse_str(&id).ok())
@@ -173,7 +178,7 @@ pub(crate) fn codex_rollout_records_cwd(store: &Path, sid: &str, cwd: &Path) -> 
         let sessions = Path::new("sessions");
         root.directory_modified(sessions).ok()??;
         let mut found = Vec::new();
-        find_codex_rollouts(&root, sessions, 0, target, &mut found).ok()?;
+        find_codex_rollouts(&root, sessions, 0, target, &mut 0, &mut found).ok()?;
         let cwd = cwd.canonicalize().ok()?;
         Some(
             !found.is_empty()
@@ -312,6 +317,34 @@ mod tests {
             std::fs::write(day.join(format!("pad-{n}")), "").unwrap();
         }
         assert!(!codex_rollout_records_cwd(&store, long, &project));
+    }
+
+    #[test]
+    fn codex_rollout_scan_budget_is_shared_across_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "11111111-2222-4333-8444-555555555551";
+        let day = store.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{id}.jsonl")),
+            rollout_line(id, project.to_str().unwrap()),
+        )
+        .unwrap();
+        let verified = || codex_rollout_records_cwd(&store, id, &project);
+        assert!(verified());
+
+        // Every directory stays under its own limit; only the whole walk is over.
+        for month in ["01", "02", "03"] {
+            let padded = store.join("sessions/2026").join(month);
+            std::fs::create_dir_all(&padded).unwrap();
+            for n in 0..CODEX_SCAN_MAX_ENTRIES / 2 {
+                std::fs::write(padded.join(format!("pad-{n}")), "").unwrap();
+            }
+        }
+        assert!(!verified());
     }
 
     fn rollout_line(id: &str, cwd: &str) -> String {
