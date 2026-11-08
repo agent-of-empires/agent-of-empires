@@ -110,6 +110,7 @@ jobs:
           context: ./docker
           file: ./docker/Dockerfile.dev
           platforms: linux/amd64,linux/arm64
+          build-args: BASE_IMAGE=${{ env.REGISTRY }}/agent-of-empires/aoe-sandbox:${{ inputs.tag == 'nightly' && 'nightly' || 'latest' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
