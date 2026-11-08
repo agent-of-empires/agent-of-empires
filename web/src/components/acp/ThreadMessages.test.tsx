@@ -77,7 +77,7 @@ describe("AssistantMessage nonterminal native tool output", () => {
       },
     ];
     const messages = activityToThreadMessages(rows, false);
-    const parts = messages.flatMap((message) => typeof message.content === "string" ? [] : message.content);
+    const parts = messages.flatMap((message) => (typeof message.content === "string" ? [] : message.content));
     const tool = parts.find((part) => part.type === "tool-call");
     expect(tool).toBeDefined();
     expect(tool && "result" in tool ? tool.result : undefined).toBeUndefined();
