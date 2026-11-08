@@ -4176,7 +4176,7 @@ fn tui_new_passphrase_is_saved_only_for_the_running_successor() {
     use std::os::unix::fs::PermissionsExt;
 
     require_tmux!();
-    for replacement_succeeds in [true, false] {
+    for (replacement_succeeds, reconnect_fails) in [(true, false), (false, false), (true, true)] {
         let mut h = TuiTestHarness::new_in_tmp("serve_new_passphrase_outcome");
         h.remove_env("AOE_DAEMON_URL");
         h.stop_daemon_on_drop();
@@ -4186,6 +4186,12 @@ fn tui_new_passphrase_is_saved_only_for_the_running_successor() {
             &bin.join("tailscale"),
             r#"#!/bin/sh
 case "$*" in
+  "--version")
+    if test -f "$AOE_TEST_RECONNECT_FLAG" && test "$AOE_SERVE_PASSPHRASE" != "$AOE_TEST_ORIGINAL_PASSPHRASE"; then
+      mv "$AOE_TEST_CLIENT_PROFILE" "$AOE_TEST_HIDDEN_PROFILE" || exit 1
+      rm "$AOE_TEST_RECONNECT_FLAG"
+    fi
+    ;;
   "status --json")
     printf '%s\n' '{"Self":{"DNSName":"fixture.tailnet.ts.net.","CapMap":{"https://tailscale.com/cap/funnel-ports?ports=443":null}}}'
     ;;
@@ -4210,6 +4216,19 @@ exit 0
         h.add_path_dir(&bin);
         h.set_env("AOE_TEST_FUNNEL_STATE", h.home_path().join("funnel.json"));
         let original = "original e2e remote credential";
+        let app = app_dir_in(h.home_path());
+        let reconnect_flag = h.home_path().join("fail-reconnect");
+        if reconnect_fails {
+            h.run_cli_ok(&["profile", "create", "client-only"]);
+            h.set_env("AOE_SERVE_PASSPHRASE", original);
+            h.set_env("AOE_TEST_ORIGINAL_PASSPHRASE", original);
+            h.set_env("AOE_TEST_RECONNECT_FLAG", &reconnect_flag);
+            h.set_env("AOE_TEST_CLIENT_PROFILE", app.join("profiles/client-only"));
+            h.set_env(
+                "AOE_TEST_HIDDEN_PROFILE",
+                h.home_path().join("hidden-profile"),
+            );
+        }
         let started = h.run_cli(&[
             "serve",
             "--remote",
@@ -4224,12 +4243,15 @@ exit 0
             "{}",
             String::from_utf8_lossy(&started.stderr)
         );
-        let app = app_dir_in(h.home_path());
         let saved = app.join("serve.saved_passphrase");
         std::fs::write(&saved, original).unwrap();
         std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
         let predecessor = daemon_pid(&h).unwrap();
-        h.spawn_tui_sized(120, 40);
+        if reconnect_fails {
+            h.spawn(&["--profile", "client-only"]);
+        } else {
+            h.spawn_tui_sized(120, 40);
+        }
         h.wait_for_ready();
         h.send_keys("R");
         h.wait_for("Connections");
@@ -4238,6 +4260,10 @@ exit 0
         if !replacement_succeeds {
             std::fs::write(app.join(".schema_version"), "39").unwrap();
             block_workers_dir(&app.join("acp-workers"));
+        }
+        if reconnect_fails {
+            // Replay uses default; remove only the Client's profile before successor loading.
+            std::fs::write(&reconnect_flag, "").unwrap();
         }
         h.send_keys_unfenced("G");
         h.wait_for("Press G again for a new passphrase.");
@@ -4253,8 +4279,15 @@ exit 0
                     Err("replacement has not published its credential".to_owned())
                 }
             });
-            h.wait_for(&running);
-            h.wait_for("R: restart");
+            if reconnect_fails {
+                h.wait_for("Serve failed");
+                assert!(!app.join("profiles/client-only").exists());
+                assert!(h.home_path().join("hidden-profile").is_dir());
+                assert!(pid_alive(daemon_pid(&h).unwrap() as i32));
+            } else {
+                h.wait_for(&running);
+                h.wait_for("R: restart");
+            }
             assert_eq!(std::fs::read_to_string(&saved).unwrap(), running);
         } else {
             h.wait_for("Serve failed");

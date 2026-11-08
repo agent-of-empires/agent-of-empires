@@ -2093,7 +2093,19 @@ impl TuiControlTarget {
     }
 }
 
+struct TuiObservedDaemon {
+    target: TuiControlTarget,
+    dashboard: bool,
+    passphrase: bool,
+}
+
 pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
+    Ok(tui_observed_daemon()?.target)
+}
+
+fn tui_observed_daemon() -> Result<TuiObservedDaemon> {
+    let mut dashboard = false;
+    let mut passphrase = false;
     let process = match daemon_status() {
         DaemonStatus::Absent => None,
         DaemonStatus::Unverified => bail!("Cannot verify the Daemon; inspect `aoe serve --status`"),
@@ -2110,14 +2122,24 @@ pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
                         !launch_contradicts(&launch, pid, instance_is_live(&launch, pid)),
                         "Daemon launch identity contradicts its process; preserving serve state"
                     );
+                    dashboard = !launch.core_only;
+                    passphrase = launch.has_passphrase;
                     launch.instance_id
                 }
-                _ => None,
+                _ => {
+                    dashboard = true;
+                    passphrase = true;
+                    None
+                }
             };
             Some((pid, birth, instance))
         }
     };
-    Ok(TuiControlTarget { process })
+    Ok(TuiObservedDaemon {
+        target: TuiControlTarget { process },
+        dashboard,
+        passphrase,
+    })
 }
 
 #[cfg(test)]
@@ -2144,7 +2166,7 @@ pub(crate) fn wait_for_test_daemon(child: &mut std::process::Child) -> TuiContro
     }
 }
 
-/// Holds lifecycle exclusion through guarded mutation or observation.
+/// Holds lifecycle exclusion through a strictly incarnation-bound mutation.
 pub(crate) struct TuiControlLease {
     transaction: crate::daemon::lifecycle::Transaction,
     target: TuiControlTarget,
@@ -2155,14 +2177,7 @@ impl TuiControlLease {
         target: TuiControlTarget,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
-        let transaction = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("Serve operation cancelled before admission"),
-            result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                crate::daemon::lifecycle::Transaction::acquire(),
-            ) => result.context("Daemon lifecycle is busy; inspect status before retrying")??,
-        };
+        let transaction = tui_lifecycle_transaction(cancel).await?;
         anyhow::ensure!(
             !cancel.is_cancelled() && tui_control_target()? == target,
             "Daemon identity changed before control admission; preserving its successor"
@@ -2179,10 +2194,115 @@ impl TuiControlLease {
         }
         stop_daemon_locked(&self.transaction, false).await
     }
+}
+
+async fn tui_lifecycle_transaction(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<crate::daemon::lifecycle::Transaction> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("Serve operation cancelled before admission"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::daemon::lifecycle::Transaction::acquire(),
+        ) => result.context("Daemon lifecycle is busy; inspect status before retrying")?,
+    }
+}
+
+/// Read-only observation can diagnose an exited owner, never adopt its replacement.
+pub(crate) struct TuiObservationLease {
+    _transaction: crate::daemon::lifecycle::Transaction,
+    observed: TuiObservedDaemon,
+    exited_pid: Option<u32>,
+}
+
+impl TuiObservationLease {
+    pub(crate) async fn prepare(
+        expected: Option<TuiControlTarget>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tui_lifecycle_transaction(cancel).await?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Serve observation cancelled");
+        let observed = tui_observed_daemon()?;
+        let exited_pid = expected
+            .as_ref()
+            .map(|expected| tui_observed_exit(expected, &observed.target))
+            .transpose()?
+            .flatten();
+        Ok(Self {
+            _transaction: transaction,
+            observed,
+            exited_pid,
+        })
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.observed.target.is_running()
+    }
+
+    pub(crate) fn has_dashboard(&self) -> bool {
+        self.observed.dashboard
+    }
+
+    pub(crate) fn has_passphrase(&self) -> bool {
+        self.observed.passphrase
+    }
+
+    pub(crate) fn recheck(&mut self) -> Result<()> {
+        let current = tui_control_target()?;
+        if let Some(pid) = tui_observed_exit(&self.observed.target, &current)? {
+            self.exited_pid = Some(pid);
+            self.observed.dashboard = false;
+            self.observed.passphrase = false;
+        }
+        self.observed.target = current;
+        Ok(())
+    }
+
+    pub(crate) fn startup_tail(&self) -> Vec<String> {
+        self.exited_pid
+            .map(crate::acp::client::autostart::startup_log_tail)
+            .unwrap_or_default()
+    }
 
     pub(crate) fn into_target(self) -> TuiControlTarget {
-        self.target
+        self.observed.target
     }
+}
+
+fn tui_observed_exit(
+    expected: &TuiControlTarget,
+    current: &TuiControlTarget,
+) -> Result<Option<u32>> {
+    if expected == current {
+        return Ok(None);
+    }
+    let changed = "Daemon identity changed during observation; preserving its successor";
+    anyhow::ensure!(!current.is_running(), "{changed}");
+    let Some((pid, birth, instance)) = &expected.process else {
+        bail!("{changed}");
+    };
+    anyhow::ensure!(
+        !crate::process::process_birth_is_live(*pid, birth)?,
+        "{changed}"
+    );
+    anyhow::ensure!(
+        crate::process::process_birth_identity(*pid)?
+            .as_ref()
+            .is_none_or(|now| now == birth),
+        "{changed}"
+    );
+    if let Some(raw) = launch_file("serve.pid")?.read()? {
+        anyhow::ensure!(parse_positive_pid(&raw) == Some(*pid as i32), "{changed}");
+    }
+    if let Some(raw) = launch_file("serve.launch")?.read()? {
+        let launch: ServeLaunch = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            launch.pid == *pid && launch.instance_id == *instance,
+            "{changed}"
+        );
+    }
+    Ok(Some(*pid))
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]

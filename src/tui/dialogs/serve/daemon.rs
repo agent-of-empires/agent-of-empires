@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 use rand::prelude::IndexedRandom;
 
@@ -12,9 +11,6 @@ use super::{ServeMode, TransportStatus, TunnelTransport};
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
 const EPHEMERAL_PASSPHRASE_FILE: &str = "serve.passphrase";
-
-/// Passphrase of the daemon this process spawned, cleared when it stops it.
-static LAST_SPAWNED_PASSPHRASE: Mutex<Option<String>> = Mutex::new(None);
 
 fn app_file(name: &str) -> Option<PathBuf> {
     crate::session::get_app_dir().ok().map(|dir| dir.join(name))
@@ -32,32 +28,8 @@ pub(super) fn remove_app_file(name: &str) {
     }
 }
 
-fn set_cached_passphrase(pp: Option<&str>) {
-    if let Ok(mut guard) = LAST_SPAWNED_PASSPHRASE.lock() {
-        *guard = pp.map(str::to_string);
-    }
-}
-
-fn cached_passphrase() -> Option<String> {
-    LAST_SPAWNED_PASSPHRASE.lock().ok()?.clone()
-}
-
-pub(super) fn remember_passphrase(pp: &str) {
-    set_cached_passphrase(Some(pp));
-}
-
-pub(super) fn recall_passphrase() -> Option<String> {
-    if let Some(pp) = cached_passphrase() {
-        tracing::debug!(target: "tui.dialog", "passphrase recalled from in-memory cache");
-        return Some(pp);
-    }
-    if let Some(pp) = read_app_file(SAVED_PASSPHRASE_FILE) {
-        tracing::debug!(target: "tui.dialog", "passphrase recalled from serve.saved_passphrase");
-        return Some(pp);
-    }
-    let pp = read_app_file(EPHEMERAL_PASSPHRASE_FILE)?;
-    tracing::debug!(target: "tui.dialog", "passphrase recalled from serve.passphrase on disk");
-    Some(pp)
+pub(super) fn current_passphrase() -> Option<String> {
+    read_app_file(EPHEMERAL_PASSPHRASE_FILE)
 }
 
 /// Persist the passphrase that survives stop/start, owner-readable only.
@@ -152,10 +124,6 @@ pub(super) fn diagnose_daemon_exit(log: &str, mode: ServeMode) -> &'static str {
                 privileged port (<1024)? We normally pick a high port.";
     }
     ""
-}
-
-pub(super) fn forget_stopped_passphrase() {
-    set_cached_passphrase(None);
 }
 
 pub(super) fn read_serve_mode() -> Option<ServeMode> {

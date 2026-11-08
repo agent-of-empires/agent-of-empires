@@ -141,10 +141,29 @@ impl Submitter {
     }
 }
 
+struct ServeWorker {
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Drop for ServeWorker {
+    fn drop(&mut self) {
+        self.shared.close();
+        if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+        {
+            tracing::warn!(target: "tui.dialog", "Serve worker stopped after a panic");
+        }
+    }
+}
+
 /// One active operation and one replaceable, not-yet-admitted request.
 #[derive(Default)]
 pub(crate) struct ServeJobs {
-    worker: Option<(Arc<Shared>, JoinHandle<()>)>,
+    worker: Option<ServeWorker>,
 }
 
 impl ServeJobs {
@@ -159,12 +178,12 @@ impl ServeJobs {
         if self
             .worker
             .as_ref()
-            .is_some_and(|(_, worker)| worker.is_finished())
+            .is_some_and(|worker| worker.thread.as_ref().is_none_or(JoinHandle::is_finished))
         {
             self.shutdown();
         }
-        if let Some((shared, _)) = &self.worker {
-            return Submitter(Arc::clone(shared));
+        if let Some(worker) = &self.worker {
+            return Submitter(Arc::clone(&worker.shared));
         }
         let shared = Arc::new(Shared::default());
         let worker_shared = Arc::clone(&shared);
@@ -209,7 +228,13 @@ impl ServeJobs {
                 }
             });
         match spawned {
-            Ok(worker) => self.worker = Some((Arc::clone(&shared), worker)),
+            Ok(thread) => {
+                self.worker = Some(ServeWorker {
+                    shared: Arc::clone(&shared),
+                    thread: Some(thread),
+                    runtime: tokio::runtime::Handle::try_current().ok(),
+                })
+            }
             Err(error) => {
                 shared.close();
                 tracing::warn!(target: "tui.dialog", %error, "Serve worker could not start");
@@ -227,10 +252,13 @@ impl ServeJobs {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        if let Some((shared, worker)) = self.worker.take() {
-            shared.close();
-            if worker.join().is_err() {
-                tracing::warn!(target: "tui.dialog", "Serve worker stopped after a panic");
+        if let Some(mut worker) = self.worker.take() {
+            worker.shared.close();
+            if !worker.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+                if let Some(runtime) = worker.runtime.take() {
+                    // The owner also joins if the runtime cancels this finalizer.
+                    runtime.spawn_blocking(move || drop(worker));
+                }
             }
         }
     }

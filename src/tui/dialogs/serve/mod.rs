@@ -13,9 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
 use crate::acp::client::autostart::initial_log_tail;
-use crate::cli::serve::{
-    read_serve_urls, ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget,
-};
+use crate::cli::serve::{ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
@@ -169,7 +167,6 @@ impl ServeLaunchRequest {
         // A failed reconnect can follow a successor that already runs the new passphrase.
         if let Some(passphrase) = self.passphrase {
             if result.is_ok() || crate::cli::serve::daemon_runs_passphrase(&passphrase) {
-                remember_passphrase(&passphrase);
                 save_passphrase_to_disk(&passphrase);
             }
         }
@@ -358,9 +355,9 @@ impl ServeViewState {
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
+        urls: Vec<ServeUrl>,
         log_offset: u64,
     ) -> Self {
-        let urls = read_serve_urls();
         if urls.is_empty() {
             return ServeViewState::Starting {
                 mode,
@@ -654,6 +651,7 @@ enum PendingJob {
     RetryContext {
         failed: Option<TunnelTransport>,
     },
+    ResetContext,
     Picker {
         selected: Option<ServeMode>,
     },
@@ -683,6 +681,7 @@ impl PendingJob {
         match self {
             Self::Open => Some("Looking for a running daemon"),
             Self::RetryContext { .. } => Some("Checking Daemon identity for provider retry"),
+            Self::ResetContext => Some("Checking Daemon identity for Funnel reset"),
             Self::Picker { .. } => Some("Checking access options"),
             Self::Providers { .. } => Some("Checking tunnel providers"),
             Self::Retry { .. } => Some("Stopping the observed daemon before provider retry"),
@@ -977,6 +976,7 @@ impl ServeView {
             PendingJob::Open
             | PendingJob::ErrorContext
             | PendingJob::RetryContext { .. }
+            | PendingJob::ResetContext
             | PendingJob::Retry { .. }
             | PendingJob::Reset
             | PendingJob::LaunchContext(_)
@@ -1295,6 +1295,13 @@ impl ServeView {
         }
     }
 
+    fn request_funnel_reset(&mut self) {
+        match &self.target {
+            Some(target) => self.request(Job::Reset(target.clone()), PendingJob::Reset),
+            None => self.request(Job::ErrorContext, PendingJob::ResetContext),
+        }
+    }
+
     fn error_key(&mut self, code: KeyCode) -> ServeAction {
         let ServeViewState::Error {
             message,
@@ -1310,11 +1317,7 @@ impl ServeView {
             KeyCode::Char('p' | 'P') if *mode == ServeMode::Tunnel => {
                 self.request_provider_retry(failed);
             }
-            KeyCode::Char('r' | 'R') if reset => {
-                if let Some(target) = &self.target {
-                    self.request(Job::Reset(target.clone()), PendingJob::Reset);
-                }
-            }
+            KeyCode::Char('r' | 'R') if reset => self.request_funnel_reset(),
             KeyCode::Enter | KeyCode::Char(' ') => return ServeAction::Close,
             _ => {}
         }
@@ -1469,7 +1472,7 @@ impl ServeView {
         }
         if matches!(
             kind,
-            PendingJob::ErrorContext | PendingJob::RetryContext { .. }
+            PendingJob::ErrorContext | PendingJob::RetryContext { .. } | PendingJob::ResetContext
         ) && matches!(self.state, ServeViewState::Error { .. })
         {
             self.target = None;
@@ -1526,13 +1529,17 @@ impl ServeView {
                 self.launch_in_flight = false;
             }
             (
-                kind @ (PendingJob::ErrorContext | PendingJob::RetryContext { .. }),
+                kind @ (PendingJob::ErrorContext
+                | PendingJob::RetryContext { .. }
+                | PendingJob::ResetContext),
                 JobResult::ErrorContext(target),
             ) => {
                 self.target = Some(target);
                 self.control_error = None;
-                if let PendingJob::RetryContext { failed } = kind {
-                    self.request_provider_retry(failed);
+                match kind {
+                    PendingJob::RetryContext { failed } => self.request_provider_retry(failed),
+                    PendingJob::ResetContext => self.request_funnel_reset(),
+                    _ => {}
                 }
             }
             (PendingJob::Passphrase, JobResult::Passphrase(passphrase)) => {
@@ -1615,7 +1622,11 @@ impl ServeView {
                 }
                 self.pending_launch = Some(request);
             }
-            (PendingJob::Starting, JobResult::Starting(observation)) => {
+            (
+                PendingJob::Starting | PendingJob::LaunchOutcome,
+                JobResult::Starting(observation),
+            ) => {
+                self.launch_in_flight = false;
                 self.target = Some(observation.target);
                 let ServeViewState::Starting {
                     mode,

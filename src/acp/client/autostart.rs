@@ -40,6 +40,14 @@ fn random_port() -> u16 {
 
 /// The current run's lines: the log is shared, so start at the last `[AOE_START_MARKER]`.
 pub(crate) fn initial_log_tail() -> Vec<String> {
+    log_tail(None)
+}
+
+pub(crate) fn startup_log_tail(pid: u32) -> Vec<String> {
+    log_tail(Some(pid))
+}
+
+fn log_tail(pid: Option<u32>) -> Vec<String> {
     let Some(contents) = crate::cli::serve::stdio_redirect_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -47,11 +55,27 @@ pub(crate) fn initial_log_tail() -> Vec<String> {
         return Vec::new();
     };
     let all: Vec<&str> = contents.lines().collect();
-    let from = all
-        .iter()
-        .rposition(|line| line.contains("[AOE_START_MARKER]"))
-        .unwrap_or(0);
-    let window = &all[from..];
+    let marker = pid.map(|pid| format!("pid={pid}"));
+    let from = all.iter().rposition(|line| {
+        line.contains("[AOE_START_MARKER]")
+            && marker
+                .as_ref()
+                .is_none_or(|marker| line.split_whitespace().any(|word| word == marker))
+    });
+    let from = match (from, pid) {
+        (Some(from), _) => from,
+        (None, None) => 0,
+        (None, Some(_)) => return Vec::new(),
+    };
+    let end = if pid.is_some() {
+        all[from + 1..]
+            .iter()
+            .position(|line| line.contains("[AOE_START_MARKER]"))
+            .map_or(all.len(), |next| from + 1 + next)
+    } else {
+        all.len()
+    };
+    let window = &all[from..end];
     let start = window.len().saturating_sub(LOG_TAIL_LINES);
     window[start..].iter().map(|s| s.to_string()).collect()
 }

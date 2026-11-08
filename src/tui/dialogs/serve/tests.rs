@@ -542,21 +542,22 @@ fn a_timely_confirmation_survives_a_slow_second_assessment() {
 #[serial_test::serial]
 fn every_pending_state_leaves_a_closed_worker() {
     let _home = crate::session::test_support::isolate_app_dir();
-    for (held, retry_context) in [
-        (Held::Open, false),
-        (Held::Picker, false),
-        (Held::Providers, false),
-        (Held::Retry, false),
-        (Held::Reset, false),
-        (Held::Restart, false),
-        (Held::LaunchContext, false),
-        (Held::LaunchOutcome, false),
-        (Held::Starting, false),
-        (Held::Passphrase, false),
-        (Held::ErrorContext, false),
-        (Held::ErrorContext, true),
-        (Held::ActiveLog, false),
-        (Held::Copy, false),
+    for (held, recovery_key) in [
+        (Held::Open, None),
+        (Held::Picker, None),
+        (Held::Providers, None),
+        (Held::Retry, None),
+        (Held::Reset, None),
+        (Held::Restart, None),
+        (Held::LaunchContext, None),
+        (Held::LaunchOutcome, None),
+        (Held::Starting, None),
+        (Held::Passphrase, None),
+        (Held::ErrorContext, None),
+        (Held::ErrorContext, Some('P')),
+        (Held::ErrorContext, Some('R')),
+        (Held::ActiveLog, None),
+        (Held::Copy, None),
     ] {
         let mut view = ServeView::for_test(if held == Held::ErrorContext {
             error_state()
@@ -615,10 +616,10 @@ fn every_pending_state_leaves_a_closed_worker() {
             Held::Passphrase => (Job::Passphrase, PendingJob::Passphrase),
             Held::ErrorContext => (
                 Job::ErrorContext,
-                if retry_context {
-                    PendingJob::RetryContext { failed: None }
-                } else {
-                    PendingJob::ErrorContext
+                match recovery_key {
+                    Some('P') => PendingJob::RetryContext { failed: None },
+                    Some('R') => PendingJob::ResetContext,
+                    _ => PendingJob::ErrorContext,
                 },
             ),
             Held::ActiveLog => (Job::ObserveActive, PendingJob::ActiveLog),
@@ -1170,7 +1171,6 @@ fn launch_observations_never_mix_a_replacement_with_prior_credentials() {
 
     let _home = crate::session::test_support::isolate_app_dir();
     let app = crate::session::get_app_dir().unwrap();
-    forget_stopped_passphrase();
     for hold_starting in [false, true] {
         for replaced in [false, true] {
             remove_app_file("serve.url");
@@ -1295,4 +1295,299 @@ fn launch_observations_never_mix_a_replacement_with_prior_credentials() {
             }
         }
     }
+}
+
+struct TestDaemon {
+    _root: tempfile::TempDir,
+    child: std::process::Child,
+}
+
+impl TestDaemon {
+    fn new() -> Self {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &root.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let child = std::process::Command::new("cat")
+            .arg0("aoe")
+            .arg("serve")
+            .current_dir(root.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { _root: root, child }
+    }
+
+    fn publish(&mut self) -> TuiControlTarget {
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::write(app.join("serve.pid"), self.child.id().to_string()).unwrap();
+        crate::cli::serve::wait_for_test_daemon(&mut self.child)
+    }
+
+    fn exit(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn open_uses_current_credentials_without_saved_default_fallback() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let mut daemon = TestDaemon::new();
+    daemon.publish();
+    std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+    std::fs::write(app.join("serve.url"), "https://current.invalid/").unwrap();
+    save_passphrase_to_disk("previous saved default");
+    for current in [Some("current runtime credential"), None] {
+        remove_app_file("serve.passphrase");
+        if let Some(current) = current {
+            std::fs::write(app.join("serve.passphrase"), current).unwrap();
+        }
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::new(&mut jobs);
+        wait_for(&mut view, |view| {
+            matches!(
+                view.state,
+                ServeViewState::Active { .. } | ServeViewState::Error { .. }
+            )
+        });
+        let ServeViewState::Active { passphrase, .. } = &view.state else {
+            panic!("current Daemon was not opened");
+        };
+        assert_eq!(passphrase.as_deref(), current);
+        assert_eq!(view.pending_passphrase, "previous saved default");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn open_rejects_replacement_during_a_metadata_read() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let mut original = TestDaemon::new();
+    original.publish();
+    std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+    std::fs::write(app.join("serve.passphrase"), "original runtime credential").unwrap();
+    let url = app.join("serve.url");
+    nix::unistd::mkfifo(
+        &url,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::new(&mut jobs);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut writer = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&url)
+        {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                assert!(Instant::now() < deadline, "Open did not reach the URL read");
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("cannot open metadata gate: {error}"),
+        }
+    };
+    original.exit();
+    let mut replacement = TestDaemon::new();
+    replacement.publish();
+    std::fs::write(app.join("serve.mode"), "local").unwrap();
+    std::fs::write(
+        app.join("serve.passphrase"),
+        "replacement runtime credential",
+    )
+    .unwrap();
+    std::fs::remove_file(&url).unwrap();
+    std::fs::write(&url, "https://replacement.invalid/").unwrap();
+    writer.write_all(b"https://replacement.invalid/\n").unwrap();
+    drop(writer);
+    wait_for(&mut view, |view| {
+        matches!(
+            view.state,
+            ServeViewState::Active { .. } | ServeViewState::Error { .. }
+        )
+    });
+    assert!(matches!(view.state, ServeViewState::Error { .. }));
+    assert!(replacement.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[serial_test::serial]
+fn launch_observations_diagnose_only_a_proven_owner_exit() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    #[derive(Clone, Copy)]
+    enum Change {
+        Exit,
+        Hide,
+        Foreign,
+    }
+    for (hold_starting, change) in [
+        (false, Change::Exit),
+        (true, Change::Exit),
+        (true, Change::Hide),
+        (true, Change::Foreign),
+    ] {
+        remove_app_file("serve.url");
+        let mut daemon = TestDaemon::new();
+        let target = daemon.publish();
+        let (entered, received) = mpsc::sync_channel(1);
+        let (release, retained) = mpsc::sync_channel(1);
+        let mut jobs = ServeJobs::default();
+        let submitter = jobs.with_handler(move |job, control, runtime| {
+            if operation(&job)
+                == if hold_starting {
+                    Held::Starting
+                } else {
+                    Held::LaunchOutcome
+                }
+            {
+                entered.send(()).unwrap();
+                retained.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            run_job(job, control, runtime)
+        });
+        let mut view = ServeView::with_state(starting(), submitter);
+        view.launch_in_flight = true;
+        view.finish_launch(Ok(target));
+        if hold_starting {
+            wait_for(&mut view, |view| !view.launch_in_flight);
+        }
+        received.recv_timeout(Duration::from_secs(10)).unwrap();
+        if matches!(change, Change::Hide) {
+            std::fs::remove_file(app.join("serve.pid")).unwrap();
+        } else {
+            daemon.exit();
+            if matches!(change, Change::Foreign) {
+                std::fs::write(app.join("serve.pid"), std::process::id().to_string()).unwrap();
+            }
+        }
+        std::fs::write(
+            crate::cli::serve::stdio_redirect_path().unwrap(),
+            format!(
+                "[AOE_START_MARKER] pid={} exe=aoe\naddress already in use\nfixture-own-startup-tail\n\
+                 [AOE_START_MARKER] pid={} exe=tui\nunrelated-later-tail\n",
+                daemon.child.id(), std::process::id()
+            ),
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        wait_for(&mut view, |view| {
+            matches!(view.state, ServeViewState::Error { .. })
+        });
+        let ServeViewState::Error { message, .. } = &view.state else {
+            unreachable!()
+        };
+        if matches!(change, Change::Exit) {
+            assert!(message.contains("exited before"), "{message}");
+            assert!(message.contains("fixture-own-startup-tail"), "{message}");
+            assert!(message.contains("address already in use"), "{message}");
+        } else {
+            assert!(!message.contains("exited before"), "{message}");
+            assert!(!message.contains("fixture-own-startup-tail"), "{message}");
+            if matches!(change, Change::Hide) {
+                assert!(daemon.child.try_wait().unwrap().is_none());
+            }
+        }
+        assert!(!message.contains("unrelated-later-tail"), "{message}");
+        remove_app_file("serve.pid");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn runtime_owned_shutdown_does_not_hold_terminal_teardown_for_an_admitted_reset() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for drop_owner in [false, true] {
+        let fixture = FunnelFixture::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered_runtime = runtime.enter();
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::with_state(error_state(), jobs.submitter());
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+        view.handle_key(key('R'));
+        let process = fixture.entered();
+        drop(view);
+        drop(entered_runtime);
+        let (finished, received) = mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            if drop_owner {
+                drop(jobs);
+            } else {
+                jobs.shutdown();
+            }
+            finished.send(()).unwrap();
+        });
+        let returned = received.recv_timeout(Duration::from_secs(1));
+        fixture.release();
+        shutdown.join().unwrap();
+        drop(runtime);
+        assert!(
+            returned.is_ok(),
+            "terminal teardown waited for the admitted reset"
+        );
+        assert!(process.exited().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
+            "reset\n"
+        );
+        assert!(fixture.root.path().join("complete").exists());
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn funnel_reset_rediscovers_repaired_identity_without_replaying_the_mutation() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let fixture = FunnelFixture::new();
+    let pid = crate::session::get_app_dir().unwrap().join("serve.pid");
+    std::fs::create_dir(&pid).unwrap();
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(error_state(), jobs.submitter());
+    view.request(Job::ErrorContext, PendingJob::ErrorContext);
+    wait_for(&mut view, |view| view.pending.is_none());
+    view.handle_key(key('R'));
+    wait_for(&mut view, |view| view.pending.is_none());
+    assert!(view.target.is_none());
+    assert!(view.control_error.is_some());
+    assert!(!fixture.root.path().join("calls").exists());
+    std::fs::remove_dir(&pid).unwrap();
+    view.handle_key(key('R'));
+    wait_for(&mut view, |_| fixture.root.path().join("entered").exists());
+    let process = fixture.entered();
+    for _ in 0..3 {
+        view.handle_key(key('R'));
+        view.tick();
+    }
+    fixture.release();
+    wait_for(&mut view, |view| view.pending.is_none());
+    assert!(process.exited().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
+        "reset\n"
+    );
 }

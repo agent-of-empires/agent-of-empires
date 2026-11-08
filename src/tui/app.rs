@@ -4499,9 +4499,15 @@ mod tests {
             app.home.serve_view.is_none(),
             "input remains usable during deferred Stop"
         );
+        // Reopen under free lifecycle exclusion while the launch remains unsettled.
+        drop(transaction);
         app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled(
             &mut app.home.serve_jobs,
         ));
+        let transaction = crate::daemon::lifecycle::Transaction::acquire()
+            .await
+            .unwrap();
+        assert!(app.dashboard_stop.is_none());
         assert!(app
             .home
             .handle_key(KeyEvent::from(KeyCode::Enter), None)
