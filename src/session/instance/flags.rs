@@ -95,8 +95,8 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
-    /// Stamp recency after input reached a live pane. Callers stamp after releasing the lock
-    /// `lock_for_input` held, so an archive or trash may have landed since; never clear it.
+    /// Stamp recency after input reached a live pane. Effect-time native exclusion has
+    /// ended, so an archive or trash may have landed since; never clear it.
     pub fn touch_after_input(&mut self) {
         if self.ensure_startable().is_ok() {
             self.touch_last_accessed();

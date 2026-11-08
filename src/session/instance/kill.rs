@@ -154,22 +154,18 @@ impl Instance {
     }
 
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
-        use crate::tmux::utils::{probe_pane, PaneProbe};
+        use crate::tmux::utils::{observe_pane, remove_owned_dead_pane, PaneProbe};
         self.capture_poller.stop();
         let pane = self.tmux_session().and_then(|session| {
-            match probe_pane(session.name()) {
-                PaneProbe::Missing => return Ok(()),
-                PaneProbe::Unknown => anyhow::bail!(
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            match observe_pane(session.name(), &deadline)? {
+                None => return Ok(()),
+                Some((corpse, PaneProbe::Dead, _)) => return remove_owned_dead_pane(&corpse),
+                Some((_, PaneProbe::Alive, _)) => {}
+                Some(_) => anyhow::bail!(
                     "cannot prove tmux pane state for {} before teardown",
                     session.name()
                 ),
-                PaneProbe::Alive => {}
-                PaneProbe::Dead => {
-                    let shell = crate::session::environment::user_shell();
-                    if let Err(error) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
-                        tracing::warn!(target: "session.store", %error, "respawn_dead_pane failed before teardown");
-                    }
-                }
             }
             session.kill()?;
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -549,6 +545,70 @@ impl Instance {
 mod tests {
 
     use super::*;
+    #[test]
+    #[serial_test::serial]
+    fn clean_kill_removes_the_dead_pane_without_respawning_a_shell() {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        if crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|output| !output.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let instance = Instance::new("dead cleanup", root.path().to_str().unwrap());
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let guard = TmuxTestSession::from_name(name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+            .status()
+            .unwrap()
+            .success());
+        let pane = only_pane_id(guard.name());
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &pane,
+                "remain-on-exit",
+                "on",
+                ";",
+                "respawn-pane",
+                "-k",
+                "-t",
+                &pane,
+                "exit 0"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(&pane);
+        let marker = root.path().join("respawned");
+        let native_tmux = which::which("tmux").unwrap();
+        // Arm only after corpse preparation. Observe real native invocations and
+        // forward every argument unchanged; tmux has no after-respawn-pane hook.
+        let _observer = crate::session::test_support::install_login_shell_path_command(
+            root.path(), "tmux",
+            &format!(
+                "#!/bin/sh\nfor arg do\ncase \"$arg\" in *respawn-pane*) printf 'respawn\\n' >> {};; esac\ndone\nexec {} \"$@\"\n",
+                crate::session::environment::shell_escape_script_word(marker.to_str().unwrap()),
+                crate::session::environment::shell_escape_script_word(native_tmux.to_str().unwrap()),
+            ),
+        );
+        crate::tmux::refresh_session_cache();
+        instance.kill_clean_locked().unwrap();
+        assert!(!crate::tmux::tmux_command()
+            .args(["has-session", "-t", guard.name()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!marker.exists(), "dead cleanup must never spawn a shell");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::serial]

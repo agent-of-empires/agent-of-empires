@@ -211,7 +211,8 @@ impl NativeSessionStore {
             .find(|row| row.id == instance.id)
             .ok_or(crate::session::LifecycleReservationError::Superseded)?;
         anyhow::ensure!(
-            row.lifecycle_generation == instance.lifecycle_generation
+            row.created_at == instance.created_at
+                && row.lifecycle_generation == instance.lifecycle_generation
                 && row.source_profile == instance.source_profile
                 && row.title == instance.title,
             crate::session::LifecycleReservationError::Superseded

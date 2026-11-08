@@ -103,8 +103,8 @@ pub use instance::{
     TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
-    ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
-    ResumeLaunchOptions, TerminalContextResume,
+    ConversationState, LaunchReservation, ManagedResumeRefused, NativeInputError, NativeInputFence,
+    NativeStartAdmission, ResumeAttemptPolicy, ResumeLaunchOptions, TerminalContextResume,
 };
 pub use instance::{
     ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,

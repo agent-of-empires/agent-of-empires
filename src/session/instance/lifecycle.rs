@@ -750,7 +750,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn fail_reserved_launch(
+    pub(crate) fn fail_reserved_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
         generation: u64,
