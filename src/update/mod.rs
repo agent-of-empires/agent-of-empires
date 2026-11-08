@@ -328,6 +328,9 @@ fn classify_releases_behind(
     let Some(latest) = cached_latest.filter(|v| parse_version(v).is_some()) else {
         return ReleasesBehind::Unknown;
     };
+    if parse_version(current).is_none() {
+        return ReleasesBehind::Unknown;
+    }
     if !is_newer_version(latest, current) {
         return ReleasesBehind::Current;
     }
@@ -515,6 +518,7 @@ mod tests {
         assert_eq!(classify_update_status("1.2.3", Some("")), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("   ")), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("garbage")), Unknown);
+        assert_eq!(classify_update_status("garbage", Some("1.3.0")), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("1.2.3")), Current);
         assert_eq!(classify_update_status("1.2.3", Some("1.2.0")), Current);
         assert_eq!(classify_update_status("1.2.3", Some("1.2.4")), PatchBehind);
@@ -552,6 +556,12 @@ mod tests {
                 ReleasesBehind::OneBehind,
             ),
             ("1.2.3", Some("9.9.9"), &[][..], ReleasesBehind::OneBehind),
+            (
+                "garbage",
+                Some("1.3.0"),
+                &releases[..],
+                ReleasesBehind::Unknown,
+            ),
         ] {
             assert_eq!(
                 classify_releases_behind(current, latest, cached),
