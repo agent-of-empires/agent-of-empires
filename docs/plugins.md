@@ -89,6 +89,10 @@ plugin files. They use the preview fingerprint and preserve the enabled state.
 An incompatible or malformed update preview stops before submission. Check the
 Client and Daemon versions, then upgrade and restart the Daemon on its host with
 `aoe serve --restart`, or restart its foreground process or service manager.
+The Daemon logs the redacted chained cause under `plugin.install`; native
+clients deliberately show only fixed preview-failure guidance. Install and update
+previews allow two hours plus ten minutes for preparation and bounded network
+phases. This transport allowance does not extend submission or polling deadlines.
 
 Each accepted operation prints a job id and waits for its result. Resume observation
 with `aoe plugin job <job_id>` using the same Daemon endpoint and credentials.
@@ -97,6 +101,9 @@ outcome is unknown, not permission to retry. The CLI never resubmits automatical
 If no job id arrived, inspect `GET /api/plugins` on that Daemon before deciding
 whether to submit again. Jobs expire after an hour when another job starts and
 do not survive a Daemon restart; a missing job requires inspecting current state.
+Failed CLI observations print the bounded tail and the actual full-log path on
+the Daemon host. The TUI and dashboard also show that host-side path. Read the
+file on that host, not on a remote Client; job ids are not log filenames.
 
 Successful install and uninstall jobs reconcile the live worker set. Installation
 schedules worker startup; job success does not mean the worker is ready.
@@ -110,6 +117,8 @@ Each preparation/application has one fixed **two-hour budget**, shared by its
 Git commands and approved build steps. Exhaustion does not start Git fallback.
 The host terminates its owned command group and retained descendant handles,
 even after those descendants change group, before rollback and exclusion release.
+The direct command child stays unreaped until settlement, reserving its original
+process group even when the leader exits before a later-born group member.
 It verifies their physical exit. Observation ending does
 not cancel an accepted mutation. This policy adds no cancellation endpoint,
 flag, or configurable timeout, and commands remain unsandboxed: it is not a
@@ -120,14 +129,21 @@ If command settlement or restoration cannot be proven, the host retains
 exclusion and installation/backup or staging evidence rather than rolling back
 against potentially live writers. It attempts to write
 `<app_dir>/.plugin-recovery-required`, logging any persistence failure.
-Further mutations refuse while that marker exists.
+Further mutations and all external worker launches refuse while that marker
+exists or cannot be checked. Builtin workers remain available.
 The job reports an explicit recovery-required failure, not a completed rollback.
 Stop the Daemon without removing the marker. Verify the recorded commands and
 owned workers have physically exited, then restore the intended installation.
 Remove the marker only after recovery, then restart the Daemon to release any
 retained in-process ownership. Restart alone is not recovery.
+Tree publication and target config/lock entries share one rollback boundary.
+The previous tree stays backed up until both metadata writes commit. Restoration
+preserves the prior enabled, source, dev, grant, dismissal and settings values
+without overwriting unrelated config. A backup cleanup failure after commit is
+reported as recovery required; do not restore that backup over the committed tree.
+Local release-binary targets must be regular executable files before publication.
 
-A plugin lands in `<app_dir>/plugins/<id>/`, with a GitHub source pinned to its exact commit and any release-binary worker downloaded for your platform. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
+A plugin lands in `<app_dir>/plugins/<id>/`. GitHub sources are pinned to an exact commit and release-binary workers are downloaded for your platform; local sources must supply their own executable. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 
 Build steps and workers run with `AOE_NODE` set to the resolved Node and its directory first on `PATH`. If no Node is found when a plugin declares a build step or a non-system worker, install downloads the pinned one on Linux and macOS. Elsewhere, put Node on `PATH` or set `AOE_ACP_NODE`.
 

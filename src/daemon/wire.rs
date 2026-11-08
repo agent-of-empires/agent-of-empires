@@ -59,6 +59,7 @@ pub struct PluginJobAccepted {
 
 #[derive(Serialize, Deserialize)]
 pub struct PluginJobLog {
+    pub path: String,
     pub exists: bool,
     pub tail: String,
     pub lines_returned: usize,

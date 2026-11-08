@@ -3556,9 +3556,9 @@ mod tests {
         );
     }
 
-    // Unrelated tests can launch tools without holding EnvGuard's process-wide lock.
+    // Isolate process-wide probe and socket state from unrelated tests.
     #[cfg(unix)]
-    fn run_probe_test_in_subprocess() -> bool {
+    pub(super) fn run_probe_test_in_subprocess() -> bool {
         const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
         let thread = std::thread::current();
         let test = thread.name().expect("named test thread");

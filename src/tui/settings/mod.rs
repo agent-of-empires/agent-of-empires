@@ -534,6 +534,23 @@ impl SettingsView {
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        let editor = if self.editing_input.is_some() || self.list_edit_state.is_some() {
+            self.fields.get(self.selected_field).map(|field| {
+                let owner = field
+                    .schema_section()
+                    .and_then(crate::session::config::settings_schema::section_plugin_id);
+                let valid = owner.is_none_or(|id| {
+                    crate::plugin::registry::is_builtin_id(id)
+                        || old_baseline
+                            .get(id)
+                            .zip(disk.plugins.get(id))
+                            .is_some_and(|(base, current)| same_plugin_lifecycle(base, current))
+                });
+                (field.ident(), valid)
+            })
+        } else {
+            None
+        };
         let staged = std::mem::take(&mut self.global_config.plugins);
         let baseline_val = serde_json::to_value(&disk.plugins);
         self.global_config.plugins = merge_staged_plugins(&old_baseline, &staged, disk.plugins);
@@ -545,6 +562,21 @@ impl SettingsView {
         // with it the virtual `plugin:<id>` settings sections; rebuild so the
         // fields pane under the manager tracks it.
         self.rebuild_fields();
+        if let Some((identity, valid)) = editor {
+            if let Some(index) = valid
+                .then(|| {
+                    self.fields
+                        .iter()
+                        .position(|field| field.ident() == identity)
+                })
+                .flatten()
+            {
+                self.selected_field = index;
+            } else {
+                self.editing_input = None;
+                self.list_edit_state = None;
+            }
+        }
     }
 
     /// Advance `selected_field` to the first interactive field
@@ -1081,6 +1113,13 @@ impl SettingsView {
     }
 }
 
+fn same_plugin_lifecycle(
+    base: &crate::session::PluginConfig,
+    current: &crate::session::PluginConfig,
+) -> bool {
+    current.source == base.source && current.dev == base.dev && current.grant == base.grant
+}
+
 /// Merge only settings-owned plugin leaves. Source, dev and the complete
 /// grant are conservative identity evidence, not an unconditional ABA token.
 fn merge_staged_plugins(
@@ -1099,20 +1138,7 @@ fn merge_staged_plugins(
             let Some(current) = fresh.get(id) else {
                 continue;
             };
-            let same_grant = match (&current.grant, &base.grant) {
-                (Some(current), Some(base)) => {
-                    current.manifest_hash == base.manifest_hash
-                        && current.capabilities == base.capabilities
-                        && current.granted_at == base.granted_at
-                }
-                (None, None) => true,
-                _ => false,
-            };
-            if !baseline.contains_key(id)
-                || current.source != base.source
-                || current.dev != base.dev
-                || !same_grant
-            {
+            if !baseline.contains_key(id) || !same_plugin_lifecycle(base, current) {
                 continue;
             }
         }
@@ -1424,6 +1450,116 @@ mod dirty_tracking_tests {
             "the disk-side install must appear in the staged view"
         );
         assert!(view.has_changes, "the staged toggle keeps the view dirty");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_resync_invalidates_affected_editors_and_rebinds_unrelated_fields() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        for editor in ["text", "list", "unrelated"] {
+            for mutation in ["replacement", "removal", "field-disappearance", "unchanged"] {
+                let (_home, _temp, mut view) = fresh_view();
+                let source = tempfile::tempdir().unwrap();
+                let manifest = "id = \"acme.editor\"\nname = \"Editor\"\nversion = \"1.0.0\"\napi_version = 14\n[[settings]]\nkey = \"text\"\nlabel = \"Text\"\ntype = \"string\"\ndefault = \"old\"\n[[settings]]\nkey = \"items\"\nlabel = \"Items\"\ntype = \"string_list\"\ndefault = []\n";
+                std::fs::write(source.path().join("aoe-plugin.toml"), manifest).unwrap();
+                crate::plugin::install::install(source.path().to_str().unwrap(), true, false)
+                    .await
+                    .unwrap();
+                view.scope = SettingsScope::Global;
+                view.global_config = Config::load().unwrap();
+                view.snapshot_baseline();
+                view.plugin_manager = crate::tui::dialogs::PluginManagerDialog::embedded();
+                let category = if editor == "unrelated" {
+                    SettingsCategory::Worktree
+                } else {
+                    SettingsCategory::Plugins
+                };
+                view.selected_category = view
+                    .categories
+                    .iter()
+                    .position(|row| row.as_tab() == Some(category))
+                    .unwrap();
+                view.focus = SettingsFocus::Fields;
+                view.plugins_fields_focus = true;
+                view.rebuild_fields();
+                let identity = match editor {
+                    "text" => "plugin:acme.editor.text",
+                    "list" => "plugin:acme.editor.items",
+                    _ => "worktree.path_template",
+                };
+                // Preserve an editor across a change in field order, not just a reload.
+                if mutation == "unchanged" || editor == "unrelated" {
+                    view.fields.rotate_left(1);
+                }
+                view.selected_field = view
+                    .fields
+                    .iter()
+                    .position(|field| field.ident() == identity)
+                    .unwrap();
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                view.handle_key(key(KeyCode::Enter));
+                if editor == "list" {
+                    view.handle_key(key(KeyCode::Char('a')));
+                }
+                view.handle_key(key(KeyCode::Char('z')));
+                match mutation {
+                    "replacement" => {
+                        crate::plugin::install::uninstall("acme.editor").unwrap();
+                        crate::plugin::install::install(
+                            source.path().to_str().unwrap(),
+                            true,
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "removal" => crate::plugin::install::uninstall("acme.editor").unwrap(),
+                    "field-disappearance" => {
+                        std::fs::write(crate::plugin::plugins_dir().unwrap().join("acme.editor/aoe-plugin.toml"),
+                            "id = \"acme.editor\"\nname = \"Editor\"\nversion = \"1.0.0\"\napi_version = 14\n").unwrap();
+                        crate::plugin::reload_registry();
+                    }
+                    _ => {
+                        update_config(|config| {
+                            config
+                                .plugins
+                                .get_mut("acme.editor")
+                                .unwrap()
+                                .dismissed_update = Some("new notice".into())
+                        })
+                        .unwrap();
+                    }
+                }
+                view.resync_after_plugin_mutation();
+                let retained = editor == "unrelated" || mutation == "unchanged";
+                assert_eq!(
+                    view.editing_input.is_some() || view.list_edit_state.is_some(),
+                    retained,
+                    "{editor}/{mutation}"
+                );
+                if retained {
+                    assert_eq!(view.fields[view.selected_field].ident(), identity);
+                    view.handle_key(key(KeyCode::Enter));
+                    if editor == "unrelated" {
+                        assert!(view.global_config.worktree.path_template.ends_with('z'));
+                    } else if editor == "text" {
+                        assert_eq!(
+                            view.global_config.plugins["acme.editor"].settings["text"].as_str(),
+                            Some("oldz")
+                        );
+                    } else {
+                        assert_eq!(
+                            view.global_config.plugins["acme.editor"].settings["items"]
+                                .as_array()
+                                .unwrap()[0]
+                                .as_str(),
+                            Some("z")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ pub(super) struct RecoveryRequired(pub String);
 impl Budget {
     pub(super) fn new() -> Self {
         Self {
-            deadline: Instant::now() + Duration::from_secs(2 * 60 * 60),
+            deadline: Instant::now() + super::EXECUTION_BUDGET,
             #[cfg(test)]
             expired: None,
         }
@@ -49,38 +49,18 @@ impl Budget {
         if self.is_expired() {
             return Err(Exhausted.into());
         }
-        let mut child = crate::process::spawn_process_group(command)
+        let mut child = crate::process::OwnedProcessGroup::spawn(command)
             .context("spawning plugin command process group")?;
         let pid = child.id();
-        let guard = (|| {
-            let birth = crate::process::process_birth_identity(pid)?;
-            crate::process::RunnerProcessGuard::capture(pid, birth.map(|b| b.fingerprint()))
-        })();
-        let guard = match guard {
-            Ok(guard) => guard,
-            Err(error) => {
-                // Do not let a failed identity probe release ownership of a writer.
-                let settlement = crate::process::terminate_and_reap_process_group(
-                    &mut child,
-                    Duration::from_millis(250),
-                );
-                std::mem::forget(child);
-                return Err(RecoveryRequired(format!(
-                    "cannot attest command {pid}: {error:#}; leader settlement: {settlement:?}"
-                ))
-                .into());
-            }
-        };
         let mut descendants = match crate::process::CapturedProcessTree::capture(pid) {
             Ok(tree) => Some(tree),
-            Err(error) => match child.try_wait() {
-                Ok(Some(_)) => None,
+            Err(error) => match child.exited() {
+                Ok(true) => None,
                 outcome => {
-                    std::mem::forget((guard, child));
+                    std::mem::forget(child);
                     return Err(RecoveryRequired(format!(
                         "cannot attest descendants of command {pid}: {error:#}; leader status: {outcome:?}"
-                    ))
-                    .into());
+                    )).into());
                 }
             },
         };
@@ -96,33 +76,29 @@ impl Budget {
                 })
             })
         }
-        let stdout = reader(child.stdout.take());
-        let stderr = reader(child.stderr.take());
+        let stdout = reader(child.take_stdout());
+        let stderr = reader(child.take_stderr());
         let mut timed_out = false;
         let mut next_census = Instant::now() + Duration::from_secs(1);
-        let status = loop {
+        loop {
             #[cfg(test)]
             if let Some(dir) = command.get_current_dir() {
                 super::fetch::test_gate::reach(dir, "command-observe");
             }
             let expired = self.is_expired();
             if expired || Instant::now() >= next_census {
-                let observed = descendants
-                    .as_mut()
-                    .map_or(Ok(()), |tree| tree.refresh())
-                    .and_then(|()| guard.executing());
+                let observed = descendants.as_mut().map_or(Ok(()), |tree| tree.refresh());
                 if let Err(error) = observed {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
+                    match child.exited() {
+                        Ok(true) => {
                             timed_out = expired;
-                            break Some(status);
+                            break;
                         }
                         outcome => {
-                            std::mem::forget((descendants, guard, child));
+                            std::mem::forget((descendants, child));
                             return Err(RecoveryRequired(format!(
                                 "cannot observe command {pid}: {error:#}; leader status: {outcome:?}"
-                            ))
-                            .into());
+                            )).into());
                         }
                     }
                 }
@@ -130,40 +106,43 @@ impl Budget {
             }
             if expired {
                 timed_out = true;
-                break None;
+                break;
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            #[cfg(test)]
+            if let Some(dir) = command.get_current_dir() {
+                super::fetch::test_gate::reach(dir, "leader-exit-observe");
+            }
+            match child.exited() {
+                Ok(true) => break,
+                Ok(false) => std::thread::sleep(Duration::from_millis(25)),
                 Err(error) => {
-                    std::mem::forget((descendants, guard, child));
+                    std::mem::forget((descendants, child));
                     return Err(RecoveryRequired(format!(
                         "cannot wait for command {pid}: {error}"
                     ))
                     .into());
                 }
             }
-        };
+        }
         // A completed leader can leave writers behind. Settle them on success too.
         if let Some(tree) = &descendants {
             if let Err(error) = tree.settle(Duration::from_millis(250)) {
-                std::mem::forget((descendants, guard, child));
+                std::mem::forget((descendants, child));
                 return Err(RecoveryRequired(format!(
                     "command {pid} descendant settlement unproven: {error:#}"
                 ))
                 .into());
             }
         }
-        if let Err(error) = guard.settle(Duration::from_millis(250)) {
-            std::mem::forget((descendants, guard, child));
+        if let Err(error) = child.settle(Duration::from_millis(250)) {
+            std::mem::forget((descendants, child));
             return Err(
                 RecoveryRequired(format!("command {pid} settlement unproven: {error:#}")).into(),
             );
         }
-        let status = match status {
-            Some(status) => status,
-            None => child.wait().context("reaping settled plugin command")?,
-        };
+        let status = child.reap().map_err(|error| {
+            RecoveryRequired(format!("command {pid} final reap unproven: {error}"))
+        })?;
         fn finish(
             reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
         ) -> Result<Vec<u8>> {
@@ -195,12 +174,13 @@ pub(super) fn needs_recovery<T>(result: &Result<T>) -> bool {
         .is_some_and(|error| error.downcast_ref::<RecoveryRequired>().is_some())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn leader_exit_during_census_does_not_require_manual_recovery() {
         static EXPIRED: AtomicBool = AtomicBool::new(false);
         EXPIRED.store(false, Ordering::SeqCst);
@@ -281,6 +261,80 @@ mod tests {
         assert!(
             error.downcast_ref::<Exhausted>().is_some(),
             "a completed leader needs ordinary deadline settlement, not manual recovery: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_same_group_child_settles_before_normal_result() {
+        static EXPIRED: AtomicBool = AtomicBool::new(false);
+        EXPIRED.store(false, Ordering::SeqCst);
+        struct ExpireOnDrop;
+        impl Drop for ExpireOnDrop {
+            fn drop(&mut self) {
+                EXPIRED.store(true, Ordering::SeqCst);
+            }
+        }
+        let _expire = ExpireOnDrop;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut observe = super::super::fetch::test_gate::install(&root, "leader-exit-observe");
+        let mut command = Command::new("sh");
+        command.args(["-c",
+            "printf %s $$ > leader; while [ ! -f start ]; do sleep 0.01; done; sleep 300 & printf %s $! > late; while [ ! -f release ]; do sleep 0.01; done; exit 0"])
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let task = tokio::task::spawn_blocking(move || {
+            Budget::controlled_for_test(&EXPIRED).run(&mut command)
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut observe.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(root.join("start"), b"").unwrap();
+        async fn captured(path: &std::path::Path) -> crate::process::CapturedProcess {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                    {
+                        if let Some(birth) = crate::process::process_birth_identity(pid).unwrap() {
+                            if let Some(process) =
+                                crate::process::CapturedProcess::capture(pid, &birth).unwrap()
+                            {
+                                return process;
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let leader = captured(&root.join("leader")).await;
+        let late = captured(&root.join("late")).await;
+        std::fs::write(root.join("release"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader.exited().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!late.exited().unwrap());
+        observe.release();
+        let output = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            late.exited().unwrap(),
+            "late uncaptured group writer must physically exit"
         );
     }
 }

@@ -141,18 +141,17 @@ pub fn resolve_launch(
         RuntimeSpec::Command { command, .. } => {
             resolve_command(&plugin_id, dir, command, resolver)?
         }
-        RuntimeSpec::ReleaseBinary { asset, bin } => {
-            let target = bin.as_deref().unwrap_or(asset.as_str());
-            let path = resolve_in_tree(&plugin_id, dir, target, resolver, |path| {
-                LaunchError::ReleaseBinaryMissing {
-                    plugin_id: plugin_id.clone(),
-                    path,
-                    os: std::env::consts::OS.to_string(),
-                    arch: std::env::consts::ARCH.to_string(),
-                }
-            })?;
-            (path, Vec::new())
-        }
+        RuntimeSpec::ReleaseBinary { asset, bin } => (
+            resolve_release_binary(
+                &plugin_id,
+                dir,
+                asset,
+                &plugin.manifest.version,
+                bin.as_deref(),
+                resolver,
+            )?,
+            Vec::new(),
+        ),
     };
 
     let mut env = BTreeMap::new();
@@ -163,6 +162,28 @@ pub fn resolve_launch(
         args,
         cwd: dir.clone(),
         env,
+    })
+}
+
+pub(crate) fn resolve_release_binary(
+    plugin_id: &str,
+    dir: &Path,
+    asset: &str,
+    version: &str,
+    bin: Option<&str>,
+    resolver: &dyn LaunchResolver,
+) -> Result<PathBuf, LaunchError> {
+    let target = match bin {
+        Some(bin) => std::borrow::Cow::Borrowed(bin),
+        None => super::fetch::render_asset_template(asset, version),
+    };
+    resolve_in_tree(plugin_id, dir, target.as_ref(), resolver, |path| {
+        LaunchError::ReleaseBinaryMissing {
+            plugin_id: plugin_id.to_owned(),
+            path,
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+        }
     })
 }
 

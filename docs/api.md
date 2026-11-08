@@ -223,13 +223,19 @@ and `expected_fingerprint` set to the preview's `fingerprint`. Update uses
 Update previews include a source `notice` and a fingerprint, including
 `no_update`. Explicit CLI updates reapply that pinned source to repair missing
 files; other consumers can keep treating `no_update` as no available version.
-The CLI shows the notice before applying.
+The CLI and both TUI review branches show the notice before applying.
 Uninstall uses `POST /api/plugins/{id}/uninstall`.
 Apply returns `202` with `job_id`; observe it through
 `GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.
+The response's existing `log` object contains `path` (the actual Daemon-host
+filename), `exists`, `tail`, `lines_returned` and `truncated`. A bounded tail may
+omit the original diagnostic; recover the full file on that host using `path`.
 Preview failures return `502` with `AoE-Error-Code: preview_failed`; conflicting
 Daemon jobs return `409` with `AoE-Error-Code: plugin_job_active`. Native clients
 show fixed recovery guidance from these codes without reflecting response bodies.
+The Daemon warns with the redacted chained preview cause under `plugin.install`.
+Native install/update preview transport deadlines are two hours plus ten minutes;
+mutation submission, job polling and general send deadlines are unchanged.
 
 Lifecycle changes share cross-process exclusion with local TUI operations and
 startup sweeps. If another process owns that exclusion, an accepted job fails

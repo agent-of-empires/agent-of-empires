@@ -82,17 +82,27 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
 
 const OPERATION_LOCK: &str = ".plugin-operation.lock";
 
-pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
+pub(crate) fn check_recovery_evidence() -> Result<()> {
     let evidence = crate::session::get_app_dir()?.join(".plugin-recovery-required");
-    if evidence.exists() {
-        bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display());
+    match std::fs::symlink_metadata(&evidence) {
+        Ok(_) => bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("checking plugin recovery evidence"),
     }
-    crate::session::try_acquire_storage_flock(&crate::session::get_app_dir()?, OPERATION_LOCK)
+}
+
+pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
+    let root = crate::session::get_app_dir()?;
+    #[cfg(test)]
+    fetch::test_gate::reach(&root, "operation-admission");
+    let lock = crate::session::try_acquire_storage_flock(&root, OPERATION_LOCK)
         .context("acquiring plugin operation lock")?
         .map(Arc::new)
         .ok_or_else(|| {
             anyhow!("another plugin operation is running; inspect its outcome before retrying")
-        })
+        })?;
+    check_recovery_evidence()?;
+    Ok(lock)
 }
 
 pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
@@ -388,12 +398,63 @@ async fn prepare_install(
     result
 }
 
+struct PriorMetadata {
+    config: Option<PluginConfig>,
+    locked: Option<LockedPlugin>,
+}
+
+impl PriorMetadata {
+    fn capture(id: &str) -> Result<Self> {
+        Ok(Self {
+            config: Config::load()?.plugins.get(id).cloned(),
+            locked: Lockfile::load()?.get(id).cloned(),
+        })
+    }
+
+    fn restore(&self, id: &str) -> Result<()> {
+        let config_result = (|| -> Result<()> {
+            let current = Config::load()?.plugins.remove(id);
+            if current != self.config {
+                update_config(|config| match &self.config {
+                    Some(prior) => {
+                        config.plugins.insert(id.to_owned(), prior.clone());
+                    }
+                    None => {
+                        config.plugins.remove(id);
+                    }
+                })?;
+            }
+            Ok(())
+        })();
+        let lock_result = (|| -> Result<()> {
+            let mut lock = Lockfile::load()?;
+            if lock.get(id) != self.locked.as_ref() {
+                match &self.locked {
+                    Some(prior) => lock.upsert(id, prior.clone()),
+                    None => {
+                        lock.remove(id);
+                    }
+                }
+                lock.save()?;
+            }
+            Ok(())
+        })();
+        match (config_result, lock_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (config, lock) => {
+                bail!("target config restoration: {config:?}; target lock restoration: {lock:?}")
+            }
+        }
+    }
+}
+
 fn apply_prepared_install(
     p: &PreparedInstall,
     node_env: &NodeEnv,
     log: &OperationLog,
 ) -> Result<InstallReport> {
     let final_dir = super::plugins_dir()?.join(&p.id);
+    let prior = PriorMetadata::capture(&p.id)?;
     if final_dir.exists() {
         bail!(
             "{} is already installed; run `aoe plugin update {}` or uninstall it first",
@@ -430,6 +491,8 @@ fn apply_prepared_install(
     }
 
     let persisted = (|| -> Result<()> {
+        #[cfg(test)]
+        fetch::test_gate::reach(&final_dir, "metadata-commit");
         persist_install(
             &p.persisted_source,
             &p.id,
@@ -445,21 +508,14 @@ fn apply_prepared_install(
         )
     })();
     if let Err(e) = persisted {
-        // Not `uninstall`: nothing finished installing, so nothing is announced as uninstalled.
-        let rollback = match is_installed_external(&p.id) {
-            Ok(true) => remove_external(&p.id),
-            Ok(false) => std::fs::remove_dir_all(&final_dir)
-                .with_context(|| format!("removing {}", final_dir.display())),
-            // An unreadable config must not strand the staged tree, or the next
-            // install of the same plugin is refused as already installed.
-            Err(error) => {
-                tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback: config check failed; removing staged tree");
-                std::fs::remove_dir_all(&final_dir)
-                    .with_context(|| format!("removing {}", final_dir.display()))
-            }
-        };
-        if let Err(error) = rollback {
-            tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback failed");
+        #[cfg(test)]
+        fetch::test_gate::reach(&final_dir, "rollback");
+        let metadata = prior.restore(&p.id);
+        let tree = std::fs::remove_dir_all(&final_dir);
+        if metadata.is_err() || tree.is_err() {
+            return Err(super::execution::RecoveryRequired(format!(
+                "install {} failed: {e:#}; metadata restoration: {metadata:?}; tree restoration: {tree:?}", p.id
+            )).into());
         }
         return Err(e);
     }
@@ -805,12 +861,12 @@ async fn prepare_update(
         );
         let runtime_change = if new_is_release_binary && !prior_was_release_binary {
             Some(
-                "the worker is now a downloaded release binary (opaque, not source-auditable)"
+                "the worker uses a prebuilt release binary (opaque, not source-auditable)"
                     .to_string(),
             )
         } else if prior_was_release_binary && !new_is_release_binary {
             Some(
-                "the worker is now an in-tree command (was a downloaded release binary)"
+                "the worker is now an in-tree command (previously a prebuilt release binary)"
                     .to_string(),
             )
         } else {
@@ -882,15 +938,24 @@ fn apply_prepared(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
-    replace_and_build(id, &prepared.fetched, &final_dir, node_env, log)?;
-
+    let prior = PriorMetadata::capture(id)?;
     let granted = grant.is_some();
-    persist_update(id, &prepared.source_str, grant)?;
-    write_lock(
+    replace_and_build(
         id,
         &prepared.fetched,
-        &prepared.manifest_hash,
-        trust_label(prepared.featured_verified, prepared.dev),
+        &final_dir,
+        node_env,
+        log,
+        || {
+            persist_update(id, &prepared.source_str, grant)?;
+            write_lock(
+                id,
+                &prepared.fetched,
+                &prepared.manifest_hash,
+                trust_label(prepared.featured_verified, prepared.dev),
+            )
+        },
+        &prior,
     )?;
     super::reload_registry();
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -1613,6 +1678,17 @@ fn build_in_place(
             )
         })?;
     }
+    if let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = &manifest.runtime {
+        super::launch::resolve_release_binary(
+            plugin_id,
+            dir,
+            asset,
+            &manifest.version,
+            bin.as_deref(),
+            &super::launch::OsLaunchResolver::new(node_env.clone()),
+        )
+        .context("release-binary worker is not runnable after install")?;
+    }
     Ok(())
 }
 
@@ -1662,25 +1738,17 @@ fn replace_and_build(
     final_dir: &Path,
     node_env: &NodeEnv,
     log: &OperationLog,
+    commit_metadata: impl FnOnce() -> Result<()>,
+    prior: &PriorMetadata,
 ) -> Result<()> {
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
 
     if backup_dir.exists() {
-        if final_dir.exists() {
-            std::fs::remove_dir_all(final_dir).map_err(|error| {
-                super::execution::RecoveryRequired(format!(
-                    "removing interrupted update {}: {error}",
-                    final_dir.display()
-                ))
-            })?;
-        }
-        std::fs::rename(&backup_dir, final_dir).map_err(|error| {
-            super::execution::RecoveryRequired(format!(
-                "recovering interrupted update backup {} to {}: {error}",
-                backup_dir.display(),
-                final_dir.display()
-            ))
-        })?;
+        return Err(super::execution::RecoveryRequired(format!(
+            "ambiguous prior update backup {}; manual recovery required",
+            backup_dir.display()
+        ))
+        .into());
     }
 
     let had_prior = final_dir.exists();
@@ -1703,14 +1771,22 @@ fn replace_and_build(
             node_env,
             log,
             fetched.budget,
-        )
+        )?;
+        #[cfg(test)]
+        fetch::test_gate::reach(final_dir, "metadata-commit");
+        commit_metadata()
     })();
 
     match place_and_build {
         Ok(()) => {
             if had_prior {
+                #[cfg(test)]
+                fetch::test_gate::reach(final_dir, "backup-cleanup");
                 if let Err(error) = std::fs::remove_dir_all(&backup_dir) {
-                    tracing::warn!(target: "plugin.install", plugin = %plugin_id, %error, "could not remove update backup");
+                    return Err(super::execution::RecoveryRequired(format!(
+                        "update {plugin_id} committed, but backup cleanup at {} failed: {error}; do not restore this backup over the committed installation",
+                        backup_dir.display()
+                    )).into());
                 }
             }
             Ok(())
@@ -1723,10 +1799,11 @@ fn replace_and_build(
             }
             #[cfg(test)]
             fetch::test_gate::reach(final_dir, "rollback");
+            let metadata = prior.restore(plugin_id);
             if final_dir.exists() {
                 std::fs::remove_dir_all(final_dir).map_err(|error| {
                     super::execution::RecoveryRequired(format!(
-                        "removing failed update {}: {error}; original failure: {e:#}",
+                        "removing failed update {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
                         final_dir.display()
                     ))
                 })?;
@@ -1734,11 +1811,17 @@ fn replace_and_build(
             if had_prior {
                 std::fs::rename(&backup_dir, final_dir).map_err(|error| {
                     super::execution::RecoveryRequired(format!(
-                        "restoring {} from {}: {error}; original failure: {e:#}",
+                        "restoring {} from {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
                         final_dir.display(),
                         backup_dir.display()
                     ))
                 })?;
+            }
+            if let Err(error) = metadata {
+                return Err(super::execution::RecoveryRequired(format!(
+                    "update {plugin_id} failed: {e:#}; metadata restoration failed: {error:#}"
+                ))
+                .into());
             }
             Err(e)
         }
@@ -1814,6 +1897,291 @@ mod tests {
     use crate::session::test_support::isolate_app_dir;
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn admission_rechecks_recovery_after_prior_owner_releases_exclusion() {
+        let _home = isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        let owner = begin_operation().unwrap();
+        let mut gate = fetch::test_gate::install(&root, "operation-admission");
+        let contender = tokio::task::spawn_blocking(begin_operation);
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join(".plugin-recovery-required"),
+            "prior owner could not restore",
+        )
+        .unwrap();
+        drop(owner);
+        gate.release();
+        let error = contender
+            .await
+            .unwrap()
+            .err()
+            .expect("recovery must fence the admitted contender");
+        assert!(format!("{error:#}").contains("recovery evidence"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn local_release_binary_install_validates_target_before_granting() {
+        use std::os::unix::fs::PermissionsExt;
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        for dev in [false, true] {
+            for target in ["missing", "directory", "non-executable", "executable"] {
+                let source = tempfile::tempdir().unwrap();
+                let id = format!("acme.binary-{}-{target}", if dev { "dev" } else { "copy" });
+                std::fs::write(source.path().join("aoe-plugin.toml"), format!(
+                    "id = \"{id}\"\nname = \"Binary\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"release-binary\"\nasset = \"worker\"\nbin = \"worker\"\n"
+                )).unwrap();
+                let worker = source.path().join("worker");
+                match target {
+                    "directory" => std::fs::create_dir(&worker).unwrap(),
+                    "non-executable" | "executable" => {
+                        std::fs::write(&worker, "#!/bin/sh\nexit 0\n").unwrap();
+                        std::fs::set_permissions(
+                            &worker,
+                            std::fs::Permissions::from_mode(if target == "executable" {
+                                0o700
+                            } else {
+                                0o600
+                            }),
+                        )
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+                update_config(|config| {
+                    let row = config.plugins.entry(id.clone()).or_default();
+                    row.enabled = false;
+                    row.settings.insert(
+                        "retained".into(),
+                        toml::Value::String("user setting".into()),
+                    );
+                })
+                .unwrap();
+                let before = serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap();
+                let result = install(source.path().to_str().unwrap(), true, dev).await;
+                if target == "executable" {
+                    result.unwrap();
+                    let config = Config::load().unwrap();
+                    assert!(!config.plugins[&id].enabled);
+                    assert!(config.plugins[&id].grant.is_some());
+                    assert!(Lockfile::load().unwrap().get(&id).is_some());
+                } else {
+                    assert!(result.is_err(), "{dev}/{target}");
+                    assert_eq!(
+                        serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap(),
+                        before
+                    );
+                    assert!(Lockfile::load().unwrap().get(&id).is_none());
+                    assert!(!super::super::plugins_dir().unwrap().join(&id).exists());
+                }
+                assert!(
+                    source.path().join("aoe-plugin.toml").is_file(),
+                    "dev source remains user-owned"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_failures_restore_target_tree_and_exact_prior_intent() {
+        let _reload = super::super::ReloadRegistryOnDrop;
+        for operation in ["install", "update", "repair"] {
+            for boundary in ["config", "lock", "restoration"] {
+                for dev in [false, true] {
+                    let _home = isolate_app_dir();
+                    let source = tempfile::tempdir().unwrap();
+                    let id = "acme.metadata";
+                    let manifest = |version| {
+                        format!("id = \"{id}\"\nname = \"Metadata\"\nversion = \"{version}\"\napi_version = 2\n")
+                    };
+                    std::fs::write(source.path().join("aoe-plugin.toml"), manifest("1.0.0"))
+                        .unwrap();
+                    let input = source.path().display().to_string();
+                    if operation != "install" {
+                        install(&input, true, dev).await.unwrap();
+                    }
+                    update_config(|config| {
+                        let row = config.plugins.entry(id.into()).or_default();
+                        row.enabled = false;
+                        row.settings.insert(
+                            "retained".into(),
+                            toml::Value::String("exact setting".into()),
+                        );
+                        row.dismissed_update = Some("prior dismissal".into());
+                    })
+                    .unwrap();
+                    let prior_config =
+                        serde_json::to_value(&Config::load().unwrap().plugins[id]).unwrap();
+                    let prior_lock = Lockfile::load().unwrap().get(id).cloned();
+                    let final_dir = super::super::plugins_dir().unwrap().join(id);
+                    let prior_tree = if operation == "update" {
+                        Some(std::fs::read(final_dir.join("aoe-plugin.toml")).unwrap())
+                    } else {
+                        if operation == "repair" {
+                            std::fs::remove_dir_all(&final_dir).unwrap();
+                        }
+                        None
+                    };
+                    std::fs::write(source.path().join("aoe-plugin.toml"), manifest("2.0.0"))
+                        .unwrap();
+                    let fingerprint = if operation == "install" {
+                        preview_install(&input, dev).await.unwrap().fingerprint
+                    } else {
+                        match preview_update(id, true).await.unwrap() {
+                            UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+                            UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+                            other => panic!("expected repair/update candidate: {other:?}"),
+                        }
+                    };
+                    let mut commit = fetch::test_gate::install(&final_dir, "metadata-commit");
+                    let mut rollback = fetch::test_gate::install(&final_dir, "rollback");
+                    let task = tokio::spawn(async move {
+                        if operation == "install" {
+                            apply_install(&input, &fingerprint, dev, OperationLog::Inherit).await
+                        } else {
+                            apply_update(id, Some(fingerprint), true, OperationLog::Inherit).await
+                        }
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit.entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    update_config(|config| {
+                        config.default_profile = "concurrent-unrelated-edit".into()
+                    })
+                    .unwrap();
+                    let path = if boundary == "config" {
+                        crate::session::config::config_path().unwrap()
+                    } else {
+                        crate::session::get_app_dir().unwrap().join("plugins.lock")
+                    };
+                    let rescue = path.with_extension("saved");
+                    let existed = path.exists();
+                    if existed {
+                        std::fs::rename(&path, &rescue).unwrap();
+                    }
+                    std::fs::create_dir(&path).unwrap();
+                    commit.release();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut rollback.entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if boundary != "restoration" {
+                        std::fs::remove_dir(&path).unwrap();
+                        if existed {
+                            std::fs::rename(&rescue, &path).unwrap();
+                        }
+                    }
+                    rollback.release();
+                    let error = task.await.unwrap().unwrap_err();
+                    if boundary == "restoration" {
+                        assert!(
+                            error
+                                .downcast_ref::<super::super::execution::RecoveryRequired>()
+                                .is_some(),
+                            "{error:#}"
+                        );
+                        assert!(crate::session::get_app_dir()
+                            .unwrap()
+                            .join(".plugin-recovery-required")
+                            .exists());
+                    } else {
+                        assert!(!super::super::execution::needs_recovery::<()>(&Err(error)));
+                        assert_eq!(Lockfile::load().unwrap().get(id), prior_lock.as_ref());
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&Config::load().unwrap().plugins[id]).unwrap(),
+                        prior_config
+                    );
+                    assert_eq!(
+                        Config::load().unwrap().default_profile,
+                        "concurrent-unrelated-edit"
+                    );
+                    assert_eq!(
+                        std::fs::read(final_dir.join("aoe-plugin.toml")).ok(),
+                        prior_tree
+                    );
+                    assert!(source.path().join("aoe-plugin.toml").exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn post_commit_cleanup_failure_never_restores_old_tree_over_commit() {
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let manifest = |version| {
+            format!("id = \"acme.cleanup\"\nname = \"Cleanup\"\nversion = \"{version}\"\napi_version = 2\n")
+        };
+        std::fs::write(source.path().join("aoe-plugin.toml"), manifest("1.0.0")).unwrap();
+        install(source.path().to_str().unwrap(), true, false)
+            .await
+            .unwrap();
+        std::fs::write(source.path().join("aoe-plugin.toml"), manifest("2.0.0")).unwrap();
+        let fingerprint = match preview_update("acme.cleanup", true).await.unwrap() {
+            UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+            other => panic!("expected safe update: {other:?}"),
+        };
+        let final_dir = super::super::plugins_dir().unwrap().join("acme.cleanup");
+        let backup = final_dir.with_file_name("acme.cleanup.bak");
+        let rescue = source.path().join("old-tree");
+        let mut cleanup = fetch::test_gate::install(&final_dir, "backup-cleanup");
+        let task = tokio::spawn(async move {
+            apply_update(
+                "acme.cleanup",
+                Some(fingerprint),
+                true,
+                OperationLog::Inherit,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut cleanup.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&backup, &rescue).unwrap();
+        std::fs::write(&backup, "filesystem cleanup obstruction").unwrap();
+        cleanup.release();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error
+            .downcast_ref::<super::super::execution::RecoveryRequired>()
+            .is_some());
+        assert!(format!("{error:#}").contains("committed"));
+        assert_eq!(
+            PluginManifest::from_toml_str(
+                &std::fs::read_to_string(final_dir.join("aoe-plugin.toml")).unwrap()
+            )
+            .unwrap()
+            .version,
+            "2.0.0"
+        );
+        assert_eq!(
+            Lockfile::load()
+                .unwrap()
+                .get("acme.cleanup")
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+        assert!(backup.is_file() && rescue.is_dir());
+        assert!(crate::session::get_app_dir()
+            .unwrap()
+            .join(".plugin-recovery-required")
+            .exists());
+        assert!(begin_operation().is_err());
+    }
 
     #[test]
     fn web_recovery_guidance_preserves_authority_refusals() {
@@ -2304,7 +2672,14 @@ mod tests {
         )
         .unwrap();
         let consent = preview_install(&input, false).await.unwrap();
-        let mut gate = fetch::test_gate::install(&source.path().join("aoe-plugin.toml"), "copy");
+        let mut gate = fetch::test_gate::install(
+            &source
+                .path()
+                .join("aoe-plugin.toml")
+                .canonicalize()
+                .unwrap(),
+            "copy",
+        );
         let operation = tokio::spawn(async move {
             apply_install(&input, &consent.fingerprint, false, OperationLog::Inherit).await
         });

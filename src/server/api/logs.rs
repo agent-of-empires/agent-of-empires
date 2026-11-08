@@ -21,7 +21,6 @@ const DEFAULT_LINES: usize = 500;
 const MAX_LINES: usize = 2000;
 /// Bounds the read when a single line is huge or rotation is disabled.
 const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024;
-const REDACTED: &str = "[REDACTED]";
 
 #[derive(Deserialize)]
 pub struct LogsQuery {
@@ -141,22 +140,27 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
 
 /// Each pattern keeps capture group 1 (the key) and replaces the value. Quoted values run
 /// through backslash escapes to their closing quote.
-static REDACTORS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
+static REDACTORS: LazyLock<[Regex; 7]> = LazyLock::new(|| {
     [
         r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]+)"#,
         r#"(?i)(authorization["']?\s*[:=]\s*")(?:\\.|[^"\\\r\n])+"#,
         r#"(?i)(authorization["']?\s*[:=]\s*')(?:\\.|[^'\\\r\n])+"#,
         r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
         r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&"',;]+)"#,
+        r#"(?i)(https?://)[^/\s@]+@"#,
+        r#"()(?i:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
 });
 
-fn redact(text: &str) -> String {
-    let replacement = format!("${{1}}{REDACTED}");
-    REDACTORS.iter().fold(text.to_string(), |acc, re| {
-        re.replace_all(&acc, replacement.as_str()).into_owned()
-    })
+pub(crate) fn redact(text: &str) -> String {
+    let mut redacted = std::borrow::Cow::Borrowed(text);
+    for re in REDACTORS.iter() {
+        if let std::borrow::Cow::Owned(next) = re.replace_all(&redacted, "${1}[REDACTED]") {
+            redacted = std::borrow::Cow::Owned(next);
+        }
+    }
+    redacted.into_owned()
 }
 
 #[cfg(test)]

@@ -716,10 +716,7 @@ pub async fn plugin_update_preview(
     .await
     {
         Ok(preview) => Json(preview).into_response(),
-        Err(e) => super::api_error_with_code_header(
-            crate::daemon::ApiErrorCode::PluginPreviewFailed,
-            format!("{e:#}"),
-        ),
+        Err(e) => preview_failure(e),
     }
 }
 
@@ -1033,11 +1030,14 @@ pub async fn preview_plugin_install(
     }
     match plugin::install::preview_install(&body.source, body.dev).await {
         Ok(consent) => Json(consent).into_response(),
-        Err(e) => super::api_error_with_code_header(
-            crate::daemon::ApiErrorCode::PluginPreviewFailed,
-            format!("{e:#}"),
-        ),
+        Err(e) => preview_failure(e),
     }
+}
+
+fn preview_failure(error: anyhow::Error) -> Response {
+    let cause = super::logs::redact(&format!("{error:#}"));
+    tracing::warn!(target: "plugin.install", error = %cause, "plugin preview failed");
+    super::api_error_with_code_header(crate::daemon::ApiErrorCode::PluginPreviewFailed, cause)
 }
 
 /// `POST /api/plugins/install`: apply a fingerprint-approved candidate.
@@ -1124,6 +1124,7 @@ pub async fn plugin_job_status(
     };
     let tail = q.tail.unwrap_or(200).clamp(1, 2000);
     let log_path = tracked.log_path;
+    let path = log_path.display().to_string();
     let read = tokio::task::spawn_blocking(move || {
         crate::server::api::acp::read_log_tail(&log_path, tail)
     })
@@ -1132,6 +1133,7 @@ pub async fn plugin_job_status(
         Ok(Ok((lines, truncated, exists))) => Json(PluginJobResponse {
             job: tracked.job,
             log: PluginJobLog {
+                path,
                 exists,
                 tail: lines.join("\n"),
                 lines_returned: lines.len(),
@@ -1153,6 +1155,92 @@ mod tests {
     use super::*;
     use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn malformed_preview_warns_with_redacted_cause_and_fixed_header() {
+        use tracing::instrument::WithSubscriber;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("aoe-plugin.toml"),
+            "id = [\"https://alice:private-password@example.test/?token=private-token\", \"ghp_privatebaretoken\"]\n").unwrap();
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        let response = preview_plugin_install(
+            State(crate::server::test_support::build_test_app_state(Vec::new())),
+            Some(axum::Extension(Principal::LocalPeer { uid: 1000 })),
+            Json(InstallPreviewBody {
+                source: source.path().display().to_string(),
+                dev: false,
+            }),
+        )
+        .with_subscriber(subscriber)
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+            Some(crate::daemon::ApiErrorCode::PluginPreviewFailed)
+        );
+        let warning = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(
+            warning.contains("plugin.install") && warning.contains("[REDACTED]"),
+            "{warning}"
+        );
+        for secret in [
+            "alice",
+            "private-password",
+            "private-token",
+            "ghp_privatebaretoken",
+        ] {
+            assert!(!warning.contains(secret), "{warning}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_job_reports_actual_host_log_beyond_bounded_tail() {
+        use std::io::Write;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let response = start_job(
+            state.clone(),
+            PluginJobKind::Install,
+            "acme.failure".into(),
+            |log| async move {
+                let OperationLog::File(mut file) = log else {
+                    panic!("job requires a real log file")
+                };
+                writeln!(file, "early diagnostic sentinel")?;
+                for line in 0..250 {
+                    writeln!(file, "later build output {line}")?;
+                }
+                std::fs::metadata(crate::session::get_app_dir()?.join("absent-build-input"))?;
+                Ok(())
+            },
+        )
+        .await;
+        let job = finish(&state, response).await;
+        assert!(matches!(job.status, PluginJobStatus::Failed { .. }));
+        let response: PluginJobResponse = decode(
+            plugin_job_status(
+                State(state.clone()),
+                Path(job.id.clone()),
+                Query(JobLogQuery { tail: Some(200) }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!response.log.tail.contains("early diagnostic sentinel"));
+        assert!(response.log.tail.contains("later build output 249"));
+        assert!(std::fs::read_to_string(&response.log.path)
+            .unwrap()
+            .contains("early diagnostic sentinel"));
+    }
 
     #[cfg(unix)]
     async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {

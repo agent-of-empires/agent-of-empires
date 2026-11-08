@@ -488,11 +488,35 @@ async fn download_release_binary(
     .context("plugin asset preparation task failed")?
 }
 
-fn render_asset_template(template: &str, version: &str) -> String {
-    template
-        .replace("${os}", std::env::consts::OS)
-        .replace("${arch}", std::env::consts::ARCH)
-        .replace("${version}", version)
+pub(super) fn render_asset_template<'a>(
+    template: &'a str,
+    version: &str,
+) -> std::borrow::Cow<'a, str> {
+    let mut rendered = None;
+    let mut copied = 0;
+    for (offset, _) in template.match_indices("${") {
+        let rest = &template[offset..];
+        let (token, value) = if rest.starts_with("${os}") {
+            ("${os}", std::env::consts::OS)
+        } else if rest.starts_with("${arch}") {
+            ("${arch}", std::env::consts::ARCH)
+        } else if rest.starts_with("${version}") {
+            ("${version}", version)
+        } else {
+            continue;
+        };
+        let output = rendered.get_or_insert_with(|| String::with_capacity(template.len()));
+        output.push_str(&template[copied..offset]);
+        output.push_str(value);
+        copied = offset + token.len();
+    }
+    match rendered {
+        Some(mut output) => {
+            output.push_str(&template[copied..]);
+            std::borrow::Cow::Owned(output)
+        }
+        None => std::borrow::Cow::Borrowed(template),
+    }
 }
 
 async fn http_get_bytes(url: &str) -> Result<Vec<u8>> {
@@ -635,11 +659,23 @@ mod tests {
 
     #[test]
     fn renders_platform_tokens() {
-        let rendered = render_asset_template("w-${os}-${arch}-${version}.tar.gz", "1.2.3");
-        assert!(rendered.starts_with("w-"));
-        assert!(rendered.ends_with("-1.2.3.tar.gz"));
-        assert!(rendered.contains(std::env::consts::OS));
-        assert!(rendered.contains(std::env::consts::ARCH));
+        let platform = format!(
+            "w-{}-{}-1.2.3.tar.gz",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        for (template, version, expected) in [
+            (
+                "w-${os}-${arch}-${version}.tar.gz",
+                "1.2.3",
+                platform.as_str(),
+            ),
+            ("literal-${unknown}", "1.2.3", "literal-${unknown}"),
+            ("µ-${version}-${version}", "1.2.3", "µ-1.2.3-1.2.3"),
+            ("${version}", "${os}", "${os}"),
+        ] {
+            assert_eq!(render_asset_template(template, version), expected);
+        }
     }
 
     #[test]
@@ -701,7 +737,7 @@ mod tests {
             } else {
                 std::fs::write(&entry, b"original").unwrap();
             }
-            let mut gate = test_gate::install(&entry, "copy");
+            let mut gate = test_gate::install(&entry.canonicalize().unwrap(), "copy");
             let root = src.path().to_owned();
             let into = dst.path().join("tree");
             let task = tokio::task::spawn_blocking(move || copy_tree(&root, &into));

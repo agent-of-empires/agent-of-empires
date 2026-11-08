@@ -945,6 +945,7 @@ export interface PluginJob {
     finished_at: number | null;
   };
   log: {
+    path: string;
     exists: boolean;
     tail: string;
     lines_returned: number;

@@ -6,6 +6,8 @@ pub mod changelog;
 pub mod contributions;
 pub mod discover;
 mod execution;
+pub(crate) const EXECUTION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
 pub mod featured;
 pub mod fetch;
 pub mod install;

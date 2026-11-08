@@ -447,6 +447,10 @@ async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
                     return Ok(());
                 }
                 PluginJobStatus::Failed { error } => {
+                    if !response.log.tail.is_empty() {
+                        eprintln!("{}", response.log.tail);
+                    }
+                    eprintln!("Full log on Daemon host: {}", response.log.path);
                     bail!("Plugin job {id} failed: {error}");
                 }
             }

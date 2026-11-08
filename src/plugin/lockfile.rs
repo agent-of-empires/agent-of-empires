@@ -72,7 +72,8 @@ impl Lockfile {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         let text = toml::to_string_pretty(self).context("serializing plugins.lock")?;
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+        crate::session::atomic_write(&path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn get(&self, id: &str) -> Option<&LockedPlugin> {

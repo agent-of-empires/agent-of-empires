@@ -23,6 +23,8 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
+    crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
 /// One active plugin command as the daemon reports it (`GET
 /// /api/plugins/commands`), the source of truth the structured view resolves
@@ -876,8 +878,13 @@ impl HttpClient {
     ) -> Result<crate::plugin::install::InstallConsent, HttpError> {
         let url = format!("{}/api/plugins/install/preview", self.endpoint.base_url);
         let response = check_global_status(
-            self.execute(self.http.post(url).json(body).timeout(SEND_TIMEOUT))
-                .await?,
+            self.execute(
+                self.http
+                    .post(url)
+                    .json(body)
+                    .timeout(PLUGIN_PREVIEW_TIMEOUT),
+            )
+            .await?,
         )?;
         Ok(crate::daemon::decode_json(response).await?)
     }
@@ -904,7 +911,7 @@ impl HttpClient {
             path_segment(id)?,
         );
         let response = check_global_status(
-            self.execute(self.http.get(url).timeout(SEND_TIMEOUT))
+            self.execute(self.http.get(url).timeout(PLUGIN_PREVIEW_TIMEOUT))
                 .await?,
         )?;
         Ok(crate::daemon::decode_json(response).await?)
@@ -2048,6 +2055,53 @@ mod tests {
                     | (504, HttpError::SmartRenameTimeout)
             ));
             assert!(!error.to_string().contains("secret-provider-credential"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plugin_previews_allow_preparation_beyond_general_send_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for install in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started, accepted) = tokio::sync::oneshot::channel();
+            let (release, resume) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                started.send(()).unwrap();
+                resume.await.unwrap();
+                stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nAoE-Error-Code: preview_failed\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+            let request = tokio::spawn(async move {
+                if install {
+                    client
+                        .preview_plugin_install(&crate::daemon::InstallPreviewBody {
+                            source: "gh:acme/fixture".into(),
+                            dev: false,
+                        })
+                        .await
+                        .err()
+                        .unwrap()
+                } else {
+                    client
+                        .preview_plugin_update("acme.fixture")
+                        .await
+                        .err()
+                        .unwrap()
+                }
+            });
+            accepted.await.unwrap();
+            tokio::time::advance(Duration::from_secs(121)).await;
+            release.send(()).unwrap();
+            assert!(matches!(
+                request.await.unwrap(),
+                HttpError::PluginPreviewFailed
+            ));
+            server.await.unwrap();
         }
     }
 

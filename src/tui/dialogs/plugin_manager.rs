@@ -33,6 +33,7 @@ struct Review {
     fingerprint: String,
     changelog: UpdateChangelog,
     consent: Option<UpdateConsent>,
+    notice: String,
 }
 
 /// Installed-plugin details, captured from the registry when opened so the
@@ -51,7 +52,7 @@ struct Progress {
     title: String,
     log_path: PathBuf,
     daemon_job: Option<String>,
-    daemon_log: Option<String>,
+    daemon_log: Option<std::sync::Arc<crate::daemon::PluginJobLog>>,
     /// `None` while running; the final outcome line once done.
     done: Option<Result<String, String>>,
 }
@@ -88,7 +89,7 @@ enum Pending {
     Updates(oneshot::Receiver<Vec<UpdateStatus>>),
     Discover(oneshot::Receiver<Result<Vec<DiscoveryResult>, String>>),
     Preview(oneshot::Receiver<Result<(crate::acp::client::HttpClient, UpdatePreview), String>>),
-    Apply(tokio::sync::mpsc::UnboundedReceiver<UpdateEvent>),
+    Apply(tokio::sync::watch::Receiver<UpdateObservation>),
     /// An enable/disable; the Ok string says whether the daemon reconciled.
     Toggle(oneshot::Receiver<Result<String, String>>),
     InstallPreview(oneshot::Receiver<Result<InstallConsent, String>>),
@@ -96,10 +97,11 @@ enum Pending {
     Uninstall(oneshot::Receiver<Result<String, String>>),
 }
 
-enum UpdateEvent {
-    Accepted(String),
-    Log(String),
-    Finished(Result<String, String>),
+#[derive(Clone, Default)]
+struct UpdateObservation {
+    accepted: Option<String>,
+    log: Option<std::sync::Arc<crate::daemon::PluginJobLog>>,
+    finished: Option<Result<String, String>>,
 }
 
 /// Submit exactly once, then observe on the client that produced consent.
@@ -107,7 +109,7 @@ async fn observe_update(
     client: &crate::acp::client::HttpClient,
     id: &str,
     fingerprint: Option<String>,
-    events: &tokio::sync::mpsc::UnboundedSender<UpdateEvent>,
+    events: &tokio::sync::watch::Sender<UpdateObservation>,
 ) -> Result<String, String> {
     use crate::acp::client::HttpError;
     let accepted = match client
@@ -138,21 +140,34 @@ async fn observe_update(
         }
     };
     let job = accepted.job_id;
-    let _ = events.send(UpdateEvent::Accepted(job.clone()));
+    events.send_modify(|state| state.accepted = Some(job.clone()));
     loop {
-        let response = client.plugin_job(&job).await.map_err(|error| format!(
+        let response = tokio::select! {
+            _ = events.closed() => return Err(format!("Observation stopped; Daemon job {job} continues.")),
+            response = client.plugin_job(&job) => response,
+        }.map_err(|error| format!(
             "Job {job} outcome unknown: {error}. Run `env -u AOE_DAEMON_URL aoe plugin job {job}` on the same local Daemon host; no operation was resubmitted."
         ))?;
-        let _ = events.send(UpdateEvent::Log(response.log.tail));
-        match response.job.status {
-            crate::daemon::PluginJobStatus::Running => {}
-            crate::daemon::PluginJobStatus::Succeeded => return Ok(format!(
+        let log = std::sync::Arc::new(response.log);
+        let finished = match response.job.status {
+            crate::daemon::PluginJobStatus::Running => None,
+            crate::daemon::PluginJobStatus::Succeeded => Some(Ok(format!(
                 "Updated {id}; Daemon job {job} finished. Worker restart requested; readiness is not implied."
-            )),
+            ))),
             crate::daemon::PluginJobStatus::Failed { error } =>
-                return Err(format!("Daemon job {job} failed: {error}")),
+                Some(Err(format!("Daemon job {job} failed: {error}"))),
+        };
+        events.send_modify(|state| {
+            state.log = Some(log);
+            state.finished = finished.clone();
+        });
+        if let Some(result) = finished {
+            return result;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::select! {
+            _ = events.closed() => return Err(format!("Observation stopped; Daemon job {job} continues.")),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
     }
 }
 
@@ -174,6 +189,8 @@ pub struct PluginManagerDialog {
     has_settings_pane: bool,
     mode: Mode,
     pending: Option<Pending>,
+    #[cfg(test)]
+    observation_finished: Option<oneshot::Receiver<()>>,
     loading: Option<&'static str>,
     /// Update statuses from the last `c` check, driving the per-row marker.
     updates: HashMap<String, UpdateStatus>,
@@ -403,6 +420,8 @@ impl PluginManagerDialog {
             has_settings_pane: false,
             mode: Mode::Browse,
             pending: None,
+            #[cfg(test)]
+            observation_finished: None,
             loading: None,
             updates: HashMap::new(),
             discover_rows: Vec::new(),
@@ -947,11 +966,26 @@ impl PluginManagerDialog {
             self.error = Some("Update refused: review it again on the local Daemon.".into());
             return;
         };
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::watch::channel(UpdateObservation::default());
+        #[cfg(test)]
+        let stopped = {
+            let (stopped, finished) = oneshot::channel();
+            self.observation_finished = Some(finished);
+            stopped
+        };
         let apply_id = id.clone();
         tokio::spawn(async move {
             let result = observe_update(&client, &apply_id, fingerprint, &tx).await;
-            let _ = tx.send(UpdateEvent::Finished(result));
+            tx.send_if_modified(|state| {
+                if state.finished.is_some() {
+                    false
+                } else {
+                    state.finished = Some(result);
+                    true
+                }
+            });
+            #[cfg(test)]
+            let _ = stopped.send(());
         });
         self.pending_plugin = Some(id.clone());
         self.pending = Some(Pending::Apply(rx));
@@ -959,7 +993,7 @@ impl PluginManagerDialog {
             title: format!(" Updating {id} "),
             log_path: PathBuf::new(),
             daemon_job: None,
-            daemon_log: Some(String::new()),
+            daemon_log: None,
             done: None,
         }));
         self.loading = Some("Updating…");
@@ -1167,7 +1201,7 @@ impl PluginManagerDialog {
                             to_version,
                             fingerprint,
                             changelog,
-                            ..
+                            notice,
                         }) => {
                             if let Some(id) = self.pending_plugin.clone() {
                                 let from_version = self
@@ -1183,13 +1217,16 @@ impl PluginManagerDialog {
                                     fingerprint,
                                     changelog,
                                     consent: None,
+                                    notice,
                                 })));
                             }
                         }
                         // A dismissed version resurfaces only when a newer
                         // one appears.
                         Ok(UpdatePreview::ConsentRequired {
-                            consent, dismissed, ..
+                            consent,
+                            dismissed,
+                            notice,
                         }) => {
                             if dismissed {
                                 self.info = Some(format!(
@@ -1204,6 +1241,7 @@ impl PluginManagerDialog {
                                     fingerprint: consent.fingerprint.clone(),
                                     changelog: consent.changelog.clone(),
                                     consent: Some(*consent),
+                                    notice,
                                 })));
                             }
                         }
@@ -1219,8 +1257,25 @@ impl PluginManagerDialog {
                     true
                 }
             },
-            Pending::Apply(rx) => match rx.try_recv() {
-                Ok(UpdateEvent::Finished(result)) => {
+            Pending::Apply(rx) => {
+                if matches!(rx.has_changed(), Ok(false)) {
+                    return false;
+                }
+                let closed = rx.has_changed().is_err();
+                let snapshot = rx.borrow_and_update().clone();
+                if let Some(id) = snapshot.accepted {
+                    self.info = Some(format!("Accepted job {id}; observe with `env -u AOE_DAEMON_URL aoe plugin job {id}` on the local host."));
+                    if let Some(Popup::Progress(progress)) = &mut self.popup {
+                        progress.daemon_job = Some(id);
+                    }
+                }
+                if let Some(Popup::Progress(progress)) = &mut self.popup {
+                    if let Some(log) = snapshot.log {
+                        progress.log_path = PathBuf::from(&log.path);
+                        progress.daemon_log = Some(log);
+                    }
+                }
+                if let Some(result) = snapshot.finished {
                     self.pending = None;
                     self.loading = None;
                     if result.is_ok() {
@@ -1229,29 +1284,13 @@ impl PluginManagerDialog {
                         }
                     }
                     self.finish_operation(result);
-                    true
-                }
-                Ok(UpdateEvent::Accepted(id)) => {
-                    self.info = Some(format!("Accepted job {id}; observe with `env -u AOE_DAEMON_URL aoe plugin job {id}` on the local host."));
-                    if let Some(Popup::Progress(progress)) = &mut self.popup {
-                        progress.daemon_job = Some(id);
-                    }
-                    true
-                }
-                Ok(UpdateEvent::Log(tail)) => {
-                    if let Some(Popup::Progress(progress)) = &mut self.popup {
-                        progress.daemon_log = Some(tail);
-                    }
-                    true
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                } else if closed {
                     self.pending = None;
                     self.loading = None;
                     self.finish_operation(Err("Update outcome unknown; inspect jobs on the same local Daemon. No operation was resubmitted.".to_string()));
-                    true
                 }
-            },
+                true
+            }
             Pending::Toggle(rx) => match rx.try_recv() {
                 Ok(result) => {
                     self.pending = None;
@@ -1398,6 +1437,12 @@ impl PluginManagerDialog {
             ),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ))];
+        if !review.notice.is_empty() {
+            lines.push(Line::from(Span::styled(
+                review.notice.as_str(),
+                Style::default().fg(theme.waiting),
+            )));
+        }
         if review.consent.is_some() {
             lines.push(Line::from(Span::styled(
                 "This update expands what the plugin can do.",
@@ -1898,15 +1943,15 @@ impl PluginManagerDialog {
                 "Accepted job {id}; `env -u AOE_DAEMON_URL aoe plugin job {id}`"
             )));
         }
-        let tail = match &progress.daemon_log {
-            Some(tail) => tail.lines().map(str::to_owned).collect(),
-            None => read_log_tail(&progress.log_path, PROGRESS_TAIL_LINES),
-        };
-        for line in tail {
-            lines.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(theme.dimmed),
-            )));
+        let log_style = Style::default().fg(theme.dimmed);
+        if let Some(log) = &progress.daemon_log {
+            for line in log.tail.lines() {
+                lines.push(Line::from(Span::styled(line, log_style)));
+            }
+        } else if progress.daemon_job.is_none() {
+            for line in read_log_tail(&progress.log_path, PROGRESS_TAIL_LINES) {
+                lines.push(Line::from(Span::styled(line, log_style)));
+            }
         }
         // Pinned, so a long log tail cannot push them off screen.
         let mut footer: Vec<Line> = Vec::new();
@@ -1917,14 +1962,17 @@ impl PluginManagerDialog {
                     Style::default().fg(theme.waiting),
                 )));
                 footer.push(Line::from(Span::styled(
-                    format!(
-                        "esc hide (keeps running) · log: {}",
-                        progress
-                            .daemon_job
-                            .as_deref()
-                            .map(|_| "local Daemon job".to_owned())
-                            .unwrap_or_else(|| progress.log_path.display().to_string())
-                    ),
+                    if progress.daemon_job.is_some() {
+                        format!(
+                            "esc hide (keeps running) · log on Daemon host: {}",
+                            progress.log_path.display()
+                        )
+                    } else {
+                        format!(
+                            "esc hide (keeps running) · log: {}",
+                            progress.log_path.display()
+                        )
+                    },
                     Style::default().fg(theme.dimmed),
                 )));
             }
@@ -1933,6 +1981,12 @@ impl PluginManagerDialog {
                     message.clone(),
                     Style::default().fg(theme.running),
                 )));
+                if progress.daemon_job.is_some() && !progress.log_path.as_os_str().is_empty() {
+                    footer.push(Line::from(Span::styled(
+                        format!("Full log on Daemon host: {}", progress.log_path.display()),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
                 footer.push(Line::from(Span::styled(
                     "esc close",
                     Style::default().fg(theme.dimmed),
@@ -1944,16 +1998,16 @@ impl PluginManagerDialog {
                     Style::default().fg(theme.error),
                 )));
                 footer.push(Line::from(Span::styled(
-                    format!(
-                        "Full log: {}",
-                        progress
-                            .daemon_job
-                            .as_deref()
-                            .map(|id| format!(
-                                "env -u AOE_DAEMON_URL aoe plugin job {id} (same local host)"
-                            ))
-                            .unwrap_or_else(|| progress.log_path.display().to_string())
-                    ),
+                    if progress.daemon_job.is_some() {
+                        if progress.log_path.as_os_str().is_empty() {
+                            "Full log path unavailable; resume job observation on the Daemon host."
+                                .to_owned()
+                        } else {
+                            format!("Full log on Daemon host: {}", progress.log_path.display())
+                        }
+                    } else {
+                        format!("Full log: {}", progress.log_path.display())
+                    },
                     Style::default().fg(theme.dimmed),
                 )));
                 footer.push(Line::from(Span::styled(
@@ -2327,6 +2381,111 @@ mod mouse_tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn both_update_reviews_render_source_notice() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for expands_access in [false, true] {
+            let mut dialog = PluginManagerDialog::new();
+            let changelog = UpdateChangelog::unavailable("No changelog");
+            let notice = "Unverified source: explicit reference may change.".to_owned();
+            let preview = if expands_access {
+                UpdatePreview::ConsentRequired {
+                    consent: Box::new(UpdateConsent {
+                        id: "acme.notice".into(),
+                        from_version: "1.0.0".into(),
+                        to_version: "2.0.0".into(),
+                        prior_capabilities: vec![],
+                        new_capabilities: vec![],
+                        added_capabilities: vec![],
+                        removed_capabilities: vec![],
+                        ui: vec![],
+                        build_steps: vec![],
+                        agent_integrations: vec![],
+                        runtime_change: None,
+                        trust_downgrade: false,
+                        fingerprint: "reviewed".into(),
+                        stays_active_if_declined: true,
+                        changelog,
+                    }),
+                    dismissed: false,
+                    notice: notice.clone(),
+                }
+            } else {
+                UpdatePreview::SafeUpdate {
+                    to_version: "2.0.0".into(),
+                    fingerprint: "reviewed".into(),
+                    changelog,
+                    notice: notice.clone(),
+                }
+            };
+            let client =
+                crate::acp::client::HttpClient::new(crate::daemon::DaemonEndpoint::local_unix(
+                    PathBuf::from("/unused-preview-fixture"),
+                    None,
+                ))
+                .unwrap();
+            let (tx, rx) = oneshot::channel();
+            dialog.pending_plugin = Some("acme.notice".into());
+            dialog.pending = Some(Pending::Preview(rx));
+            assert!(tx.send(Ok((client, preview))).is_ok());
+            assert!(dialog.tick());
+            let buffer = draw(120, 40, |frame, theme| {
+                dialog.render(frame, frame.area(), theme)
+            });
+            find(&buffer, &notice);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn one_tick_observes_latest_terminal_log_after_sender_closed() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut dialog = PluginManagerDialog::new();
+        let (tx, rx) = tokio::sync::watch::channel(UpdateObservation::default());
+        dialog.pending = Some(Pending::Apply(rx));
+        dialog.pending_plugin = Some("acme.latest".into());
+        dialog.open_popup(Popup::Progress(Progress {
+            title: "Updating acme.latest".into(),
+            log_path: PathBuf::new(),
+            daemon_job: None,
+            daemon_log: None,
+            done: None,
+        }));
+        tx.send_modify(|state| state.accepted = Some("accepted-job".into()));
+        for index in 0..1000 {
+            let log = crate::daemon::PluginJobLog {
+                path: "/daemon/logs/actual-file.log".into(),
+                exists: true,
+                tail: format!("newest output {index}"),
+                lines_returned: 1,
+                truncated: true,
+            };
+            tx.send_modify(|state| {
+                state.log = Some(std::sync::Arc::new(log));
+                if index == 999 {
+                    state.finished = Some(Err("terminal build failure".into()));
+                }
+            });
+        }
+        drop(tx);
+        assert!(dialog.tick());
+        assert!(dialog.pending.is_none());
+        let Some(Popup::Progress(progress)) = &dialog.popup else {
+            panic!("progress must remain visible")
+        };
+        assert_eq!(progress.daemon_job.as_deref(), Some("accepted-job"));
+        assert!(matches!(&progress.done, Some(Err(error)) if error == "terminal build failure"));
+        let buffer = draw(120, 40, |frame, theme| {
+            dialog.render(frame, frame.area(), theme)
+        });
+        find(&buffer, "newest output 999");
+        find(
+            &buffer,
+            "Full log on Daemon host: /daemon/logs/actual-file.log",
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn rows_select_then_open_and_only_the_open_popup_s_hints_click() {
@@ -2571,7 +2730,12 @@ mod daemon_update_tests {
                         // Hiding the popup must not cancel its accepted mutation.
                         dialog.popup = None;
                         let _ = shutdown_rx.await;
+                        let finished = dialog.observation_finished.take().unwrap();
                         drop(dialog);
+                        tokio::time::timeout(Duration::from_secs(5), finished)
+                            .await
+                            .unwrap()
+                            .unwrap();
                     });
                     drop(runtime);
                     let _ = stopped_tx.send(());
