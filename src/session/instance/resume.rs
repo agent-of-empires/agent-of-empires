@@ -353,7 +353,17 @@ impl Instance {
                 && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
                 && probe.expected.matches_launch_observation(row)
         }) {
-            self.resume_intent.clone_from(&row.resume_intent);
+            if probe.expected.intent != row.resume_intent {
+                // OMP deliberately clears the local anchor while awaiting confirmation.
+                // Restore the exact fenced anchor too, or the first different capture loses its CAS.
+                self.set_agent_conversation(
+                    row.agent_session_id.clone(),
+                    row.agent_session_binding.clone(),
+                    row.pi_session_path.clone(),
+                );
+                self.resume_intent.clone_from(&row.resume_intent);
+                self.resume_binding.clone_from(&row.resume_binding);
+            }
             Ok(())
         } else {
             Err(LaunchIndeterminateCause::OwnershipUnproven)
@@ -3685,6 +3695,12 @@ mod tests {
             );
             if change == "confirmed" {
                 instance.capture_poller.stop();
+                assert_eq!(instance.resume_intent, ResumeIntent::Default);
+                assert_eq!(instance.agent_session_id.as_deref(), Some(SID));
+                assert!(
+                    instance.conversation_state().matches(&row),
+                    "accepted confirmation must restore the exact local CAS baseline"
+                );
                 let active = instance.active_execution.clone().unwrap();
                 let next_path = store.join("next.jsonl");
                 std::fs::write(
