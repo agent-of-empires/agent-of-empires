@@ -247,6 +247,7 @@ fn channel_releases(
                 && r.tag_name.starts_with(NIGHTLY_TAG_PREFIX) == nightly
         })
         .map(release_info_from)
+        .filter(|r| parse_version(&r.version).is_some())
         .collect()
 }
 
@@ -458,6 +459,7 @@ mod tests {
                     false,
                 ),
                 gh("v1.23.0-rc.1", "rc", true, false),
+                gh("nightly-20261110", "renamed by hand", true, false),
                 gh("v1.23.0", "draft", false, true),
             ]
         };
