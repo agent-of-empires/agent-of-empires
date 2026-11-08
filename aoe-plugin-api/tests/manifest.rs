@@ -257,6 +257,7 @@ id = "nolabel"
 
     assert!(m.host_compat("0.11.0").is_ok());
     assert!(m.host_compat("0.11.1-nightly.20261108").is_ok());
+    assert!(m.host_compat("0.13.0-nightly.20261108").is_err());
     assert!(m.host_compat("0.10.0-rc.1").is_err());
     let err = m.host_compat("0.13.0").unwrap_err();
     assert!(
