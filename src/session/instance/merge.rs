@@ -28,8 +28,13 @@ impl Instance {
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
         self.inherit_acp_load_capability(&prior);
+        self.capture_poller.adopt_relaunch(
+            &prior.capture_poller,
+            prior.held(),
+            prior.last_start_time != self.last_start_time,
+            Held::new(&self.tool, self.active_execution.as_ref()),
+        );
         self.last_start_time = prior.last_start_time;
-        self.capture_poller = prior.capture_poller;
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
         self.pending_host_env = prior.pending_host_env;
@@ -617,6 +622,63 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .stop();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_launch_adoption_preserves_canonical_poller_and_next_observation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut canonical = Instance::new("canonical-poller", "/tmp/test");
+        canonical.tool = "claude".into();
+        canonical.source_profile = "compatible-canonical-poller".into();
+        let storage = crate::session::Storage::new_unwatched(&canonical.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(canonical.clone());
+                Ok(())
+            })
+            .unwrap();
+        let launched = canonical.clone();
+        let poller = running_poller(
+            &canonical.id,
+            &canonical.tool,
+            canonical.active_execution.clone(),
+        );
+        canonical.capture_poller.set_handle(Some(poller.clone()));
+        canonical.inherit_process_runtime(launched);
+        assert!(
+            canonical
+                .capture_poller
+                .handle()
+                .is_some_and(|held| Arc::ptr_eq(held, &poller)),
+            "an empty launch slot must not discard a compatible canonical watcher"
+        );
+        let sid = "11111111-2222-4333-8444-555555555555";
+        poller
+            .lock()
+            .unwrap()
+            .inject_test_update(&canonical.id, sid);
+        let observed = canonical
+            .capture_poller
+            .handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_observation()
+            .unwrap();
+        assert_eq!(observed.1.sid, sid);
+        crate::session::sync::capture_launched_session_id_blocking(
+            &mut canonical,
+            &crate::file_watch::FileWatchService::noop(),
+            std::time::Duration::ZERO,
+            false,
+        );
+        assert_eq!(canonical.agent_session_id.as_deref(), Some(sid));
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(sid),
+            "the retained canonical watcher must persist its next observation",
+        );
     }
 
     #[test]
