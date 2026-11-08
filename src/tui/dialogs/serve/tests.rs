@@ -793,8 +793,12 @@ case "$1 $2" in
   "funnel reset")
     printf 'reset\n' >> "$AOE_TEST_FUNNEL_ROOT/calls"
     if [ -f "$AOE_TEST_FUNNEL_ROOT/spawn-descendant" ]; then
-      sleep 600 &
-      printf '%s\n' "$!" > "$AOE_TEST_FUNNEL_ROOT/descendant"
+      /bin/sh -c '
+        printf "%s\n" "$$" > "$AOE_TEST_FUNNEL_ROOT/descendant"
+        printf "ready\n" > "$AOE_TEST_FUNNEL_ROOT/descendant-ready"
+        read -r line < "$AOE_TEST_FUNNEL_ROOT/descendant-release"
+      ' &
+      read -r ready < "$AOE_TEST_FUNNEL_ROOT/descendant-ready"
     fi
     printf '%s\n' "$$" > "$AOE_TEST_FUNNEL_ROOT/entered"
     read -r line < "$AOE_TEST_FUNNEL_ROOT/release"
@@ -819,11 +823,13 @@ esac
         let cloudflare = root.path().join("cloudflared");
         std::fs::write(&cloudflare, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&cloudflare, std::fs::Permissions::from_mode(0o755)).unwrap();
-        nix::unistd::mkfifo(
-            &root.path().join("release"),
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .unwrap();
+        for name in ["release", "descendant-ready", "descendant-release"] {
+            nix::unistd::mkfifo(
+                &root.path().join(name),
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+        }
         let path = crate::session::test_support::path_prepended(root.path());
         let environment = crate::session::test_support::EnvGuard::set(&[(
             "AOE_TEST_FUNNEL_ROOT",
@@ -933,6 +939,8 @@ fn an_admitted_reset_finishes_once_after_close_and_reopen() {
     let descendant = crate::process::CapturedProcess::capture(descendant_pid, &birth)
         .unwrap()
         .unwrap();
+    assert!(!process.exited().unwrap());
+    assert!(!descendant.exited().unwrap());
     for _ in 0..3 {
         view.tick();
         assert!(matches!(view.handle_key(key('R')), ServeAction::Continue));
@@ -945,6 +953,9 @@ fn an_admitted_reset_finishes_once_after_close_and_reopen() {
     assert!(matches!(view.handle_key(close), ServeAction::Close));
     drop(view);
     let mut reopened = ServeView::new(&mut jobs);
+    assert!(!process.exited().unwrap());
+    assert!(!descendant.exited().unwrap());
+    assert!(!fixture.root.path().join("complete").exists());
     fixture.release();
     wait_for(&mut reopened, |view| {
         matches!(view.state, ServeViewState::ModePicker { .. })
