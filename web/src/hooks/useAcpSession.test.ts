@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState } from "../lib/acpTypes";
+import { emptyAcpState, type ReducedState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
@@ -19,6 +19,7 @@ import {
   type Route,
 } from "./__tests__/acpHarness";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
+import * as serverQueueSync from "./acpSession/serverQueueSync";
 
 vi.mock("../lib/api", async (importActual) => ({
   ...(await importActual<typeof import("../lib/api")>()),
@@ -51,6 +52,27 @@ async function openSession(...args: HookArgs) {
   lastSocket().open();
   await flushAsync();
   return hook;
+}
+
+function reduced(overrides: Partial<ReducedState> = {}): ReducedState {
+  return {
+    agent: "claude",
+    model: null,
+    mode: "Default",
+    current_plan: null,
+    in_flight_tool: null,
+    pending_approvals: [],
+    pending_elicitations: [],
+    thinking: null,
+    rate_limit: null,
+    available_commands: [],
+    available_modes: [],
+    current_mode_id: null,
+    turn_active: false,
+    cancelling: false,
+    compacting: false,
+    ...overrides,
+  };
 }
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
@@ -674,6 +696,7 @@ describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
   let workerDown: boolean;
+  let queueReadFails: boolean;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -686,11 +709,15 @@ describe("server queue", () => {
     serverQueue = new Map();
     serverBusy = false;
     workerDown = false;
+    queueReadFails = false;
     vi.mocked(reportAcpInteraction).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
         const item = url.match(/\/queue\/([^/?]+)/)?.[1];
-        if (method === "GET") return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        if (method === "GET") {
+          if (queueReadFails) return new Response("unavailable", { status: 503 });
+          return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        }
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
@@ -733,8 +760,264 @@ describe("server queue", () => {
     const { result } = await openBusy("sess-busy");
     expect(posts("/acp/prompt").map((c) => JSON.parse(c.body!).text)).toEqual(["follow-up"]);
     expect(posts("/queue")).toHaveLength(0);
-    expect(result.current.state.queuedPrompts).toMatchObject([{ text: "follow-up", pending: false }]);
+    expect(result.current.state.queuedPrompts).toMatchObject([{ text: "follow-up" }]);
+    expect(result.current.state.queuedPrompts[0]!.pending ?? false).toBe(false);
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("refreshes a compaction-deferred row after the server drains it without ending the turn", async () => {
+    vi.useFakeTimers();
+    const sid = "sess-compaction-drain";
+    serverQueue.set("deferred", row("deferred", "first explain the archive plan", { resume_after_compaction: true }));
+    const { result, unmount } = await openSession(sid);
+    lastSocket().message({
+      session_id: sid,
+      seq: 1,
+      event: { PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true } },
+    });
+    lastSocket().message({ session_id: sid, seq: 2, event: { UserPromptSent: { text: "original task" } } });
+    lastSocket().message({ kind: "reduced_state", seq: 3, state: reduced({ turn_active: true, compacting: true }) });
+    await flushAsync();
+    expect(result.current.state.compacting).toBe(true);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    const postsBefore = posts("/acp/prompt").length;
+
+    lastSocket().message({ kind: "reduced_state", seq: 4, state: reduced({ turn_active: true, compacting: false }) });
+    await flushAsync();
+    expect(result.current.state.turnActive).toBe(true);
+    expect(result.current.state.compacting).toBe(false);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    queueReadFails = true;
+    const readsBeforeFailure = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(
+      readsBeforeFailure + 1,
+    );
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    queueReadFails = false;
+    serverQueue.delete("deferred");
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toEqual([]);
+    expect(result.current.state.turnActive).toBe(true);
+    expect(posts("/acp/prompt")).toHaveLength(postsBefore);
+    expect(posts("/queue")).toHaveLength(0);
+    const reads = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    await flushAsync();
+    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(reads);
+    unmount();
+  });
+
+  it.each([
+    ["edit", false],
+    ["remove", false],
+    ["clear", false],
+    ["edit", true],
+    ["remove", true],
+    ["clear", true],
+  ] as const)("ignores stale reads during %s (failure=%s) and refreshes after settlement", async (mutation, fails) => {
+    const sid = `sess-queue-race-${mutation}-${fails}`;
+    let rows = [row("last", "original")];
+    let releaseRead!: () => void;
+    let releaseMutation!: () => void;
+    const heldRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const heldMutation = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    let holdReads = false;
+    let heldReads = 0;
+    let mutations = 0;
+    let settledReads = 0;
+    calls = installAcpFakes(async ({ url, method, body }) => {
+      if (!url.includes("/queue")) return undefined;
+      if (method === "GET") {
+        const snapshot = rows.map((entry) => ({ ...entry }));
+        if (holdReads) {
+          heldReads += 1;
+          await heldRead;
+        } else if (mutations > 0) {
+          settledReads += 1;
+        }
+        return json(snapshot);
+      }
+      mutations += 1;
+      await heldMutation;
+      if (fails) return new Response("unavailable", { status: 503 });
+      if (method === "PATCH") rows = [{ ...rows[0]!, text: JSON.parse(body!).text }];
+      else rows = [];
+      return new Response(null, { status: 204 });
+    });
+    const { result, unmount } = await openSession(sid);
+    await waitFor(() => expect(result.current.state.queuedPrompts).toHaveLength(1), { timeout: 2000 });
+    holdReads = true;
+    lastSocket().message({ session_id: sid, seq: 1, event: { UserPromptSent: { text: "active" } } });
+    await waitFor(() => expect(heldReads).toBeGreaterThan(0), { timeout: 2000 });
+    act(() => {
+      if (mutation === "edit") result.current.editQueuedPrompt("last", "edited");
+      else if (mutation === "remove") result.current.removeQueuedPrompt("last");
+      else result.current.clearQueue();
+    });
+    await waitFor(() => expect(mutations).toBe(1), { timeout: 2000 });
+    const handled = vi.spyOn(serverQueueSync, "reconcileQueueSnapshot");
+    await act(async () => releaseRead());
+    await waitFor(() => expect(handled).toHaveBeenCalledWith(sid, expect.anything(), expect.any(Array)), {
+      timeout: 2000,
+    });
+    await act(async () => {});
+    handled.mockRestore();
+    let expected: string[] = [];
+    if (mutation === "edit") expected = ["edited"];
+    expect(result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(expected);
+    holdReads = false;
+    await act(async () => releaseMutation());
+    await waitFor(() => expect(settledReads).toBeGreaterThan(0), { timeout: 2000 });
+    if (fails) expected = ["original"];
+    await waitFor(() => expect(result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(expected), {
+      timeout: 2000,
+    });
+    unmount();
+  });
+
+  it("does not let an old session mutation invalidate the new session's queue read", async () => {
+    let releaseMutation!: () => void;
+    let releaseRead!: () => void;
+    const mutation = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    const read = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let mutationStarted = false;
+    let readStarted = false;
+    const incoming = row("new-session-row", "new session queue");
+    calls = installAcpFakes(async ({ url, method }) => {
+      if (!url.includes("/queue")) return undefined;
+      if (method === "PATCH") {
+        mutationStarted = true;
+        await mutation;
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("/sess-new/")) {
+        readStarted = true;
+        await read;
+        return json([incoming]);
+      }
+      return json([row("old-session-row", "old session queue")]);
+    });
+    const hook = renderHook(({ sid }) => useAcpSession(sid), {
+      initialProps: { sid: "sess-old" },
+      wrapper: profileWrapper,
+    });
+    await waitFor(() => expect(sockets).toHaveLength(1), { timeout: 2000 });
+    lastSocket().open();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toHaveLength(1), { timeout: 2000 });
+    act(() => hook.result.current.editQueuedPrompt("old-session-row", "edited"));
+    await waitFor(() => expect(mutationStarted).toBe(true), { timeout: 2000 });
+    hook.rerender({ sid: "sess-new" });
+    await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
+    lastSocket().open();
+    await waitFor(() => expect(readStarted).toBe(true), { timeout: 2000 });
+    await act(async () => releaseMutation());
+    await act(async () => releaseRead());
+    await waitFor(
+      () => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual([incoming.id]),
+      { timeout: 2000 },
+    );
+    hook.unmount();
+  });
+
+  it("reconciles an edit that settles after the originating hook unmounts", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let text = "original";
+    let started = false;
+    let reads = 0;
+    calls = installAcpFakes(async ({ url, method }) => {
+      if (!url.includes("/queue")) return undefined;
+      if (method === "PATCH") {
+        started = true;
+        await pending;
+        text = "canonical edit";
+        return new Response(null, { status: 204 });
+      }
+      reads += 1;
+      return json([row("edited", text)]);
+    });
+    const first = await openSession("sess-remount-edit");
+    act(() => first.result.current.editQueuedPrompt("edited", "edited locally"));
+    await waitFor(() => expect(started).toBe(true), { timeout: 2000 });
+    first.unmount();
+    const before = reads;
+    const next = await openSession("sess-remount-edit");
+    await waitFor(() => expect(reads).toBeGreaterThan(before), { timeout: 2000 });
+    expect(next.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["edited locally"]);
+    await act(async () => release());
+    await waitFor(
+      () => expect(next.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["canonical edit"]),
+      { timeout: 2000 },
+    );
+    next.unmount();
+  });
+
+  it("refreshes other queue rows while Send now awaits its response", async () => {
+    let rows = [row("selected", "selected"), row("other", "other")];
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    calls = installAcpFakes(async ({ url, method }) => {
+      if (url.includes("/queue") && method === "GET") return json(rows);
+      if (url.includes("/acp/prompt")) {
+        started = true;
+        await pending;
+        return json({ disposition: "sent" }, 202);
+      }
+      return undefined;
+    });
+    const hook = await openSession("sess-send-refresh");
+    const selected = hook.result.current.state.queuedPrompts[0]!;
+    rows = [rows[0]!, { ...rows[1]!, text: "canonical other" }];
+    let send!: Promise<void>;
+    act(() => {
+      send = hook.result.current.sendQueuedNow(selected);
+    });
+    await waitFor(() => expect(started).toBe(true), { timeout: 2000 });
+    await waitFor(
+      () => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.text)).toEqual(["canonical other"]),
+      { timeout: 2000 },
+    );
+    rows = [];
+    act(() => hook.result.current.manualReconnect());
+    await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
+    lastSocket().open();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toEqual([]), { timeout: 2000 });
+    await act(async () => {
+      release();
+      await send;
+    });
+    expect(posts("/acp/prompt")).toHaveLength(1);
+    hook.unmount();
+  });
+
+  it("retries an unknown initial queue even when the local cache is empty", async () => {
+    vi.useFakeTimers();
+    queueReadFails = true;
+    serverQueue.set("hidden", row("hidden", "deferred", { resume_after_compaction: true }));
+    const hook = await openSession("sess-initial-queue-failure");
+    expect(calls.some((call) => call.method === "GET" && call.url.includes("/queue"))).toBe(true);
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
+    queueReadFails = false;
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await flushAsync();
+    expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["hidden"]);
+    hook.unmount();
   });
 
   it("POSTs directly when the session is idle", async () => {

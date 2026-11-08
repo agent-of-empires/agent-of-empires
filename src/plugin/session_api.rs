@@ -764,7 +764,8 @@ async fn sessions_turn_send(
                 woke_idle_dormant,
                 prompt_id: None,
                 synthesized: false,
-                no_revive: false, },
+                no_revive: false,
+                queued: false, },
             )
             .await;
         if sent.is_err() && marked_pending {
@@ -940,13 +941,16 @@ async fn deliver_structured(
         if reason != QueueReason::WorkerDown {
             service.clear_pending_initial_turn(id).await;
             service
-                .enqueue_prompt(
+                .enqueue_prompt_with_options(
                     id,
                     uuid::Uuid::new_v4().to_string(),
                     req.message.clone(),
                     Vec::new(),
-                    None,
-                    Some(plugin_id.to_string()),
+                    crate::server::session_service::QueuedPromptOptions {
+                        origin_plugin: Some(plugin_id.to_string()),
+                        resume_after_compaction: reason == QueueReason::Compacting,
+                        ..Default::default()
+                    },
                 )
                 .await
                 .ok_or_else(session_not_found)?;
@@ -968,6 +972,7 @@ async fn deliver_structured(
                 prompt_id: None,
                 synthesized: false,
                 no_revive: false,
+                queued: false,
             },
         )
         .await;
@@ -1667,6 +1672,71 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].text, "PR #7 was merged");
         assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+    }
+
+    #[tokio::test]
+    async fn message_send_preserves_compaction_deferral_and_plugin_origin() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "sess-msg-compaction";
+        let (deps, state, _dir, cmds) = foreign_live_session(id).await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        for (seq, event) in [
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                steering: true,
+                load_session: Some(false),
+            },
+            Event::UserPromptSent {
+                text: "original task".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            },
+            Event::ConversationCompactionStarted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(sink.publish_persisted(id, seq as u64 + 1, &event));
+        }
+        let out = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params(id, "PR #7 was merged"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["disposition"], "queued");
+        let queue = deps.session_service.queued_prompts_snapshot(id).await;
+        assert_eq!(queue.len(), 1);
+        assert!(queue[0].resume_after_compaction);
+        assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 4)]);
+        sink.publish_persisted(id, 4, &Event::ConversationCompacted);
+        deps.session_service.drain_queued_prompts_once(id).await;
+        assert!(deps
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .is_empty());
+        state.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(cmds.lock().unwrap().contains(&"prompt"));
+        let origins = state.acp_event_store.replay_from(id, 0);
+        assert!(origins.iter().any(|(_, event)| matches!(
+            event,
+            Event::UserPromptSent { origin_plugin: Some(origin), .. } if origin == "cron"
+        )));
     }
 
     #[tokio::test]

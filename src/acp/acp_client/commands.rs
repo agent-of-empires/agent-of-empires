@@ -7,12 +7,59 @@ use tokio::sync::oneshot;
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
 
+/// A worker reservation. Dropping it cancels delivery; committing it follows
+/// the durable sent event, so agent output cannot overtake that event.
+#[derive(Debug)]
+pub(crate) struct QueuedPromptPermit(pub(crate) oneshot::Sender<()>);
+
+impl QueuedPromptPermit {
+    pub(crate) fn commit(self) -> Result<(), super::AcpError> {
+        self.0.send(()).map_err(|_| super::AcpError::AgentExited)
+    }
+}
+
+pub(super) struct QueuedPromptReservation {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) commit: oneshot::Receiver<()>,
+    pub(super) committed: bool,
+}
+
+impl QueuedPromptReservation {
+    pub(super) fn new(
+        blocks: Vec<ContentBlock>,
+        ready: oneshot::Sender<Option<QueuedPromptPermit>>,
+    ) -> Option<Self> {
+        let (publish, commit) = oneshot::channel();
+        ready.send(Some(QueuedPromptPermit(publish))).ok()?;
+        Some(Self {
+            blocks,
+            commit,
+            committed: false,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn reserve_queued_prompt(
+    ready: oneshot::Sender<Option<QueuedPromptPermit>>,
+) -> bool {
+    let Some(reservation) = QueuedPromptReservation::new(Vec::new(), ready) else {
+        return false;
+    };
+    reservation.commit.await.is_ok()
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
     /// The fully-built prompt content blocks (text first, then any
     /// attachments). Built in `send_prompt` so the connection task just
     /// forwards them to `session/prompt`. See #1000.
     Prompt(Vec<ContentBlock>),
+    /// A durable queue keeps its rows until this task admits the content.
+    QueuedPrompt {
+        blocks: Vec<ContentBlock>,
+        ready: oneshot::Sender<Option<QueuedPromptPermit>>,
+    },
     Cancel,
     /// Force-stop now: end the in-flight turn with `user_forced` and let
     /// the drain task kill the worker process group + respawn. See #1727.

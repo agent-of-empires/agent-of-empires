@@ -200,6 +200,13 @@ done
             }
         }
 
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.prepare_queued_prompt("keep the durable queue row", &[]),
+        )
+        .await
+        .expect("worker answers admission without waiting for compaction to end")
+        .expect_err("compaction refuses a queued delivery");
         client
             .send_prompt("also check the tests", &[])
             .await

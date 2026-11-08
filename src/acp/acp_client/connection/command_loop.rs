@@ -20,7 +20,7 @@ use super::notifications::{now_ms, Shared};
 use crate::acp::acp_client::between_prompt::{
     between_prompt_stop_reason, BETWEEN_PROMPT_IDLE_CHECK_INTERVAL,
 };
-use crate::acp::acp_client::commands::ClientCmd;
+use crate::acp::acp_client::commands::{ClientCmd, QueuedPromptReservation};
 use crate::acp::acp_client::config_options::{
     config_option_failure_event, config_options_event, dispatch_set_config_option,
     dispatch_set_mode, mode_config_id, model_option, modes_available_event,
@@ -61,9 +61,24 @@ pub(super) struct Session {
     /// Steers the adapter handed back unconsumed, run as ordinary turns.
     /// Kept here rather than re-sent on the bounded channel this task drains.
     pub(super) pending_prompts: VecDeque<Vec<ContentBlock>>,
+    /// Steering receipts outlive the turn they were submitted into.
+    pub(super) steer_fut: Option<std::sync::Mutex<super::prompt::SteerFut>>,
+    pub(super) steer_backlog: VecDeque<Vec<ContentBlock>>,
+    pub(super) queued_reservation: Option<QueuedPromptReservation>,
 }
 
 impl Session {
+    pub(super) fn receive_queue_commit(&mut self, result: Result<(), oneshot::error::RecvError>) {
+        if result.is_ok() {
+            self.queued_reservation
+                .as_mut()
+                .expect("reservation exists")
+                .committed = true;
+        } else {
+            self.queued_reservation = None;
+        }
+    }
+
     pub(super) async fn send_cancel(&self) -> Result<(), agent_client_protocol::Error> {
         match self.control.as_ref() {
             Some(control) => {
@@ -119,10 +134,36 @@ impl Session {
                     acp_internal_error("native session is not established".into())
                 })?;
             // Fallback prompts go first so later messages cannot overtake them.
-            let cmd = match self.pending_prompts.pop_front() {
+            let mut pending = None;
+            if self.steer_fut.is_none() {
+                if self
+                    .queued_reservation
+                    .as_ref()
+                    .is_some_and(|reserved| reserved.committed)
+                {
+                    pending = self
+                        .queued_reservation
+                        .take()
+                        .map(|reserved| reserved.blocks);
+                } else if self.queued_reservation.is_none() {
+                    pending = self.pending_prompts.pop_front();
+                }
+            }
+            let cmd = match pending {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
                     cmd = self.cmd_rx.recv() => cmd,
+                    committed = async { (&mut self.queued_reservation.as_mut().expect("guarded").commit).await },
+                        if self.queued_reservation.as_ref().is_some_and(|reserved| !reserved.committed) => {
+                        self.receive_queue_commit(committed);
+                        continue;
+                    }
+                    (blocks, res) = async {
+                        self.steer_fut.as_mut().expect("guarded").get_mut().expect("exclusive steer").await
+                    }, if self.steer_fut.is_some() => {
+                        self.on_steer_result(blocks, res).await;
+                        continue;
+                    }
                     _ = idle_tick.tick() => {
                         if self.between_prompt_idle_tick().await {
                             break;
@@ -133,9 +174,27 @@ impl Session {
             };
             match cmd {
                 Some(ClientCmd::Prompt(blocks)) => {
+                    if self.steer_fut.is_some() || self.queued_reservation.is_some() {
+                        self.pending_prompts.push_back(blocks);
+                        continue;
+                    }
                     if self.run_prompt(blocks).await? {
                         break;
                     }
+                }
+                Some(ClientCmd::QueuedPrompt { blocks, ready }) => {
+                    if self.shared.adopted_turn_active.load(Ordering::Relaxed)
+                        || self.steer_fut.is_some()
+                        || self.queued_reservation.is_some()
+                        || !self.pending_prompts.is_empty()
+                    {
+                        let _ = ready.send(None);
+                        continue;
+                    }
+                    let Some(reservation) = QueuedPromptReservation::new(blocks, ready) else {
+                        continue;
+                    };
+                    self.queued_reservation = Some(reservation);
                 }
                 Some(ClientCmd::Cancel) => {
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
@@ -185,7 +244,15 @@ impl Session {
                     text,
                     deadline,
                     respond_to,
-                }) => self.reset_session(text, deadline, respond_to).await?,
+                }) => {
+                    if self.steer_fut.is_some() || self.queued_reservation.is_some() {
+                        let _ = respond_to.send(ResetSessionOutcome::Failed {
+                            message: "steering is still in flight".into(),
+                        });
+                    } else {
+                        self.reset_session(text, deadline, respond_to).await?;
+                    }
+                }
                 #[cfg(test)]
                 Some(ClientCmd::FlushForTest(done)) => {
                     let _ = done.send(());

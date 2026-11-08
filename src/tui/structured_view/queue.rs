@@ -75,6 +75,7 @@ impl QueueMirror {
             created_at: String::new(),
             origin_device: None,
             origin_plugin: None,
+            resume_after_compaction: false,
         });
     }
 }
@@ -122,6 +123,7 @@ mod tests {
             created_at: String::new(),
             origin_device: None,
             origin_plugin: None,
+            resume_after_compaction: false,
         };
         q.set_snapshot(vec![entry("b", 5, "second"), entry("a", 2, "first")]);
         assert_eq!(q.text_at(0), Some("first"));

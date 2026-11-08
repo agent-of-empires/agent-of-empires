@@ -738,6 +738,7 @@ mod tests {
             created_at: created_at.into(),
             origin_device: None,
             origin_plugin: None,
+            resume_after_compaction: false,
         };
         let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
         let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
@@ -819,6 +820,7 @@ mod tests {
                     created_at: queued_at,
                     origin_device: None,
                     origin_plugin: None,
+                    resume_after_compaction: false,
                 },
             );
             assert!(

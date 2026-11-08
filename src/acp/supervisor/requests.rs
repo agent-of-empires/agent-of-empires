@@ -105,6 +105,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// Reserve queue delivery before publishing its sent event. Driven resets
+    /// already have their own request/response ownership.
+    pub(crate) async fn prepare_queued_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<Option<crate::acp::acp_client::QueuedPromptPermit>, SupervisorError> {
+        let agent = self.agent_key_for_session(session_id).await;
+        let profile = crate::acp::agent_profiles::resolve(&agent);
+        if profile.is_clear_command(text) && profile.clear_requires_driven_reset {
+            return Ok(None);
+        }
+        let client = self.ready_client(session_id).await?;
+        Ok(Some(client.prepare_queued_prompt(text, attachments).await?))
+    }
+
     /// Drive a conversation reset (a fresh `session/new`) for a clear command,
     /// then re-assert the session's mode.
     pub async fn reset_session_context(

@@ -1243,6 +1243,159 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
 }
 
+#[tokio::test]
+async fn compaction_queued_prompts_resume_before_the_running_turn_ends() {
+    use crate::acp::supervisor::BroadcastSink;
+
+    for completion in [
+        Event::ConversationCompacted,
+        Event::ConversationCompactionFailed,
+    ] {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "sess-compaction-queue";
+        let state = structured_state(id, false).await;
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        for (seq, event) in [
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+                steering: true,
+            },
+            Event::UserPromptSent {
+                text: "continue the original task".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            },
+            Event::ConversationCompactionStarted,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(sink.publish_persisted(id, seq as u64 + 1, event));
+        }
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 3)]);
+
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.to_string()),
+            prompt_req("first explain the archive plan"),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["disposition"], "queued");
+        assert_eq!(body["reason"], "compacting");
+        let queued = state.session_service.queued_prompts_snapshot(id).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].text, "first explain the archive plan");
+        assert!(queued[0].resume_after_compaction);
+        let storage = crate::session::Storage::new("default", state.file_watch.clone()).unwrap();
+        assert!(storage.load().unwrap()[0].queued_prompts[0].resume_after_compaction);
+        state.session_service.drain_queued_prompts_once(id).await;
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .len(),
+            1
+        );
+        assert!(!published(&state, id, |event| matches!(
+            event,
+            Event::UserPromptSent { text, .. } if text == "first explain the archive plan"
+        )));
+
+        state
+            .session_service
+            .enqueue_prompt(
+                id,
+                "ordinary".into(),
+                "wait for the next turn".into(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(sink.publish_persisted(id, 4, &completion));
+        let mut capabilities = Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            load_session: None,
+            steering: false,
+        };
+        assert!(sink.publish_persisted(id, 5, &capabilities));
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 5)]);
+        assert!(
+            state
+                .session_service
+                .fold_control_state(id)
+                .await
+                .turn_active
+        );
+        state.session_service.drain_queued_prompts_once(id).await;
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .len(),
+            2
+        );
+        if let Event::PromptCapabilities { steering, .. } = &mut capabilities {
+            *steering = true;
+        }
+        assert!(sink.publish_persisted(id, 6, &capabilities));
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 6)]);
+        state.session_service.drain_queued_prompts_once(id).await;
+        let remaining = state.session_service.queued_prompts_snapshot(id).await;
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ordinary"],
+            "{completion:?}: resume only the compaction-deferred prompt"
+        );
+        state.session_service.drain_queued_prompts_once(id).await;
+        assert_eq!(
+            state.acp_event_store.replay_from(id, 0).iter().filter(|(_, event)| {
+                matches!(event, Event::UserPromptSent { text, .. } if text == "first explain the archive plan")
+            }).count(),
+            1,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if commands.lock().unwrap().contains(&"prompt") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fake worker must receive the deferred prompt");
+    }
+}
+
 /// The 202 names how the prompt was dispatched and, when it became a turn, the seq of its
 /// `UserPromptSent`; a queued prompt has a row id and no seq.
 #[tokio::test]
