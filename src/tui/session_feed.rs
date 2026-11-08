@@ -37,7 +37,10 @@ const COMMAND_CAPACITY: usize = 32;
 
 pub(crate) enum SessionRequest {
     Mutation(SessionMutation),
-    Trash(crate::daemon::TrashSessionBody),
+    Trash {
+        body: crate::daemon::TrashSessionBody,
+        expected_epoch: String,
+    },
     ForgetTrash {
         body: crate::daemon::ForgetTrashBody,
         expected_epoch: String,
@@ -486,8 +489,11 @@ async fn run_queued_command(
                             })
                         })
                 }
-                SessionRequest::Trash(body) => client
-                    .trash_session(&id, &body, epoch)
+                SessionRequest::Trash {
+                    body,
+                    expected_epoch,
+                } => client
+                    .trash_session(&id, &body, &expected_epoch)
                     .await
                     .map(CommandReply::Trash),
                 SessionRequest::ForgetTrash {

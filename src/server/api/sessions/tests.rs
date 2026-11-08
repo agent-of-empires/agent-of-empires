@@ -1309,6 +1309,103 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
 
 #[tokio::test]
 #[serial_test::serial]
+async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<()> {
+    for acp in [false, true] {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let claude = home.path().join("claude");
+        let _env = crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &claude)]);
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        let project = home.path().join("import-project");
+        let retained = home.path().join("retained");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&retained)?;
+        let history = claude.join("projects").join("-import-project");
+        std::fs::create_dir_all(&history)?;
+        std::fs::write(
+            history.join("listed.jsonl"),
+            serde_json::json!({
+                "type": "user", "cwd": project,
+                "message": {"role": "user", "content": "retained native conversation"}
+            })
+            .to_string()
+                + "\n",
+        )?;
+        let mut owner = Instance::new("forgotten owner", retained.to_str().unwrap());
+        owner.source_profile = "test".into();
+        owner.tool = "pi".into();
+        owner.terminal_scopes = Some(Vec::new());
+        let parked = owner
+            .prior_tool_session_ids
+            .entry("claude".into())
+            .or_default();
+        if acp {
+            parked.acp_session_id = Some("listed".into());
+        } else {
+            parked.agent_session_id = Some("listed".into());
+        }
+        owner.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )?;
+        owner.trash();
+        let consent = crate::daemon::ForgetTrashBody {
+            expected_profile: owner.source_profile.clone(),
+            expected_generation: owner.lifecycle_generation,
+            expected_trashed_at: owner.trashed_at.unwrap(),
+            expected_trash_lifecycle_id: owner.trash_lifecycle_id.clone().unwrap(),
+        };
+        let (launcher, _) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![owner.clone()],
+            launcher,
+        );
+        let storage = Storage::new("test", state.file_watch.clone())?;
+        storage.update(|rows, _| {
+            rows.push(owner.clone());
+            Ok(())
+        })?;
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let forgotten =
+            forget_trash_record(State(state.clone()), Path(owner.id), Ok(Json(consent)))
+                .await
+                .into_response();
+        assert_eq!(forgotten.status(), StatusCode::NO_CONTENT);
+        let journal = root.join(crate::session::purge_owners::FILE_NAME);
+        let evidence = std::fs::read(&journal)?;
+        let (status, response) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "imported parked conversation", "path": project, "tool": "claude",
+                "profile": "test", "import_acp_session_id": "listed", "cli": {}
+            }),
+        )
+        .await;
+        state.runtime.work.shutdown.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.runtime.work.drain(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert!(
+            storage.load()?.is_empty(),
+            "import must not publish a claimant"
+        );
+        assert_eq!(std::fs::read(journal)?, evidence);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
     use crate::session::LifecycleOperation;
     for (already_trashed, precondition, omit_body, peer) in [

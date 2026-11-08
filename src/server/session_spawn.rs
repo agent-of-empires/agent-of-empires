@@ -261,15 +261,6 @@ pub(crate) async fn spawn_structured_session(
         let (existing_titles, existing_branches): (Vec<String>, Vec<String>) = {
             let rows = worker_state.instances.blocking_read();
             let owned_rows = || rows.iter().chain(cleanup_owners.frozen_instances());
-            if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
-                anyhow::ensure!(
-                    !owned_rows().any(|row| {
-                        row.acp_session_id.as_deref() == Some(import_id)
-                            || row.agent_session_id.as_deref() == Some(import_id)
-                    }),
-                    "import source is already owned by an AoE session"
-                );
-            }
             (owned_rows().map(|row| row.title.clone()).collect(),
              owned_rows().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
         };
@@ -284,6 +275,23 @@ pub(crate) async fn spawn_structured_session(
         )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            let rows = worker_state.instances.blocking_read();
+            let source = import_binding.as_ref().and_then(|binding| binding.execution.as_ref());
+            anyhow::ensure!(
+                !rows.iter().any(|row| {
+                    row.acp_session_id.as_deref() == Some(import_id)
+                        || row.agent_session_id.as_deref() == Some(import_id)
+                })
+                    && !cleanup_owners.frozen_instances().any(|row| {
+                        row.acp_session_id.as_deref() == Some(import_id)
+                            || row.prior_tool_session_ids.values()
+                                .any(|parked| parked.acp_session_id.as_deref() == Some(import_id))
+                    })
+                    && !cleanup_owners.blocks_conversation(&instance.id, import_id, source),
+                "import source is already owned by an AoE session"
+            );
+        }
         anyhow::ensure!(
             !cleanup_owners.session_ids().any(|id| id == instance.id),
             "session identity retains protected cleanup ownership"

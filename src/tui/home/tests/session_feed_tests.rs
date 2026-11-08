@@ -2975,7 +2975,7 @@ fn trash_confirmation_rejects_a_changed_original_target() {
             let request = requests(Err("trash request observed".into()));
             if change == "selection" {
                 assert!(
-                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash(_))) if target == id)
+                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash { .. })) if target == id)
                 );
             } else {
                 assert!(request.is_none(), "{change}");
@@ -3652,4 +3652,62 @@ fn forget_confirmation_does_not_survive_runtime_epoch_replacement() {
     env.view.handle_key(key(KeyCode::Char('y')), None);
     assert!(commands(Err("old consent was submitted".into())).is_none());
     assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
+}
+
+#[test]
+#[serial]
+fn retained_trash_context_menu_keeps_opening_epoch() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+    use crate::tui::dialogs::{ContextMenuAction, ContextMenuDialog};
+    for replacement in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |row| {
+            row.trash();
+            row.lifecycle_generation = 4;
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Trash,
+                generation: 4,
+                at: chrono::Utc::now() - chrono::Duration::hours(1),
+            });
+        });
+        env.view.trashed_section_collapsed = false;
+        env.view.rebuild_flat_items();
+        env.view.select_session_by_id(&id);
+        env.view
+            .session_feed
+            .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+        env.view.apply_session_feed();
+        let row = env.view.get_instance(&id).unwrap();
+        env.view.context_menu = Some(
+            ContextMenuDialog::for_trashed_session((1, 1), true).with_session_target(
+                &id,
+                &row.source_profile,
+                row.lifecycle_generation,
+                env.view.session_feed.applied_epoch(),
+            ),
+        );
+        if replacement {
+            let SessionFeedResult::Snapshot(mut next) = daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut next).cursor.epoch = "replacement".into();
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(next));
+            env.view.apply_session_feed();
+        }
+        let mut commands = env.view.session_feed.request_driver_for_test();
+        assert!(env.view.session_feed.native_interaction_available());
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::RetryTrash);
+        let submitted = commands(Err("test completion".into()));
+        assert_eq!(
+            submitted.is_some(),
+            !replacement,
+            "an old menu cannot use a replacement runtime's writer"
+        );
+        assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
+    }
 }

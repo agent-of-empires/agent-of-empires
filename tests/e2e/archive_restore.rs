@@ -1651,3 +1651,86 @@ fn trash_forget_confirmation_expires_across_daemon_restart_with_unchanged_row() 
             .any(|owner| owner["session_id"] == id && owner["purpose"]["kind"] == "retained"));
     }
 }
+
+#[test]
+#[parallel]
+fn trash_retry_menu_rejects_old_epoch_and_accepts_fresh_consent() {
+    require_tmux!();
+    for mouse in [false, true] {
+        let mut h = TuiTestHarness::new("trash_retry_epoch");
+        h.stop_daemon_on_drop();
+        let (original, id, sentinel) = pending_trash_row(&h, "RetryEpoch", true);
+        std::fs::write(
+            h.sessions_path(),
+            serde_json::to_vec(std::slice::from_ref(&original)).unwrap(),
+        )
+        .unwrap();
+        let port = h.start_daemon();
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        h.wait_for("Trash (");
+        h.send_keys("End");
+        h.send_keys("Enter");
+        trash_management_menu(&mut h, "RetryEpoch");
+        let screen = h.capture_screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Retry Trash"))
+            .unwrap();
+        let x = unicode_width::UnicodeWidthStr::width(&line[..line.find("Retry Trash").unwrap()])
+            as u16
+            + 1;
+        let y = y as u16 + 1;
+
+        h.run_cli_ok(&["serve", "--stop"]);
+        h.run_cli_ok(&[
+            "serve",
+            "--daemon",
+            "--port",
+            &port.to_string(),
+            "--no-auth",
+        ]);
+        assert!(crate::harness::wait_for_port(port, Duration::from_secs(10)));
+        h.wait_for("Reconnect");
+        h.send_keys("r");
+        h.wait_for_runtime_ready();
+        if mouse {
+            h.send_mouse_click(0, x, y);
+        } else {
+            h.send_keys("Enter");
+        }
+        h.wait_for("Session changed; reopen the context menu");
+        record_trash_management(&h, "trash-retry-epoch-rejected");
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        for key in ["trashed_at", "trash_lifecycle_id", "lifecycle_generation"] {
+            assert_eq!(row[key], original[key], "stale menu changed {key}");
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"retained files");
+
+        trash_management_menu(&mut h, "RetryEpoch");
+        h.send_keys("Enter");
+        crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            let rows = h.read_sessions();
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap();
+            (row["lifecycle_generation"].as_u64()
+                == original["lifecycle_generation"]
+                    .as_u64()
+                    .map(|generation| generation + 1))
+            .then_some(())
+            .ok_or_else(|| format!("fresh Retry not admitted: {row}"))
+        });
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"retained files");
+    }
+}

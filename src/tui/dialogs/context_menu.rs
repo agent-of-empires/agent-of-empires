@@ -52,6 +52,13 @@ pub enum ContextMenuAction {
     ForgetTrash,
 }
 
+pub struct SessionMenuTarget {
+    pub id: String,
+    pub profile: String,
+    pub generation: u64,
+    pub epoch: Option<String>,
+}
+
 pub struct ContextMenuDialog {
     items: Vec<(ContextMenuAction, &'static str)>,
     /// The highlighted item. Opens at `Some(0)` so Enter submits the first
@@ -62,7 +69,7 @@ pub struct ContextMenuDialog {
     anchor: (u16, u16),
     /// Last rendered rect, so click-outside needs no layout math.
     last_area: Rect,
-    session_target: Option<(String, String, u64)>,
+    session_target: Option<SessionMenuTarget>,
 }
 
 /// The menu item at `(col, row)`, or `None` on any border, past the last item,
@@ -160,12 +167,23 @@ impl ContextMenuDialog {
         )
     }
 
-    pub fn with_session_target(mut self, id: &str, profile: &str, generation: u64) -> Self {
-        self.session_target = Some((id.to_owned(), profile.to_owned(), generation));
+    pub fn with_session_target(
+        mut self,
+        id: &str,
+        profile: &str,
+        generation: u64,
+        epoch: Option<&str>,
+    ) -> Self {
+        self.session_target = Some(SessionMenuTarget {
+            id: id.to_owned(),
+            profile: profile.to_owned(),
+            generation,
+            epoch: epoch.map(str::to_owned),
+        });
         self
     }
 
-    pub fn session_target(&self) -> Option<&(String, String, u64)> {
+    pub fn session_target(&self) -> Option<&SessionMenuTarget> {
         self.session_target.as_ref()
     }
 

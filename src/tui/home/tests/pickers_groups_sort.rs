@@ -152,7 +152,7 @@ pub(super) async fn settle_row_command(
         let base = format!("/api/sessions/{id}");
         match request {
             SessionRequest::Rename(body) => ("PATCH", base, serde_json::to_value(body).unwrap()),
-            SessionRequest::Trash(body) => (
+            SessionRequest::Trash { body, .. } => (
                 "POST",
                 format!("{base}/trash"),
                 serde_json::to_value(body).unwrap(),
@@ -203,7 +203,7 @@ pub(super) async fn settle_row_command(
             cursor,
             outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
         }),
-        SessionRequest::Trash(_) => SessionCommandOutcome::Trashed(MutationReceipt {
+        SessionRequest::Trash { .. } => SessionCommandOutcome::Trashed(MutationReceipt {
             cursor,
             outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
         }),
@@ -502,15 +502,19 @@ pub(super) async fn settle_trash(
     id: &str,
 ) {
     let generation = view.get_instance(id).unwrap().lifecycle_generation;
+    let expected_epoch = view.session_feed.applied_epoch().unwrap().to_owned();
     settle_row_command(
         state,
         view,
         id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-            expected_profile: None,
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: None,
+            },
+            expected_epoch,
+        },
         |view| {
             view.trash_session_by_id(id);
             Ok(())

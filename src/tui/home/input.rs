@@ -5568,6 +5568,7 @@ impl HomeView {
                                 &inst.id,
                                 &inst.source_profile,
                                 inst.lifecycle_generation,
+                                self.session_feed.applied_epoch(),
                             ),
                     );
                     return true;
@@ -5689,20 +5690,25 @@ impl HomeView {
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
         let menu = self.context_menu.take();
-        if let Some((id, profile, generation)) =
-            menu.as_ref().and_then(ContextMenuDialog::session_target)
-        {
-            let valid = self.selected_session.as_ref() == Some(id)
-                && self.get_instance(id).is_some_and(|inst| {
-                    inst.source_profile == *profile
-                        && inst.lifecycle_generation == *generation
+        if let Some(target) = menu.as_ref().and_then(ContextMenuDialog::session_target) {
+            let valid = target
+                .epoch
+                .as_deref()
+                .is_some_and(|epoch| self.session_feed.applied_epoch() == Some(epoch))
+                && self.selected_session.as_ref() == Some(&target.id)
+                && self.get_instance(&target.id).is_some_and(|inst| {
+                    inst.source_profile == target.profile
+                        && inst.lifecycle_generation == target.generation
                         && inst.is_trashed()
                 })
-                && self.session_feed.applied_session(id).is_some_and(|row| {
-                    row.profile == *profile
-                        && row.lifecycle_generation == *generation
-                        && row.trashed_at.is_some()
-                });
+                && self
+                    .session_feed
+                    .applied_session(&target.id)
+                    .is_some_and(|row| {
+                        row.profile == target.profile
+                            && row.lifecycle_generation == target.generation
+                            && row.trashed_at.is_some()
+                    });
             if !valid {
                 self.flash_status("Session changed; reopen the context menu");
                 return;

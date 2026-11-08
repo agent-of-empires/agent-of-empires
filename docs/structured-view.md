@@ -182,8 +182,9 @@ position. Read failures keep the last loaded content visible with an error.
 Content, size, or theme changes clear the previous text selection.
 
 Dialogs close when their target session changes or disappears. Trash context
-menus reject actions if the original session, profile, or lifecycle generation
-changes. Restore and permanent deletion never target a replacement selection.
+menus reject actions if their original session, profile, lifecycle generation,
+or runtime epoch changes. Restore and permanent deletion never target a
+replacement selection.
 
 An unfinished Trash transition offers **Retry Trash** in the TUI context menu and
 web Trash controls. A fresh owner remains busy; an unverified retained checkout
