@@ -3551,6 +3551,9 @@ mod tests {
             grant: Arc::new(AtomicU64::new(1)),
             generation: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            preparation: None,
+            latest: None,
         };
         let (slow_result, mut slow_reply) = tokio::sync::oneshot::channel();
         requests
