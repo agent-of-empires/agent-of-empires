@@ -1630,7 +1630,11 @@ mod tests {
             .settle(std::time::Duration::from_millis(500))
             .unwrap();
         wait_for_pane_dead(&pane);
-        let (state, _, current_pid) = probe_owned_pane(
+        let OwnedPaneProbe {
+            state,
+            pane_pid: current_pid,
+            ..
+        } = probe_owned_pane(
             guard.name(),
             &born,
             &crate::tmux::TmuxCommandDeadline::new(),
@@ -1722,7 +1726,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap()
-                .0,
+                .state,
                 PaneProbe::Dead,
                 "{field} refusal must preserve the corpse"
             );

@@ -3416,7 +3416,7 @@ mod tests {
         let (_pane, observation) = observed_dead_resume_fixture(&instance);
         let probe = LaunchProbe {
             tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-            pane: Some(observation),
+            pane: Some(std::sync::Arc::new(observation)),
             expected: instance.conversation_state(),
         };
         let releases = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -3481,7 +3481,7 @@ mod tests {
             let (_pane, observation) = observed_dead_resume_fixture(&instance);
             let probe = LaunchProbe {
                 tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-                pane: Some(observation),
+                pane: Some(std::sync::Arc::new(observation)),
                 expected: instance.conversation_state(),
             };
             let peer = std::rc::Rc::new(std::cell::RefCell::new(None));

@@ -1782,6 +1782,7 @@ mod tests {
                         .ensure_tool(
                             "session",
                             &EnsureToolBody {
+                                expected: None,
                                 tool_name: "shell".into(),
                                 size: None,
                                 adoption: None,

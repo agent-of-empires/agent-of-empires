@@ -1484,12 +1484,9 @@ mod tests {
             fn migrate_sandbox_store(
                 &self,
                 id: &str,
-                reporter: Option<crate::migrations::progress::Reporter>,
                 runtime: &crate::containers::ContainerRuntime,
             ) -> Result<()> {
-                crate::session::SessionStore::migrate_sandbox_store(
-                    self.inner, id, reporter, runtime,
-                )
+                crate::session::SessionStore::migrate_sandbox_store(self.inner, id, runtime)
             }
         }
         let root = tempfile::tempdir()?;
