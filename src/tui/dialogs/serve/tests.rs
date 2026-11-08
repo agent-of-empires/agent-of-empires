@@ -1,6 +1,12 @@
 use super::*;
 use std::sync::mpsc;
 
+fn remove_app_file(name: &str) {
+    if let Ok(app) = crate::session::get_app_dir() {
+        let _ = std::fs::remove_file(app.join(name));
+    }
+}
+
 fn key(code: char) -> KeyEvent {
     KeyEvent::from(KeyCode::Char(code))
 }
@@ -667,7 +673,7 @@ fn a_liveness_result_cannot_beat_a_published_url() {
             },
             passphrase: None,
             log_offset: 0,
-            tail: Vec::new(),
+            tail: Default::default(),
         }));
         wait_for(&mut view, |view| {
             !matches!(view.state, ServeViewState::Starting { .. })
@@ -1450,11 +1456,12 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         Hide,
         Foreign,
     }
-    for (hold_starting, change) in [
-        (false, Change::Exit),
-        (true, Change::Exit),
-        (true, Change::Hide),
-        (true, Change::Foreign),
+    for (hold_starting, change, legacy) in [
+        (false, Change::Exit, false),
+        (true, Change::Exit, false),
+        (true, Change::Hide, false),
+        (true, Change::Foreign, false),
+        (true, Change::Exit, true),
     ] {
         remove_app_file("serve.url");
         let mut daemon = TestDaemon::new();
@@ -1493,18 +1500,22 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
                 std::fs::write(app.join("serve.pid"), std::process::id().to_string()).unwrap();
             }
         }
+        let identity = if legacy {
+            String::new()
+        } else {
+            format!(" boot_id={} start_id={}", birth.boot_id, birth.start_id)
+        };
         std::fs::write(
             crate::cli::serve::stdio_redirect_path().unwrap(),
             format!(
-                "[AOE_START_MARKER] pid={} boot_id={} start_id={} exe=aoe\n\
+                "[AOE_START_MARKER] pid={}{} exe=aoe\n\
                  {}fixture-own-startup-tail\n\
                  [AOE_START_MARKER] pid={} exe=tui\n\
                  Address already in use\nfixture-late-startup-tail\n\
                  [AOE_START_MARKER] pid={} boot_id={} start_id=departed-reuse exe=aoe\n\
                  unrelated-later-tail\n",
                 daemon.child.id(),
-                birth.boot_id,
-                birth.start_id,
+                identity,
                 "earlier runtime context\n".repeat(32),
                 std::process::id(),
                 daemon.child.id(),
@@ -1524,6 +1535,13 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
             assert!(message.contains("fixture-own-startup-tail"), "{message}");
             assert!(message.contains("Address already in use"), "{message}");
             assert!(message.contains("fixture-late-startup-tail"), "{message}");
+            assert!(!message.contains("\n\nHint:"), "{message}");
+            if legacy {
+                assert!(
+                    message.contains("Unattributed shared log context"),
+                    "{message}"
+                );
+            }
             let buffer = crate::tui::dialogs::test_render::draw(100, 30, |frame, theme| {
                 view.render(frame, frame.area(), theme);
             });
@@ -1537,6 +1555,34 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         }
         remove_app_file("serve.pid");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let port = app.join("serve.last_port");
+    std::fs::write(&port, "55555").unwrap();
+    std::fs::write(
+        crate::cli::serve::stdio_redirect_path().unwrap(),
+        "[AOE_START_MARKER] pid=23 exe=another-client\nAddress already in use\n",
+    )
+    .unwrap();
+    let request = ServeLaunchRequest {
+        restart: false,
+        mode: ServeMode::Local,
+        transport: None,
+        passphrase: None,
+    };
+    let failed = tokio::time::timeout(
+        Duration::from_secs(10),
+        request.run("unknown-diagnostic-fixture".to_owned(), None),
+    )
+    .await
+    .unwrap();
+    assert!(failed.is_err());
+    assert_eq!(std::fs::read_to_string(port).unwrap(), "55555");
 }
 
 #[test]

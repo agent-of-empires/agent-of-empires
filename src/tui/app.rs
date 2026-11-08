@@ -2594,7 +2594,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(crate::tui::dialogs::ServeLaunchFailure {
                 message: "Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned(),
-                log_tail: Vec::new(),
+                log_tail: Default::default(),
             }),
         };
         self.dashboard_launch = None;
@@ -4618,7 +4618,7 @@ mod tests {
                 target,
                 failure: ServeLaunchFailure {
                     message: "tailscale funnel failed".to_owned(),
-                    log_tail: Vec::new(),
+                    log_tail: Default::default(),
                 },
             },
             &mut app.home.serve_jobs,

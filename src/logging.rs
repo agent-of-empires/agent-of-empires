@@ -830,7 +830,7 @@ impl Drop for SizeRotatingWriter {
     }
 }
 
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
     PathBuf::from(s)

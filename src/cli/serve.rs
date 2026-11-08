@@ -1467,19 +1467,20 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
     result
 }
 
-/// Path the daemon's stdout/stderr are redirected to. Resolved from the
-/// configured `[logging].file_path` so panic backtraces interleave with
-/// the structured tracing stream. Used by `start_daemon()` for the stdio
-/// redirect, by the TUI serve dialog for the tail pane, and by `aoe logs`
-/// for the viewer target.
+/// Configured log shared by tracing and the Daemon's redirected stdout/stderr.
 pub fn stdio_redirect_path() -> Result<PathBuf> {
+    stdio_redirect_logging().map(|(path, _)| path)
+}
+
+pub(crate) fn stdio_redirect_logging() -> Result<(PathBuf, crate::session::config::LoggingConfig)> {
     let dir = crate::session::get_app_dir()?;
     let log_cfg = crate::session::load_config()
         .ok()
         .flatten()
         .map(|c| c.logging)
         .unwrap_or_default();
-    Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
+    let path = crate::logging::resolve_log_path(&log_cfg, &dir);
+    Ok((path, log_cfg))
 }
 
 /// URL a CityHall-hosted workspace fetches its config bundle from. Unset means
@@ -2264,11 +2265,24 @@ impl TuiObservationLease {
         Ok(())
     }
 
-    pub(crate) fn startup_tail(&self) -> Vec<String> {
-        self.exited_process
+    pub(crate) fn into_target_and_tail(
+        self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> (TuiControlTarget, crate::acp::client::autostart::LogContext) {
+        let Self {
+            _transaction,
+            observed,
+            exited_process,
+        } = self;
+        // Diagnostic scans must not retain lifecycle exclusion after the identity recheck.
+        drop(_transaction);
+        let tail = exited_process
             .as_ref()
-            .map(|(pid, birth)| crate::acp::client::autostart::startup_log_tail(*pid, birth))
-            .unwrap_or_default()
+            .map(|(pid, birth)| {
+                crate::acp::client::autostart::startup_log_tail(*pid, birth, cancel)
+            })
+            .unwrap_or_default();
+        (observed.target, tail)
     }
 
     pub(crate) fn into_target(self) -> TuiControlTarget {

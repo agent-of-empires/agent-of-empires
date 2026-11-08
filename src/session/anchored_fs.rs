@@ -149,7 +149,8 @@ impl ResolvedDataFile {
         self.parent.sync()?;
         Ok(self.parent.root.join(name))
     }
-    pub(crate) fn read(&self) -> Result<Option<String>> {
+    /// Regular descriptor and length captured before reading.
+    pub(crate) fn open_read_snapshot(&self) -> Result<Option<(File, u64)>> {
         let fd = match openat(
             &self.parent.fd,
             self.leaf.as_os_str(),
@@ -160,11 +161,20 @@ impl ResolvedDataFile {
             Err(Errno::ENOENT) => return Ok(None),
             Err(error) => return Err(error).context("opening resolved data file"),
         };
-        if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
+        let stat = fstat(&fd)?;
+        if stat.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
             bail!("resolved data file is not a regular file");
         }
+        let length = u64::try_from(stat.st_size).context("invalid regular-file length")?;
+        Ok(Some((File::from(fd), length)))
+    }
+
+    pub(crate) fn read(&self) -> Result<Option<String>> {
+        let Some((mut file, _)) = self.open_read_snapshot()? else {
+            return Ok(None);
+        };
         let mut content = String::new();
-        File::from(fd).read_to_string(&mut content)?;
+        file.read_to_string(&mut content)?;
         Ok(Some(content))
     }
 

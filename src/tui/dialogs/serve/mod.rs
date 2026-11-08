@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
-use crate::acp::client::autostart::initial_log_tail;
+use crate::acp::client::autostart::{initial_log_tail, LogContext};
 use crate::cli::serve::{ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
@@ -59,7 +59,7 @@ pub struct ServeLaunchRequest {
 #[derive(Clone)]
 pub struct ServeLaunchFailure {
     pub(crate) message: String,
-    pub(crate) log_tail: Vec<String>,
+    pub(crate) log_tail: LogContext,
 }
 
 impl ServeLaunchFailure {
@@ -135,7 +135,7 @@ impl ServeLaunchRequest {
         }
         let parsed = crate::cli::Cli::try_parse_from(argv).map_err(|error| ServeLaunchFailure {
             message: error.to_string(),
-            log_tail: Vec::new(),
+            log_tail: LogContext::default(),
         })?;
         let Some(crate::cli::Commands::Serve(mut args)) = parsed.command else {
             unreachable!();
@@ -153,14 +153,6 @@ impl ServeLaunchRequest {
                 }
             });
         let result = result.map_err(ServeLaunchFailure::capture);
-        if result.as_ref().err().is_some_and(|failure| {
-            failure
-                .log_tail
-                .iter()
-                .any(|line| line.contains("EADDRINUSE") || line.contains("Address already in use"))
-        }) {
-            remove_app_file("serve.last_port");
-        }
         if result.is_ok() {
             remember_last_mode(self.mode);
         }
@@ -340,11 +332,10 @@ impl ServeViewState {
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         headline: &str,
-        tail: Vec<String>,
+        tail: LogContext,
     ) -> Self {
-        let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
         ServeViewState::Error {
-            message: format!("{headline}{hint}{}", last_log_lines(&tail)),
+            message: format!("{headline}{}", last_log_lines(&tail)),
             mode,
             transport,
         }

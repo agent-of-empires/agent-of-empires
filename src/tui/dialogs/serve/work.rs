@@ -49,7 +49,7 @@ pub(super) struct StartingObservation {
     pub(super) urls: Vec<crate::cli::serve::ServeUrl>,
     pub(super) passphrase: Option<String>,
     pub(super) log_offset: u64,
-    pub(super) tail: Vec<String>,
+    pub(super) tail: crate::acp::client::autostart::LogContext,
 }
 
 pub(super) enum JobResult {
@@ -82,7 +82,7 @@ async fn picker(
     let (state, primary) = ServeViewState::mode_picker(cancel);
     let mut lease = TuiObservationLease::prepare(None, cancel).await?;
     if lease.has_dashboard() {
-        return dashboard(lease, passphrase);
+        return dashboard(lease, passphrase, cancel);
     }
     lease.recheck()?;
     Ok(JobResult::Snapshot(Snapshot {
@@ -93,9 +93,13 @@ async fn picker(
     }))
 }
 
-fn dashboard(lease: TuiObservationLease, passphrase: Option<String>) -> anyhow::Result<JobResult> {
+fn dashboard(
+    lease: TuiObservationLease,
+    passphrase: Option<String>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<JobResult> {
     let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
-    let observation = observe(lease, mode == ServeMode::Tunnel)?;
+    let observation = observe(lease, mode == ServeMode::Tunnel, cancel)?;
     let state = if observation.running {
         ServeViewState::running(
             mode,
@@ -123,6 +127,7 @@ fn dashboard(lease: TuiObservationLease, passphrase: Option<String>) -> anyhow::
 fn observe(
     mut lease: TuiObservationLease,
     read_passphrase: bool,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<StartingObservation> {
     let mut urls = if lease.has_dashboard() {
         crate::cli::serve::read_serve_urls()
@@ -139,20 +144,18 @@ fn observe(
     }
     lease.recheck()?;
     let running = lease.is_running();
-    let tail = if running {
-        Vec::new()
-    } else {
+    if !running {
         urls.clear();
         passphrase = None;
-        lease.startup_tail()
-    };
+    }
+    let (target, tail) = lease.into_target_and_tail(cancel);
     Ok(StartingObservation {
         running,
         urls,
         passphrase,
         log_offset,
         tail,
-        target: lease.into_target(),
+        target,
     })
 }
 
@@ -167,7 +170,7 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                     drop(lease);
                     return picker(cancel, Some(passphrase)).await;
                 }
-                dashboard(lease, Some(passphrase))
+                dashboard(lease, Some(passphrase), cancel)
             })
             .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
         Job::Passphrase => JobResult::Passphrase(load_or_generate_passphrase()),
@@ -235,8 +238,11 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
         } => runtime
             .block_on(async {
                 let lease = TuiObservationLease::prepare(Some(target), cancel).await?;
-                let observation =
-                    observe(lease, passphrase.is_none() && mode == ServeMode::Tunnel)?;
+                let observation = observe(
+                    lease,
+                    passphrase.is_none() && mode == ServeMode::Tunnel,
+                    cancel,
+                )?;
                 if !observation.running {
                     return Ok::<_, anyhow::Error>(JobResult::Starting(observation));
                 }
@@ -258,7 +264,7 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
         Job::ObserveStarting(target) => runtime
             .block_on(async {
                 let lease = TuiObservationLease::prepare(Some(target), cancel).await?;
-                observe(lease, true).map(JobResult::Starting)
+                observe(lease, true, cancel).map(JobResult::Starting)
             })
             .unwrap_or_else(|error| JobResult::Failed(error.to_string())),
         Job::ObserveActive => JobResult::ActiveLog(log_file_size()),

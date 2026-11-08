@@ -23,12 +23,6 @@ pub(super) fn read_app_file(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-pub(super) fn remove_app_file(name: &str) {
-    if let Some(path) = app_file(name) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 pub(super) fn current_passphrase() -> Option<String> {
     read_app_file(EPHEMERAL_PASSPHRASE_FILE)
 }
@@ -105,28 +99,6 @@ pub(super) fn default_transport(
     }
 }
 
-/// A blank-line-prefixed hint for a recognized errno in the daemon log, or `""`.
-pub(super) fn diagnose_daemon_exit(log: &str, mode: ServeMode) -> &'static str {
-    if log.contains("EADDRNOTAVAIL") || log.contains("Cannot assign requested address") {
-        return match mode {
-            ServeMode::Local => {
-                "\n\nHint: the interface we tried to bind on went away. \
-                 Is Tailscale still up?"
-            }
-            ServeMode::Tunnel => "",
-        };
-    }
-    if log.contains("EADDRINUSE") || log.contains("Address already in use") {
-        return "\n\nHint: the daemon couldn't bind the picked port. \
-                Reopen the dialog to try again with a fresh random port.";
-    }
-    if log.contains("Permission denied") {
-        return "\n\nHint: permission denied on bind. Are you trying a \
-                privileged port (<1024)? We normally pick a high port.";
-    }
-    ""
-}
-
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
     ServeMode::from_file_token(&read_app_file("serve.mode")?)
 }
@@ -186,7 +158,8 @@ pub(super) fn log_file_size() -> u64 {
 }
 
 /// Shared context with compacted lines, or `""` for an empty tail.
-pub(super) fn last_log_lines(tail: &[String]) -> String {
+pub(super) fn last_log_lines(context: &crate::acp::client::autostart::LogContext) -> String {
+    let tail = &context.lines;
     if tail.is_empty() {
         return String::new();
     }
@@ -194,10 +167,12 @@ pub(super) fn last_log_lines(tail: &[String]) -> String {
         .iter()
         .map(|line| compact_log_line(line))
         .collect();
-    format!(
-        "\n\nShared log context (other AoE processes may appear):\n{}",
-        compact.join("\n")
-    )
+    let label = if context.has_process_marker {
+        "Shared log context (other AoE processes may appear):"
+    } else {
+        "Unattributed shared log context (other or earlier runs may appear):"
+    };
+    format!("\n\n{label}\n{}", compact.join("\n"))
 }
 
 /// `2026-04-19T23:43:44Z  INFO agent_of_empires::server::tunnel: msg` becomes `INFO tunnel: msg`.
@@ -315,16 +290,6 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(compact_log_line(input), expected);
         }
-    }
-
-    #[test]
-    fn diagnose_daemon_exit_recognizes_common_errnos() {
-        let unavailable = "ERROR: bind: Cannot assign requested address";
-        assert!(diagnose_daemon_exit(unavailable, ServeMode::Local).contains("interface"));
-        assert_eq!(diagnose_daemon_exit(unavailable, ServeMode::Tunnel), "");
-        assert!(diagnose_daemon_exit("Address already in use", ServeMode::Local).contains("port"));
-        assert!(diagnose_daemon_exit("Permission denied", ServeMode::Tunnel).contains("permission"));
-        assert_eq!(diagnose_daemon_exit("unrelated", ServeMode::Local), "");
     }
 
     #[test]
