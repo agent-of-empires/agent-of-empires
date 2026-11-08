@@ -1305,7 +1305,6 @@ mod tests {
                     LaunchSidOutcome::Fresh {
                         pinned_prior_sid: None
                     },
-                    None,
                     &storage,
                     generation,
                     &probe,
