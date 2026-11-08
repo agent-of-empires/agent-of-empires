@@ -299,6 +299,27 @@ impl Instance {
         })();
         if let Err(error) = result {
             if error.is::<LaunchIndeterminateCause>() {
+                let released = storage.update(|rows, _| {
+                    Ok(rows
+                        .iter_mut()
+                        .find(|row| row.id == self.id)
+                        .is_some_and(|row| {
+                            row.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Launch,
+                                generation,
+                            )
+                        }))
+                });
+                match released {
+                    Ok(true) if self.lifecycle_generation == generation => {
+                        self.lifecycle_reservation = None;
+                    }
+                    Ok(_) => {}
+                    Err(release) => {
+                        tracing::warn!(target: "session.store", session = %self.id, %release,
+                            "indeterminate direct-start reservation release failed; runtime and handoff retained");
+                    }
+                }
                 return Err(error);
             }
             self.fail_reserved_launch(storage, generation, &error, false);
@@ -1423,6 +1444,161 @@ mod tests {
 
     #[cfg(unix)]
     use crate::session::instance::test_helpers::frozen_test_helper;
+
+    #[test]
+    #[serial_test::serial]
+    fn direct_start_refusal_releases_only_its_launch_and_allows_immediate_retry() {
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, wait_for_pane_dead, TmuxTestSession,
+        };
+        crate::tmux::test_helpers::require_tmux!();
+        for superseded in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(root.path());
+            let _env = crate::session::test_support::EnvGuard::unset(&[
+                "TMUX",
+                "TMUX_PANE",
+                "AOE_DAEMON_URL",
+            ])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true
+            })
+            .unwrap();
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+                config.session.agent_status_hooks = false;
+            })
+            .unwrap();
+            let mut instance =
+                Instance::new("direct-shared-refusal", root.path().to_str().unwrap());
+            instance.source_profile = "direct-shared-refusal".into();
+            instance.tool = "bash".into();
+            instance.command = "exec /bin/sleep 60".into();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let _pane = TmuxTestSession::from_name(&name);
+            assert!(crate::tmux::tmux_command()
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &name,
+                    "exec /bin/sleep 60"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            let corpse = only_pane_id(&name);
+            assert!(crate::tmux::tmux_command()
+                .args(["set-option", "-t", &name, "remain-on-exit", "on"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert!(crate::tmux::tmux_command()
+                .args(["respawn-pane", "-k", "-t", &corpse, "exit 17"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            wait_for_pane_dead(&corpse);
+            let split = crate::tmux::tmux_command()
+                .args([
+                    "split-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    &corpse,
+                    "exec /bin/sleep 60",
+                ])
+                .output()
+                .unwrap();
+            assert!(split.status.success());
+            let peer = std::str::from_utf8(&split.stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+            crate::tmux::test_helpers::wait_for_pane_command(&peer, "sleep");
+            let peer_pid = pane_field(&peer, "#{pane_pid}").parse().unwrap();
+            let peer_birth = crate::process::process_birth_identity(peer_pid)
+                .unwrap()
+                .unwrap();
+            let foreign = std::rc::Rc::new(std::cell::Cell::new(None));
+            let captured_foreign = foreign.clone();
+            let profile = instance.source_profile.clone();
+            let _boundary =
+                crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(move |_| {
+                    if superseded {
+                        let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
+                        let generation = storage
+                            .update(|rows, _| {
+                                let row = &mut rows[0];
+                                let generation = row.lifecycle_generation;
+                                assert!(row.release_lifecycle_reservation_if_owned(
+                                    LifecycleOperation::Launch,
+                                    generation
+                                ));
+                                Ok(row.try_acquire_lifecycle_reservation(
+                                    LifecycleOperation::Launch,
+                                    Instance::LIFECYCLE_RESERVATION_TTL,
+                                    chrono::Utc::now(),
+                                )?)
+                            })
+                            .unwrap();
+                        captured_foreign.set(Some(generation));
+                    }
+                });
+            let refusal = instance.start_with_size_opts(None, true).unwrap_err();
+            assert!(refusal.is::<LaunchIndeterminateCause>(), "{refusal:#}");
+            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
+            assert_eq!(pane_field(&corpse, "#{pane_dead}"), "1");
+            if superseded {
+                let generation = foreign
+                    .get()
+                    .expect("foreign launch must supersede this call");
+                let row = storage.load().unwrap().remove(0);
+                assert!(
+                    row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    "a refused old start must not release the foreign launch"
+                );
+                // The fixture owns this separate peer reservation and releases it before testing retry.
+                storage
+                    .update(|rows, _| {
+                        assert!(rows[0].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Launch,
+                            generation
+                        ));
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert!(crate::tmux::tmux_command()
+                .args(["kill-pane", "-t", &peer])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            let retry = instance.start_with_size_opts(None, true);
+            assert!(
+                retry.is_ok(),
+                "removing the split must permit immediate direct start: {retry:?}"
+            );
+            assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
+        }
+    }
 
     #[cfg(unix)]
     #[test]
