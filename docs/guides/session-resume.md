@@ -128,6 +128,8 @@ Same-ID observations, including binding qualification and OMP launch confirmatio
 
 An accepted OMP pin confirmation also converges the local launch intent, so the first subsequent capture can record a different conversation. An empty outgoing launch poller does not erase a compatible canonical poller installed during adoption.
 
+Reloads retain the compatible row's capture-repair pacing and managed-start retry deadline even when it has no poller handle. They use the existing tool-and-execution handoff guards, not the separate relaunch reset policy.
+
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
 
 AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.
