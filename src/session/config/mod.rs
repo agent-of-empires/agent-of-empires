@@ -942,9 +942,7 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_group_collapsed: Vec<String>,
 
-    /// Collapsed paths of the status-mode sidebar folders. Same shape and rationale
-    /// as `org_group_collapsed`: status headers are derived from each session's
-    /// execution status, so their collapse state has nowhere else to live.
+    /// Collapsed paths of the status-mode sidebar folders, alongside `org_group_collapsed`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status_group_collapsed: Vec<String>,
 

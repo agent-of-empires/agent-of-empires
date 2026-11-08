@@ -71,15 +71,41 @@ export function optimisticKey(workspaceId: string, sessionId: string | null): st
   return `${workspaceId}${KEY_SEP}${sessionId ?? ""}`;
 }
 
-/** The override a row may render: a pending action belongs only to the session it was issued for. */
-export function optimisticForRow(map: ReadonlyMap<string, OptimisticTriage>, workspace: Workspace): OptimisticTriage {
+/** A row's pending overrides: the aggregate it renders, plus each target session's own entry when several apply. */
+export interface RowOptimistic extends OptimisticTriage {
+  /** Keyed by target session id; absent while only one session of the row has a pending action. */
+  bySession?: ReadonlyMap<string, OptimisticTriage>;
+}
+
+/** The overrides a row may render: a pending action belongs only to the session it was issued for. */
+export function optimisticForRow(map: ReadonlyMap<string, OptimisticTriage>, workspace: Workspace): RowOptimistic {
   const untargeted = map.get(optimisticKey(workspace.id, null));
   if (untargeted) return untargeted;
+  const bySession = new Map<string, OptimisticTriage>();
   for (const session of workspace.sessions) {
     const override = map.get(optimisticKey(workspace.id, session.id));
-    if (override) return override;
+    if (override) bySession.set(session.id, override);
   }
-  return EMPTY_OPTIMISTIC;
+  if (bySession.size === 0) return EMPTY_OPTIMISTIC;
+  // Keep the stored entry as the row's identity while it is the only one pending.
+  if (bySession.size === 1) return bySession.values().next().value!;
+  return { ...mergeTriage([...bySession.values()]), bySession };
+}
+
+/** A row renders as one aggregate: a pending archive, pin or unread on any target shows on the combined row. */
+function mergeTriage(entries: readonly OptimisticTriage[]): OptimisticTriage {
+  const tri = (of: (e: OptimisticTriage) => boolean | null) =>
+    entries.some((e) => of(e) === true) ? true : entries.some((e) => of(e) === false) ? false : null;
+  return {
+    pinned: tri((e) => e.pinned),
+    archived: tri((e) => e.archived),
+    sessionId: null,
+    snoozedUntil:
+      entries.find((e) => e.snoozedUntil != null)?.snoozedUntil ??
+      entries.find((e) => e.snoozedUntil !== undefined)?.snoozedUntil ??
+      undefined,
+    unread: tri((e) => e.unread),
+  };
 }
 
 /** A boolean clears once it matches the server; a snooze clears when both are unsnoozed or the deadlines are close enough. */

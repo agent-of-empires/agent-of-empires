@@ -58,6 +58,21 @@ describe("bucketSelectionForBulk", () => {
     expect(buckets.archivable.map((w) => w.sessions[0]!.id)).toEqual(["b"]);
   });
 
+  it("buckets a recombined row by every pending action on it", () => {
+    const combined = ws("shared", { id: "a", status: "Idle", archived_at: null });
+    combined.sessions = [
+      { id: "a", status: "Idle", archived_at: null },
+      { id: "b", status: "Stopped", archived_at: null },
+    ] as SessionResponse[];
+    const overlay = new Map([
+      [optimisticKey("shared", "a"), withOverride(EMPTY_OPTIMISTIC, { unread: true, sessionId: "a" })],
+      [optimisticKey("shared", "b"), withOverride(EMPTY_OPTIMISTIC, { archived: true, sessionId: "b" })],
+    ]);
+    const buckets = bucketSelectionForBulk([combined], (workspace) => optimisticForRow(overlay, workspace));
+    expect(buckets.unarchivable.map((w) => w.id)).toEqual(["shared"]);
+    expect(buckets.archivable).toEqual([]);
+  });
+
   it("buckets each slice of one workspace by its own pending action", () => {
     const archivedSlice = ws("shared", { id: "a", archived_at: null });
     const liveSlice = ws("shared", { id: "b", unread: false });

@@ -51,6 +51,42 @@ describe("useSidebarTriage pending actions", () => {
     expect(result.current.optimisticFor(unreadSlice)).toMatchObject({ archived: null, unread: true, sessionId: "b" });
   });
 
+  it("keeps both pending actions when the slices recombine into one row", async () => {
+    const held = () => {
+      let resolve!: (value: SessionResponse) => void;
+      const promise = new Promise<SessionResponse>((r) => (resolve = r));
+      return { promise, resolve };
+    };
+    const archiveCall = held();
+    const unreadCall = held();
+    vi.mocked(setSessionArchive).mockReturnValue(archiveCall.promise);
+    vi.mocked(setSessionUnread).mockReturnValue(unreadCall.promise);
+    // A Repository/Org/Group axis shows the workspace as one row again.
+    const combined: Workspace = { ...archivedSlice, sessions: [...archivedSlice.sessions, ...unreadSlice.sessions] };
+    const { result, rerender } = renderHook(
+      ({ workspaces }: { workspaces: Workspace[] }) => useSidebarTriage(workspaces),
+      {
+        initialProps: { workspaces: slices },
+      },
+    );
+
+    act(() => {
+      result.current.archiveToggle(archivedSlice, true);
+      result.current.unreadToggle(unreadSlice, true);
+    });
+    rerender({ workspaces: [combined] });
+
+    const row = result.current.optimisticFor(combined);
+    expect(row).toMatchObject({ archived: true, unread: true });
+    expect(row.bySession?.get("a")?.archived).toBe(true);
+    expect(row.bySession?.get("b")?.unread).toBe(true);
+
+    await act(async () => {
+      archiveCall.resolve(accepted);
+      unreadCall.resolve(accepted);
+    });
+  });
+
   it("reverts a failed action without clearing the other session's pending action", async () => {
     vi.mocked(setSessionArchive).mockResolvedValue(null);
     const { result } = renderHook(() => useSidebarTriage(slices));

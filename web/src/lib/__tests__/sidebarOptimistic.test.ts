@@ -191,6 +191,23 @@ describe("reconcileOptimistic", () => {
   });
 });
 
+it("rolls every pending target of a recombined row into one aggregate and keeps each entry", () => {
+  const archiveKey = optimisticKey("w", "b");
+  const unreadKey = optimisticKey("w", "a");
+  const overlay = new Map([
+    [archiveKey, override({ archived: true, sessionId: "b" })],
+    [unreadKey, override({ unread: true, sessionId: "a" })],
+  ]);
+  const combined = ws("w", [
+    { id: "a", archived_at: null, unread: false },
+    { id: "b", status: "Stopped", archived_at: null },
+  ]);
+  const row = optimisticForRow(overlay, combined);
+  expect(row).toMatchObject({ archived: true, unread: true });
+  expect(row.bySession?.get("b")).toBe(overlay.get(archiveKey));
+  expect(row.bySession?.get("a")).toBe(overlay.get(unreadKey));
+});
+
 it("applies an override only to the rows that show its target session", () => {
   const key = optimisticKey("w", "a");
   const map = new Map([[key, override({ snoozedUntil: "2099-01-01T00:00:00Z", sessionId: "a" })]]);

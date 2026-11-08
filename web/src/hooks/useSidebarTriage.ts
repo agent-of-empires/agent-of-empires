@@ -9,6 +9,7 @@ import {
   reconcileOptimistic,
   withOverride,
   type OptimisticTriage,
+  type RowOptimistic,
 } from "../lib/sidebarOptimistic";
 import type { Workspace } from "../lib/types";
 
@@ -41,7 +42,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
   }, []);
 
   const optimisticFor = useCallback(
-    (workspace: Workspace): OptimisticTriage => optimisticForRow(overlay, workspace),
+    (workspace: Workspace): RowOptimistic => optimisticForRow(overlay, workspace),
     [overlay],
   );
 

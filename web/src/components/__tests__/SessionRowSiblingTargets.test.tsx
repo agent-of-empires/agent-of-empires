@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
-import { EMPTY_OPTIMISTIC } from "../../lib/sidebarOptimistic";
+import { EMPTY_OPTIMISTIC, optimisticForRow, optimisticKey, withOverride } from "../../lib/sidebarOptimistic";
 import { resolveActionTargets } from "../sidebar/sessionActionTargets";
 import { makeSession, makeWorkspace, openRowMenu, stubFetch } from "./fixtures";
 
@@ -59,6 +59,16 @@ describe("resolveActionTargets", () => {
     expect(ids(resolveActionTargets(stopped, pending(false, "b")).start)).toEqual(["a", "b"]);
     // Unarchiving a leaves b, still archived, without Start.
     expect(ids(resolveActionTargets(stopped, pending(false, "a")).start)).toEqual(["a"]);
+  });
+
+  it("keeps Start off the session with its own pending archive when the row recombines", () => {
+    const sessions = [sibling("a", { status: "Idle" }), sibling("b", { status: "Stopped" })];
+    const overlay = new Map([
+      [optimisticKey("w", "a"), withOverride(EMPTY_OPTIMISTIC, { unread: true, sessionId: "a" })],
+      [optimisticKey("w", "b"), withOverride(EMPTY_OPTIMISTIC, { archived: true, sessionId: "b" })],
+    ]);
+    const row = optimisticForRow(overlay, makeWorkspace("w", sessions));
+    expect(ids(resolveActionTargets(sessions, row).start)).toEqual([]);
   });
 });
 

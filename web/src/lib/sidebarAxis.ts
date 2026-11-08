@@ -7,7 +7,7 @@ import { safeGetItem, safeSetItem } from "./safeStorage";
  *  the nested `repo+group` axis that keeps repository headers and nests
  *  user groups inside each one, or the status axis backed by each session's
  *  execution status. Per-browser, like the sort mode. See
- *  #1234, #1720, #3283, #4867. */
+ *  #1234, #1720, #3283. */
 export type SidebarAxis = "repo" | "org" | "group" | "repo+group" | "status";
 
 export const SIDEBAR_AXIS_KEY = "aoe-sidebar-axis";

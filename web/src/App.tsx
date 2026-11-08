@@ -547,8 +547,8 @@ function AppContent({
     pluginSort,
     pluginAttention,
   );
-  // The status axis (#4867) buckets sessions by execution status instead of
-  // by where they live, so it owns its own grouping and collapse state.
+  // The status axis groups by execution status instead of by where a session
+  // lives, so it owns its own grouping and collapse state.
   const { groups: statusGroups, toggleGroupCollapsed: toggleStatusGroupCollapsed } = useStatusGroups(
     workspaces,
     sidebarSortMode,
@@ -578,7 +578,7 @@ function AppContent({
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group and status axes are
   // already in that shape. Collapse routing follows the active axis so each
-  // axis keeps independent collapse state. See #1234, #4867.
+  // axis keeps independent collapse state. See #1234.
   const sidebarGroups = useMemo(() => {
     if (sidebarAxis === "status") return statusGroups;
     if (sidebarAxis === "group") return sessionGroups;

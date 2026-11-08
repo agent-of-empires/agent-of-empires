@@ -1289,12 +1289,11 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        // Status buckets reshuffle while the dialog is open, so pin the set the
-        // count describes instead of recomputing it on confirm.
+        // Pin the set the count describes: status buckets reshuffle while the dialog is open.
         self.pending_archive_group_ids = Some(ids);
-        // Project/Org group by repo or owner, Manual by assigned path and Status by its
-        // bucket name, so name the scope and show the full path, or nested groups
-        // sharing a leaf segment would be ambiguous.
+        // Project/Org group by repo or owner and Manual by assigned path, so name the
+        // scope and show the full path, or nested groups sharing a leaf segment
+        // would be ambiguous.
         let (title, scope) = match self.group_by {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),

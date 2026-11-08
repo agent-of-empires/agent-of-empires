@@ -1,5 +1,5 @@
 import type { SessionResponse } from "../../lib/types";
-import { effectiveArchivedOf, type OptimisticTriage } from "../../lib/sidebarOptimistic";
+import { effectiveArchivedOf, type RowOptimistic } from "../../lib/sidebarOptimistic";
 
 /** Row menu actions that act on one session, so a row with several siblings must name which. */
 export type SessionAction =
@@ -36,10 +36,12 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
 export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
 
 /** The siblings each action may act on, in row order. */
-export function resolveActionTargets(sessions: SessionResponse[], optimistic: OptimisticTriage): SessionActionTargets {
-  // A pending archive applies to the one session it was issued for, not every sibling.
-  const archivedOf = (s: SessionResponse) =>
-    s.id === optimistic.sessionId ? effectiveArchivedOf(optimistic, !!s.archived_at) : !!s.archived_at;
+export function resolveActionTargets(sessions: SessionResponse[], optimistic: RowOptimistic): SessionActionTargets {
+  // A pending action applies to the one session it was issued for, not every sibling.
+  const archivedOf = (s: SessionResponse) => {
+    const entry = optimistic.bySession?.get(s.id) ?? (s.id === optimistic.sessionId ? optimistic : undefined);
+    return entry ? effectiveArchivedOf(entry, !!s.archived_at) : !!s.archived_at;
+  };
   const targets = (action: SessionAction) => sessions.filter((s) => ELIGIBLE[action](s, archivedOf(s)));
   return {
     stop: targets("stop"),
