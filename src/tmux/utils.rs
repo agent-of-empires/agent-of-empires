@@ -647,7 +647,10 @@ pub(crate) fn remove_owned_live_pane(
     remove_owned_pane(expected, false)
 }
 
-fn remove_owned_pane(expected: &crate::session::LegacyToolObservation, dead: bool) -> Result<()> {
+pub(crate) fn remove_owned_pane(
+    expected: &crate::session::LegacyToolObservation,
+    dead: bool,
+) -> Result<()> {
     let identity = &expected.identity;
     anyhow::ensure!(
         crate::process::process_birth_is_live(expected.server.pid, &expected.server.birth)?,
