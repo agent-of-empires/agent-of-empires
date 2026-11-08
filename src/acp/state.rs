@@ -808,8 +808,8 @@ pub enum Event {
         /// Client-minted id so a web client reconciles its optimistic row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
-        /// Ids of the other queued rows a drain folded into this one turn, so
-        /// a web client settles each of their optimistic rows.
+        /// Ids of the other queued rows folded into this turn (queue drain or
+        /// send-now), so a web client settles each of their optimistic rows.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         merged_prompt_ids: Vec<String>,
         /// True when the daemon queued this turn itself (a rate-limit resume

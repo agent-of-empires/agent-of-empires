@@ -415,7 +415,7 @@ export type AcpEvent =
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
-        /** Other queued rows a drain folded into this turn; each one's optimistic row is retired too. */
+        /** Other queued rows folded into this turn (queue drain or send-now); each one's optimistic row is retired too. */
         merged_prompt_ids?: string[];
       };
     }
