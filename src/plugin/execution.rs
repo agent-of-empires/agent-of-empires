@@ -101,6 +101,10 @@ impl Budget {
         let mut timed_out = false;
         let mut next_census = Instant::now() + Duration::from_secs(1);
         let status = loop {
+            #[cfg(test)]
+            if let Some(dir) = command.get_current_dir() {
+                super::fetch::test_gate::reach(dir, "command-observe");
+            }
             let expired = self.is_expired();
             if expired || Instant::now() >= next_census {
                 let observed = descendants
@@ -108,11 +112,19 @@ impl Budget {
                     .map_or(Ok(()), |tree| tree.refresh())
                     .and_then(|()| guard.executing());
                 if let Err(error) = observed {
-                    std::mem::forget((descendants, guard, child));
-                    return Err(RecoveryRequired(format!(
-                        "cannot observe command {pid}: {error:#}"
-                    ))
-                    .into());
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            timed_out = expired;
+                            break Some(status);
+                        }
+                        outcome => {
+                            std::mem::forget((descendants, guard, child));
+                            return Err(RecoveryRequired(format!(
+                                "cannot observe command {pid}: {error:#}; leader status: {outcome:?}"
+                            ))
+                            .into());
+                        }
+                    }
                 }
                 next_census = Instant::now() + Duration::from_secs(1);
             }
@@ -181,4 +193,94 @@ pub(super) fn needs_recovery<T>(result: &Result<T>) -> bool {
         .as_ref()
         .err()
         .is_some_and(|error| error.downcast_ref::<RecoveryRequired>().is_some())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn leader_exit_during_census_does_not_require_manual_recovery() {
+        static EXPIRED: AtomicBool = AtomicBool::new(false);
+        EXPIRED.store(false, Ordering::SeqCst);
+        struct ExpireOnDrop;
+        impl Drop for ExpireOnDrop {
+            fn drop(&mut self) {
+                EXPIRED.store(true, Ordering::SeqCst);
+            }
+        }
+        let _expire = ExpireOnDrop;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("leader-pid");
+        let release = dir.path().join("release-leader");
+        let mut observe = super::super::fetch::test_gate::install(dir.path(), "command-observe");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf %s $$ > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done",
+                "leader",
+            ])
+            .arg(&pid_file)
+            .arg(&release)
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let task = tokio::task::spawn_blocking(move || {
+            Budget::controlled_for_test(&EXPIRED).run(&mut command)
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut observe.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok())
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        let process = crate::process::CapturedProcess::capture(pid, &birth)
+            .unwrap()
+            .unwrap();
+        struct Cleanup(crate::process::CapturedProcessTree);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.settle(Duration::ZERO);
+            }
+        }
+        let _cleanup = Cleanup(crate::process::CapturedProcessTree::capture(pid).unwrap());
+        EXPIRED.store(true, Ordering::SeqCst);
+        std::fs::write(release, b"finish").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !process.exited().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            crate::process::process_birth_identity(pid)
+                .unwrap()
+                .is_some(),
+            "the command remains unreaped during the gated census"
+        );
+        observe.release();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error.downcast_ref::<Exhausted>().is_some(),
+            "a completed leader needs ordinary deadline settlement, not manual recovery: {error:#}"
+        );
+    }
 }
