@@ -45,6 +45,66 @@ const expect2xx = (res: Response) => {
   expect(res.status).toBeLessThan(300);
 };
 
+test("original Native partial tool output survives a correlated prompt failure until its real terminal", async ({
+  page,
+  spawnServe,
+}, testInfo) => {
+  const toolId = "original-native-open-tool";
+  const partial = "NATIVE_PARTIAL_TOOL_OUTPUT";
+  const final = "NATIVE_REAL_TERMINAL_OUTPUT";
+  const failure = "NATIVE_LOCAL_REQUEST_FAILURE";
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "native-partial-tool-custody",
+    fakeAcpScript: script(
+      {
+        updates: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: toolId,
+            title: "printf native-stream",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: { command: "printf native-stream" },
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: toolId,
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: partial } }],
+          },
+        ],
+        error: { code: -32603, message: failure },
+      },
+      endTurn({
+        sessionUpdate: "tool_call_update",
+        toolCallId: toolId,
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: final } }],
+      }),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId);
+  await postPrompt(serve.baseUrl, sessionId, "start the original tool");
+  await expect
+    .poll(async () => {
+      const frames = JSON.stringify(await replayFrames(serve.baseUrl, sessionId));
+      return frames.includes(failure) && frames.includes("prompt_failed");
+    })
+    .toBe(true);
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  const rows = (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?view=rows&since=0`).then(
+    (response) => response.json(),
+  )) as { rows: { kind: string; tool_call_id?: string }[] };
+  expect(rows.rows.filter((row) => row.tool_call_id === toolId).map((row) => row.kind)).toEqual(["tool_start"]);
+  await page.reload();
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("native-partial-after-local-failure.png"), fullPage: true });
+  await postPrompt(serve.baseUrl, sessionId, "finish the same original tool explicitly");
+  await expect(page.getByText(final, { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(partial, { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("native-real-tool-terminal.png"), fullPage: true });
+});
+
 test("structured view prompt carries an image attachment end to end", async ({ spawnServe }) => {
   // #1000, #965
   const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-attach", fakeAcpScript: IMAGE_CAPABLE });
