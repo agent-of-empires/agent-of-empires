@@ -154,6 +154,8 @@ struct Construction {
     /// Wall-clock ms of admission, refreshed on install so a slow start
     /// does not read as idle; atomic only so tests can backdate it.
     idle_baseline_ms: std::sync::atomic::AtomicI64,
+    /// Prompts admitted to this epoch; an idle stop observed before one is void.
+    admissions: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Construction {
@@ -177,6 +179,7 @@ impl Default for Construction {
             idle_baseline_ms: std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp_millis(),
             ),
+            admissions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -211,6 +214,12 @@ impl Lease {
         self.construction
             .idle_baseline_ms
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn admissions(&self) -> u64 {
+        self.construction
+            .admissions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1418,6 +1427,22 @@ impl LifecycleTable {
         match entry.phase {
             Phase::Running { identity } => Some((self.lease(session_id, entry.epoch), identity)),
             _ => None,
+        }
+    }
+
+    /// Count a prompt against the running epoch and restart its idle clock,
+    /// since the prompt is not stored yet. Under the table lock so an idle
+    /// stop's check cannot interleave with it.
+    pub(crate) fn note_admission(&self, session_id: &str) {
+        if let Some((lease, _)) = self.running(session_id) {
+            lease.construction.idle_baseline_ms.fetch_max(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            lease
+                .construction
+                .admissions
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
