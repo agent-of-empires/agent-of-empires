@@ -453,6 +453,8 @@ mod tests {
         }
 
         let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
+        inst.tool = "bash".into();
+        inst.command = "sleep 60".into();
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
@@ -476,6 +478,8 @@ mod tests {
             return;
         }
         crate::tmux::refresh_session_cache();
+        let pane = crate::tmux::test_helpers::only_pane_id(&tmux_name);
+        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
 
         inst.status = Status::Running;
         let prev_start = inst.last_start_time;
@@ -485,6 +489,7 @@ mod tests {
         assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&tmux_name), pane);
 
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
