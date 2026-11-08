@@ -89,7 +89,7 @@ impl NativeSessionStore {
     }
 
     fn check_source(&self) -> Result<()> {
-        ensure_healthy(&self.state)?;
+        self.check_physical_source()?;
         if let Some((id, _, _, _)) = &self.launch_identity {
             let rows = self.state.instances.blocking_read();
             self.validate_launch_identity(&rows)?;
@@ -99,6 +99,11 @@ impl NativeSessionStore {
                 crate::session::LifecycleReservationError::Superseded
             );
         }
+        Ok(())
+    }
+
+    fn check_physical_source(&self) -> Result<()> {
+        ensure_healthy(&self.state)?;
         self.storage.verify_bound_profile().map_err(|error| {
             let publication = self.state.publication.blocking_write();
             mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
@@ -368,12 +373,17 @@ impl NativeSessionStore {
         })
     }
 
-    fn commit_with_status(
+    fn commit_canonical(
         &self,
         mutation: &mut SessionMutation<'_>,
         status: super::reload::StatusCommit,
+        validate_launch: bool,
     ) -> Result<()> {
-        self.check_source()?;
+        if validate_launch {
+            self.check_source()?;
+        } else {
+            self.check_physical_source()?;
+        }
         let reload = self
             .runtime
             .block_on(self.state.session_service.disk_reload_guard());
@@ -389,7 +399,12 @@ impl NativeSessionStore {
         };
         let mut rejected = false;
         let result = transition.update_with_snapshot(&self.storage, |rows, groups| {
-            self.validate_launch_identity(rows)
+            let admissible = if validate_launch {
+                self.validate_launch_identity(rows)
+            } else {
+                Ok(())
+            };
+            admissible
                 .and_then(|()| mutation(rows, groups))
                 .inspect_err(|_| rejected = true)
         });
@@ -582,13 +597,23 @@ impl SessionStore for NativeSessionStore {
     }
 
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        self.commit_with_status(mutation, super::reload::StatusCommit::Lifecycle)
+        self.commit_canonical(mutation, super::reload::StatusCommit::Lifecycle, true)
     }
 
     fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        self.commit_with_status(mutation, super::reload::StatusCommit::LaunchReady)
+        self.commit_canonical(mutation, super::reload::StatusCommit::LaunchReady, true)
     }
 
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        // Metadata uses the original bound handles, never a profile-name reopen.
+        // Do not wait on namespace exclusion while the caller holds its native fence.
+        let _namespace = self
+            .state
+            .profile_namespace
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("native metadata namespace is busy"))?;
+        self.commit_canonical(mutation, super::reload::StatusCommit::Lifecycle, false)
+    }
     fn migrate_sandbox_store(
         &self,
         id: &str,
@@ -941,6 +966,7 @@ mod tests {
                     state
                         .acp_events_tx
                         .send(AcpBroadcastFrame {
+                            native_subject: None,
                             session_id: id.clone(),
                             seq: 1,
                             event: Arc::new(Event::PromptCapabilities {
@@ -1047,6 +1073,7 @@ mod tests {
                         seq: 1,
                         event: Arc::new(event),
                         worker_generation: None,
+                        native_subject: None,
                         sidebar_status: None,
                     })
                     .unwrap();
@@ -1095,6 +1122,7 @@ mod tests {
                         seq: 2,
                         event: Arc::new(event),
                         worker_generation: None,
+                        native_subject: None,
                         sidebar_status,
                     })
                     .unwrap();
@@ -1142,6 +1170,80 @@ mod tests {
             assert_eq!(persisted[0].lifecycle_generation, 8);
             assert_eq!(persisted[0].status, Status::Stopped);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_metadata_checkpoint_ignores_only_launch_title_admission() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut original = Instance::new("original title", "/tmp");
+        original.source_profile = "default".into();
+        original.view = crate::session::View::Structured;
+        original.fork_pending = Some("original-parent".into());
+        original.import_pending = Some(true);
+        let id = original.id.clone();
+        let storage = Storage::new_unwatched("default")?;
+        storage.update(|rows, _| {
+            *rows = vec![original.clone()];
+            Ok(())
+        })?;
+        let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (launch, ()) =
+            NativeSessionStore::open_for_launch(state.clone(), &original, ()).await?;
+        let state_for_commit = state.clone();
+        let checkpoint_id = id.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let context =
+                crate::acp::state::NativeEventContext::capture(&original, launch.storage())?;
+            let selection = original.conversation_state();
+            let canonical = NativeSessionStore::open(state_for_commit, "default", None)?;
+            canonical.commit(&mut |rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == checkpoint_id)
+                    .unwrap()
+                    .title = "renamed while fork pending".into();
+                Ok(())
+            })?;
+            assert!(
+                launch.commit(&mut |_, _| Ok(())).is_err(),
+                "launch admission must remain title-fenced"
+            );
+            launch.commit_metadata_checkpoint(&mut |rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == checkpoint_id).unwrap();
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(row, launch.storage())?
+                        == context
+                        && selection.matches_checkpoint(row)
+                        && row.acp_session_id == original.acp_session_id
+                        && row.fork_pending == original.fork_pending
+                        && row.import_pending == original.import_pending
+                );
+                row.fork_pending = None;
+                row.import_pending = None;
+                Ok(())
+            })?;
+            assert!(
+                launch.load().is_err(),
+                "metadata checkpoint must not relax later launch reads"
+            );
+            let rows = launch.storage().load()?;
+            let row = rows.iter().find(|row| row.id == checkpoint_id).unwrap();
+            assert_eq!(row.title, "renamed while fork pending");
+            assert_eq!(row.acp_session_id, original.acp_session_id);
+            assert!(row.fork_pending.is_none() && row.import_pending.is_none());
+            Ok(())
+        })
+        .await??;
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.title, "renamed while fork pending");
+        assert!(
+            row.acp_session_id.is_none()
+                && row.fork_pending.is_none()
+                && row.import_pending.is_none()
+        );
+        Ok(())
     }
 
     #[test]

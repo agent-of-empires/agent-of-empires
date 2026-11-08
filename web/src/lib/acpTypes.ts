@@ -304,6 +304,23 @@ export interface OperationErrorEvidence {
 }
 
 // One variant per Event::* in src/acp/state.rs, externally tagged.
+export interface AcpConnectionUnavailability {
+  source: "sdk" | "control" | "native" | "runner_record";
+  cause:
+    | "incoming_ended"
+    | "read_failed"
+    | "write_failed"
+    | "protocol_ended"
+    | "dispatch_failed"
+    | "forward_pump_ended"
+    | "stdout_eof"
+    | "control_protocol_unknown"
+    | "control_protocol_incompatible"
+    | "ownership_unconfirmed";
+  /** This daemon's local phase, not durable native establishment. */
+  phase: "initializing" | "establishing" | "established";
+}
+
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
   | {
@@ -447,7 +464,7 @@ export type AcpEvent =
         steering?: boolean;
       };
     }
-  | { AcpSessionAssigned: { acp_session_id: string } }
+  | { AcpSessionAssigned: Record<string, unknown> }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
@@ -462,6 +479,8 @@ export type AcpEvent =
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
+  | { AcpConnectionUnavailable: AcpConnectionUnavailability }
+  | { AcpSessionAssigned: { acp_session_id: string; connection_ready?: boolean | null } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
 export interface PromptAttachmentRefWire {
@@ -541,6 +560,11 @@ export interface ReducedState {
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
   operation_error?: OperationErrorEvidence | null;
+  connection_unavailable?: AcpConnectionUnavailability | null;
+  connection_ready?: boolean | null;
+  /** Existing current WorkerDown queue/wake eligibility, not native health. */
+  prompt_wake_eligible?: boolean | null;
+  last_seq?: number;
   /** The session's workflow runs; omitted when there are none. */
   workflow_runs?: {
     task_id: string;
@@ -580,11 +604,11 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
-  /** `session/new` or `session/load` answered, so the Agent's session exists. */
+  /** A current input receipt was observed for this connection. */
   sessionAssigned: boolean;
   /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
   restartInFlight: boolean;
-  /** Counts restarts ended by assignment, startup error or another stop, so a late acknowledgement is ignored. */
+  /** Counts restarts ended by a current receipt, startup error or another stop. */
   restartEpoch: number;
   /** A restart stopped the sent prompt and it hasn't been sent again. Kept here because the restart's stop
    *  unmounts the startup line before the restart answers. Not persisted. */
@@ -599,11 +623,20 @@ export interface AcpState {
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
   lastErrorEvidence: OperationErrorEvidence | null;
+  connectionUnavailable: AcpConnectionUnavailability | null;
+  /** Historical diagnostic, never permission to control a native runtime. */
+  connectionUnavailableNotice: AcpConnectionUnavailability | null;
+  connectionReady: boolean;
+  /** Only a live daemon snapshot supplies current control authority, even at seq 0. */
+  nativeSnapshotSeq: number | null;
+  promptWakeEligible: boolean;
   interactionError: InteractionError | null;
   /** Derived from `serverTurnActive || inflightPromptIds.length > 0`; never written directly. */
   turnActive: boolean;
   /** The daemon's `turn_active`; only it knows whether a mid-turn prompt was steered into the running turn. */
   serverTurnActive: boolean;
+  /** Turn context at the raw cursor, not the current daemon projection. Missing in old caches. */
+  replayTurnActive?: boolean;
   /** Prompt ids POSTed but not yet echoed or failed; covers the POST-to-echo gap. */
   inflightPromptIds: string[];
   /** Monotonic prompt count; an echo of this client's own optimistic prompt counts once. */
@@ -669,6 +702,8 @@ export interface AcpState {
   backgroundTasks: string[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
+  /** Runs explicitly covered by the latest current daemon snapshot. */
+  workflowSnapshotKeys?: string[];
   /** Agent-pushed advisories for the current turn, oldest first. */
   sessionNotices: SessionNotice[];
   /** Ids dismissed in this tab. Local, so it never clears another client. */
@@ -948,7 +983,6 @@ export function emptyAcpState(): AcpState {
     interactionError: null,
     turnActive: false,
     serverTurnActive: false,
-    inflightPromptIds: [],
     promptSeq: 0,
     availableModes: [],
     currentModeId: null,
@@ -980,12 +1014,62 @@ export function emptyAcpState(): AcpState {
     pendingConfigOption: null,
     sessionNotices: [],
     dismissedNoticeIds: [],
+    connectionUnavailable: null,
+    connectionUnavailableNotice: null,
+    connectionReady: false,
+    nativeSnapshotSeq: null,
+    promptWakeEligible: false,
+    replayTurnActive: false,
+    inflightPromptIds: [],
+    workflowSnapshotKeys: [],
   };
 }
 
-/** A prompt steered into the running turn must not run {@link applyNewTurnResets}. Reads `serverTurnActive`, since `turnActive` is also true for this client's own unechoed prompt. */
-function isSteeredContinuation(state: AcpState): boolean {
-  return state.serverTurnActive && !!state.promptCapabilities?.steering;
+export function nativeInputAvailable(
+  state: Pick<AcpState, "connectionReady" | "nativeSnapshotSeq" | "connectionUnavailable">,
+): boolean {
+  return (
+    state.nativeSnapshotSeq != null &&
+    Number.isFinite(state.nativeSnapshotSeq) &&
+    state.connectionReady &&
+    state.connectionUnavailable === null
+  );
+}
+
+/** Managed wake/queue intents retain the existing governor. Generic Unknown
+ *  grants neither a native write nor implicit wake permission. */
+export function canSubmitPromptIntent(
+  state: Pick<AcpState, "connectionReady" | "nativeSnapshotSeq" | "connectionUnavailable" | "promptWakeEligible">,
+): boolean {
+  return (
+    state.nativeSnapshotSeq != null &&
+    Number.isFinite(state.nativeSnapshotSeq) &&
+    state.connectionUnavailable === null &&
+    (nativeInputAvailable(state) || state.promptWakeEligible)
+  );
+}
+/** A cache or a new socket dial is historical data, not a current native receipt. */
+export function revokeNativeAuthority(state: AcpState): AcpState {
+  if (
+    !state.connectionReady &&
+    !state.promptWakeEligible &&
+    state.nativeSnapshotSeq == null &&
+    state.connectionUnavailable === null
+  )
+    return state;
+  return {
+    ...state,
+    connectionReady: false,
+    nativeSnapshotSeq: null,
+    promptWakeEligible: false,
+    connectionUnavailableNotice: state.connectionUnavailable ?? state.connectionUnavailableNotice,
+    connectionUnavailable: null,
+  };
+}
+
+/** Classify a raw prompt using its preceding raw turn, not a newer snapshot. */
+function isSteeredContinuation(state: AcpState, precedingTurnActive: boolean): boolean {
+  return precedingTurnActive && !!state.promptCapabilities?.steering;
 }
 
 function applyNewTurnResets(next: AcpState): void {
@@ -1026,11 +1110,103 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if (frame.seq <= state.lastSeq) {
     return state;
   }
-  const next = { ...state, lastSeq: frame.seq };
+  const covered = state.nativeSnapshotSeq != null && frame.seq <= state.nativeSnapshotSeq;
+  const rawTurnActive = covered ? (state.replayTurnActive ?? state.serverTurnActive) : state.serverTurnActive;
+  let rawState = state;
+  let protectedRuns: Record<string, WorkflowRun> | undefined;
+  if (
+    covered &&
+    typeof frame.event === "object" &&
+    ("BackgroundTaskStarted" in frame.event || "BackgroundTaskFinished" in frame.event)
+  ) {
+    const current = new Set(state.workflowSnapshotKeys ?? []);
+    const entries = Object.entries(state.workflowRuns);
+    const protectedEntries = entries.filter(([key, run]) => current.has(key) || run.finished);
+    const protectedKeys = new Set(protectedEntries.map(([key]) => key));
+    protectedRuns = Object.fromEntries(protectedEntries);
+    rawState = {
+      ...state,
+      workflowRuns: Object.fromEntries(entries.filter(([key]) => !protectedKeys.has(key))),
+    };
+  }
+  const next = applyRawEvent(rawState, frame, rawTurnActive, covered);
+  if (protectedRuns) next.workflowRuns = { ...next.workflowRuns, ...protectedRuns };
+  next.replayTurnActive =
+    typeof frame.event === "object" &&
+    "AcpConnectionUnavailable" in frame.event &&
+    frame.event.AcpConnectionUnavailable.source !== "runner_record"
+      ? false
+      : next.serverTurnActive;
+  if (!covered) return next;
+
+  // A header can arrive before its raw catch-up. Replay still owns fields absent
+  // from ReducedState: config/results, usage/cost, capabilities, diagnostics,
+  // cap/park bookkeeping, wake/monitor/primer state and background-agent history.
+  // Only the daemon-folded control projection wins over covered raw effects.
+  next.agent = state.agent;
+  next.model = state.model;
+  next.mode = state.mode;
+  next.plan = state.plan;
+  next.inFlightTool = state.inFlightTool;
+  next.pendingApprovals = state.pendingApprovals;
+  next.pendingElicitations = state.pendingElicitations;
+  next.locallyResolved = state.locallyResolved;
+  next.thinking = state.thinking;
+  next.rateLimit = state.rateLimit;
+  next.availableCommands = state.availableCommands;
+  next.availableModes = state.availableModes;
+  next.currentModeId = state.currentModeId;
+  next.authStatus = state.authStatus;
+  next.lastErrorEvidence = state.lastErrorEvidence;
+  next.connectionReady = state.connectionReady;
+  next.connectionUnavailable = state.connectionUnavailable;
+  next.connectionUnavailableNotice = state.connectionUnavailable ?? next.connectionUnavailableNotice;
+  next.nativeSnapshotSeq = state.nativeSnapshotSeq;
+  next.promptWakeEligible = state.promptWakeEligible;
+  next.serverTurnActive = state.serverTurnActive;
+  next.cancelling = state.cancelling;
+  next.compacting = state.compacting;
+  next.sessionNotices = state.sessionNotices;
+  next.backgroundTasks = state.backgroundTasks;
+  // A stale stop cannot settle a newer local POST. Only its own unique echo can.
+  const event = frame.event;
+  const acknowledgedId = typeof event === "object" && "UserPromptSent" in event ? event.UserPromptSent.prompt_id : null;
+  const acknowledgesOwnPrompt = !!acknowledgedId && state.inflightPromptIds.includes(acknowledgedId);
+  next.inflightPromptIds = acknowledgesOwnPrompt
+    ? state.inflightPromptIds.filter((id) => id !== acknowledgedId)
+    : state.inflightPromptIds;
+  next.turnActive = acknowledgesOwnPrompt ? deriveTurnActive(next) : state.turnActive;
+  const callbackResolution =
+    typeof event === "object" && ("ApprovalResolved" in event || "ElicitationResolved" in event);
+  // Raw callback resolutions settle only their unique matching nonce; unlike a
+  // historical turn reset, that acknowledgement may clear its transient error.
+  if (!acknowledgesOwnPrompt && !callbackResolution) next.interactionError = state.interactionError;
+  // Positive current readiness heals old worker/compatibility chrome. Qualified
+  // loss likewise cannot be rewritten as process death by a prior owner's stop.
+  if (nativeInputAvailable(state) || state.connectionUnavailable) {
+    next.workerStopped = state.workerStopped;
+    next.workerRestarting = state.workerRestarting;
+    next.workerIdleStopped = state.workerIdleStopped;
+    next.agentUnresponsive = state.agentUnresponsive;
+    next.agentOrphaned = state.agentOrphaned;
+    next.incompatibleAgent = state.incompatibleAgent;
+  }
+  return next;
+}
+
+/** Raw history effects; callers fence snapshot-owned fields after folding. */
+function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean, covered: boolean): AcpState {
+  const next = {
+    ...state,
+    lastSeq: frame.seq,
+    serverTurnActive: rawTurnActive,
+    // A current loss cannot change whether an older raw prompt began a turn.
+    connectionUnavailable: covered ? null : state.connectionUnavailable,
+  };
   const event = frame.event;
   if (typeof event === "string") {
     // The agent reports lifetime cost, so each context boundary snapshots a baseline.
-    if (event === "ThinkingStarted") {
+    if (event === "ThinkingStarted" && !next.connectionUnavailable) {
       // Agent-initiated work still opens a turn, mirroring `AcpState::apply_event`.
       next.serverTurnActive = true;
       next.turnActive = true;
@@ -1215,6 +1391,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     closeTurn(next);
     return next;
   }
+  if ("AcpConnectionUnavailable" in event) {
+    next.connectionUnavailableNotice = event.AcpConnectionUnavailable;
+    next.connectionReady = false;
+    next.promptWakeEligible = false;
+    return next;
+  }
   if ("ApprovalResolved" in event || "ElicitationResolved" in event) {
     const kind = "ApprovalResolved" in event ? "approval" : "elicitation";
     const nonce = "ApprovalResolved" in event ? event.ApprovalResolved.nonce : event.ElicitationResolved.nonce;
@@ -1243,34 +1425,25 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     } else {
       next.promptSeq += 1;
     }
-    next.serverTurnActive = true;
-    next.turnActive = true;
-    if (!isSteeredContinuation(state)) {
+    next.serverTurnActive = !next.connectionUnavailable;
+    next.turnActive = deriveTurnActive(next);
+    if (!isSteeredContinuation(state, rawTurnActive)) {
       applyNewTurnResets(next);
     }
     return next;
   }
   if ("UserDiffCommentsPrompt" in event) {
     next.promptSeq += 1;
-    next.serverTurnActive = true;
-    next.turnActive = true;
-    if (!isSteeredContinuation(state)) {
+    next.serverTurnActive = !next.connectionUnavailable;
+    next.turnActive = deriveTurnActive(next);
+    if (!isSteeredContinuation(state, rawTurnActive)) {
       applyNewTurnResets(next);
     }
     return next;
   }
   if ("AcpSessionAssigned" in event) {
-    next.sessionAssigned = true;
-    endRestart(next);
-    next.startupError = null;
-    next.incompatibleAgent = null;
-    next.workerStopped = false;
-    next.workerRestarting = false;
-    next.workerIdleStopped = false;
-    next.agentUnresponsive = false;
-    next.agentOrphaned = false;
-    next.rateLimit = null;
-    next.rateLimitParked = false;
+    // Session ids and replayed availability are history. Only a current daemon
+    // projection may restore native controls or physical-worker chrome.
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
@@ -1451,7 +1624,17 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
 }
 
 /** Adopt the daemon's folded control state. Leaves `lastSeq` to the raw frames that dedupe replays. */
-export function applyReducedState(state: AcpState, reduced: ReducedState, unchanged: string[] = []): AcpState {
+export function applyReducedState(
+  state: AcpState,
+  reduced: ReducedState,
+  unchanged: string[] = [],
+  snapshotSeq?: number,
+): AcpState {
+  const authoritative = snapshotSeq != null && Number.isFinite(snapshotSeq) && snapshotSeq >= 0;
+  if (authoritative && snapshotSeq < Math.max(state.lastSeq, state.nativeSnapshotSeq ?? 0)) return state;
+  if (!authoritative && state.nativeSnapshotSeq != null) return state;
+  const connectionUnavailable = authoritative ? (reduced.connection_unavailable ?? null) : null;
+  const connectionReady = authoritative && reduced.connection_ready === true && connectionUnavailable === null;
   // Omitted cold fields arrive as empty defaults; adopting them would blank the pickers.
   const holds = (field: string) => unchanged.includes(field);
   const stillPending = new Set<string>([
@@ -1460,8 +1643,9 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
   ]);
   const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
   const resolved = new Set(locallyResolved);
-  return {
+  const next: AcpState = {
     ...state,
+    replayTurnActive: state.replayTurnActive ?? state.serverTurnActive,
     agent: reduced.agent,
     model: reduced.model,
     mode: reduced.mode,
@@ -1472,6 +1656,11 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     thinking: reduced.thinking != null,
     rateLimit: reduced.rate_limit,
     lastErrorEvidence: reduced.operation_error ?? null,
+    connectionUnavailable,
+    connectionUnavailableNotice: connectionUnavailable ?? state.connectionUnavailableNotice,
+    connectionReady,
+    nativeSnapshotSeq: authoritative ? snapshotSeq : null,
+    promptWakeEligible: authoritative && reduced.prompt_wake_eligible === true && connectionUnavailable === null,
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
@@ -1481,6 +1670,7 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     turnActive: deriveTurnActive({
       serverTurnActive: reduced.turn_active,
       inflightPromptIds: state.inflightPromptIds,
+      connectionUnavailable,
     }),
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,
@@ -1491,8 +1681,21 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
+    workflowSnapshotKeys: reduced.workflow_runs?.map((run) => run.tool_call_id) ?? [],
     locallyResolved,
   };
+  if (connectionReady) {
+    next.sessionAssigned = true;
+    endRestart(next);
+    next.workerStopped = false;
+    next.workerRestarting = false;
+    next.workerIdleStopped = false;
+    next.agentUnresponsive = false;
+    next.agentOrphaned = false;
+    next.incompatibleAgent = null;
+  }
+  if (next.connectionUnavailable) closeUnavailableConnection(next);
+  return next;
 }
 
 /** The replay window can miss a run's launch or finish. Adopts runs it
@@ -1585,7 +1788,14 @@ export function appendElicitationAnswerRow(
 }
 
 /** Mid-turn steering can complete several prompts with one event, so prompt counters cannot derive this. */
-export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds">): boolean {
+export function deriveTurnActive(
+  state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds"> & Partial<Pick<AcpState, "connectionUnavailable">>,
+): boolean {
+  if (state.connectionUnavailable) {
+    // Refused management does not finish observed native work. Optimistic
+    // local intent alone still cannot establish a turn under that refusal.
+    return state.connectionUnavailable.source === "runner_record" && state.serverTurnActive;
+  }
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
@@ -1607,6 +1817,29 @@ export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAg
 function closeTurn(next: AcpState): void {
   next.serverTurnActive = false;
   next.turnActive = deriveTurnActive(next);
+}
+
+function closeUnavailableConnection(next: AcpState): void {
+  // A refused management attachment grants no controls, but does not prove
+  // that the retained native turn, tool or callbacks ended.
+  if (next.connectionUnavailable?.source === "runner_record") return;
+  next.serverTurnActive = false;
+  next.turnActive = false;
+  next.thinking = false;
+  next.cancelling = false;
+  next.cancelEscalatesAt = null;
+  next.compacting = false;
+  next.inFlightTool = null;
+  next.pendingApprovals = [];
+  next.pendingElicitations = [];
+  next.locallyResolved = [];
+  next.pendingConfigOption = null;
+  next.interactionError = null;
+  if (next.monitorArmed && next.monitorWorkSeen) {
+    next.monitorArmed = false;
+    next.monitorWorkSeen = false;
+    next.monitorDescription = null;
+  }
 }
 
 /** Whether to show the compaction reminder. Needs an advertised `compact` command and a reported window; `used > size` counts as due. */
@@ -1640,6 +1873,11 @@ export function normaliseTurnState(
     compactionReminderDismissed?: SessionUsage | null;
     sessionNotices?: SessionNotice[];
     dismissedNoticeIds?: string[];
+    connectionUnavailable?: AcpConnectionUnavailability | null;
+    connectionUnavailableNotice?: AcpConnectionUnavailability | null;
+    connectionReady?: boolean;
+    nativeSnapshotSeq?: number | null;
+    promptWakeEligible?: boolean;
   },
 ): AcpState {
   const serverTurnActive =
@@ -1667,9 +1905,14 @@ export function normaliseTurnState(
     typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
       ? Math.max(0, Math.floor(state.oldestSeq))
       : 0;
-  return {
+  const next: AcpState = {
     ...state,
     oldestSeq,
+    connectionUnavailable: state.connectionUnavailable ?? null,
+    connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
+    connectionReady: state.connectionReady === true,
+    nativeSnapshotSeq: typeof state.nativeSnapshotSeq === "number" ? state.nativeSnapshotSeq : null,
+    promptWakeEligible: state.promptWakeEligible === true,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,
@@ -1685,4 +1928,6 @@ export function normaliseTurnState(
     inflightPromptIds: [],
     turnActive: serverTurnActive,
   };
+  if (next.connectionUnavailable) closeUnavailableConnection(next);
+  return next;
 }

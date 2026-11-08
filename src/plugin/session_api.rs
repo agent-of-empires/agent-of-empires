@@ -663,6 +663,14 @@ async fn sessions_turn_send(
             .admit_prompt_submission(&caller, &req.session_id)
             .await
             .map_err(|e| map_send_error(e.into()))?;
+        if let Some(unavailability) = deps.session_service
+            .prompt_native_unavailability(&req.session_id).await
+        {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ));
+        }
 
         // A target not currently counted (archived, snoozed, or not in one of the counted
         // statuses) re-occupies a slot the instant it becomes counted. Mark it pending here,
@@ -713,6 +721,15 @@ async fn sessions_turn_send(
             .await
         {
             PromptTouch::Touched { idle_dormant } => idle_dormant,
+            PromptTouch::Unavailable(unavailability) => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+                ));
+            }
             PromptTouch::WorkerNotReady | PromptTouch::RevivalRefused => {
                 if marked_pending {
                     clear_revival_pending(&deps.session_service, &req.session_id).await;
@@ -734,6 +751,15 @@ async fn sessions_turn_send(
             .session_service
             .prompt_dispatch_under_submission(&req.session_id, &req.text, woke_idle_dormant, false)
             .await;
+        if let crate::acp::dispatch::PromptDispatch::Unavailable { unavailability } = dispatch {
+            if marked_pending {
+                clear_revival_pending(&deps.session_service, &req.session_id).await;
+            }
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION, "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ));
+        }
         // A cold worker is not a refusal on this path: `send_turn` resumes it
         // and waits, which is how a scheduler wakes a session it created. The
         // turn gates are, because a second prompt at a busy non-steerable
@@ -927,6 +953,13 @@ async fn deliver_structured(
         .map_err(|e| map_send_error(e.into()))?;
     let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "native_channel_unavailable",
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+            ))
+        }
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
@@ -935,6 +968,13 @@ async fn deliver_structured(
     let dispatch = service
         .prompt_dispatch_under_submission(id, &req.message, woke_idle_dormant, false)
         .await;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "native_channel_unavailable",
+            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+        ));
+    }
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
@@ -1057,6 +1097,12 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
                 "worker not ready; retry",
             )
         }
+        SendTurnError::Unavailable(unavailability)
+        | SendTurnError::UnavailableAfterPublish(unavailability) => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "native_channel_unavailable",
+            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
+        ),
         // Unreachable: this plugin surface never sets `no_revive`.
         SendTurnError::RevivalRefused => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,

@@ -342,6 +342,399 @@ pub enum StartupErrorDetail {
     },
 }
 
+/// This daemon's local setup/initialize, assignment, and established-command phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpConnectionPhase {
+    Initializing,
+    Establishing,
+    Established,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpConnectionSource {
+    Sdk,
+    Control,
+    Native,
+    RunnerRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpConnectionCause {
+    IncomingEnded,
+    ReadFailed,
+    WriteFailed,
+    ProtocolEnded,
+    DispatchFailed,
+    ForwardPumpEnded,
+    StdoutEof,
+    ControlProtocolUnknown,
+    ControlProtocolIncompatible,
+    OwnershipUnconfirmed,
+}
+
+/// Why this daemon cannot use the connection; no process-death or recovery authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpConnectionUnavailability {
+    pub source: AcpConnectionSource,
+    pub cause: AcpConnectionCause,
+    pub phase: AcpConnectionPhase,
+}
+
+impl AcpConnectionSource {
+    /// Semantics of an already-qualified observation, not proof of process
+    /// death: refused management attachment does not end retained native work.
+    pub(crate) fn is_channel_loss(self) -> bool {
+        matches!(self, Self::Sdk | Self::Control | Self::Native)
+    }
+}
+
+/// Optional receipt metadata: missing and null both mean no affirmative receipt.
+fn deserialize_optional_receipt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
+}
+
+/// Opaque incarnation equality, not permission to recover or create a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEventContext([u8; 32]);
+
+impl NativeEventContext {
+    pub(crate) fn capture(
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        Self::capture_identity(&row.id, row.created_at, row.lifecycle_generation, storage)
+    }
+
+    pub(crate) fn capture_identity(
+        id: &str,
+        created_at: DateTime<Utc>,
+        lifecycle_generation: u64,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let (device, inode) = storage.bound_profile_identity()?;
+        let mut digest = Sha256::new();
+        digest.update(b"aoe-acp-native-context-v1\0");
+        for text in [storage.profile(), id] {
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text.as_bytes());
+        }
+        digest.update(device.to_le_bytes());
+        digest.update(inode.to_le_bytes());
+        digest.update(created_at.timestamp().to_le_bytes());
+        digest.update(created_at.timestamp_subsec_nanos().to_le_bytes());
+        digest.update(lifecycle_generation.to_le_bytes());
+        Ok(Self(digest.finalize().into()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeObservationScope {
+    pub context: NativeEventContext,
+    pub fence: std::sync::Arc<crate::session::NativeInputFence>,
+}
+
+impl NativeObservationScope {
+    pub fn capture(
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            context: NativeEventContext::capture(row, storage)?,
+            fence: crate::session::NativeInputFence::capture_route(
+                storage.profile(),
+                &row.id,
+                row.created_at,
+                row.lifecycle_generation,
+                false,
+                Some(storage.bound_profile_identity()?),
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeForkRejection {
+    pub(crate) owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    pub(crate) parent: String,
+}
+
+/// Kept only in the private journal and runtime fold, never public JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEventSubject {
+    pub(crate) context: NativeEventContext,
+    pub(crate) owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    pub(crate) kind: NativeSubjectEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NativeSubjectEvent {
+    ChannelReady,
+    BindingObserved,
+    RuntimeObservation,
+    StartupDiagnostic,
+    ChannelUnavailable(AcpConnectionUnavailability),
+    PromptDiagnostic,
+    TurnEnded,
+    AdmissionRefusal(crate::process::worker_registry::ControlAdmissionRefusal),
+}
+
+impl NativeEventSubject {
+    pub(crate) fn channel(
+        context: NativeEventContext,
+        owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+        event: &Event,
+    ) -> Self {
+        let kind = match event {
+            Event::AcpSessionAssigned {
+                connection_ready, ..
+            } => {
+                if *connection_ready {
+                    NativeSubjectEvent::ChannelReady
+                } else {
+                    NativeSubjectEvent::BindingObserved
+                }
+            }
+            Event::AcpConnectionUnavailable {
+                source,
+                cause,
+                phase,
+                ..
+            } => NativeSubjectEvent::ChannelUnavailable(AcpConnectionUnavailability {
+                source: *source,
+                cause: *cause,
+                phase: *phase,
+            }),
+            Event::PromptRuntimeError { .. } => NativeSubjectEvent::PromptDiagnostic,
+            Event::Stopped { .. } => NativeSubjectEvent::TurnEnded,
+            Event::AgentStartupError { .. } => NativeSubjectEvent::StartupDiagnostic,
+            _ => NativeSubjectEvent::RuntimeObservation,
+        };
+        Self {
+            context,
+            owner,
+            kind,
+        }
+    }
+
+    pub(crate) fn owner_is_current(&self, session_id: &str) -> bool {
+        if let NativeSubjectEvent::AdmissionRefusal(refusal) = self.kind {
+            return crate::process::worker_registry::refusal_still_applies(session_id, &refusal);
+        }
+        self.owner.is_some_and(|owner| {
+            crate::process::worker_registry::load_strict(session_id)
+                .ok()
+                .flatten()
+                .is_some_and(|record| owner.owns_record(&record))
+                && crate::process::process_birth_identity(owner.pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|birth| Some(birth.fingerprint()) == owner.birth_fingerprint)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CurrentNativeAvailability {
+    pub context: NativeEventContext,
+    pub owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    pub unavailable: Option<AcpConnectionUnavailability>,
+    pub ready: bool,
+    pub client: std::sync::Arc<crate::acp::acp_client::AcpClient>,
+    pub lifecycle: std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
+    pub lease: crate::acp::runner_lifecycle::Lease,
+}
+
+impl CurrentNativeAvailability {
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.owner == other.owner
+            && self.lease == other.lease
+            && std::sync::Arc::ptr_eq(&self.client, &other.client)
+    }
+
+    /// Called with the native fence held; lifecycle contention must not invert
+    /// the producer's lifecycle-to-native lock order.
+    pub(crate) fn refresh(&mut self, session_id: &str) -> Result<bool, NativeObservationWait> {
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(NativeObservationWait {
+                    context: self.context,
+                    lock: NativeObservationLock::Lifecycle(self.lifecycle.clone()),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Ok(false),
+        };
+        if lifecycle.phase(session_id) != crate::acp::runner_lifecycle::WorkerPhase::Running
+            || lifecycle.current_lease(session_id).as_ref() != Some(&self.lease)
+            || self.owner != self.client.connected_runner()
+        {
+            return Ok(false);
+        }
+        self.ready = self.client.connection_ready();
+        self.unavailable = self.client.connection_unavailable();
+        self.ready &= self.unavailable.is_none();
+        Ok(self.ready || self.unavailable.is_some())
+    }
+}
+
+pub(crate) struct NativeObservationWait {
+    pub context: NativeEventContext,
+    lock: NativeObservationLock,
+}
+
+impl std::fmt::Debug for NativeObservationWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeObservationWait")
+            .finish_non_exhaustive()
+    }
+}
+
+enum NativeObservationLock {
+    Native(std::sync::Arc<crate::session::NativeInputFence>),
+    Lifecycle(std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>),
+}
+
+impl NativeObservationWait {
+    pub(crate) fn native(scope: &NativeObservationScope) -> Self {
+        Self {
+            context: scope.context,
+            lock: NativeObservationLock::Native(scope.fence.clone()),
+        }
+    }
+
+    pub(crate) fn lifecycle(
+        context: NativeEventContext,
+        lifecycle: std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
+    ) -> Self {
+        Self {
+            context,
+            lock: NativeObservationLock::Lifecycle(lifecycle),
+        }
+    }
+
+    /// Only the contended lock survives into this wait, never a publication guard.
+    pub(crate) async fn settle(self) -> bool {
+        tokio::task::spawn_blocking(move || match self.lock {
+            NativeObservationLock::Native(fence) => fence.lock_observation().is_ok(),
+            NativeObservationLock::Lifecycle(lifecycle) => lifecycle.lock().is_ok(),
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeAvailabilityProjection {
+    pub ready: bool,
+    pub unavailable: Option<AcpConnectionUnavailability>,
+    pub control_failure: Option<(u64, NativeControlFailure)>,
+    pub prompt_wake_eligible: bool,
+    context: Option<NativeEventContext>,
+    owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeControlFailure {
+    Prompt,
+    Startup,
+}
+
+impl NativeAvailabilityProjection {
+    pub(crate) fn resolve(
+        historical: Option<(u64, NativeEventSubject)>,
+        context: Option<NativeEventContext>,
+        current: Option<&CurrentNativeAvailability>,
+        historical_owner_current: bool,
+        current_refusal: Option<crate::process::worker_registry::ControlAdmissionRefusal>,
+    ) -> Self {
+        let Some(context) = context else {
+            return Self::default();
+        };
+        if let Some(current) = current.filter(|current| current.context == context) {
+            return Self {
+                ready: current.ready && current.unavailable.is_none(),
+                unavailable: current.unavailable,
+                control_failure: None,
+                prompt_wake_eligible: false,
+                context: Some(context),
+                owner: current.owner,
+            };
+        }
+        let unavailable = if let Some(refusal) = current_refusal {
+            Some(refusal.observation())
+        } else {
+            historical
+                .filter(|(_, subject)| subject.context == context && historical_owner_current)
+                .and_then(|(_, subject)| match subject.kind {
+                    NativeSubjectEvent::ChannelUnavailable(unavailable)
+                        if unavailable.source == AcpConnectionSource::Native =>
+                    {
+                        Some(unavailable)
+                    }
+                    NativeSubjectEvent::AdmissionRefusal(refusal) => Some(refusal.observation()),
+                    _ => None,
+                })
+        };
+        Self {
+            ready: false,
+            unavailable,
+            control_failure: None,
+            context: Some(context),
+            prompt_wake_eligible: false,
+            owner: current_refusal
+                .and_then(|refusal| refusal.owner)
+                .or_else(|| historical.and_then(|(_, subject)| subject.owner)),
+        }
+    }
+
+    pub(crate) fn with_prompt_wake_eligibility(mut self, eligible: bool) -> Self {
+        self.prompt_wake_eligible =
+            eligible && self.context.is_some() && !self.ready && self.unavailable.is_none();
+        self
+    }
+
+    pub(crate) fn context(&self) -> Option<NativeEventContext> {
+        self.context
+    }
+}
+
+impl Event {
+    /// Admission refusal describes management, not terminal native work.
+    pub(crate) fn is_channel_loss(&self) -> bool {
+        matches!(self, Self::AcpConnectionUnavailable { source, native_subject, .. }
+            if source.is_channel_loss()
+                && !native_subject.is_some_and(|subject| matches!(subject.kind, NativeSubjectEvent::AdmissionRefusal(_))))
+    }
+
+    pub(crate) fn native_subject(&self) -> Option<NativeEventSubject> {
+        match self {
+            Self::PromptRuntimeError { native_subject, .. }
+            | Self::AcpConnectionUnavailable { native_subject, .. }
+            | Self::AgentStartupError { native_subject, .. }
+            | Self::AcpSessionAssigned { native_subject, .. } => *native_subject,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_native_subject(&mut self, subject: NativeEventSubject) {
+        match self {
+            Self::PromptRuntimeError { native_subject, .. }
+            | Self::AcpConnectionUnavailable { native_subject, .. }
+            | Self::AgentStartupError { native_subject, .. }
+            | Self::AcpSessionAssigned { native_subject, .. } => *native_subject = Some(subject),
+            _ => {}
+        }
+    }
+}
+
 /// Lifecycle status of an async background sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -510,6 +903,21 @@ pub struct AcpState {
     /// The diagnostic message stays in the event/transcript, independently of liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_error: Option<crate::session::OperationErrorEvidence>,
+    /// Missing means no recorded unavailability, not affirmative native-channel health.
+    #[serde(default)]
+    pub connection_unavailable: Option<AcpConnectionUnavailability>,
+    /// Only a current, source-qualified channel observation makes this true.
+    #[serde(default, deserialize_with = "deserialize_optional_receipt")]
+    pub connection_ready: bool,
+    /// Live reduced-state envelope metadata for clients only. The server derives
+    /// its governor from NativeAvailabilityProjection, never this deserialized
+    /// field. Missing/null is unknown; history/cache serialization omits it.
+    #[serde(default, skip_serializing)]
+    pub(crate) prompt_wake_eligible: Option<bool>,
+    #[serde(skip)]
+    pub(crate) native_availability: Option<(u64, NativeEventSubject)>,
+    #[serde(skip)]
+    pub(crate) native_control_seq: u64,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -779,6 +1187,16 @@ pub enum Event {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<crate::session::OperationErrorEvidence>,
+        #[serde(default, skip_serializing)]
+        native_subject: Option<NativeEventSubject>,
+    },
+    /// The local owner can no longer use this ACP connection.
+    AcpConnectionUnavailable {
+        source: AcpConnectionSource,
+        cause: AcpConnectionCause,
+        phase: AcpConnectionPhase,
+        #[serde(default, skip_serializing)]
+        native_subject: Option<NativeEventSubject>,
     },
     AgentMessageChunk {
         text: String,
@@ -803,6 +1221,8 @@ pub enum Event {
     /// The agent failed to spawn or never completed `initialize`.
     AgentStartupError {
         message: String,
+        #[serde(default, skip_serializing)]
+        native_subject: Option<NativeEventSubject>,
     },
     /// `initialize` completed but the adapter failed the compatibility policy.
     IncompatibleAgent {
@@ -856,10 +1276,21 @@ pub enum Event {
     /// the next spawn can `session/load`.
     AcpSessionAssigned {
         acp_session_id: String,
+        /// Qualified local admission, not registry identity or historical backfill.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_receipt",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        connection_ready: bool,
+        #[serde(default, skip_serializing)]
+        native_subject: Option<NativeEventSubject>,
     },
     /// Native context continuity was lost or a fork could not be established.
     SessionContextReset {
         reason: String,
+        #[serde(skip)]
+        fork_rejection: Option<std::sync::Arc<NativeForkRejection>>,
     },
     /// The agent called the Claude SDK's `ScheduleWakeup` tool.
     WakeupScheduled {
@@ -934,9 +1365,34 @@ impl AcpState {
         }
     }
 
+    /// Historical notices never grant current channel health or recovery authority.
+    pub(crate) fn apply_native_availability(&mut self, projection: NativeAvailabilityProjection) {
+        self.connection_ready = projection.ready;
+        self.connection_unavailable = projection.unavailable;
+        if let Some((seq, failure)) = projection
+            .control_failure
+            .filter(|(seq, _)| *seq > self.native_control_seq)
+        {
+            self.native_control_seq = seq;
+            self.end_turn("aborted");
+            if failure == NativeControlFailure::Startup {
+                self.sidebar_phase = SidebarPhase::Error;
+            }
+        }
+        if self
+            .connection_unavailable
+            .is_some_and(|unavailable| unavailable.source.is_channel_loss())
+        {
+            self.retire_unavailable_controls();
+        }
+    }
+
     /// The sidebar status this state implies. A live background agent keeps
     /// the row `Running` between main turns.
     pub fn sidebar_status(&self) -> Status {
+        if self.connection_unavailable.is_some() {
+            return Status::Error;
+        }
         match self.sidebar_phase {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
@@ -947,6 +1403,26 @@ impl AcpState {
     }
 
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
+        let closes_native = match &event {
+            Event::AcpConnectionUnavailable { .. } => event.is_channel_loss(),
+            Event::AgentStartupError {
+                native_subject: Some(subject),
+                ..
+            } => matches!(subject.kind, NativeSubjectEvent::ChannelUnavailable(_)),
+            _ => false,
+        };
+        if matches!(
+            &event,
+            Event::UserPromptSent { .. }
+                | Event::UserDiffCommentsPrompt { .. }
+                | Event::Stopped { .. }
+                | Event::PromptRuntimeError { .. }
+                | Event::SessionContextReset { .. }
+                | Event::SessionCleared
+                | Event::AgentSwitched { .. }
+        ) {
+            self.native_control_seq = seq;
+        }
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
@@ -1133,6 +1609,57 @@ impl AcpState {
                 self.cancelling = false;
                 self.sidebar_phase = SidebarPhase::Error;
             }
+            Event::AcpConnectionUnavailable {
+                source,
+                cause,
+                phase,
+                native_subject,
+            } => {
+                let unavailable = AcpConnectionUnavailability {
+                    source,
+                    cause,
+                    phase,
+                };
+                self.native_availability = native_subject.map(|subject| (seq, subject));
+                self.connection_unavailable = Some(unavailable);
+                self.connection_ready = false;
+            }
+            Event::AgentStartupError {
+                native_subject: Some(subject),
+                ..
+            } => {
+                match subject.kind {
+                    NativeSubjectEvent::ChannelUnavailable(unavailable) => {
+                        self.connection_unavailable = Some(unavailable);
+                        self.native_availability = Some((seq, subject));
+                    }
+                    NativeSubjectEvent::AdmissionRefusal(refusal) => {
+                        let unavailable = refusal.observation();
+                        self.connection_unavailable = Some(unavailable);
+                        self.native_availability = Some((seq, subject));
+                    }
+                    NativeSubjectEvent::ChannelReady => {
+                        self.native_availability = Some((seq, subject));
+                    }
+                    NativeSubjectEvent::PromptDiagnostic => {
+                        self.turn_active = false;
+                        self.cancelling = false;
+                        self.sidebar_phase = SidebarPhase::PromptFailed;
+                    }
+                    NativeSubjectEvent::TurnEnded => {
+                        self.end_turn("aborted");
+                        self.native_control_seq = seq;
+                    }
+                    NativeSubjectEvent::StartupDiagnostic => {
+                        self.turn_active = false;
+                        self.cancelling = false;
+                        self.sidebar_phase = SidebarPhase::Error;
+                    }
+                    NativeSubjectEvent::BindingObserved
+                    | NativeSubjectEvent::RuntimeObservation => {}
+                }
+                self.connection_ready = false;
+            }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;
                 self.cancelling = false;
@@ -1146,10 +1673,21 @@ impl AcpState {
             }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = steering,
-            Event::AcpSessionAssigned { .. } => {
-                self.startup_error = None;
-                self.rate_limit = None;
-                self.heal_sidebar_phase();
+            Event::AcpSessionAssigned {
+                connection_ready,
+                native_subject,
+                ..
+            } => {
+                if connection_ready
+                    && native_subject
+                        .is_some_and(|subject| subject.kind == NativeSubjectEvent::ChannelReady)
+                {
+                    self.connection_unavailable = None;
+                    self.native_availability = native_subject.map(|subject| (seq, subject));
+                    self.startup_error = None;
+                    self.rate_limit = None;
+                    self.heal_sidebar_phase();
+                }
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
             Event::SessionContextReset { .. } => self.usage = None,
@@ -1287,9 +1825,26 @@ impl AcpState {
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }
+        if closes_native {
+            self.retire_unavailable_controls();
+            self.sidebar_phase = SidebarPhase::Error;
+        }
         self.last_seq = seq;
         self.updated_at = Utc::now();
         Ok(self.last_seq)
+    }
+
+    /// These are actionable callback metadata, not transcript/history or a
+    /// fabricated permission decision. Ordinary request failure never calls this.
+    fn retire_unavailable_controls(&mut self) {
+        self.turn_active = false;
+        self.cancelling = false;
+        self.compacting = false;
+        self.compaction_tool_id = None;
+        self.in_flight_tool = None;
+        self.thinking = None;
+        self.pending_approvals.clear();
+        self.pending_elicitations.clear();
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
@@ -1328,7 +1883,7 @@ impl AcpState {
 
     /// A fresh worker attached: a startup error no longer holds the row.
     fn heal_sidebar_phase(&mut self) {
-        if self.sidebar_phase == SidebarPhase::Error {
+        if self.sidebar_phase == SidebarPhase::Error && self.operation_error.is_none() {
             self.sidebar_phase = SidebarPhase::Idle;
         }
     }
@@ -1336,7 +1891,7 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = if reason == "prompt_failed" {
+        self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
             SidebarPhase::PromptFailed
         } else if reason == "session_reset_failed" {
             SidebarPhase::Error
@@ -1454,6 +2009,18 @@ mod tests {
         s
     }
 
+    fn observed_channel_ready(acp_session_id: &str) -> Event {
+        Event::AcpSessionAssigned {
+            acp_session_id: acp_session_id.into(),
+            connection_ready: true,
+            native_subject: Some(NativeEventSubject {
+                context: NativeEventContext([0xa5; 32]),
+                owner: None,
+                kind: NativeSubjectEvent::ChannelReady,
+            }),
+        }
+    }
+
     #[test]
     fn failed_operation_metadata_replays_without_erasing_owned_state() {
         use crate::session::{
@@ -1498,6 +2065,7 @@ mod tests {
             let event = Event::PromptRuntimeError {
                 message: "request failed".into(),
                 evidence: metadata,
+                native_subject: None,
             };
             let decoded: Event =
                 serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -1548,6 +2116,8 @@ mod tests {
                     replay.last_seq + 1,
                     Event::AcpSessionAssigned {
                         acp_session_id: "same-native-history".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     },
                 )
                 .unwrap();
@@ -1562,6 +2132,49 @@ mod tests {
                 .unwrap();
             assert!(replay.turn_active && replay.operation_error.is_none());
         }
+        let mut refused = state.clone();
+        let management = AcpConnectionUnavailability {
+            source: AcpConnectionSource::RunnerRecord,
+            cause: AcpConnectionCause::ControlProtocolUnknown,
+            phase: AcpConnectionPhase::Establishing,
+        };
+        refused
+            .apply_event(
+                refused.last_seq + 1,
+                Event::AcpConnectionUnavailable {
+                    source: management.source,
+                    cause: management.cause,
+                    phase: management.phase,
+                    native_subject: None,
+                },
+            )
+            .unwrap();
+        refused.apply_native_availability(NativeAvailabilityProjection {
+            unavailable: Some(management),
+            ..NativeAvailabilityProjection::default()
+        });
+        assert!(
+            refused.turn_active,
+            "management refusal does not finish retained native work"
+        );
+        assert!(!refused.connection_ready);
+        assert_eq!(refused.sidebar_status(), Status::Error);
+        assert_eq!(refused.pending_approvals.len(), 1);
+        assert_eq!(refused.pending_elicitations.len(), 1);
+        refused
+            .apply_event(
+                refused.last_seq + 1,
+                Event::AcpConnectionUnavailable {
+                    source: AcpConnectionSource::Native,
+                    cause: AcpConnectionCause::StdoutEof,
+                    phase: AcpConnectionPhase::Established,
+                    native_subject: None,
+                },
+            )
+            .unwrap();
+        assert!(!refused.turn_active);
+        assert!(refused.pending_approvals.is_empty());
+        assert!(refused.pending_elicitations.is_empty());
         for json in [
             r#"{"PromptRuntimeError":{"message":"old failure"}}"#,
             r#"{"PromptRuntimeError":{"message":"old failure","evidence":null}}"#,
@@ -1571,6 +2184,199 @@ mod tests {
                 Event::PromptRuntimeError { evidence: None, .. }
             ));
         }
+    }
+
+    #[test]
+    fn optional_native_receipts_and_private_subjects_do_not_create_replay_authority() {
+        for json in [
+            r#"{"AcpSessionAssigned":{"acp_session_id":"legacy"}}"#,
+            r#"{"AcpSessionAssigned":{"acp_session_id":"legacy","connection_ready":null}}"#,
+        ] {
+            assert!(matches!(
+                serde_json::from_str::<Event>(json).unwrap(),
+                Event::AcpSessionAssigned {
+                    connection_ready: false,
+                    native_subject: None,
+                    ..
+                }
+            ));
+        }
+        for absent in [true, false] {
+            let mut json = serde_json::to_value(fresh_state()).unwrap();
+            if absent {
+                json.as_object_mut().unwrap().remove("connection_ready");
+            } else {
+                json["connection_ready"] = serde_json::Value::Null;
+            }
+            let decoded: AcpState = serde_json::from_value(json).unwrap();
+            assert!(!decoded.connection_ready);
+            assert!(decoded.native_availability.is_none());
+        }
+        let context = NativeEventContext([0xa5; 32]);
+        let subject = NativeEventSubject {
+            context,
+            owner: None,
+            kind: NativeSubjectEvent::ChannelReady,
+        };
+        let event = Event::AcpSessionAssigned {
+            acp_session_id: "retained-conversation".into(),
+            connection_ready: true,
+            native_subject: Some(subject),
+        };
+        let mut folded = fresh_state();
+        folded.apply_event(7, event.clone()).unwrap();
+        let frame = crate::acp::protocol::AcpBroadcastFrame {
+            session_id: "s-1".into(),
+            seq: 7,
+            event: std::sync::Arc::new(event.clone()),
+            worker_generation: Some(99),
+            native_subject: Some(subject),
+            sidebar_status: Some(Status::Idle),
+        };
+        let public = serde_json::to_string(&serde_json::json!({
+            "frames": [frame], "state": folded, "event": event,
+        }))
+        .unwrap();
+        for private in [
+            "native_subject",
+            "native_availability",
+            "native_control_seq",
+            "birth_fingerprint",
+            "worker_generation",
+        ] {
+            assert!(
+                !public.contains(private),
+                "{private} escaped into public JSON"
+            );
+        }
+        let replayed: Event =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert!(replayed.native_subject().is_none());
+        let historical = NativeAvailabilityProjection::resolve(
+            Some((7, subject)),
+            Some(context),
+            None,
+            true,
+            None,
+        );
+        assert!(
+            !historical.ready,
+            "a recorded assignment is not a current usable channel"
+        );
+    }
+
+    #[test]
+    fn native_loss_and_explicit_wake_eligibility_need_current_qualified_context() {
+        let context = NativeEventContext([1; 32]);
+        let unavailable = AcpConnectionUnavailability {
+            source: AcpConnectionSource::Native,
+            cause: AcpConnectionCause::StdoutEof,
+            phase: AcpConnectionPhase::Established,
+        };
+        let subject = NativeEventSubject {
+            context,
+            owner: None,
+            kind: NativeSubjectEvent::ChannelUnavailable(unavailable),
+        };
+        let current_loss = NativeAvailabilityProjection::resolve(
+            Some((9, subject)),
+            Some(context),
+            None,
+            true,
+            None,
+        )
+        .with_prompt_wake_eligibility(true);
+        assert_eq!(current_loss.unavailable, Some(unavailable));
+        assert!(!current_loss.ready && !current_loss.prompt_wake_eligible);
+        for (qualified, owner_current) in [
+            (None, true),
+            (Some(NativeEventContext([2; 32])), true),
+            (Some(context), false),
+        ] {
+            let unknown = NativeAvailabilityProjection::resolve(
+                Some((9, subject)),
+                qualified,
+                None,
+                owner_current,
+                None,
+            );
+            assert!(!unknown.ready && unknown.unavailable.is_none());
+        }
+        let mut sdk_subject = subject;
+        if let NativeSubjectEvent::ChannelUnavailable(loss) = &mut sdk_subject.kind {
+            loss.source = AcpConnectionSource::Sdk;
+        }
+        let old_sdk = NativeAvailabilityProjection::resolve(
+            Some((9, sdk_subject)),
+            Some(context),
+            None,
+            true,
+            None,
+        );
+        assert!(
+            old_sdk.unavailable.is_none(),
+            "a previous SDK socket is not current native loss"
+        );
+        assert!(
+            !NativeAvailabilityProjection::default()
+                .with_prompt_wake_eligibility(true)
+                .prompt_wake_eligible
+        );
+        let known_dormant =
+            NativeAvailabilityProjection::resolve(None, Some(context), None, false, None)
+                .with_prompt_wake_eligibility(true);
+        assert!(known_dormant.prompt_wake_eligible && !known_dormant.ready);
+        assert!(
+            !NativeAvailabilityProjection::resolve(None, Some(context), None, false, None)
+                .prompt_wake_eligible,
+            "a coherent context alone does not admit a prompt intent"
+        );
+    }
+
+    #[test]
+    fn carried_native_receipts_recheck_loss_and_the_original_lifecycle_after_await() {
+        use crate::acp::runner_lifecycle::{LifecycleTable, ResumeKind};
+        use std::sync::{Arc, Mutex};
+        let (client, _events) =
+            crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId("receipt".into()));
+        client.test_observe_native_ready();
+        let client = Arc::new(client);
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit("receipt", ResumeKind::Spawn).unwrap();
+        table.install(&lease, None).unwrap();
+        let lifecycle = Arc::new(Mutex::new(table));
+        let mut carried = CurrentNativeAvailability {
+            context: NativeEventContext([3; 32]),
+            owner: None,
+            ready: true,
+            unavailable: None,
+            client: Arc::clone(&client),
+            lifecycle: Arc::clone(&lifecycle),
+            lease: lease.clone(),
+        };
+        assert!(carried.refresh("receipt").unwrap() && carried.ready);
+        let held = lifecycle.lock().unwrap();
+        assert!(
+            carried.refresh("receipt").is_err(),
+            "identified lifecycle contention is distinguishable from stable Unknown"
+        );
+        drop(held);
+        client.test_observe_native_loss();
+        assert!(carried.refresh("receipt").unwrap());
+        assert!(!carried.ready);
+        assert_eq!(
+            carried.unavailable.unwrap().cause,
+            AcpConnectionCause::StdoutEof
+        );
+        let mut table = lifecycle.lock().unwrap();
+        assert!(table.release_running(&lease));
+        let replacement = table.admit("receipt", ResumeKind::Spawn).unwrap();
+        table.install(&replacement, None).unwrap();
+        drop(table);
+        assert!(
+            !carried.refresh("receipt").unwrap(),
+            "a replacement cannot reuse the captured client's receipt"
+        );
     }
 
     /// The sidebar projection over event sequences, including the ones the old
@@ -1621,10 +2427,9 @@ mod tests {
         };
         let startup_error = || Event::AgentStartupError {
             message: "boom".into(),
+            native_subject: None,
         };
-        let assigned = || Event::AcpSessionAssigned {
-            acp_session_id: "a-1".into(),
-        };
+        let assigned = || observed_channel_ready("a-1");
         let cases: Vec<(&str, Vec<Event>, Status)> = vec![
             ("nothing yet", vec![], Status::Idle),
             ("open turn", vec![prompt("go")], Status::Running),
@@ -1756,6 +2561,30 @@ mod tests {
                 "worker reattached",
                 vec![startup_error(), assigned()],
                 Status::Idle,
+            ),
+            (
+                "binding-only observation does not heal a startup error",
+                vec![
+                    startup_error(),
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "binding-only".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    },
+                ],
+                Status::Error,
+            ),
+            (
+                "bare ready flag does not heal a startup error",
+                vec![
+                    startup_error(),
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "unqualified".into(),
+                        connection_ready: true,
+                        native_subject: None,
+                    },
+                ],
+                Status::Error,
             ),
             (
                 "assignment mid-turn",
@@ -2025,10 +2854,12 @@ mod tests {
         for terminal in [
             Event::AgentStartupError {
                 message: "boom".into(),
+                native_subject: None,
             },
             Event::PromptRuntimeError {
                 message: "boom".into(),
                 evidence: None,
+                native_subject: None,
             },
             Event::PromptRejected {
                 reason: "agent_busy".into(),
@@ -2153,9 +2984,33 @@ mod tests {
         assert!(applied([rate_limit(), stopped("rate_limited")])
             .rate_limit
             .is_some());
-        let assigned = Event::AcpSessionAssigned {
-            acp_session_id: "acp-2".into(),
-        };
+        assert!(
+            applied([
+                rate_limit(),
+                Event::AcpSessionAssigned {
+                    acp_session_id: "binding-only".into(),
+                    connection_ready: false,
+                    native_subject: None,
+                }
+            ])
+            .rate_limit
+            .is_some(),
+            "an identity hint is not a live-channel declaration"
+        );
+        assert!(
+            applied([
+                rate_limit(),
+                Event::AcpSessionAssigned {
+                    acp_session_id: "unqualified".into(),
+                    connection_ready: true,
+                    native_subject: None,
+                }
+            ])
+            .rate_limit
+            .is_some(),
+            "a bare ready flag does not end a native park"
+        );
+        let assigned = observed_channel_ready("acp-2");
         for end in [
             prompt("go"),
             assigned,

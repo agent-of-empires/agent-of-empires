@@ -1,4 +1,4 @@
-import type { AcpState } from "../../lib/acpTypes";
+import { nativeInputAvailable, type AcpState } from "../../lib/acpTypes";
 import type { SessionResponse } from "../../lib/types";
 import type { AcpContext } from "./AcpRuntime";
 
@@ -19,9 +19,7 @@ export function hasStartedBefore(session: Pick<SessionResponse, "acp_session_id"
   return !!session.acp_session_id && !session.import_pending;
 }
 
-/** A new Session whose Agent session doesn't exist yet: its Worker, first connection, or
- *  `session/new` is still coming up. Events persisted before `session/new` answers
- *  (prompt capabilities, commands) don't end it; `AcpSessionAssigned` does. */
+/** Wait for current input authority, not initialization events or historical session IDs. */
 export function isNewSessionStarting(
   state: AcpState,
   connection: ConnectionRetryState & Pick<AcpContext, "hasEverOpened">,
@@ -30,7 +28,7 @@ export function isNewSessionStarting(
 ): boolean {
   if (
     startedBefore ||
-    state.sessionAssigned ||
+    nativeInputAvailable(state) ||
     state.startupError ||
     state.workerStopped ||
     state.workerRestarting ||
@@ -39,7 +37,7 @@ export function isNewSessionStarting(
     return false;
   const { status, hasEverOpened, reconnecting } = connection;
   if (acpWorkerState === "resuming") return true;
-  // A running Worker's replay says whether its session was assigned, so wait for the connection.
+  // Wait for its current receipt after the connection opens.
   if (acpWorkerState === "running") return hasEverOpened;
   return !hasEverOpened && (reconnecting || status === "connecting" || status === "error");
 }

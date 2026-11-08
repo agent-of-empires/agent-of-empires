@@ -929,6 +929,7 @@ async fn run_queued_command(
                         .ensure_agent(&id, &StartSessionBody { expected, size }, epoch)
                         .await
                         .map(CommandReply::Terminal),
+
                     SessionRequest::CancelCreation => client
                         .cancel_creation(&id, epoch)
                         .await

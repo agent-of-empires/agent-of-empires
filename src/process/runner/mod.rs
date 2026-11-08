@@ -6,6 +6,7 @@ mod shared;
 
 use self::connection::{fanout_agent_stdout, handle_control_connection};
 use self::shared::RunnerShared;
+use crate::acp::control_protocol;
 use crate::process::worker::RunnerRecordState;
 use crate::process::worker_registry::{self, WorkerRecord};
 use crate::util::now_secs;
@@ -199,6 +200,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
+    record.control_protocol_version = Some(control_protocol::CONTROL_PROTOCOL_VERSION);
     record.scope = args
         .systemd_scope
         .as_ref()
@@ -298,64 +300,73 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     let mut preserve_registry = false;
 
-    tokio::select! {
-        status = agent_child.wait() => {
-            let elapsed = agent_started_at.elapsed();
-            match status {
-                Ok(s) if elapsed < FAST_EXIT_THRESHOLD => warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    status = ?s,
-                    elapsed_ms = elapsed.as_millis(),
-                    "agent exited within {}s of startup (likely a broken spawn); runner shutting down",
-                    FAST_EXIT_THRESHOLD.as_secs()
-                ),
-                Ok(s) => info!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    status = ?s,
-                    "agent exited; runner shutting down"
-                ),
-                Err(e) => warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    "agent wait error: {e}"
-                ),
-            }
-        }
-        _ = shutdown_signal => {
-            info!(
-                target: "acp.runner",
-                session = %session_id,
-                "shutdown signal received; terminating agent"
-            );
-            let _ = agent_child.start_kill();
-            let _ = agent_child.wait().await;
-        }
-        _ = shared.fatal_triggered() => {
-            warn!(
-                target: "acp.runner",
-                session = %session_id,
-                "fatal runner state detected; terminating agent"
-            );
-            let _ = agent_child.start_kill();
-            let _ = agent_child.wait().await;
-        }
-        reason = &mut watchdog_rx => {
-            if let Ok(reason) = reason {
-                // The replacement runner owns the registry and socket now.
-                if matches!(reason, WatchdogShutdown::Superseded) {
-                    preserve_registry = true;
+    {
+        let lifetime = async {
+            tokio::select! {
+                status = agent_child.wait() => {
+                    let elapsed = agent_started_at.elapsed();
+                    match status {
+                        Ok(s) if elapsed < FAST_EXIT_THRESHOLD => warn!(
+                            target: "acp.runner",
+                            session = %session_id,
+                            status = ?s,
+                            elapsed_ms = elapsed.as_millis(),
+                            "agent exited within {}s of startup (likely a broken spawn); runner shutting down",
+                            FAST_EXIT_THRESHOLD.as_secs()
+                        ),
+                        Ok(s) => info!(
+                            target: "acp.runner",
+                            session = %session_id,
+                            status = ?s,
+                            "agent exited; runner shutting down"
+                        ),
+                        Err(e) => warn!(
+                            target: "acp.runner",
+                            session = %session_id,
+                            "agent wait error: {e}"
+                        ),
+                    }
                 }
-                self_terminate_agent_tree(reason, &record, &mut agent_child).await;
+                _ = shutdown_signal => {
+                    info!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "shutdown signal received; terminating agent"
+                    );
+                    let _ = agent_child.start_kill();
+                    let _ = agent_child.wait().await;
+                }
+                _ = shared.fatal_triggered() => {
+                    warn!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "fatal runner state detected; terminating agent"
+                    );
+                    let _ = agent_child.start_kill();
+                    let _ = agent_child.wait().await;
+                }
+                reason = &mut watchdog_rx => {
+                    if let Ok(reason) = reason {
+                        // The replacement runner owns the registry and socket now.
+                        if matches!(reason, WatchdogShutdown::Superseded) {
+                            preserve_registry = true;
+                        }
+                        self_terminate_agent_tree(reason, &record, &mut agent_child).await;
+                    }
+                }
+                terminate_runner = accept_loop => {
+                    debug_assert!(terminate_runner);
+                    // The daemon may already have spawned a replacement; never unlink it.
+                    preserve_registry = true;
+                    let _ = agent_child.start_kill();
+                    let _ = agent_child.wait().await;
+                }
             }
-        }
-        terminate_runner = accept_loop => {
-            debug_assert!(terminate_runner);
-            // The daemon may already have spawned a replacement; never unlink it.
-            preserve_registry = true;
-            let _ = agent_child.start_kill();
-            let _ = agent_child.wait().await;
+        };
+        tokio::pin!(lifetime);
+        tokio::select! {
+            _ = &mut lifetime => {}
+            _ = shared.retire_native_waiters() => lifetime.await,
         }
     }
 

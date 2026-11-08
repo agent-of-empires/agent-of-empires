@@ -34,11 +34,46 @@ struct RetiringClient {
     shutdown_done: std::sync::atomic::AtomicBool,
 }
 
+/// A handoff controller's metadata-only custody of its original publisher.
+/// This fence is never installed as a worker's native-control admission.
+pub(crate) struct RetiringIdentityScope {
+    pub scope: crate::acp::state::NativeObservationScope,
+    pub owner: RunnerIdentity,
+    key: crate::session::TerminalHandoffKey,
+    target_generation: u64,
+    source: crate::session::ConversationState,
+    context: crate::session::TerminalHandoffContext,
+}
+
+impl RetiringIdentityScope {
+    pub fn matches(&self, row: &crate::session::Instance) -> bool {
+        self.source.matches(row)
+            && row.terminal_handoff.as_ref().is_some_and(|intent| {
+                intent.id == self.key.id
+                    && intent.generation == self.key.generation
+                    && intent.target_generation == self.target_generation
+                    && intent.stage == crate::session::TerminalHandoffStage::RetirementPending
+                    && intent.source_conversation == self.source
+                    && intent.context == self.context
+                    && matches!(
+                        &intent.runner,
+                        crate::session::purge_owners::RunnerCapture::Captured {
+                            pid, generation, birth_fingerprint, ..
+                        } if *pid == self.owner.pid
+                            && *generation == self.owner.generation
+                            && *birth_fingerprint == self.owner.birth_fingerprint
+                    )
+            })
+    }
+}
+
 /// Original connections and their publisher stay owned across request cancellation.
 pub(crate) struct RetirementResources {
     gate: tokio::sync::Mutex<()>,
     clients: std::sync::Mutex<[Option<Arc<RetiringClient>>; 2]>,
     drain: std::sync::Mutex<Option<RetiringDrain>>,
+    identity_scope: std::sync::Mutex<Option<Arc<RetiringIdentityScope>>>,
+    fork: std::sync::Mutex<super::fork_rejection::ForkCustody>,
     emit_events: std::sync::atomic::AtomicBool,
 }
 
@@ -48,12 +83,80 @@ impl Default for RetirementResources {
             gate: tokio::sync::Mutex::new(()),
             clients: std::sync::Mutex::new([None, None]),
             drain: std::sync::Mutex::new(None),
+            identity_scope: std::sync::Mutex::new(None),
+            fork: std::sync::Mutex::default(),
             emit_events: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
 
 impl RetirementResources {
+    pub(super) fn prepare_fork_seed(&self, seed: Arc<super::fork_rejection::ForkSeed>) {
+        lock_recover(&self.fork).prepare(seed);
+    }
+
+    pub(super) fn receive_fork_rejection(
+        &self,
+        lease: &Lease,
+        proof: &Arc<crate::acp::state::NativeForkRejection>,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receive(lease, proof)
+    }
+
+    pub(super) fn fork_rejection(
+        &self,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receipt()
+    }
+
+    /// Prepare under native exclusion; installation follows a committed row.
+    pub(crate) fn prepare_handoff_identity_scope(
+        &self,
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+        owner: RunnerIdentity,
+    ) -> anyhow::Result<Arc<RetiringIdentityScope>> {
+        let intent = row
+            .terminal_handoff
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("handoff missing"))?;
+        anyhow::ensure!(
+            owner.birth_fingerprint.is_some(),
+            "handoff publisher birth is unproven"
+        );
+        let custody = RetiringIdentityScope {
+            scope: crate::acp::state::NativeObservationScope::capture(row, storage)?,
+            owner,
+            key: crate::session::TerminalHandoffKey {
+                id: intent.id,
+                generation: intent.generation,
+            },
+            target_generation: intent.target_generation,
+            source: intent.source_conversation.clone(),
+            context: intent.context.clone(),
+        };
+        anyhow::ensure!(custody.matches(row), "handoff publisher custody changed");
+        Ok(Arc::new(custody))
+    }
+
+    pub(super) fn identity_scope(&self) -> Option<Arc<RetiringIdentityScope>> {
+        lock_recover(&self.identity_scope).clone()
+    }
+
+    pub(crate) fn has_handoff_identity_scope(
+        &self,
+        key: crate::session::TerminalHandoffKey,
+        owner: Option<RunnerIdentity>,
+    ) -> bool {
+        lock_recover(&self.identity_scope)
+            .as_ref()
+            .is_some_and(|scope| scope.key == key && Some(scope.owner) == owner)
+    }
+
+    pub(crate) fn record_handoff_identity_scope(&self, scope: Arc<RetiringIdentityScope>) {
+        *lock_recover(&self.identity_scope) = Some(scope);
+    }
+
     pub(super) fn record_client(&self, client: &Arc<AcpClient>, close: bool) {
         use std::sync::atomic::Ordering;
         let mut clients = lock_recover(&self.clients);
@@ -107,6 +210,7 @@ impl RetirementResources {
     pub(crate) fn clear(&self) {
         *lock_recover(&self.clients) = [None, None];
         lock_recover(&self.drain).take();
+        lock_recover(&self.identity_scope).take();
     }
 }
 
@@ -602,6 +706,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         expected: Option<&RetirementTarget>,
         cancel_pending: bool,
     ) -> Result<(), SupervisorError> {
+        let constructor = lock_recover(&self.lifecycle).current_lease(session_id);
         let record_before = if expected.is_none() {
             worker_registry::load_strict(session_id).map_err(|error| {
                 SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
@@ -622,7 +727,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 cancel_pending,
             )
             .await;
-        // The existing synchronous teardown grace precedes the settlement wait.
+        // Teardown grace precedes settlement.
         let deadline = tokio::time::Instant::now() + deadline;
         match stopped {
             Ok(()) => {}
@@ -658,9 +763,43 @@ impl<S: BroadcastSink> Supervisor<S> {
             if !still_owned() {
                 break;
             }
+            if let Some(lease) = constructor
+                .as_ref()
+                .filter(|lease| lease.constructor_finished())
+            {
+                let original = RetirementTarget {
+                    lease: Some(lease.clone()),
+                    identity: lease.spawned_runner(),
+                    scopes: lease.scopes(),
+                    prime: lease.prime(),
+                    journalled: false,
+                };
+                self.shutdown_with_reason(
+                    session_id,
+                    "user_stopped",
+                    delete_adapter_state,
+                    Some(expected.unwrap_or(&original)),
+                    None,
+                )
+                .await?;
+                if !still_owned() {
+                    break;
+                }
+            }
             if tokio::time::timeout_at(deadline, notified).await.is_err() && still_owned() {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
             }
+        }
+        let child_owner = match expected {
+            Some(target) => target.lease.as_ref(),
+            None => constructor.as_ref(),
+        };
+        while child_owner.is_some_and(|lease| lease.owned_child_wait_pending()) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
+            tokio::time::sleep(TEARDOWN_POLL.min(remaining)).await;
         }
         #[cfg(unix)]
         if let Some(identity) = identity_before {
@@ -2537,10 +2676,17 @@ mod tests {
             }
             persisted
         }
-        fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+        fn publish_from_worker(
+            &self,
+            session_id: &str,
+            seq: u64,
+            event: &Event,
+            generation: u64,
+            native_subject: Option<crate::acp::state::NativeEventSubject>,
+        ) {
             let parked = self.park(event);
             self.inner
-                .publish_from_worker(session_id, seq, event, generation);
+                .publish_from_worker(session_id, seq, event, generation, native_subject);
             if parked {
                 let _ = self.done.send(());
             }
@@ -4177,7 +4323,7 @@ mod tests {
         let target = supervisor.capture_retirement(id).unwrap();
         // Dropping before any launch crosses birth exclusion proves no original child.
         drop(construction);
-        let replacement = HeldAttachRunner::new(id, tmp.path(), 18, None);
+        let replacement = HeldAttachRunner::new(id, tmp.path(), 18, None).await;
         let replacement_bytes = std::fs::read(worker_registry::record_path(id).unwrap()).unwrap();
         let observer = reserve(
             supervisor

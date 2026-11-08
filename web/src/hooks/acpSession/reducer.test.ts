@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
 
 import {
   applyEvent,
@@ -200,7 +201,11 @@ describe("locally resolved cards", () => {
 });
 
 describe("in-flight prompt settlement", () => {
-  const sent = (id: string) => reducer(empty(), { kind: "user_prompt", id, text: "hi" });
+  const sent = (id: string) => {
+    const receipt = currentControlSnapshot(empty(), { ready: true });
+    const live = reducer(empty(), { kind: "reduced_state", state: receipt.state, seq: receipt.seq, unchanged: [] });
+    return reducer(live, { kind: "user_prompt", id, text: "hi" });
+  };
 
   it("user_prompt records the id and shows the spinner immediately", () => {
     const state = sent("p1");
@@ -280,6 +285,7 @@ describe("prompt queue", () => {
     );
     const next = reducer(local, {
       kind: "hydrate_server_queue",
+      queueAtRead: local.queuedPrompts,
       rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
     });
     expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two", "just typed"]);
@@ -288,11 +294,17 @@ describe("prompt queue", () => {
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {
     const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
     const local = run(empty(), { kind: "enqueue_prompt", id: "q1", text: "img", attachments: [image] });
-    const kept = reducer(local, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "img", [ref])] });
+    const kept = reducer(local, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("q1", 0, "img", [ref])],
+      queueAtRead: local.queuedPrompts,
+    });
     expect(kept.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
 
-    const reloaded = reducer(empty(), {
+    const fresh = empty();
+    const reloaded = reducer(fresh, {
       kind: "hydrate_server_queue",
+      queueAtRead: fresh.queuedPrompts,
       rows: [serverRow("q2", 0, "reloaded", [{ ...ref, kind: "resource", mime_type: "text/plain", name: "n.txt" }])],
     });
     expect(reloaded.queuedPrompts[0]?.attachments?.[0]).toMatchObject({
@@ -301,6 +313,56 @@ describe("prompt queue", () => {
       name: "n.txt",
       dataB64: "",
     });
+  });
+
+  it("upserts the same queued id without duplicating it or losing attachment bytes", () => {
+    const first = reducer(empty(), { kind: "enqueue_prompt", id: "same", text: "original", attachments: [image] });
+    const next = run(
+      first,
+      { kind: "confirm_queued_prompt", id: "same" },
+      { kind: "enqueue_prompt", id: "same", text: "retained after refusal" },
+      { kind: "confirm_queued_prompt", id: "same" },
+    );
+    expect(next.queuedPrompts).toHaveLength(1);
+    expect(next.queuedPrompts[0]).toMatchObject({
+      id: "same",
+      text: "retained after refusal",
+      pending: false,
+      queuedAt: first.queuedPrompts[0]!.queuedAt,
+      attachments: [image],
+    });
+  });
+
+  it("ignores a stale GET that would erase new acknowledged intent or resurrect consumed intent", () => {
+    const before = empty();
+    const acknowledged = run(
+      before,
+      { kind: "enqueue_prompt", id: "queued", text: "accepted by server" },
+      { kind: "confirm_queued_prompt", id: "queued" },
+    );
+    expect(
+      reducer(acknowledged, {
+        kind: "hydrate_server_queue",
+        rows: [],
+        queueAtRead: before.queuedPrompts,
+      }),
+    ).toBe(acknowledged);
+    const consumed = reducer(acknowledged, { kind: "dequeue_prompt", id: "queued" });
+    expect(
+      reducer(consumed, {
+        kind: "hydrate_server_queue",
+        rows: [serverRow("queued", 0, "accepted by server")],
+        queueAtRead: acknowledged.queuedPrompts,
+      }),
+    ).toBe(consumed);
+    const settled = reducer(consumed, { kind: "dequeue_prompt", id: "queued" });
+    expect(
+      reducer(settled, {
+        kind: "hydrate_server_queue",
+        rows: [serverRow("queued", 0, "accepted by server")],
+        queueAtRead: consumed.queuedPrompts,
+      }),
+    ).toBe(settled);
   });
 });
 
@@ -384,9 +446,6 @@ describe("recent-first paging", () => {
     const filled = reducer(empty(), { kind: "handshake", frames: [caps] });
     expect(filled.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true, steering: false });
     expect(filled.activity).toHaveLength(0);
-    expect(filled.sessionAssigned).toBe(false);
-    const assigned: AcpFrame = { session_id: "s", seq: 2, event: { AcpSessionAssigned: { acp_session_id: "acp-1" } } };
-    expect(reducer(empty(), { kind: "handshake", frames: [caps, assigned] }).sessionAssigned).toBe(true);
   });
 });
 
@@ -439,19 +498,19 @@ describe("a restart of a start in progress", () => {
   const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
   // Acknowledges a restart requested before any of these frames.
   const restarted: Action = { kind: "restart_started", epoch: 0, stoppedSent: false };
-  const assigned = (seq: number) => frame(seq, { AcpSessionAssigned: { acp_session_id: "acp-2" } });
+  const ready = (seq: number): Action => currentControlSnapshot(empty(), { ready: true }, seq);
   it.each<[string, Action[], boolean, boolean]>([
     ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
     ["its stop applied after doesn't either", [restarted, stop(1)], false, true],
     [
-      "a real Stop after the replacement is assigned latches again",
-      [stop(1), restarted, assigned(2), stop(3)],
+      "a real Stop after the replacement's current receipt latches again",
+      [stop(1), restarted, ready(2), stop(3)],
       true,
       false,
     ],
     [
-      "an acknowledgement landing after the assignment doesn't re-arm it",
-      [stop(1), assigned(2), restarted, stop(3)],
+      "an acknowledgement landing after the current receipt doesn't re-arm it",
+      [stop(1), ready(2), restarted, stop(3)],
       true,
       false,
     ],
@@ -495,8 +554,8 @@ describe("a restart of a start in progress", () => {
 
   it.each<[string, Action[], string | null, boolean]>([
     ["a failure after its stop keeps the stop and names the reason", [stop(1), failed], "Server returned 500.", true],
-    ["a failure after the restart already ended is ignored", [stop(1), assigned(2), failed], null, false],
-    ["the replacement's assignment clears it", [stop(1), failed, assigned(2)], null, false],
+    ["a failure after the restart already ended is ignored", [stop(1), ready(2), failed], null, false],
+    ["the replacement's current receipt clears it", [stop(1), failed, ready(2)], null, false],
     ["the next restart clears it", [stop(1), failed, restarted], null, false],
     ["sending again clears it", [stop(1), failed, { kind: "user_prompt", text: "hi" }], null, true],
   ])("%s", (_label, actions, restartFailure, workerStopped) => {

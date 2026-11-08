@@ -790,8 +790,11 @@ pub(crate) async fn spawn_structured_session(
             if error.is::<crate::session::LaunchIndeterminateCause>() {
                 return Err(error);
             }
-            // Archiving during hooks preserves the row but refuses ACP admission.
+            // Archived rows refuse ACP admission without rollback.
             if !error.is::<crate::session::StartBlocked>() {
+                drop(_guard);
+                drop(_submission);
+                drop(_namespace);
                 rollback(native, instance, false);
                 return Err(error);
             }
@@ -960,6 +963,7 @@ pub(crate) async fn spawn_structured_session(
                                             store: launch_native,
                                             generation,
                                             namespace: Some(spawn_state.profile_namespace.clone()),
+                                            native_scope: None,
                                         },
                                     ),
                                     expected_lifecycle_generation: generation,
@@ -1583,10 +1587,58 @@ mod tests {
         .expect("the session must be released for later operations");
     }
 
-    /// A create that answered has registered every resource the launch owns,
-    /// so a delete issued while its ACP handshake is still unanswered must
-    /// claim the row. Holding the launch reservation for that wait instead made
-    /// the pair unresolvable for as long as the agent took to answer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refused_control_admission_answers_create_without_deadlocking_rollback() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let app_dir = temp.path().join("x".repeat(96));
+        std::fs::create_dir(&app_dir).unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&app_dir);
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let launcher: crate::acp::supervisor::Launcher = Arc::new(|_, _| {
+            Box::pin(async {
+                Err(crate::acp::acp_client::AcpError::Spawn(
+                    "control admission must refuse before Native launch".into(),
+                ))
+            })
+        });
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "refused-control", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::server::api::sessions::create_session(
+                State(Arc::clone(&state)),
+                Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                None,
+                None,
+                Ok(Json(body)),
+            ),
+        )
+        .await
+        .expect("refused control admission must complete rollback")
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        state.shutdown.cancel();
+    }
+
+    /// Creation remains purgeable while its ACP handshake is unanswered.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_created_structured_session_is_purgeable_before_its_handshake_answers() {
@@ -1595,7 +1647,7 @@ mod tests {
         use axum::response::IntoResponse;
         use axum::Json;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();

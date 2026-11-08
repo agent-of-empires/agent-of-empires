@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
-use crate::server::acp_reconciler::install_rate_limit_continuation;
+use crate::server::acp_reconciler::{resume_rate_limited, QuotaResume};
 use crate::server::api::find_instance;
 
 use super::*;
@@ -120,7 +120,7 @@ pub async fn spawn_acp(
         Err(error) => return supervisor_error_response("spawn cancelled", &error),
     };
     // A stop must be able to cancel a launch waiting on either exclusion guard.
-    let exclusion = tokio::select! {
+    let mut exclusion = tokio::select! {
         biased;
         _ = spawn_request.cancellation().cancelled() => {
             return supervisor_error_response(
@@ -158,6 +158,24 @@ pub async fn spawn_acp(
             "error": "creation_not_finalized", "message": "The structured session launch is not finalized",
         }))).into_response();
     }
+    if rate_limit_resume_probe(&state, &id).await.is_some() {
+        let explicit = req.agent.as_deref().or(instance.agent_name.as_deref());
+        let agent = pick_agent(&state, &instance, explicit).await;
+        let submission = exclusion
+            .take_submission()
+            .expect("launch owns prompt submission");
+        drop(exclusion);
+        if let Err(error) = resume_rate_limited(&state, &id, submission, QuotaResume::Manual).await
+        {
+            return supervisor_error_response("quota continuation failed", &error);
+        }
+        return Json(SpawnAcpResponse {
+            session_id: id,
+            agent,
+            status: "running",
+        })
+        .into_response();
+    }
 
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
@@ -186,13 +204,6 @@ pub async fn spawn_acp(
             &SupervisorError::SpawnCancelled(id.clone()),
         );
     }
-    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
-    if spawn_request.cancellation().is_cancelled() {
-        return supervisor_error_response(
-            "spawn cancelled",
-            &SupervisorError::SpawnCancelled(id.clone()),
-        );
-    }
 
     // Explicit resume has settled and consumed only the observed native stop.
 
@@ -201,6 +212,7 @@ pub async fn spawn_acp(
             store: native,
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -236,8 +248,7 @@ pub async fn spawn_acp(
         )
         .await
     {
-        Ok(reservation) => Some(reservation),
-        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => None,
+        Ok(reservation) => reservation,
         Err(e) => return supervisor_error_response("spawn failed", &e),
     };
     if spawn_request.cancellation().is_cancelled() {
@@ -248,42 +259,8 @@ pub async fn spawn_acp(
         );
     }
     drop(exclusion);
-    if let Some(reservation) = reservation {
-        if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
-            return supervisor_error_response("spawn failed", &e);
-        }
-    }
-    if rate_limit_resume_resets_at.is_some() {
-        // Reacquire only for installing the continuation. The guard is not
-        // held while the adapter launch and its hooks run.
-        let exclusion = tokio::select! {
-            biased;
-            _ = spawn_request.cancellation().cancelled() => {
-                return supervisor_error_response(
-                    "spawn cancelled",
-                    &SupervisorError::SpawnCancelled(id.clone()),
-                );
-            }
-            exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true) => exclusion,
-        };
-        if let Ok(mut exclusion) = exclusion {
-            if spawn_request.cancellation().is_cancelled() {
-                return supervisor_error_response(
-                    "spawn cancelled",
-                    &SupervisorError::SpawnCancelled(id.clone()),
-                );
-            }
-            if let Some(submission) = exclusion.take_submission() {
-                let _ = install_rate_limit_continuation(&state, &id, submission).await;
-            }
-        }
-    }
-    if let Some(resets_at) = rate_limit_resume_resets_at {
-        // The manual breadcrumb is the budget's disarm step, so it fires
-        // whether or not a queued prompt superseded the continuation.
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, resets_at, true);
+    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+        return supervisor_error_response("spawn failed", &e);
     }
     Json(SpawnAcpResponse {
         session_id: id,
@@ -579,6 +556,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             store: native,
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -967,6 +945,7 @@ pub async fn switch_acp_agent(
             store: native.clone(),
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         model: model.clone(),
         effort: None,
@@ -1259,6 +1238,7 @@ pub async fn switch_acp_provider(
             store: native,
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         ..spawn_request_for(&updated, agent, sandbox_info)
     };
@@ -1307,6 +1287,7 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+    use crate::session::SessionStore as _;
 
     async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
@@ -1460,7 +1441,7 @@ mod tests {
             &mut crate::server::acp_reconciler::ReapCadence::default(),
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashSet::new(),
-            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashMap::new(),
         )
         .await;
         assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -1550,6 +1531,7 @@ mod tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: resumed.lifecycle_generation,
                 namespace: None,
+                native_scope: None,
             };
             let mut child = crate::acp::supervisor::with_durable_launch(
                 Some(admission),
@@ -1627,6 +1609,9 @@ mod tests {
             )
             .await
             .unwrap();
+            let native_scope = Some(
+                crate::acp::state::NativeObservationScope::capture(&row, native.storage()).unwrap(),
+            );
             state
                 .acp_supervisor
                 .running_lease(&row.id)
@@ -1635,6 +1620,7 @@ mod tests {
                     store: native,
                     generation: row.lifecycle_generation,
                     namespace: Some(state.profile_namespace.clone()),
+                    native_scope,
                 }));
             let gate = crate::server::acp_events::pause_assignment_listener_for_test(&row.id, 1);
             let listener =
@@ -1646,13 +1632,31 @@ mod tests {
             })
             .await
             .expect("listener subscribed");
-            let event = crate::acp::Event::AcpSessionAssigned {
+            let mut event = crate::acp::Event::AcpSessionAssigned {
                 acp_session_id: sid.into(),
+                connection_ready: false,
+                native_subject: None,
             };
+            let subject = crate::acp::state::NativeEventSubject::channel(
+                state
+                    .acp_supervisor
+                    .running_lease(&row.id)
+                    .unwrap()
+                    .native_scope()
+                    .unwrap()
+                    .unwrap()
+                    .context,
+                Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                    &record,
+                )),
+                &event,
+            );
+            event.set_native_subject(subject);
             state.acp_event_store.record(&row.id, 1, &event).unwrap();
             state
                 .acp_events_tx
                 .send(AcpBroadcastFrame {
+                    native_subject: Some(subject),
                     session_id: row.id.clone(),
                     seq: 1,
                     event: Arc::new(event),
@@ -1664,12 +1668,10 @@ mod tests {
                 .await
                 .expect("original tagged assignment reached listener")
                 .unwrap();
-            assert!(
-                state
-                    .acp_supervisor
-                    .is_current_worker_generation(&row.id, old_epoch)
-                    .await
-            );
+            assert!(state
+                .acp_supervisor
+                .running_lease(&row.id)
+                .is_some_and(|lease| lease.epoch() == old_epoch));
 
             let storage = Storage::open_unwatched("default").unwrap();
             let expected_status = if retire {
@@ -1709,12 +1711,10 @@ mod tests {
                     .find(|instance| instance.id == row.id)
                     .unwrap()
                     .mark_idle_dormant();
-                assert!(
-                    state
-                        .acp_supervisor
-                        .is_current_worker_generation(&row.id, old_epoch)
-                        .await
-                );
+                assert!(state
+                    .acp_supervisor
+                    .running_lease(&row.id)
+                    .is_some_and(|lease| lease.epoch() == old_epoch));
                 assert!(runner.try_wait().unwrap().is_none());
                 Status::Running
             };
@@ -1802,6 +1802,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: resumed.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 }),
                 row.id.clone(),
                 || {
@@ -1889,6 +1890,7 @@ mod tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: old_generation,
                 namespace: None,
+                native_scope: None,
             };
             let late_birth = crate::acp::supervisor::with_durable_launch(
                 Some(admission),
@@ -2172,7 +2174,7 @@ mod tests {
                 &mut crate::server::acp_reconciler::ReapCadence::default(),
                 &mut std::collections::HashMap::new(),
                 &mut std::collections::HashSet::new(),
-                &mut std::collections::HashSet::new(),
+                &mut std::collections::HashMap::new(),
             )
             .await;
             assert_eq!(
@@ -2185,6 +2187,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: row.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let rejected = crate::acp::supervisor::with_durable_launch(
                     Some(admission),
@@ -3673,6 +3676,7 @@ mod tests {
             kind: "rate_limit".to_string(),
         };
         let park = |info, cap_reached| RateLimitPark {
+            seq: 1,
             info,
             recorded_at_ms: 0,
             cap_reached,
@@ -3762,6 +3766,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rate_limit_manual_resume_tolerates_an_already_running_worker() {
+        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use crate::acp::Event;
         use crate::session::{Instance, Status, Storage, View};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3774,6 +3780,7 @@ mod tests {
         row.view = View::Structured;
         row.tool = "claude".into();
         row.agent_name = Some("claude".into());
+        row.acp_session_id = Some("same-native-manual-quota".into());
         let id = row.id.clone();
         let mut ordinary_row =
             Instance::new("ordinary running worker", project.path().to_str().unwrap());
@@ -3806,11 +3813,7 @@ mod tests {
             launcher,
         );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
-        state
+        let ordinary_commands = state
             .acp_supervisor
             .test_insert_worker_cmd_recording(&ordinary_id)
             .await;
@@ -3862,6 +3865,52 @@ mod tests {
             .acp_supervisor
             .hydrate_seqs([(id.clone(), state.acp_event_store.highest_seq(&id))]);
         assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
+        let park = state.acp_event_store.rate_limit_park(&id).unwrap();
+        let mut runner = HeldAttachRunner::recording_prompt(
+            &id,
+            project.path(),
+            17,
+            Some("default"),
+            "same-native-manual-quota",
+        )
+        .await;
+        let mut observed = state.acp_events_tx.subscribe();
+        state
+            .acp_supervisor
+            .attach(id.clone(), project.path().into(), Vec::new(), false, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = observed.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned {
+                    acp_session_id,
+                    connection_ready: true,
+                    ..
+                } if acp_session_id == "same-native-manual-quota")
+                {
+                    break;
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runner.resumed_session().await, "same-native-manual-quota");
+        let original = state
+            .acp_supervisor
+            .current_native_availability(&id)
+            .await
+            .unwrap();
+        assert_eq!(original.owner, Some(runner.identity));
+        assert_eq!(
+            state.acp_event_store.rate_limit_park(&id).unwrap().seq,
+            park.seq
+        );
+        let frontier = state.acp_event_store.highest_seq(&id);
 
         let request =
             || -> Result<Json<SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
@@ -3879,6 +3928,41 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.acp_supervisor.is_running(&id).await);
         assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let native_prompt =
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner.next_prompt())
+                .await
+                .unwrap();
+        assert_eq!(native_prompt["sessionId"], "same-native-manual-quota");
+        let native_text = native_prompt["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .map(|block| block["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(native_text, "continue the interrupted work");
+        assert!(state.acp_supervisor.current_lease(&id) == Some(original.lease.clone()));
+        assert_eq!(
+            state
+                .acp_supervisor
+                .current_native_availability(&id)
+                .await
+                .unwrap()
+                .owner,
+            Some(runner.identity)
+        );
+        assert!(crate::process::worker_registry::is_record_live(
+            &runner.record
+        ));
+        let memory = state.instances.read().await;
+        let current = memory.iter().find(|row| row.id == id).unwrap();
+        assert!(current.pending_initial_turn.is_none());
+        assert_eq!(
+            current.acp_session_id.as_deref(),
+            Some("same-native-manual-quota")
+        );
+        drop(memory);
         let stored = Storage::open_unwatched("default")
             .unwrap()
             .load()
@@ -3886,22 +3970,31 @@ mod tests {
             .into_iter()
             .find(|instance| instance.id == id)
             .expect("session remains stored");
+        assert!(stored.pending_initial_turn.is_none());
         assert_eq!(
-            stored
-                .pending_initial_turn
-                .as_ref()
-                .map(|turn| turn.text.as_str()),
-            Some("continue the interrupted work")
+            stored.acp_session_id.as_deref(),
+            Some("same-native-manual-quota")
         );
+        assert!(state.acp_event_store.rate_limit_park(&id).is_none());
         assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
-        assert!(matches!(
-            state
-                .acp_event_store
-                .replay_from(&id, 1)
-                .last()
-                .map(|(_, event)| event),
-            Some(crate::acp::Event::RateLimitAutoResumed { manual: true, .. })
-        ));
+        let delivered = state.acp_event_store.replay_from(&id, frontier);
+        let breadcrumbs = delivered
+            .iter()
+            .filter_map(|(seq, event)| {
+                matches!(event, Event::RateLimitAutoResumed { manual: true, .. }).then_some(*seq)
+            })
+            .collect::<Vec<_>>();
+        let prompts = delivered
+            .iter()
+            .filter_map(|(seq, event)| match event {
+                Event::UserPromptSent { text, .. } => Some((*seq, text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(breadcrumbs.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, "continue the interrupted work");
+        assert!(breadcrumbs[0] < prompts[0].0);
 
         let ordinary_response =
             spawn_acp(State(state.clone()), Path(ordinary_id.clone()), request())
@@ -3914,5 +4007,21 @@ mod tests {
             .replay_from(&ordinary_id, 1)
             .is_empty());
         assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(ordinary_commands.lock().unwrap().is_empty());
+        runner.complete_turn();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = observed.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        state.acp_supervisor.test_remove_worker(&id).await;
+        original.client.shutdown().await.unwrap();
+        state.acp_supervisor.test_remove_worker(&ordinary_id).await;
+        state.shutdown.cancel();
     }
 }

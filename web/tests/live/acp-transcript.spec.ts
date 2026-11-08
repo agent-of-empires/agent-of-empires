@@ -405,7 +405,7 @@ test("the spinner names the compaction phase and hides the force-end hatch", asy
   const spinner = page.getByTestId("acp-working-spinner");
   await expect(spinner).toContainText(/Compaction in progress/i, { timeout: 10_000 });
   await composer.fill("also check the tests");
-  await composer.press("Enter");
+  await page.getByRole("button", { name: "Send message into the current turn", exact: true }).click();
   await expect(page.getByRole("button", { name: /^also check the tests$/ })).toBeVisible({ timeout: 5_000 });
   await expect(spinner).toContainText(/Compaction in progress/i);
   await expect(page.getByText("answered after compaction")).toHaveCount(0);

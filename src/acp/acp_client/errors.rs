@@ -33,6 +33,10 @@ pub enum AcpError {
     AgentExited,
     #[error("client task is not running")]
     NotRunning,
+    #[error("ACP connection is unavailable ({:?}, {:?}, {:?})", .0.source, .0.cause, .0.phase)]
+    ConnectionUnavailable(crate::acp::state::AcpConnectionUnavailability),
+    #[error("{0}; the existing owner has been preserved")]
+    RetainedRuntimeUnavailable(Box<crate::process::worker_registry::ControlAdmissionRefusal>),
     #[error("no pending approval with that nonce")]
     UnknownNonce,
     #[error("agent did not offer a {0:?} option")]
@@ -166,7 +170,7 @@ fn configured_path_source(config: &super::SpawnConfig) -> Option<&'static str> {
     )
 }
 
-/// Build a crate error for a control v3 handshake failure.
+/// Build a crate error for a control handshake failure.
 pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Error {
     let mut err = agent_client_protocol::Error::internal_error();
     err.message = message;
@@ -239,16 +243,8 @@ pub(super) fn prompt_runtime_error(
     crate::acp::state::Event::PromptRuntimeError {
         message: public_error_message(error),
         evidence: Some(evidence),
+        native_subject: None,
     }
-}
-
-pub(super) fn control_transport_closed_error() -> agent_client_protocol::Error {
-    acp_internal_error("runner control channel closed during prompt".into()).data(
-        serde_json::json!({
-            "reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON,
-            "method": "session/prompt",
-        }),
-    )
 }
 
 /// Preserve private code/data for the existing structured classifiers.
@@ -285,6 +281,7 @@ mod tests {
         let crate::acp::state::Event::PromptRuntimeError {
             message,
             evidence: Some(evidence),
+            ..
         } = event
         else {
             panic!("a prompt failure retains its diagnostic and bounded evidence");

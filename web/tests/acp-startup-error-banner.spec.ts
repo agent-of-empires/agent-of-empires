@@ -13,6 +13,7 @@ async function openFailedSession(page: Page) {
   const mock = await mockAcpSession(page, {
     title: "story-startup-error",
     initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+    nativeAvailable: false,
   });
   const disables: string[] = [];
   await page.route("**/api/sessions/*/acp/disable", (r) => {

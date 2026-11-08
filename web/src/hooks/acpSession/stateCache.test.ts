@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyEvent,
   emptyAcpState,
+  nativeInputAvailable,
+  canSubmitPromptIntent,
   type AcpEvent,
   type AcpState,
   type ActivityRow,
@@ -36,17 +38,22 @@ beforeEach(() => localStorage.clear());
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPersistedState", () => {
-  it.each(["pendingElicitations", "oldestSeq", "interactionError"])(
-    "backfills %s missing from an older entry",
-    (field) => {
-      const legacy: Record<string, unknown> = { ...emptyAcpState() };
-      delete legacy[field];
-      writeEntry("legacy", legacy);
-      expect(loadPersistedState("legacy")).toMatchObject({
-        [field]: (emptyAcpState() as unknown as Record<string, unknown>)[field],
-      });
-    },
-  );
+  it.each([
+    "pendingElicitations",
+    "oldestSeq",
+    "interactionError",
+    "connectionReady",
+    "nativeSnapshotSeq",
+    "promptWakeEligible",
+    "connectionUnavailableNotice",
+  ])("backfills %s missing from an older entry", (field) => {
+    const legacy: Record<string, unknown> = { ...emptyAcpState() };
+    delete legacy[field];
+    writeEntry("legacy", legacy);
+    expect(loadPersistedState("legacy")).toMatchObject({
+      [field]: (emptyAcpState() as unknown as Record<string, unknown>)[field],
+    });
+  });
 
   it("preserves stored values", () => {
     const elicitation = { nonce: "e-1", message: "Pick", questions: [], resolved: null };
@@ -71,6 +78,28 @@ describe("loadPersistedState", () => {
     expect(loaded?.lastError).toBe("canonical failure");
     expect(loaded?.lastErrorEvidence).toBeNull();
     expect(loaded?.interactionError).toBeNull();
+  });
+
+  it("never restores native or governed-wake authority from disk or a retained in-memory view", () => {
+    const live = {
+      ...emptyAcpState(),
+      connectionReady: true,
+      nativeSnapshotSeq: 9,
+      promptWakeEligible: true,
+      lastError: "retained diagnostic",
+    };
+    writeEntry("poisoned-authority", live);
+    const disk = loadPersistedState("poisoned-authority")!;
+    expect(nativeInputAvailable(disk)).toBe(false);
+    expect(canSubmitPromptIntent(disk)).toBe(false);
+    expect(disk.lastError).toBe("retained diagnostic");
+    cacheSet("retained-authority", live);
+    const retained = cacheGet("retained-authority")!;
+    expect(nativeInputAvailable(retained)).toBe(false);
+    expect(canSubmitPromptIntent(retained)).toBe(false);
+    expect(retained.lastError).toBe("retained diagnostic");
+    expect(nativeInputAvailable(live)).toBe(true);
+    clearAcpCache("retained-authority");
   });
 });
 

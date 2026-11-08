@@ -208,6 +208,13 @@ impl BetweenPromptTracker {
         self.state().active = false;
     }
 
+    pub(super) fn deactivate_unsuccessful_turn(&self, terminal: &TerminalClaim, turn: u64) {
+        let mut state = self.state();
+        if terminal.failed() && terminal.claimed_turn() == Some(turn) {
+            state.active = false;
+        }
+    }
+
     /// A real prompt supersedes any tracked agent-initiated turn.
     pub(super) fn reset_for_prompt(&self) {
         self.state().reset();

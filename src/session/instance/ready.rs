@@ -169,23 +169,89 @@ impl NativeInputFence {
 
     /// Retain the guard through the native effect acknowledgement, not user hooks or waits.
     pub(crate) fn lock(&self) -> Result<StorageFlock> {
-        let mut cache = self.cache.lock().map_err(|_| NativeInputError::Ownership)?;
+        self.lock_scoped(true)
+    }
+
+    /// Runtime observations compare incarnation, not input or recovery permission.
+    pub(crate) fn lock_observation(&self) -> Result<StorageFlock> {
+        self.lock_scoped(false)
+    }
+
+    /// Additional controller custody may only restrict an observation fence,
+    /// never override its physical profile, creation or generation checks.
+    pub(crate) fn lock_observation_matching(
+        &self,
+        matches: impl FnOnce(&Instance) -> bool,
+    ) -> Result<StorageFlock> {
+        self.lock_scoped_matching(false, matches, false)?
+            .context(NativeInputError::Ownership)
+    }
+
+    pub(crate) fn try_lock_observation_matching(
+        &self,
+        matches: impl FnOnce(&Instance) -> bool,
+    ) -> Result<Option<StorageFlock>> {
+        self.lock_scoped_matching(false, matches, true)
+    }
+
+    fn lock_scoped(&self, input: bool) -> Result<StorageFlock> {
+        self.lock_scoped_matching(input, |_| true, false)?
+            .context(NativeInputError::Ownership)
+    }
+
+    fn lock_scoped_matching(
+        &self,
+        input: bool,
+        matches: impl FnOnce(&Instance) -> bool,
+        nonblocking: bool,
+    ) -> Result<Option<StorageFlock>> {
+        let mut cache = if nonblocking {
+            match self.cache.try_lock() {
+                Ok(cache) => cache,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(NativeInputError::Ownership.into())
+                }
+            }
+        } else {
+            self.cache.lock().map_err(|_| NativeInputError::Ownership)?
+        };
         anyhow::ensure!(!cache.invalidated, NativeInputError::Ownership);
         let result = (|| {
-            let lock = self
-                .store
-                .acquire_lifecycle_lock()
-                .context(NativeInputError::Ownership)?;
+            let lock = if nonblocking {
+                let Some(lock) = self
+                    .store
+                    .try_acquire_lifecycle_lock()
+                    .context(NativeInputError::Ownership)?
+                else {
+                    return Ok(None);
+                };
+                lock
+            } else {
+                self.store
+                    .acquire_lifecycle_lock()
+                    .context(NativeInputError::Ownership)?
+            };
             let revision = self.store.revision().context(NativeInputError::Ownership)?;
             if cache
                 .witness
                 .as_ref()
                 .is_none_or(|witness| witness.revision != revision)
             {
-                let (revision, rows) = self
-                    .store
-                    .load_complete()
-                    .context(NativeInputError::Ownership)?;
+                let (revision, rows) = if nonblocking {
+                    let Some(snapshot) = self
+                        .store
+                        .try_load_complete()
+                        .context(NativeInputError::Ownership)?
+                    else {
+                        return Ok(None);
+                    };
+                    snapshot
+                } else {
+                    self.store
+                        .load_complete()
+                        .context(NativeInputError::Ownership)?
+                };
                 let mut matching = rows.into_iter().filter(|row| row.id == self.instance_id);
                 let row = matching.next().ok_or(NativeInputError::Ownership)?;
                 anyhow::ensure!(matching.next().is_none(), NativeInputError::Ownership);
@@ -196,20 +262,29 @@ impl NativeInputFence {
                 .as_ref()
                 .ok_or(NativeInputError::Ownership)?
                 .row;
-            anyhow::ensure!(
-                row.created_at == self.created_at
-                    && row.lifecycle_generation == self.lifecycle_generation
-                    && row.source_profile == self.store.profile()
-                    && !row.has_fresh_lifecycle_reservation(Utc::now()),
-                LifecycleReservationError::Superseded
-            );
-            if self.agent {
+            let same_context = row.created_at == self.created_at
+                && row.lifecycle_generation == self.lifecycle_generation
+                && row.source_profile == self.store.profile();
+            if !same_context {
+                cache.invalidated = true;
+                return Err(LifecycleReservationError::Superseded.into());
+            }
+            anyhow::ensure!(matches(row), LifecycleReservationError::Superseded);
+            if !input {
+                anyhow::ensure!(row.is_structured(), LifecycleReservationError::Superseded);
+            } else {
+                anyhow::ensure!(
+                    !row.has_fresh_lifecycle_reservation(Utc::now()),
+                    LifecycleReservationError::Superseded
+                );
+            }
+            if input && self.agent {
                 row.ensure_startable()?;
                 anyhow::ensure!(!row.is_structured(), NativeInputError::AgentNotReady);
             }
-            Ok(lock)
+            Ok(Some(lock))
         })();
-        if result.is_err() {
+        if input && result.is_err() {
             cache.invalidated = true;
         }
         result

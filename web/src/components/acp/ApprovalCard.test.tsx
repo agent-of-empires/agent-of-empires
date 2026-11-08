@@ -51,7 +51,7 @@ function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "
 }
 
 function mount(approval: Approval, onResolve = vi.fn().mockResolvedValue(undefined)) {
-  render(<ApprovalCard approval={approval} onResolve={onResolve} />);
+  render(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
   return onResolve;
 }
 
@@ -166,6 +166,32 @@ describe("ApprovalCard decisions", () => {
       fireEvent.mouseUp(button);
       expect(onResolve).not.toHaveBeenCalled();
       hold(button, 800);
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
+    });
+
+    it("requires a new full hold after permission is withdrawn and regranted", () => {
+      const approval = makeApproval({ destructive: true });
+      const onResolve = vi.fn().mockResolvedValue(undefined);
+      const { rerender } = render(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      const button = screen.getByRole("button", { name: "Hold to allow" }) as HTMLButtonElement;
+      hold(button, 400);
+      rerender(<ApprovalCard approval={approval} canDecide={false} onResolve={onResolve} />);
+      expect(button.disabled).toBe(true);
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      rerender(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      expect(button.disabled).toBe(false);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+
+      hold(button, 799);
+      expect(onResolve).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
       expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
     });
 
@@ -444,10 +470,10 @@ describe("ApprovalCard plan viewer", () => {
     const { container } = render(
       <>
         <div data-testid="covered" inert>
-          <ApprovalCard approval={covered} onResolve={vi.fn()} />
+          <ApprovalCard approval={covered} canDecide onResolve={vi.fn()} />
         </div>
         <div data-testid="active">
-          <ApprovalCard approval={active} onResolve={vi.fn()} />
+          <ApprovalCard approval={active} canDecide onResolve={vi.fn()} />
         </div>
       </>,
     );
@@ -508,7 +534,7 @@ describe("ApprovalCard plan viewer", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(
       <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
-        <ApprovalCard approval={makeApproval({ plan: "see LINK" })} onResolve={onResolve} />
+        <ApprovalCard approval={makeApproval({ plan: "see LINK" })} canDecide onResolve={onResolve} />
       </AcpFileRefContext.Provider>,
     );
     fireEvent.click(screen.getByText("View plan"));
