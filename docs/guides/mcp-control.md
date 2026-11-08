@@ -11,7 +11,21 @@ The server is off by default. Turn on the **MCP server** toggle in Settings, or 
 mcp_enabled = true
 ```
 
-The daemon reads the setting at startup, so restart it afterwards with `aoe serve --restart`, or start one with `aoe serve --daemon`. It then serves MCP over Streamable HTTP at `/mcp` on the same port as the dashboard and API.
+The daemon reads this global setting at startup. With it enabled, a fresh CLI or TUI acquisition opens the existing TCP API on loopback with token authentication, unless the registered `aoe.web` plugin is disabled. This includes MCP over Streamable HTTP at `/mcp`. Builds with the `web` Cargo feature also serve the dashboard. It does not request a LAN bind or a tunnel. Passphrase and CityHall protections still apply.
+
+The private local runtime and `aoe plugin enable aoe.web` remain available while that plugin is disabled. Re-enabling it does not promote an existing private daemon. With readable global configuration, explicit TCP starts remain rejected until the plugin is enabled.
+
+For an already-running TCP daemon, use `aoe serve --restart` to apply the setting. Restart preserves the recorded launch mode: it does not promote a core-only daemon. To enable TCP on a running core-only daemon, explicitly run `aoe serve --daemon`. This replaces the managed daemon and disconnects its clients; reconnect them afterwards.
+
+### When configured TCP cannot start
+
+A configured TCP startup failure is reported without automatically starting a core-only daemon. For example, an occupied listener port makes CLI reads fail and leaves the TUI disconnected. AoE does not silently drop the configured MCP service to keep local reads working.
+
+Free the port or repair the reported startup failure, then retry the CLI command or press `r` in the TUI to reconnect.
+
+If global settings or application state cannot be loaded, fresh automatic acquisition fails instead of choosing default service settings. Explicit serving and restart retain their selected launch mode and existing configuration-recovery behavior. Explicit TCP recovery may use default runtime settings, including when an unreadable configuration contains a Web-disable setting. Use `--core-only` for recovery without TCP.
+
+To work intentionally without TCP, run `aoe serve --core-only --daemon`, then retry the command or reconnect the TUI. MCP remains unavailable on that daemon. Restart preserves core-only mode; after freeing the port, run `aoe serve --daemon` to explicitly promote it back to TCP.
 
 ## Connect an agent
 

@@ -484,17 +484,27 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
+    let inst = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .context("session disappeared before archive")?;
+    anyhow::ensure!(
+        !inst.has_pending_trash(),
+        crate::session::LifecycleReservationError::Busy(crate::session::LifecycleOperation::Trash)
+    );
     if !args.no_kill {
-        let inst = storage
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .context("session disappeared before archive")?;
         inst.kill_all_tmux_sessions_locked()?;
     }
 
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
+            anyhow::ensure!(
+                !stored.has_pending_trash(),
+                crate::session::LifecycleReservationError::Busy(
+                    crate::session::LifecycleOperation::Trash
+                )
+            );
             stored.archive();
             stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
             Ok(true)
@@ -3354,6 +3364,40 @@ mod session_mutation_tests {
             .into_iter()
             .find(|row| row.id == id)
             .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn archive_preserves_unfinished_trash_before_teardown() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("unfinished trash", "/tmp/unfinished-trash");
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        row.trash();
+        let (storage, id) = seed("archive-debt", row);
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        for no_kill in [false, true] {
+            let error = super::archive_session(
+                "archive-debt",
+                super::ArchiveArgs {
+                    identifier: id.clone(),
+                    no_kill,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                Some(crate::session::LifecycleReservationError::Busy(
+                    crate::session::LifecycleOperation::Trash
+                ))
+            ));
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        }
     }
 
     #[tokio::test]

@@ -28,6 +28,23 @@ pub enum Tone {
     Danger,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgePresentation {
+    #[default]
+    Text,
+    Glyph,
+}
+
+impl BadgePresentation {
+    pub(crate) fn separator_width(self) -> usize {
+        match self {
+            Self::Text => 2,
+            Self::Glyph => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SortDirection {
@@ -80,6 +97,8 @@ struct BadgeItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    presentation: Option<BadgePresentation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tone: Option<Tone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     href: Option<String>,
@@ -101,6 +120,8 @@ struct RowBadgePayload {
     tooltip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    presentation: Option<BadgePresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     href: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,6 +693,13 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             if parsed.text.is_none() && parsed.items.is_none() {
                 return Err("badge requires text or items".into());
             }
+            if raw
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.get("presentation").is_some()))
+            {
+                return Err("presentation is only supported for row badges".into());
+            }
             check_badge_groups(parsed.items.as_deref().unwrap_or_default())?;
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
@@ -879,6 +907,34 @@ mod tests {
                 UiSlot::RowBadge,
                 Some("s1"),
                 json!({"text": "x", "tone": "rainbow"}),
+                false,
+            ),
+            (
+                "unknown row badge presentation rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"text": "x", "presentation": "compact"}),
+                false,
+            ),
+            (
+                "unknown item presentation rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [{"text": "x", "presentation": "compact"}]}),
+                false,
+            ),
+            (
+                "row columns do not accept presentation",
+                UiSlot::RowColumn,
+                Some("s1"),
+                json!({"text": "x", "presentation": "glyph"}),
+                false,
+            ),
+            (
+                "non-row badge items reject presentation",
+                UiSlot::StatusBar,
+                None,
+                json!({"items": [{"text": "x", "presentation": "glyph"}]}),
                 false,
             ),
             (
@@ -1169,6 +1225,24 @@ mod tests {
             s.remove("acme.kit", g, UiSlot::RowBadge, "x", None),
             Err(UiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn row_badge_presentations_survive_validation() {
+        let payload = json!({
+            "text": "⇄", "presentation": "glyph",
+            "items": [
+                {"text": "✓", "presentation": "glyph"},
+                {"text": "Open", "presentation": "text"},
+                {"text": "Default"}
+            ]
+        });
+        assert_eq!(
+            validate_payload(UiSlot::RowBadge, &payload).unwrap(),
+            payload
+        );
+        let top = json!({"text": "Open", "presentation": "text"});
+        assert_eq!(validate_payload(UiSlot::RowBadge, &top).unwrap(), top);
     }
 
     #[test]
