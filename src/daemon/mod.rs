@@ -188,6 +188,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::LifecycleLocked) => {
             "Session is busy with another operation; nothing changed, retry when it finishes".into()
         }
+        Some(ApiErrorCode::TrashIncomplete) => {
+            "Trash is in progress or unfinished; if interrupted, retry `aoe rm <id>` before another lifecycle action".into()
+        }
         Some(ApiErrorCode::LifecycleSuperseded) => {
             "Session changed after it was selected; it may be partly processed, refresh and check before retrying".into()
         }
@@ -1033,6 +1036,7 @@ impl DaemonClient {
                 code,
                 Some(
                     ApiErrorCode::LifecycleLocked
+                        | ApiErrorCode::TrashIncomplete
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::SandboxMigrationDeferred

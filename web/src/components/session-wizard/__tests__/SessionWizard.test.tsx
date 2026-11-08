@@ -190,6 +190,7 @@ describe("SessionWizard structured view payload", () => {
   });
 
   it.each([
+    ["auto", "structured"],
     ["terminal", "terminal"],
     ["structured", "structured"],
     ["off", "terminal"],

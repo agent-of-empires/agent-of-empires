@@ -90,6 +90,8 @@ aoe plugin update my-plugin        # re-runs the build, re-approves changed gran
 aoe plugin uninstall my-plugin
 ```
 
+To work on a plugin whose id is in a reserved namespace (`aoe.*`, `agent-of-empires.*`), install the checkout with `--dev`. TypeScript plugins can run Node through `AOE_NODE`, which build steps and workers receive.
+
 Drive the worker by hand before installing, to confirm the protocol:
 
 ```sh
