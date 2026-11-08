@@ -138,6 +138,8 @@ Direct `aoe session start` keeps its separate policy: it may retry a previously 
 
 Terminal handoff additionally requires the created pane's physical receipt before finalizing projection cleanup. Missing birth evidence returns a non-destructive refusal, preserving the actual terminal, `TerminalLaunchOwed` intent and retained projection for inspection or explicit recovery.
 
+A direct-start indeterminate refusal releases only its captured, still-owned Launch reservation, without cleanup or changes to the pending handoff. After an unrelated split is removed, an immediate explicit retry is not held by that refused start. A superseding generation keeps its own reservation; failed release preserves the refusal and runtime rather than granting teardown authority.
+
 An explicit pin or fork that migration left unqualified resumes against the store current configuration resolves. Agents that resolve their store or transcript before that check still refuse, for the reasons listed in [Supported managed contexts](#supported-managed-contexts). An armed pin is the exception to the rule above: no capture qualifies the binding it names.
 
 An agent that publishes its own conversation spends the pin at launch; its recorded binding remains unqualified until a capture qualifies it. A spent pin follows the `Default` failed-probe policy above. An agent without such a publisher keeps its persistent `Use` pin armed, including after a failed probe; that pin remains retryable without another assertion. Each retry still validates the resolved execution context and any qualified binding. A dispatched fork is always spent, whether or not it resumes. `set-session-id` is the only way to assert a store without launching:

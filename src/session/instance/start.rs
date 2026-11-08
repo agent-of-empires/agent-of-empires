@@ -276,6 +276,27 @@ impl Instance {
         })();
         if let Err(error) = result {
             if error.is::<LaunchIndeterminateCause>() {
+                let released = storage.update(|rows, _| {
+                    Ok(rows
+                        .iter_mut()
+                        .find(|row| row.id == self.id)
+                        .is_some_and(|row| {
+                            row.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Launch,
+                                generation,
+                            )
+                        }))
+                });
+                match released {
+                    Ok(true) if self.lifecycle_generation == generation => {
+                        self.lifecycle_reservation = None;
+                    }
+                    Ok(_) => {}
+                    Err(release) => {
+                        tracing::warn!(target: "session.store", session = %self.id, %release,
+                            "indeterminate direct-start reservation release failed; runtime and handoff retained");
+                    }
+                }
                 return Err(error);
             }
             self.fail_reserved_launch(storage, generation, &error, handoff.is_none());
