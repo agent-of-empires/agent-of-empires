@@ -6,6 +6,7 @@ import { TerminalView } from "./TerminalView";
 
 interface Props {
   readOnly: boolean;
+  recoveryCurrentIds?: readonly string[];
   active?: boolean;
   activeSessionId: string;
   sessions: SessionResponse[];
@@ -15,6 +16,7 @@ interface Props {
 
 export function TerminalSessionStack({
   readOnly,
+  recoveryCurrentIds,
   active = true,
   activeSessionId,
   sessions,
@@ -44,7 +46,12 @@ export function TerminalSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView session={session} readOnly={readOnly} active={active && selected} />
+            <TerminalView
+              session={session}
+              readOnly={readOnly}
+              active={active && selected}
+              recoveryCurrent={recoveryCurrentIds?.includes(session.id) === true}
+            />
           </div>
         );
       })}

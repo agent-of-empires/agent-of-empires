@@ -72,6 +72,7 @@ impl McpServer {
             }),
             group: params.group,
             children_of: params.children_of,
+            profile: None,
         };
         list_sessions_envelope(&self.state, filter)
             .await

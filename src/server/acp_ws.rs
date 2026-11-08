@@ -490,6 +490,7 @@ struct ConnectionFolds<'a> {
 struct ColdFieldCache {
     hashes: std::collections::HashMap<&'static str, u64>,
     native: Option<crate::acp::state::NativeAvailabilityProjection>,
+    recovery: Option<Option<crate::session::SessionRecovery>>,
     rate_limit_park: Option<&'static str>,
     original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
     snapshot_seq: u64,
@@ -583,10 +584,26 @@ async fn send_native_state(
         )
         .await;
     let contended = observation.is_contended();
+    let mut sampled_recovery = match current_recovery_projection(
+        owner,
+        session_id,
+        reduced,
+        observation.projection,
+        !contended && !owner.read_only && !owner.cityhall_mode,
+    )
+    .await
+    {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            warn!(target: "acp.ws", %error, "read recovery projection");
+            return false;
+        }
+    };
     if contended {
         let original = crate::acp::control_cache::OriginalDecisions::default();
         if (cold.native != Some(observation.projection)
             || cold.rate_limit_park != park
+            || cold.recovery.as_ref() != Some(&sampled_recovery)
             || !cold.original_decision_nonces.is_empty())
             && !send_projected_reduced_state(
                 socket,
@@ -598,6 +615,7 @@ async fn send_native_state(
                     native: observation.projection,
                     rate_limit_park: park,
                     original: &original,
+                    recovery: sampled_recovery.take(),
                 },
             )
             .await
@@ -622,6 +640,7 @@ async fn send_native_state(
         && cold.native == Some(observation.projection)
         && cold.rate_limit_park == park
         && cold.original_decision_nonces == original.nonces
+        && cold.recovery.as_ref() == Some(&sampled_recovery)
     {
         return true;
     }
@@ -645,6 +664,25 @@ async fn send_native_state(
             }
         };
     }
+    let recovery = if contended {
+        match current_recovery_projection(
+            owner,
+            session_id,
+            reduced,
+            native,
+            !owner.read_only && !owner.cityhall_mode,
+        )
+        .await
+        {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                warn!(target: "acp.ws", %error, "refresh recovery projection");
+                return false;
+            }
+        }
+    } else {
+        sampled_recovery
+    };
     send_projected_reduced_state(
         socket,
         session_id,
@@ -655,9 +693,35 @@ async fn send_native_state(
             native,
             rate_limit_park: park,
             original: &original,
+            recovery,
         },
     )
     .await
+}
+
+async fn current_recovery_projection(
+    owner: &AppState,
+    session_id: &str,
+    reduced: &AcpState,
+    native: crate::acp::state::NativeAvailabilityProjection,
+    mutations: bool,
+) -> anyhow::Result<Option<crate::session::SessionRecovery>> {
+    let row = owner
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == session_id)
+        .cloned();
+    match row {
+        Some(row) => {
+            owner
+                .session_service
+                .recovery_projection(&row, Some(reduced.clone()), native, mutations)
+                .await
+        }
+        None => Ok(None),
+    }
 }
 
 fn projected_rate_limit_park(
@@ -681,6 +745,7 @@ struct LiveControlProjection<'a> {
     native: crate::acp::state::NativeAvailabilityProjection,
     rate_limit_park: Option<&'static str>,
     original: &'a crate::acp::control_cache::OriginalDecisions,
+    recovery: Option<crate::session::SessionRecovery>,
 }
 
 async fn send_projected_reduced_state(
@@ -695,6 +760,7 @@ async fn send_projected_reduced_state(
         native,
         rate_limit_park,
         original,
+        recovery,
     } = projection;
     let mut state = match project_control_state(reduced, cold.projection) {
         Ok(v) => v,
@@ -707,6 +773,7 @@ async fn send_projected_reduced_state(
     state["connection_unavailable"] = serde_json::json!(native.unavailable);
     state["prompt_wake_eligible"] = serde_json::json!(native.prompt_wake_eligible);
     state["rate_limit_park"] = serde_json::json!(rate_limit_park);
+    state["recovery"] = serde_json::json!(recovery);
     let channel_loss = native
         .unavailable
         .is_some_and(|unavailable| unavailable.source.is_channel_loss());
@@ -752,6 +819,7 @@ async fn send_projected_reduced_state(
     cold.original_decision_nonces.clone_from(&original.nonces);
     cold.native = Some(native);
     cold.rate_limit_park = rate_limit_park;
+    cold.recovery = Some(recovery);
     let seq = seq.max(cold.snapshot_seq).max(reduced.last_seq);
     cold.snapshot_seq = seq;
     let unchanged = cold.strip_unchanged(&mut state);

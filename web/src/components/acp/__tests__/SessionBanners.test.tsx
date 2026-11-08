@@ -545,7 +545,7 @@ describe("StartupWaitLine", () => {
           state={state}
           startingAgent={isNewSessionStarting(state, connection, "resuming", false) ? "Claude Code" : null}
           canRestart
-          onRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
+          onStartupRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
           onRestartFailed={(epoch, message, stoppedSent) =>
             send({ kind: "restart_failed", epoch, message, stoppedSent })
           }
@@ -685,5 +685,46 @@ describe("SessionBanners startup line", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
     expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
     expect(screen.queryByTestId("startup-wait-restart-cost") !== null).toBe(canRestart);
+  });
+
+  it("never offers legacy startup Restart over a canonical recovery selection", () => {
+    vi.useFakeTimers();
+    const state = emptyAcpState();
+    state.recovery = {
+      reason: "operation_failed",
+      diagnostic: "The provider could not complete this operation.",
+      evidence: {
+        source: "local_prompt_result",
+        operation: "prompt",
+        runtime: "unknown",
+        blocking_scope: "operation",
+        retryable: true,
+        reported_code: -32603,
+        observed_at_ms: 10,
+      },
+      runtime: "acp_transport_ready",
+      work_in_progress: false,
+      uncertainty: null,
+      guidance: "Repair the provider configuration before composing a new operation.",
+      actions: { attach: true, retry_operation: true, restart_same: false, stop: false, fresh: false },
+      expected: "original-selection",
+    };
+    render(
+      <SessionBanners
+        sessionId="s1"
+        state={state}
+        startingAgent="Claude Code"
+        canRestart
+        recoveryCurrent
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(31_000));
+    expect(screen.queryByTestId("startup-wait-restart")).toBeNull();
+    expect((screen.getByTestId("session-recovery-restart-same") as HTMLButtonElement).disabled).toBe(true);
   });
 });

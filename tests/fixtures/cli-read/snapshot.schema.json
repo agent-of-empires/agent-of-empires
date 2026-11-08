@@ -243,6 +243,139 @@
         "branch": { "type": "string" }
       }
     },
+    "runtime_evidence": {
+      "description": "RuntimeEvidence in src/session/instance/status.rs. ACP transport readiness and closure describe the channel, not native OS-process liveness or authority to retry.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["unknown", "pane_alive", "acp_transport_closed", "acp_transport_ready"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pane_exited"],
+          "properties": {
+            "pane_exited": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "exit_code": {
+                  "type": ["integer", "null"],
+                  "minimum": -2147483648,
+                  "maximum": 2147483647
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "error_evidence_generation": {
+      "description": "ErrorEvidenceGeneration in src/session/instance/status.rs. Terminal lifecycle generations and ACP worker epochs are distinct namespaces.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["terminal_lifecycle"],
+          "properties": {
+            "terminal_lifecycle": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["acp_worker"],
+          "properties": {
+            "acp_worker": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        }
+      ]
+    },
+    "operation_error_evidence": {
+      "description": "OperationErrorEvidence in src/session/instance/status.rs. Missing metadata is unknown; absent or null retryability never grants retry permission.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "operation", "observed_at_ms"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["terminal_text", "tmux_observation", "local_prompt_result", "runner_completion", "transcript_recovery"]
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["prompt", "context_reset", "terminal_observation"]
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime_evidence",
+          "default": "unknown"
+        },
+        "origin": {
+          "enum": ["tmux_observation", "acp_transport", null]
+        },
+        "blocking_scope": {
+          "enum": ["operation", "runtime", null]
+        },
+        "retryable": { "type": ["boolean", "null"] },
+        "reported_code": {
+          "type": ["integer", "null"],
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "observed_at_ms": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "generation": {
+          "oneOf": [{ "$ref": "#/$defs/error_evidence_generation" }, { "type": "null" }]
+        }
+      }
+    },
+    "recovery_actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attach", "retry_operation", "restart_same", "stop", "fresh"],
+      "properties": {
+        "attach": { "type": "boolean" },
+        "retry_operation": { "type": "boolean" },
+        "restart_same": { "type": "boolean" },
+        "stop": { "type": "boolean" },
+        "fresh": { "type": "boolean" }
+      }
+    },
+    "session_recovery": {
+      "description": "SessionRecovery in src/session/projection.rs. This optional read projection is ephemeral; missing projection or metadata is unknown, and explicit null clears the projection.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "diagnostic", "runtime", "work_in_progress", "guidance", "actions", "expected"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": ["operation_failed", "channel_unavailable", "probe_failed", "identity_unattested", "runtime_exited", "observation_unknown"]
+        },
+        "diagnostic": { "type": "string" },
+        "evidence": {
+          "oneOf": [{ "$ref": "#/$defs/operation_error_evidence" }, { "type": "null" }]
+        },
+        "runtime": { "$ref": "#/$defs/runtime_evidence" },
+        "work_in_progress": { "type": "boolean" },
+        "uncertainty": { "type": ["string", "null"] },
+        "guidance": { "type": "string" },
+        "actions": { "$ref": "#/$defs/recovery_actions" },
+        "expected": {
+          "description": "Opaque server-issued concurrency selection token, not Native authority. May be empty when observation is unavailable and all writes are refused.",
+          "type": "string"
+        }
+      }
+    },
     "session_read": {
       "type": "object",
       "additionalProperties": false,
@@ -303,6 +436,12 @@
         },
         "last_error": {
           "type": ["string", "null"]
+        },
+        "last_error_evidence": {
+          "oneOf": [{ "$ref": "#/$defs/operation_error_evidence" }, { "type": "null" }]
+        },
+        "recovery": {
+          "oneOf": [{ "$ref": "#/$defs/session_recovery" }, { "type": "null" }]
         },
         "archived_at": {
           "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]

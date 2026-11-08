@@ -7,6 +7,8 @@ const drafts = new Map<string, string>();
 interface Props {
   readOnly: boolean;
   draftKey: string;
+  /** Explicit recovery composition starts empty and never loads or overwrites a saved draft. */
+  freshDraft?: boolean;
   /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
   /** Whether the pane will receive the text. */
@@ -18,10 +20,17 @@ interface Props {
  * A native textarea for writing a prompt with autocorrect, dictation, and long-press paste, delivered as one paste.
  * It is uncontrolled so a React re-render never rewrites text iOS dictation is still inserting.
  */
-export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit, onClose }: Props) {
+export function TerminalComposeSheet({
+  draftKey,
+  bottomInset,
+  readOnly,
+  freshDraft = false,
+  onSubmit,
+  onClose,
+}: Props) {
   const textRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
-  const [empty, setEmpty] = useState(() => !drafts.get(draftKey)?.trim());
+  const [empty, setEmpty] = useState(() => freshDraft || !drafts.get(draftKey)?.trim());
 
   const grow = useCallback(() => {
     const ta = textRef.current;
@@ -42,7 +51,7 @@ export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit
   const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
     if (readOnly || !text.trim() || !onSubmit(text, submit)) return;
-    drafts.delete(draftKey);
+    if (!freshDraft) drafts.delete(draftKey);
     // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
     if (!keepTyping) textRef.current?.blur();
     onClose(keepTyping);
@@ -87,12 +96,12 @@ export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit
         <textarea
           ref={textRef}
           aria-label="Message"
-          defaultValue={drafts.get(draftKey) ?? ""}
+          defaultValue={freshDraft ? "" : (drafts.get(draftKey) ?? "")}
           placeholder="Type, dictate, or long-press to paste"
           rows={2}
           onInput={(e) => {
             const value = e.currentTarget.value;
-            drafts.set(draftKey, value);
+            if (!freshDraft) drafts.set(draftKey, value);
             setEmpty(!value.trim());
             grow();
           }}

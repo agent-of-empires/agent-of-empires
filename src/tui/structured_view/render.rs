@@ -40,6 +40,15 @@ pub fn render(
     // Keep the previous window start so hover cannot scroll rows away.
     let prev_picker = state.mouse_targets.take().picker;
 
+    if let Some(recovery) = state.transcript.recovery.as_ref() {
+        crate::tui::components::preview::render_session_recovery(
+            frame,
+            layout.recovery,
+            recovery,
+            state.transcript.recovery_current && state.ws.is_some(),
+            theme,
+        );
+    }
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);
     render_status(frame, layout.status, theme, state, active);
     if layout.approval.height > 0 {
@@ -220,24 +229,35 @@ fn render_popup_above(
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
     let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
+    let notices_height = notices_strip_height(state);
+    let composer_height = composer_height(state);
+    let recovery_height = if state.transcript.recovery.is_some() {
+        area.height
+            .saturating_sub(approval_height + notices_height + queue_height + composer_height + 6)
+            .min(crate::tui::components::preview::RECOVERY_BANNER_ROWS)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(recovery_height),
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(notices_strip_height(state)), // 0 when none
-            Constraint::Length(queue_height),                // queued prompts strip (0 when empty)
-            Constraint::Length(composer_height(state)),
+            Constraint::Length(notices_height),
+            Constraint::Length(queue_height),
+            Constraint::Length(composer_height),
             Constraint::Length(1), // status line
         ])
         .split(area);
     ViewLayout {
-        transcript: chunks[0],
-        approval: chunks[1],
-        notices: chunks[2],
-        queue: chunks[3],
-        composer: chunks[4],
-        status: chunks[5],
+        recovery: chunks[0],
+        transcript: chunks[1],
+        approval: chunks[2],
+        notices: chunks[3],
+        queue: chunks[4],
+        composer: chunks[5],
+        status: chunks[6],
     }
 }
 

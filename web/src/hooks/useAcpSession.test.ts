@@ -4,7 +4,7 @@ import { act, renderHook } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, nativeInputAvailable } from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable, type SessionRecovery } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";
@@ -62,6 +62,122 @@ async function openSession(...args: HookArgs) {
 }
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
+
+it("never wakes or queues an explicit recovery retry after refusal, lost Native input, or changed selection", async () => {
+  calls = installAcpFakes(({ method, url }) =>
+    method === "POST" && url.endsWith("/acp/prompt")
+      ? new Response("worker_not_ready: existing Agent unavailable", { status: 503 })
+      : undefined,
+  );
+  const { result, unmount } = await openSession("retry-existing", "running", null, "2099-01-01T00:00:00Z");
+  const projection: SessionRecovery = {
+    reason: "operation_failed",
+    diagnostic: "Provider rejected the operation.",
+    evidence: null,
+    runtime: "acp_transport_ready",
+    work_in_progress: false,
+    uncertainty: null,
+    guidance: "Use explicit input without revival.",
+    actions: { attach: true, retry_operation: true, restart_same: false, stop: true, fresh: false },
+    expected: "selection-a",
+  };
+  const receipt = (recovery: SessionRecovery, ready = true) => {
+    const snapshot = currentControlSnapshot(result.current.state, { ready, wakeEligible: !ready });
+    lastSocket().message({ ...snapshot, state: { ...snapshot.state, recovery } });
+  };
+  receipt(projection);
+  await flushAsync();
+  await act(async () =>
+    expect(await result.current.retryOperation("explicit new input", undefined, "selection-a")).toBe(false),
+  );
+  expect(posts("/acp/prompt")).toHaveLength(1);
+  expect(posts("/queue")).toEqual([]);
+  expect(calls.filter((call) => call.method === "PATCH" && call.url.endsWith("/snooze"))).toEqual([]);
+  for (const [current, ready] of [
+    [{ ...projection, expected: "selection-b" }, true],
+    [{ ...projection, work_in_progress: true, actions: { ...projection.actions, retry_operation: false } }, true],
+    [projection, false],
+  ] as const) {
+    receipt(current, ready);
+    await flushAsync();
+    await act(async () =>
+      expect(await result.current.retryOperation("must not dispatch", undefined, "selection-a")).toBe(false),
+    );
+  }
+  expect(posts("/acp/prompt")).toHaveLength(1);
+  expect(posts("/queue")).toEqual([]);
+  expect(calls.filter((call) => call.method === "PATCH" && call.url.endsWith("/snooze"))).toEqual([]);
+  unmount();
+});
+
+it("keeps explicit recovery retry single-flight until acceptance, then rechecks each later selection", async () => {
+  const heldResponse = Promise.withResolvers<Response>();
+  const requestStarted = Promise.withResolvers<void>();
+  let holdResponse = true;
+  calls = installAcpFakes(({ method, url }) => {
+    if (method !== "POST" || !url.endsWith("/acp/prompt")) return undefined;
+    requestStarted.resolve();
+    return holdResponse ? heldResponse.promise : json({ disposition: "sent" }, 202);
+  });
+  const { result, unmount } = await openSession("retry-single-flight");
+  const projection: SessionRecovery = {
+    reason: "operation_failed",
+    diagnostic: "Provider rejected the operation.",
+    evidence: null,
+    runtime: "acp_transport_ready",
+    work_in_progress: false,
+    uncertainty: null,
+    guidance: "Use explicit input without revival.",
+    actions: { attach: true, retry_operation: true, restart_same: false, stop: true, fresh: false },
+    expected: "selection-a",
+  };
+  const receipt = (expected: string) => {
+    const snapshot = currentControlSnapshot(result.current.state, { ready: true });
+    lastSocket().message({ ...snapshot, state: { ...snapshot.state, recovery: { ...projection, expected } } });
+  };
+  receipt("selection-a");
+  await flushAsync();
+  const retry = result.current.retryOperation;
+  let first!: Promise<boolean>;
+  let duplicate!: Promise<boolean>;
+  act(() => {
+    first = retry("explicit input", undefined, "selection-a");
+    duplicate = retry("explicit input", undefined, "selection-a");
+  });
+  await act(async () => {
+    await requestStarted.promise;
+    expect(await duplicate).toBe(false);
+  });
+  expect(posts("/acp/prompt")).toHaveLength(1);
+  expect(JSON.parse(posts("/acp/prompt")[0]!.body!)).toMatchObject({
+    text: "explicit input",
+    prompt_id: expect.any(String),
+    no_revive: true,
+  });
+
+  receipt("selection-b");
+  await act(async () => {
+    holdResponse = false;
+    heldResponse.resolve(json({ disposition: "sent" }, 202));
+    expect(await first).toBe(true);
+  });
+  await act(async () => {
+    expect(await retry("stale input", undefined, "selection-a")).toBe(false);
+  });
+  expect(posts("/acp/prompt")).toHaveLength(1);
+  expect(posts("/queue")).toEqual([]);
+  expect(calls.filter((call) => call.method === "PATCH" && call.url.endsWith("/snooze"))).toEqual([]);
+
+  await act(async () => {
+    expect(await result.current.retryOperation("later explicit input", undefined, "selection-b")).toBe(true);
+  });
+  expect(posts("/acp/prompt")).toHaveLength(2);
+  expect(JSON.parse(posts("/acp/prompt")[1]!.body!)).toMatchObject({
+    text: "later explicit input",
+    no_revive: true,
+  });
+  unmount();
+});
 
 describe("Original decision authority", () => {
   it.each(["approval", "elicitation"] as const)(

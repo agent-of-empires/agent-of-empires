@@ -235,6 +235,11 @@ pub(super) fn public_error_message(error: &agent_client_protocol::Error) -> Stri
     message
 }
 
+/// Apply the existing public prompt-error scrubber to an already folded diagnostic.
+pub(crate) fn public_diagnostic(message: &str) -> String {
+    public_error_message(&agent_client_protocol::Error::new(-32603, message))
+}
+
 pub(super) fn prompt_runtime_error(
     error: &agent_client_protocol::Error,
     source: crate::session::ErrorEvidenceSource,

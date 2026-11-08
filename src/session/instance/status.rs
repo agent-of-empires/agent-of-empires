@@ -30,6 +30,24 @@ pub enum RuntimeEvidence {
         exit_code: Option<i32>,
     },
     AcpTransportClosed,
+    /// Only a current qualified ACP channel observation, not native OS-process liveness.
+    AcpTransportReady,
+}
+
+impl RuntimeEvidence {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Unknown => {
+                "Runtime observation unknown; no liveness or input permission established"
+            }
+            Self::PaneAlive => "Owned terminal pane observed alive",
+            Self::PaneExited { .. } => "Terminal pane observed exited",
+            Self::AcpTransportClosed => "ACP channel unavailable; native process liveness unknown",
+            Self::AcpTransportReady => {
+                "ACP channel observed ready; not proof of native OS-process liveness"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -159,6 +159,7 @@ describe("connectivity independently of canonical admission", () => {
       await settle(GAP);
       expect(result.current.error).toBe(false);
       expect(isServerDown()).toBe(false);
+      expect(result.current.recoveryCurrentIds).toEqual([]);
       expect(ids(result)).toEqual(["A", "B"]);
       expect(result.current.workspaceOrdering).toEqual(["A", "B"]);
       expect(result.current.observedById).toEqual({ A: cursor(10n), B: cursor(12n) });

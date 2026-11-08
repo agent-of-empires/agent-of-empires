@@ -2,7 +2,6 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LiveTerminalView } from "../LiveTerminalView";
 import { TerminalView } from "../TerminalView";
 import { PairedShellPane } from "../PairedTerminal";
 import { installResizeObserver } from "./liveTerminalHarness";
@@ -90,29 +89,6 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("LiveTerminalView Restart with the real hook", () => {
-  it("dials a new socket only after ensure resolves, and clears the exited strip once it opens", async () => {
-    render(<LiveTerminalView readOnly={false} session={makeSession({ id: "restart" })} />);
-    await waitFor(() => expect(FakeWS.sockets).toHaveLength(1));
-    const dead = FakeWS.sockets[0]!;
-    act(() => {
-      dead.readyState = FakeWS.CLOSED;
-      dead.onclose?.(new CloseEvent("close", { code: 4001 }));
-    });
-
-    fireEvent.click(await screen.findByRole("button", { name: "Restart" }));
-    await waitFor(() => expect(ensureSession).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(FakeWS.sockets).toHaveLength(2));
-
-    const fresh = FakeWS.sockets[1]!;
-    act(() => {
-      fresh.readyState = FakeWS.OPEN;
-      fresh.onopen?.({} as Event);
-    });
-    await waitFor(() => expect(screen.queryByText("Agent exited")).toBeNull());
-  });
-});
-
 const frame = (content: string, seq = 1) => ({
   type: "frame",
   seq,
@@ -165,7 +141,6 @@ describe("read-only live consumers with the real socket and terminal", () => {
         socket.readyState = FakeWS.CLOSED;
         socket.onclose?.(new CloseEvent("close", { code: 4001 }));
       });
-      expect(await screen.findByText("Agent exited")).toBeTruthy();
       expect(screen.queryByRole("button", { name: "Restart" })).toBeNull();
       expect(ensureSession).not.toHaveBeenCalled();
       expect(ensureTerminal).not.toHaveBeenCalled();
@@ -407,7 +382,7 @@ describe("read-only live consumers with the real socket and terminal", () => {
       socket.onclose?.(new CloseEvent("close", { code: 4001 }));
     });
     view.rerender(<TerminalView session={{ ...stopped, status: "Running" }} readOnly />);
-    expect(await screen.findByText("Agent exited")).toBeTruthy();
+    expect(screen.getByLabelText<HTMLTextAreaElement>("Live terminal input").readOnly).toBe(true);
     expect(screen.queryByRole("button", { name: "Restart" })).toBeNull();
     expect(ensureSession).not.toHaveBeenCalled();
     expect(FakeWS.sockets).toHaveLength(1);

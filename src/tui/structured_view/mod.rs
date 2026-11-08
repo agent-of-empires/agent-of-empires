@@ -467,11 +467,12 @@ async fn apply_ws_message(
             seq,
             state: reduced,
             unchanged,
+            recovery_present,
         }) => {
             let was_active = state.transcript.turn_active;
             state
                 .transcript
-                .apply_reduced_state(seq, *reduced, &unchanged);
+                .apply_reduced_state(seq, *reduced, &unchanged, recovery_present);
             state.reconcile_selection();
             state.prune_dismissed_notices();
             auto_present_elicitation(state, toast_deadline);

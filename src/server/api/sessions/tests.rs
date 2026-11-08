@@ -4350,7 +4350,10 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
 
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await;
@@ -4389,7 +4392,10 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
 
     let response = list_sessions(
         axum::extract::State(state),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await
@@ -4433,7 +4439,10 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
 
     let response = list_sessions(
         axum::extract::State(state),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await
@@ -4481,7 +4490,10 @@ async fn list_sessions_state_filter() {
 
     let all = list_sessions(
         axum::extract::State(state.clone()),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await;
@@ -4494,6 +4506,7 @@ async fn list_sessions_state_filter() {
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Live),
+            profile: None,
         }),
         axum::http::HeaderMap::new(),
     )
@@ -4504,6 +4517,7 @@ async fn list_sessions_state_filter() {
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::Trashed),
+            profile: None,
         }),
         axum::http::HeaderMap::new(),
     )
@@ -4514,6 +4528,7 @@ async fn list_sessions_state_filter() {
         axum::extract::State(state),
         axum::extract::Query(ListSessionsQuery {
             state: Some(crate::session::SessionScope::All),
+            profile: None,
         }),
         axum::http::HeaderMap::new(),
     )
@@ -9754,7 +9769,7 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
 }
 
 #[test]
-fn update_restart_needs_a_captured_session_id_unless_resume_is_proven() {
+fn update_restart_never_treats_raw_session_ids_as_context_preservation_receipts() {
     let mut inst = Instance::new("t", "/tmp");
     let unchecked = ContextResumeAvailability::Indeterminate {
         reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
@@ -9762,14 +9777,14 @@ fn update_restart_needs_a_captured_session_id_unless_resume_is_proven() {
     let handshake = ContextResumeAvailability::Indeterminate {
         reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
     };
-    assert!(update_restart_resumable(
+    assert!(!update_restart_resumable(
         &inst,
         &ContextResumeAvailability::Available
     ));
     assert!(!update_restart_resumable(&inst, &unchecked));
     assert!(!update_restart_resumable(&inst, &handshake));
     inst.agent_session_id = Some("sid".into());
-    assert!(update_restart_resumable(&inst, &unchecked));
+    assert!(!update_restart_resumable(&inst, &unchecked));
     assert!(!update_restart_resumable(&inst, &handshake));
 }
 
@@ -9944,7 +9959,10 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
     ]);
     let resp = list_sessions(
         axum::extract::State(state),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await
@@ -10030,7 +10048,10 @@ async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
     let state = crate::server::test_support::build_test_app_state(vec![scratch_inst]);
     let resp = list_sessions(
         axum::extract::State(state),
-        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::extract::Query(ListSessionsQuery {
+            state: None,
+            profile: None,
+        }),
         axum::http::HeaderMap::new(),
     )
     .await

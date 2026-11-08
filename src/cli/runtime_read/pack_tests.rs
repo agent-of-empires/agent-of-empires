@@ -109,6 +109,250 @@ fn required_nullable_fields_reject_omission_but_accept_null() {
     }
 }
 
+fn recovery_snapshot() -> serde_json::Value {
+    use crate::session::{
+        ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation,
+        ErrorOrigin, OperationErrorEvidence, RecoveryActions, RuntimeEvidence, SessionRecovery,
+        SessionRecoveryReason,
+    };
+
+    let frames = pack::application_frames(pack::fixture("uds-list-nominal").wire);
+    let mut snapshot: serde_json::Value = serde_json::from_slice(frames[1].as_bytes()).unwrap();
+    let mut evidence = OperationErrorEvidence::new(
+        ErrorEvidenceSource::LocalPromptResult,
+        ErrorOperation::Prompt,
+    );
+    evidence.origin = Some(ErrorOrigin::AcpTransport);
+    evidence.blocking_scope = Some(ErrorBlockingScope::Operation);
+    evidence.retryable = Some(false);
+    evidence.reported_code = Some(-32603);
+    evidence.observed_at_ms = 1;
+    evidence.generation = Some(ErrorEvidenceGeneration::AcpWorker(1));
+    let recovery = SessionRecovery {
+        reason: SessionRecoveryReason::OperationFailed,
+        diagnostic: "Operation failed".to_owned(),
+        evidence: Some(evidence),
+        runtime: RuntimeEvidence::AcpTransportReady,
+        work_in_progress: false,
+        uncertainty: Some("Delivery unknown".to_owned()),
+        guidance: "Inspect the current runtime".into(),
+        actions: RecoveryActions::default(),
+        expected: "opaque selection".to_owned(),
+    };
+    snapshot["data"]["sessions"][0]["last_error_evidence"] =
+        serde_json::to_value(evidence).unwrap();
+    snapshot["data"]["sessions"][0]["recovery"] = serde_json::to_value(recovery).unwrap();
+    snapshot
+}
+
+#[test]
+#[serial_test::parallel]
+fn published_snapshot_accepts_recovery_and_unknown_optional_metadata() {
+    use crate::session::{
+        ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation,
+        ErrorOrigin, RuntimeEvidence, SessionRecoveryReason,
+    };
+
+    let mut snapshot = recovery_snapshot();
+    let accepts = |value: &serde_json::Value| {
+        pack::validate_data(pack::SNAPSHOT_SCHEMA, &value["data"]).unwrap();
+        parse_snapshot(&serde_json::to_vec(value).unwrap()).unwrap()
+    };
+    accepts(&snapshot);
+    for runtime in [
+        RuntimeEvidence::Unknown,
+        RuntimeEvidence::PaneAlive,
+        RuntimeEvidence::PaneExited { exit_code: None },
+        RuntimeEvidence::PaneExited { exit_code: Some(1) },
+        RuntimeEvidence::AcpTransportClosed,
+        RuntimeEvidence::AcpTransportReady,
+    ] {
+        let runtime = serde_json::to_value(runtime).unwrap();
+        snapshot["data"]["sessions"][0]["recovery"]["runtime"] = runtime.clone();
+        snapshot["data"]["sessions"][0]["recovery"]["evidence"]["runtime"] = runtime.clone();
+        snapshot["data"]["sessions"][0]["last_error_evidence"]["runtime"] = runtime;
+        accepts(&snapshot);
+    }
+    for reason in [
+        SessionRecoveryReason::OperationFailed,
+        SessionRecoveryReason::ChannelUnavailable,
+        SessionRecoveryReason::ProbeFailed,
+        SessionRecoveryReason::IdentityUnattested,
+        SessionRecoveryReason::RuntimeExited,
+        SessionRecoveryReason::ObservationUnknown,
+    ] {
+        snapshot["data"]["sessions"][0]["recovery"]["reason"] =
+            serde_json::to_value(reason).unwrap();
+        accepts(&snapshot);
+    }
+    for (field, values) in [
+        (
+            "source",
+            vec![
+                serde_json::to_value(ErrorEvidenceSource::TerminalText).unwrap(),
+                serde_json::to_value(ErrorEvidenceSource::TmuxObservation).unwrap(),
+                serde_json::to_value(ErrorEvidenceSource::RunnerCompletion).unwrap(),
+                serde_json::to_value(ErrorEvidenceSource::TranscriptRecovery).unwrap(),
+            ],
+        ),
+        (
+            "operation",
+            vec![
+                serde_json::to_value(ErrorOperation::ContextReset).unwrap(),
+                serde_json::to_value(ErrorOperation::TerminalObservation).unwrap(),
+            ],
+        ),
+        (
+            "origin",
+            vec![
+                serde_json::to_value(ErrorOrigin::TmuxObservation).unwrap(),
+                serde_json::Value::Null,
+            ],
+        ),
+        (
+            "blocking_scope",
+            vec![
+                serde_json::to_value(ErrorBlockingScope::Runtime).unwrap(),
+                serde_json::Value::Null,
+            ],
+        ),
+        (
+            "generation",
+            vec![
+                serde_json::to_value(ErrorEvidenceGeneration::TerminalLifecycle(2)).unwrap(),
+                serde_json::Value::Null,
+            ],
+        ),
+        (
+            "retryable",
+            vec![serde_json::json!(true), serde_json::Value::Null],
+        ),
+        ("reported_code", vec![serde_json::Value::Null]),
+    ] {
+        for value in values {
+            snapshot["data"]["sessions"][0]["last_error_evidence"][field] = value.clone();
+            snapshot["data"]["sessions"][0]["recovery"]["evidence"][field] = value;
+            accepts(&snapshot);
+        }
+    }
+    snapshot["data"]["sessions"][0]["recovery"]["expected"] = serde_json::json!("");
+    for path in [
+        "/data/sessions/0/last_error_evidence",
+        "/data/sessions/0/recovery/evidence",
+    ] {
+        let evidence = snapshot.pointer_mut(path).unwrap().as_object_mut().unwrap();
+        for field in [
+            "runtime",
+            "origin",
+            "blocking_scope",
+            "retryable",
+            "reported_code",
+            "generation",
+        ] {
+            evidence.remove(field);
+        }
+    }
+    let parsed = accepts(&snapshot);
+    let evidence = parsed.sessions[0]
+        .recovery
+        .as_ref()
+        .unwrap()
+        .evidence
+        .unwrap();
+    assert_eq!(evidence.runtime, RuntimeEvidence::Unknown);
+    assert_eq!(evidence.blocking_scope, None);
+    assert_eq!(evidence.retryable, None);
+    for field in ["evidence", "uncertainty"] {
+        snapshot["data"]["sessions"][0]["recovery"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        accepts(&snapshot);
+        snapshot["data"]["sessions"][0]["recovery"][field] = serde_json::Value::Null;
+        accepts(&snapshot);
+    }
+    for field in ["recovery", "last_error_evidence"] {
+        snapshot["data"]["sessions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        let parsed = accepts(&snapshot);
+        assert!(parsed.sessions[0].recovery.is_none());
+        snapshot["data"]["sessions"][0][field] = serde_json::Value::Null;
+        let parsed = accepts(&snapshot);
+        assert!(parsed.sessions[0].recovery.is_none());
+    }
+}
+
+#[test]
+#[serial_test::parallel]
+fn published_snapshot_rejects_invalid_recovery_shapes() {
+    let snapshot = recovery_snapshot();
+    for (path, invalid) in [
+        ("/reason", serde_json::json!("retry_now")),
+        ("/diagnostic", serde_json::Value::Null),
+        ("/runtime", serde_json::json!("native_alive")),
+        (
+            "/runtime",
+            serde_json::json!({"pane_exited": {"exit_code": "1"}}),
+        ),
+        (
+            "/runtime",
+            serde_json::json!({"pane_exited": {}, "unknown": null}),
+        ),
+        (
+            "/runtime",
+            serde_json::json!({"pane_exited": {"extra": true}}),
+        ),
+        ("/work_in_progress", serde_json::json!("false")),
+        ("/guidance", serde_json::Value::Null),
+        ("/uncertainty", serde_json::json!(false)),
+        ("/expected", serde_json::json!(1)),
+        ("/actions", serde_json::json!({"attach": false})),
+        ("/actions/stop", serde_json::json!("false")),
+        ("/actions/extra", serde_json::json!(false)),
+        ("/evidence/source", serde_json::json!("provider")),
+        ("/evidence/operation", serde_json::json!("restart")),
+        ("/evidence/runtime", serde_json::Value::Null),
+        ("/evidence/origin", serde_json::json!("agent")),
+        ("/evidence/blocking_scope", serde_json::json!("session")),
+        ("/evidence/retryable", serde_json::json!("unknown")),
+        ("/evidence/reported_code", serde_json::json!(2147483648_i64)),
+        ("/evidence/observed_at_ms", serde_json::Value::Null),
+        (
+            "/evidence/generation",
+            serde_json::json!({"acp_worker": -1}),
+        ),
+        (
+            "/evidence/generation",
+            serde_json::json!({"acp_worker": 1, "terminal_lifecycle": 1}),
+        ),
+        ("/evidence/extra", serde_json::json!(true)),
+        ("/extra", serde_json::json!(true)),
+    ] {
+        let mut invalid_snapshot = snapshot.clone();
+        let (parent, field) = path.rsplit_once('/').unwrap();
+        invalid_snapshot["data"]["sessions"][0]["recovery"]
+            .pointer_mut(parent)
+            .unwrap()[field] = invalid;
+        assert!(
+            pack::validate_data(pack::SNAPSHOT_SCHEMA, &invalid_snapshot["data"]).is_err(),
+            "invalid recovery accepted: {path}"
+        );
+    }
+    for field in ["source", "operation", "observed_at_ms"] {
+        let mut invalid_snapshot = snapshot.clone();
+        invalid_snapshot["data"]["sessions"][0]["last_error_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            pack::validate_data(pack::SNAPSHOT_SCHEMA, &invalid_snapshot["data"]).is_err(),
+            "evidence omission accepted: {field}"
+        );
+    }
+}
+
 /// A Hello that announces a protocol this client does not speak is a transport
 /// mismatch, checked before any other field is looked at.
 #[test]

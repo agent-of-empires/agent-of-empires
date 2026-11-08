@@ -184,7 +184,7 @@ impl HomeView {
             permission_response_dialog: None,
             agent_question_dialog: None,
             pending_permission_response: None,
-            pending_send_session: None,
+            pending_message: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
             pending_native_attachment: None,

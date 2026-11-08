@@ -11,6 +11,8 @@ interface Props {
   /** The pane's process exited; Restart re-ensures the session instead of just redialing. */
   paneDead?: boolean;
   onRestart?: () => void;
+  observeAllowed?: boolean;
+  paneDeadLabel?: string;
 }
 
 export function TerminalConnectionBanners({
@@ -22,12 +24,14 @@ export function TerminalConnectionBanners({
   onRetry,
   paneDead,
   onRestart,
+  observeAllowed = true,
+  paneDeadLabel = "Agent exited",
 }: Props) {
   if (connected) return null;
   if (paneDead) {
     return (
       <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-        <span className="text-xs text-status-error">Agent exited</span>
+        <span className="text-xs text-status-error">{paneDeadLabel}</span>
         {onRestart && (
           <button onClick={onRestart} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
             Restart
@@ -49,7 +53,11 @@ export function TerminalConnectionBanners({
     return (
       <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Connection lost</span>
-        <button onClick={onRetry} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
+        <button
+          onClick={onRetry}
+          disabled={!observeAllowed}
+          className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline disabled:opacity-50"
+        >
           Retry
         </button>
       </div>

@@ -452,7 +452,7 @@ fn render_show(
 
     if args.json {
         #[derive(Serialize)]
-        struct ShowJson {
+        struct ShowJson<'a> {
             id: String,
             title: String,
             path: String,
@@ -474,6 +474,8 @@ fn render_show(
             #[serde(skip_serializing_if = "Option::is_none")]
             parent_session_id: Option<String>,
             profile: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            recovery: Option<&'a crate::session::SessionRecovery>,
         }
         return json_lines(&ShowJson {
             id: session.id.clone(),
@@ -491,6 +493,7 @@ fn render_show(
             agent_session_id: session.agent_session_id.clone(),
             parent_session_id: session.parent_session_id.clone(),
             profile: profile_name.to_string(),
+            recovery: session.recovery.as_ref(),
         })
         .map(Projection::text);
     }
@@ -530,6 +533,53 @@ fn render_show(
         );
     }
     output.push_str(&format!("  Profile: {}\n", terminal_text(profile_name)));
+    if let Some(recovery) = &session.recovery {
+        let _ = writeln!(
+            output,
+            "  Diagnostic: {}\n  Observed runtime: {}",
+            terminal_text(&recovery.diagnostic),
+            recovery.runtime.description()
+        );
+        if let Some(evidence) = recovery.evidence {
+            let scope = match evidence.blocking_scope {
+                Some(crate::session::ErrorBlockingScope::Operation) => "operation",
+                Some(crate::session::ErrorBlockingScope::Runtime) => "runtime",
+                None => "unknown",
+            };
+            let _ = writeln!(
+                output,
+                "  Operation: {:?}\n  Blocking scope: {scope}",
+                evidence.operation
+            );
+            if let Some(code) = evidence.reported_code {
+                let _ = writeln!(output, "  Reported code: {code}");
+            }
+        }
+        if recovery.work_in_progress {
+            output.push_str("  Agent work is ongoing; no concurrent retry is authorized.\n");
+        }
+        if let Some(uncertainty) = recovery.uncertainty.as_deref() {
+            let _ = writeln!(output, "  Uncertainty: {}", terminal_text(uncertainty));
+        }
+        let _ = writeln!(
+            output,
+            "  Recovery: {}\n  Server-authorized actions:",
+            terminal_text(&recovery.guidance)
+        );
+        for (label, allowed) in [
+            ("Attach existing runtime", recovery.actions.attach),
+            (
+                "Retry operation with explicit input",
+                recovery.actions.retry_operation,
+            ),
+            ("Restart same conversation", recovery.actions.restart_same),
+            ("Stop owned runtime", recovery.actions.stop),
+            ("Launch without AoE restore flags", recovery.actions.fresh),
+        ] {
+            let availability = if allowed { "available" } else { "unavailable" };
+            let _ = writeln!(output, "    {label}: {availability}");
+        }
+    }
     if let Some(parent_id) = &session.parent_session_id {
         // A purged parent can leave a dangling id.
         let line = match sessions.iter().find(|candidate| &candidate.id == parent_id) {
@@ -994,6 +1044,7 @@ mod tests {
             idle_entered_at: None,
             last_error: None,
             last_error_evidence: None,
+            recovery: None,
             archived_at: None,
             trashed_at: None,
             active_snoozed_until: None,

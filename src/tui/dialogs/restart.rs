@@ -1,11 +1,4 @@
-//! Restart session dialog: pick profile + AI engine before respawning.
-//!
-//! Profile-on-restart means a heavy respawn that re-applies the new
-//! profile's env (CLAUDE_CONFIG_DIR, API keys, MCP servers). Picking a
-//! profile auto-populates the tool from `config.session.default_tool`,
-//! mirroring `NewSessionDialog::reload_config_defaults`. A manual tool
-//! override does not snap the profile, so users can keep the profile
-//! and swap only the engine.
+//! Restart configuration and explicit server-admitted recovery.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
@@ -21,17 +14,13 @@ use crate::tui::components::{
 };
 use crate::tui::styles::Theme;
 
-/// Data returned when the restart dialog is submitted.
 #[derive(Debug, Clone)]
 pub struct RestartData {
-    /// New profile (None means keep current).
     pub profile: Option<String>,
-    /// New tool (None means keep current).
     pub tool: Option<String>,
-    /// New extra args (None means keep current).
     pub extra_args: Option<String>,
-    /// New command override (None means keep current).
     pub command_override: Option<String>,
+    pub recovery: Option<crate::session::SessionRecoveryRequest>,
 }
 
 pub struct RestartDialog {
@@ -64,6 +53,11 @@ pub struct RestartDialog {
     /// Which selector row the mouse is over, for the hover highlight.
     /// Visual only; never moves keyboard `focused_field`.
     hover: HoverState,
+    recovery: Option<crate::session::SessionRecovery>,
+    recovery_action: Option<crate::session::SessionRecoveryAction>,
+    recovery_selector_area: Rect,
+    recovery_current: bool,
+    controls_available: bool,
 }
 
 impl RestartDialog {
@@ -104,10 +98,161 @@ impl RestartDialog {
             profile_selector_area: Rect::default(),
             tool_selector_area: Rect::default(),
             hover: HoverState::default(),
+            recovery: None,
+            recovery_action: None,
+            recovery_selector_area: Rect::default(),
+            recovery_current: false,
+            controls_available: true,
         }
     }
 
+    pub fn with_recovery(
+        mut self,
+        recovery: Option<crate::session::SessionRecovery>,
+        controls_available: bool,
+    ) -> Self {
+        self.recovery = recovery;
+        self.controls_available = controls_available;
+        self.recovery_current = controls_available;
+        self
+    }
+
+    pub fn set_current_recovery(
+        &mut self,
+        current: Option<&crate::session::SessionRecovery>,
+        transport_available: bool,
+    ) {
+        self.recovery_current = match (self.recovery.as_ref(), current) {
+            (None, None) => true,
+            (Some(offered), Some(current)) => {
+                offered.expected == current.expected
+                    && offered.actions.restart_same == current.actions.restart_same
+                    && offered.actions.fresh == current.actions.fresh
+            }
+            _ => false,
+        };
+        self.controls_available = transport_available && self.recovery_current;
+    }
+
+    fn recovery_allowed(&self, action: crate::session::SessionRecoveryAction) -> bool {
+        self.controls_available
+            && self.recovery.as_ref().is_some_and(|recovery| match action {
+                crate::session::SessionRecoveryAction::Same => recovery.actions.restart_same,
+                crate::session::SessionRecoveryAction::Fresh => recovery.actions.fresh,
+            })
+    }
+
+    fn cycle_recovery(&mut self) {
+        use crate::session::SessionRecoveryAction::{Fresh, Same};
+        let choices = match self.recovery_action {
+            Some(Same) => [Fresh, Same],
+            Some(Fresh) | None => [Same, Fresh],
+        };
+        self.recovery_action = choices
+            .into_iter()
+            .find(|action| self.recovery_allowed(*action));
+    }
+
+    fn handle_recovery_key(&mut self, key: KeyEvent) -> DialogResult<RestartData> {
+        match key.code {
+            KeyCode::Esc => DialogResult::Cancel,
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char(' ') => {
+                self.cycle_recovery();
+                DialogResult::Continue
+            }
+            KeyCode::Enter => {
+                let Some(action) = self
+                    .recovery_action
+                    .filter(|action| self.recovery_allowed(*action))
+                else {
+                    return DialogResult::Continue;
+                };
+                let Some(recovery) = &self.recovery else {
+                    return DialogResult::Continue;
+                };
+                DialogResult::Submit(RestartData {
+                    profile: None,
+                    tool: None,
+                    extra_args: None,
+                    command_override: None,
+                    recovery: Some(crate::session::SessionRecoveryRequest {
+                        action,
+                        expected: recovery.expected.clone(),
+                    }),
+                })
+            }
+            _ => DialogResult::Continue,
+        }
+    }
+
+    fn render_recovery(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let block = super::dialog_block(" Explicit Recovery ", theme);
+        let (_, inner) = super::render_dialog_frame(frame, area, 76, 19, block);
+        let chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(inner);
+        self.recovery_selector_area = chunks[2];
+        let Some(recovery) = &self.recovery else {
+            return;
+        };
+        frame.render_widget(Paragraph::new(self.current_title.as_str()), chunks[0]);
+        crate::tui::components::preview::render_session_recovery(
+            frame,
+            chunks[1],
+            recovery,
+            self.recovery_current,
+            theme,
+        );
+        let (label, effect) = match self.recovery_action {
+            Some(crate::session::SessionRecoveryAction::Same) => (
+                "Restart Same",
+                "Resume the exact qualified stored conversation. No previous prompt is resent.",
+            ),
+            Some(crate::session::SessionRecoveryAction::Fresh) => (
+                "Launch without AoE restore flags",
+                "Discard pending AoE input and restore flags; keep native history. An opaque wrapper may reopen its own history. No prior input is replayed.",
+            ),
+            None => (
+                "Choose an offered recovery",
+                "Opening this dialog does not restart or replace the Agent.",
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(format!("Recovery: {label}")).style(Style::default().fg(theme.hint)),
+            chunks[2],
+        );
+        frame.render_widget(Paragraph::new(effect).wrap(Wrap { trim: false }), chunks[3]);
+        frame.render_widget(
+            Paragraph::new(
+                if self.recovery_allowed(crate::session::SessionRecoveryAction::Same)
+                    || self.recovery_allowed(crate::session::SessionRecoveryAction::Fresh)
+                {
+                    "Left/Right: choose offered action  Enter: confirm  Esc: cancel"
+                } else {
+                    "No restart currently offered; observation only.  Esc: close"
+                },
+            )
+            .style(Style::default().fg(theme.dimmed)),
+            chunks[4],
+        );
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RestartData>> {
+        if self.recovery.is_some() {
+            if self
+                .recovery_selector_area
+                .contains(Position::from((col, row)))
+            {
+                self.cycle_recovery();
+            }
+            return Some(DialogResult::Continue);
+        }
         let pos = ratatui::layout::Position::from((col, row));
         // While the tool-config overlay is up, a click on a field focuses it;
         // any other click is swallowed so a stray click on the (now-hidden)
@@ -146,6 +291,9 @@ impl RestartDialog {
     /// not silently shift which field that key targets). Returns `true`
     /// when the highlighted row changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.recovery.is_some() {
+            return self.hover.update(col, row, &[self.recovery_selector_area]);
+        }
         // The overlay covers the selectors; don't highlight rows beneath it.
         if self.tool_config_mode {
             return false;
@@ -261,6 +409,12 @@ impl RestartDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<RestartData> {
+        if self.recovery.is_some() {
+            return self.handle_recovery_key(key);
+        }
+        if !self.controls_available && key.code == KeyCode::Enter {
+            return DialogResult::Continue;
+        }
         if self.tool_config_mode {
             return self.handle_tool_config_key(key);
         }
@@ -316,6 +470,7 @@ impl RestartDialog {
                     tool,
                     extra_args,
                     command_override,
+                    recovery: None,
                 })
             }
             KeyCode::Tab => {
@@ -395,6 +550,10 @@ impl RestartDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        if self.recovery.is_some() {
+            self.render_recovery(frame, area, theme);
+            return;
+        }
         // Wide enough that the Tool row's "(configured)  Ctrl+P: edit" suffix
         // isn't clipped (the cycler + suffix run past the old 54-col width).
         let block = super::dialog_block(" Restart Session ", theme);
@@ -582,19 +741,79 @@ mod tests {
         }
     }
 
+    fn recovery(same: bool, fresh: bool) -> crate::session::SessionRecovery {
+        crate::session::SessionRecovery {
+            reason: crate::session::SessionRecoveryReason::ProbeFailed,
+            diagnostic: "The prior resume attempt failed.".into(),
+            evidence: None,
+            runtime: crate::session::RuntimeEvidence::Unknown,
+            work_in_progress: false,
+            uncertainty: None,
+            guidance: "Choose only an offered explicit recovery.".into(),
+            actions: crate::session::RecoveryActions {
+                attach: false,
+                retry_operation: false,
+                restart_same: same,
+                stop: false,
+                fresh,
+            },
+            expected: "selection-a".into(),
+        }
+    }
+
     #[test]
-    fn new_seeds_from_the_current_session() {
-        let d = RestartDialog::new("My Sess", "work", "codex", "", "", profiles(), tools());
-        assert_eq!((d.profile_index, d.tool_index, d.focused_field), (1, 1, 0));
+    fn recovery_requires_an_explicit_current_offered_choice() {
+        use crate::session::SessionRecoveryAction::{Fresh, Same};
+        for (same, fresh) in [(false, false), (false, true), (true, false), (true, true)] {
+            let offered = recovery(same, fresh);
+            let mut dialog = configured().with_recovery(Some(offered.clone()), true);
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+            dialog.handle_key(key(KeyCode::Tab));
+            if !same && !fresh {
+                assert!(matches!(
+                    dialog.handle_key(key(KeyCode::Enter)),
+                    DialogResult::Continue
+                ));
+                continue;
+            }
+            let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+            assert_eq!(
+                data.recovery.unwrap().action,
+                if same { Same } else { Fresh }
+            );
+            assert!(data.profile.is_none() && data.tool.is_none());
+            assert!(data.extra_args.is_none() && data.command_override.is_none());
 
-        // A profile or tool that is no longer listed falls back to the first.
-        let d = RestartDialog::new("S", "ghost", "ghost-tool", "", "", profiles(), tools());
-        assert_eq!((d.profile_index, d.tool_index), (0, 0));
-
-        let d = configured();
-        assert_eq!(d.command_override.value(), "claude-wrapper");
-        assert_eq!(d.extra_args.value(), "--foo");
-        assert!(!d.tool_config_mode);
+            dialog.set_current_recovery(Some(&offered), false);
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            let mut replaced = offered.clone();
+            replaced.expected = "different-conversation-selection".into();
+            dialog.set_current_recovery(Some(&replaced), true);
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            dialog.set_current_recovery(None, true);
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            let mut withdrawn = offered;
+            withdrawn.actions.restart_same = false;
+            withdrawn.actions.fresh = false;
+            dialog.set_current_recovery(Some(&withdrawn), true);
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+        }
     }
 
     #[test]

@@ -9,16 +9,9 @@ use ratatui::widgets::*;
 use crate::session::Instance;
 use crate::tui::styles::Theme;
 
-/// Light value type the renderers consume in place of a raw `&str`.
-/// The caller is expected to hand over the cached parse from
-/// `PreviewCache::ensure_parsed`; we then read it directly for the
-/// actual render.
-///
-/// Passing a pre-parsed `Text` is the whole point of the
-/// optimisation: it lets the cache update once per content change
-/// rather than re-running the full `ansi-to-tui` pipeline on every
-/// frame. See `PreviewCache::ensure_parsed` for the parse-and-cache
-/// contract.
+pub(crate) const RECOVERY_BANNER_ROWS: u16 = 8;
+
+/// Cached ANSI parse borrowed by the renderer.
 pub struct CachedPreview<'a> {
     /// `None` means the source `content` was empty.
     pub text: Option<&'a Text<'static>>,
@@ -35,19 +28,7 @@ impl<'a> CachedPreview<'a> {
     }
 }
 
-/// Row count of the Agent-view info header (profile/tool, path, status,
-/// optional sandbox line, optional worktree block) for `instance`.
-///
-/// Exposed at the module level so callers outside `Preview::render_with_cache`
-/// can compute the same split. In particular, render queues the live-send
-/// worker to size the tmux pane to the OUTPUT portion, not the full inner. The
-/// output portion is
-/// `inner.height - agent_info_height(inst) - 1`: subtract the info
-/// header, then subtract one more row for the inner ` Output ` banner
-/// that `render_output_cached` draws on top of the output sub-rect (a
-/// `Borders::TOP` block consumes one row). If the agent renders into a
-/// taller pane than the visible output area, the top of its output gets
-/// clipped on every frame and the user sees content shifted up.
+/// Agent info-header rows, shared by painting, scrolling, and pane sizing.
 pub fn agent_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // profile+tool / path / status
     let sandbox_lines: u16 = if instance.is_sandboxed() { 1 } else { 0 };
@@ -78,16 +59,7 @@ pub fn terminal_info_height(instance: &Instance) -> u16 {
     base + sandbox_lines
 }
 
-/// The geometry of the preview body, computed once so every consumer agrees on
-/// where the output goes and how many rows it spans.
-///
-/// Historically the info-header / banner / output split was re-derived
-/// independently in the renderers (`Layout` + `Borders`), in `render_preview`
-/// (for the tmux pane size and the scroll clamp), and in the live `[offset/max]`
-/// footer. Each derivation drifted by a row at some point, which is the bug
-/// #1521, #1570, and #1604 each chased in turn. `PreviewLayout::compute` is the
-/// single definition; `output.height` is THE visible-row count. Anyone needing
-/// preview geometry calls this rather than re-counting rows.
+/// Shared preview geometry. `output.height` controls scrolling and pane sizing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreviewLayout {
     /// The info-header rect, present iff the header is shown (header toggle on
@@ -96,6 +68,7 @@ pub(crate) struct PreviewLayout {
     /// The inner ` Output ` / ` Terminal Output ` banner row, present exactly
     /// when `info` is (it visually separates the header from the body).
     pub banner: Option<Rect>,
+    pub recovery: Option<Rect>,
     /// Where captured agent/terminal output paints. `output.height` is the
     /// authoritative visible-row count for scrolling and pane sizing.
     pub output: Rect,
@@ -113,6 +86,7 @@ impl PreviewLayout {
             return Self {
                 info: None,
                 banner: None,
+                recovery: None,
                 output: area,
             };
         }
@@ -145,8 +119,29 @@ impl PreviewLayout {
         Self {
             info: Some(info),
             banner,
+            recovery: None,
             output,
         }
+    }
+
+    pub(crate) fn with_recovery(
+        mut self,
+        recovery: Option<&crate::session::SessionRecovery>,
+    ) -> Self {
+        if recovery.is_some() {
+            let height = self
+                .output
+                .height
+                .saturating_sub(3)
+                .min(RECOVERY_BANNER_ROWS);
+            self.recovery = Some(Rect {
+                height,
+                ..self.output
+            });
+            self.output.y += height;
+            self.output.height -= height;
+        }
+        self
     }
 }
 
@@ -279,6 +274,8 @@ impl Preview {
         frame: &mut Frame,
         area: Rect,
         instance: &Instance,
+        recovery: Option<&crate::session::SessionRecovery>,
+        recovery_current: bool,
         cached_output: CachedPreview<'_>,
         scroll_offset: u16,
         theme: &Theme,
@@ -286,10 +283,11 @@ impl Preview {
         compact: bool,
         show_info: bool,
     ) {
-        // One source of truth for the split. With the header hidden or the
-        // viewport compact the output claims the whole pane, and the outer block
-        // already says "Preview".
-        let layout = PreviewLayout::compute(area, compact, show_info, agent_info_height(instance));
+        let layout = PreviewLayout::compute(area, compact, show_info, agent_info_height(instance))
+            .with_recovery(recovery);
+        if let (Some(area), Some(recovery)) = (layout.recovery, recovery) {
+            render_session_recovery(frame, area, recovery, recovery_current, theme);
+        }
         if let Some(info_area) = layout.info {
             Self::render_info(frame, info_area, instance, theme, idle_decay_window);
         }
@@ -297,7 +295,6 @@ impl Preview {
             frame,
             layout.output,
             layout.banner,
-            instance,
             cached_output,
             scroll_offset,
             theme,
@@ -414,19 +411,11 @@ impl Preview {
         frame: &mut Frame,
         output: Rect,
         banner: Option<Rect>,
-        instance: &Instance,
         cached_output: CachedPreview<'_>,
         scroll_offset: u16,
         theme: &Theme,
     ) {
-        // `output.height` is the visible-row count straight from
-        // `PreviewLayout`. The error path below returns early, so `parsed_output`
-        // is the caller's cached parse by the time the Paragraph uses it.
         let visible_height = output.height as usize;
-        // The error path below returns early, so by the time we use
-        // `parsed_output` for the output Paragraph the error case has
-        // been handled. Until then `parsed_output` is just the cached
-        // parse passed in by the caller (renamed for readability).
         let parsed_output = cached_output.text;
         let line_count = parsed_output.map_or(0, |t| t.lines.len());
 
@@ -451,25 +440,6 @@ impl Preview {
         }
         let inner = output;
 
-        if let Some(error) = &instance.last_error {
-            let mut error_lines: Vec<Line> = vec![
-                Line::from(Span::styled(
-                    "Error:",
-                    Style::default().fg(theme.error).bold(),
-                )),
-                Line::from(""),
-            ];
-            for line in error.split('\n') {
-                error_lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(theme.error),
-                )));
-            }
-            let paragraph = Paragraph::new(error_lines).wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, inner);
-            return;
-        }
-
         if let Some(output_text) = parsed_output {
             render_scrolled_output(
                 frame,
@@ -489,17 +459,52 @@ impl Preview {
     }
 }
 
-/// The `Borders::TOP` block that draws the ` Output ` / ` Terminal Output `
-/// banner. It spans the banner row plus the whole output body so its single top
-/// border lands on the banner row and `block.inner()` coincides exactly with
-/// `output`. Built from `PreviewLayout`'s `output` + `banner` rects so the
-/// banner can never be sized independently of the body it caps.
+pub(crate) fn render_session_recovery(
+    frame: &mut Frame,
+    area: Rect,
+    recovery: &crate::session::SessionRecovery,
+    current: bool,
+    theme: &Theme,
+) {
+    let mut lines = vec![Line::styled(
+        recovery.diagnostic.as_str(),
+        Style::default().fg(theme.error),
+    )];
+    if current {
+        lines.push(Line::from(recovery.runtime.description()));
+    } else {
+        lines.push(Line::from(
+            "Current runtime observation unavailable; saved diagnostic only.",
+        ));
+    }
+    if let Some(evidence) = recovery.evidence {
+        let scope = match evidence.blocking_scope {
+            Some(crate::session::ErrorBlockingScope::Operation) => "operation",
+            Some(crate::session::ErrorBlockingScope::Runtime) => "runtime",
+            None => "unknown",
+        };
+        lines.push(Line::from(format!(
+            "Operation: {:?}; blocking scope: {scope}",
+            evidence.operation
+        )));
+    }
+    if current && recovery.work_in_progress {
+        lines.push(Line::from("Agent work ongoing; no concurrent AoE retry."));
+    }
+    if let Some(uncertainty) = recovery.uncertainty.as_deref() {
+        lines.push(Line::from(uncertainty));
+    }
+    lines.push(Line::from(recovery.guidance.as_ref()));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// The output banner spans diagnostics and the visible output body.
 fn banner_block_area(output: Rect, banner: Rect) -> Rect {
     Rect {
         x: output.x,
         y: banner.y,
         width: output.width,
-        height: output.height.saturating_add(1),
+        height: output.bottom().saturating_sub(banner.y),
     }
 }
 
@@ -605,6 +610,55 @@ fn shorten_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_diagnostic_does_not_replace_live_agent_output() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut instance = Instance::new("agent", "/tmp/agent");
+        instance.status = crate::session::Status::Error;
+        instance.last_error = Some("PROVIDER_OPERATION_FAILED".into());
+        let recovery = crate::session::SessionRecovery {
+            reason: crate::session::SessionRecoveryReason::OperationFailed,
+            diagnostic: "PROVIDER_OPERATION_FAILED".into(),
+            evidence: None,
+            runtime: crate::session::RuntimeEvidence::PaneAlive,
+            work_in_progress: true,
+            uncertainty: None,
+            guidance: "Observe ongoing Agent work.".into(),
+            actions: crate::session::RecoveryActions::default(),
+            expected: "selection".into(),
+        };
+        let output = Text::from("VISIBLE_NATIVE_OUTPUT");
+        for height in [5, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    Preview::render_with_cache(
+                        frame,
+                        frame.area(),
+                        &instance,
+                        Some(&recovery),
+                        true,
+                        CachedPreview::new(Some(&output), false),
+                        0,
+                        &Theme::default(),
+                        Duration::ZERO,
+                        true,
+                        false,
+                    );
+                })
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(screen.contains("PROVIDER_OPERATION_FAILED"), "{screen}");
+            assert!(screen.contains("VISIBLE_NATIVE_OUTPUT"), "{screen}");
+        }
+    }
 
     /// Pins `$HOME` so the read inside `shorten_path` cannot see a value another
     /// test set. `isolate_home` holds the process-global env lock for the guard's

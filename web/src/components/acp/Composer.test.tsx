@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
@@ -13,6 +14,7 @@ import type { PromptAttachmentInput, QueuedPrompt } from "../../lib/acpTypes";
 import { buildSkillIndex, type SkillIndex } from "../../lib/skillProvenance";
 import { Composer } from "./Composer";
 import { useCancelEscalation } from "./useCancelEscalation";
+import type { CompositionSendResult } from "./useComposerHooks";
 
 const { skillIndexRef, entriesRef } = vi.hoisted(() => ({
   skillIndexRef: { current: { labelsByKey: new Map<string, Set<string>>() } as SkillIndex },
@@ -64,6 +66,9 @@ function Harness({
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
+        operationRetryActive={false}
+        compositionControlRef={{ current: null }}
+        attachmentReadGenerationRef={{ current: 0 }}
         queuedPrompts={[]}
         editQueuedPrompt={() => {}}
         {...overrides}
@@ -187,6 +192,79 @@ describe("toolbar and send", () => {
     entriesRef.current = [entry({ kind: "insert-text", id: "op-2", text: " world" })];
     rerender(<Harness />);
     await waitFor(() => expect(textarea().value).toBe("hello world"));
+  });
+});
+
+describe("explicit retry composition", () => {
+  it.each([
+    { revision: "unchanged", editText: false, addFile: false, restoreText: false },
+    { revision: "new text", editText: true, addFile: false, restoreText: false },
+    { revision: "new file", editText: false, addFile: true, restoreText: false },
+    { revision: "new text and file", editText: true, addFile: true, restoreText: false },
+    { revision: "edited then restored text", editText: true, addFile: false, restoreText: true },
+  ])("clears only owned input after held success: $revision", async ({ editText, addFile, restoreText }) => {
+    const admission = Promise.withResolvers<CompositionSendResult>();
+    const entered = Promise.withResolvers<void>();
+    const enqueuePrompt = vi.fn(() => {
+      entered.resolve();
+      return admission.promise;
+    });
+    const submittedAttachments: PromptAttachmentInput[] = [
+      { kind: "image", mimeType: "image/png", name: "submitted.png", dataB64: "AQID" },
+    ];
+    function RetryHarness() {
+      const [pendingAttachments, setPendingAttachments] = useState(submittedAttachments);
+      return (
+        <Harness
+          operationRetryActive
+          enqueuePrompt={enqueuePrompt}
+          promptCapabilities={{ image: true, audio: false, embeddedContext: false }}
+          pendingAttachments={pendingAttachments}
+          setPendingAttachments={setPendingAttachments}
+        />
+      );
+    }
+    const view = render(<RetryHarness />);
+    const textarea = () => view.container.querySelector("textarea")!;
+    fireEvent.change(textarea(), { target: { value: "submitted retry" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await entered.promise;
+    expect(enqueuePrompt).toHaveBeenCalledWith("submitted retry", submittedAttachments);
+    expect(textarea().value).toBe("submitted retry");
+    expect(textarea().disabled).toBe(false);
+    expect(screen.getByRole("button", { name: "Remove submitted.png" })).toBeTruthy();
+
+    if (editText) {
+      fireEvent.change(textarea(), { target: { value: "newer draft" } });
+      await waitFor(() => expect(textarea().value).toBe("newer draft"));
+      if (restoreText) {
+        fireEvent.change(textarea(), { target: { value: "submitted retry" } });
+        await waitFor(() => expect(textarea().value).toBe("submitted retry"));
+      }
+    }
+    if (addFile) {
+      const file = new File([new Uint8Array([4, 5, 6])], "newer.png", { type: "image/png" });
+      fireEvent.paste(textarea(), {
+        clipboardData: { items: [{ kind: "file", getAsFile: () => file }] },
+      });
+      await screen.findByRole("button", { name: "Remove newer.png" });
+    }
+    const expectedText = editText && !restoreText ? "newer draft" : "submitted retry";
+    fireEvent(window, new Event("pagehide"));
+    expect(window.localStorage.getItem("acp:draft:sess")).toBe(expectedText);
+
+    await act(async () => {
+      admission.resolve("consumed");
+      await admission.promise;
+    });
+    await flush();
+
+    const revised = editText || addFile;
+    expect(textarea().value).toBe(revised ? expectedText : "");
+    expect(window.localStorage.getItem("acp:draft:sess")).toBe(revised ? expectedText : null);
+    expect(screen.queryByRole("button", { name: "Remove submitted.png" }) !== null).toBe(revised);
+    expect(screen.queryByRole("button", { name: "Remove newer.png" }) !== null).toBe(addFile);
+    expect(enqueuePrompt).toHaveBeenCalledTimes(1);
   });
 });
 

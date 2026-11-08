@@ -40,6 +40,7 @@ pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
 };
 pub(in crate::server::api) use worker::rate_limit_resume_probe;
+pub(crate) use worker::restart_session_recovery;
 pub use worker::{
     get_option_catalog, list_acp_agents, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
