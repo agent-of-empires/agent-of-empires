@@ -257,7 +257,7 @@ impl Instance {
                     return Err(error);
                 }
             };
-        let result = (|| {
+        let result: Result<LaunchSidOutcome> = (|| {
             if corpse_pane {
                 let publication = self.prime_root_publication(true);
                 self.kill_for_revival_locked()?;
