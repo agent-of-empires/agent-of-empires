@@ -175,7 +175,40 @@ impl Instance {
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Respawned);
         }
-        Ok(EnsureReadyOutcome::AlreadyAlive)
+        Ok(match self.positive_pane_readiness() {
+            Ok(true) => EnsureReadyOutcome::AlreadyAlive,
+            Ok(false) => EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::StabilizationExpired,
+            },
+            Err(_) => EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::ObservationFailed,
+            },
+        })
+    }
+
+    pub(super) fn positive_pane_readiness(&self) -> Result<bool> {
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let Some((_, pane)) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+        else {
+            return Ok(false);
+        };
+        if pane.pane_dead {
+            return Ok(false);
+        }
+        if self.expects_shell()
+            || self.has_command_override()
+            || crate::hooks::read_hook_status(&self.id).is_some()
+        {
+            return Ok(true);
+        }
+        let command = pane
+            .pane_current_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
+        Ok(!crate::tmux::utils::is_pane_running_shell_command(
+            command,
+            pane.pane_start_command_is_protected,
+        ))
     }
 
     /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.

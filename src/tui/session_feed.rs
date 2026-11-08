@@ -585,6 +585,7 @@ async fn run_queued_command(
                                     code:
                                         crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                                         | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                                        | crate::daemon::ApiErrorCode::LaunchIndeterminate
                                         | crate::daemon::ApiErrorCode::SandboxMigrationFailed,
                                     ..
                                 } => CommandFailure::Rejected(error.to_string()),
@@ -621,6 +622,7 @@ async fn run_queued_command(
                     crate::daemon::ApiErrorCode::PurgeFailed
                         | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                         | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                        | crate::daemon::ApiErrorCode::LaunchIndeterminate
                         | crate::daemon::ApiErrorCode::SandboxMigrationFailed
                 ) {
                     CommandFailure::Rejected(message)

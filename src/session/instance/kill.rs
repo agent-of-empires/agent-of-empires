@@ -181,6 +181,61 @@ impl Instance {
         combine_teardown_results(pane, native)
     }
 
+    /// Revival may remove only its exact pane while it remains the sole occupant.
+    /// Capture process handles first, but signal and release scopes only after tmux's guard.
+    pub(super) fn kill_for_revival_locked(&self) -> Result<()> {
+        let removed = (|| -> Result<()> {
+            use crate::tmux::utils::{probe_pane, PaneProbe};
+            let session = self.tmux_session()?;
+            match probe_pane(session.name()) {
+                PaneProbe::Missing => return Ok(()),
+                PaneProbe::Unknown => {
+                    return Err(LaunchIndeterminateCause::ObservationFailed.into());
+                }
+                PaneProbe::Alive | PaneProbe::Dead => {}
+            }
+            let server = std::sync::Arc::new(crate::tmux::ToolSession::server_identity()?);
+            let panes = crate::tmux::batch_pane_metadata()?;
+            let (_, metadata) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+            let identity = crate::tmux::ToolSession::legacy_identity(metadata)?;
+            let processes = if metadata.pane_dead {
+                None
+            } else {
+                Some(crate::process::CapturedProcessTree::capture(
+                    identity
+                        .pane_pid
+                        .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?,
+                )?)
+            };
+            let observation = LegacyToolObservation { identity, server };
+            crate::tmux::utils::remove_owned_pane(&observation, metadata.pane_dead)?;
+            if let Some(processes) = processes {
+                processes.settle(std::time::Duration::from_millis(100))?;
+            }
+            self.release_scope()?;
+            Ok(())
+        })();
+        if let Err(error) = removed {
+            let cause = error
+                .downcast_ref::<LaunchIndeterminateCause>()
+                .copied()
+                .unwrap_or(LaunchIndeterminateCause::OwnershipUnproven);
+            tracing::warn!(target: "session.store", session = %self.id, %error,
+                "revival ownership or exclusivity unproven; runtime retained");
+            return Err(cause.into());
+        }
+        self.capture_poller.stop();
+        if let Some(runtime) = self.prime_runtime() {
+            runtime.cleanup().map_err(|error| {
+                tracing::warn!(target: "session.store", session = %self.id, %error,
+                    "revival native cleanup failed");
+                anyhow::Error::from(LaunchIndeterminateCause::ObservationFailed)
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn kill_clean_in(&self, storage: &dyn crate::session::SessionStore) -> Result<u64> {
         storage.check_available()?;
         let _lifecycle_lock = storage

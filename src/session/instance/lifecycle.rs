@@ -350,6 +350,9 @@ impl Instance {
                     }
                 }
             }
+            if row.status == Status::Creating {
+                row.status = Status::Starting;
+            }
             row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(row.status)
         })?;

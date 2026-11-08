@@ -513,16 +513,30 @@ pub(crate) fn probe_owned_pane(
 pub(crate) fn remove_owned_dead_pane(
     expected: &crate::session::LegacyToolObservation,
 ) -> Result<()> {
+    remove_owned_pane(expected, true)
+}
+
+/// Remove only the captured exclusive pane, with topology checked in the same tmux command.
+pub(crate) fn remove_owned_pane(
+    expected: &crate::session::LegacyToolObservation,
+    require_dead: bool,
+) -> Result<()> {
     let identity = &expected.identity;
-    let pid = identity
-        .pane_pid
-        .ok_or_else(|| anyhow::anyhow!("pane process identity unavailable"))?;
     let literal = crate::tmux::Session::tmux_format_literal;
     let session = format!("#{{==:#{{session_id}},{}}}", literal(&identity.session_id));
     let pane = format!("#{{==:#{{pane_id}},{}}}", literal(&identity.pane_id));
-    let process = format!(
-        "#{{&&:#{{||:#{{==:#{{pane_pid}},{pid}}},#{{==:#{{pane_pid}},}}}},#{{==:#{{pane_dead}},1}}}}"
-    );
+    let process = match identity.pane_pid {
+        Some(pid) => format!(
+            "#{{||:#{{==:#{{pane_pid}},{pid}}},#{{&&:#{{==:#{{pane_dead}},1}},#{{==:#{{pane_pid}},}}}}}}"
+        ),
+        // A legacy corpse has no live process identity. Require it to remain a corpse.
+        None => "#{&&:#{==:#{pane_dead},1},#{==:#{pane_pid},}}".to_owned(),
+    };
+    let process = if require_dead {
+        format!("#{{&&:{process},#{{==:#{{pane_dead}},1}}}}")
+    } else {
+        process
+    };
     let server = format!(
         "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{socket_path}},{}}}}}",
         expected.server.pid,

@@ -260,18 +260,24 @@ impl Instance {
         let result = (|| {
             if corpse_pane {
                 let publication = self.prime_root_publication(true);
-                self.kill_clean_locked()?;
+                self.kill_for_revival_locked()?;
                 prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
                     CaptureStorage::Scoped(storage),
                     prepared,
                     publication,
                 )?;
             }
-            let (outcome, _) = self.spawn_prepared_launch(size, storage, prepared)?;
+            let (outcome, probe) = self.spawn_prepared_launch(size, storage, prepared)?;
+            if handoff.is_some() && probe.pane.is_none() {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven.into());
+            }
             self.commit_lifecycle_launch(storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
+            if error.is::<LaunchIndeterminateCause>() {
+                return Err(error);
+            }
             self.fail_reserved_launch(storage, generation, &error, handoff.is_none());
             return Err(error);
         }

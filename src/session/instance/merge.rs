@@ -22,8 +22,13 @@ impl Instance {
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
         self.inherit_acp_load_capability(&prior);
+        self.capture_poller.adopt_relaunch(
+            &prior.capture_poller,
+            prior.held(),
+            prior.last_start_time != self.last_start_time,
+            Held::new(&self.tool, self.active_execution.as_ref()),
+        );
         self.last_start_time = prior.last_start_time;
-        self.capture_poller = prior.capture_poller;
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
         self.pending_host_env = prior.pending_host_env;
