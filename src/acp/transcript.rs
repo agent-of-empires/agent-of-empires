@@ -37,6 +37,10 @@ pub struct TranscriptRow {
     /// Plugin that sent a `user_prompt` row; absent when the user typed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<String>,
+    /// Ids of other queued rows folded into a `user_prompt` row, so a client that
+    /// only sees this row (snapshot or replay) still settles their optimistic rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_prompt_ids: Vec<String>,
     /// Structured payload on a `user_diff_comments` row; `text` holds the markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_comments: Option<DiffCommentsPayload>,
@@ -364,9 +368,9 @@ impl TranscriptModel {
                 text,
                 attachments,
                 prompt_id,
+                merged_prompt_ids,
                 synthesized,
                 origin_plugin,
-                ..
             } => {
                 self.begin_turn();
                 // A rate-limit resume continuation replays a prompt the user
@@ -383,6 +387,7 @@ impl TranscriptModel {
                     let mut row = self.grouped_row(id, TranscriptRowKind::UserPrompt, text.clone());
                     row.attachments = attachments.clone();
                     row.origin_plugin = origin_plugin.clone();
+                    row.merged_prompt_ids = merged_prompt_ids.clone();
                     vec![self.append(row)]
                 }
             }
@@ -930,6 +935,7 @@ impl TranscriptRow {
             output: Vec::new(),
             attachments: Vec::new(),
             origin_plugin: None,
+            merged_prompt_ids: Vec::new(),
             diff_comments: None,
             elicitation_answers: Vec::new(),
             async_subagent: false,
@@ -1536,6 +1542,21 @@ mod tests {
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
         }
+
+        let mut m = TranscriptModel::new();
+        m.apply_event(
+            8,
+            &Event::UserPromptSent {
+                merged_prompt_ids: vec!["q2".into()],
+                text: "a\n\nb".into(),
+                attachments: Vec::new(),
+                prompt_id: Some("q1".into()),
+                synthesized: false,
+                origin_plugin: None,
+            },
+        );
+        assert_eq!(m.rows()[0].id, "q1");
+        assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
 
         let m = fold([Event::UserDiffCommentsPrompt {
             intro: "look".into(),

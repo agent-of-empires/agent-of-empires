@@ -761,6 +761,8 @@ export interface ActivityRow {
   attachments?: AcpAttachment[];
   /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
   originPlugin?: string;
+  /** Other queued rows folded into this `user_prompt` row; their optimistic rows are retired with it. */
+  mergedPromptIds?: string[];
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -781,6 +783,7 @@ export interface TranscriptRow {
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
   origin_plugin?: string;
+  merged_prompt_ids?: string[];
   diff_comments?: {
     intro: string;
     outro: string;
@@ -832,6 +835,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
     ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
+    ...(row.merged_prompt_ids && row.merged_prompt_ids.length > 0 ? { mergedPromptIds: row.merged_prompt_ids } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {

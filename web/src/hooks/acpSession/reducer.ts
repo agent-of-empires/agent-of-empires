@@ -109,7 +109,9 @@ function pruneOptimisticRows(state: AcpState): AcpState {
 }
 
 function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
-  return pruneOptimisticRows({ ...state, activity });
+  const next = pruneOptimisticRows({ ...state, activity });
+  if (next.optimisticRows.length === 0 && next.inflightPromptIds.length === 0) return next;
+  return activity.flatMap((r) => r.mergedPromptIds ?? []).reduce(rollbackOptimisticPrompt, next);
 }
 
 function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => QueuedPrompt): AcpState {

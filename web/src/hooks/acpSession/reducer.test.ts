@@ -195,6 +195,22 @@ describe("prompt queue", () => {
     expect(reducer(s, { kind: "clear_queue" }).queuedPrompts).toEqual([]);
   });
 
+  it("a snapshot row carrying merged ids settles their overlay rows when the live frame was missed (#5401)", () => {
+    const local = run(
+      empty(),
+      { kind: "user_prompt", id: "p2", text: "second" },
+      { kind: "user_prompt", id: "direct", text: "unrelated, echo not here yet" },
+    );
+    const next = reducer(local, {
+      kind: "transcript_snapshot",
+      rows: [
+        { id: "p1", kind: "user_prompt", at: "2026-01-01T00:00:00Z", text: "first\n\nsecond", mergedPromptIds: ["p2"] },
+      ],
+    });
+    expect(next.inflightPromptIds).toEqual(["direct"]);
+    expect(next.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+  });
+
   it("hydrate replaces confirmed rows with the server snapshot but keeps in-flight ones", () => {
     const local = run(
       empty(),
