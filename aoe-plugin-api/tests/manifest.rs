@@ -538,6 +538,39 @@ fn path_icon_and_hash_helpers() {
 }
 
 #[test]
+fn instruction_flag_keeps_the_escaped_instruction_one_word() {
+    let body = |flag: &str| {
+        format!(
+            "capabilities = [\"session.integration\"]\n[[agent_integrations]]\ntool = \"acme-helper\"\nprovider_versions = [\"^1\"]\ncommand = \"acme-helper\"\n[agent_integrations.launch]\ninstruction_flag = {flag:?}\n"
+        )
+    };
+    for flag in [
+        "--append-system-prompt {}",
+        "--instructions={}",
+        "--prompt {} --verbose",
+    ] {
+        parse(20, &body(flag));
+    }
+    // Quoting or concatenating the placeholder moves the escaped instruction
+    // out of a word boundary, so the substituted text stops being data.
+    for flag in [
+        "--append-system-prompt \"{}\"",
+        "--append-system-prompt '{}'",
+        "--append-system-prompt pre{}",
+        "--append-system-prompt=$(id) {}",
+        "--append-system-prompt  {}",
+    ] {
+        let errors = invalid(20, &body(flag));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("instruction_flag")),
+            "{flag:?}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn agent_launch_declarations_parse_at_v20() {
     let body = r#"
 capabilities = ["session.integration"]
@@ -728,7 +761,7 @@ command = "acme-helper"
 [agent_integrations.launch]
 instruction_flag = "--append-system-prompt"
 "#,
-            "exactly one `{}` placeholder",
+            "one `{}` whole argument",
         ),
         (
             r#"

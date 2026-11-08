@@ -714,45 +714,57 @@ fn agent_id_ok(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
-/// One argv token the host appends verbatim to a shell launch command.
-fn flag_token_ok(value: &str) -> bool {
-    value.starts_with('-')
-        && value.len() <= 128
-        && !value.chars().any(|c| {
-            c.is_control()
-                || c.is_whitespace()
-                || matches!(
-                    c,
-                    '{' | '}'
-                        | ';'
-                        | '|'
-                        | '&'
-                        | '$'
-                        | '`'
-                        | '\\'
-                        | '"'
-                        | '\''
-                        | '<'
-                        | '>'
-                        | '('
-                        | ')'
-                        | '*'
-                        | '?'
-                        | '['
-                        | ']'
-                        | '#'
-                        | '!'
-                        | '~'
-                )
-        })
+/// Whitespace, braces, and everything a POSIX shell would act on.
+fn shell_syntax_free(value: &str) -> bool {
+    !value.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(
+                c,
+                '{' | '}'
+                    | ';'
+                    | '|'
+                    | '&'
+                    | '$'
+                    | '`'
+                    | '\\'
+                    | '"'
+                    | '\''
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '#'
+                    | '!'
+                    | '~'
+            )
+    })
 }
 
+/// One argv token the host appends verbatim to a shell launch command.
+fn flag_token_ok(value: &str) -> bool {
+    value.starts_with('-') && value.len() <= 128 && shell_syntax_free(value)
+}
+
+/// The instruction is substituted as a single shell-escaped word, which is only
+/// safe where the template cannot quote it. The placeholder must therefore be a
+/// whole argument, its own or after `=`, with the rest free of shell syntax.
 fn instruction_flag_ok(value: &str) -> bool {
     if !value.starts_with('-') || value.len() > 256 || value.matches("{}").count() != 1 {
         return false;
     }
-    let rest = value.replacen("{}", "", 1);
-    !rest.contains('{') && !rest.contains('}') && !rest.chars().any(char::is_control)
+    let Some((head, _)) = value.split_once("{}") else {
+        return false;
+    };
+    (head.ends_with(' ') || head.ends_with('='))
+        && value
+            .replacen("{}", "x", 1)
+            .split(' ')
+            .all(|word| !word.is_empty() && shell_syntax_free(word))
 }
 
 fn env_name_ok(name: &str) -> bool {
@@ -866,7 +878,7 @@ fn validate_agent_declarations(
             check(
                 instruction_flag_ok(flag),
                 format!(
-                    "agent_integrations[{i}].launch.instruction_flag must be one argv token starting with `-` and containing exactly one `{{}}` placeholder"
+                    "agent_integrations[{i}].launch.instruction_flag must start with `-`, hold one `{{}}` whole argument or `=` value, and carry no shell syntax"
                 ),
             );
         }
