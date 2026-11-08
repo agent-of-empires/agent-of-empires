@@ -143,7 +143,7 @@ export function activityToThreadMessages(
     if (row.kind === "tool_start" && row.tool) {
       const parentBuilder = builderByToolId.get(row.tool.parent_tool_call_id ?? "");
       const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
-      builder.appendToolCall(row.tool, !!parentBuilder);
+      builder.appendToolCall(row.tool, !!parentBuilder, row.output);
       builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
@@ -234,7 +234,7 @@ class AssistantBuilder {
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
-  appendToolCall(tool: ToolCall, isChild = false) {
+  appendToolCall(tool: ToolCall, isChild = false, output?: ToolOutputBlock[]) {
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
@@ -243,6 +243,8 @@ class AssistantBuilder {
     if (tool.raw_name) argsObj._aoe_raw_tool_name = tool.raw_name;
     if (tool.memory_recall) argsObj._aoe_memory_recall = tool.memory_recall;
     if (tool.diffs?.length) argsObj._aoe_diffs = tool.diffs;
+    // Streamed output is not a tool result; keep the part open until a real terminal arrives.
+    if (output?.length) argsObj._aoe_partial_output = output;
     const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,

@@ -464,7 +464,9 @@ fn fold_connect_history(
             .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)?;
         folds.last_applied_seq = stored.seq;
         if stored.seq <= since {
-            folds.transcript.observe_prior(stored.seq, &stored.event);
+            folds
+                .transcript
+                .observe_prior(stored.seq, &stored.event, &stored.metadata);
         } else {
             folds
                 .transcript

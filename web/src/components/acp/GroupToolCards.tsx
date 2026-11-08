@@ -12,6 +12,7 @@ import {
   HighlightedBlock,
   PlaceholderLine,
   spanTimes,
+  toolOutput,
   useToolArgs,
   useToolCardExpansion,
   type Status,
@@ -158,6 +159,7 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
   const { args, description } = useTaskDescription(tool);
   const hasChildren = children.length > 0;
   const prompt = pickStr(args, "prompt");
+  const output = toolOutput(tool, result);
   const report = result ? extractTaskResult(result.text ?? "") : "";
   // Only the parent's own error fails the header.
   const status: Status =
@@ -199,7 +201,7 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
           ))
         }
       />
-      {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
+      {output?.length ? <ToolOutputMedia blocks={output} /> : null}
     </>
   );
 }

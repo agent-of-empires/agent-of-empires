@@ -164,6 +164,18 @@ impl ToolLifecycle {
     }
 }
 
+pub(crate) fn closes_tool_lifecycle(
+    event: &Event,
+    metadata: &crate::acp::event_sender::EventMetadata,
+) -> bool {
+    matches!(
+        event,
+        Event::AgentStartupError { .. }
+            | Event::IncompatibleAgent { .. }
+            | Event::AgentSwitched { .. }
+    ) || (matches!(event, Event::Stopped { .. }) && metadata.operation.is_none())
+}
+
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
@@ -235,7 +247,12 @@ impl TranscriptModel {
     }
 
     /// Observe prefix lifecycle and context without rows, advancing the replay watermark.
-    pub fn observe_prior(&mut self, seq: u64, event: &Event) {
+    pub fn observe_prior(
+        &mut self,
+        seq: u64,
+        event: &Event,
+        metadata: &crate::acp::event_sender::EventMetadata,
+    ) {
         if seq <= self.last_seq {
             return;
         }
@@ -284,7 +301,9 @@ impl TranscriptModel {
             Event::Stopped { .. }
             | Event::AgentStartupError { .. }
             | Event::IncompatibleAgent { .. }
-            | Event::AgentSwitched { .. } => {
+            | Event::AgentSwitched { .. }
+                if closes_tool_lifecycle(event, metadata) =>
+            {
                 for (id, tool) in &mut self.tools {
                     if matches!(tool, ToolLifecycle::Buffered(_)) {
                         if let Some(output) = tool.finish().into_unfinished(id) {
@@ -519,7 +538,7 @@ impl TranscriptModel {
                 vec![self.append(row)]
             }
             Event::Stopped { .. } => {
-                let mut deltas = if metadata.operation.is_none() {
+                let mut deltas = if closes_tool_lifecycle(event, metadata) {
                     self.turn_active = false;
                     self.sweep_open_tools(seq)
                 } else {
@@ -1288,7 +1307,11 @@ mod tests {
                 let mut model = TranscriptModel::new();
                 for (index, event) in events.iter().enumerate() {
                     if index < split {
-                        model.observe_prior(index as u64 + 1, event);
+                        model.observe_prior(
+                            index as u64 + 1,
+                            event,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        );
                     } else {
                         model.apply_scoped_event(
                             index as u64 + 1,
@@ -1376,7 +1399,11 @@ mod tests {
                 for (index, event) in events.iter().enumerate() {
                     let seq = index as u64 + 1;
                     if index < split {
-                        model.observe_prior(seq, event);
+                        model.observe_prior(
+                            seq,
+                            event,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        );
                     } else {
                         model.apply_scoped_event(
                             seq,
@@ -2132,7 +2159,11 @@ mod tests {
             ]
         );
         let mut m = TranscriptModel::new();
-        m.observe_prior(1, &thought("earlier", a));
+        m.observe_prior(
+            1,
+            &thought("earlier", a),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         m.apply_scoped_event(
             2,
             &thought("later", b),
@@ -2157,7 +2188,11 @@ mod tests {
         ] {
             let mut m = TranscriptModel::new();
             for (index, event) in prior.iter().enumerate() {
-                m.observe_prior(index as u64 + 1, event);
+                m.observe_prior(
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
             }
             m.apply_scoped_event(
                 10,
@@ -2188,7 +2223,11 @@ mod tests {
             let mut m = TranscriptModel::new();
             for (i, e) in events.iter().enumerate() {
                 if i < split {
-                    m.observe_prior(i as u64 + 1, e);
+                    m.observe_prior(
+                        i as u64 + 1,
+                        e,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    );
                 } else {
                     m.apply_scoped_event(
                         i as u64 + 1,
@@ -2306,7 +2345,11 @@ mod tests {
         ] {
             let mut model = TranscriptModel::new();
             for (index, event) in prefix.iter().enumerate() {
-                model.observe_prior(index as u64 + 1, event);
+                model.observe_prior(
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
                 assert!(model.rows().is_empty(), "{label}: prefix stays unrendered");
             }
             for (index, event) in suffix.iter().enumerate() {
@@ -2377,7 +2420,11 @@ mod tests {
             .iter()
             .enumerate()
             {
-                model.observe_prior(index as u64 + 1, event);
+                model.observe_prior(
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
             }
             assert!(model.rows().is_empty());
             let output = vec![ToolOutputBlock::Text {
@@ -2442,7 +2489,11 @@ mod tests {
         .enumerate()
         {
             let seq = index as u64 + 1;
-            model.observe_prior(seq, event);
+            model.observe_prior(
+                seq,
+                event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert_eq!(model.last_seq(), seq, "{event:?}");
             assert!(model.rows().is_empty(), "{event:?}");
             assert!(
@@ -2461,9 +2512,21 @@ mod tests {
     #[test]
     fn observed_prefix_rejects_stale_stop_before_later_tool() {
         let mut model = TranscriptModel::new();
-        model.observe_prior(1, &stopped("prompt_complete"));
-        model.observe_prior(2, &started(tool("later", "Later tool")));
-        model.observe_prior(1, &stopped("prompt_complete"));
+        model.observe_prior(
+            1,
+            &stopped("prompt_complete"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        model.observe_prior(
+            2,
+            &started(tool("later", "Later tool")),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        model.observe_prior(
+            1,
+            &stopped("prompt_complete"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert_eq!(model.last_seq(), 2, "stale observation keeps the watermark");
         assert!(model.rows().is_empty());
         assert!(
@@ -2516,8 +2579,16 @@ mod tests {
             },
         ] {
             let mut model = TranscriptModel::new();
-            model.observe_prior(1, &content("reused", "old orphan output"));
-            model.observe_prior(2, &closer);
+            model.observe_prior(
+                1,
+                &content("reused", "old orphan output"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            model.observe_prior(
+                2,
+                &closer,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(model.rows().is_empty(), "{closer:?}: prefix stays hidden");
             model.apply_scoped_event(
                 10,
@@ -2572,7 +2643,11 @@ mod tests {
             for observed_content in [false, true] {
                 let mut model = TranscriptModel::new();
                 if observed_content {
-                    model.observe_prior(1, &content("reused", "old orphan output"));
+                    model.observe_prior(
+                        1,
+                        &content("reused", "old orphan output"),
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    );
                 } else {
                     model.apply_scoped_event(
                         1,
@@ -2626,9 +2701,17 @@ mod tests {
         for observed_start in [false, true] {
             let mut model = TranscriptModel::new();
             if observed_start {
-                model.observe_prior(1, &started(tool("done", "Old call")));
+                model.observe_prior(
+                    1,
+                    &started(tool("done", "Old call")),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                );
             }
-            model.observe_prior(2, &completed("done", false, "finished before cursor"));
+            model.observe_prior(
+                2,
+                &completed("done", false, "finished before cursor"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(
                 model
                     .apply_scoped_event(
@@ -2850,8 +2933,16 @@ mod tests {
             let m = fold([started(tool("t1", "T")), closer.clone()]);
             assert_eq!(count(&m, TranscriptRowKind::ToolStopped), 1, "{label}");
             let mut partial = TranscriptModel::new();
-            partial.observe_prior(1, &started(tool("t1", "T")));
-            partial.observe_prior(2, &content("t1", "buffered before cursor"));
+            partial.observe_prior(
+                1,
+                &started(tool("t1", "T")),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            partial.observe_prior(
+                2,
+                &content("t1", "buffered before cursor"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(partial.rows().is_empty(), "{label}");
             partial.apply_scoped_event(
                 10,
@@ -2875,9 +2966,21 @@ mod tests {
                 "{label}"
             );
             let mut closed_prefix = TranscriptModel::new();
-            closed_prefix.observe_prior(1, &started(tool("t1", "T")));
-            closed_prefix.observe_prior(2, &content("t1", "discarded before cursor"));
-            closed_prefix.observe_prior(3, &closer);
+            closed_prefix.observe_prior(
+                1,
+                &started(tool("t1", "T")),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            closed_prefix.observe_prior(
+                2,
+                &content("t1", "discarded before cursor"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
+            closed_prefix.observe_prior(
+                3,
+                &closer,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
             assert!(closed_prefix.rows().is_empty(), "{label}");
             assert!(
                 closed_prefix
