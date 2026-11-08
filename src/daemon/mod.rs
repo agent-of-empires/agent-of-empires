@@ -149,7 +149,7 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     match code {
         ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
         ApiErrorCode::LaunchIndeterminate => {
-            crate::session::LaunchIndeterminateCause::ObservationFailed.message()
+            "Launch committed but readiness is unconfirmed; runtime preserved"
         }
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
         ApiErrorCode::ResumeFailed => {
@@ -164,7 +164,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::AgentHooksNotApproved) =>
             "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
-        Some(ApiErrorCode::LaunchIndeterminate) => crate::session::LaunchIndeterminateCause::ObservationFailed.message().into(),
+        Some(ApiErrorCode::LaunchIndeterminate) => committed_failure_message(ApiErrorCode::LaunchIndeterminate).into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
         "Auto-name is unavailable for this session; check its repository and tool configuration"
             .into()
@@ -1015,6 +1015,7 @@ impl DaemonClient {
                     ApiErrorCode::LifecycleLocked
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
+                        | ApiErrorCode::LaunchIndeterminate
                 )
             ) || status == StatusCode::UNAUTHORIZED
             {
@@ -1800,6 +1801,64 @@ mod tests {
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess%2Fa%3Fb/restart");
     }
+    #[tokio::test]
+    async fn launch_indeterminate_does_not_wait_for_anonymous_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            DaemonClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap();
+        let (headers_sent, headers_seen) = tokio::sync::oneshot::channel();
+        let (release_body, body_released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 409 Conflict\r\n{ERROR_CODE_HEADER}: launch_indeterminate\r\nContent-Length: 100\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            headers_sent.send(()).unwrap();
+            let _ = body_released.await;
+        });
+        let mut request = tokio::spawn(async move {
+            client
+                .mutate_session(
+                    "session",
+                    &SessionMutation::Start(StartSessionBody::default()),
+                    "epoch",
+                )
+                .await
+        });
+        headers_seen.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut request).await;
+        let _ = release_body.send(());
+        server.await.unwrap();
+        if result.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        assert!(
+            matches!(
+                result,
+                Ok(Ok(Err(DaemonClientError::Status {
+                    status: StatusCode::CONFLICT,
+                    code: Some(ApiErrorCode::LaunchIndeterminate),
+                    ref body,
+                    truncated: false,
+                }))) if body.is_empty()
+            ),
+            "finite refusal must precede response-body release: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn conflict_lifecycle_locked_maps_without_reading_body() {
         let (tx, rx) = tokio::sync::oneshot::channel();

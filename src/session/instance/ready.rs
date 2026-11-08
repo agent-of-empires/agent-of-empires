@@ -134,14 +134,14 @@ impl Instance {
             return Err(EnsureReadyError::StructuredView);
         }
         let session = self.tmux_session().map_err(EnsureReadyError::Tmux)?;
-        if !session.exists() {
-            // Route fresh starts through the resume probe so a sid loaded
-            // from disk that crashes the agent on launch is detected and
-            // preserved on the first failure. The next attempt starts fresh
-            // rather than repeating that resume. Always `Allow`: sends must
-            // keep trying to preserve agent context regardless of
-            // `auto_resume_on_restart`, which only scopes explicit
-            // restart/reattach. See #2609.
+        let probe = crate::tmux::utils::probe_pane(session.name());
+        if probe == crate::tmux::utils::PaneProbe::Unknown {
+            return Ok(EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::ObservationFailed,
+            });
+        }
+        if probe == crate::tmux::utils::PaneProbe::Missing {
+            // Sends permit resume regardless of the automatic restart setting.
             let outcome =
                 self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
@@ -158,7 +158,7 @@ impl Instance {
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Started);
         }
-        if session.is_pane_dead() {
+        if probe == crate::tmux::utils::PaneProbe::Dead {
             let outcome =
                 self.restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
@@ -262,6 +262,65 @@ mod tests {
             Err(EnsureReadyError::StructuredView) => {}
             other => panic!("expected StructuredView, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cached_presence_never_makes_an_unknown_probe_ready() {
+        if std::env::var_os("AOE_TEST_READY_UNKNOWN_CHILD").is_none() {
+            if !crate::tmux::test_helpers::tmux_available() {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let not_directory = root.path().join("not-directory");
+            std::fs::write(&not_directory, b"not a socket directory").unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "session::instance::ready::tests::cached_presence_never_makes_an_unknown_probe_ready",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_READY_UNKNOWN_CHILD", "1")
+                .env("AOE_TMUX_SOCKET", not_directory.join("socket"))
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"));
+            let output =
+                crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 3)
+                    .unwrap()
+                    .expect("private unknown-probe test must complete");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("cached-unknown-readiness", root.path().to_str().unwrap());
+        instance.status = Status::Running;
+        let session = instance.tmux_session().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Unknown
+        );
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert!(
+            session.exists(),
+            "the stale positive cache must be established"
+        );
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::ObservationFailed,
+            }
+        );
+        assert_eq!(instance.status, Status::Running);
+        assert_eq!(instance.last_start_time, None);
     }
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no

@@ -2859,10 +2859,34 @@ pub(crate) struct ConversationState {
 
 impl ConversationState {
     pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        self.intent == instance.resume_intent && self.matches_context(instance)
+    }
+
+    pub(super) fn matches_launch_observation(&self, instance: &Instance) -> bool {
+        let confirmed = match self.active.as_ref() {
+            Some(ActiveExecution {
+                binding,
+                capture: Some(CaptureContext::Omp(metadata)),
+                ..
+            }) => {
+                if binding.agent != "omp"
+                    || instance.omp_capture_generation.as_deref()
+                        != Some(metadata.launch_id.as_str())
+                {
+                    return false;
+                }
+                matches!(&self.intent, ResumeIntent::Use(sid) if self.session_id.as_ref() == Some(sid))
+                    && instance.resume_intent == ResumeIntent::Default
+            }
+            _ => false,
+        };
+        (self.intent == instance.resume_intent || confirmed) && self.matches_context(instance)
+    }
+
+    fn matches_context(&self, instance: &Instance) -> bool {
         self.tool == instance.tool
             && self.session_id == instance.agent_session_id
             && self.binding == instance.agent_session_binding
-            && self.intent == instance.resume_intent
             && self.resume_binding == instance.resume_binding
             && self.active == instance.active_execution
             && self.pi_session_path == instance.pi_session_path

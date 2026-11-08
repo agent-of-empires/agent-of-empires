@@ -252,9 +252,11 @@ pub(crate) enum PaneProbe {
 #[cfg(test)]
 pub(crate) mod owned_probe_test_support {
     type Callback = Box<dyn FnMut(&mut std::process::Output)>;
+    type RemovalCallback = Box<dyn FnOnce(&crate::session::LegacyToolObservation)>;
     thread_local! {
         static OBSERVER: std::cell::RefCell<Option<Callback>> = const { std::cell::RefCell::new(None) };
         static EXPIRE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static BEFORE_REMOVAL: std::cell::RefCell<Option<RemovalCallback>> = const { std::cell::RefCell::new(None) };
     }
     pub(crate) struct Observer;
     impl Observer {
@@ -272,6 +274,31 @@ pub(crate) mod owned_probe_test_support {
                 slot.borrow_mut().take();
             });
             EXPIRE_REMOVAL.with(|slot| slot.set(false));
+        }
+    }
+    pub(crate) struct BeforeRemoval;
+    impl BeforeRemoval {
+        pub(crate) fn install(
+            callback: impl FnOnce(&crate::session::LegacyToolObservation) + 'static,
+        ) -> Self {
+            BEFORE_REMOVAL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(callback));
+            });
+            Self
+        }
+    }
+    impl Drop for BeforeRemoval {
+        fn drop(&mut self) {
+            BEFORE_REMOVAL.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(super) fn before_removal(expected: &crate::session::LegacyToolObservation) {
+        let callback = BEFORE_REMOVAL.with(|slot| slot.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback(expected);
         }
     }
     pub(super) fn observe(output: &mut std::process::Output) {
@@ -302,13 +329,12 @@ pub(crate) fn created_pane_observation(
     stdout: &[u8],
 ) -> Result<crate::session::LegacyToolObservation> {
     let text = std::str::from_utf8(stdout)?;
-    let mut parts = text.trim_end_matches(['\r', '\n']).split('|');
+    let mut parts = text.trim_end_matches(['\r', '\n']).splitn(5, '|');
     let fields: [Option<&str>; 5] = std::array::from_fn(|_| parts.next());
-    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(socket), Some(server_pid)] = fields
+    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(socket)] = fields
     else {
         bail!("malformed created pane identity");
     };
-    anyhow::ensure!(parts.next().is_none(), "malformed created pane identity");
     let identity = crate::session::LegacyToolIdentity {
         session_id: session_id.to_owned(),
         pane_id: pane_id.to_owned(),
@@ -331,12 +357,18 @@ pub(crate) fn created_pane_observation(
     })
 }
 
+pub(crate) struct OwnedPaneProbe {
+    pub(crate) state: PaneProbe,
+    pub(crate) shell: bool,
+    pub(crate) exclusive: bool,
+}
+
 /// Fresh observation of the pane this launch created. None means ownership changed.
 pub(crate) fn probe_owned_pane(
     session_name: &str,
     expected: &crate::session::LegacyToolObservation,
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Result<Option<(PaneProbe, bool)>> {
+) -> Result<Option<OwnedPaneProbe>> {
     anyhow::ensure!(
         crate::process::process_birth_is_live(expected.server.pid, &expected.server.birth)?,
         "original tmux server is unavailable"
@@ -354,7 +386,7 @@ pub(crate) fn probe_owned_pane(
                 "list-panes",
                 "-a",
                 "-F",
-                "#{socket_path}|#{pid}|#{session_id}|#{pane_id}",
+                "#{pid}|#{session_id}|#{pane_id}|#{socket_path}",
             ]);
             let output = deadline.run(&mut command)?;
             anyhow::ensure!(
@@ -369,13 +401,12 @@ pub(crate) fn probe_owned_pane(
             );
             let mut owned_identity_present = false;
             for line in stdout.lines() {
-                let mut parts = line.split('|');
+                let mut parts = line.splitn(4, '|');
                 let fields: [Option<&str>; 4] = std::array::from_fn(|_| parts.next());
-                let [Some(socket), Some(server_pid), Some(session_id), Some(pane_id)] = fields
+                let [Some(server_pid), Some(session_id), Some(pane_id), Some(socket)] = fields
                 else {
                     bail!("malformed tmux absence inventory");
                 };
-                anyhow::ensure!(parts.next().is_none(), "malformed tmux absence inventory");
                 anyhow::ensure!(
                     socket == expected.server.socket
                         && server_pid.parse::<u32>()? == expected.server.pid,
@@ -399,7 +430,11 @@ pub(crate) fn probe_owned_pane(
             if owned_identity_present {
                 return Ok(None);
             }
-            return Ok(Some((PaneProbe::Missing, false)));
+            return Ok(Some(OwnedPaneProbe {
+                state: PaneProbe::Missing,
+                shell: false,
+                exclusive: true,
+            }));
         }
     };
     if ids.first() != Some(&expected.identity.pane_id) {
@@ -408,7 +443,7 @@ pub(crate) fn probe_owned_pane(
     let mut command = crate::tmux::tmux_query_command_for_socket(&expected.server.socket);
     command.args([
         "display-message", "-p", "-t", &expected.identity.pane_id,
-        "#{session_id}|#{pane_id}|#{pane_pid}|#{socket_path}|#{pid}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+        "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{session_windows}|#{window_panes}|#{pane_current_command}|#{pane_start_command}",
     ]);
     let output = deadline.run(&mut command)?;
     #[cfg(test)]
@@ -423,13 +458,26 @@ pub(crate) fn probe_owned_pane(
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = std::str::from_utf8(&output.stdout)?;
-    let mut parts = stdout.trim_end_matches(['\r', '\n']).splitn(8, '|');
-    let fields: [Option<&str>; 8] = std::array::from_fn(|_| parts.next());
-    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(socket), Some(server_pid), Some(dead), Some(command), Some(start_command)] =
+    let (length, data) = stdout
+        .trim_end_matches(['\r', '\n'])
+        .split_once('|')
+        .ok_or_else(|| anyhow::anyhow!("missing tmux socket length"))?;
+    let length = length.parse::<usize>()?;
+    let socket = data
+        .get(..length)
+        .ok_or_else(|| anyhow::anyhow!("invalid tmux socket length"))?;
+    let suffix = data
+        .get(length..)
+        .and_then(|rest| rest.strip_prefix('|'))
+        .ok_or_else(|| anyhow::anyhow!("malformed tmux socket field"))?;
+    let mut parts = suffix.splitn(9, '|');
+    let fields: [Option<&str>; 9] = std::array::from_fn(|_| parts.next());
+    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(windows), Some(panes), Some(command), Some(start_command)] =
         fields
     else {
         bail!("malformed tmux pane observation");
     };
+    let exclusive = (windows.parse::<u32>()?, panes.parse::<u32>()?) == (1, 1);
     let pid: u32 = server_pid.parse()?;
     let probe = classify_pane_probe(true, dead, &[]);
     anyhow::ensure!(
@@ -454,7 +502,11 @@ pub(crate) fn probe_owned_pane(
     }
     let shell =
         is_pane_running_shell_command(command, start_command.contains(PANE_ENV_FILE_PREFIX));
-    Ok(Some((probe, shell)))
+    Ok(Some(OwnedPaneProbe {
+        state: probe,
+        shell,
+        exclusive,
+    }))
 }
 
 /// The tmux server checks the same dead pane identity in the command that removes it.
@@ -476,7 +528,9 @@ pub(crate) fn remove_owned_dead_pane(
         expected.server.pid,
         literal(&expected.server.socket)
     );
-    let condition = format!("#{{&&:#{{&&:{session},{pane}}},#{{&&:{process},{server}}}}}");
+    let exclusive = "#{&&:#{==:#{session_windows},1},#{==:#{window_panes},1}}";
+    let condition =
+        format!("#{{&&:#{{&&:{session},{pane}}},#{{&&:#{{&&:{process},{server}}},{exclusive}}}}}");
     let target = crate::tmux::Session::tmux_command_string_literal(&identity.session_id);
     let effect = format!("kill-session -t {target} ; display-message -p aoe-probe-stopped");
     let mut command = crate::tmux::tmux_query_command_for_socket(&expected.server.socket);
@@ -491,6 +545,8 @@ pub(crate) fn remove_owned_dead_pane(
     let deadline = crate::tmux::TmuxCommandDeadline::new();
     #[cfg(test)]
     let deadline = owned_probe_test_support::removal_deadline(deadline);
+    #[cfg(test)]
+    owned_probe_test_support::before_removal(expected);
     let output = deadline.run(&mut command)?;
     anyhow::ensure!(
         output.status.success()
@@ -1896,6 +1952,199 @@ esac
 #[cfg(test)]
 mod pane_probe_tests {
     use super::*;
+
+    fn create_observed_test_pane(
+        instance: &crate::session::Instance,
+        root: &std::path::Path,
+    ) -> crate::session::LegacyToolObservation {
+        let session = instance.tmux_session().unwrap();
+        let observation = session
+            .create_with_size_env_and_container_env(
+                root.to_str().unwrap(),
+                Some("exec sleep 120"),
+                None,
+                "default",
+                &[],
+                &[],
+                None,
+            )
+            .unwrap()
+            .expect("real creation must return its captured pane identity");
+        crate::tmux::test_helpers::wait_for_pane_command(&observation.identity.pane_id, "sleep");
+        observation
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn socket_delimiters_preserve_created_owned_and_absent_pane_identity() {
+        use crate::tmux::test_helpers::{wait_for_pane_dead, TmuxTestSession};
+
+        if std::env::var_os("AOE_TEST_PIPE_SOCKET_CHILD").is_none() {
+            if !crate::tmux::test_helpers::tmux_available() {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("probe-|é.sock");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tmux::utils::pane_probe_tests::socket_delimiters_preserve_created_owned_and_absent_pane_identity",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_PIPE_SOCKET_CHILD", "1")
+                .env("AOE_TMUX_SOCKET", &socket)
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"));
+            let output =
+                crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 8)
+                    .unwrap();
+            let _ = crate::tmux::tmux_query_command_for_socket(socket.to_str().unwrap())
+                .arg("kill-server")
+                .output();
+            let output = output.expect("private pipe-socket test must complete");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let socket = std::path::PathBuf::from(
+            std::env::var_os(crate::tmux::TMUX_SOCKET_ENV).expect("parent supplies private socket"),
+        );
+        let instance =
+            crate::session::Instance::new("socket-framing", root.path().to_str().unwrap());
+        let session = instance.tmux_session().unwrap();
+        let _pane = TmuxTestSession::from_name(session.name());
+        let expected = create_observed_test_pane(&instance, root.path());
+        assert_eq!(expected.server.socket, socket.to_str().unwrap());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert_eq!(
+            probe_owned_pane(session.name(), &expected, &deadline)
+                .unwrap()
+                .unwrap()
+                .state,
+            PaneProbe::Alive
+        );
+        for args in [
+            vec![
+                "set-option",
+                "-p",
+                "-t",
+                expected.identity.pane_id.as_str(),
+                "remain-on-exit",
+                "on",
+            ],
+            vec!["send-keys", "-t", expected.identity.pane_id.as_str(), "C-c"],
+        ] {
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        wait_for_pane_dead(&expected.identity.pane_id);
+        assert_eq!(
+            probe_owned_pane(session.name(), &expected, &deadline)
+                .unwrap()
+                .unwrap()
+                .state,
+            PaneProbe::Dead
+        );
+        let keeper = crate::session::Instance::new("socket-keeper", root.path().to_str().unwrap());
+        let _keeper = TmuxTestSession::from_name(keeper.tmux_session().unwrap().name());
+        let keeper_observation = create_observed_test_pane(&keeper, root.path());
+        assert!(crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &expected.identity.session_id])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            probe_owned_pane(session.name(), &expected, &deadline)
+                .unwrap()
+                .unwrap()
+                .state,
+            PaneProbe::Missing
+        );
+        assert_eq!(
+            crate::tmux::test_helpers::pane_field(
+                &keeper_observation.identity.pane_id,
+                "#{pane_dead}"
+            ),
+            "0"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dead_pane_cleanup_never_kills_a_peer_pane() {
+        use crate::tmux::test_helpers::{
+            pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
+        };
+
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let instance = crate::session::Instance::new("shared-probe", root.path().to_str().unwrap());
+        let session = instance.tmux_session().unwrap();
+        let _pane = TmuxTestSession::from_name(session.name());
+        let expected = create_observed_test_pane(&instance, root.path());
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &expected.identity.pane_id,
+                "remain-on-exit",
+                "on"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(crate::tmux::tmux_command()
+            .args(["send-keys", "-t", &expected.identity.pane_id, "C-c"])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(&expected.identity.pane_id);
+        let peer = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &expected.identity.pane_id,
+                "exec sleep 120",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            peer.status.success(),
+            "{}",
+            String::from_utf8_lossy(&peer.stderr)
+        );
+        let peer_id = std::str::from_utf8(&peer.stdout).unwrap().trim().to_owned();
+        wait_for_pane_command(&peer_id, "sleep");
+        let pid = pane_field(&peer_id, "#{pane_pid}").parse().unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        let removed = remove_owned_dead_pane(&expected);
+        assert!(
+            removed.is_err(),
+            "shared session must refuse cleanup: {removed:?}"
+        );
+        assert_eq!(pane_field(&peer_id, "#{pane_dead}"), "0");
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+    }
 
     /// The failure taxonomy the session-id poller depends on: a recognized
     /// "gone" stays Missing, an unrecognized failure never folds into it, so

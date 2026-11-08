@@ -1028,7 +1028,10 @@ impl Instance {
                 row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                 LifecycleReservationError::Superseded
             );
-            anyhow::ensure!(expected.matches(row), LifecycleReservationError::Superseded);
+            anyhow::ensure!(
+                expected.matches_launch_observation(row),
+                LifecycleReservationError::Superseded
+            );
             if row.agent_session_id.as_deref() == Some(sid) {
                 row.resume_probe_failed_sid = Some(sid.to_owned());
             }

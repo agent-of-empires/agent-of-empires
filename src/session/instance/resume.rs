@@ -171,6 +171,12 @@ pub(super) struct LaunchProbe {
     pub(super) expected: ConversationState,
 }
 
+pub(super) struct LaunchSandboxSnapshot {
+    pub(super) container_name: String,
+    pub(super) container_id: Option<String>,
+    pub(super) workdir: Option<String>,
+}
+
 pub(crate) struct ResumeLaunchOptions {
     pub(crate) resume_policy: ResumeAttemptPolicy,
     pub(crate) restart: bool,
@@ -281,7 +287,7 @@ impl Instance {
         loop {
             let observation =
                 crate::tmux::utils::probe_owned_pane(session.name(), pane, &command_deadline);
-            let (state, shell) = match observation {
+            let crate::tmux::utils::OwnedPaneProbe { state, shell, .. } = match observation {
                 Ok(Some(observation)) => observation,
                 Ok(None) => {
                     return ProbeResult::Indeterminate(LaunchIndeterminateCause::OwnershipUnproven)
@@ -337,7 +343,7 @@ impl Instance {
         if rows.iter().any(|row| {
             row.id == self.id
                 && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
-                && probe.expected.matches(row)
+                && probe.expected.matches_launch_observation(row)
         }) {
             Ok(())
         } else {
@@ -601,6 +607,15 @@ impl Instance {
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
+        let sandbox_prior = self
+            .sandbox_info
+            .as_ref()
+            .filter(|sandbox| sandbox.enabled)
+            .map(|sandbox| LaunchSandboxSnapshot {
+                container_name: sandbox.container_name.clone(),
+                container_id: sandbox.container_id.clone(),
+                workdir: sandbox.container_workdir.clone(),
+            });
         let spawned = (|| {
             let mut prepared =
                 self.stop_carry_and_prepare_in(storage, restart, conversation_carry, prior)?;
@@ -633,7 +648,12 @@ impl Instance {
             self.last_error = Some(cause.message().to_owned());
             self.last_error_check = Some(std::time::Instant::now());
             // A failed release cannot turn missing evidence into teardown authority.
-            if let Err(error) = self.release_indeterminate_launch(storage, generation) {
+            if let Err(error) = self.release_indeterminate_launch(
+                storage,
+                generation,
+                &probe,
+                sandbox_prior.as_ref(),
+            ) {
                 tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "indeterminate launch reservation release failed; runtime retained");
             }
             return Ok(outcome);
@@ -825,11 +845,13 @@ impl Instance {
         let deadline = tests::probe_deadline(deadline);
         let state = match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline)
         {
-            Ok(Some((
-                state @ (crate::tmux::utils::PaneProbe::Dead
-                | crate::tmux::utils::PaneProbe::Missing),
-                _,
-            ))) => state,
+            Ok(Some(crate::tmux::utils::OwnedPaneProbe {
+                state:
+                    state @ (crate::tmux::utils::PaneProbe::Dead
+                    | crate::tmux::utils::PaneProbe::Missing),
+                exclusive: true,
+                ..
+            })) => state,
             Ok(_) => {
                 return Ok(ProbeResult::Indeterminate(
                     LaunchIndeterminateCause::OwnershipUnproven,
@@ -902,6 +924,11 @@ impl Instance {
         generation: u64,
         probe: &LaunchProbe,
     ) -> Result<StartOutcome> {
+        if probe.pane.is_none() {
+            return Ok(StartOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::OwnershipUnproven,
+            });
+        }
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
                 if is_valid_session_id(&sid) && self.supports_native_resume() =>
@@ -1503,6 +1530,25 @@ mod tests {
         }
     }
 
+    fn owned_probe_fields(output: &std::process::Output) -> (&str, [&str; 9]) {
+        let text = std::str::from_utf8(&output.stdout).unwrap().trim_end();
+        let (length, data) = text.split_once('|').unwrap();
+        let (socket, suffix) = data.split_at(length.parse().unwrap());
+        let mut parts = suffix.strip_prefix('|').unwrap().splitn(9, '|');
+        (socket, std::array::from_fn(|_| parts.next().unwrap()))
+    }
+
+    fn replace_owned_probe_fields(
+        output: &mut std::process::Output,
+        replacements: &[(usize, &str)],
+    ) {
+        let (socket, mut fields) = owned_probe_fields(output);
+        for &(index, value) in replacements {
+            fields[index] = value;
+        }
+        output.stdout = format!("{}|{socket}|{}\n", socket.len(), fields.join("|")).into_bytes();
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -1764,15 +1810,18 @@ mod tests {
                     observed_query.set(sample);
                     match fault {
                         "pane_pid_missing" | "dead_pid_changed" => {
-                            let text = String::from_utf8(output.stdout.clone()).unwrap();
-                            let mut fields: Vec<_> = text.trim_end().splitn(8, '|').collect();
                             let other_pid = std::process::id().to_string();
-                            fields[2] = if fault == "pane_pid_missing" {
-                                ""
-                            } else {
-                                &other_pid
-                            };
-                            output.stdout = format!("{}\n", fields.join("|")).into_bytes();
+                            replace_owned_probe_fields(
+                                output,
+                                &[(
+                                    2,
+                                    if fault == "pane_pid_missing" {
+                                        ""
+                                    } else {
+                                        &other_pid
+                                    },
+                                )],
+                            );
                         }
                         "dead_recheck_timeout" if sample == 1 => {
                             PROBE_COMMANDS.with(|commands| commands.set(Some(0)));
@@ -1782,10 +1831,7 @@ mod tests {
                         }
                         "dead_recheck_marked" => {
                             if sample == 1 {
-                                assert!(
-                                    String::from_utf8_lossy(&output.stdout).split('|').nth(5)
-                                        == Some("1")
-                                );
+                                assert_eq!(owned_probe_fields(output).1[4], "1");
                                 crate::session::Storage::new_unwatched(&profile)
                                     .unwrap()
                                     .update(|rows, _| {
@@ -1827,18 +1873,11 @@ mod tests {
                         }
                         "malformed" => output.stdout = b"not a pane observation\n".to_vec(),
                         "server_changed" => {
-                            let text = String::from_utf8(output.stdout.clone()).unwrap();
-                            let mut fields: Vec<_> = text.trim_end().splitn(8, '|').collect();
                             let other_pid = std::process::id().to_string();
-                            fields[4] = &other_pid;
-                            output.stdout = format!("{}\n", fields.join("|")).into_bytes();
+                            replace_owned_probe_fields(output, &[(3, &other_pid)]);
                         }
                         "expiry" => {
-                            let text = String::from_utf8(output.stdout.clone()).unwrap();
-                            let mut fields: Vec<_> = text.trim_end().splitn(8, '|').collect();
-                            fields[6] = "sh";
-                            fields[7] = "";
-                            output.stdout = format!("{}\n", fields.join("|")).into_bytes();
+                            replace_owned_probe_fields(output, &[(7, "sh"), (8, "")]);
                         }
                         "superseded" | "same_sid_assertion" | "concurrent_status" => {
                             if sample != 1 {
@@ -2322,27 +2361,6 @@ mod tests {
                 !resume_supported,
                 "{tool}: direct resume flags"
             );
-            if matches!(tool, "qwen" | "kiro") {
-                assert_eq!(
-                    inst.finish_resume_launch(
-                        LaunchSidOutcome::Fresh {
-                            pinned_prior_sid: Some(sid.to_string()),
-                        },
-                        None,
-                        &crate::session::storage::Storage::new_unwatched("resume-contract")
-                            .unwrap(),
-                        0,
-                        &LaunchProbe {
-                            tmux_session: String::new(),
-                            pane: None,
-                            expected: inst.conversation_state()
-                        },
-                    )
-                    .unwrap(),
-                    StartOutcome::Fresh,
-                    "{tool}: inert stored ID must not trigger the pinned launch probe"
-                );
-            }
         }
     }
 
@@ -2446,6 +2464,9 @@ mod tests {
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
         let finalized = std::rc::Rc::new(std::cell::Cell::new(false));
         let finalized_in_observer = finalized.clone();
+        let retained_capture =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let retained_start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
             match phase {
                 FinalizePhase::Before => {
@@ -2465,6 +2486,15 @@ mod tests {
                         .update(|rows, _| {
                             let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
                             row.agent_session_id = Some(PEER_SID.to_string());
+                            row.active_execution = instance.active_execution.clone();
+                            row.active_execution
+                                .as_mut()
+                                .unwrap()
+                                .launch_id
+                                .push_str("-retained");
+                            row.capture_started_at = Some(retained_capture);
+                            row.started_at = Some(retained_start);
+                            row.launch_executable = Some("/bin/sh".into());
                             Ok(())
                         })
                         .unwrap();
@@ -2488,6 +2518,18 @@ mod tests {
         let rows = storage.load().unwrap();
         let row = rows.iter().find(|row| row.id == inst.id).unwrap();
         assert_eq!(row.agent_session_id.as_deref(), Some(PEER_SID));
+        assert_eq!(row.capture_started_at, Some(retained_capture));
+        assert_eq!(row.started_at, Some(retained_start));
+        assert_eq!(
+            row.launch_executable.as_deref(),
+            Some(std::path::Path::new("/bin/sh"))
+        );
+        assert!(row
+            .active_execution
+            .as_ref()
+            .unwrap()
+            .launch_id
+            .ends_with("-retained"));
         assert_eq!(
             row.resume_probe_failed_sid, None,
             "failure of A must not mark the peer's B as failed"
@@ -2508,27 +2550,34 @@ mod tests {
         let storage =
             crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
         let _pane = dead_resume_fixture(&inst);
-        let result = inst
-            .finish_resume_launch(
-                LaunchSidOutcome::Existing {
-                    sid: launched_sid.to_owned(),
-                },
-                None,
-                &storage,
-                0,
-                &LaunchProbe {
-                    tmux_session: String::new(),
-                    pane: None,
-                    expected: inst.conversation_state(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            result,
-            StartOutcome::Indeterminate {
-                cause: LaunchIndeterminateCause::OwnershipUnproven
-            }
-        );
+        for launch in [
+            LaunchSidOutcome::Existing {
+                sid: launched_sid.to_owned(),
+            },
+            LaunchSidOutcome::Fresh {
+                pinned_prior_sid: None,
+            },
+        ] {
+            let result = inst
+                .finish_resume_launch(
+                    launch,
+                    None,
+                    &storage,
+                    0,
+                    &LaunchProbe {
+                        tmux_session: String::new(),
+                        pane: None,
+                        expected: inst.conversation_state(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                result,
+                StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::OwnershipUnproven
+                }
+            );
+        }
         assert_eq!(inst.resume_probe_failed_sid, None);
         assert!(inst.tmux_session().unwrap().exists());
         assert!(inst.tmux_session().unwrap().is_pane_dead());
@@ -3037,5 +3086,399 @@ mod tests {
         inst.tool = "work-claude".to_string();
         inst.command = "claude".to_string();
         assert!(inst.should_probe_pinned_fresh_launch(Some("11111111-2222-3333-4444-555555555555")));
+    }
+
+    fn observed_dead_resume_fixture(
+        instance: &Instance,
+    ) -> (
+        crate::tmux::test_helpers::TmuxTestSession,
+        LegacyToolObservation,
+    ) {
+        use crate::tmux::test_helpers::{
+            wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
+        };
+        let session = instance.tmux_session().unwrap();
+        let guard = TmuxTestSession::from_name(session.name());
+        let observation = session
+            .create_with_size_env_and_container_env(
+                &instance.project_path,
+                Some("exec sleep 60"),
+                None,
+                &instance.source_profile,
+                &[],
+                &[],
+                None,
+            )
+            .unwrap()
+            .expect("real creation must capture its pane");
+        let pane = &observation.identity.pane_id;
+        wait_for_pane_command(pane, "sleep");
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                pane,
+                "remain-on-exit",
+                "on",
+                ";",
+                "send-keys",
+                "-t",
+                pane,
+                "C-c",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(pane);
+        (guard, observation)
+    }
+
+    fn add_live_probe_peer(pane: &str) -> (String, u32, crate::process::ProcessBirthIdentity) {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                pane,
+                "exec sleep 60",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let peer = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        crate::tmux::test_helpers::wait_for_pane_command(&peer, "sleep");
+        let pid = crate::tmux::test_helpers::pane_field(&peer, "#{pane_pid}")
+            .parse()
+            .unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        (peer, pid, birth)
+    }
+
+    #[test]
+    #[serial]
+    fn owned_dead_pane_without_durable_launch_owner_is_preserved() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = isolate_resume_environment(root.path());
+        let mut instance = Instance::new("owned-dead-no-owner", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "owned-dead-no-owner".into();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        instance.agent_session_id = Some(sid.into());
+        assert!(instance.supports_native_resume());
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        let (_pane, observation) = observed_dead_resume_fixture(&instance);
+        let probe = LaunchProbe {
+            tmux_session: instance.tmux_session().unwrap().name().to_owned(),
+            pane: Some(observation),
+            expected: instance.conversation_state(),
+        };
+        let releases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_releases = releases.clone();
+        let _release = crate::process::systemd::release_probe::install(move |_| {
+            observed_releases.set(observed_releases.get() + 1);
+        });
+        for launch in [
+            LaunchSidOutcome::Existing { sid: sid.into() },
+            LaunchSidOutcome::Fresh {
+                pinned_prior_sid: Some(sid.into()),
+            },
+        ] {
+            assert_eq!(
+                instance
+                    .finish_resume_launch(launch, None, &storage, 0, &probe)
+                    .unwrap(),
+                StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::OwnershipUnproven,
+                }
+            );
+            assert_eq!(
+                crate::tmux::utils::probe_pane(&probe.tmux_session),
+                crate::tmux::utils::PaneProbe::Dead
+            );
+            assert!(storage.load().unwrap().is_empty());
+            assert_eq!(instance.resume_probe_failed_sid, None);
+            assert_eq!(releases.get(), 0);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn shared_dead_probe_preserves_peers_and_only_justified_failure_markers() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        for after_marker in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            let mut instance = Instance::new("shared-dead-probe", root.path().to_str().unwrap());
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
+            instance.source_profile = "shared-dead-probe".into();
+            let sid = "11111111-2222-4333-8444-555555555555";
+            instance.agent_session_id = Some(sid.into());
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let generation = instance
+                .acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )
+                .unwrap();
+            let (_pane, observation) = observed_dead_resume_fixture(&instance);
+            let probe = LaunchProbe {
+                tmux_session: instance.tmux_session().unwrap().name().to_owned(),
+                pane: Some(observation),
+                expected: instance.conversation_state(),
+            };
+            let peer = std::rc::Rc::new(std::cell::RefCell::new(None));
+            if !after_marker {
+                *peer.borrow_mut() = Some(add_live_probe_peer(
+                    &probe.pane.as_ref().unwrap().identity.pane_id,
+                ));
+            }
+            let removal_peer = peer.clone();
+            let profile = instance.source_profile.clone();
+            let _removal = crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(
+                move |expected| {
+                    assert!(
+                        after_marker,
+                        "a shared initial observation must refuse before removal"
+                    );
+                    let row = crate::session::Storage::new_unwatched(&profile)
+                        .unwrap()
+                        .load()
+                        .unwrap()
+                        .remove(0);
+                    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(sid));
+                    *removal_peer.borrow_mut() =
+                        Some(add_live_probe_peer(&expected.identity.pane_id));
+                },
+            );
+            let releases = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_releases = releases.clone();
+            let _release = crate::process::systemd::release_probe::install(move |_| {
+                observed_releases.set(observed_releases.get() + 1);
+            });
+            assert!(matches!(
+                instance
+                    .remove_probed_pane(&storage, generation, &probe, Some(sid))
+                    .unwrap(),
+                ProbeResult::Indeterminate(_)
+            ));
+            let row = storage.load().unwrap().remove(0);
+            assert_eq!(
+                row.resume_probe_failed_sid.as_deref(),
+                after_marker.then_some(sid)
+            );
+            assert!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation));
+            assert_eq!(releases.get(), 0);
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(
+                    &probe.pane.as_ref().unwrap().identity.pane_id,
+                    "#{pane_dead}"
+                ),
+                "1"
+            );
+            let peer = peer.borrow();
+            let (pane, pid, birth) = peer.as_ref().expect("peer must have been created");
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(pane, "#{pane_dead}"),
+                "0"
+            );
+            assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(pane, "#{session_id}"),
+                probe.pane.as_ref().unwrap().identity.session_id
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn omp_pin_confirmation_during_grace_keeps_only_the_captured_launch_owner() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        const SID: &str = "11111111-2222-4333-8444-555555555555";
+        const PEER_SID: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        for change in ["confirmed", "repinned", "generation", "execution"] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            let (_hooks, _base, _hook_root) = crate::hooks::test_support::BaseGuard::ready();
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let _omp = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "omp",
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+            );
+            let project = root.path().join("project");
+            let store = root.path().join("store");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&store).unwrap();
+            let transcript = store.join("original.jsonl");
+            let original_transcript = format!(
+                "{}\n",
+                serde_json::json!({"type":"session", "id":SID, "cwd":project})
+            );
+            std::fs::write(&transcript, &original_transcript).unwrap();
+            let mut instance = Instance::new("omp-confirmed-probe", project.to_str().unwrap());
+            instance.tool = "omp".into();
+            instance.command = "omp".into();
+            instance.source_profile = "omp-confirmed-probe".into();
+            instance.extra_args =
+                format!("--session-dir {}", shell_escape(store.to_str().unwrap()));
+            instance.agent_session_id = Some(SID.into());
+            let binding = instance
+                .asserted_resume_binding(SID, Some(&transcript))
+                .unwrap();
+            instance.agent_session_binding = Some(binding.clone());
+            instance.resume_binding = Some(binding);
+            instance.resume_intent = ResumeIntent::Use(SID.into());
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let session = instance.tmux_session().unwrap();
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+            let profile = instance.source_profile.clone();
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let callback_observed = observed.clone();
+            POST_SHELL_OBSERVER.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |session| {
+                    let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
+                    let row = storage.load().unwrap().remove(0);
+                    assert_eq!(row.resume_intent, ResumeIntent::Use(SID.into()));
+                    let active = row.active_execution.as_ref().unwrap();
+                    let Some(CaptureContext::Omp(metadata)) = active.capture.as_ref() else {
+                        panic!("the real launch must publish OMP capture metadata");
+                    };
+                    assert_eq!(
+                        row.omp_capture_generation.as_deref(),
+                        Some(metadata.launch_id.as_str())
+                    );
+                    let confirmation = Instance::persist_omp_pin_confirmation(
+                        &storage,
+                        &row.id,
+                        SID,
+                        &metadata.launch_id,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        confirmation.outcome,
+                        crate::session::instance::sid_persist::SidWrite::Applied
+                    );
+                    assert_eq!(
+                        storage.load().unwrap()[0].resume_intent,
+                        ResumeIntent::Default
+                    );
+                    storage
+                        .update(|rows, _| {
+                            let row = rows
+                                .iter_mut()
+                                .find(|candidate| candidate.id == row.id)
+                                .unwrap();
+                            match change {
+                                "repinned" => {
+                                    row.resume_intent = ResumeIntent::Use(PEER_SID.into())
+                                }
+                                "generation" => {
+                                    row.omp_capture_generation = Some("foreign-generation".into())
+                                }
+                                "execution" => row
+                                    .active_execution
+                                    .as_mut()
+                                    .unwrap()
+                                    .launch_id
+                                    .push_str("-foreign"),
+                                "confirmed" => {}
+                                _ => unreachable!(),
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    let pane = crate::tmux::test_helpers::only_pane_id(session.name());
+                    let pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
+                        .parse()
+                        .unwrap();
+                    let birth = crate::process::process_birth_identity(pid)
+                        .unwrap()
+                        .unwrap();
+                    *callback_observed.borrow_mut() = Some((pane, pid, birth));
+                }));
+            });
+            let _observer = PostShellObserver;
+            let outcome = instance
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
+            assert_eq!(
+                outcome,
+                if change == "confirmed" {
+                    StartOutcome::Resumed
+                } else {
+                    StartOutcome::Indeterminate {
+                        cause: LaunchIndeterminateCause::OwnershipUnproven,
+                    }
+                },
+                "{change}"
+            );
+            let observed = observed.borrow();
+            let (pane, pid, birth) = observed
+                .as_ref()
+                .expect("confirmation must occur during the post-shell grace");
+            assert_eq!(
+                crate::tmux::test_helpers::only_pane_id(session.name()),
+                *pane
+            );
+            assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
+            let row = storage.load().unwrap().remove(0);
+            assert_eq!(row.resume_probe_failed_sid, None);
+            assert_eq!(
+                row.resume_intent,
+                if change == "repinned" {
+                    ResumeIntent::Use(PEER_SID.into())
+                } else {
+                    ResumeIntent::Default
+                }
+            );
+            assert_eq!(
+                std::fs::read_to_string(&transcript).unwrap(),
+                original_transcript
+            );
+            instance.kill_clean_in(&storage).unwrap();
+        }
     }
 }

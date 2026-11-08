@@ -554,7 +554,7 @@ impl Session {
             [
                 "-P".to_owned(),
                 "-F".to_owned(),
-                "#{session_id}|#{pane_id}|#{pane_pid}|#{socket_path}|#{pid}".to_owned(),
+                "#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{socket_path}".to_owned(),
             ],
         );
         let target = format!("={}:", self.name);

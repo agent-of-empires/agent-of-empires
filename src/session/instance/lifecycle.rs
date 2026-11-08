@@ -266,6 +266,8 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         generation: u64,
+        probe: &resume::LaunchProbe,
+        sandbox_prior: Option<&resume::LaunchSandboxSnapshot>,
     ) -> Result<()> {
         let status = storage.update(|rows, _| {
             let row = rows
@@ -276,10 +278,29 @@ impl Instance {
                 row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                 LifecycleReservationError::Superseded
             );
-            if row.active_execution == self.active_execution {
+            if probe.expected.matches_launch_observation(row) {
                 row.capture_started_at = self.capture_started_at;
                 row.started_at = self.started_at;
-                row.launch_executable = self.launch_executable.clone();
+                row.launch_executable.clone_from(&self.launch_executable);
+                if let (Some(prior), Some(current), Some(stored)) = (
+                    sandbox_prior,
+                    self.sandbox_info.as_ref(),
+                    row.sandbox_info.as_mut(),
+                ) {
+                    if stored.enabled
+                        && current.enabled
+                        && stored.container_name == prior.container_name
+                        && stored.container_id == prior.container_id
+                        && stored.container_workdir == prior.workdir
+                        && current.container_name == prior.container_name
+                        && (prior.container_id.is_none()
+                            || current.container_id == prior.container_id)
+                    {
+                        stored
+                            .container_workdir
+                            .clone_from(&current.container_workdir);
+                    }
+                }
             }
             row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(row.status)
@@ -1289,6 +1310,116 @@ mod tests {
             Some(LifecycleReservationError::Busy(LifecycleOperation::Launch))
         ));
         assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn indeterminate_release_publishes_only_cas_owned_adopted_workdir() {
+        for change in [
+            "adopted",
+            "backfilled_id",
+            "peer_workdir",
+            "peer_container",
+            "peer_name",
+            "peer_disabled",
+            "peer_conversation",
+            "runtime_container",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let mut instance =
+                Instance::new("indeterminate-workdir", root.path().to_str().unwrap());
+            instance.source_profile = "indeterminate-workdir".into();
+            let mut sandbox = crate::session::instance::test_helpers::test_sandbox(
+                "original-container",
+                Some("/recorded"),
+            );
+            sandbox.container_id = (change != "backfilled_id").then(|| "container-1".into());
+            instance.sandbox_info = Some(sandbox);
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let generation = instance
+                .acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )
+                .unwrap();
+            let original = instance.sandbox_info.as_ref().unwrap();
+            let snapshot = resume::LaunchSandboxSnapshot {
+                container_name: original.container_name.clone(),
+                container_id: original.container_id.clone(),
+                workdir: original.container_workdir.clone(),
+            };
+            let probe = resume::LaunchProbe {
+                tmux_session: String::new(),
+                pane: None,
+                expected: instance.conversation_state(),
+            };
+            let current = instance.sandbox_info.as_mut().unwrap();
+            current.container_workdir = Some("/actual".into());
+            current.container_id = Some(
+                if change == "runtime_container" {
+                    "replacement"
+                } else {
+                    "container-1"
+                }
+                .into(),
+            );
+            storage
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                    if change == "peer_conversation" {
+                        row.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+                    }
+                    let stored = row.sandbox_info.as_mut().unwrap();
+                    stored.extra_env = Some(vec!["PEER=preserved".into()]);
+                    stored.provider = Some("peer-provider".into());
+                    match change {
+                        "peer_workdir" => stored.container_workdir = Some("/peer".into()),
+                        "peer_container" => stored.container_id = Some("replacement".into()),
+                        "peer_name" => stored.container_name = "replacement".into(),
+                        "peer_disabled" => stored.enabled = false,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            instance
+                .release_indeterminate_launch(&storage, generation, &probe, Some(&snapshot))
+                .unwrap();
+            let row = storage.load().unwrap().remove(0);
+            let stored = row.sandbox_info.as_ref().unwrap();
+            assert_eq!(
+                stored.container_workdir.as_deref(),
+                Some(match change {
+                    "adopted" | "backfilled_id" => "/actual",
+                    "peer_workdir" => "/peer",
+                    _ => "/recorded",
+                }),
+                "{change}"
+            );
+            assert!(matches!(
+                stored.extra_env.as_deref(),
+                Some([value]) if value == "PEER=preserved"
+            ));
+            assert_eq!(stored.provider.as_deref(), Some("peer-provider"));
+            assert_eq!(
+                stored.container_id.as_deref(),
+                if change == "peer_container" {
+                    Some("replacement")
+                } else {
+                    snapshot.container_id.as_deref()
+                }
+            );
+            assert!(row.lifecycle_reservation.is_none());
+            assert_eq!(row.lifecycle_generation, generation);
+        }
     }
 
     #[test]
