@@ -85,6 +85,8 @@ struct UpdateCache {
     latest_version: String,
     #[serde(default)]
     releases: Vec<ReleaseInfo>,
+    #[serde(default)]
+    nightly: bool,
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -97,16 +99,13 @@ fn load_cache() -> Option<UpdateCache> {
     serde_json::from_str(&content).ok()
 }
 
-/// A cache written by a build on the other channel describes the wrong releases. An empty
-/// latest says nothing about either channel.
+/// A cache written by a build on the other channel describes the wrong releases. Only a
+/// nightly cache may be empty: stable falls back to `releases/latest` instead.
 fn load_cache_for(current_version: &str) -> Option<UpdateCache> {
     load_cache().filter(|cache| {
-        !cache.latest_version.is_empty() && same_channel(&cache.latest_version, current_version)
+        cache.nightly == is_nightly(current_version)
+            && (cache.nightly || !cache.latest_version.is_empty())
     })
-}
-
-fn same_channel(a: &str, b: &str) -> bool {
-    is_nightly(a) == is_nightly(b)
 }
 
 fn save_cache(cache: &UpdateCache) -> Result<()> {
@@ -190,6 +189,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
             checked_at: chrono::Utc::now(),
             latest_version: version.clone(),
             releases: vec![release_info],
+            nightly: false,
         };
         if let Err(e) = save_cache(&cache) {
             warn!("Failed to save update cache: {}", e);
@@ -206,6 +206,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         checked_at: chrono::Utc::now(),
         latest_version: latest_version.clone(),
         releases,
+        nightly: is_nightly(current_version),
     };
     if let Err(e) = save_cache(&cache) {
         warn!("Failed to save update cache: {}", e);
@@ -421,7 +422,8 @@ mod tests {
         }
     }
 
-    /// A fresh cache from the other channel, or with no latest, must not answer the check.
+    /// A fresh cache from the other channel, or an empty stable one, must not answer the
+    /// check. An empty nightly cache does, so polls do not refetch while no nightly exists.
     #[tokio::test]
     async fn check_for_update_refetches_over_a_cache_from_the_other_channel() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -440,14 +442,16 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, app).await });
 
-        for (current, cached_latest, expected) in [
-            ("1.22.0", "1.22.3-nightly.20261201", "1.22.1"),
-            ("1.22.0", "", "1.22.1"),
+        for (current, cached_latest, cached_nightly, expected) in [
+            ("1.22.0", "1.22.3-nightly.20261201", true, "1.22.1"),
+            ("1.22.0", "", false, "1.22.1"),
             (
                 "1.22.2-nightly.20261101",
                 "9.9.9",
+                false,
                 "1.22.2-nightly.20261109",
             ),
+            ("1.22.2-nightly.20261101", "", true, ""),
         ] {
             let home = tempfile::TempDir::new().unwrap();
             let _env = crate::session::test_support::EnvGuard::set(&[
@@ -459,6 +463,7 @@ mod tests {
                 checked_at: chrono::Utc::now(),
                 latest_version: cached_latest.to_string(),
                 releases: vec![],
+                nightly: cached_nightly,
             })
             .unwrap();
 
