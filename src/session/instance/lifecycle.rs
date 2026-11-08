@@ -1576,6 +1576,80 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn indeterminate_creation_release_preserves_concurrent_status_and_generation() {
+        for status in [
+            Status::Creating,
+            Status::Starting,
+            Status::Running,
+            Status::Waiting,
+            Status::Error,
+            Status::Stopped,
+        ] {
+            for superseded in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+                let mut instance = Instance::new(
+                    "indeterminate-create-release",
+                    root.path().to_str().unwrap(),
+                );
+                instance.source_profile = "indeterminate-create-release".into();
+                let storage =
+                    crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows.push(instance.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let generation = instance
+                    .acquire_lifecycle_reservation(
+                        &storage,
+                        LifecycleOperation::Launch,
+                        Some(Status::Creating),
+                    )
+                    .unwrap();
+                let probe = resume::LaunchProbe {
+                    tmux_session: String::new(),
+                    pane: None,
+                    expected: instance.conversation_state(),
+                };
+                storage
+                    .update(|rows, _| {
+                        rows[0].status = status;
+                        if superseded {
+                            rows[0].lifecycle_generation += 1;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let result =
+                    instance.release_indeterminate_launch(&storage, generation, &probe, None);
+                let stored = storage.load().unwrap().remove(0);
+                if superseded {
+                    assert!(result.unwrap_err().is::<LifecycleReservationError>());
+                    assert_eq!(stored.status, status);
+                    assert_eq!(stored.lifecycle_generation, generation + 1);
+                    assert!(stored.lifecycle_reservation.is_some());
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        stored.status,
+                        if status == Status::Creating {
+                            Status::Starting
+                        } else {
+                            status
+                        }
+                    );
+                    assert_eq!(instance.status, stored.status);
+                    assert_eq!(stored.lifecycle_generation, generation);
+                    assert!(stored.lifecycle_reservation.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn failed_launch_releases_reservation_after_status_drift() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
