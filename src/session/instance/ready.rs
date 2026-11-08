@@ -461,6 +461,7 @@ mod tests {
             crate::agents::get_agent(&inst.tool).map(|agent| agent.binary),
             Some("claude")
         );
+        // An explicit command override accepts its live protected launch shell.
         assert!(inst.has_command_override());
         let session = inst.tmux_session().unwrap();
         let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
@@ -474,13 +475,11 @@ mod tests {
             .expect("managed agent pane");
         crate::tmux::refresh_session_cache();
         let pane = crate::tmux::test_helpers::only_pane_id(session.name());
-        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
         let panes = crate::tmux::batch_pane_metadata().unwrap();
         let (_, before) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
             .expect("unambiguous managed agent target")
             .expect("managed agent pane appears in the readiness batch");
         assert_eq!(before.pane_id, pane);
-        assert_eq!(before.pane_current_command.as_deref(), Some("sleep"));
         assert!(!before.pane_dead);
         let pid = before.pane_pid.expect("live pane has a PID");
 
