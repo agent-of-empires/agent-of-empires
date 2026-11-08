@@ -274,7 +274,7 @@ impl Instance {
                     return Err(error);
                 }
             };
-        let result = (|| {
+        let result: Result<LaunchSidOutcome> = (|| {
             if admission.corpse.is_some() {
                 let publication = self.prime_root_publication(true);
                 admission.remove_corpse()?;
@@ -290,11 +290,17 @@ impl Instance {
             if admission.corpse.is_none() {
                 admission.verify()?;
             }
-            let (outcome, _) = self.spawn_prepared_launch(size, storage, prepared)?;
+            let (outcome, probe) = self.spawn_prepared_launch(size, storage, prepared)?;
+            if handoff.is_some() && probe.pane.is_none() {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven.into());
+            }
             self.commit_lifecycle_launch(storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
+            if error.is::<LaunchIndeterminateCause>() {
+                return Err(error);
+            }
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
         }

@@ -118,9 +118,15 @@ An inconclusive resume or fresh-pinned probe, a missing created-pane identity on
 
 AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
 
+An indeterminate creation still finalizes its idempotency key: its durable status changes from `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. A concurrent status or launch generation is not overwritten. A later ensure rechecks live-pane readiness, using the existing shell, command-override and hook exemptions; cached presence alone does not establish readiness or physical existence.
+
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 
+This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
+
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. A matching OMP confirmation can consume an explicit pin during stabilization without changing the captured launch owner. Capturing a different ID clears the marker; an explicit `set-session-id` assertion or a successful launch can also clear it.
+
+An accepted OMP pin confirmation also converges the local launch intent, so the first subsequent capture can record a different conversation. An empty outgoing launch poller does not erase a compatible canonical poller installed during adoption.
 
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
 
@@ -129,6 +135,8 @@ AoE reports this fresh result only after the new association, or the cleared ass
 To retry the original conversation through the restart cascade, first restore its original configuration and store, then run `aoe session set-session-id <session> <native-id>`, using `--store` with the exact store or transcript where required. That assertion clears the failure marker. An intentional configured-fresh restart remains available; use the empty-ID command below for a one-shot fresh conversation.
 
 Direct `aoe session start` keeps its separate policy: it may retry a previously failed ID when native execution and target validation succeed. It performs that shared preflight before replacing an ordinary dead pane, but does not run the cascade's final resume probe. A successful start therefore does not prove that the native conversation loaded.
+
+Terminal handoff additionally requires the created pane's physical receipt before finalizing projection cleanup. Missing birth evidence returns a non-destructive refusal, preserving the actual terminal, `TerminalLaunchOwed` intent and retained projection for inspection or explicit recovery.
 
 An explicit pin or fork that migration left unqualified resumes against the store current configuration resolves. Agents that resolve their store or transcript before that check still refuse, for the reasons listed in [Supported managed contexts](#supported-managed-contexts). An armed pin is the exception to the rule above: no capture qualifies the binding it names.
 
