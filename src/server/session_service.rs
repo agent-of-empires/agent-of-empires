@@ -1447,14 +1447,15 @@ impl SessionService {
                 transaction,
             )
         };
-        let (persisted, transaction) = match crate::session::Storage::new(
-            &profile,
-            self.file_watch.clone(),
-        ) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let joined = tokio::task::spawn_blocking(move || {
-                    let written = storage.update(|instances, _groups| {
+        // Write and undo run in one blocking task that owns the persist lock, so a caller
+        // dropped mid-write still gets its undo before the lock is released.
+        let service = Arc::clone(self);
+        let id_persist = id.to_string();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let _transaction = transaction;
+            let written = match crate::session::Storage::new(&profile, service.file_watch.clone()) {
+                Ok(storage) => storage
+                    .update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             if mirrored.pending_turn_cleared {
                                 inst.pending_initial_turn = None;
@@ -1467,31 +1468,31 @@ impl SessionService {
                                 inst.last_accessed_at.max(mirrored.last_accessed_at);
                         }
                         Ok(())
-                    });
-                    (written, transaction)
-                })
-                .await;
-                match joined {
-                    Ok((written, transaction)) => (written.is_ok(), Some(transaction)),
-                    Err(_) => (false, None),
+                    })
+                    .is_ok(),
+                Err(e) => {
+                    tracing::warn!(target: "acp.queue", session = %id_persist, "failed to open storage for queue mutation: {e}");
+                    false
+                }
+            };
+            if !written {
+                tracing::warn!(target: "acp.queue", session = %id_persist, "queue mutation was not persisted; a later reload may discard it");
+                if let Some(undo) = undo {
+                    if let Some(inst) = service
+                        .instances
+                        .blocking_write()
+                        .iter_mut()
+                        .find(|i| i.id == id_persist)
+                    {
+                        undo(inst);
+                    }
+                    service.invalidate_disk_snapshots();
                 }
             }
-            Err(e) => {
-                tracing::warn!(target: "acp.queue", session = %id, "failed to open storage for queue mutation: {e}");
-                (false, Some(transaction))
-            }
-        };
-        if !persisted {
-            tracing::warn!(target: "acp.queue", session = %id, "queue mutation was not persisted; a later reload may discard it");
-            // Under the persist lock still: nothing else has mutated the row since.
-            if let (Some(undo), Some(_)) = (undo, &transaction) {
-                if let Some(inst) = self.instances.write().await.iter_mut().find(|i| i.id == id) {
-                    undo(inst);
-                }
-                self.invalidate_disk_snapshots();
-            }
-        }
-        drop(transaction);
+            written
+        })
+        .await
+        .unwrap_or(false);
         Some((result, persisted))
     }
 
@@ -4488,6 +4489,73 @@ mod tests {
         let inst = state.instances.read().await[0].clone();
         assert!(inst.queued_prompts.is_empty());
         assert_eq!(inst.pending_initial_turn, Some(seeded));
+    }
+
+    /// The undo belongs to the blocking writer, so a caller dropped while the write is
+    /// pending still gets its memory restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_superseding_enqueue_is_still_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let seeded = crate::session::PendingInitialTurn {
+            text: "continuation".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        };
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-cancel".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.pending_initial_turn = Some(seeded.clone());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let profile = state.instances.read().await[0].source_profile.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &profile,
+            vec![state.instances.read().await[0].clone()],
+        );
+        let dir = crate::session::Storage::new_unwatched(&profile)
+            .expect("storage")
+            .sessions_path()
+            .parent()
+            .expect("sessions dir")
+            .to_path_buf();
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let service = state.session_service.clone();
+        let mut enqueue = Box::pin(service.enqueue_prompt_superseding_continuation(
+            "sess-cancel",
+            "a".into(),
+            "fresh".into(),
+            vec![],
+            None,
+            None,
+        ));
+        let polled = futures_util::poll!(enqueue.as_mut());
+        drop(enqueue);
+
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let inst = state.instances.read().await;
+                    if inst[0].queued_prompts.is_empty() && inst[0].pending_initial_turn.is_some() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        std::fs::set_permissions(&dir, original).unwrap();
+        assert!(
+            polled.is_pending(),
+            "the write must still be in flight when the caller is dropped"
+        );
+        assert!(restored.is_ok(), "the undo must run without the caller");
+        assert_eq!(
+            state.instances.read().await[0].pending_initial_turn,
+            Some(seeded)
+        );
     }
 
     #[tokio::test]

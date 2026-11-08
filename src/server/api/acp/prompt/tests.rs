@@ -1155,6 +1155,64 @@ fn shot_ref() -> crate::daemon::PromptAttachmentRef {
     }
 }
 
+/// #5253: a repost of a queued row that cannot be persisted leaves the row and the bytes it
+/// pointed at as they were, whether the repost carried new attachments or none.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_repost_keeps_the_rows_attachment_bytes() {
+    use crate::acp::event_store::AttachmentBlob;
+    use std::os::unix::fs::PermissionsExt;
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-5253-bytes";
+    let state = state_with_attachment_row(id, true).await;
+    let profile = state.instances.read().await[0].source_profile.clone();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &profile,
+        vec![state.instances.read().await[0].clone()],
+    );
+    let dir = crate::session::Storage::new_unwatched(&profile)
+        .expect("storage")
+        .sessions_path()
+        .parent()
+        .expect("sessions dir")
+        .to_path_buf();
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    let replacement = AttachmentBlob {
+        id: "att-2".into(),
+        kind: crate::daemon::PromptAttachmentKind::Image,
+        mime_type: "image/png".into(),
+        name: None,
+        data: b"newer".to_vec(),
+    };
+    for blobs in [vec![replacement], Vec::new()] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = super::super::super::queue::buffer_and_enqueue(
+            &state,
+            id,
+            super::super::super::queue::QueuedPrompt {
+                prompt_id: "q1",
+                text: "caption".to_string(),
+                blobs: &blobs,
+                origin_device: None,
+                origin_plugin: None,
+                supersede_pending_turn: true,
+            },
+        )
+        .await;
+        std::fs::set_permissions(&dir, original.clone()).unwrap();
+        assert!(result.is_err(), "the failed write must be reported");
+        let rows = state.session_service.queued_prompts_snapshot(id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attachments, vec![shot_ref()]);
+        let stored = state
+            .acp_event_store
+            .load_pending_attachments_for_ref(id, "q1");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "att-1");
+        assert_eq!(stored[0].data, b"stored".to_vec());
+    }
+}
+
 async fn state_with_attachment_row(id: &str, store_bytes: bool) -> Arc<AppState> {
     let state = structured_state(id, true).await;
     state

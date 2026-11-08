@@ -211,6 +211,14 @@ pub(super) async fn buffer_and_enqueue(
     // `enqueue_prompt` replaces the row's refs with whatever came in, so a
     // re-enqueue that drops them would orphan the prior blobs against the
     // per-session cap until the 24h sweep.
+    // A repost replaces the row's blobs; keep the old bytes to put back if the row is not kept.
+    let replaced_blobs = if queue.iter().any(|row| row.id == prompt_id) {
+        state
+            .acp_event_store
+            .load_pending_attachments_for_ref(id, prompt_id)
+    } else {
+        Vec::new()
+    };
     state
         .acp_event_store
         .delete_pending_attachments_for_ref(id, prompt_id);
@@ -259,6 +267,11 @@ pub(super) async fn buffer_and_enqueue(
         }
         Err(QueuePersistFailed) => {
             drop_blobs();
+            for blob in &replaced_blobs {
+                state
+                    .acp_event_store
+                    .record_pending_attachment(id, prompt_id, blob);
+            }
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "the prompt could not be saved; try again".to_string(),
