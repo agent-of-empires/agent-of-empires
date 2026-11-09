@@ -34,15 +34,19 @@ region = "whole_recent"
 visible = true
 line_regex = ['(?i)^\s*\x{203A}\s*\S']
 
-# Braille only: Vibe's Textual spinner draws no other frame, and a middle dot or
-# bullet is ordinary separator punctuation in its parked output.
+# Braille only: a middle dot or bullet is separator punctuation in parked output.
+# Spinner frames are at most two cells; the logo, always on screen in a short
+# session, is braille too but runs longer.
 [[rules]]
-extends = "spinner"
 id = "spinner"
+state = "running"
 priority = 960
+region = "whole_recent"
+visible = true
+line = { regex = ['[\x{2800}-\x{28FF}]'], not_regex = ['[\x{2800}-\x{28FF}]{3}'] }
 
-# Loose on purpose: these words are matched anywhere in the window, which is the
-# behaviour this detector has always had.
+# Beside the input prompt these words are transcript or path text: a working
+# Vibe draws the spinner there.
 [[rules]]
 id = "activity_word"
 state = "running"
@@ -57,6 +61,7 @@ contains_any = [
   "generating",
   "thinking",
 ]
+not = [{ region = "whole_recent", line_regex = ['^\s*[>!/&](\s|$)'] }]
 
 # A trailing ellipsis on the last line: a status line mid-render.
 [[rules]]

@@ -326,6 +326,18 @@ fn observe_test_relay<T: serde::Serialize + ?Sized>(
         let _ = observer.send(TestRelayObservation { stage, payload });
     }
 }
+
+fn settle_unreachable_sdk_route(
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+    state: &ConnectionState,
+    source: AcpConnectionSource,
+    cause: AcpConnectionCause,
+) {
+    state.observe(source, cause);
+    release_settled(settled);
+    state.mark_ordered_loss();
+}
+
 /// A failed relay releases any local outcome whose marker can no longer arrive.
 async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
@@ -340,12 +352,9 @@ async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
         observe_test_relay(state, value, TestRelayStage::Relayed);
         return true;
     }
-    state.observe(
-        crate::acp::state::AcpConnectionSource::Control,
-        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+    settle_unreachable_sdk_route(
+        settled, state, AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
     );
-    release_settled(settled);
-    state.mark_ordered_loss();
     #[cfg(test)]
     observe_test_relay(state, value, TestRelayStage::Failed);
     false
@@ -622,6 +631,12 @@ impl DaemonControlClient {
             .expect("native response application")
             .as_ref()
             .map(|slot| (slot.attempt, slot.context))
+    }
+
+    pub(super) fn close_sdk_route(&self, source: AcpConnectionSource, cause: AcpConnectionCause) {
+        // Only an already-correlated outcome may precede the ordered loss wakeup.
+        settle_unreachable_sdk_route(&self.settled, &self.connection_state, source, cause);
+        self.shutdown();
     }
 
     pub(super) fn shutdown(&self) {
@@ -1837,22 +1852,16 @@ pub(super) async fn connect_runner_control(
             line.clear();
             match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                 Ok(0) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     debug!(
                         target: "acp.protocol",
                         session = %pump_session,
@@ -3516,6 +3525,102 @@ mod tests {
     #[serial_test::serial]
     async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
         release_real_prompt_and_keep_the_next_owner(true).await;
+    }
+
+    /// Relay loss cannot erase the already received, correlated completion.
+    /// The separate connection loss still fences every further native control.
+    #[tokio::test]
+    async fn failed_marker_relay_preserves_completed_result_without_further_native_controls() {
+        let mut peer = PromptControlPeer::new().await;
+        let mut completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        peer.await_settled_outcome(&mut completion).await;
+        // Fail the actual relay writer only after the real reader correlated completion.
+        // Dropping the entire SDK duplex before correlation would race native EOF instead.
+        let (closed_crate, shim) = tokio::io::duplex(64);
+        drop(closed_crate);
+        let (_, write) = tokio::io::split(shim);
+        let failed_relay = Mutex::new(write);
+        assert!(!shim_write_line_releasing(
+            &failed_relay, &PromptCompletedMarker::default(), &peer.client.settled,
+            &peer.client.connection_state,
+        ).await);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), completion)
+                .await
+                .expect("a completion the crate never receives must settle")
+                .unwrap(),
+            ControlPromptResult::Outcome(end("end_turn"))
+        );
+        assert_eq!(
+            peer.client.connection_state.loss().unwrap().cause,
+            crate::acp::state::AcpConnectionCause::ForwardPumpEnded
+        );
+        peer.client.cancel().await;
+        assert!(matches!(
+            peer.client.prompt(serde_json::json!({})).await,
+            Err(AcpError::ConnectionUnavailable(_))
+        ));
+        let mut byte = [0_u8; 1];
+        match peer.peer.try_read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => {}
+            other => panic!("an unavailable SDK route must send no native controls: {other:?}"),
+        }
+    }
+
+    /// Failure of a later relay likewise preserves the genuine settled outcome
+    /// while retiring the local route, rather than reclassifying completion as loss.
+    #[tokio::test]
+    async fn failed_relay_after_a_relayed_marker_preserves_completed_result() {
+        let mut peer = PromptControlPeer::new().await;
+        let mut completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        peer.await_settled_outcome(&mut completion).await;
+        // Reading the marker proves correlation and its successful relay.
+        // SDK EOF below must settle it even if no further native frame arrives.
+        let mut relayed = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            peer.transport.read_line(&mut relayed),
+        )
+        .await
+        .expect("the relayed marker must reach the crate")
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(relayed.trim())
+                .unwrap()
+                .get("method")
+                .unwrap(),
+            &serde_json::json!(PromptCompletedMarker::default().method())
+        );
+        peer.close_crate_side();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), completion)
+                .await
+                .expect("an unreachable crate must settle the waiter")
+                .unwrap(),
+            ControlPromptResult::Outcome(end("end_turn"))
+        );
+        assert_eq!(
+            peer.client.connection_state.loss().unwrap().cause,
+            crate::acp::state::AcpConnectionCause::ForwardPumpEnded
+        );
+        peer.client.cancel().await;
+        assert!(matches!(
+            peer.client.prompt(serde_json::json!({})).await,
+            Err(AcpError::ConnectionUnavailable(_))
+        ));
+        let mut byte = [0_u8; 1];
+        match peer.peer.try_read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => {}
+            other => panic!("an unavailable SDK route must send no native controls: {other:?}"),
+        }
     }
 
     #[tokio::test]
