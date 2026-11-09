@@ -3520,18 +3520,11 @@ async fn prepare_agent_session_inner(
                 tokio::runtime::Handle::current().block_on(
                     durable_stop_tests::pause_before_adoption(&started.id),
                 );
-                if outcome
+                let pending_release = outcome
                     .as_ref()
                     .err()
                     .is_some_and(|error| error.is::<crate::session::LaunchFinalizationPending>())
-                {
-                    native.defer_lifecycle_release(
-                        started.id.clone(),
-                        crate::session::LifecycleRelease::IndeterminateLaunch,
-                        generation,
-                        None,
-                    );
-                }
+                    .then(|| started.id.clone());
                 let adoption = (|| -> anyhow::Result<_> {
                 let _title = crate::session::acquire_session_title_lock(&started.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
@@ -3575,23 +3568,33 @@ async fn prepare_agent_session_inner(
                 crate::server::pane::sample_panes(
                     row, tools, panes.as_ref(), legacy_scope.as_ref(), None,
                 );
-                // Current observations may update the view, but cannot mint an
-                // old operation's Created receipt for a different physical owner.
-                let prepared = super::ensure::PreparedAgentTarget::captured(
-                    born_at, generation, profile.clone(), born_pane,
-                    if preparation == AgentPreparation::Restart {
-                        crate::daemon::TerminalTargetStatus::Restarted
-                    } else {
-                        crate::daemon::TerminalTargetStatus::Created
-                    },
-                    native,
-                );
                 adoption_state.mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 adoption_state.runtime.request_publish();
-                    Ok((profile, prepared))
+                    Ok(profile)
                 })();
+                if let Some(id) = pending_release {
+                    native.defer_lifecycle_release(
+                        id,
+                        crate::session::LifecycleRelease::IndeterminateLaunch,
+                        generation,
+                        None,
+                    );
+                    return Err(outcome.expect_err("pending release retains the launch error"));
+                }
                 match adoption {
-                    Ok((profile, prepared)) => Ok(Some((generation, profile, outcome, prepared))),
+                    Ok(profile) => {
+                        // Only this operation's captured birth can authorize its target.
+                        let prepared = super::ensure::PreparedAgentTarget::captured(
+                            born_at, generation, profile.clone(), born_pane,
+                            if preparation == AgentPreparation::Restart {
+                                crate::daemon::TerminalTargetStatus::Restarted
+                            } else {
+                                crate::daemon::TerminalTargetStatus::Created
+                            },
+                            native,
+                        );
+                        Ok(Some((generation, profile, outcome, prepared)))
+                    }
                     Err(adoption_error) => match outcome {
                         // Adoption cannot replace migration failure or retained finalization debt.
                         Err(error)
