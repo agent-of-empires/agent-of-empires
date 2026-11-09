@@ -258,12 +258,17 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
-        // Ownership is keyed on the detection identity, so a custom tool aliased
-        // to a provider tool still reads that provider's report.
         let integration = crate::plugin::agent_integration::integration_status(self);
         let integration_configured = integration.configured;
         let integration_snapshot = integration.snapshot;
-        let pane_tool = integration.tool;
+        let pane_tool = integration.pane_tool;
+        tracing::trace!(target: "session.store",
+            "status '{}': integration owner={} pane_tool={} configured={}",
+            self.title,
+            integration.tool,
+            pane_tool,
+            integration.configured
+        );
         if let Some(status) = crate::plugin::agent_integration::session_status_override(
             integration_configured,
             is_dead,

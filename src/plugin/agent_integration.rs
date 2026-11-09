@@ -250,9 +250,10 @@ fn eligible(instance: &Instance) -> bool {
         )
 }
 
-/// Whether an approved integration owns this session's status. Ownership is read
-/// through `tool`, the detection identity the poll derives for the pane, so a
-/// custom tool aliased to a provider tool reads that provider's report.
+/// Whether an approved integration owns this session's status through `tool`.
+/// The poll asks with the session's own tool first and the detection alias only
+/// after that, so an outgoing alias cannot hand another tool's report to the
+/// session.
 pub fn status_configured(instance: &Instance, tool: &str) -> bool {
     eligible(instance) && status_owned(tool)
 }
@@ -279,30 +280,36 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     provider_snapshot(instance, &instance.tool)
 }
 
-/// The provider snapshot that owns this session's status.
-pub fn status_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegrationSnapshot> {
-    provider_snapshot(instance, tool)
-}
-
-/// The integration status a poll applies, carrying the identity it derived.
+/// The integration status a poll applies: the identity whose report it reads,
+/// plus the detection identity the pane is parsed with.
 pub(crate) struct IntegrationStatus {
     pub(crate) tool: String,
+    pub(crate) pane_tool: String,
     pub(crate) configured: bool,
     pub(crate) snapshot: Option<AgentIntegrationSnapshot>,
 }
 
 pub(crate) fn integration_status(instance: &Instance) -> IntegrationStatus {
-    let tool = crate::tmux::status_rules::detection_tool(
+    let pane_tool = crate::tmux::status_rules::detection_tool(
         &instance.source_profile,
         &instance.tool,
         &instance.detect_as,
-    );
-    let configured = status_configured(instance, &tool);
-    let snapshot = configured
-        .then(|| status_snapshot(instance, &tool))
-        .flatten();
+    )
+    .into_owned();
+    // The session's own tool owns the report first: `agent_detect_as` only
+    // redirects pane parsing, so an outgoing alias must not let another tool's
+    // provider drive this session.
+    let owner = [instance.tool.as_str(), pane_tool.as_str()]
+        .into_iter()
+        .find(|tool| status_configured(instance, tool))
+        .map(str::to_owned);
+    let configured = owner.is_some();
+    let snapshot = owner
+        .as_deref()
+        .and_then(|tool| provider_snapshot(instance, tool));
     IntegrationStatus {
-        tool: tool.into_owned(),
+        tool: owner.unwrap_or_else(|| pane_tool.clone()),
+        pane_tool,
         configured,
         snapshot,
     }
@@ -1160,6 +1167,33 @@ mod tests {
         assert_eq!(generation_after, generation_before + 1);
         assert!(std::sync::Arc::ptr_eq(&after, &reloaded));
         assert!(!std::sync::Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_outgoing_alias_keeps_the_sessions_own_provider_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.alias-owner", "acme-alias", true, true, "");
+
+        let mut instance = Instance::new("acme-alias-session", "/tmp");
+        instance.tool = "acme-alias".into();
+        instance.detect_as = "claude".into();
+        instance.status = crate::session::Status::Running;
+
+        let status = super::integration_status(&instance);
+        assert!(status.configured, "the session's own tool owns its report");
+        assert_eq!(status.tool, "acme-alias");
+        assert_eq!(
+            status.pane_tool, "claude",
+            "the alias only redirects pane parsing"
+        );
     }
 
     #[test]
