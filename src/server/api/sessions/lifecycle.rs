@@ -199,7 +199,7 @@ impl Drop for ArchiveReservationRelease {
             crate::session::SessionStore::defer_lifecycle_release(
                 native,
                 std::mem::take(&mut self.id),
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 None,
             );
@@ -1838,7 +1838,7 @@ async fn finish_structured_user_stop(
                 });
             let released = native.release_lifecycle_reservation(
                 &release_id,
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 Some(lifecycle),
             );
@@ -2887,6 +2887,11 @@ fn reserve_structured_restart(
     Ok((native, reserved, binding))
 }
 
+struct PreparedQuotaRestart {
+    resets_at: chrono::DateTime<chrono::Utc>,
+    continuation: Option<crate::server::acp_reconciler::PreparedContinuation>,
+}
+
 struct StructuredRestartLaunch {
     generation: u64,
     started: Instance,
@@ -2898,6 +2903,7 @@ struct StructuredRestartLaunch {
     wake: Option<String>,
     reservation: Option<crate::acp::supervisor::ResumeReservation>,
     reason: &'static str,
+    quota: Option<PreparedQuotaRestart>,
 }
 
 /// Without auto-resume a terminal launch starts a fresh conversation and still reports success,
@@ -2934,15 +2940,16 @@ pub(super) async fn discard_stale_continuation(
 /// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
 /// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
 /// disarms the auto-resume budget exactly once.
+/// A failed durable breadcrumb aborts the restart rather than authorizing its default wake.
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     explicit_wake: bool,
-    prepared: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
+    submission: &tokio::sync::OwnedMutexGuard<()>,
+    prepared: Option<crate::server::acp_reconciler::PreparedContinuation>,
 ) -> Result<bool, crate::acp::supervisor::SupervisorError> {
-    let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
             && row.lifecycle_generation == generation
@@ -2952,15 +2959,21 @@ pub(super) async fn continue_interrupted_prompt(
     if !current {
         return Ok(false);
     }
+    let selected = if explicit_wake {
+        None
+    } else {
+        let prepared = prepared.ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
+        let outcome = prepared.outcome(state, id, submission).await?;
+        Some((prepared, outcome))
+    };
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
         .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     if explicit_wake {
-        // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
-        // now newer work may have been installed, and it must survive.
-        drop(submission);
+        // The caller clears stale pending only after this durable publication
+        // succeeds, still under submission authority and before the spawn.
         return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
@@ -2971,11 +2984,14 @@ pub(super) async fn continue_interrupted_prompt(
         .iter()
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
+    let (prepared, outcome) = selected
+        .ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
     let outcome = crate::server::acp_reconciler::install_prepared_continuation(
         state,
         id,
-        &submission,
+        submission,
         prepared,
+        outcome,
     )
     .await?;
     Ok(pending_before
@@ -3008,24 +3024,10 @@ async fn finish_structured_restart(
             wake,
             reservation,
             reason: _,
+            quota,
         } = launch;
-        // Read before the spawn: the new worker's session assignment retires the park.
-        let resumes_rate_limit = if account_swap {
-            match crate::server::api::acp::rate_limit_resume_probe(state, id).await? {
-                crate::acp::event_store::ControlKnowledge::Known(marker) => marker,
-                crate::acp::event_store::ControlKnowledge::Indeterminate => {
-                    return Err(crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into());
-                }
-            }
-        } else {
-            None
-        };
+        let quota = if account_swap { quota } else { None };
         let wake_requested = wake.is_some();
-        let prepared_continuation = if resumes_rate_limit.is_some() && !wake_requested {
-            crate::server::acp_reconciler::resolve_continuation(state, id).await?
-        } else {
-            None
-        };
         let mut reservation = match reservation {
             Some(reservation) => reservation,
             None => supervisor.reserve_spawn(id, crate::acp::supervisor::ResumeKind::Spawn,
@@ -3098,7 +3100,15 @@ async fn finish_structured_restart(
     .await??;
         // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
         // under the submission authority, so the new worker cannot drain it before the wake.
-        discard_stale_continuation(state, id, resumes_rate_limit.is_some(), wake_requested).await;
+        let resumes_rate_limit = quota.is_some();
+        let continued = match quota {
+            Some(prepared) => continue_interrupted_prompt(
+                state, id, generation, prepared.resets_at, wake_requested,
+                &submission, prepared.continuation,
+            ).await?,
+            None => false,
+        };
+        discard_stale_continuation(state, id, resumes_rate_limit, wake_requested).await;
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -3138,14 +3148,6 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
-        let continued = match resumes_rate_limit {
-            Some(resets_at) => {
-                continue_interrupted_prompt(
-                    state, id, generation, resets_at, wake_requested, prepared_continuation,
-                ).await?
-            }
-            None => false,
-        };
         let wake = if continued { String::new() } else { wake };
         if !wake.is_empty() {
             let state = state.clone();
@@ -3433,6 +3435,38 @@ async fn prepare_agent_session_inner(
         }
         _ => {}
     }
+    let quota = if let Some(body) = restart.as_ref().filter(|body| {
+        instance.is_structured() && body.tool.as_deref().is_some_and(|tool|
+            tool != instance.tool && matches!(
+                crate::session::conversation_carry::classify(
+                    &instance, body.profile.as_deref().unwrap_or(&instance.source_profile), tool,
+                ),
+                crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+            ))
+    }) {
+        let marker = match crate::server::api::acp::rate_limit_resume_probe(&state, &id).await {
+            Ok(crate::acp::event_store::ControlKnowledge::Known(marker)) => marker,
+            Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) =>
+                return structured_lifecycle_error(&state, crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into()),
+            Err(error) => return structured_lifecycle_error(&state, error.into()),
+        };
+        match marker {
+            Some(resets_at) => {
+                let continuation = if body.wake_message.is_some() {
+                    None
+                } else {
+                    match crate::server::acp_reconciler::resolve_continuation(&state, &id).await {
+                        Ok(prepared) => Some(prepared),
+                        Err(error) => return structured_lifecycle_error(&state, error.into()),
+                    }
+                };
+                Some(PreparedQuotaRestart { resets_at, continuation })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let mut resume_reservation = None;
     if instance.is_structured()
         && matches!(restart_origin, RestartOrigin::Explicit)
@@ -3616,6 +3650,11 @@ async fn prepare_agent_session_inner(
                 );
             }
         }
+        let mut revival = if worker_restart.is_some() && !outgoing.is_structured() {
+            outgoing.capture_revival_target()?
+        } else {
+            None
+        };
         if let Some(body) = &worker_restart {
             account_swap_precondition(&outgoing, body)
                 .map_err(LifecycleTargetError::AccountSwapRefused)?;
@@ -3782,6 +3821,7 @@ async fn prepare_agent_session_inner(
                         }),
                         crate::session::LifecycleReservationError::Superseded
                     );
+                    revival = admission.revival_target();
                     start_admission = Some(admission);
                 }
                 if !row.is_structured() {
@@ -3852,11 +3892,13 @@ async fn prepare_agent_session_inner(
         }) {
             started.discard_reserved_restart_container(store, started.lifecycle_generation)?;
         }
-        let generation = started.prepare_reserved_launch_hooks(
+        let reservation = started.prepare_reserved_launch_hooks(
             store,
             preparation == AgentPreparation::Restart && worker_restart.is_none(),
             crate::session::LaunchReservation {
                 generation: started.lifecycle_generation,
+                revival,
+                start_admission,
                 title_lock,
                 lifecycle_lock,
             },
@@ -3864,11 +3906,10 @@ async fn prepare_agent_session_inner(
         drop(identity);
         Ok((
             Some((
-                generation,
+                reservation,
                 started,
                 native,
                 (account_swap, conversation_carry),
-                start_admission,
             )),
             None,
         ))
@@ -3887,8 +3928,9 @@ async fn prepare_agent_session_inner(
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native, conversation_carry, start_admission)))) => {
+        Ok(Ok(Some((reservation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
+                let generation = reservation.generation;
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
                         crate::session::recovery::recovery_hook_timeout(),
@@ -3901,12 +3943,11 @@ async fn prepare_agent_session_inner(
                     Some(generation),
                 );
                 Ok(Some((
-                    generation,
+                    reservation,
                     started,
                     native,
                     hooks,
                     conversation_carry,
-                    start_admission,
                 )))
             })
             .await
@@ -3916,12 +3957,12 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((generation, started, native, hooks, carry, _)))) if started.is_structured() => {
+        Ok(Ok(Some((reservation, started, native, hooks, carry)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
                 StructuredRestartLaunch {
-                    generation,
+                    generation: reservation.generation,
                     started,
                     native,
                     hooks,
@@ -3930,6 +3971,7 @@ async fn prepare_agent_session_inner(
                     wake: requested_wake_message,
                     reservation: resume_reservation,
                     reason,
+                    quota,
                 },
             )
             .await;
@@ -3945,16 +3987,10 @@ async fn prepare_agent_session_inner(
     let mut restart_identity = None;
     let adoption_state = state.clone();
     let result = match hooked {
-        Ok(Ok(Some((
-            generation,
-            mut started,
-            native,
-            hooks,
-            conversation_carry,
-            start_admission,
-        )))) => {
+        Ok(Ok(Some((reservation, mut started, native, hooks, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
+                let generation = reservation.generation;
                 let outcome = started.finish_reserved_launch(
                     &native,
                     size,
@@ -3962,9 +3998,8 @@ async fn prepare_agent_session_inner(
                         resume_policy,
                         restart: preparation == AgentPreparation::Restart,
                         conversation_carry: conversation_carry.1,
-                        start_admission,
                     },
-                    generation,
+                    reservation,
                     hooks,
                 );
                 let born_at = started.created_at;
@@ -3979,6 +4014,11 @@ async fn prepare_agent_session_inner(
                 tokio::runtime::Handle::current().block_on(
                     durable_stop_tests::pause_before_adoption(&started.id),
                 );
+                let pending_release = outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<crate::session::LaunchFinalizationPending>())
+                    .then(|| started.id.clone());
                 let adoption = (|| -> anyhow::Result<_> {
                 let _title = crate::session::acquire_session_title_lock(&started.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
@@ -4022,26 +4062,41 @@ async fn prepare_agent_session_inner(
                 crate::server::pane::sample_panes(
                     row, tools, panes.as_ref(), legacy_scope.as_ref(), None,
                 );
-                // Current observations may update the view, but cannot mint an
-                // old operation's Created receipt for a different physical owner.
-                let prepared = super::ensure::PreparedAgentTarget::captured(
-                    born_at, generation, profile.clone(), born_pane,
-                    if preparation == AgentPreparation::Restart {
-                        crate::daemon::TerminalTargetStatus::Restarted
-                    } else {
-                        crate::daemon::TerminalTargetStatus::Created
-                    },
-                    native,
-                );
                 adoption_state.mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 adoption_state.runtime.request_publish();
-                    Ok((profile, prepared))
+                    Ok(profile)
                 })();
+                if let Some(id) = pending_release {
+                    native.defer_lifecycle_release(
+                        id,
+                        crate::session::LifecycleRelease::IndeterminateLaunch,
+                        generation,
+                        None,
+                    );
+                    return Err(outcome.expect_err("pending release retains the launch error"));
+                }
                 match adoption {
-                    Ok((profile, prepared)) => Ok(Some((generation, profile, outcome, prepared))),
+                    Ok(profile) => {
+                        // Only this operation's captured birth can authorize its target.
+                        let prepared = super::ensure::PreparedAgentTarget::captured(
+                            born_at, generation, profile.clone(), born_pane,
+                            if preparation == AgentPreparation::Restart {
+                                crate::daemon::TerminalTargetStatus::Restarted
+                            } else {
+                                crate::daemon::TerminalTargetStatus::Created
+                            },
+                            native,
+                        );
+                        Ok(Some((generation, profile, outcome, prepared)))
+                    }
                     Err(adoption_error) => match outcome {
-                        // Adoption must not replace the original migration failure.
-                        Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => Err(error),
+                        // Adoption cannot replace migration failure or retained finalization debt.
+                        Err(error)
+                            if error.is::<crate::migrations::SandboxMigrationError>()
+                                || error.is::<crate::session::LaunchFinalizationPending>() =>
+                        {
+                            Err(error)
+                        }
                         _ => Err(adoption_error),
                     },
                 }
@@ -4068,9 +4123,15 @@ async fn prepare_agent_session_inner(
         .is_some_and(|error| error.is::<crate::migrations::SandboxMigrationError>());
     let outcome = match outcome {
         Err(error) => {
-            let response = if let Some(response) = lifecycle_rejection(&state, &error) {
+            let response = if let Some(&cause) =
+                error.downcast_ref::<crate::session::LaunchIndeterminateCause>()
+            {
+                super::ensure::indeterminate_launch_response(cause)
+            } else if let Some(response) = lifecycle_rejection(&state, &error) {
                 response
-            } else if error.is::<crate::session::NativeStoreUnavailable>() {
+            } else if error.is::<crate::session::NativeStoreUnavailable>()
+                || error.is::<crate::session::LaunchFinalizationPending>()
+            {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             } else if error.is::<crate::session::HostHookApprovalRequired>() {
                 crate::server::api::api_error_with_code_header(
@@ -5620,7 +5681,7 @@ pub async fn update_session_unread(
 
 #[cfg(test)]
 mod restart_wake_tests {
-    use super::{select_restart_wake_message, RestartOrigin};
+    use super::*;
 
     #[test]
     #[serial_test::serial]
@@ -5683,5 +5744,73 @@ mod restart_wake_tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn explicit_restart_keeps_existing_pending_when_quota_publication_fails() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "restart-quota-publication-io",
+            ).await;
+            live.park("original interrupted work").await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            state.session_service.set_pending_initial_turn(
+                &id, "existing pending work".into(), Vec::new(),
+            ).await;
+            let requests = live.native.requests();
+            let frontier = state.acp_event_store.highest_seq(&id);
+            let budget = state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
+            live.client = scope.adopt_with(live.client, false, || async {
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                let preparation_state = state.clone();
+                let target = id.clone();
+                let (native, started, generation) = tokio::task::spawn_blocking(move || {
+                    let runtime = tokio::runtime::Handle::current();
+                    let mut started = runtime.block_on(preparation_state.instances.read()).iter()
+                        .find(|row| row.id == target).unwrap().clone();
+                    let native = crate::server::session_store::NativeSessionStore::open(
+                        preparation_state, &started.source_profile, Some(target),
+                    ).unwrap();
+                    let generation = started.acquire_lifecycle_reservation(
+                        &native, LifecycleOperation::Launch, Some(Status::Starting),
+                    ).unwrap();
+                    native.adopt_runtime_fields(&started).unwrap();
+                    (native, started, generation)
+                }).await.unwrap();
+                state.acp_event_store.test_conn().execute_batch(
+                    "CREATE TEMP TRIGGER fail_explicit_restart_quota BEFORE INSERT ON acp_events
+                     WHEN NEW.discriminant = 'RateLimitAutoResumed'
+                     BEGIN SELECT RAISE(ABORT, 'genuine explicit restart quota IO failure'); END;"
+                ).unwrap();
+                let response = finish_structured_restart(&state, &id, StructuredRestartLaunch {
+                    generation, started, native, hooks: Ok(()), account_swap: true,
+                    carry: None, wake: Some("explicit replacement wake".into()),
+                    reservation: None, reason: "user",
+                    quota: Some(PreparedQuotaRestart { resets_at: chrono::Utc::now(), continuation: None }),
+                }).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let current = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                assert!(current.launch_is_finalized(),
+                    "post-hook generation must finalize before the refused breadcrumb");
+                assert_eq!(current.pending_initial_turn.as_ref().map(|turn| turn.text.as_str()),
+                    Some("existing pending work"));
+                let durable = crate::session::Storage::open_unwatched(&current.source_profile)
+                    .unwrap().load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                assert_eq!(serde_json::to_value(durable.pending_initial_turn).unwrap(),
+                    serde_json::to_value(current.pending_initial_turn).unwrap());
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), budget);
+                assert_eq!(live.native.requests(), requests);
+                state.acp_event_store.test_conn().execute_batch(
+                    "DROP TRIGGER fail_explicit_restart_quota",
+                ).unwrap();
+            }).await;
+            live.client.stop_session().await;
+        })).await;
     }
 }

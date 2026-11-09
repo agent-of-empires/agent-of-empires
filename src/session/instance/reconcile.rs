@@ -43,9 +43,7 @@ impl Instance {
         };
         // Runtime custody follows the same held conversation rules as a disk reload.
         let prior = std::mem::replace(self, disk);
-        let handoff = Handoff::decide(&prior.capture_poller, prior.held(), self.held());
         self.inherit_runtime(prior, preserve_errors);
-        handoff.settle(&mut self.capture_poller);
     }
 
     /// Flush the previous pane's publication before its source is retired.
@@ -85,6 +83,7 @@ impl Instance {
             &self.id,
             &observation,
             &baseline,
+            None,
         );
         match commit.outcome {
             SidWrite::Applied => {
