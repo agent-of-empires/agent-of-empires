@@ -2629,8 +2629,8 @@ impl App {
             Err(failure) => {
                 let message = failure.message.clone();
                 if let Some(serve) = &mut self.home.serve_view {
-                    let predecessor = launch.and_then(|launch| launch.predecessor());
-                    serve.finish_launch(Err(failure), predecessor);
+                    let observed_target = launch.and_then(|launch| launch.observed_target());
+                    serve.finish_launch(Err(failure), observed_target);
                 } else if let Some(crate::tui::dialogs::DashboardLaunch::Running {
                     target, ..
                 }) = launch
@@ -4916,5 +4916,80 @@ mod tests {
             assert!(app.home.pending_dashboard_launch.is_none());
             drop(transaction);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_control_stops_a_settled_launch_while_final_observation_is_held() {
+        use crate::tui::dialogs::{DashboardLaunch, ServeView};
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut daemon = ChildGuard(
+            std::process::Command::new("cat")
+                .arg0("aoe")
+                .arg("serve")
+                .current_dir(fixture.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = crate::session::get_app_dir().unwrap().join("serve.pid");
+        std::fs::write(&pid, daemon.0.id().to_string()).unwrap();
+        let receipt = crate::cli::serve::wait_for_test_daemon(&mut daemon.0);
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let transaction = crate::daemon::lifecycle::Transaction::acquire()
+            .await
+            .unwrap();
+        let mut view = ServeView::for_launch(
+            DashboardLaunch::tunnel_for_test(std::time::Instant::now()),
+            &mut app.home.serve_jobs,
+        );
+        view.finish_launch(Ok(receipt), None);
+        app.home.serve_view = Some(view);
+        assert!(app.home.dashboard_launch.is_none());
+        let action = app
+            .home
+            .handle_key(KeyEvent::from(KeyCode::Char('S')), None);
+        assert!(matches!(action, Some(Action::StopDashboard)));
+        app.request_dashboard_stop();
+        assert!(app.dashboard_stop.is_some());
+        app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+        assert!(app.home.serve_view.is_none());
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        drop(transaction);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.poll_dashboard_stop() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "settled launch Stop never completed"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(daemon.0.try_wait().unwrap().is_some());
+        assert!(!pid.exists());
+        assert!(app.home.dashboard_stop.is_none());
     }
 }

@@ -712,7 +712,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                     needs_passphrase: false,
                 },
                 PendingJob::LaunchContext(ServeLaunchRequest {
-                    restart: None,
+                    intent: LaunchIntent::Start(None),
                     mode: ServeMode::Local,
                     transport: None,
                     passphrase: None,
@@ -1341,7 +1341,12 @@ fn launch_observations_never_mix_a_replacement_with_prior_credentials() {
             view.launch_in_flight = true;
             view.finish_launch(Ok(target), None);
             if hold_starting {
-                wait_for(&mut view, |view| !view.launch_in_flight);
+                wait_for(&mut view, |view| {
+                    !view
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| matches!(pending.kind, PendingJob::LaunchOutcome))
+                });
                 if let ServeViewState::Error { message, .. } = &view.state {
                     panic!(
                         "launch failed before Starting observation; replaced={replaced}: {message}"
@@ -1766,7 +1771,12 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         view.launch_in_flight = true;
         view.finish_launch(Ok(target), None);
         if hold_starting {
-            wait_for(&mut view, |view| !view.launch_in_flight);
+            wait_for(&mut view, |view| {
+                !view
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| matches!(pending.kind, PendingJob::LaunchOutcome))
+            });
         }
         received.recv_timeout(Duration::from_secs(10)).unwrap();
         if matches!(change, Change::Hide) {
@@ -1847,7 +1857,7 @@ async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
     )
     .unwrap();
     let request = ServeLaunchRequest {
-        restart: None,
+        intent: LaunchIntent::Start(None),
         mode: ServeMode::Local,
         transport: None,
         passphrase: None,
@@ -2230,7 +2240,7 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
                     &mut jobs,
                 );
             } else {
-                view.finish_launch(Err(failure), context.predecessor);
+                view.finish_launch(Err(failure), context.observed_target);
             }
             wait_for(&mut view, |view| view.pending.is_none());
             let recovery = match replacement {
@@ -2327,4 +2337,92 @@ fn quitting_retains_an_admitted_direct_stop_until_physical_retirement() {
         .unwrap()
         .join("serve.pid")
         .exists());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn launch_control_preserves_observed_absence_after_fresh_start_refusal() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let tools = FunnelFixture::new();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(app.join("profiles/default")).unwrap();
+    for recovery in ['P', 'S', 'R'] {
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::settled(&mut jobs);
+        assert!(matches!(view.state, ServeViewState::ModePicker { .. }));
+        view.handle_key(key('T'));
+        wait_for(&mut view, |view| {
+            matches!(view.state, ServeViewState::Confirm { .. })
+        });
+        view.handle_key(KeyEvent::from(KeyCode::Left));
+        assert!(matches!(
+            view.state,
+            ServeViewState::Confirm {
+                selected: TunnelTransport::Tailscale,
+                ..
+            }
+        ));
+        view.handle_key(KeyEvent::from(KeyCode::Enter));
+        wait_assessment(&mut view);
+        let request = view
+            .take_launch()
+            .expect("provider confirmation did not hand off startup");
+        let context = request.target();
+        if recovery == 'S' {
+            drop(view);
+            view = ServeView::for_launch(
+                DashboardLaunch::Running {
+                    target: context.clone(),
+                    started_at: Instant::now(),
+                },
+                &mut jobs,
+            );
+        }
+        let mut successor = TestDaemon::new();
+        std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+        std::fs::write(app.join("serve.url"), "https://fixture.tailnet.ts.net/").unwrap();
+        std::fs::write(app.join("serve.passphrase"), "external fixture credential").unwrap();
+        successor.publish();
+        let published = ["serve.pid", "serve.mode", "serve.url", "serve.passphrase"]
+            .map(|name| (name, std::fs::read(app.join(name)).unwrap()));
+        let failure = match request.run("default".to_owned(), None).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("fresh start unexpectedly replaced the external dashboard"),
+        };
+        if recovery == 'R' {
+            drop(view);
+            view = ServeView::for_launch(
+                DashboardLaunch::Failed {
+                    target: context,
+                    failure,
+                },
+                &mut jobs,
+            );
+        } else {
+            view.finish_launch(Err(failure), context.observed_target);
+        }
+        wait_for(&mut view, |view| view.pending.is_none());
+        match view.handle_key(key(recovery)) {
+            ServeAction::Stop(request) => {
+                assert!(request.run(&mut jobs).await.is_err());
+            }
+            ServeAction::Continue => {
+                assert!(view.pending.as_ref().is_some_and(|pending| matches!(
+                    pending.kind,
+                    PendingJob::Retry { .. } | PendingJob::Reset
+                )));
+                wait_for(&mut view, |view| view.pending.is_none());
+            }
+            _ => panic!("fresh-start recovery did not reach its control owner"),
+        }
+        assert!(successor.child.try_wait().unwrap().is_none());
+        assert!(!tools.root.path().join("calls").exists());
+        for (name, expected) in published {
+            assert_eq!(std::fs::read(app.join(name)).unwrap(), expected);
+        }
+        successor.exit();
+        for name in ["serve.pid", "serve.mode", "serve.url", "serve.passphrase"] {
+            remove_app_file(name);
+        }
+    }
 }
