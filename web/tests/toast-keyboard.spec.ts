@@ -14,6 +14,14 @@ async function recordOpens(page: Page) {
       w.__opened.push(["link", String(url)]);
       return null;
     }) as typeof window.open;
+    // Counts the ToastProvider's service-worker listener, so a test can wait until a push would
+    // be heard instead of racing the effect that adds it.
+    const sw = navigator.serviceWorker as unknown as EventTarget & { __messageListeners?: number };
+    const add = sw.addEventListener.bind(sw);
+    sw.addEventListener = ((type: string, ...rest: [EventListenerOrEventListenerObject, AddEventListenerOptions?]) => {
+      if (type === "message") sw.__messageListeners = (sw.__messageListeners ?? 0) + 1;
+      return add(type, ...rest);
+    }) as typeof sw.addEventListener;
     window.addEventListener("aoe-open-session", (e) =>
       w.__opened.push(["session", (e as CustomEvent<{ sessionId: string }>).detail.sessionId]),
     );
@@ -39,6 +47,12 @@ async function mockPluginNotifications(page: Page) {
     await seeded;
     seq += 1;
   };
+}
+
+async function swListening(page: Page) {
+  await page.waitForFunction(
+    () => ((navigator.serviceWorker as unknown as { __messageListeners?: number }).__messageListeners ?? 0) > 0,
+  );
 }
 
 async function pushSessionToast(page: Page) {
@@ -75,6 +89,7 @@ test.describe("linked toasts from the keyboard (#5344)", () => {
   test("a session toast opens once with Enter; Dismiss from the keyboard doesn't navigate", async ({ page }) => {
     await page.goto("/");
     const list = page.getByTestId("toast-list");
+    await swListening(page);
 
     await pushSessionToast(page);
     await expect(list.getByRole("button", { name: "Done" })).toBeVisible();
@@ -84,6 +99,7 @@ test.describe("linked toasts from the keyboard (#5344)", () => {
     expect(await opened(page)).toEqual([["session", "s-1"]]);
 
     await pushSessionToast(page);
+    await expect(list.getByRole("button", { name: "Done" })).toBeVisible();
     expect(await tabTo(page, "Dismiss")).toBe(2);
     await page.keyboard.press("Enter");
     await expect(list.getByText("Done")).toHaveCount(0);
