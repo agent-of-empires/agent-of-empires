@@ -123,33 +123,33 @@ export function useAcpSession(
   // Reject failures so the card rolls back and the same nonce remains retryable.
 
   const resolveApproval = useCallback(
-  async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
-    if (!sessionId) return;
-    let res: Response;
-    try {
-      res = await fetch(
-        acpUrl(sessionId, `approvals/${encodeURIComponent(nonce)}`),
-        jsonPost(optionId === undefined ? { decision } : { decision, option_id: optionId }),
-      );
-    } catch (e) {
-      dispatch({
-        kind: "error",
-        message: `Network error resolving approval: ${describeError(e)}`,
-        target: { kind: "approval", nonce },
-      });
-      throw e;
-    }
-    const detail = res.ok ? "" : await safeText(res);
-    const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
-    if (outcome.kind === "resolved") {
-      dispatch({ kind: "approval_resolved_locally", nonce });
-      return;
-    }
-    dispatch({ kind: "error", message: outcome.message, target: { kind: "approval", nonce } });
-    throw new Error(outcome.message);
-  },
-  [sessionId],
-);
+    async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
+      if (!sessionId) return;
+      let res: Response;
+      try {
+        res = await fetch(
+          acpUrl(sessionId, `approvals/${encodeURIComponent(nonce)}`),
+          jsonPost(optionId === undefined ? { decision } : { decision, option_id: optionId }),
+        );
+      } catch (e) {
+        dispatch({
+          kind: "error",
+          message: `Network error resolving approval: ${describeError(e)}`,
+          target: { kind: "approval", nonce },
+        });
+        throw e;
+      }
+      const detail = res.ok ? "" : await safeText(res);
+      const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
+      if (outcome.kind === "resolved") {
+        dispatch({ kind: "approval_resolved_locally", nonce });
+        return;
+      }
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "approval", nonce } });
+      throw new Error(outcome.message);
+    },
+    [sessionId],
+  );
 
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
