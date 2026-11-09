@@ -214,16 +214,8 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
-    let app_dir = event_store
-        .is_none()
-        .then(|| tempfile::tempdir().expect("tempdir"));
     let event_store = event_store.unwrap_or_else(|| {
-        let acp_db = app_dir
-            .as_ref()
-            .expect("default store directory")
-            .path()
-            .join("acp_events.db");
-        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
+        Arc::new(crate::acp::event_store::EventStore::temporary_for_test(100).expect("event store"))
     });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
