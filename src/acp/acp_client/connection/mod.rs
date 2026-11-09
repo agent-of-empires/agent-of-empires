@@ -405,11 +405,14 @@ pub(super) async fn run_connection_task<W, R>(
                     .sdk_closing
                     .store(true, Ordering::Release);
                 if let Some(control) = control {
-                    control.close_sdk_route(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
-                } else {
-                    shared.connection_state.observe(
-                        AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded,
+                    control.close_sdk_route(
+                        AcpConnectionSource::Sdk,
+                        AcpConnectionCause::IncomingEnded,
                     );
+                } else {
+                    shared
+                        .connection_state
+                        .observe(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
                     shared.connection_state.mark_ordered_loss();
                 }
                 // Preserve an earlier correlated response's diagnostic and

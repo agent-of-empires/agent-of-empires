@@ -17,7 +17,16 @@
 // Submitting disables actions until the hook confirms resolution or rejects
 // to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
