@@ -79,8 +79,10 @@ pub use groups::{
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resolved_agent_for;
+#[cfg(all(test, unix))]
+pub(crate) use instance::test_helpers::frozen_test_helper;
 #[cfg(test)]
-pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+pub(crate) use instance::test_helpers::{publish_host_pi_transcript, seed_claude_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{

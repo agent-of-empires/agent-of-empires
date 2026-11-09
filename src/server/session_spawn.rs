@@ -1679,7 +1679,7 @@ mod tests {
             ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
         ]);
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
-        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+        let _native_helper = crate::session::frozen_test_helper(
             root.path(),
             concat!(
                 module_path!(),
@@ -1713,7 +1713,7 @@ mod tests {
         parent.tool = "claude".into();
         parent.command = "claude".into();
         let parent_sid = crate::session::capture::generate_session_uuid();
-        crate::session::instance::test_helpers::seed_claude_transcript(&mut parent, &parent_sid);
+        crate::session::seed_claude_transcript(&mut parent, &parent_sid);
         crate::server::test_support::seed_instances_on_disk_for_test("test", vec![parent.clone()]);
         let state = crate::server::test_support::build_test_app_state(vec![parent.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
