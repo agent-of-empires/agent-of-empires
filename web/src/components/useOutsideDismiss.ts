@@ -1,6 +1,10 @@
 import { useEffect, type RefObject } from "react";
 
-/** While `active`, a mousedown outside every ref or an Escape keydown calls `onDismiss`. */
+/**
+ * While `active`, a mousedown outside every ref or an Escape keydown calls `onDismiss`. The Escape is
+ * marked handled (`defaultPrevented`), so window-level Escape handlers, such as clearing the sidebar
+ * selection, leave it to this popup.
+ */
 export function useOutsideDismiss(active: boolean, refs: RefObject<HTMLElement | null>[], onDismiss: () => void) {
   useEffect(() => {
     if (!active) return;
@@ -9,7 +13,9 @@ export function useOutsideDismiss(active: boolean, refs: RefObject<HTMLElement |
       onDismiss();
     };
     const onKeydown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onDismiss();
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      onDismiss();
     };
     document.addEventListener("mousedown", onMouseDown);
     document.addEventListener("keydown", onKeydown);

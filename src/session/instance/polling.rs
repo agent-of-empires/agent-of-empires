@@ -353,6 +353,13 @@ impl Instance {
             self.capture_poller.stop();
         }
         self.capture_poller.drop_handle();
+        if self
+            .capture_poller
+            .retry_after()
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return Ok(PollerStart::Deferred);
+        }
         let Some((capture, context)) = self.source_session_support() else {
             return Ok(PollerStart::NotApplicable);
         };
@@ -843,7 +850,7 @@ impl Instance {
                 return;
             }
         };
-        if let Err(error) = self.stop_and_flush_poller_lifecycle_locked(&storage) {
+        if let Err(error) = self.stop_and_flush_poller_lifecycle_locked(&storage, None) {
             tracing::warn!(target: "session.sync", session = %self.id, %error, "final capture failed");
         }
     }
@@ -851,12 +858,13 @@ impl Instance {
     pub(super) fn stop_and_flush_poller_lifecycle_locked(
         &mut self,
         storage: &dyn crate::session::SessionStore,
+        mut selection: Option<&mut [u8; 32]>,
     ) -> anyhow::Result<()> {
         let native_prime = self.prime_runtime().is_some();
         let flush = if native_prime {
             None
         } else {
-            self.flush_published_conversation(storage)
+            self.flush_published_conversation(storage, selection.as_deref_mut())
         };
         if !matches!(flush, Some(SidWrite::Failed)) {
             if let Ok(rows) = storage.load() {
@@ -873,10 +881,12 @@ impl Instance {
                 "could not persist final conversation publication"
             )),
             _ if self.capture_poller.handle().is_some() => {
-                let drained = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
-                    std::slice::from_mut(self),
-                    storage,
-                );
+                let mut drained =
+                    crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                        std::slice::from_mut(self),
+                        storage,
+                        selection.as_deref_mut(),
+                    );
                 #[cfg(test)]
                 if let Some(hook) = take_after_final_pi_drain_hook() {
                     hook(self);
@@ -889,28 +899,51 @@ impl Instance {
                         inst.observation_is_current_pi_path(observation)
                     });
                 if retry_pi_path {
-                    let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
-                        std::slice::from_mut(self),
-                        storage,
-                    );
+                    let retried =
+                        crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                            std::slice::from_mut(self),
+                            storage,
+                            selection.as_deref_mut(),
+                        );
+                    if drained.is_ok() {
+                        drained = retried;
+                    }
                 }
                 drained.map(|_| ())
             }
             _ => Ok(()),
         };
         self.capture_poller.drop_handle();
-        if native_prime
-            && result.is_ok()
-            && matches!(
-                self.flush_published_conversation(storage),
-                Some(SidWrite::Failed)
-            )
-        {
-            return Err(anyhow::anyhow!(
-                "could not persist final native Prime publication"
-            ));
+        if native_prime && result.is_ok() {
+            let flush = self.flush_published_conversation(storage, selection.as_deref_mut());
+            if matches!(flush, Some(SidWrite::Failed)) {
+                return Err(anyhow::anyhow!(
+                    "could not persist final native Prime publication"
+                ));
+            }
+            if let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) {
+                self.adopt_conversation_state(row.conversation_state());
+                self.resume_probe_failed_sid = row.resume_probe_failed_sid;
+                self.omp_capture_generation = row.omp_capture_generation;
+            }
         }
-        result
+        result?;
+        if let Some(expected) = selection {
+            anyhow::ensure!(
+                self.native_preparation_selection()? == *expected,
+                super::LifecycleReservationError::Superseded
+            );
+            let row = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == self.id)
+                .ok_or(super::LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.native_preparation_selection()? == *expected,
+                super::LifecycleReservationError::Superseded
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1169,6 +1202,117 @@ mod tests {
             .expect("stopping the poller releases the store lease");
     }
 
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tmux_applied_reload_preserves_a_real_managed_capture_lease_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let mut prior = Instance::new("boot-store-contention", root.path().to_str().unwrap());
+        prior.source_profile = "default".into();
+        prior.tool = "prime-agent".into();
+        prior.status = Status::Starting;
+        prior.sandbox_info = Some(test_sandbox("boot-store-contention", None));
+        admit_sandbox_fixture(&prior);
+        let store = prior.sandbox_capture_store_dir().unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        prior
+            .prime_agent_capture_plan_in(
+                prior
+                    .prime_agent_capture_options()
+                    .expect("Prime fixture has valid capture arguments"),
+                crate::session::CaptureStorage::Scoped(&storage),
+            )
+            .expect("the fixture must reach real lease contention, not configuration refusal");
+        let backend = crate::agents::SessionCaptureBackend::PrimeAgent;
+        let lease = super::try_acquire_managed_capture_lease(backend, &store).unwrap();
+        assert!(
+            prior.last_start_time.is_none(),
+            "a boot-loaded row has no launch stamp"
+        );
+        assert!(prior.active_execution.is_none());
+        assert_eq!(prior.maybe_start_poller(), PollerStart::Deferred);
+        let deadline = prior
+            .capture_poller
+            .retry_after()
+            .expect("the real contended store lease must arm its retry deadline");
+        assert!(prior.capture_poller.handle().is_none());
+        storage
+            .update(|rows, _| {
+                rows.push(prior.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut fresh = storage.load().unwrap().remove(0);
+        fresh.status = Status::Running;
+        assert!(
+            fresh.capture_poller.retry_after().is_none(),
+            "disk has no runtime pacing"
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![prior]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        crate::server::test_support::reload_tmux_applied_for_test(&state, vec![fresh], Vec::new())
+            .await;
+        // A transient API snapshot offers neither a watcher nor a repair outcome.
+        // It must not erase the canonical deadline earned from real store contention,
+        // whether it still describes this tool or describes a stale different tool.
+        for foreign_tool in [false, true] {
+            let mut snapshot = state.instances.read().await[0].clone();
+            snapshot.capture_poller = Default::default();
+            if foreign_tool {
+                snapshot.tool = "claude".into();
+            }
+            let publish = state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::server::session_store::NativeSessionStore::open(
+                    publish,
+                    "default",
+                    Some(snapshot.id.clone()),
+                )
+                .unwrap()
+                .adopt_runtime_fields(&snapshot)
+                .unwrap();
+            })
+            .await
+            .unwrap();
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].tool, "prime-agent");
+            assert!(rows[0].capture_poller.handle().is_none());
+            assert_eq!(rows[0].capture_poller.retry_after(), Some(deadline));
+        }
+        let mut rows = state.instances.write().await;
+        let reloaded = &mut rows[0];
+        assert_eq!(
+            reloaded.status,
+            Status::Running,
+            "fresh tmux status must win"
+        );
+        assert_eq!(
+            reloaded.capture_poller.retry_after(),
+            Some(deadline),
+            "a status-poll reload must not discard the real store-contention deadline"
+        );
+        drop(lease);
+        assert_eq!(reloaded.maybe_start_poller(), PollerStart::Deferred);
+        assert!(
+            reloaded.capture_poller.handle().is_none(),
+            "no attempt before the deadline"
+        );
+        reloaded.capture_poller.set_retry_after(Some(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        ));
+        assert_eq!(reloaded.maybe_start_poller(), PollerStart::Started);
+        assert!(reloaded.capture_poller.is_running());
+        assert_eq!(
+            super::try_acquire_managed_capture_lease(backend, &store).unwrap_err(),
+            super::LeaseRefusal::Contended,
+            "the resumed watcher must actually own the physical store lease"
+        );
+        reloaded.capture_poller.stop();
+    }
+
     // Every teardown path must flush the last published conversation.
     #[test]
     #[serial_test::serial]
@@ -1196,7 +1340,7 @@ mod tests {
         let published = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
-        inst.stop_and_flush_poller_lifecycle_locked(&storage)
+        inst.stop_and_flush_poller_lifecycle_locked(&storage, None)
             .unwrap();
 
         assert_eq!(
@@ -1209,6 +1353,87 @@ mod tests {
             Some(published),
             "and the in-memory row a restart reads moments later"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn final_pi_drain_advances_only_its_own_selection_witness() {
+        use crate::session::poller::{SessionIdObservation, SessionPoller};
+        use std::sync::{Arc, Mutex};
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        const OLD: &str = "22f13307-461c-4161-908e-95a247fac750";
+        const FINAL: &str = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        for (same_sid, peer_after_drain) in [(true, false), (false, false), (false, true)] {
+            let profile = format!("pi-witness-{same_sid}-{peer_after_drain}");
+            let mut inst = Instance::new(&profile, home.path().to_str().unwrap());
+            inst.source_profile = profile.clone();
+            inst.tool = "pi".into();
+            inst.agent_session_id = Some(if same_sid { FINAL } else { OLD }.into());
+            let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let transcript = publish_host_pi_transcript(&inst.id, FINAL, home.path());
+            let observation = inst.final_publication_observation().unwrap();
+            let poller = SessionPoller::new(
+                format!("test-tmux-{}", inst.id),
+                inst.tool.clone(),
+                inst.active_execution.clone(),
+            );
+            poller.inject_test_observation(&inst.id, observation);
+            inst.capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(poller))));
+            let mut selection = inst.native_preparation_selection().unwrap();
+            let original = selection;
+            let hook_profile = profile.clone();
+            let hook_path = transcript.to_str().unwrap().to_owned();
+            let _hook = Instance::set_after_final_pi_drain_hook_for_test(move |current| {
+                assert_eq!(current.pi_session_path.as_deref(), Some(hook_path.as_str()));
+                if peer_after_drain {
+                    let peer = crate::session::Storage::new_unwatched(&hook_profile).unwrap();
+                    peer.update(|rows, _| {
+                        rows[0].resume_intent = crate::session::ResumeIntent::Use(OLD.into());
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                // Exercise the second, final Pi path drain with the same witness.
+                let mut observation =
+                    SessionIdObservation::instance_sidecar(FINAL.into(), Some(hook_path));
+                observation.execution = current.active_execution.clone();
+                current
+                    .capture_poller
+                    .handle()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .inject_test_observation(&current.id, observation);
+            });
+            let result =
+                inst.stop_and_flush_poller_lifecycle_locked(&storage, Some(&mut selection));
+            let durable = storage.load().unwrap().remove(0);
+            assert_ne!(selection, original, "own capture must advance the witness");
+            assert_eq!(durable.pi_session_path.as_deref(), transcript.to_str());
+            assert!(inst.capture_poller.handle().is_none());
+            if peer_after_drain {
+                // Reloading a foreign pin must not re-seal the admitted selection.
+                assert_ne!(selection, durable.native_preparation_selection().unwrap());
+                assert!(result.is_err(), "{result:?}");
+                assert_eq!(
+                    durable.resume_intent,
+                    crate::session::ResumeIntent::Use(OLD.into())
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(selection, durable.native_preparation_selection().unwrap());
+                assert_eq!(selection, inst.native_preparation_selection().unwrap());
+            }
+        }
     }
 
     #[test]

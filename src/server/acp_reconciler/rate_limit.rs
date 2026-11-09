@@ -388,14 +388,16 @@ pub(crate) async fn resume_rate_limited(
     {
         return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
     }
-    if manual || matches!(outcome, ContinuationOutcome::Stands | ContinuationOutcome::Installed) {
-        if manual && park.cap_reached {
-            resume_at = Utc::now();
-        }
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
+    if manual
+    || matches!(outcome, ContinuationOutcome::Stands | ContinuationOutcome::Installed)
+{
+    if manual && park.cap_reached {
+        resume_at = Utc::now();
     }
+    state
+        .acp_supervisor
+        .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
+}
     super::resume::ensure_rate_limit_worker(state, id, authority, false).await?;
     let control = state
         .session_service
