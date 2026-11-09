@@ -20,8 +20,27 @@ pub enum InstallMethod {
     Unknown { binary_path: PathBuf },
 }
 
+/// Where Homebrew installs: Apple silicon, Intel macOS, and Linuxbrew.
+const HOMEBREW_PREFIXES: [&str; 3] = ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// `<prefix>/Cellar/aoe/<version>/bin/aoe`, where a canonicalized Homebrew `aoe` lives. Read from
+/// the path alone, so it holds when `brew` itself can't run (#5515).
+fn is_homebrew_cellar_binary(path: &Path) -> bool {
+    HOMEBREW_PREFIXES.iter().any(|prefix| {
+        let Ok(rest) = path.strip_prefix(Path::new(prefix).join("Cellar").join("aoe")) else {
+            return false;
+        };
+        let parts: Vec<_> = rest.components().map(|c| c.as_os_str()).collect();
+        matches!(parts.as_slice(), [_, bin, name] if *bin == "bin" && *name == "aoe")
+    })
+}
+
 fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     let path = binary_path;
+
+    if is_homebrew_cellar_binary(path) {
+        return InstallMethod::Homebrew;
+    }
 
     if path.starts_with("/nix/store/") {
         return InstallMethod::Nix;
@@ -49,7 +68,8 @@ fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     }
 }
 
-/// `Homebrew` only when `brew list aoe` resolves to the running binary.
+/// `Homebrew` when the path already says so, or when `brew list aoe` resolves to the running
+/// binary (a Homebrew install outside the known prefixes).
 fn classify_with_brew(
     prefix: InstallMethod,
     brew_path: Option<&Path>,
@@ -79,6 +99,10 @@ pub fn detect_install_method() -> Result<InstallMethod> {
     let home = dirs::home_dir().context("locating home directory")?;
     let home = home.canonicalize().unwrap_or(home);
     let prefix = classify_path_prefix(&exe, &home);
+    // A Cellar path already says Homebrew, and `brew` may not be on a Daemon's PATH.
+    if prefix == InstallMethod::Homebrew {
+        return Ok(prefix);
+    }
     let brew_path = probe_brew_aoe_path();
     Ok(classify_with_brew(prefix, brew_path.as_deref(), &exe))
 }
@@ -643,6 +667,7 @@ mod tests {
         let home = home();
         let nix = |_: &Path| InstallMethod::Nix;
         let cargo = |_: &Path| InstallMethod::Cargo;
+        let homebrew = |_: &Path| InstallMethod::Homebrew;
         let tarball = |p: &Path| InstallMethod::Tarball {
             binary_path: p.to_path_buf(),
         };
@@ -656,6 +681,34 @@ mod tests {
             (home.join(".local/bin/aoe"), &tarball),
             (home.join("bin/aoe"), &tarball),
             (PathBuf::from("/opt/aoe-custom/bin/aoe"), &unknown),
+            // #5515: a binary in a Homebrew Cellar is Homebrew without asking `brew`, which a
+            // Daemon started without Homebrew on PATH cannot run.
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &homebrew,
+            ),
+            (
+                PathBuf::from("/usr/local/Cellar/aoe/1.22.3/bin/aoe"),
+                &homebrew,
+            ),
+            (
+                PathBuf::from("/home/linuxbrew/.linuxbrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &homebrew,
+            ),
+            // Look-alikes stay as they were.
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe-fork/1.0/bin/aoe"),
+                &unknown,
+            ),
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe/1.22.3/libexec/aoe"),
+                &unknown,
+            ),
+            (PathBuf::from("/opt/homebrew/Cellar/aoe/bin/aoe"), &unknown),
+            (
+                PathBuf::from("/srv/opt/homebrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &unknown,
+            ),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -858,6 +911,13 @@ mod tests {
                 tarball.clone(),
             ),
             (&other_exe, None, tarball.clone(), tarball.clone()),
+            // A Cellar binary is already Homebrew by its path, with no probe result (#5515).
+            (
+                &brew_exe,
+                None,
+                InstallMethod::Homebrew,
+                InstallMethod::Homebrew,
+            ),
         ];
         for (exe, brew_path, prefix_class, expected) in cases {
             assert_eq!(classify_with_brew(prefix_class, brew_path, exe), expected);
