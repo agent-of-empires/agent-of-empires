@@ -61,7 +61,7 @@ contains_any = [
   "generating",
   "thinking",
 ]
-not = [{ region = "whole_recent", line_regex = ['^\s*>(\s|$)'] }]
+not = [{ region = "whole_recent", line_regex = ['^\s*[>!/&](\s|$)'] }]
 
 # A trailing ellipsis on the last line: a status line mid-render.
 [[rules]]

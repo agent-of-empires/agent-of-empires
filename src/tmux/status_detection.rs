@@ -2520,6 +2520,14 @@ Do you want to proceed?\n\
             (format!("{TURN}{INPUT}"), Status::Idle),
             (format!("{LOGO_3}{DRAFT}"), Status::Idle),
             (
+                "  Reading it.\n──────────\n! ls\n──────────\n".into(),
+                Status::Idle,
+            ),
+            (
+                "  Reading it.\n──────────\n/ hel\n──────────\n".into(),
+                Status::Idle,
+            ),
+            (
                 format!("{LOGO_3}⠒⠂ Generating… (3s Esc/Ctrl+C to interrupt)\n{INPUT}"),
                 Status::Running,
             ),
