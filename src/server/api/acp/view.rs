@@ -3069,6 +3069,9 @@ mod tests {
             let old_pid = crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
             let old_birth = crate::process::process_birth_identity(old_pid)?
                 .expect("unproven birth still names a real live process");
+            let (old_physical, _, _) = crate::tmux::utils::observe_pane(
+                &name, &crate::tmux::TmuxCommandDeadline::new(),
+            )?.expect("physical original pane exists independently of its missing durable receipt");
             storage.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == source.id).unwrap();
                 row.terminal_handoff.as_mut().unwrap().stage = HandoffStage::ProjectionCleanupOwed;
@@ -3128,10 +3131,24 @@ mod tests {
             assert!(completed.lifecycle_reservation.is_none());
             assert!(completed.lifecycle_generation > renewed.generation);
             let new_pane = crate::tmux::test_helpers::only_pane_id(&name);
-            assert_ne!(new_pane, old_pane);
+            let (new_physical, _, _) = crate::tmux::utils::observe_pane(
+                &name, &crate::tmux::TmuxCommandDeadline::new(),
+            )?.expect("new physical pane exists");
+            let new_pid = new_physical.identity.pane_pid.expect("new pane PID");
+            let new_birth = crate::process::process_birth_identity(new_pid)?
+                .expect("new pane has a real process birth");
+            assert_ne!(
+                (&new_physical.server, &new_pane, new_pid, &new_birth),
+                (&old_physical.server, &old_pane, old_pid, &old_birth),
+                "bare pane IDs may be reused only on a different physical server or birth"
+            );
             let repeat = terminal_handoff_request(state.clone(), source.id.clone()).await;
             assert_eq!(repeat.status(), StatusCode::OK);
             assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), new_pane);
+            assert_eq!(crate::tmux::utils::observe_pane(
+                &name, &crate::tmux::TmuxCommandDeadline::new(),
+            )?.unwrap().0, new_physical, "a repeated request must retain the actual new physical owner");
+            assert!(crate::process::process_birth_is_live(new_pid, &new_birth)?);
             assert!(events.replay_from(&source.id, 0).is_empty());
             assert_eq!(crate::tmux::test_helpers::only_pane_id(peer.name()), peer_pane);
             assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth)?);
