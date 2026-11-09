@@ -30,6 +30,7 @@ surrounding backend, the map, and the tests are original.
 
 Modifications: shared memory-backed and disk-backed input, parser storage,
 reference dictionaries, and text normalization preserve the parser's grammar.
+The disk backend shares the application's SQLite dependency.
 
 ## unicode-width 0.2.2
 

@@ -136,7 +136,7 @@ tempfile = "3.14"
 which = "8.0"
 
 # SQLite
-rusqlite = { version = "0.40", features = ["blob"] }
+rusqlite = { version = "0.41", features = ["blob"] }
 
 axum = { version = "0.8", features = ["ws"] }
 # hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.

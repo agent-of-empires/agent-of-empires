@@ -30,7 +30,7 @@ impl Store {
             ));
         }
         let file = NamedTempFile::new()?;
-        let connection = Connection::open(file.path()).map_err(io::Error::other)?;
+        let mut connection = Connection::open(file.path()).map_err(io::Error::other)?;
         let progress_cancelled = Arc::clone(&cancelled);
         connection
             .progress_handler(
