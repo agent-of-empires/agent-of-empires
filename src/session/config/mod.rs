@@ -2252,19 +2252,19 @@ impl SessionConfig {
         }
     }
 
-    /// The `agent_clear_alias` entries that apply: only an agent launched through its own valid
-    /// `agent_acp_cmd`, the check that makes it ACP-capable. An agent inheriting a built-in adapter through `agent_detect_as` runs as
-    /// that built-in, whose profile already decides its reset command.
-    pub fn declared_clear_aliases(&self) -> HashMap<String, String> {
-        self.agent_clear_alias
-            .iter()
-            .filter(|(name, _)| {
-                self.agent_acp_cmd
-                    .get(*name)
-                    .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
-            })
-            .map(|(name, alias)| (name.clone(), alias.clone()))
-            .collect()
+    /// The reset profile `agent_clear_alias` declares for `agent`. Only a custom agent launched
+    /// through its own valid `agent_acp_cmd` takes one; an agent inheriting a built-in adapter
+    /// through `agent_detect_as` runs as that built-in.
+    pub fn clear_alias_profile(
+        &self,
+        agent: &str,
+    ) -> Option<&'static crate::acp::agent_profiles::AgentProfile> {
+        if crate::acp::agent_profiles::is_builtin(agent) {
+            return None;
+        }
+        let cmd = self.agent_acp_cmd.get(agent)?;
+        crate::acp::AgentSpec::from_acp_cmd(agent, cmd).ok()?;
+        crate::acp::agent_profiles::alias_profile(self.agent_clear_alias.get(agent)?)
     }
 
     /// Log warnings for misconfigured custom agent entries.
@@ -2311,7 +2311,7 @@ impl SessionConfig {
                     "agent_clear_alias: '{}' = '{}' is ignored; use an agent name and \"/clear\" or \"/new\"",
                     name, alias
                 );
-            } else if crate::agents::get_agent(name).is_some() {
+            } else if crate::acp::agent_profiles::is_builtin(name) {
                 tracing::warn!(target: "session.store",
                     "agent_clear_alias: '{}' is a built-in agent with its own reset command; the entry is ignored",
                     name
@@ -4143,35 +4143,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declared_clear_aliases_apply_only_to_an_agent_with_its_own_acp_command() {
-        let mut config = SessionConfig {
-            agent_clear_alias: [("own", "/clear"), ("inherits", "/new")]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            ..SessionConfig::default()
-        };
-        config
-            .agent_acp_cmd
-            .insert("own".into(), "own-bridge acp".into());
-        // `inherits` has no agent_acp_cmd: it is launched as its agent_detect_as base.
+    fn a_clear_alias_applies_only_to_a_custom_agent_with_its_own_acp_command() {
+        let mut config = SessionConfig::default();
+        // (agent, acp command)
+        let agents = [
+            ("own", Some("own-bridge acp")),
+            // Launched as its agent_detect_as base.
+            ("inherits", None),
+            ("empty", Some("")),
+            ("malformed", Some("bridge \"unterminated")),
+            // Built-in, in the registry without an ACP profile.
+            ("cursor", Some("cursor-bridge acp")),
+        ];
+        for (agent, cmd) in agents {
+            config
+                .agent_clear_alias
+                .insert(agent.into(), "/clear".into());
+            if let Some(cmd) = cmd {
+                config.agent_acp_cmd.insert(agent.into(), cmd.into());
+            }
+        }
         config
             .agent_detect_as
             .insert("inherits".into(), "claude".into());
-        // An empty or malformed command leaves the agent ACP-incapable, so it advertises nothing.
-        config
-            .agent_clear_alias
-            .insert("empty".into(), "/clear".into());
-        config.agent_acp_cmd.insert("empty".into(), String::new());
-        config
-            .agent_clear_alias
-            .insert("malformed".into(), "/clear".into());
-        config
-            .agent_acp_cmd
-            .insert("malformed".into(), "bridge \"unterminated".into());
-        let declared = config.declared_clear_aliases();
-        assert_eq!(declared.len(), 1, "{declared:?}");
-        assert_eq!(declared.get("own").map(String::as_str), Some("/clear"));
+        for (agent, _) in agents {
+            assert_eq!(
+                config.clear_alias_profile(agent).map(|p| p.key),
+                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
+                "{agent}"
+            );
+        }
     }
 
     #[test]

@@ -384,7 +384,7 @@ pub(super) fn custom_agent_acp_capable(
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, String), (SessionConfig, StructuredView)>,
+    entries: HashMap<(String, String), crate::session::config::Config>,
     /// Where this cache reports its disk reads. The counter belongs to the
     /// request, not to the cache, so every cache the request opens adds to
     /// one total: splitting the shared cache per overlay then shows up as
@@ -401,26 +401,29 @@ impl<'a> SessionCfgCache<'a> {
         }
     }
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
-    fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
+    pub(super) fn config(
+        &mut self,
+        profile: &str,
+        project_path: &str,
+    ) -> &crate::session::config::Config {
         let misses = self.misses;
         self.entries
             .entry((profile.to_string(), project_path.to_string()))
             .or_insert_with(|| {
                 misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     profile,
                     std::path::Path::new(project_path),
-                );
-                (config.session, config.acp.structured_view)
+                )
             })
     }
 
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
-        &self.entry(profile, project_path).0
+        &self.config(profile, project_path).session
     }
 
     pub(super) fn structured_view(&mut self, profile: &str, project_path: &str) -> StructuredView {
-        self.entry(profile, project_path).1
+        self.config(profile, project_path).acp.structured_view
     }
 }
 

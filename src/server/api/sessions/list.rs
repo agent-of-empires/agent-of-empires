@@ -120,6 +120,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
     let mut project_override_cache = ProjectRegistryCache::new();
+    let acp_registry = crate::acp::AgentRegistry::with_defaults();
 
     // Overlay custom-agent ACP capability; built-ins were resolved in the
     // constructor. Distinct `(profile, project_path)` pairs resolve once via
@@ -135,24 +136,36 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
         }
-        // A custom agent's declared reset alias, so the composer treats it as a clear command.
-        if resp.clear_aliases.is_empty() {
-            let agent_key = inst
-                .agent_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&inst.tool);
-            let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
-            if let Some(profile) = crate::acp::agent_profiles::resolve_with_aliases(
-                agent_key,
-                &cfg.declared_clear_aliases(),
-            )
-            .clear_aliases
-            .first()
-            .filter(|_| !crate::acp::agent_profiles::is_builtin(agent_key))
-            {
-                resp.clear_aliases = vec![profile.to_string()];
-            }
+        // The solo commands of the agent that classifies this session's prompts, resolved as the
+        // queue and publication resolve it, so a custom agent's declared reset is advertised.
+        if inst.is_structured() {
+            use crate::acp::supervisor::SessionAgent;
+            let agent = match state.acp_supervisor.worker_agent_key(&inst.id).await {
+                Some(key) => SessionAgent::Worker(key),
+                None => SessionAgent::Next {
+                    tool: inst.tool.clone(),
+                    explicit: inst.agent_name.clone(),
+                },
+            };
+            let profile = match &agent {
+                SessionAgent::Worker(key) if crate::acp::agent_profiles::is_builtin(key) => {
+                    crate::acp::agent_profiles::resolve(key)
+                }
+                _ => agent.profile_with(
+                    &acp_registry,
+                    session_cfg_cache.config(&inst.source_profile, &inst.project_path),
+                ),
+            };
+            resp.clear_aliases = profile
+                .clear_aliases
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            resp.compact_aliases = profile
+                .compact_aliases
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         }
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {

@@ -204,9 +204,10 @@ pub fn could_be_declared_alias(text: &str) -> bool {
     matches_alias(&["/clear", "/new"], text)
 }
 
-/// True when `key` names an agent with its own built-in profile.
+/// True when `key` names a built-in agent: one in the agent registry or with its own profile.
+/// A built-in agent keeps its own reset command and ignores `session.agent_clear_alias`.
 pub fn is_builtin(key: &str) -> bool {
-    resolve(key).key != DEFAULT.key
+    crate::agents::get_agent(key).is_some() || resolve(key).key != DEFAULT.key
 }
 
 /// A custom agent that resets with `/clear`, declared by `session.agent_clear_alias`.
@@ -234,20 +235,12 @@ pub fn alias_profile(alias: &str) -> Option<&'static AgentProfile> {
     }
 }
 
-/// [`resolve`], except that an agent with no built-in profile takes the reset alias the
-/// session configuration declares for it. A built-in agent keeps its own profile.
-pub fn resolve_with_aliases(
+/// [`resolve`], except that a custom agent takes the reset alias `session` declares for it.
+pub fn resolve_with_config(
     key: &str,
-    clear_aliases: &std::collections::HashMap<String, String>,
+    session: &crate::session::config::SessionConfig,
 ) -> &'static AgentProfile {
-    let profile = resolve(key);
-    if profile.key != DEFAULT.key {
-        return profile;
-    }
-    clear_aliases
-        .get(key)
-        .and_then(|alias| alias_profile(alias))
-        .unwrap_or(profile)
+    session.clear_alias_profile(key).unwrap_or(resolve(key))
 }
 
 /// Resolve a static profile by registry key.
@@ -310,15 +303,20 @@ mod tests {
 
     #[test]
     fn a_declared_alias_gives_a_custom_agent_a_reset_but_never_a_built_in() {
-        let aliases: std::collections::HashMap<String, String> = [
+        let mut session = crate::session::config::SessionConfig::default();
+        // `cursor` is a registry agent with no ACP profile of its own.
+        for (agent, alias) in [
             ("my-claude", "/clear"),
             ("my-codex", " /new "),
             ("odd", "/compact"),
             ("claude", "/new"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+            ("cursor", "/clear"),
+        ] {
+            session.agent_clear_alias.insert(agent.into(), alias.into());
+            session
+                .agent_acp_cmd
+                .insert(agent.into(), format!("{agent}-bridge acp"));
+        }
         // (agent, text, resets)
         let cases = [
             ("my-claude", "/clear", true),
@@ -327,13 +325,12 @@ mod tests {
             ("my-codex", "/clear", false),
             ("odd", "/compact", false),
             ("unlisted", "/clear", false),
-            // A built-in agent keeps its own alias whatever the map says.
             ("claude", "/clear", true),
             ("claude", "/new", false),
+            ("cursor", "/clear", false),
         ];
         for (agent, text, resets) in cases {
-            let profile = resolve_with_aliases(agent, &aliases);
-            assert_eq!(profile.is_clear_command(text), resets, "{agent} {text:?}");
+            let profile = resolve_with_config(agent, &session);
             assert_eq!(
                 profile.is_clear_command(text) && profile.clear_requires_driven_reset,
                 resets,

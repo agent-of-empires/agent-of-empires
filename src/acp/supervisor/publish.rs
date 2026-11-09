@@ -107,7 +107,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None, None)
             .await
             .disposition
     }
@@ -115,7 +115,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Record a `UserPromptSent` (attachments stored as blobs keyed to its seq)
     /// and decide how the caller routes the text. `synthesized` marks a
     /// daemon-queued rate-limit continuation rather than text the user just
-    /// typed, which the transcript renders no row for (#4040).
+    /// typed, which the transcript renders no row for (#4040). `classified_as`
+    /// is the profile a caller already cut the turn with; `None` looks it up.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_user_prompt_with_attachments(
         &self,
         session_id: &str,
@@ -124,10 +126,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         prompt_id: Option<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
+        classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
     ) -> PublishedPrompt {
         // Before any await or store, so an idle stop cannot claim the worker in between.
         super::lock_recover(&self.lifecycle).note_admission(session_id);
-        let profile = self.profile_for_session(session_id, &text).await;
+        let profile = match classified_as {
+            Some(profile) => profile,
+            None => self.profile_for_session(session_id, &text).await,
+        };
         let is_clear = profile.is_clear_command(&text);
         let disposition = if is_clear && profile.clear_requires_driven_reset {
             PromptDisposition::ResetContext
@@ -202,60 +208,60 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
     }
 
-    /// The session's agent profile. An agent with no built-in profile takes the reset alias its
-    /// resolved `session.agent_clear_alias` declares, so a custom agent's `/clear` drives a real
-    /// reset instead of reaching the model as text.
-    pub(crate) async fn profile_for_session(
+    /// The session's agent profile, read from its worker or registry record. A session with
+    /// neither predates the key and runs `claude`.
+    async fn profile_for_session(
         &self,
         session_id: &str,
         text: &str,
     ) -> &'static crate::acp::agent_profiles::AgentProfile {
         use crate::acp::agent_profiles::resolve;
-        let (agent_key, source_profile, cwd) = {
-            let live = self
-                .workers
-                .lock()
-                .await
-                .get(session_id)
-                .and_then(|handle| match &handle.kind {
-                    WorkerKind::Runner { spawn_config } => Some((
-                        spawn_config.agent_key.clone(),
-                        spawn_config.source_profile.clone(),
-                        spawn_config.cwd.clone(),
-                    )),
-                    _ => None,
-                });
-            match live {
-                Some(found) => found,
-                None => match crate::process::worker_registry::load(session_id) {
-                    Ok(Some(record)) if !record.agent_key.is_empty() => {
-                        (record.agent_key, record.source_profile, record.cwd)
-                    }
-                    _ => return resolve("claude"),
-                },
-            }
+        let Some((agent_key, source_profile, cwd)) = self.worker_agent(session_id).await else {
+            return resolve("claude");
         };
-        // Only a `/clear` or `/new` can match a declared alias, so every other prompt skips the
-        // configuration read. Settings changes are read fresh each time one of those arrives.
+        // Only a `/clear` or `/new` can match a declared alias, so other prompts skip the
+        // configuration read.
         if !crate::acp::agent_profiles::could_be_declared_alias(text) {
             return resolve(&agent_key);
         }
-        super::agents::profile_for_agent(&agent_key, &source_profile.unwrap_or_default(), &cwd)
+        super::SessionAgent::Worker(agent_key)
+            .profile(&source_profile.unwrap_or_default(), &cwd)
             .await
     }
 
-    /// The session's agent registry key: from the live runner, else its
-    /// registry record, else `claude` for records that predate the key.
-    pub(super) async fn agent_key_for_session(&self, session_id: &str) -> String {
+    /// The registry key, source profile and cwd of the session's live runner, else of its
+    /// registry record.
+    async fn worker_agent(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Option<String>, std::path::PathBuf)> {
         if let Some(handle) = self.workers.lock().await.get(session_id) {
             if let WorkerKind::Runner { spawn_config } = &handle.kind {
-                return spawn_config.agent_key.clone();
+                return Some((
+                    spawn_config.agent_key.clone(),
+                    spawn_config.source_profile.clone(),
+                    spawn_config.cwd.clone(),
+                ));
             }
         }
         match crate::process::worker_registry::load(session_id) {
-            Ok(Some(record)) if !record.agent_key.is_empty() => record.agent_key,
-            _ => "claude".to_string(),
+            Ok(Some(record)) if !record.agent_key.is_empty() => {
+                Some((record.agent_key, record.source_profile, record.cwd))
+            }
+            _ => None,
         }
+    }
+
+    /// The session's worker agent key; see [`Self::worker_agent`].
+    pub(crate) async fn worker_agent_key(&self, session_id: &str) -> Option<String> {
+        self.worker_agent(session_id).await.map(|(key, ..)| key)
+    }
+
+    /// The session's agent registry key, else `claude` for records that predate the key.
+    pub(super) async fn agent_key_for_session(&self, session_id: &str) -> String {
+        self.worker_agent_key(session_id)
+            .await
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     pub(super) fn cancel_orphaned_requests(&self, session_id: &str) {
@@ -736,6 +742,7 @@ inherits-claude = "claude"
             None,
             true,
             None,
+            None,
         )
         .await;
 
@@ -768,7 +775,15 @@ inherits-claude = "claude"
         let sup = Supervisor::new(sink.clone());
         sup.publish_user_prompt("s-1", "first".into()).await;
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "second".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "second".into(),
+                &[],
+                None,
+                false,
+                None,
+                None,
+            )
             .await;
         let recorded = sink.frames.lock().unwrap().last().unwrap().1;
         assert_eq!(
@@ -781,7 +796,15 @@ inherits-claude = "claude"
 
         let sup = Supervisor::new(std::sync::Arc::new(RefusesToPersist));
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "lost".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "lost".into(),
+                &[],
+                None,
+                false,
+                None,
+                None,
+            )
             .await;
         assert_eq!(
             published,

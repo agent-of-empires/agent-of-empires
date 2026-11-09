@@ -783,6 +783,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
             None,
             false,
             None,
+            None,
         )
         .await;
     drop(winner);
@@ -1362,7 +1363,15 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
         .await;
     state
         .acp_supervisor
-        .publish_user_prompt_with_attachments(id, "the user's turn".into(), &[], None, false, None)
+        .publish_user_prompt_with_attachments(
+            id,
+            "the user's turn".into(),
+            &[],
+            None,
+            false,
+            None,
+            None,
+        )
         .await;
 
     let response = acp_prompt(

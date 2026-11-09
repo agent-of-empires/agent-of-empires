@@ -141,31 +141,56 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-/// The agent's profile for a session running in `profile` and `project_path`. An agent with no
-/// built-in profile takes the reset alias its resolved `session.agent_clear_alias` declares, so a
-/// custom agent's `/clear` drives a real reset instead of reaching the model as text.
-pub(crate) async fn profile_for_agent(
-    agent: &str,
-    profile: &str,
-    project_path: &Path,
-) -> &'static crate::acp::agent_profiles::AgentProfile {
-    use crate::acp::agent_profiles::{resolve, resolve_with_aliases, DEFAULT};
-    let builtin = resolve(agent);
-    if builtin.key != DEFAULT.key {
-        return builtin;
+/// The agent a session's prompts are classified as: its worker's registry key, or for a session
+/// with no worker, the agent its next spawn picks.
+#[derive(Debug, Clone)]
+pub(crate) enum SessionAgent {
+    Worker(String),
+    Next {
+        tool: String,
+        explicit: Option<String>,
+    },
+}
+
+impl SessionAgent {
+    /// The agent's profile under resolved configuration, with any declared reset alias.
+    pub(crate) fn profile_with(
+        &self,
+        registry: &AgentRegistry,
+        config: &crate::session::config::Config,
+    ) -> &'static crate::acp::agent_profiles::AgentProfile {
+        let key = match self {
+            Self::Worker(key) => key.clone(),
+            Self::Next { tool, explicit } => crate::acp::pick_acp_agent_name(
+                registry,
+                &config.session,
+                &config.acp,
+                tool,
+                explicit.as_deref(),
+            ),
+        };
+        crate::acp::agent_profiles::resolve_with_config(&key, &config.session)
     }
-    let name = agent.to_string();
-    let aliases: HashMap<String, String> =
+
+    /// [`Self::profile_with`] for a session whose configuration resolves from `profile` and
+    /// `project_path`. A built-in worker skips the configuration read.
+    pub(crate) async fn profile(
+        self,
+        profile: &str,
+        project_path: &Path,
+    ) -> &'static crate::acp::agent_profiles::AgentProfile {
+        use crate::acp::agent_profiles::{is_builtin, resolve};
+        let fallback = match &self {
+            Self::Worker(key) if is_builtin(key) => return resolve(key),
+            Self::Worker(key) => resolve(key),
+            Self::Next { .. } => &crate::acp::agent_profiles::DEFAULT,
+        };
         with_resolved_config(profile, project_path, move |cfg| {
-            cfg.session
-                .declared_clear_aliases()
-                .into_iter()
-                .filter(|(key, _)| *key == name)
-                .collect()
+            self.profile_with(&AgentRegistry::with_defaults(), &cfg)
         })
         .await
-        .unwrap_or_default();
-    resolve_with_aliases(agent, &aliases)
+        .unwrap_or(fallback)
+    }
 }
 
 /// Resolve the profile + repo config off the async runtime; `None` if the task panics.
