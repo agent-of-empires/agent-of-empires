@@ -1125,6 +1125,13 @@ mod tests {
                     assert_eq!(live.state.instances.read().await.iter()
                         .find(|row| row.id == id).unwrap().pending_initial_turn.as_ref()
                         .map(|turn| turn.text.as_str()), pending.then_some("existing pending work"));
+                    let profile = live.state.instances.read().await.iter()
+                        .find(|row| row.id == id).unwrap().source_profile.clone();
+                    let durable = crate::session::Storage::open_unwatched(&profile).unwrap()
+                        .load_instances_complete().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                    assert_eq!(durable.pending_initial_turn.as_ref().map(|turn| turn.text.as_str()),
+                        pending.then_some("existing pending work"),
+                        "genuine SQL refusal must preserve durable pending intent too");
                     assert_eq!(live.native.requests(), requests,
                         "failed publication must neither attach nor deliver autonomous input");
                     assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
@@ -1316,6 +1323,14 @@ mod tests {
                 live.state.session_service.set_pending_initial_turn(
                     &id, "existing pending work".into(), Vec::new(),
                 ).await;
+                if !automatic {
+                let submission = live.state.session_service.prompt_submission(&id).await;
+                live.state.session_service.enqueue_prompt(
+                    &id, "retained-queue".into(), "queued work must remain".into(),
+                    Vec::new(), None, None,
+                ).await.unwrap();
+                drop(submission);
+                }
                 let park_seq = known_park(&live.state, &id).seq;
                 let frontier = live.state.acp_event_store.highest_seq(&id);
                 let budget = live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
