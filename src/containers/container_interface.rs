@@ -107,9 +107,9 @@ pub struct RuntimeEnvArgs {
     pub target_env: Vec<(String, String)>,
 }
 
-/// Argv carries only names. A literal naming a runtime routing key stays inline: on
-/// the client's own env it would redirect the runtime (`HOME=/root` hides
-/// `~/.docker`). Dedupes by key, first wins.
+/// Argv carries only names. Configured literals target the container, so they never
+/// touch the client's environment, where `HOME`, `LD_PRELOAD` or `SSL_CERT_FILE`
+/// would change the runtime CLI itself. Dedupes by key, first wins.
 pub fn docker_env_args(entries: &[EnvEntry]) -> RuntimeEnvArgs {
     let mut argv = Vec::with_capacity(entries.len() * 2);
     let mut inherit = Vec::new();
@@ -120,24 +120,15 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> RuntimeEnvArgs {
         if !seen.insert(key) {
             continue;
         }
-        if RUNTIME_PROXY_KEYS
+        let is_proxy = RUNTIME_PROXY_KEYS
             .iter()
-            .any(|proxy| key.eq_ignore_ascii_case(proxy))
-        {
+            .any(|proxy| key.eq_ignore_ascii_case(proxy));
+        if matches!(entry, EnvEntry::Inherit { .. }) && !is_proxy {
+            argv.push("-e".to_string());
+            argv.push(key.to_string());
+            inherit.push((key.to_string(), entry.value().to_string()));
+        } else {
             target_env.push((key.to_string(), entry.value().to_string()));
-            continue;
-        }
-        argv.push("-e".to_string());
-        match entry {
-            EnvEntry::Literal { key, value }
-                if super::execution::RUNTIME_ROUTING_KEYS.contains(&key.as_str()) =>
-            {
-                argv.push(format!("{key}={value}"));
-            }
-            EnvEntry::Inherit { key, value } | EnvEntry::Literal { key, value } => {
-                argv.push(key.clone());
-                inherit.push((key.clone(), value.clone()));
-            }
         }
     }
     if !target_env.is_empty() {
@@ -328,10 +319,12 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
         };
-        // (entries, expected argv, expected inherited pairs, values that must not reach argv)
+        // (entries, expected argv, expected inherited pairs, expected env-file pairs,
+        // values that must not reach argv)
         type EnvCase = (
             Vec<EnvEntry>,
             &'static [&'static str],
+            &'static [(&'static str, &'static str)],
             &'static [(&'static str, &'static str)],
             &'static [&'static str],
         );
@@ -340,19 +333,22 @@ mod tests {
                 vec![inherit("GH_TOKEN", "ghp_secret")],
                 &["-e", "GH_TOKEN"],
                 &[("GH_TOKEN", "ghp_secret")],
+                &[],
                 &["ghp_secret"],
             ),
             (
                 vec![literal("API_KEY", "sk-literal")],
-                &["-e", "API_KEY"],
+                &["--env-file", "/dev/fd/9"],
+                &[],
                 &[("API_KEY", "sk-literal")],
-                &["sk-literal"],
+                &["API_KEY", "sk-literal"],
             ),
             (
                 vec![literal("HOME", "/root")],
-                &["-e", "HOME=/root"],
+                &["--env-file", "/dev/fd/9"],
                 &[],
-                &[],
+                &[("HOME", "/root")],
+                &["/root"],
             ),
             (
                 vec![
@@ -360,11 +356,12 @@ mod tests {
                     literal("TERM", "xterm"),
                     inherit("TOKEN", "tok"),
                 ],
-                &["-e", "SECRET", "-e", "TERM", "-e", "TOKEN"],
-                &[("SECRET", "s3cr3t"), ("TERM", "xterm"), ("TOKEN", "tok")],
-                &["s3cr3t"],
+                &["-e", "SECRET", "-e", "TOKEN", "--env-file", "/dev/fd/9"],
+                &[("SECRET", "s3cr3t"), ("TOKEN", "tok")],
+                &[("TERM", "xterm")],
+                &["s3cr3t", "xterm"],
             ),
-            (vec![], &[], &[], &[]),
+            (vec![], &[], &[], &[], &[]),
             (
                 vec![
                     inherit("GH_TOKEN", "ghp_first"),
@@ -373,22 +370,25 @@ mod tests {
                 ],
                 &["-e", "GH_TOKEN", "-e", "OTHER"],
                 &[("GH_TOKEN", "ghp_first"), ("OTHER", "kept")],
+                &[],
                 &["literal_should_be_skipped"],
             ),
         ];
-        for (entries, expected_argv, expected_inherit, secrets) in cases {
+        let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        for (entries, expected_argv, expected_inherit, expected_target, secrets) in cases {
             let RuntimeEnvArgs {
                 argv,
                 inherit: inherited,
                 target_env,
             } = docker_env_args(&entries);
             assert_eq!(argv, expected_argv);
-            assert!(target_env.is_empty());
-            let expected_inherit: Vec<(String, String)> = expected_inherit
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            assert_eq!(inherited, expected_inherit);
+            assert_eq!(inherited, owned(expected_inherit));
+            assert_eq!(target_env, owned(expected_target));
             for secret in secrets {
                 assert!(
                     !argv.iter().any(|a| a.contains(secret)),

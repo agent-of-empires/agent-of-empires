@@ -1217,7 +1217,8 @@ mod tests {
             args[..6],
             strings(&["run", "-d", "--name", "c", "-w", "/workspace"])
         );
-        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN", "TERM"]);
+        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN"]);
+        assert_eq!(arg_after(&args, "--env-file"), Some("/dev/fd/9"));
         assert!(!args.iter().any(|a| a.contains("ghp_secret123")));
         assert_eq!(arg_after(&args, "--cpus"), Some("2"));
         assert_eq!(arg_after(&args, "-m"), Some("4g"));
@@ -1556,12 +1557,13 @@ mod tests {
         }
     }
 
-    /// A target proxy reaches the container through the env-file while the
-    /// client process keeps the host's proxy.
+    /// Literals and target proxies reach the container through the env-file. The
+    /// client process keeps the host's own values, or none.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn run_create_keeps_the_target_proxy_off_the_client() {
+    fn run_create_keeps_container_values_off_the_client() {
+        use crate::containers::EnvEntry;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1570,7 +1572,8 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\n{{ echo \"client=$HTTP_PROXY\"; cat /dev/fd/9; echo \"argv=$*\"; }} > '{}'\necho fake-id\n",
+                "#!/bin/sh\n{{ echo \"client=$HTTP_PROXY|$HOME|$SSL_CERT_FILE|$LD_PRELOAD|$DOCKER_DEFAULT_PLATFORM\"; \
+                 cat /dev/fd/9; echo \"argv=$*\"; }} > '{}'\necho fake-id\n",
                 log.display()
             ),
         )
@@ -1580,15 +1583,28 @@ mod tests {
             binary: Box::leak(shim.to_string_lossy().into_owned().into_boxed_str()),
             ..RuntimeBase::DOCKER
         };
-        let _env = crate::session::test_support::EnvGuard::set(&[(
-            "HTTP_PROXY",
-            "http://host-proxy.example:3128",
-        )]);
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HTTP_PROXY", "http://host-proxy.example:3128"),
+            ("HOME", "/host-home"),
+            ("SSL_CERT_FILE", "/host/ca.pem"),
+            ("DOCKER_DEFAULT_PLATFORM", "linux/host"),
+        ]);
+        let host_preload = std::env::var("LD_PRELOAD").unwrap_or_default();
+        let literals = [
+            ("HTTP_PROXY", "http://proxy.container.internal:3128"),
+            ("HOME", "/container-home"),
+            ("SSL_CERT_FILE", "/container/ca.pem"),
+            ("LD_PRELOAD", "/container/hook.so"),
+            ("DOCKER_DEFAULT_PLATFORM", "linux/arm64"),
+        ];
         let config = ContainerConfig {
-            environment: vec![crate::containers::EnvEntry::Literal {
-                key: "HTTP_PROXY".to_string(),
-                value: "http://proxy.container.internal:3128".to_string(),
-            }],
+            environment: literals
+                .iter()
+                .map(|(key, value)| EnvEntry::Literal {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -1599,14 +1615,20 @@ mod tests {
 
         let log = std::fs::read_to_string(log).unwrap();
         let mut lines = log.lines();
-        assert_eq!(lines.next(), Some("client=http://host-proxy.example:3128"));
         assert_eq!(
-            lines.next(),
-            Some("HTTP_PROXY=http://proxy.container.internal:3128")
+            lines.next().unwrap(),
+            format!(
+                "client=http://host-proxy.example:3128|/host-home|/host/ca.pem|{host_preload}|linux/host"
+            )
         );
+        for (key, value) in literals {
+            assert_eq!(lines.next(), Some(format!("{key}={value}").as_str()));
+        }
         let argv = lines.next().unwrap();
         assert!(argv.contains("--env-file /dev/fd/9"), "{argv}");
-        assert!(!argv.contains("proxy.container.internal"), "{argv}");
+        for (key, value) in literals {
+            assert!(!argv.contains(key) && !argv.contains(value), "{argv}");
+        }
     }
 
     #[cfg(unix)]

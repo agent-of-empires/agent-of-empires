@@ -298,7 +298,7 @@ mod tests {
     }
 
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
-    /// <argv>`, with a literal env entry named in argv and its value on `inherit_env`.
+    /// <argv>`, with a literal env entry delivered only through the env-file.
     #[test]
     fn build_sandbox_docker_argv_wraps_agent_in_docker_exec() {
         let tmp = tempfile::tempdir().unwrap();
@@ -324,7 +324,7 @@ mod tests {
             argv.docker_args[container + 1..],
             ["claude-agent-acp", "--stdio"]
         );
-        assert_named_without_value(&argv, "MY_LITERAL", "hello");
+        assert_delivered_by_env_file(&argv, "MY_LITERAL", "hello");
     }
 
     /// `-e KEY` names the credential, the value rides `inherit_env`, and the
@@ -354,6 +354,31 @@ mod tests {
     }
 
     /// The value is read back through the descriptor a real launch inherits.
+    fn assert_delivered_by_env_file(argv: &SandboxArgv, key: &str, value: &str) {
+        let env_file = argv
+            .docker_args
+            .iter()
+            .position(|a| a == "--env-file")
+            .expect("env-file named in argv");
+        assert_eq!(argv.docker_args[env_file + 1], "/dev/fd/9");
+        assert!(env_file + 1 < argv.exec_prefix_len);
+        assert!(!argv.docker_args.iter().any(|a| a.contains(key)), "{key}");
+        assert!(!argv.inherit_env.iter().any(|(k, _)| k == key), "{key}");
+
+        let mut reader = std::process::Command::new("cat");
+        reader.arg("/dev/fd/9");
+        argv.target_env
+            .as_ref()
+            .expect("env-file attached")
+            .attach(&mut reader)
+            .unwrap();
+        let output = String::from_utf8(reader.output().unwrap().stdout).unwrap();
+        assert!(
+            output.lines().any(|l| l == format!("{key}={value}")),
+            "{output}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_sandbox_docker_argv_delivers_target_proxy_through_the_env_file() {
@@ -366,24 +391,7 @@ mod tests {
             build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
                 .unwrap();
 
-        let env_file = argv
-            .docker_args
-            .iter()
-            .position(|a| a == "--env-file")
-            .expect("env-file named in argv");
-        assert_eq!(argv.docker_args[env_file + 1], "/dev/fd/9");
-        assert!(env_file + 1 < argv.exec_prefix_len);
-        assert!(!argv.docker_args.iter().any(|a| a.contains("HTTP_PROXY")));
-        assert!(!argv.inherit_env.iter().any(|(k, _)| k == "HTTP_PROXY"));
-
-        let mut reader = std::process::Command::new("cat");
-        reader.arg("/dev/fd/9");
-        argv.target_env.unwrap().attach(&mut reader).unwrap();
-        let output = String::from_utf8(reader.output().unwrap().stdout).unwrap();
-        assert!(
-            output.lines().any(|l| l == format!("HTTP_PROXY={target}")),
-            "{output}"
-        );
+        assert_delivered_by_env_file(&argv, "HTTP_PROXY", target);
     }
 
     fn assert_absent(argv: &SandboxArgv, key: &str) {
@@ -494,7 +502,7 @@ mod tests {
         let argv =
             build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
                 .unwrap();
-        assert_named_without_value(&argv, KEY, "omitted");
+        assert_delivered_by_env_file(&argv, KEY, "omitted");
     }
 
     #[test]
@@ -531,7 +539,7 @@ mod tests {
         let logs = crate::session::test_support::LogCapture::start();
         let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
 
-        assert_named_without_value(&argv, "CLAUDE_CONFIG_DIR", "/host/claude");
+        assert_delivered_by_env_file(&argv, "CLAUDE_CONFIG_DIR", "/host/claude");
         assert!(
             !logs.contents().contains("dropping host-only path variable"),
             "a key that crossed must not be reported as dropped"

@@ -252,8 +252,8 @@ mod tests {
                 vec![
                     "-e",
                     "GH_TOKEN",
-                    "-e",
-                    "TERM",
+                    "--env-file",
+                    "/dev/fd/9",
                     "aoe-sandbox-test",
                     "gh",
                     "pr",
@@ -268,15 +268,25 @@ mod tests {
             ),
         ];
         for (env_entries, command, args, tail) in cases {
-            let inherits = env_entries
+            let (inherits, targets): (Vec<_>, Vec<_>) = env_entries
                 .iter()
-                .map(|e| (e.key().to_string(), e.value().to_string()))
-                .collect::<Vec<_>>();
+                .partition(|e| matches!(e, EnvEntry::Inherit { .. }));
+            let pairs = |entries: Vec<&EnvEntry>| {
+                entries
+                    .into_iter()
+                    .map(|e| (e.key().to_string(), e.value().to_string()))
+                    .collect::<Vec<_>>()
+            };
+            let (inherits, targets) = (pairs(inherits), pairs(targets));
             let sandbox = TerminalSandbox {
                 container_name: "aoe-sandbox-test".into(),
                 env_entries,
             };
-            let RuntimeEnvArgs { argv, inherit, .. } = build_sandbox_exec_args(
+            let RuntimeEnvArgs {
+                argv,
+                inherit,
+                target_env,
+            } = build_sandbox_exec_args(
                 &sandbox,
                 std::path::Path::new("/workspace"),
                 command,
@@ -288,8 +298,9 @@ mod tests {
                 .map(str::to_string)
                 .collect();
             assert_eq!(argv, want, "{command}");
-            // An inherited value reaches `cmd.env`, never argv.
+            // An inherited value reaches `cmd.env`, a literal only the env-file.
             assert_eq!(inherit, inherits, "{command}");
+            assert_eq!(target_env, targets, "{command}");
             assert!(!argv.iter().any(|a| a.contains("ghp_secret")), "{command}");
         }
     }

@@ -18,7 +18,7 @@ pub(crate) struct RuntimeExecutionSnapshot {
     pub(crate) global_arguments: Vec<String>,
 }
 
-pub(super) const RUNTIME_ROUTING_KEYS: &[&str] = &[
+const RUNTIME_ROUTING_KEYS: &[&str] = &[
     "HOME",
     "PATH",
     "XDG_CONFIG_HOME",
