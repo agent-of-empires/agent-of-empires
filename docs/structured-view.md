@@ -154,6 +154,9 @@ Non-ACP tools always run in the terminal view.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
+In the native TUI, wrapping and copying keep Unicode grapheme clusters intact
+across ANSI style changes. A cluster uses its first code point's style.
+
 ### Inspecting Trash in the TUI
 
 Select a session in the expanded **Trash** section to read its retained ACP

@@ -17,6 +17,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 permissions:
   contents: read
@@ -184,6 +187,10 @@ jobs:
       - uses: ./.github/actions/kache
         with:
           manifest-key: docs
+      - name: Build xtask and workspace member tests
+        run: |
+          cargo build -p xtask
+          cargo test -p xtask -p aoe-plugin-api --no-run
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
       # The workspace declares no `default-members`, so every other `cargo
@@ -438,6 +445,9 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: website/package-lock.json
-      - name: Install and build
+      - name: Install dependencies
         working-directory: website
-        run: npm install && npm run build
+        run: npm install
+      - name: Build
+        working-directory: website
+        run: npm run build
