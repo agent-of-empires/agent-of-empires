@@ -184,7 +184,6 @@ export function useAcpSession(
     [sessionId, requireNativeInput],
   );
 
-
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;

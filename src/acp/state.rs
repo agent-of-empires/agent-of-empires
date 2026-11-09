@@ -773,7 +773,9 @@ impl CurrentNativeAvailability {
         self.ready = selected && self.client.connection_ready();
         self.unavailable = self.client.connection_unavailable();
         self.ready &= self.unavailable.is_none();
-        Ok(self.ready || self.unavailable.is_some() || self.client.initial_prompt_intent_available())
+        Ok(self.ready
+            || self.unavailable.is_some()
+            || self.client.initial_prompt_intent_available())
     }
 
     /// After refresh, qualify ownership under the Native fence without a registry guard.
