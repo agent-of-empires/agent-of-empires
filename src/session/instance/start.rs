@@ -1300,14 +1300,22 @@ impl Instance {
                 .find(|row| row.id == self.id)
                 .ok_or(LifecycleReservationError::Superseded)
                 .context(LaunchPublicationFailure::Unconfirmed)?;
+            // Own conversation adoption may commit before its active-execution publication.
             let refused = disk.created_at == self.created_at
                 && disk.lifecycle_reservation_is_owned(
                     LifecycleOperation::Launch,
                     self.lifecycle_generation,
                 )
-                && desired
-                    .as_ref()
-                    .is_some_and(|desired| !desired.matches(&disk));
+                && desired.as_ref().is_some_and(|desired| {
+                    !desired.matches(&disk)
+                        && !(expected.matches(&disk)
+                            && expected.tool == desired.tool
+                            && expected.session_id == desired.session_id
+                            && expected.binding == desired.binding
+                            && expected.intent == desired.intent
+                            && expected.resume_binding == desired.resume_binding
+                            && expected.pi_session_path == desired.pi_session_path)
+                });
             self.reconcile_loaded(disk, storage.storage().profile());
             return Err(if refused {
                 LaunchPublicationFailure::Refused
