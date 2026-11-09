@@ -2429,8 +2429,11 @@ mod tests {
                 root.path(),
                 concat!(module_path!(), "::public_ensure_refuses_unknown_observation_after_a_real_launch"),
             );
-            let _agent = install_fake_claude(root.path(),
-                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n");
+            let agent_pid_file = root.path().join("actual-host-agent.pid");
+            let _agent = install_fake_claude(root.path(), &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+                crate::session::environment::shell_escape_script_word(&agent_pid_file.to_string_lossy()),
+            ));
             crate::session::config::update_config(|config| {
                 config.systemd.enabled = false;
                 config.session.agent_status_hooks = false;
@@ -2477,7 +2480,7 @@ mod tests {
                     "one actual launch, not a replay"
                 );
                 let pane = only_pane_id(&launched_name);
-                crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+                crate::tmux::test_helpers::wait_for_pane_agent_command(&pane, &agent_pid_file, "sleep");
                 assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
                 let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
                 let birth = crate::process::process_birth_identity(pid)

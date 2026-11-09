@@ -2932,9 +2932,13 @@ mod tests {
             "HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR",
         ]).and_set("HOME", root.path()).and_set("XDG_CONFIG_HOME", root.path().join(".config"))
             .and_set("CLAUDE_CONFIG_DIR", root.path().join(".claude"));
+        let agent_pid_file = root.path().join("actual-host-agent.pid");
         let _agent = crate::session::test_support::install_login_shell_path_command(
             root.path(), "claude",
-            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+                crate::session::environment::shell_escape_script_word(&agent_pid_file.to_string_lossy()),
+            ),
         );
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
@@ -3002,7 +3006,7 @@ mod tests {
         if let Some(mode) = recovery {
             use crate::tmux::test_helpers::{only_pane_id, pane_field};
             let pane = only_pane_id(&name);
-            crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+            crate::tmux::test_helpers::wait_for_pane_agent_command(&pane, &agent_pid_file, "sleep");
             let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>()?;
             let birth = crate::process::process_birth_identity(pid)?
                 .expect("the unproven terminal nevertheless has a real process birth");
@@ -3063,7 +3067,7 @@ mod tests {
             let storage = crate::session::Storage::open_unwatched("default")?;
             let old_key = handoff_key(&durable)?;
             let old_pane = crate::tmux::test_helpers::only_pane_id(&name);
-            crate::tmux::test_helpers::wait_for_pane_command(&old_pane, "sleep");
+            crate::tmux::test_helpers::wait_for_pane_agent_command(&old_pane, &agent_pid_file, "sleep");
             let old_pid = crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
             let old_birth = crate::process::process_birth_identity(old_pid)?
                 .expect("unproven birth still names a real live process");
