@@ -1230,9 +1230,13 @@ fn prepare_terminal_rename(
     let detect_tool =
         crate::tmux::status_rules::detection_tool(profile, &instance.tool, &instance.detect_as);
     if let Ok(content) = tmux.capture_pane(50) {
-        if crate::tmux::detect_status_from_content_in(profile, &content, &detect_tool)
-            == crate::session::Status::Running
-        {
+        let integration = crate::plugin::agent_integration::integration_status(&instance);
+        let detected = if integration.configured {
+            crate::session::Status::Unknown
+        } else {
+            crate::tmux::detect_status_from_content_unowned(profile, &content, &detect_tool)
+        };
+        if detected == crate::session::Status::Running {
             return Ok(None);
         }
     }

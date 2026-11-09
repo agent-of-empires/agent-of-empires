@@ -11,10 +11,11 @@ use super::utils::strip_ansi;
 pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -> Status {
     // An approved provider integration owns status; a missing report is not
     // permission to reinterpret the pane.
-    if crate::plugin::agent_integration::status_owned(profile, tool) {
+    let effective = crate::plugin::agent_integration::EffectiveSession::load(profile);
+    if crate::plugin::agent_integration::status_owned_with(effective.detection_config(), tool) {
         return Status::Unknown;
     }
-    detect_status_from_content_unowned(profile, content, tool)
+    detect_status_from_content_unowned_with(profile, effective.detection_config(), content, tool)
 }
 
 /// Pane detection for a caller that already decided no integration owns the
@@ -49,9 +50,13 @@ pub fn detect_status_from_content_unowned_with(
         // describes its own pane.
         None => crate::agents::resolve_builtin_tool_name(tool).and_then(crate::agents::get_agent),
     };
-    agent
-        .map(|a| (a.detect_status)(&clean))
-        .unwrap_or(Status::Idle)
+    agent.map(|a| (a.detect_status)(&clean)).unwrap_or_else(|| {
+        if config.is_none() && crate::plugin::agent_integration::declares_tool(tool) {
+            Status::Unknown
+        } else {
+            Status::Idle
+        }
+    })
 }
 
 /// One policy and detector selection shared by polling and CLI captures.

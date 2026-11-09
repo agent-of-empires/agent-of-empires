@@ -1712,7 +1712,14 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             match hook {
                 Some(hook) => hook.status,
                 None => tmux_session
-                    .detect_status(profile, &rules_tool)
+                    .capture_pane(50)
+                    .map(|content| {
+                        crate::tmux::detect_status_from_content_unowned(
+                            profile,
+                            &content,
+                            &rules_tool,
+                        )
+                    })
                     .unwrap_or_default(),
             }
         };

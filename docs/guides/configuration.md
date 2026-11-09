@@ -307,6 +307,12 @@ opencode = "nono run --profile opencode-dev --allow-cwd -- opencode"
 
 Set the same thing in the TUI under **Agents**, using `<agent>=<cmd>`, or per session with `aoe add --cmd-override <CMD>`. Overrides are evaluated per-session first, then profile, then global (a repo config cannot set one).
 
+For a session's own tool, plugin status and replies require its launch command
+to run the declared program. A different wrapper uses pane status detection
+instead; an explicit detection alias can still select another provider's status.
+If global or profile configuration cannot be read, plugin declarations remain
+unavailable until the configuration is readable again.
+
 A configured override also applies to plain `aoe add --cmd <agent>`, and the on-PATH check validates the resolved override binary, so a session works when only the wrapper is installed. For native resume and fork behavior, including wrappers and automatic restarts, see [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 
 The web wizard previews the resolved command in its **Agent** panel, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.

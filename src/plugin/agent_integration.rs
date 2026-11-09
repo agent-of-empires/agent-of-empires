@@ -43,7 +43,7 @@ fn program(command: &str) -> Option<String> {
     if basename(executable) != "env" {
         return Some(basename(executable));
     }
-    env_program(words)
+    env_program(&mut words)
 }
 
 /// `env` long options that take their argument as a separate word, so the word
@@ -51,7 +51,7 @@ fn program(command: &str) -> Option<String> {
 const ENV_ARGUMENT_OPTIONS: [&str; 5] =
     ["--unset", "--chdir", "--split-string", "--argv0", "--path"];
 
-fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<String> {
+fn env_program(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     let mut options_ended = false;
     while let Some(word) = words.next() {
         if is_assignment(word) {
@@ -69,9 +69,10 @@ fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<String> {
         }
         // `env -S 'acme --serve'` runs the command line it splits, so the
         // remaining words belong to that command, not to `env`.
-        if let Some(split) = split_string_operand(word, &mut words) {
-            let split = shell_words::split(&split).ok()?;
-            return env_program(split.iter().map(String::as_str));
+        if let Some(split) = split_string_operand(word, words) {
+            let mut split = shell_words::split(&split).ok()?;
+            split.extend(words.map(str::to_owned));
+            return env_program(&mut split.iter().map(String::as_str));
         }
         if word.starts_with("--") {
             if ENV_ARGUMENT_OPTIONS.contains(&word) {
@@ -97,8 +98,9 @@ fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<String> {
                     } else {
                         flags[index..].to_string()
                     };
-                    let split = shell_words::split(&operand).ok()?;
-                    return env_program(split.iter().map(String::as_str));
+                    let mut split = shell_words::split(&operand).ok()?;
+                    split.extend(words.map(str::to_owned));
+                    return env_program(&mut split.iter().map(String::as_str));
                 }
                 'u' | 'C' | 'P' | 'a' => {
                     if index == flags.len() {
@@ -119,7 +121,7 @@ const ENV_FLAG_OPTIONS: [&str; 3] = ["--ignore-environment", "--null", "--debug"
 /// The command line `-S`/`--split-string` carries, inline or as the next word.
 fn split_string_operand<'a>(
     word: &'a str,
-    words: &mut impl Iterator<Item = &'a str>,
+    words: &mut (impl Iterator<Item = &'a str> + ?Sized),
 ) -> Option<String> {
     if word == "-S" || word == "--split-string" {
         return words.next().map(str::to_string);
@@ -149,19 +151,82 @@ fn basename(executable: &str) -> String {
         .to_string()
 }
 
-/// A session's effective configuration, resolved once so one poll does not
-/// re-read the config files for every ownership helper.
+/// Effective session configuration and whether its source files were readable.
+#[derive(Clone)]
 pub(crate) struct EffectiveSession {
     pub(crate) config: crate::session::config::SessionConfig,
-    /// False when the profile file could not be read. Ownership then fails
-    /// closed: a transient read error must not hand a custom session to a
-    /// plugin.
+    /// False when a configuration file could not be read.
     profile_read: bool,
+}
+
+type ConfigStamp = Option<(u64, u64, i64, i64, i64, i64, u32)>;
+type ConfigKey = (std::path::PathBuf, String, Vec<ConfigStamp>);
+static EFFECTIVE_CONFIG_CACHE: LazyLock<Mutex<HashMap<ConfigKey, EffectiveSession>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn config_key(profile: &str) -> Option<ConfigKey> {
+    let dir = crate::session::get_app_dir_path().ok()?;
+    let mut paths = vec![dir.join("config.toml"), dir.join("state.toml")];
+    if !profile.is_empty() {
+        paths.push(
+            crate::session::get_profile_dir_path(profile)
+                .ok()?
+                .join("config.toml"),
+        );
+    }
+    let stamps = paths
+        .iter()
+        .map(|path| match std::fs::metadata(path) {
+            Ok(m) => Some(Some((
+                m.dev(),
+                m.ino(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mode(),
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => Some(None),
+            Err(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((dir, profile.to_owned(), stamps))
+}
+
+fn cached_effective_session(profile: &str) -> EffectiveSession {
+    let Some(key) = config_key(profile) else {
+        return EffectiveSession::load_uncached(profile);
+    };
+    let mut cache = EFFECTIVE_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(effective) = cache.get(&key) {
+        return effective.clone();
+    }
+    let effective = EffectiveSession::load_uncached(profile);
+    if config_key(profile).as_ref() == Some(&key) {
+        cache.retain(|(dir, name, _), _| dir != &key.0 || name != profile);
+        cache.insert(key, effective.clone());
+    }
+    effective
 }
 
 impl EffectiveSession {
     pub(crate) fn load(profile: &str) -> Self {
-        let global = crate::session::Config::load_or_warn();
+        cached_effective_session(profile)
+    }
+
+    fn load_uncached(profile: &str) -> Self {
+        let global = match crate::session::Config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::trace!(target: "plugin.agents", %error, "global config unavailable");
+                return Self {
+                    config: crate::session::Config::default().session,
+                    profile_read: false,
+                };
+            }
+        };
         if profile.is_empty() {
             return Self {
                 config: global.session,
@@ -175,7 +240,7 @@ impl EffectiveSession {
                 profile_read: true,
             },
             Err(error) => {
-                tracing::warn!(
+                tracing::trace!(
                     target: "plugin.agents",
                     profile,
                     %error,
@@ -194,12 +259,6 @@ impl EffectiveSession {
     fn custom_selected(&self, tool: &str) -> bool {
         self.config.custom_agent_selected(tool)
     }
-}
-
-/// The session's effective configuration, with its profile overrides applied.
-/// `None` when the profile could not be read: consumers then treat plugin
-/// declarations as unavailable instead of reading the global fallback.
-impl EffectiveSession {
     /// The configuration pane detection may consult. A profile read failure
     /// withholds plugin declarations instead of falling back to the global
     /// configuration, which knows nothing about a profile-only custom agent.
@@ -208,6 +267,8 @@ impl EffectiveSession {
     }
 }
 
+/// The session's effective configuration, with profile overrides applied.
+/// `None` when configuration could not be read.
 pub(crate) fn effective_session(profile: &str) -> Option<crate::session::config::SessionConfig> {
     let effective = EffectiveSession::load(profile);
     effective.profile_read.then_some(effective.config)
@@ -231,11 +292,13 @@ fn launches_declared(
     if !effective.profile_read || effective.custom_selected(&instance.tool) {
         return false;
     }
-    let declared = entry
-        .command
-        .as_deref()
-        .and_then(program)
-        .unwrap_or_else(|| entry.tool.clone());
+    let declared = match entry.command.as_deref() {
+        Some(command) => match program(command) {
+            Some(program) => program,
+            None => return false,
+        },
+        None => entry.tool.clone(),
+    };
     program(instance.get_tool_command()).is_some_and(|launched| launched == declared)
 }
 
@@ -483,7 +546,10 @@ pub fn status_configured(instance: &Instance, tool: &str) -> bool {
 }
 
 fn status_configured_with(instance: &Instance, effective: &EffectiveSession, tool: &str) -> bool {
-    eligible(instance) && !custom_shadowed(instance, effective, tool) && declared_owns(tool)
+    eligible(instance)
+        && !custom_shadowed(instance, effective, tool)
+        && provider(&super::registry(), instance, effective, tool)
+            .is_ok_and(|provider| provider.is_some())
 }
 
 /// Whether an approved integration owns replies, even when its report is unavailable.
@@ -722,10 +788,17 @@ pub(crate) fn declared_agent_in(
     declared_agent(tool)
 }
 
+#[cfg(test)]
 /// Whether an approved provider integration owns status for `tool`, a detection identity.
 pub(crate) fn status_owned(profile: &str, tool: &str) -> bool {
-    let effective = EffectiveSession::load(profile);
-    effective.profile_read && !effective.custom_selected(tool) && declared_owns(tool)
+    status_owned_with(EffectiveSession::load(profile).detection_config(), tool)
+}
+
+pub(crate) fn status_owned_with(
+    config: Option<&crate::session::config::SessionConfig>,
+    tool: &str,
+) -> bool {
+    config.is_some_and(|config| !config.custom_agent_selected(tool) && declared_owns(tool))
 }
 
 /// Whether an approved integration declares this exact tool name.
@@ -1367,6 +1440,8 @@ mod tests {
         // -S carries the command line itself, so it must neither be skipped
         // nor let a later word stand in for the program it names.
         assert_eq!(program("env -S 'acme --serve'").as_deref(), Some("acme"));
+        assert_eq!(program("env -S 'A=1' acme").as_deref(), Some("acme"));
+        assert_eq!(program("env -iS'A=1' acme").as_deref(), Some("acme"));
         assert_eq!(
             program("env -S 'other --serve' acme").as_deref(),
             Some("other")
@@ -1607,7 +1682,7 @@ mod tests {
         );
         assert_eq!(
             crate::tmux::detect_status_from_content_unowned(profile, "", "omp"),
-            crate::session::Status::Idle,
+            crate::session::Status::Unknown,
             "pane detection reads no declaration without the session configuration"
         );
     }
@@ -1939,6 +2014,28 @@ SHADOW_ONLY = "1"
         assert!(status_configured(&declared, "acme-declared"));
         assert!(replies_configured(&declared));
 
+        declared.command = "npx acme-declared".into();
+        let integration = integration_status_with(&declared, &EffectiveSession::load(""));
+        assert!(!integration.configured);
+        assert!(integration.snapshot.is_none());
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("");
+        let mut rule_config = crate::session::Config::default();
+        rule_config
+            .agents
+            .entry("acme-declared".into())
+            .or_default()
+            .status_rules = vec![crate::session::config::StatusRule {
+            status: crate::agents::HookStatus::Running,
+            contains: Some("working".into()),
+            regex: None,
+        }];
+        crate::tmux::status_rules::install_from_config("", &rule_config);
+        assert_eq!(
+            crate::tmux::detect_status_from_content_unowned("", "working", "acme-declared"),
+            crate::session::Status::Running
+        );
+        declared.command = "acme-declared".into();
+
         // A blank custom selection defers to the plugin, so it owns nothing and
         // the declaration still describes the tool.
         crate::session::update_config(|config| {
@@ -2142,6 +2239,11 @@ SHADOW_ONLY = "1"
         assert!(!status_configured(&instance, "acme-unreadable"));
         assert!(!replies_configured(&instance));
         assert!(!status_owned(PROFILE, "acme-unreadable"));
+        std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
+        instance.source_profile.clear();
+        assert!(!status_configured(&instance, "acme-unreadable"));
+        assert!(!replies_configured(&instance));
+        assert!(effective_session("").is_none());
     }
 
     #[test]
