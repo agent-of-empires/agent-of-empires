@@ -4772,10 +4772,23 @@ exec sleep 60
             assert_eq!(std::fs::read_to_string(count).unwrap().trim(), "2");
             assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
             assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
-            assert_eq!(
-                pane_field(&replacement.identity.pane_id, "#{pane_pid}"),
-                replacement.identity.pane_pid.unwrap().to_string()
-            );
+            let retained = crate::tmux::utils::probe_owned_pane(
+                &name, &replacement, &crate::tmux::TmuxCommandDeadline::new(),
+            ).unwrap().expect("the original replacement receipt must still own the pane");
+            assert!(retained.exclusive);
+            assert_eq!(retained.state, if replacement_dead {
+                crate::tmux::utils::PaneProbe::Dead
+            } else {
+                crate::tmux::utils::PaneProbe::Alive
+            });
+            assert_eq!(pane_field(&replacement.identity.pane_id, "#{@aoe_kind}"),
+                crate::tmux::SessionKind::Agent.as_marker());
+            if !replacement_dead {
+                assert_eq!(
+                    pane_field(&replacement.identity.pane_id, "#{pane_pid}"),
+                    replacement.identity.pane_pid.unwrap().to_string()
+                );
+            }
             assert_eq!(
                 pane_field(&replacement.identity.pane_id, "#{pane_dead}"),
                 if replacement_dead { "1" } else { "0" }
