@@ -76,7 +76,7 @@ impl CaptureStorage<'_> {
         &self,
         instance: &mut Instance,
         observation: &SessionIdObservation,
-        mut selection: Option<&mut [u8; 32]>,
+        selection: Option<&mut [u8; 32]>,
     ) -> anyhow::Result<bool> {
         let SessionIdGuard::InstanceSidecar {
             transcript: Some(path),
@@ -139,7 +139,7 @@ impl CaptureStorage<'_> {
         });
         match result {
             Ok(true) => {
-                if let (Some(selection), Some(next)) = (selection.as_deref_mut(), next_selection) {
+                if let (Some(selection), Some(next)) = (selection, next_selection) {
                     *selection = next;
                 }
                 instance.pi_session_path = Some(path.clone());
