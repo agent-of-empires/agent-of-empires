@@ -237,7 +237,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/live-terminal.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "notes": "Real Native PTY transport and two-device ownership changes preserve the visible prompt/cursor alignment. The existing ownership ping-pong case saves and attaches a positive screenshot after the final verified takeover."
     },
     {
       "id": "terminal.live-row-patches",
