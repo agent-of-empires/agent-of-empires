@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { StructuredSessionStack } from "../StructuredSessionStack";
+import { TOUR_ANCHORS, tourAnchor, tourSelector } from "../../lib/tourSteps";
 import { makeSession as baseSession } from "./fixtures";
 
 afterEach(cleanup);
@@ -22,7 +23,14 @@ function setup(initial: { id: string; persistent: boolean; limit: number; stackA
       maxLive = Math.max(maxLive, live.size);
       return () => void live.delete(id);
     }, [id]);
-    return <div data-testid={`view-${id}`} data-active={String(active)} data-selected={String(selected)} />;
+    return (
+      <div
+        {...tourAnchor(TOUR_ANCHORS.composer)}
+        data-testid={`view-${id}`}
+        data-active={String(active)}
+        data-selected={String(selected)}
+      />
+    );
   };
   const ui = (p: typeof initial) => (
     <StructuredSessionStack
@@ -91,6 +99,14 @@ describe("StructuredSessionStack", () => {
     record(observer.takeRecords());
     observer.disconnect();
     expect(detached).toEqual([]);
+  });
+
+  it("resolves a tour anchor to the selected view when a kept view comes first in the DOM", async () => {
+    const { show } = setup({ id: "s1", persistent: true, limit: 3 });
+    await show({ id: "s2", persistent: true, limit: 3 });
+    await waitFor(() => expect(screen.getByTestId("view-s1")).toBeDefined());
+
+    expect(document.querySelector(tourSelector(TOUR_ANCHORS.composer))).toBe(screen.getByTestId("view-s2"));
   });
 
   it("never mounts more than the limit, evicting the least recent", async () => {
