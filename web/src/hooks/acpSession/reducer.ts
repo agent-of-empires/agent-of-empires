@@ -36,7 +36,7 @@ export type Action =
   | { kind: "transcript_append"; row: ActivityRow }
   | { kind: "transcript_patch"; row: ActivityRow }
   | { kind: "transcript_remove"; id: string }
-  | { kind: "prompt_recovered"; id: string; rows: ActivityRow[]; toolStartIds?: string[] }
+  | { kind: "prompt_recovered"; id: string; rows: ActivityRow[]; toolStartIds?: string[]; priorRowIds?: string[] }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected"; id: string }
@@ -184,9 +184,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
       if (index < 0) return state;
       // Raw post-prompt starts distinguish genuine successors from replay-inferred prefix starts.
       const toolStarts = new Set(action.toolStartIds);
+      const priorRows = new Set(action.priorRowIds);
       const following = new Set(
         action.rows
           .slice(index + 1)
+          .filter((row) => !priorRows.has(row.id))
           .filter((row) => row.kind !== "tool_start" || toolStarts.has(row.toolCallId ?? ""))
           .map((row) => row.id),
       );

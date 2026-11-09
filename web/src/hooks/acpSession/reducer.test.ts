@@ -78,6 +78,32 @@ describe("canonical sent-prompt recovery", () => {
     expect(recovered.activity.map((row) => row.id)).toEqual(["old", "start-old-tool", "p1", "done-old-tool", "reply"]);
   });
 
+  it.each([
+    ["compaction_summary", "compaction-summary-c"],
+    ["notice", "notice-key"],
+    ["tool_complete", "done-reused-tool"],
+    ["message", "continued-message"],
+  ] as const)("ignores a pre-prompt %s patched in place", (kind, stableId) => {
+    const prior: ActivityRow = { id: stableId, kind, text: "latest live value", at: "t" };
+    const state = { ...seed(), activity: [old, prior, reply] };
+    const result = reducer(state, {
+      kind: "prompt_recovered",
+      id: "p1",
+      rows: [prompt, { ...prior, text: "stale page-local value" }, reply],
+      priorRowIds: [old.id, stableId],
+    });
+    expect(result.activity.map((row) => row.id)).toEqual([old.id, stableId, "p1", reply.id]);
+    expect(result.activity[1]).toBe(prior);
+    expect(
+      reducer(state, {
+        kind: "prompt_recovered",
+        id: "p1",
+        rows: [prompt, prior],
+        priorRowIds: [old.id, stableId],
+      }),
+    ).toBe(state);
+  });
+
   it("restores a prompt before a genuine successor tool start", () => {
     const tool: ActivityRow = {
       id: "start-new-tool",

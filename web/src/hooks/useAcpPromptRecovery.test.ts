@@ -359,6 +359,342 @@ describe("sent prompt transcript recovery", () => {
     },
   );
 
+  it.each([
+    ["compaction_summary", "compaction-summary-c"],
+    ["tool_complete", "done-earlier-tool"],
+  ])("keeps a patched pre-prompt %s out of successor candidates", async (kind, stableId) => {
+    let id = "";
+    const existing = { id: stableId, kind, text: "before the prompt", at: "t" };
+    const patched = { ...existing, text: "updated after the prompt" };
+    const calls = installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (id && params.get("since") === "100" && params.get("view") === "rows")
+        return json({
+          rows: [{ id, kind: "user_prompt", text: "after the stable row", at: "t" }, patched, reply],
+          highest_seq: 103,
+          lost: false,
+        });
+      return json({ frames: [], rows: [old], highest_seq: 90, next_cursor: 90, has_more: false, lost: false });
+    });
+    const { result, unmount } = await open();
+    await act(() => result.current.sendPrompt("after the stable row"));
+    // Deliver the old row and the ACK in one React batch, before activityRef commits.
+    act(() => {
+      const socket = lastSocket();
+      for (const data of [
+        { session_id: "prompt-recovery", seq: 90, event: { AgentMessageChunk: { text: "old" } } },
+        { kind: "transcript_delta", delta: { Append: existing } },
+        {
+          session_id: "prompt-recovery",
+          seq: 101,
+          event: { UserPromptSent: { prompt_id: id, text: "after the stable row" } },
+        },
+        { session_id: "prompt-recovery", seq: 102, event: { AgentMessageChunk: { text: "patch" } } },
+        { kind: "transcript_delta", delta: { Patch: { id: stableId, row: patched } } },
+        { session_id: "prompt-recovery", seq: 103, event: { AgentMessageChunk: { text: reply.text } } },
+        { kind: "transcript_delta", delta: { Append: reply } },
+      ])
+        socket.onmessage?.({ data: JSON.stringify(data) } as MessageEvent);
+    });
+    await waitFor(() => expect(result.current.state.optimisticRows).toEqual([]));
+    expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, stableId, id, reply.id]);
+    expect(result.current.state.activity.find((row) => row.id === stableId)?.text).toBe(patched.text);
+    expect(calls.filter((call) => call.method === "POST" && call.url.includes("/acp/prompt"))).toHaveLength(1);
+    unmount();
+  });
+
+  it.each(["replay", "snapshot", "cache"] as const)(
+    "preserves pre-prompt stable IDs loaded from %s",
+    async (source) => {
+      let id = "";
+      const existing = { id: "compaction-summary-before", kind: "compaction_summary", text: "before", at: "t" };
+      if (source === "cache") {
+        localStorage.setItem(
+          "aoe:acp-state:v1:prompt-recovery",
+          JSON.stringify({
+            savedAt: Date.now(),
+            state: { ...emptyAcpState(), lastSeq: 100, oldestSeq: 1, activity: [old, existing] },
+          }),
+        );
+      }
+      installAcpFakes(({ url, body }) => {
+        if (url.includes("/acp/prompt")) {
+          id = JSON.parse(body!).prompt_id;
+          return json({ disposition: "sent" }, 202);
+        }
+        if (!url.includes("/acp/replay")) return undefined;
+        const params = new URL(url, "http://x").searchParams;
+        if (id && params.get("since") === "100" && params.get("view") === "rows")
+          return json({
+            rows: [{ id, kind: "user_prompt", text: "follow-up", at: "t" }, existing, reply],
+            highest_seq: 102,
+            lost: false,
+          });
+        let rows = [old];
+        if (source === "replay") rows = [old, existing];
+        return json({ frames: [], rows, highest_seq: 100, next_cursor: 100, has_more: false, lost: false });
+      });
+      const hook = await open();
+      if (source === "snapshot") lastSocket().message({ kind: "transcript_snapshot", rows: [existing] });
+      await flushAsync();
+      expect(hook.result.current.state.activity.map((row) => row.id)).toEqual([old.id, existing.id]);
+      await act(() => hook.result.current.sendPrompt("follow-up"));
+      lastSocket().message({
+        session_id: "prompt-recovery",
+        seq: 101,
+        event: { UserPromptSent: { prompt_id: id, text: "follow-up" } },
+      });
+      lastSocket().message({
+        session_id: "prompt-recovery",
+        seq: 102,
+        event: { AgentMessageChunk: { text: reply.text } },
+      });
+      lastSocket().message({
+        kind: "transcript_delta",
+        delta: { Patch: { id: existing.id, row: { ...existing, text: "updated" } } },
+      });
+      lastSocket().message({ kind: "transcript_delta", delta: { Append: reply } });
+      await waitFor(() => expect(hook.result.current.state.optimisticRows).toEqual([]));
+      expect(hook.result.current.state.activity.map((row) => row.id)).toEqual([old.id, existing.id, id, reply.id]);
+      hook.unmount();
+    },
+  );
+
+  it("retains the pre-prompt provenance of rows loaded by older-history paging", async () => {
+    let id = "";
+    let release!: (response: Response) => void;
+    const held = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    let recovering = false;
+    const earlier = { id: "earlier-summary", kind: "compaction_summary", text: "earlier", at: "t" };
+    const boundary = { id: "earlier-prompt", kind: "user_prompt", text: "previous turn", at: "t" };
+    installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (params.get("before") === "80")
+        return json({ rows: [earlier], highest_seq: 100, next_cursor: 1, has_more: false, lost: false });
+      if (id && params.get("since") === "100" && params.get("view") === "rows") {
+        recovering = true;
+        return held;
+      }
+      return json({
+        frames: [],
+        rows: [boundary, old],
+        highest_seq: 100,
+        next_cursor: 80,
+        has_more: true,
+        lost: false,
+      });
+    });
+    const hook = await open();
+    await act(() => hook.result.current.sendPrompt("after earlier history"));
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 101,
+      event: { UserPromptSent: { prompt_id: id, text: "after earlier history" } },
+    });
+    await act(() => hook.result.current.loadOlder());
+    expect(hook.result.current.state.activity.map((row) => row.id)).toEqual([earlier.id, boundary.id, old.id]);
+    lastSocket().message({ session_id: "prompt-recovery", seq: 102, event: { ThinkingStarted: {} } });
+    lastSocket().message({
+      kind: "transcript_delta",
+      delta: { Patch: { id: earlier.id, row: { ...earlier, text: "patched earlier summary" } } },
+    });
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 103,
+      event: { AgentMessageChunk: { text: reply.text } },
+    });
+    lastSocket().message({ kind: "transcript_delta", delta: { Append: reply } });
+    await waitFor(() => expect(recovering).toBe(true));
+    await act(async () =>
+      release(
+        json({
+          rows: [{ id, kind: "user_prompt", text: "after earlier history", at: "t" }, earlier, reply],
+          highest_seq: 103,
+          lost: false,
+        }),
+      ),
+    );
+    await waitFor(() => expect(hook.result.current.state.optimisticRows).toEqual([]));
+    expect(hook.result.current.state.activity.map((row) => row.id)).toEqual([
+      earlier.id,
+      boundary.id,
+      old.id,
+      id,
+      reply.id,
+    ]);
+    hook.unmount();
+  });
+
+  it("ignores older-history completion from a previous session", async () => {
+    let release!: (response: Response) => void;
+    const held = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    const boundary = { id: "boundary", kind: "user_prompt", text: "previous", at: "t" };
+    installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (url.includes("prompt-recovery") && params.get("before") === "80") {
+        started = true;
+        return held;
+      }
+      let hasMore = false;
+      if (url.includes("prompt-recovery")) hasMore = true;
+      return json({
+        frames: [],
+        rows: [boundary, old],
+        highest_seq: 100,
+        next_cursor: 80,
+        has_more: hasMore,
+        lost: false,
+      });
+    });
+    const hook = renderHook(({ sid }) => useAcpSession(sid), {
+      initialProps: { sid: "prompt-recovery" },
+      wrapper: profileWrapper,
+    });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    let loading!: Promise<void>;
+    act(() => {
+      loading = hook.result.current.loadOlder();
+    });
+    await waitFor(() => expect(started).toBe(true));
+    hook.rerender({ sid: "other-session" });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    const before = hook.result.current.state.activity;
+    expect(hook.result.current.hasMoreOlder).toBe(false);
+    await act(async () => {
+      release(
+        json({
+          rows: [{ ...old, id: "stale-history" }],
+          next_cursor: 1,
+          has_more: true,
+          highest_seq: 100,
+          lost: false,
+        }),
+      );
+      await loading;
+    });
+    expect(hook.result.current.state.activity).toEqual(before);
+    expect(hook.result.current.hasMoreOlder).toBe(false);
+    hook.unmount();
+  });
+
+  it("re-arms exhausted recovery only when a genuinely new successor row arrives", async () => {
+    vi.useFakeTimers();
+    let id = "";
+    let reads = 0;
+    let successor = false;
+    const calls = installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      if (id && params.get("view") === "rows") {
+        reads += 1;
+        const rows = [{ id, kind: "user_prompt", text: "wait for output", at: "t" }];
+        if (successor) rows.push(reply);
+        return json({ rows, lost: false, highest_seq: 104 });
+      }
+      return json({ frames: [], rows: [old], highest_seq: 100, next_cursor: 100, has_more: false, lost: false });
+    });
+    const hook = await open();
+    await act(() => hook.result.current.sendPrompt("wait for output"));
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 101,
+      event: { UserPromptSent: { prompt_id: id, text: "wait for output" } },
+    });
+    lastSocket().message({ session_id: "prompt-recovery", seq: 102, event: { ThinkingStarted: {} } });
+    await flushAsync();
+    expect(reads).toBe(1);
+    for (const delay of [1000, 2000, 4000]) {
+      await act(() => vi.advanceTimersByTimeAsync(delay));
+      await flushAsync();
+    }
+    expect(reads).toBe(3);
+    lastSocket().message({ session_id: "prompt-recovery", seq: 103, event: { ThinkingEnded: {} } });
+    lastSocket().message({
+      kind: "transcript_delta",
+      delta: { Patch: { id: old.id, row: { ...old, text: "old patch" } } },
+    });
+    await flushAsync();
+    expect(reads).toBe(3);
+    successor = true;
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 104,
+      event: { AgentMessageChunk: { text: reply.text } },
+    });
+    lastSocket().message({ kind: "transcript_delta", delta: { Append: reply } });
+    await flushAsync();
+    expect(reads).toBe(4);
+    expect(hook.result.current.state.activity.map((row) => row.id)).toEqual([old.id, id, reply.id]);
+    expect(hook.result.current.state.optimisticRows).toEqual([]);
+    expect(calls.filter((call) => call.method === "POST" && call.url.includes("/acp/prompt"))).toHaveLength(1);
+    hook.unmount();
+  });
+
+  it("bounds successor-triggered recovery even while new rows keep streaming", async () => {
+    vi.useFakeTimers();
+    let id = "";
+    let reads = 0;
+    installAcpFakes(({ url, body }) => {
+      if (url.includes("/acp/prompt")) {
+        id = JSON.parse(body!).prompt_id;
+        return json({ disposition: "sent" }, 202);
+      }
+      if (!url.includes("/acp/replay")) return undefined;
+      if (id && new URL(url, "http://x").searchParams.get("view") === "rows") {
+        reads += 1;
+        return json({ rows: [], lost: false, highest_seq: 200 });
+      }
+      return json({ frames: [], rows: [old], highest_seq: 100, next_cursor: 100, has_more: false, lost: false });
+    });
+    const hook = await open();
+    await act(() => hook.result.current.sendPrompt("keep this missing prompt"));
+    lastSocket().message({
+      session_id: "prompt-recovery",
+      seq: 101,
+      event: { UserPromptSent: { prompt_id: id, text: "keep this missing prompt" } },
+    });
+    lastSocket().message({ session_id: "prompt-recovery", seq: 102, event: { ThinkingStarted: {} } });
+    await flushAsync();
+    await act(() => vi.advanceTimersByTimeAsync(7000));
+    expect(reads).toBe(3);
+    for (let seq = 103; seq < 108; seq += 1) {
+      lastSocket().message({ session_id: "prompt-recovery", seq, event: { AgentMessageChunk: { text: "more" } } });
+      lastSocket().message({
+        kind: "transcript_delta",
+        delta: { Append: { ...reply, id: `msg-${seq}` } },
+      });
+      await flushAsync();
+      await act(() => vi.advanceTimersByTimeAsync(7000));
+    }
+    expect(reads).toBe(6);
+    expect(hook.result.current.state.optimisticRows).toMatchObject([{ id, text: "keep this missing prompt" }]);
+    hook.unmount();
+  });
+
   it("bounds failed recovery to three attempts and never resends or hides the prompt", async () => {
     vi.useFakeTimers();
     let id = "";

@@ -5,6 +5,7 @@ import {
   emptyAcpState,
   type AcpFrame,
   type AcpState,
+  type ActivityRow,
   type ReducedState,
   type TranscriptDelta,
   type TranscriptRow,
@@ -91,6 +92,7 @@ export function useAcpConnection(
   const optimisticRowsRef = useLatestRef(state.optimisticRows);
   const activityRef = useLatestRef(state.activity);
   const promptRecoveryCheckRef = useRef<(() => void) | null>(null);
+  const observeHistoryRowsRef = useRef<((rows: ActivityRow[], seq: number) => void) | null>(null);
   const hasMoreOlderRef = useLatestRef(hasMoreOlder);
   const loadingOlderRef = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -191,14 +193,22 @@ export function useAcpConnection(
     if (!sid || before <= 0 || loadingOlderRef.current || !hasMoreOlderRef.current) return;
     loadingOlderRef.current = true;
     setLoadingOlder(true);
+    const observeHistoryRows = observeHistoryRowsRef.current;
+    const isCurrentHistory = () => sessionIdRef.current === sid && observeHistoryRowsRef.current === observeHistoryRows;
     try {
-      const more = await fetchOlderPage(sid, before, dispatch);
-      if (more !== null) setHasMoreOlder(more);
+      const more = await fetchOlderPage(sid, before, (action) => {
+        if (!isCurrentHistory()) return;
+        if (action.kind === "prepend") observeHistoryRows?.(action.rows, before - 1);
+        dispatch(action);
+      });
+      if (more !== null && isCurrentHistory()) setHasMoreOlder(more);
     } catch {
       // Keep hasMoreOlder; the next scroll-up retries.
     } finally {
-      loadingOlderRef.current = false;
-      setLoadingOlder(false);
+      if (isCurrentHistory()) {
+        loadingOlderRef.current = false;
+        setLoadingOlder(false);
+      }
     }
   }, [dispatch, sessionIdRef, oldestSeqRef, hasMoreOlderRef]);
 
@@ -260,6 +270,10 @@ export function useAcpConnection(
       (cached?.activity ?? []).filter((row) => row.kind === "user_prompt").map((row) => row.id),
     );
     const recoveryAttempts = new Map<string, number>();
+    // Allow one successor-triggered burst, at most six reads per prompt per dial.
+    const recoveryRearmed = new Set<string>();
+    // Retain first observation across patches, including rows not yet committed by React.
+    const rowFirstSeqs = new Map<string, number>();
     // null preserves an existing row whose original start sequence is unknown.
     const toolStartSeqs = new Map<string, number | null>();
     let latestFrameSeq = cached?.lastSeq ?? 0;
@@ -282,20 +296,43 @@ export function useAcpConnection(
       }
       if (!("UserPromptSent" in frame.event)) return;
       const prompt = frame.event.UserPromptSent;
+      for (const row of activityRef.current) {
+        if (!rowFirstSeqs.has(row.id)) rowFirstSeqs.set(row.id, frame.seq);
+      }
       if (prompt.prompt_id && !prompt.synthesized && !promptRows.has(prompt.prompt_id))
         promptEchoes.set(prompt.prompt_id, frame.seq);
     };
-    const observePromptRows = (rows: readonly { id: string; kind: string; toolCallId?: string }[]) => {
+    const observePromptRows = (rows: readonly ActivityRow[], observedSeq = latestFrameSeq) => {
       for (const row of rows) {
+        const fresh = !rowFirstSeqs.has(row.id);
+        rowFirstSeqs.set(row.id, Math.min(rowFirstSeqs.get(row.id) ?? observedSeq, observedSeq));
         if (row.kind === "tool_start" && row.toolCallId && !toolStartSeqs.has(row.toolCallId))
           toolStartSeqs.set(row.toolCallId, null);
+        if (fresh && row.kind !== "user_prompt") {
+          for (const [id, seq] of promptEchoes) {
+            const start = toolStartSeqs.get(row.toolCallId ?? "");
+            if (
+              (recoveryAttempts.get(id) ?? 0) >= 3 &&
+              !recoveryRearmed.has(id) &&
+              observedSeq > seq &&
+              (row.kind !== "tool_start" || (start != null && start > seq))
+            ) {
+              recoveryRearmed.add(id);
+              recoveryAttempts.delete(id);
+            }
+          }
+        }
         if (row.kind !== "user_prompt") continue;
         promptRows.add(row.id);
         promptEchoes.delete(row.id);
         recoveryAttempts.delete(row.id);
+        recoveryRearmed.delete(row.id);
       }
     };
     observePromptRows(cached?.activity ?? []);
+    observeHistoryRowsRef.current = (rows, seq) => {
+      if (!cancelled) observePromptRows(rows, seq);
+    };
     const cancelPromptRecovery = () => {
       promptRecovery?.abort();
       promptRecovery = null;
@@ -341,7 +378,8 @@ export function useAcpConnection(
         const toolStartIds = [...toolStartSeqs]
           .filter(([, startedSeq]) => startedSeq !== null && startedSeq > seq)
           .map(([id]) => id);
-        dispatch({ kind: "prompt_recovered", id: pending.id, rows, toolStartIds });
+        const priorRowIds = [...rowFirstSeqs].filter(([, firstSeq]) => firstSeq <= seq).map(([id]) => id);
+        dispatch({ kind: "prompt_recovered", id: pending.id, rows, toolStartIds, priorRowIds });
       })()
         .catch(() => {})
         .finally(() => {
@@ -441,6 +479,7 @@ export function useAcpConnection(
       clearRetryTimers();
       cancelPromptRecovery();
       recoveryAttempts.clear();
+      recoveryRearmed.clear();
       dialGenRef.current += 1;
       if (wsRef.current) {
         closeQuietly(wsRef.current);
@@ -522,6 +561,7 @@ export function useAcpConnection(
     return () => {
       cancelled = true;
       promptRecoveryCheckRef.current = null;
+      observeHistoryRowsRef.current = null;
       cancelPromptRecovery();
       dialGenRef.current += 1;
       replayAbortRef.current?.abort();
