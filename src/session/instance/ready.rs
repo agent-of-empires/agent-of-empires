@@ -382,7 +382,35 @@ mod tests {
             .unwrap()
             .success());
         let pane = crate::tmux::test_helpers::only_pane_id(&name);
-        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sh");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let panes = crate::tmux::batch_pane_metadata().unwrap();
+            let (_, observed) =
+                crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)
+                    .expect("unambiguous boot-shell target")
+                    .expect("the boot shell must appear in the readiness batch");
+            assert_eq!(observed.pane_id, pane);
+            if !observed.pane_dead
+                && observed.pane_pid.is_some()
+                && observed
+                    .pane_current_command
+                    .as_deref()
+                    .is_some_and(|command| {
+                        crate::tmux::utils::is_pane_running_shell_command(
+                            command,
+                            observed.pane_start_command_is_protected,
+                        )
+                    })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controlled unprotected boot shell did not become observable: {:?}",
+                observed.pane_current_command
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(matches!(
             instance.ensure_pane_ready().unwrap(),
             EnsureReadyOutcome::Indeterminate { .. }

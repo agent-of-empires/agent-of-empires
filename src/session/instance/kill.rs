@@ -811,9 +811,22 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+            .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexec sleep 60\n",
+        );
         let profile = "prime-pane-cleanup-failure";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-        for clean in [false, true] {
+        for operation in ["kill", "kill_clean", "revival"] {
             let mut inst = Instance::new("Prime cleanup failure", root.path().to_str().unwrap());
             inst.source_profile = profile.into();
             let runtime = crate::process::prime::PrimeRuntime::new(
@@ -859,16 +872,23 @@ mod tests {
                 .unwrap()
                 .success());
             crate::tmux::refresh_session_cache();
-            let result = if clean {
-                inst.kill_clean_in(&storage).map(|_| ())
-            } else {
-                inst.kill()
+            let result = match operation {
+                "kill_clean" => inst.kill_clean_in(&storage).map(|_| ()),
+                "revival" => inst
+                    .restart_with_resume_policy(None, false, ResumeAttemptPolicy::Allow)
+                    .map(|_| ()),
+                "kill" => inst.kill(),
+                _ => unreachable!(),
             };
             crate::tmux::refresh_session_cache();
-            assert!(result.is_err());
             assert!(
                 !crate::tmux::session_exists(&name),
                 "cleanup error left the pane running"
+            );
+            assert!(
+                result.is_err(),
+                "{operation}: native cleanup failed after the actual pane was removed; \
+                 it must not be reported as an indeterminate refusal that preserved the runtime"
             );
             let persisted = storage
                 .load()
@@ -876,7 +896,9 @@ mod tests {
                 .into_iter()
                 .find(|row| row.id == inst.id)
                 .unwrap();
-            assert_eq!(persisted.status, Status::Error);
+            if operation != "revival" {
+                assert_eq!(persisted.status, Status::Error);
+            }
             assert_eq!(
                 persisted.prime_runtime().unwrap().directory,
                 runtime.directory

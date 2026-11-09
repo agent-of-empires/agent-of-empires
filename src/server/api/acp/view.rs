@@ -2828,6 +2828,28 @@ mod tests {
     #[serial_test::serial]
     #[cfg(unix)]
     async fn unproven_terminal_birth_keeps_handoff_and_projection() -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(None).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_stays_pending_during_maintenance() -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(Some(HandoffRecovery::Maintenance)).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_stays_pending_after_app_state_reconstruction(
+    ) -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(Some(HandoffRecovery::Startup)).await
+    }
+
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_at_recovery(
+        recovery: Option<HandoffRecovery>,
+    ) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         anyhow::ensure!(
             crate::tmux::test_helpers::tmux_available(),
@@ -2873,7 +2895,7 @@ mod tests {
                 reason: "projection sentinel".into(),
             },
         )?;
-        let response = terminal_handoff_request(state, source.id.clone()).await;
+        let response = terminal_handoff_request(state.clone(), source.id.clone()).await;
         let durable = crate::session::Storage::open_unwatched("default")?
             .load()?
             .into_iter()
@@ -2895,6 +2917,63 @@ mod tests {
                 .any(|(seq, _)| *seq == sentinel),
             "unproven terminal ownership must not erase the retained projection"
         );
+        assert!(
+            durable.terminal_handoff.as_ref().unwrap().launch.is_some(),
+            "the persisted pre-birth launch checkpoint is part of the recovery precondition"
+        );
+        if let Some(mode) = recovery {
+            use crate::tmux::test_helpers::{only_pane_id, pane_field};
+            let pane = only_pane_id(&name);
+            let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>()?;
+            let birth = crate::process::process_birth_identity(pid)?
+                .expect("the unproven terminal nevertheless has a real process birth");
+            let storage = crate::session::Storage::open_unwatched("default")?;
+            let recovered = if matches!(mode, HandoffRecovery::Startup) {
+                let recovered =
+                    crate::server::test_support::build_test_app_state_impl_with_event_store(
+                        storage.load()?,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(events.clone()),
+                        |_| {},
+                        |supervisor| supervisor,
+                    );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&recovered).await;
+                recovered
+            } else {
+                state
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                recover_pending_terminal_handoffs(&recovered, mode),
+            )
+            .await?;
+            let current = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert_eq!(
+                current.terminal_handoff.as_ref().map(|intent| intent.stage),
+                Some(HandoffStage::TerminalLaunchOwed),
+                "prepared metadata and a live marker cannot replace the missing birth receipt"
+            );
+            assert!(
+                events
+                    .replay_from(&source.id, 0)
+                    .iter()
+                    .any(|(seq, _)| *seq == sentinel),
+                "recovery without a physical receipt must retain the projection"
+            );
+            assert_eq!(
+                only_pane_id(&name),
+                pane,
+                "recovery must not replay the launch"
+            );
+            assert_eq!(crate::process::process_birth_identity(pid)?, Some(birth));
+            recovered.runtime.work.drain().await;
+        }
         Ok(())
     }
 

@@ -24,6 +24,50 @@ fn before_adoption_for_test() {
     });
 }
 
+#[cfg(test)]
+type FailedCommitCallback = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static AFTER_FAILED_COMMIT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, u64), FailedCommitCallback>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct FailedCommitObserver((u64, u64));
+
+#[cfg(test)]
+impl FailedCommitObserver {
+    pub(crate) fn install(storage: &Storage, callback: impl FnOnce() + Send + 'static) -> Self {
+        let profile = storage
+            .bound_profile_identity()
+            .expect("real bound profile");
+        assert!(AFTER_FAILED_COMMIT
+            .lock()
+            .unwrap()
+            .insert(profile, Box::new(callback))
+            .is_none());
+        Self(profile)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailedCommitObserver {
+    fn drop(&mut self) {
+        AFTER_FAILED_COMMIT.lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn after_failed_commit_for_test(storage: &Storage) {
+    let profile = storage
+        .bound_profile_identity()
+        .expect("the failed write kept its bound profile");
+    let callback = AFTER_FAILED_COMMIT.lock().unwrap().remove(&profile);
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 // The caller retains namespace and operation exclusion on a blocking worker.
 pub(crate) struct NativeSessionStore {
     storage: Storage,
@@ -397,6 +441,15 @@ impl NativeSessionStore {
             Err(error) => {
                 if !rejected {
                     mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+                }
+                #[cfg(test)]
+                {
+                    // A real reload may heal health before the caller adopts runtime state.
+                    // Release exactly the locks the failed commit would drop on return.
+                    drop(transition);
+                    drop(publication);
+                    drop(reload);
+                    after_failed_commit_for_test(&self.storage);
                 }
                 return Err(error);
             }

@@ -2288,6 +2288,105 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn public_ensure_refuses_unknown_observation_after_a_real_launch() {
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for dead in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let mut instance = Instance::new("post-launch-unknown", root.path().to_str().unwrap());
+            instance.tool = "bash".into();
+            instance.command = "exec sleep 60".into();
+            instance.source_profile = "post-launch-unknown".into();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+            let _corpse = dead.then(|| observed_dead_resume_fixture(&instance));
+            let blocked = root.path().join("post-finalization-query-failure");
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nif [ -e {} ]; then\nfor arg do\ncase \"$arg\" in display-message|list-panes|list-sessions|has-session) printf '%s\\n' 'post-finalization tmux unavailable' >&2; exit 1;; esac\ndone\nfi\nexec {} \"$@\"\n",
+                quote(&blocked.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let seen = Rc::new(RefCell::new(None));
+            let observed = seen.clone();
+            let cache = Rc::new(RefCell::new(None));
+            let forced = cache.clone();
+            let block_after_finalize = blocked.clone();
+            let launched_name = name.clone();
+            let _finalize = FinalizeObserver::install(instance.id.clone(), move |_, phase| {
+                if !matches!(phase, FinalizePhase::After) {
+                    return;
+                }
+                assert!(
+                    observed.borrow().is_none(),
+                    "one actual launch, not a replay"
+                );
+                let pane = only_pane_id(&launched_name);
+                assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+                let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+                let birth = crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .expect("the finalized birth must be physically live");
+                *observed.borrow_mut() = Some((pane, pid, birth));
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[&launched_name]);
+                *forced.borrow_mut() = Some(guard);
+                std::fs::write(&block_after_finalize, b"after actual launch finalization").unwrap();
+            });
+            let outcome = instance.ensure_pane_ready();
+            std::fs::remove_file(&blocked).expect("post-finalization observation boundary reached");
+            drop(cache.borrow_mut().take());
+            let (pane, pid, birth) = seen.borrow_mut().take().expect("real birth observed");
+            assert_eq!(
+                only_pane_id(&name),
+                pane,
+                "no cleanup or replay after observation loss"
+            );
+            assert_eq!(
+                crate::process::process_birth_identity(pid).unwrap(),
+                Some(birth)
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(crate::session::EnsureReadyOutcome::Indeterminate {
+                        cause: LaunchIndeterminateCause::ObservationFailed
+                    })
+                ),
+                "cached presence cannot authorize a newly launched pane after observation fails \
+                 (dead={dead}): {outcome:?}"
+            );
+        }
+    }
+
     fn isolate_resume_environment(
         root: &std::path::Path,
     ) -> crate::session::test_support::EnvGuard {
@@ -2951,6 +3050,547 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn stale_shared_hook_status_cannot_authorize_a_new_execution_boot_shell() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        real_native_hook_case(
+            false,
+            concat!(
+                module_path!(),
+                "::stale_shared_hook_status_cannot_authorize_a_new_execution_boot_shell"
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn refused_revival_restores_capture_before_the_next_native_publication() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        real_native_hook_case(
+            true,
+            concat!(
+                module_path!(),
+                "::refused_revival_restores_capture_before_the_next_native_publication"
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    fn real_native_hook_case(capture_after_refusal: bool, test_name: &str) {
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::io::Write;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _native_helper =
+            crate::session::instance::test_helpers::frozen_test_helper(root.path(), test_name);
+        let _env = isolate_resume_environment(root.path());
+        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = true;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let mut instance = Instance::new("qualified-hook-owner", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "qualified-hook-owner".into();
+        let directory = crate::hooks::dir_guard::hook_base_path().join(&instance.id);
+        let command = root.path().join("actual-installed-status-command");
+        let status_command = crate::hooks::status_command_for_event(
+            crate::agents::HookStatus::Running,
+            &[],
+            crate::hooks::HookInstallTarget::Host,
+            true,
+        );
+        std::fs::write(&command, &status_command).unwrap();
+        let mode = root.path().join("producer-mode");
+        let ready = root.path().join("producer-ready");
+        let request = root.path().join("publish-next-id");
+        let published = root.path().join("producer-publication");
+        let births = root.path().join("native-births");
+        std::fs::write(&mode, b"A").unwrap();
+        let _agent = install_fake_claude(
+            root.path(),
+            &format!(
+                r#"#!/bin/sh
+case "$1" in --help|--version) exit 1 ;; esac
+SID=
+while [ "$#" -gt 0 ]; do
+case "$1" in --resume|--session-id) shift; SID="$1" ;; esac
+shift
+done
+[ -n "$SID" ] || exit 92
+SOURCE="${{AOE_SESSION_SOURCE:?missing actual launch source}}"
+D={directory}
+mkdir -p "$D"; chmod 700 "$D"
+printf %s "$SID" > "$D/session_id.$SOURCE"
+MODE=$(cat {mode})
+if [ "$MODE" = A ]; then
+printf '{{"session_id":"%s"}}' "$SID" | sh {command}
+fi
+printf x >> {births}
+printf '%s|%s|%s\n' "$$" "$SOURCE" "$SID" > {ready}.tmp
+mv {ready}.tmp {ready}."$MODE"
+while [ ! -e {request} ]; do sleep 0.01; done
+NEXT=$(cat {request})
+printf %s "$NEXT" > "$D/session_id.$SOURCE"
+printf '%s|%s|%s\n' "$$" "$SOURCE" "$NEXT" > {published}.tmp
+mv {published}.tmp {published}
+exec sleep 60
+"#,
+                directory = shell_escape(&directory.to_string_lossy()),
+                mode = shell_escape(&mode.to_string_lossy()),
+                command = shell_escape(&command.to_string_lossy()),
+                births = shell_escape(&births.to_string_lossy()),
+                ready = shell_escape(&ready.to_string_lossy()),
+                request = shell_escape(&request.to_string_lossy()),
+                published = shell_escape(&published.to_string_lossy()),
+            ),
+        );
+        const SID: &str = "11111111-2222-4333-8444-555555555555";
+        const NEXT: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        seed_claude_transcript(&mut instance, SID);
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        instance.start_with_size_opts(None, true).unwrap();
+        let wait_publication = |path: &std::path::Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the real Agent did not publish {}",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let text = std::fs::read_to_string(path).unwrap();
+            let fields: Vec<_> = text.trim().split('|').map(str::to_owned).collect();
+            assert_eq!(fields.len(), 3);
+            fields
+        };
+        let first = wait_publication(&ready.with_extension("A"));
+        assert_eq!(first[2], SID);
+        assert_eq!(
+            first[1],
+            instance.active_execution.as_ref().unwrap().launch_id
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status")).unwrap(),
+            "running"
+        );
+        let original_pane = only_pane_id(&name);
+        if capture_after_refusal {
+            assert!(
+                instance.capture_poller.is_running(),
+                "the outgoing watcher must actually run"
+            );
+            let (peer, peer_pid, peer_birth) = add_live_probe_peer(&original_pane);
+            let outcome = instance
+                .restart_with_resume_policy(None, false, ResumeAttemptPolicy::Allow)
+                .unwrap();
+            assert!(matches!(outcome, StartOutcome::Indeterminate { .. }));
+            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
+            assert_eq!(pane_field(&peer, "#{pane_dead}"), "0");
+            let mut next_history: Instance =
+                serde_json::from_value(serde_json::to_value(&instance).unwrap()).unwrap();
+            next_history.source_profile = instance.source_profile.clone();
+            seed_claude_transcript(&mut next_history, NEXT);
+            std::fs::write(&request, NEXT).unwrap();
+            let publication = wait_publication(&published);
+            assert_eq!(
+                publication[0], first[0],
+                "the same preserved Native producer publishes"
+            );
+            assert_eq!(publication[1], first[1]);
+            assert_eq!(publication[2], NEXT);
+            assert!(instance.capture_poller.is_running(),
+                "the refused public revival must restore the watcher before this real Native publication");
+            let watch = crate::file_watch::FileWatchService::new().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                crate::session::sync::drain_and_persist_session_ids(
+                    std::slice::from_mut(&mut instance),
+                    &watch,
+                );
+                if storage.load().unwrap()[0].agent_session_id.as_deref() == Some(NEXT) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline,
+                    "the next real Native publication was lost after refusal; no maintenance/reload was run");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(instance.capture_poller.is_running());
+            assert_eq!(std::fs::read(&births).unwrap(), b"x");
+            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
+            instance.capture_poller.stop();
+        } else {
+            std::fs::write(&mode, b"B").unwrap();
+            instance.restart_with_size_opts(None, true).unwrap();
+            let second = wait_publication(&ready.with_extension("B"));
+            assert_eq!(
+                second[2], SID,
+                "even reusing the same conversation cannot reuse A's status"
+            );
+            assert_ne!(
+                first[1], second[1],
+                "the actual second launch has a new source"
+            );
+            assert_eq!(
+                second[1],
+                instance.active_execution.as_ref().unwrap().launch_id
+            );
+            let pane = only_pane_id(&name);
+            // Represent the supported unprotected/legacy boot-shell state with a real tmux
+            // process, not by forging metadata or weakening the protected-wrapper exemption.
+            assert!(crate::tmux::tmux_command()
+                .args(["respawn-pane", "-k", "-t", &pane, "/bin/sh"])
+                .status()
+                .unwrap()
+                .success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let panes = crate::tmux::batch_pane_metadata().unwrap();
+                let (_, observed) =
+                    crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)
+                        .unwrap()
+                        .unwrap();
+                if !observed.pane_dead
+                    && observed
+                        .pane_current_command
+                        .as_deref()
+                        .is_some_and(|command| {
+                            crate::tmux::utils::is_pane_running_shell_command(
+                                command,
+                                observed.pane_start_command_is_protected,
+                            )
+                        })
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the real unprotected boot shell is not observable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+            let birth = crate::process::process_birth_identity(pid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    instance.ensure_pane_ready().unwrap(),
+                    crate::session::EnsureReadyOutcome::Indeterminate { .. }
+                ),
+                "A's shared status must not authorize B's unprotected boot shell"
+            );
+            let mut hook = std::process::Command::new("sh")
+                .args(["-c", &status_command])
+                .env("AOE_INSTANCE_ID", &instance.id)
+                .env(crate::hooks::SESSION_SOURCE_ENV, &second[1])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            hook.stdin
+                .take()
+                .unwrap()
+                .write_all(format!(r#"{{"session_id":"{SID}"}}"#).as_bytes())
+                .unwrap();
+            assert!(hook.wait().unwrap().success());
+            assert_eq!(
+                instance.ensure_pane_ready().unwrap(),
+                crate::session::EnsureReadyOutcome::AlreadyAlive
+            );
+            assert_eq!(only_pane_id(&name), pane);
+            assert_eq!(
+                crate::process::process_birth_identity(pid).unwrap(),
+                Some(birth)
+            );
+            assert_eq!(std::fs::read(&births).unwrap(), b"xx");
+            instance.capture_poller.stop();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_rechecks_a_corpse_that_appears_after_the_initial_missing_probe() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession};
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for shared in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+                root.path(),
+                concat!(
+                    module_path!(),
+                    "::ensure_rechecks_a_corpse_that_appears_after_the_initial_missing_probe"
+                ),
+            );
+            let _env = isolate_resume_environment(root.path());
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let argv = root.path().join("actual-resume-argv");
+            let _agent = install_fake_claude(root.path(), &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$@\" > {}\nexec sleep 60\n",
+                shell_escape(&argv.to_string_lossy()),
+            ));
+            let mut instance = Instance::new("missing-then-corpse", root.path().to_str().unwrap());
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
+            instance.source_profile = "missing-then-corpse".into();
+            const SID: &str = "77777777-7777-4777-8777-777777777777";
+            seed_claude_transcript(&mut instance, SID);
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let sentinel = TmuxTestSession::new("missing-corpse-server-sentinel");
+            crate::tmux::Session::from_name(sentinel.name())
+                .create(
+                    root.path().to_str().unwrap(),
+                    Some("exec sleep 60"),
+                    &instance.source_profile,
+                )
+                .unwrap();
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let _pane = TmuxTestSession::from_name(&name);
+            assert_eq!(
+                crate::tmux::utils::probe_pane(&name),
+                crate::tmux::utils::PaneProbe::Missing
+            );
+            let requested = root.path().join("actual-missing-query-finished");
+            let ready = root.path().join("second-actor-corpse-ready");
+            let actor_request = requested.clone();
+            let actor_ready = ready.clone();
+            let actor_row = instance.clone();
+            let actor = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !actor_request.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the initial real Missing query was not observed"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let (guard, observation) = observed_dead_resume_fixture(&actor_row);
+                let peer = shared.then(|| add_live_probe_peer(&observation.identity.pane_id));
+                std::fs::write(
+                    &actor_ready,
+                    b"real managed corpse created by the second actor",
+                )
+                .unwrap();
+                (guard, observation, peer)
+            });
+            let bin = root.path().join("tmux-race");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            let target = format!("={name}:");
+            let stdout = root.path().join("original-query.stdout");
+            let stderr = root.path().join("original-query.stderr");
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nMATCH=; for arg do [ \"$arg\" != {} ] || MATCH=1; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" >{} 2>{}; R=$?\nif [ \"$R\" -ne 0 ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nfi\ncat {}; cat {} >&2; exit \"$R\"\nfi\nexec {} \"$@\"\n",
+                quote(&target), quote(&requested.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()), quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()),
+                quote(&requested.to_string_lossy()), quote(&ready.to_string_lossy()),
+                quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let result = instance.ensure_pane_ready();
+            let (_corpse_guard, old, peer) = actor.join().expect("the real corpse actor completed");
+            assert!(
+                ready.exists(),
+                "the actual corpse predates the second public probe"
+            );
+            assert_eq!(std::fs::read(&stdout).unwrap(), b"");
+            assert!(std::fs::read_to_string(&stderr)
+                .unwrap()
+                .contains("can't find session:"));
+            if let Some((peer_pane, pid, birth)) = peer {
+                assert!(
+                    crate::process::process_birth_is_live(pid, &birth).unwrap(),
+                    "a shared replacement must not be torn down: {result:?}"
+                );
+                assert_eq!(
+                    crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_dead}"),
+                    "0"
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })
+                    ),
+                    "{result:?}"
+                );
+                assert!(
+                    !argv.exists(),
+                    "a refused shared corpse must not launch or replay"
+                );
+            } else {
+                assert!(matches!(result, Ok(crate::session::EnsureReadyOutcome::Started | crate::session::EnsureReadyOutcome::Respawned)),
+                    "the same public ensure must revive a newly observed exclusive corpse: {result:?}");
+                assert_ne!(only_pane_id(&name), old.identity.pane_id);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !argv.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the resumed real Agent did not start"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let args = std::fs::read_to_string(&argv).unwrap();
+                assert!(
+                    args.lines()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .any(|pair| pair == ["--resume", SID]),
+                    "{args}"
+                );
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some(SID)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn direct_start_without_a_birth_receipt_does_not_publish_the_prepared_conversation() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+            root.path(),
+            concat!(
+                module_path!(),
+                "::direct_start_without_a_birth_receipt_does_not_publish_the_prepared_conversation"
+            ),
+        );
+        let _env = isolate_resume_environment(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let births = root.path().join("actual-native-births");
+        let _agent = install_fake_claude(root.path(), &format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf x >> {}\nexec sleep 60\n",
+            shell_escape(&births.to_string_lossy()),
+        ));
+        let mut instance =
+            Instance::new("no-receipt-no-publication", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "no-receipt-no-publication".into();
+        seed_claude_transcript(&mut instance, "77777777-7777-4777-8777-777777777777");
+        instance.resume_intent = ResumeIntent::Cleared;
+        let prior = instance.conversation_state();
+        let execution = serde_json::to_value(&instance.active_execution).unwrap();
+        let prior_start = instance.last_start_time;
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        let bin = root.path().join("tmux-shim");
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("tmux");
+        let quote = crate::session::environment::shell_escape_script_word;
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\nif [ \"$arg\" = new-session ]; then {} \"$@\" >/dev/null; exit $?; fi\ndone\nexec {} \"$@\"\n",
+            quote(&real_tmux.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let result = instance.start_with_size_opts(None, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !births.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real Native program did not start: {result:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(&births).unwrap(),
+            b"x",
+            "one actual birth, no replay"
+        );
+        let pane = only_pane_id(&name);
+        assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+        let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+        assert!(crate::process::process_birth_identity(pid)
+            .unwrap()
+            .is_some());
+        let error =
+            result.expect_err("a missing birth receipt cannot publish prepared Native state");
+        assert_eq!(
+            error.downcast_ref::<LaunchIndeterminateCause>(),
+            Some(&LaunchIndeterminateCause::OwnershipUnproven),
+            "{error:#}"
+        );
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.conversation_state(), prior);
+        assert_eq!(
+            serde_json::to_value(&stored.active_execution).unwrap(),
+            execution
+        );
+        assert_eq!(stored.last_start_time, prior_start);
+        assert_eq!(instance.conversation_state(), prior);
+    }
+
     #[test]
     #[serial]
     fn fresh_after_failed_resume_requires_durable_conversation_publication() {
@@ -2961,15 +3601,20 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _env = isolate_resume_environment(temp.path());
         let sid = "77777777-7777-4777-8777-777777777777";
-        for tool in ["claude", "copilot"] {
+        for (tool, with_peer) in [
+            ("claude", false),
+            ("claude", true),
+            ("copilot", false),
+            ("copilot", true),
+        ] {
             let _agent = crate::session::test_support::install_login_shell_path_command(
                 temp.path(),
                 tool,
                 "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec /bin/sleep 60\n",
             );
-            let project = temp.path().join(tool);
+            let project = temp.path().join(format!("{tool}-shared-{with_peer}"));
             std::fs::create_dir(&project).unwrap();
-            let profile = format!("fresh-publication-{tool}");
+            let profile = format!("fresh-publication-{tool}-shared-{with_peer}");
             let mut instance = Instance::new(tool, project.to_str().unwrap());
             instance.tool = tool.into();
             instance.command = tool.into();
@@ -2988,6 +3633,26 @@ mod tests {
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
                 instance.tmux_session().unwrap().name(),
             );
+            let peer = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured_peer = peer.clone();
+            let _finalize = super::super::start::test_support::FinalizeObserver::install(
+                instance.id.clone(),
+                move |row, phase| {
+                    if with_peer
+                        && matches!(
+                            phase,
+                            super::super::start::test_support::FinalizePhase::Before
+                        )
+                    {
+                        assert!(captured_peer.borrow().is_none());
+                        let name = row.tmux_session().unwrap().name().to_owned();
+                        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+                        let actual_peer = add_live_probe_peer(&pane);
+                        *captured_peer.borrow_mut() =
+                            Some((actual_peer, row.terminal_scopes.clone()));
+                    }
+                },
+            );
             {
                 let _fault = super::super::sid_persist::test_support::WriteFailures::install(
                     instance.id.clone(),
@@ -3001,6 +3666,24 @@ mod tests {
                     error.to_string().contains("durable publication"),
                     "{tool}: {error:#}"
                 );
+                if with_peer {
+                    let ((peer_pane, peer_pid, peer_birth), prior_scopes) = peer
+                        .borrow_mut()
+                        .take()
+                        .expect("real peer added after birth capture");
+                    assert!(
+                        crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap(),
+                        "finalization cleanup must preserve the unrelated real peer {peer_pid}: {error:#}"
+                    );
+                    assert_eq!(
+                        crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_dead}"),
+                        "0"
+                    );
+                    let stored = storage.load().unwrap().remove(0);
+                    assert_eq!(stored.conversation_state(), before);
+                    assert_eq!(stored.terminal_scopes, prior_scopes);
+                    continue;
+                }
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(stored.conversation_state(), before);
                 assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(sid));
