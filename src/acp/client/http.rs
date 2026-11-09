@@ -2061,50 +2061,94 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn plugin_previews_allow_preparation_beyond_general_send_deadline() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn plugin_previews_outlive_an_elapsed_general_http_budget() {
+        use axum::{body::Bytes, routing::get, Router};
+        use std::sync::Arc;
+        use tokio::sync::{oneshot, Mutex, Notify};
+
         for install in [true, false] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let (started, accepted) = tokio::sync::oneshot::channel();
-            let (release, resume) = tokio::sync::oneshot::channel();
+            let (started, accepted) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            let preview = Arc::new(Mutex::new(Some((started, resume))));
+            let health = Arc::new(Notify::new());
+            let health_handler = health.clone();
+            let app = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(move || {
+                        let health = health_handler.clone();
+                        async move {
+                            health.notified().await;
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .fallback(move |_: Bytes| {
+                    let preview = preview.clone();
+                    async move {
+                        let (started, resume) = preview.lock().await.take().unwrap();
+                        started.send(()).unwrap();
+                        let _ = resume.await;
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [("AoE-Error-Code", "preview_failed")],
+                        )
+                    }
+                });
+            let (shutdown, stopped) = oneshot::channel();
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                assert!(stream.read(&mut request).await.unwrap() > 0);
-                started.send(()).unwrap();
-                resume.await.unwrap();
-                stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nAoE-Error-Code: preview_failed\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
             });
-            let client =
+            let mut client =
                 HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+            client.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap();
+            let request_client = client.clone();
             let request = tokio::spawn(async move {
                 if install {
-                    client
+                    request_client
                         .preview_plugin_install(&crate::daemon::InstallPreviewBody {
                             source: "gh:acme/fixture".into(),
                             dev: false,
                         })
                         .await
-                        .err()
-                        .unwrap()
+                        .map(|_| ())
                 } else {
-                    client
+                    request_client
                         .preview_plugin_update("acme.fixture")
                         .await
-                        .err()
-                        .unwrap()
+                        .map(|_| ())
                 }
             });
             accepted.await.unwrap();
-            tokio::time::advance(Duration::from_secs(121)).await;
-            release.send(()).unwrap();
-            assert!(matches!(
-                request.await.unwrap(),
-                HttpError::PluginPreviewFailed
-            ));
+            let ordinary = client.health_check().await;
+            health.notify_one();
+            let _ = release.send(());
+            let preview = request.await.unwrap();
+            let _ = shutdown.send(());
             server.await.unwrap();
+            assert!(
+                matches!(
+                    ordinary,
+                    Err(HttpError::Daemon(crate::daemon::DaemonClientError::Timeout))
+                ),
+                "{ordinary:?}"
+            );
+            assert!(
+                matches!(preview, Err(HttpError::PluginPreviewFailed)),
+                "{preview:?}"
+            );
         }
     }
 

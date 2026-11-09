@@ -1210,7 +1210,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     #[serial_test::serial]
     async fn normal_build_descendant_exec_keeps_mutation_admission() {
@@ -1251,25 +1251,29 @@ while not (p/'finish').exists():
         )
         .unwrap();
         let manifest = format!(
-            "id = \"acme.exec\"\nname = \"Native exec\"\nversion = \"1\"\napi_version = 2\ncapabilities = []\n[runtime]\nkind = \"command\"\ncommand = [\"true\"]\nsystem = true\n[[runtime.build]]\ncommand = [\"python3\", \"root.py\", {}]\n",
+            "id = \"acme.exec\"\nname = \"Native exec\"\nversion = \"1\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"true\"]\nsystem = true\n[[runtime.build]]\ncommand = [\"python3\", \"root.py\", {}]\n",
             serde_json::to_string(&effects.path().display().to_string()).unwrap(),
         );
         std::fs::write(source.path().join("aoe-plugin.toml"), manifest).unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let owner = Some(axum::Extension(Principal::LocalPeer { uid: 1000 }));
         let input = source.path().display().to_string();
-        let consent: plugin::install::InstallConsent = decode(
-            preview_plugin_install(
-                State(state.clone()),
-                owner,
-                Json(InstallPreviewBody {
-                    source: input.clone(),
-                    dev: false,
-                }),
-            )
-            .await,
+        let response = preview_plugin_install(
+            State(state.clone()),
+            owner,
+            Json(InstallPreviewBody {
+                source: input.clone(),
+                dev: false,
+            }),
         )
         .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{:?}",
+            decode::<serde_json::Value>(response).await
+        );
+        let consent: plugin::install::InstallConsent = decode(response).await;
         let plugins = plugin::plugins_dir().unwrap();
         let mut capture = plugin::fetch::test_gate::install(&plugins, "command-capture");
         let mut observe = plugin::fetch::test_gate::install(&plugins, "command-observe");
