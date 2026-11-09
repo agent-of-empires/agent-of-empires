@@ -889,6 +889,38 @@ describe("server queue", () => {
   });
 });
 
+describe("resolveApproval outcomes", () => {
+  it.each([
+    ["a 500", () => new Response("boom", { status: 500 }), /Could not resolve approval \(500\)/],
+    [
+      "a network failure",
+      () => {
+        throw new TypeError("network down");
+      },
+      /Network error resolving approval/,
+    ],
+  ])("rejects and reports %s so the card can retry", async (_label, respond, error) => {
+    installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
+    const { result } = render("sess-approve");
+    await flushAsync();
+    await act(() => expect(result.current.resolveApproval("n-1", "Allow")).rejects.toThrow());
+    expect(result.current.state.interactionError?.message).toMatch(error);
+  });
+
+  it.each([
+    ["a 200", () => json({})],
+    ["a 404 for an approval already resolved", () => new Response("no pending approval n-1", { status: 404 })],
+  ])("resolves on %s", async (_label, respond) => {
+    calls = installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
+    const { result } = render("sess-approve");
+    await flushAsync();
+    await act(() => result.current.resolveApproval("n-1", "Allow", "opt-1"));
+    const [post] = posts("/api/sessions/sess-approve/acp/approvals/n-1");
+    expect(JSON.parse(post!.body!)).toEqual({ decision: "Allow", option_id: "opt-1" });
+    expect(result.current.state.interactionError).toBeNull();
+  });
+});
+
 describe("setConfigOption", () => {
   it("posts the config id and value", async () => {
     const { result } = render("sess-cfg");
