@@ -722,14 +722,15 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
     let mut h = TuiTestHarness::new("mcp_trust_dialog");
     // Stands in for `claude` on a folder it has never seen: it shows the trust dialog, then
     // writes every byte it is sent to a file. Raw mode delivers a keystroke without Enter too.
+    // The file is created only once raw mode is on, so its existence proves the recorder runs.
     let typed = h.home_path().join("typed-into-the-dialog");
     let bin = h.home_path().join("fake-agent-bin");
     std::fs::create_dir_all(&bin).unwrap();
     crate::harness::write_executable(
         &bin.join("claude"),
         &format!(
-            "#!/bin/sh\nprintf 'Do you trust the files in this folder?\\n\\nIs this a project you created or one you trust?\\n\\n\\342\\235\\257 1. Yes, I trust this folder\\n  2. No, exit\\n'\nstty raw -echo\nexec cat > '{}'\n",
-            typed.display()
+            "#!/bin/sh\nprintf 'Do you trust the files in this folder?\\n\\nIs this a project you created or one you trust?\\n\\n\\342\\235\\257 1. Yes, I trust this folder\\n  2. No, exit\\n'\nstty raw -echo\n: > '{typed}'\nexec cat >> '{typed}'\n",
+            typed = typed.display()
         ),
     );
     h.add_path_dir(&bin);
@@ -762,6 +763,15 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
             .as_str()
             .expect("session id")
             .to_string();
+        // The negative check below means nothing unless the recorder is running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !typed.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake agent never started recording"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         let send = json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
@@ -774,10 +784,11 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
             body["result"]["structuredContent"]["code"], "waiting",
             "{body}"
         );
-        // A late keystroke would still land within this window.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // `tmux send-keys` returns before the pane reads the bytes, so a keystroke that did go
+        // out lands within this window; nothing else types into the pane afterwards.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
-    let received = std::fs::read(&typed).unwrap_or_default();
+    let received = std::fs::read(&typed).expect("the recorder's file");
     assert!(
         received.is_empty(),
         "the dialog received keystrokes: {:?}",

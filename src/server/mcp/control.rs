@@ -433,9 +433,8 @@ impl McpServer {
             .map(|i| i.view)
     }
 
-    /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
     /// Whether a terminal session's pane shows a dialog or question waiting on a person, read
-    /// once, without waiting.
+    /// once, without waiting. A check that fails to run counts as waiting, so `send` refuses.
     async fn terminal_pane_waiting(&self, id: &str) -> bool {
         let instance = self
             .state
@@ -450,9 +449,10 @@ impl McpServer {
         };
         tokio::task::spawn_blocking(move || pane_readiness(&instance) == PaneReadiness::Waiting)
             .await
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
+    /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
     async fn publish(&self) {
         if let Err(error) = self.state.runtime.publish(&self.state).await {
             tracing::debug!(target: "server.runtime", %error, "runtime publish after MCP mutation failed");
@@ -484,9 +484,8 @@ fn create_body(params: &CreateSessionParams) -> Result<CreateSessionBody, String
     .map_err(|e| e.to_string())
 }
 
-/// The created session from a create response, or the refusal it carries.
-/// The created session, and whether this call created it: `201` is a fresh create, `200` the
-/// answer to a retried `idempotency_key`.
+/// The created session from a create response, or the refusal it carries, and whether this call
+/// created it: `201` is a fresh create, `200` the answer to a retried `idempotency_key`.
 async fn success_body(
     response: axum::response::Response,
 ) -> Result<(SessionResponse, bool), Box<CallToolResult>> {
@@ -597,7 +596,9 @@ fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage
         };
     }
     // The rendering only grows with the prefix, so the longest prefix that fits is found by
-    // bisection; at least one event is always returned so the cursor moves.
+    // bisection; at least one event is always returned so the cursor moves. A render over the cap
+    // comes back as its tail behind a "truncated" marker, which keeps it longer than the cap, so
+    // a truncated render never counts as fitting.
     let (mut fits, mut over) = (0usize, events.len());
     while over - fits > 1 {
         let mid = fits + (over - fits) / 2;
