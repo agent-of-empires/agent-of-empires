@@ -245,7 +245,7 @@ mod tests {
                     "-e",
                     "GH_TOKEN",
                     "-e",
-                    "TERM=xterm",
+                    "TERM",
                     "aoe-sandbox-test",
                     "gh",
                     "pr",
@@ -262,10 +262,7 @@ mod tests {
         for (env_entries, command, args, tail) in cases {
             let inherits = env_entries
                 .iter()
-                .filter_map(|e| match e {
-                    EnvEntry::Inherit { key, value } => Some((key.clone(), value.clone())),
-                    EnvEntry::Literal { .. } => None,
-                })
+                .map(|e| (e.key().to_string(), e.value().to_string()))
                 .collect::<Vec<_>>();
             let sandbox = TerminalSandbox {
                 container_name: "aoe-sandbox-test".into(),

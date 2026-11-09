@@ -161,8 +161,8 @@ fn passthrough_denyreason(key: &str) -> Option<&'static str> {
 /// The environment a host session inherits from aoe, as `(KEY, VALUE)` pairs.
 ///
 /// This is the single source for every host spawn path: tmux agent sessions and
-/// host terminals set it via `new-session -e`, and the structured view applies
-/// it to the agent process after its `env_clear()`. Keeping one resolver is what
+/// host terminals export it from the launch script, and the structured view
+/// applies it to the agent process after its `env_clear()`. Keeping one resolver is what
 /// stops the terminal and structured views drifting apart, which is the bug
 /// #3079 shipped: it fixed the tmux paths and left the structured view forwarding
 /// nothing, so a browser-view agent still had no `DISPLAY` (#3262).
@@ -208,16 +208,15 @@ fn colorfgbg_for(appearance: crate::tui::styles::ThemeAppearance) -> &'static st
 /// Pure core of [`inherited_host_env`], split out so the filtering is
 /// unit-tested without mutating the process environment.
 ///
-/// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
-/// tmux server's frozen base environment with an empty string, and that base
-/// env is frequently the *good* one (the server was first started from the
+/// Empty values are dropped on purpose. An empty export overrides the tmux
+/// server's frozen base environment with an empty string, and that base env is
+/// frequently the *good* one (the server was first started from the
 /// user's graphical login while the current daemon is the impoverished side).
 /// Forwarding `DISPLAY=` there would blank out a working display, so we only
 /// add values aoe positively has and never clobber an inherited one with empty
 /// (an empty desktop var is useless to a browser anyway).
 ///
-/// Sorted so the emitted `-e` args and the applied process env are
-/// deterministic.
+/// Sorted so the launch script and the applied process env are deterministic.
 fn inherited_host_env_from<I>(vars: I, passthrough: bool) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,

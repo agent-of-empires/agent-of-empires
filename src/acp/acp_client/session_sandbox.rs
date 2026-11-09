@@ -171,8 +171,7 @@ pub(super) fn build_sandbox_docker_argv(
             }
         } else if seen_keys.insert(key.clone()) {
             // Only a key the sandbox env did not already claim is really
-            // dropped: one `docker_env_args` inlined keeps its value in argv,
-            // so logging here would cry over a variable that crossed.
+            // dropped: `docker_env_args` already forwarded a claimed one.
             tracing::warn!(
                 target: "acp",
                 key = %key,
@@ -294,8 +293,7 @@ mod tests {
     }
 
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
-    /// <argv>`, with literal env entries inlined as `-e KEY=VALUE` and never
-    /// duplicated into `inherit_env` (which is for parent-process values).
+    /// <argv>`, with a literal env entry named in argv and its value on `inherit_env`.
     #[test]
     fn build_sandbox_docker_argv_wraps_agent_in_docker_exec() {
         let tmp = tempfile::tempdir().unwrap();
@@ -321,8 +319,7 @@ mod tests {
             argv.docker_args[container + 1..],
             ["claude-agent-acp", "--stdio"]
         );
-        assert!(argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"));
-        assert!(!argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"));
+        assert_named_without_value(&argv, "MY_LITERAL", "hello");
     }
 
     /// `-e KEY` names the credential, the value rides `inherit_env`, and the
@@ -459,13 +456,7 @@ mod tests {
         let argv =
             build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
                 .unwrap();
-        let named: Vec<&String> = argv
-            .docker_args
-            .iter()
-            .filter(|a| a.starts_with(KEY))
-            .collect();
-        assert_eq!(named, [&format!("{KEY}=omitted")]);
-        assert!(!argv.inherit_env.iter().any(|(k, _)| k == KEY));
+        assert_named_without_value(&argv, KEY, "omitted");
     }
 
     #[test]
@@ -486,16 +477,15 @@ mod tests {
         assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-request");
     }
 
-    /// A host-only key the sandbox env already inlined keeps its value in argv;
-    /// only the adapter allowlist declined to re-send it. Logging at the filter
-    /// cried over a variable that did cross, hiding the genuinely dropped ones.
+    /// A host-only key the sandbox env already forwarded still crosses; only the
+    /// adapter allowlist declined to re-send it, so the filter must not log a drop.
     #[test]
     #[serial_test::serial]
-    fn host_only_key_inlined_by_sandbox_env_logs_nothing() {
+    fn host_only_key_forwarded_by_sandbox_env_logs_nothing() {
         let _env =
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/host/claude")]);
         let tmp = tempfile::tempdir().unwrap();
-        let mut info = sandbox("aoe-sandbox-inlined-host-only", None);
+        let mut info = sandbox("aoe-sandbox-forwarded-host-only", None);
         info.extra_env = Some(vec!["CLAUDE_CONFIG_DIR=/host/claude".into()]);
         let mut config = sandbox_config(tmp.path(), &info);
         config.spec.env_allowlist = Some(vec!["CLAUDE_CONFIG_DIR".into()]);
@@ -503,13 +493,7 @@ mod tests {
         let logs = crate::session::test_support::LogCapture::start();
         let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
 
-        assert!(
-            argv.docker_args
-                .iter()
-                .any(|a| a == "CLAUDE_CONFIG_DIR=/host/claude"),
-            "the inlined value must stay in argv, got {:?}",
-            argv.docker_args
-        );
+        assert_named_without_value(&argv, "CLAUDE_CONFIG_DIR", "/host/claude");
         assert!(
             !logs.contents().contains("dropping host-only path variable"),
             "a key that crossed must not be reported as dropped"

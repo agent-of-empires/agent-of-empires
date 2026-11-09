@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Result};
 
+use super::session::{launch_script_env, EphemeralEnvFile};
 use super::utils::{append_session_setup_args, is_pane_dead, sanitize_session_name};
 use super::{refresh_session_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX};
 use crate::cli::truncate_id;
@@ -255,26 +256,29 @@ impl PairedTerminal {
         // so a browser opened from the pane reaches the user's desktop;
         // container terminals keep the container's own env (#3075, #3262).
         //
-        // Ordered inherited-then-pinned, and the pinned pairs must stay last: a
-        // later `-e` wins, and under passthrough the inherited layer carries
-        // HOME/PATH too, which would otherwise undo the deliberate pinning
-        // above and reintroduce #2608.
+        // The pinned pairs must stay last: a later export wins, and under
+        // passthrough the inherited layer carries HOME/PATH too, which would
+        // otherwise reintroduce #2608.
         let mut env_pairs = if matches!(self.kind, TerminalKind::Host) {
             crate::session::environment::inherited_host_env(profile)
         } else {
             Vec::new()
         };
         env_pairs.extend(pinned_pairs);
-        let env_refs: Vec<(&str, &str)> = env_pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+
+        let (mut env_file, pane_command) = if env_pairs.is_empty() {
+            (None, effective_cmd)
+        } else {
+            let file = EphemeralEnvFile::create(&launch_script_env(env_pairs), &[])?;
+            let wrapped = file.wrap_command(effective_cmd.as_deref(), None)?;
+            (Some(file), Some(wrapped))
+        };
 
         let mut args = super::session::build_create_args(
             &self.name,
             working_dir,
-            &env_refs,
-            effective_cmd.as_deref(),
+            &[],
+            pane_command.as_deref(),
             size,
         );
         let target = format!("={}:", self.name);
@@ -294,6 +298,18 @@ impl PairedTerminal {
             bail!("Failed to create {}: {}", self.kind.label(), stderr);
         }
 
+        if let Some(file) = env_file.as_mut() {
+            // The pane unlinking the file acknowledges it; tmux `-d` can return first.
+            if !file.wait_until_consumed(std::time::Duration::from_secs(5)) {
+                refresh_session_cache();
+                let _ = self.kill();
+                bail!(
+                    "{} did not consume its protected launch script",
+                    self.kind.label()
+                );
+            }
+            file.disarm();
+        }
         refresh_session_cache();
 
         Ok(())
@@ -554,6 +570,29 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn aoe_test_running_server() -> TmuxTestSession {
+        let server = TmuxTestSession::new("aoe_test_env_server");
+        let status = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", server.name(), "sleep 60"])
+            .status()
+            .expect("start tmux server");
+        assert!(status.success());
+        server
+    }
+
+    /// A non-empty read, so a pane's redirect that has created but not yet
+    /// filled the file is not mistaken for its contents.
+    fn read_when_written(path: &std::path::Path) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let contents = std::fs::read_to_string(path).ok().filter(|c| !c.is_empty());
+            if contents.is_some() || std::time::Instant::now() >= deadline {
+                return contents;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn terminal_names_carry_their_kind_prefix_and_index_suffix() {
         let (id, title) = ("abc123def456", "My Project");
@@ -797,40 +836,102 @@ mod tests {
         assert_eq!(absolute_shell_in("aoe-not-a-real-shell-xyzzy", paths), None);
     }
 
+    /// #5499: inherited values reach the pane through the launch script, and
+    /// tmux's argv carries only that script's path.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn test_host_terminal_forwards_desktop_env() {
+    fn test_inherited_env_stays_out_of_tmux_argv() {
+        use crate::session::environment::shell_escape;
+        use std::os::unix::fs::PermissionsExt;
+
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
         }
+        // Already running without the sentinel, so only the script can deliver it.
+        let _server = aoe_test_running_server();
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
-        let key = "XDG_AOE_TERM_ENV_TEST_3075";
+        let bin = tmp.path().join("shim-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let shim = bin.join("tmux");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexec {} \"$@\"\n",
+                shell_escape(&argv_log.to_string_lossy()),
+                shell_escape(&which::which("tmux").unwrap().to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let key = "PASSTHROUGH_TEST_5499";
+        let secret = "argv-leak-sentinel-5499";
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let _env = crate::session::test_support::EnvGuard::set(&[
-            (key, "host-sentinel"),
+            (key, secret),
+            ("PATH", path.as_str()),
             ("SHELL", "/bin/sh"),
         ]);
+        let config_path = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n").unwrap();
 
-        let guard = TmuxTestSession::new("aoe_test_term_host_fwd");
-        let session = PairedTerminal {
-            name: guard.name().to_string(),
-            kind: TerminalKind::Host,
-        };
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
+        type Create = fn(&str, &str) -> Result<()>;
+        let cases: [(&str, Create); 2] = [
+            ("aoe_test_argv_agent", |name, command| {
+                Session::from_name(name).create_with_size(
+                    "/tmp",
+                    Some(command),
+                    Some((80, 24)),
+                    "default",
+                )
+            }),
+            ("aoe_test_argv_host", |name, command| {
+                PairedTerminal {
+                    name: name.to_string(),
+                    kind: TerminalKind::Host,
+                }
+                .create_with_size("/tmp", Some(command), Some((80, 24)), "default")
+            }),
+        ];
+        for (name, create) in cases {
+            let guard = TmuxTestSession::new(name);
+            let output = tmp.path().join(name);
+            std::fs::write(&argv_log, "").unwrap();
+            let command = format!(
+                "printf '%s' \"${key}\" > {output}; exec sleep 30",
+                output = shell_escape(&output.to_string_lossy()),
+            );
+            create(guard.name(), &command).expect("create session");
 
-        let shown = crate::tmux::tmux_command()
-            .args(["show-environment", "-t", guard.name(), key])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
+            assert_eq!(
+                read_when_written(&output).as_deref(),
+                Some(secret),
+                "{name}: the pane must receive the inherited value"
+            );
 
-        created.expect("create host terminal");
-        assert_eq!(
-            shown.as_deref(),
-            Some("XDG_AOE_TERM_ENV_TEST_3075=host-sentinel"),
-            "a host terminal must carry the forwarded desktop/session env (#3075)"
-        );
+            let argv = std::fs::read_to_string(&argv_log).unwrap();
+            assert!(argv.contains("new-session"), "{name}: {argv}");
+            assert!(!argv.contains(secret), "{name} leaked into argv: {argv}");
+            let script = argv
+                .lines()
+                .find(|line| line.starts_with("exec "))
+                .and_then(|line| line.rsplit('\'').nth(1))
+                .unwrap_or_else(|| panic!("{name}: no launch script in argv: {argv}"));
+            assert!(
+                !std::path::Path::new(script).exists(),
+                "{name}: the launch script must be removed after use"
+            );
+        }
     }
 
     /// Container terminals keep the container's own env; the host desktop env
@@ -846,30 +947,33 @@ mod tests {
             return;
         }
 
+        // Already running without the sentinel, so its base env cannot supply it.
+        let _server = aoe_test_running_server();
         let key = "XDG_AOE_TERM_ENV_TEST_3075_CTR";
         let _env = crate::session::test_support::EnvGuard::set(&[(key, "must-not-leak")]);
 
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("seen");
         let guard = TmuxTestSession::new("aoe_test_term_ctr_excl");
         let session = PairedTerminal {
             name: guard.name().to_string(),
             kind: TerminalKind::Container,
         };
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
+        session
+            .create_with_size(
+                "/tmp",
+                Some(&format!(
+                    "printf '%s' \"${{{key}-absent}}\" > {}; exec sleep 30",
+                    crate::session::environment::shell_escape(&output.to_string_lossy())
+                )),
+                Some((80, 24)),
+                "default",
+            )
+            .expect("create container terminal");
 
-        // `show-environment` exits non-zero and prints nothing to stdout for an
-        // unknown variable, so a forwarded var yields the `KEY=VALUE` line and
-        // an excluded one yields an empty string.
-        let shown = crate::tmux::tmux_command()
-            .args(["show-environment", "-t", guard.name(), key])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-
-        created.expect("create container terminal");
         assert_eq!(
-            shown.as_deref(),
-            Some(""),
+            read_when_written(&output).as_deref(),
+            Some("absent"),
             "a container terminal must NOT inherit the host desktop/session env (#3075)"
         );
     }

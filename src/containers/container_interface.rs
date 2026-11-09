@@ -95,8 +95,10 @@ impl EnvEntry {
     }
 }
 
-/// The caller must set the returned inherit pairs on the spawning `Command`. Dedupes by
-/// key, first wins.
+/// The caller must set the returned inherit pairs on the spawning `Command`, so argv
+/// carries only names. A literal naming a runtime routing key stays inline: on the
+/// client's own env it would redirect the runtime (`HOME=/root` hides `~/.docker`).
+/// Dedupes by key, first wins.
 pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, String)>) {
     let mut argv = Vec::with_capacity(entries.len() * 2);
     let mut inherit = Vec::new();
@@ -108,12 +110,14 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
         }
         argv.push("-e".to_string());
         match entry {
-            EnvEntry::Inherit { key, value } => {
+            EnvEntry::Literal { key, value }
+                if super::execution::RUNTIME_ROUTING_KEYS.contains(&key.as_str()) =>
+            {
+                argv.push(format!("{key}={value}"));
+            }
+            EnvEntry::Inherit { key, value } | EnvEntry::Literal { key, value } => {
                 argv.push(key.clone());
                 inherit.push((key.clone(), value.clone()));
-            }
-            EnvEntry::Literal { key, value } => {
-                argv.push(format!("{}={}", key, value));
             }
         }
     }
@@ -277,7 +281,7 @@ mod tests {
             &'static [(&'static str, &'static str)],
             &'static [&'static str],
         );
-        let cases: [EnvCase; 5] = [
+        let cases: [EnvCase; 6] = [
             (
                 vec![inherit("GH_TOKEN", "ghp_secret")],
                 &["-e", "GH_TOKEN"],
@@ -285,8 +289,14 @@ mod tests {
                 &["ghp_secret"],
             ),
             (
-                vec![literal("TERM", "xterm-256color")],
-                &["-e", "TERM=xterm-256color"],
+                vec![literal("API_KEY", "sk-literal")],
+                &["-e", "API_KEY"],
+                &[("API_KEY", "sk-literal")],
+                &["sk-literal"],
+            ),
+            (
+                vec![literal("HOME", "/root")],
+                &["-e", "HOME=/root"],
                 &[],
                 &[],
             ),
@@ -296,8 +306,8 @@ mod tests {
                     literal("TERM", "xterm"),
                     inherit("TOKEN", "tok"),
                 ],
-                &["-e", "SECRET", "-e", "TERM=xterm", "-e", "TOKEN"],
-                &[("SECRET", "s3cr3t"), ("TOKEN", "tok")],
+                &["-e", "SECRET", "-e", "TERM", "-e", "TOKEN"],
+                &[("SECRET", "s3cr3t"), ("TERM", "xterm"), ("TOKEN", "tok")],
                 &["s3cr3t"],
             ),
             (vec![], &[], &[], &[]),

@@ -1212,7 +1212,7 @@ mod tests {
             args[..6],
             strings(&["run", "-d", "--name", "c", "-w", "/workspace"])
         );
-        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN", "TERM=xterm"]);
+        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN", "TERM"]);
         assert!(!args.iter().any(|a| a.contains("ghp_secret123")));
         assert_eq!(arg_after(&args, "--cpus"), Some("2"));
         assert_eq!(arg_after(&args, "-m"), Some("4g"));

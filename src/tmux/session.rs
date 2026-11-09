@@ -512,12 +512,9 @@ impl Session {
         let config = super::tmux_option_config(profile);
 
         // Forward the host desktop env so agents and browsers they open reach it.
-        let inherited_env = crate::session::environment::inherited_host_env(profile);
-        let mut protected_env = Vec::new();
-        let mut tmux_env: Vec<(&str, &str)> = inherited_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
+        let mut protected_env =
+            launch_script_env(crate::session::environment::inherited_host_env(profile));
+        let mut tmux_env: Vec<(&str, &str)> = Vec::new();
         for mutation in extra_env {
             let key = mutation.key();
             if !crate::session::environment::is_valid_env_key(key) {
@@ -2426,17 +2423,47 @@ const _: () = assert!(
     SCOPED_LAUNCH_FD != 3 && SCOPED_LAUNCH_FD != crate::session::environment::CONTAINER_EXEC_ENV_FD
 );
 
+/// Set by the launch shell itself, or read-only in it. tmux `-e` could hand
+/// these to a shell that ignored them; a script export would instead pin a
+/// stale `PWD` or abort a POSIX-mode shell.
+const SHELL_OWNED_ENV_KEYS: &[&str] = &[
+    "_",
+    "BASHOPTS",
+    "BASH_VERSINFO",
+    "EUID",
+    "IFS",
+    "OLDPWD",
+    "PPID",
+    "PWD",
+    "SHELLOPTS",
+    "SHLVL",
+    "UID",
+];
+
+/// Host env pairs as launch-script exports. Values stay off tmux's argv, which
+/// `ps` shows to other users and which macOS keeps as the tmux server's title.
+pub(super) fn launch_script_env(pairs: Vec<(String, String)>) -> Vec<PaneEnvMutation> {
+    pairs
+        .into_iter()
+        .filter(|(key, _)| !SHELL_OWNED_ENV_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| PaneEnvMutation::set(key, value))
+        .collect()
+}
+
 /// A one-shot, mode-0600 environment channel for a pane command.
 ///
 /// The guard owns cleanup until the pane unlinks the file after sourcing it.
 /// A successful tmux create alone does not transfer cleanup ownership.
-struct EphemeralEnvFile {
+pub(super) struct EphemeralEnvFile {
     path: Option<std::path::PathBuf>,
     container_env_path: Option<std::path::PathBuf>,
 }
 
 impl EphemeralEnvFile {
-    fn create(env: &[PaneEnvMutation], container_env: &[(String, String)]) -> Result<Self> {
+    pub(super) fn create(
+        env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
+    ) -> Result<Self> {
         let mut channel = Self {
             path: None,
             container_env_path: None,
@@ -2483,7 +2510,7 @@ impl EphemeralEnvFile {
     /// launch in a heredoc on fd 4, still a child of the pane shell, so it
     /// stays out of every argv. `env` restores the pane's `INVOCATION_ID`,
     /// which `systemd-run` overwrites.
-    fn wrap_command(
+    pub(super) fn wrap_command(
         &self,
         command: Option<&str>,
         scope: Option<&crate::process::systemd::ScopePrefix>,
@@ -2551,7 +2578,7 @@ impl EphemeralEnvFile {
         ))
     }
 
-    fn wait_until_consumed(&self, timeout: Duration) -> bool {
+    pub(super) fn wait_until_consumed(&self, timeout: Duration) -> bool {
         let Some(path) = self.path.as_deref() else {
             return true;
         };
@@ -2566,7 +2593,7 @@ impl EphemeralEnvFile {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.path = None;
         self.container_env_path = None;
     }
@@ -2640,7 +2667,8 @@ pub(crate) fn build_create_args(
         working_dir.to_string(),
     ];
 
-    // `-e` needs tmux 3.2+, already assumed elsewhere.
+    // `-e` needs tmux 3.2+, already assumed elsewhere. Argv is world-readable:
+    // only non-secret values belong here; see `launch_script_env`.
     for (key, value) in env {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
@@ -4033,38 +4061,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_create_forwards_desktop_env_to_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        // A var only this test reads, caught by the `XDG_` forwarding rule, so
-        // it never collides with real config or another test's assertions.
-        let key = "XDG_AOE_ENV_TEST_3075";
-        let _env = crate::session::test_support::EnvGuard::set(&[(key, "sentinel-value")]);
-
-        let guard = TmuxTestSession::new("aoe_test_env_fwd");
-        let session = super::Session::from_name(guard.name());
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
-
-        let shown = crate::tmux::tmux_command()
-            .args(["show-environment", "-t", guard.name(), key])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-
-        created.expect("create session");
-        assert_eq!(
-            shown.as_deref(),
-            Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
-            "a created agent session must carry the forwarded desktop/session env (#3075)"
-        );
-    }
-
     /// #3265: tmux silently falls back to its server's `$HOME` when `-c`
     /// points at a directory that doesn't exist, landing a fresh/restarted
     /// pane in the daemon's launch directory instead of the session's
@@ -5303,6 +5299,18 @@ mod tests {
                 "{}=non-secret-generation",
                 crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY
             )
+        );
+    }
+
+    #[test]
+    fn test_launch_script_env_skips_variables_the_shell_owns() {
+        let pair = |key: &str| (key.to_string(), "host-value".to_string());
+        assert_eq!(
+            launch_script_env(vec![pair("PWD"), pair("UID"), pair("DISPLAY"), pair("_")]),
+            [PaneEnvMutation::set(
+                "DISPLAY".to_string(),
+                "host-value".to_string()
+            )]
         );
     }
 
