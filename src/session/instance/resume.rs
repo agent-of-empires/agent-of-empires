@@ -766,13 +766,14 @@ impl Instance {
                     prior,
                     revival.as_ref(),
                 )
-                .map_err(|error| LaunchFailure { error, born: None })?;
+                .map_err(|error| Box::new(LaunchFailure { error, born: None }))?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
             self.spawn_prepared_launch(size, storage, prepared)
         })();
         let (launch_outcome, probe) = match spawned {
             Ok(spawned) => spawned,
-            Err(LaunchFailure { error, born }) => {
+            Err(failure) => {
+                let LaunchFailure { error, born } = *failure;
                 if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
                     let probe = LaunchProbe {
                         tmux_session: self.tmux_session()?.name().to_owned(),
