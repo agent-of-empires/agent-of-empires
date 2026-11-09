@@ -54,6 +54,10 @@ impl Budget {
         let pid = child.id();
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
+        #[cfg(test)]
+        if let Some(dir) = command.get_current_dir() {
+            super::fetch::test_gate::reach(dir, "command-capture");
+        }
         let mut descendants = match crate::process::OwnedProcessTree::capture(&child) {
             Ok(tree) => tree,
             Err(error) => {
@@ -94,6 +98,10 @@ impl Budget {
                         "cannot observe command {pid}: {error:#}"
                     ))
                     .into());
+                }
+                #[cfg(test)]
+                if let Some(dir) = command.get_current_dir() {
+                    super::fetch::test_gate::reach(dir, "command-census");
                 }
                 next_census = Instant::now() + Duration::from_secs(1);
             }

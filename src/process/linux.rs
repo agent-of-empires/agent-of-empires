@@ -1382,6 +1382,7 @@ impl ProcessHandle {
 
     pub(super) fn capture_owned(
         identity: &super::PrimeProcessIdentity,
+        _root: &super::OwnedProcessGroup,
     ) -> anyhow::Result<Option<Self>> {
         Self::capture_identity(identity, true)
     }
@@ -1466,6 +1467,14 @@ impl ProcessHandle {
 
     pub(super) fn physically_exited(&self) -> anyhow::Result<bool> {
         self.exited()
+    }
+
+    pub(super) fn signal_owned(
+        &self,
+        signal: i32,
+        _deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.signal(signal)
     }
 
     pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {

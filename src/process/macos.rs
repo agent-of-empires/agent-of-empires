@@ -374,7 +374,167 @@ pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
     Ok(audit_token(pid)?.as_ref().map(audit_start_id))
 }
 
-pub(super) struct ProcessHandle(AuditToken);
+#[repr(C)]
+struct UniqueIdentifierInfo {
+    _uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
+    version: i32,
+    _original_parent_version: i32,
+    _reserved: [u64; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<UniqueIdentifierInfo>() == 56);
+
+#[repr(C)]
+struct OwnedProcessInfo {
+    bsd: libc::proc_bsdinfo,
+    identity: UniqueIdentifierInfo,
+}
+
+fn unique_identity(
+    pid: u32,
+    include_zombies: bool,
+) -> anyhow::Result<Option<UniqueIdentifierInfo>> {
+    let mut info = std::mem::MaybeUninit::<UniqueIdentifierInfo>::uninit();
+    let size = std::mem::size_of::<UniqueIdentifierInfo>() as i32;
+    // PROC_PIDUNIQIDENTIFIERINFO includes physical birth independently of exec.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)?,
+            17,
+            u64::from(include_zombies),
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        let error = std::io::Error::last_os_error();
+        if read == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        anyhow::bail!("process birth metadata unavailable ({read}/{size}): {error}");
+    }
+    Ok(Some(unsafe { info.assume_init() }))
+}
+
+fn owned_membership(
+    pid: u32,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<OwnedProcessInfo>> {
+    let Some(initial) = unique_identity(pid, true)? else {
+        return Ok(None);
+    };
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "owned ancestry observation expired"
+        );
+        let Some(before) = unique_identity(pid, true)? else {
+            return Ok(None);
+        };
+        if before.unique_id != initial.unique_id {
+            return Ok(None);
+        }
+        let mut info = std::mem::MaybeUninit::<OwnedProcessInfo>::uninit();
+        let size = std::mem::size_of::<OwnedProcessInfo>() as i32;
+        // PROC_PIDT_BSDINFOWITHUNIQID reads both structures from the same process.
+        let read = unsafe {
+            libc::proc_pidinfo(i32::try_from(pid)?, 18, 1, info.as_mut_ptr().cast(), size)
+        };
+        if read != size {
+            let error = std::io::Error::last_os_error();
+            if read == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            anyhow::bail!("owned ancestry metadata unavailable ({read}/{size}): {error}");
+        }
+        let info = unsafe { info.assume_init() };
+        let Some(after) = unique_identity(pid, true)? else {
+            return Ok(None);
+        };
+        if info.identity.unique_id != initial.unique_id || after.unique_id != initial.unique_id {
+            return Ok(None);
+        }
+        anyhow::ensure!(info.bsd.pbi_pid == pid, "unexpected owned ancestry PID");
+        if before.version == info.identity.version && info.identity.version == after.version {
+            return Ok(Some(info));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn owned_audit_token(
+    pid: u32,
+    birth: u64,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<AuditToken>> {
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "owned execution observation expired"
+        );
+        let Some(before) = unique_identity(pid, false)? else {
+            return Ok(None);
+        };
+        if before.unique_id != birth {
+            return Ok(None);
+        }
+        let observed = audit_token(pid);
+        let Some(after) = unique_identity(pid, false)? else {
+            return Ok(None);
+        };
+        if after.unique_id != birth {
+            return Ok(None);
+        }
+        if before.version != after.version {
+            std::thread::yield_now();
+            continue;
+        }
+        let token = observed?.context("live owned process audit token unavailable")?;
+        if token.values[7] == after.version as u32 {
+            return Ok(Some(token));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn signal_audit_token(mut token: AuditToken, signal: i32) -> std::io::Result<()> {
+    type Signal = unsafe extern "C" fn(*mut AuditToken, i32) -> i32;
+    static FUNCTION: std::sync::LazyLock<Option<Signal>> = std::sync::LazyLock::new(|| unsafe {
+        let library = libc::dlopen(
+            c"/usr/lib/libproc.dylib".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if library.is_null() {
+            return None;
+        }
+        let function = libc::dlsym(library, c"proc_signal_with_audittoken".as_ptr());
+        if function.is_null() {
+            libc::dlclose(library);
+            return None;
+        }
+        // The cached function keeps its library loaded for the process lifetime.
+        Some(std::mem::transmute::<*mut libc::c_void, Signal>(function))
+    });
+    let function = FUNCTION.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "incarnation-bound signalling unavailable on this macOS version",
+        )
+    })?;
+    let result = unsafe { function(&mut token, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(result))
+    }
+}
+
+pub(super) struct ProcessHandle {
+    initial_token: AuditToken,
+    owned_birth: Option<u64>,
+}
 
 impl ProcessHandle {
     pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
@@ -388,69 +548,118 @@ impl ProcessHandle {
         if !token.matches_start_id(&identity.start_id) {
             return Ok(None);
         }
-        Ok(Some(Self(token)))
+        Ok(Some(Self {
+            initial_token: token,
+            owned_birth: None,
+        }))
     }
 
     pub(super) fn capture_owned(
         identity: &super::PrimeProcessIdentity,
+        root: &super::OwnedProcessGroup,
     ) -> anyhow::Result<Option<Self>> {
-        let Some(token) = audit_token(identity.pid)? else {
+        root.exited()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let Some(mut child) = owned_membership(identity.pid, deadline)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
-            token.matches_start_id(&identity.start_id),
-            "owned descendant {} changed identity during capture",
-            identity.pid
-        );
-        Ok(Some(Self(token)))
+        if child.bsd.pbi_status == libc::SZOMB {
+            return Ok(None);
+        }
+        let birth = child.identity.unique_id;
+        let root_birth =
+            unique_identity(root.id(), true)?.context("unreaped command birth unavailable")?;
+        loop {
+            if child.bsd.pbi_ppid == root.id() {
+                anyhow::ensure!(
+                    child.identity.parent_unique_id == root_birth.unique_id,
+                    "owned root parent birth changed",
+                );
+                break;
+            }
+            anyhow::ensure!(
+                child.bsd.pbi_ppid > 1 && child.bsd.pbi_ppid != child.bsd.pbi_pid,
+                "process {} lacks owned command ancestry",
+                identity.pid,
+            );
+            let parent = owned_membership(child.bsd.pbi_ppid, deadline)?
+                .context("owned parent exited before ancestry proof")?;
+            anyhow::ensure!(
+                child.identity.parent_unique_id == parent.identity.unique_id,
+                "owned parent birth changed",
+            );
+            let current = unique_identity(child.bsd.pbi_pid, true)?
+                .context("owned ancestor exited before ancestry proof")?;
+            anyhow::ensure!(
+                current.unique_id == child.identity.unique_id,
+                "owned ancestor PID was reused",
+            );
+            child = parent;
+        }
+        let Some(token) = owned_audit_token(identity.pid, birth, deadline)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            initial_token: token,
+            owned_birth: Some(birth),
+        }))
     }
 
     pub(super) fn exited(&self) -> anyhow::Result<bool> {
-        Ok(audit_token(self.0.values[5])?
-            .is_none_or(|current| current.values[7] != self.0.values[7]))
+        Ok(audit_token(self.initial_token.values[5])?
+            .is_none_or(|current| current.values[7] != self.initial_token.values[7]))
     }
 
     pub(super) fn physically_exited(&self) -> anyhow::Result<bool> {
-        let Some(current) = audit_token(self.0.values[5])? else {
-            return Ok(true);
-        };
-        anyhow::ensure!(
-            current == self.0,
-            "owned descendant {} changed identity before physical exit",
-            self.0.values[5]
-        );
-        Ok(false)
+        let birth = self
+            .owned_birth
+            .context("physical observation lacks owned birth")?;
+        Ok(unique_identity(self.initial_token.values[5], false)?
+            .is_none_or(|current| current.unique_id != birth))
+    }
+
+    pub(super) fn signal_owned(
+        &self,
+        signal: i32,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        let birth = self
+            .owned_birth
+            .context("owned signal lacks physical birth")?;
+        let pid = self.initial_token.values[5];
+        loop {
+            let Some(token) = owned_audit_token(pid, birth, deadline)? else {
+                return Ok(());
+            };
+            match signal_audit_token(token, signal) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let Some(current) = unique_identity(pid, false)? else {
+                        return Ok(());
+                    };
+                    if current.unique_id != birth {
+                        return Ok(());
+                    }
+                    if current.version as u32 != token.values[7] {
+                        continue;
+                    }
+                    return Err(error).context("signalling owned physical birth");
+                }
+            }
+        }
     }
 
     pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
-        type Signal = unsafe extern "C" fn(*mut AuditToken, i32) -> i32;
-        static FUNCTION: std::sync::OnceLock<Option<Signal>> = std::sync::OnceLock::new();
-        let function = FUNCTION
-            .get_or_init(|| unsafe {
-                let library = libc::dlopen(
-                    c"/usr/lib/libproc.dylib".as_ptr(),
-                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
-                );
-                if library.is_null() {
-                    return None;
-                }
-                let function = libc::dlsym(library, c"proc_signal_with_audittoken".as_ptr());
-                if function.is_null() {
-                    libc::dlclose(library);
-                    return None;
-                }
-                // The cached function keeps its library loaded for the process lifetime.
-                Some(std::mem::transmute::<*mut libc::c_void, Signal>(function))
-            })
-            .context("incarnation-bound signalling unavailable on this macOS version")?;
-        let mut token = self.0;
-        let result = unsafe { function(&mut token, signal) };
-        // The kernel reports EPERM when the target starts exiting during the call.
-        if result != 0 && result != libc::ESRCH && !(result == libc::EPERM && self.exited()?) {
-            return Err(std::io::Error::from_raw_os_error(result))
-                .context("signalling owned audit token");
+        match signal_audit_token(self.initial_token, signal) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ESRCH)
+                    || (error.raw_os_error() == Some(libc::EPERM) && self.exited()?) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error).context("signalling owned audit token"),
         }
-        Ok(())
     }
 }
 
@@ -623,17 +832,20 @@ fn process_tree_samples_with_root(
             continue;
         }
         let pid = sample.identity.pid;
+        if owned_root {
+            if let Some(membership) = process_membership(pid)? {
+                if membership.pbi_status != libc::SZOMB {
+                    sample.parent = membership.pbi_ppid;
+                    samples.push(sample);
+                }
+            }
+            continue;
+        }
         let Some(token) = audit_token(pid)? else {
             continue;
         };
-        let Some(membership) = process_membership(pid)? else {
-            anyhow::ensure!(owned_root, "tool process membership unavailable");
-            continue;
-        };
+        let membership = process_membership(pid)?.context("tool process membership unavailable")?;
         let after = audit_token(pid)?;
-        if owned_root && after.is_none() {
-            continue;
-        }
         anyhow::ensure!(
             after == Some(token),
             "tool process incarnation changed during census"
@@ -1356,7 +1568,10 @@ mod tests {
                             pid,
                             start_id: audit_start_id(&AuditToken { values: words }),
                         },
-                        ProcessHandle(AuditToken { values: words }),
+                        ProcessHandle {
+                            initial_token: AuditToken { values: words },
+                            owned_birth: None,
+                        },
                     ));
                 }
                 let auxiliary = Command::new("cat")
@@ -1513,14 +1728,23 @@ mod tests {
     }
 
     #[test]
-    fn original_child_custody_handles_zombies_and_exec_without_rebinding_descendants() {
+    fn original_child_custody_distinguishes_physical_birth_from_execution() {
         use crate::process::{CapturedProcessTree, OwnedProcessGroup, OwnedProcessTree};
         use std::io::Write as _;
         use std::time::{Duration, Instant};
 
-        struct Original(Option<OwnedProcessGroup>);
+        struct Original(Option<OwnedProcessGroup>, Option<ProcessHandle>);
         impl Drop for Original {
             fn drop(&mut self) {
+                if let Some(handle) = self.1.take() {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let _ = handle.signal_owned(libc::SIGKILL, deadline);
+                    while handle.physically_exited().is_ok_and(|exited| !exited)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                }
                 if let Some(mut group) = self.0.take() {
                     let _ = group.settle(Duration::ZERO);
                     let _ = group.reap();
@@ -1541,9 +1765,10 @@ mod tests {
             }
         }
 
-        let mut completed = Original(Some(
-            OwnedProcessGroup::spawn(&mut Command::new("true")).unwrap(),
-        ));
+        let mut completed = Original(
+            Some(OwnedProcessGroup::spawn(&mut Command::new("true")).unwrap()),
+            None,
+        );
         let group = completed.0.as_ref().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !group.exited().unwrap() {
@@ -1559,7 +1784,7 @@ mod tests {
             .unwrap();
         assert!(completed.0.take().unwrap().reap().unwrap().success());
 
-        for descendant_exec in [false, true] {
+        for (descendant_exec, escape) in [(false, false), (true, false), (true, true)] {
             let effects = tempfile::tempdir().unwrap();
             std::fs::write(
                 effects.path().join("first.sh"),
@@ -1568,12 +1793,16 @@ mod tests {
             .unwrap();
             std::fs::write(
                 effects.path().join("second.sh"),
-                "printf '%s' \"$$\" > advanced\nIFS= read -r release\n",
+                if escape {
+                    "exec python3 -c 'import os,sys;os.setsid();open(\"advanced\",\"w\").write(str(os.getpid()));sys.stdin.readline()'\n"
+                } else {
+                    "printf '%s' \"$$\" > advanced\nIFS= read -r release\n"
+                },
             )
             .unwrap();
             let mut command = Command::new("sh");
             if descendant_exec {
-                command.args(["-c", "sh first.sh <&0 & wait"]);
+                command.args(["-c", "sh first.sh <&0 & wait \"$!\""]);
             } else {
                 command.arg("first.sh");
             }
@@ -1582,12 +1811,23 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let mut original = Original(Some(OwnedProcessGroup::spawn(&mut command).unwrap()));
+            let mut original =
+                Original(Some(OwnedProcessGroup::spawn(&mut command).unwrap()), None);
             let mut input = original.0.as_mut().unwrap().child.stdin.take().unwrap();
             let group = original.0.as_ref().unwrap();
             let pid = published_pid(&effects.path().join("ready"));
             let before = audit_token(pid).unwrap().unwrap();
-            let stale = (!descendant_exec).then(|| CapturedProcessTree::capture(pid).unwrap());
+            let stale = CapturedProcessTree::capture(pid).unwrap();
+            if descendant_exec {
+                original.1 = ProcessHandle::capture_owned(
+                    &super::super::PrimeProcessIdentity {
+                        pid,
+                        start_id: String::new(),
+                    },
+                    group,
+                )
+                .unwrap();
+            }
             let mut owned = OwnedProcessTree::capture(group).unwrap();
             input.write_all(b"advance\n").unwrap();
             assert_eq!(published_pid(&effects.path().join("advanced")), pid);
@@ -1595,25 +1835,50 @@ mod tests {
             assert_ne!(before.values[7], after.values[7]);
             assert!(!group.exited().unwrap());
 
+            let recovered = CapturedProcessTree::resume(stale.receipt().clone(), pid).unwrap();
+            recovered.settle(Duration::ZERO).unwrap();
+            assert!(audit_token(pid).unwrap().is_some());
+            owned.refresh().unwrap();
             if descendant_exec {
-                assert!(owned.refresh().is_err());
-                assert!(before.matches_start_id(&owned.members.get(&pid).unwrap().0));
-                assert!(owned.settle(Duration::ZERO).is_err());
-                assert!(!group.exited().unwrap());
+                assert!(!owned
+                    .members
+                    .get(&pid)
+                    .unwrap()
+                    .physically_exited()
+                    .unwrap());
+                let handle = owned.members.get(&pid).unwrap();
+                let actual_birth = handle.owned_birth.unwrap();
+                let stale_identity = super::super::PrimeProcessIdentity {
+                    pid,
+                    start_id: audit_start_id(&before),
+                };
+                assert!(ProcessHandle::capture(&stale_identity).unwrap().is_none());
+                let freshly_owned = ProcessHandle::capture_owned(&stale_identity, group)
+                    .unwrap()
+                    .unwrap();
+                assert!(!freshly_owned.physically_exited().unwrap());
+                let replacement = ProcessHandle {
+                    initial_token: handle.initial_token,
+                    owned_birth: Some(actual_birth.wrapping_add(1)),
+                };
+                replacement
+                    .signal_owned(libc::SIGKILL, Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+                assert!(
+                    audit_token(pid).unwrap().is_some(),
+                    "different birth was signalled"
+                );
+                owned.settle(Duration::ZERO).unwrap();
+                assert!(audit_token(pid).unwrap().is_none());
             } else {
                 assert_eq!(pid, group.id());
-                let recovered =
-                    CapturedProcessTree::resume(stale.as_ref().unwrap().receipt().clone(), pid)
-                        .unwrap();
-                recovered.settle(Duration::ZERO).unwrap();
-                assert!(!group.exited().unwrap());
-                owned.refresh().unwrap();
                 owned.settle(Duration::ZERO).unwrap();
                 assert!(!group.exited().unwrap());
             }
             drop(owned);
             original.0.as_mut().unwrap().settle(Duration::ZERO).unwrap();
             assert!(!runner_group_executing(original.0.as_ref().unwrap().id()).unwrap());
+            original.1.take();
             assert!(!original.0.take().unwrap().reap().unwrap().success());
         }
     }

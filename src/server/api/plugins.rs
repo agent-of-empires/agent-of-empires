@@ -1035,13 +1035,18 @@ pub async fn preview_plugin_install(
 }
 
 fn preview_failure(error: anyhow::Error) -> Response {
-    let code = if error.is::<plugin::install::PluginAlreadyInstalled>() {
+    let already_installed = error.is::<plugin::install::PluginAlreadyInstalled>();
+    let code = if already_installed {
         crate::daemon::ApiErrorCode::PluginAlreadyInstalled
     } else {
         crate::daemon::ApiErrorCode::PluginPreviewFailed
     };
-    let cause = super::logs::redact(&format!("{error:#}"));
-    tracing::warn!(target: "plugin.install", error = %cause, "plugin preview failed");
+    let cause = crate::logging::redact(&format!("{error:#}"));
+    if already_installed {
+        tracing::debug!(target: "plugin.install", error = %cause, "plugin install refused");
+    } else {
+        tracing::warn!(target: "plugin.install", error = %cause, "plugin preview failed");
+    }
     super::api_error_with_code_header(code, cause)
 }
 
@@ -1203,6 +1208,140 @@ mod tests {
         ] {
             assert!(!warning.contains(secret), "{warning}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn normal_build_descendant_exec_keeps_mutation_admission() {
+        use std::time::Duration;
+        let _reload = plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let node = plugin::write_fake_node(effects.path(), "node");
+        let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        std::fs::write(source.path().join("root.py"),
+            "import subprocess,sys\nsys.exit(subprocess.call([sys.executable,'before.py',sys.argv[1]]))\n").unwrap();
+        std::fs::write(
+            source.path().join("before.py"),
+            r#"import os,sys,time
+from pathlib import Path
+p=Path(sys.argv[1])
+(p/'ready').write_text(str(os.getpid()))
+deadline=time.monotonic()+20
+while not (p/'exec').exists():
+    if time.monotonic()>deadline: raise TimeoutError('exec was not released')
+    time.sleep(.01)
+os.execv(sys.executable,[sys.executable,'after.py',str(p)])
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join("after.py"),
+            r#"import os,sys,time
+from pathlib import Path
+p=Path(sys.argv[1])
+(p/'advanced').write_text(str(os.getpid()))
+deadline=time.monotonic()+20
+while not (p/'finish').exists():
+    if time.monotonic()>deadline: raise TimeoutError('build was not released')
+    time.sleep(.01)
+"#,
+        )
+        .unwrap();
+        let manifest = format!(
+            "id = \"acme.exec\"\nname = \"Native exec\"\nversion = \"1\"\napi_version = 2\ncapabilities = []\n[runtime]\nkind = \"command\"\ncommand = [\"true\"]\nsystem = true\n[[runtime.build]]\ncommand = [\"python3\", \"root.py\", {}]\n",
+            serde_json::to_string(&effects.path().display().to_string()).unwrap(),
+        );
+        std::fs::write(source.path().join("aoe-plugin.toml"), manifest).unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let owner = Some(axum::Extension(Principal::LocalPeer { uid: 1000 }));
+        let input = source.path().display().to_string();
+        let consent: plugin::install::InstallConsent = decode(
+            preview_plugin_install(
+                State(state.clone()),
+                owner,
+                Json(InstallPreviewBody {
+                    source: input.clone(),
+                    dev: false,
+                }),
+            )
+            .await,
+        )
+        .await;
+        let plugins = plugin::plugins_dir().unwrap();
+        let mut capture = plugin::fetch::test_gate::install(&plugins, "command-capture");
+        let mut observe = plugin::fetch::test_gate::install(&plugins, "command-observe");
+        let mut census = plugin::fetch::test_gate::install(&plugins, "command-census");
+        struct ReleaseBuild(std::path::PathBuf);
+        impl Drop for ReleaseBuild {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0.join("exec"), b"");
+                let _ = std::fs::write(self.0.join("finish"), b"");
+            }
+        }
+        let _release = ReleaseBuild(effects.path().to_owned());
+        async fn pid(path: &std::path::Path) -> u32 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|text| text.parse().ok())
+                    {
+                        return pid;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let response = start_plugin_install(
+            State(state.clone()),
+            None,
+            owner,
+            Json(StartInstallBody {
+                source: input,
+                dev: false,
+                expected_fingerprint: consent.fingerprint,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(5), &mut capture.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = pid(&effects.path().join("ready")).await;
+        capture.release();
+        tokio::time::timeout(Duration::from_secs(5), &mut observe.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(effects.path().join("exec"), b"").unwrap();
+        assert_eq!(pid(&effects.path().join("advanced")).await, before);
+        observe.release();
+        tokio::time::timeout(Duration::from_secs(5), &mut census.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        plugin::install::check_recovery_evidence().unwrap();
+        census.release();
+        std::fs::write(effects.path().join("finish"), b"").unwrap();
+        let job = finish(&state, response).await;
+        assert!(
+            matches!(job.status, PluginJobStatus::Succeeded),
+            "{:?}",
+            job.status
+        );
+        assert!(!crate::session::get_app_dir()
+            .unwrap()
+            .join(".plugin-recovery-required")
+            .exists());
+        let next_operation = plugin::install::begin_operation().unwrap();
+        drop(next_operation);
+        state.runtime.work.drain().await;
     }
 
     #[cfg(unix)]

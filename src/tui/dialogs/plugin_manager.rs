@@ -1964,10 +1964,15 @@ impl PluginManagerDialog {
                 )));
                 footer.push(Line::from(Span::styled(
                     if progress.daemon_job.is_some() {
-                        format!(
-                            "esc hide (keeps running) · log on Daemon host: {}",
-                            progress.log_path.display()
-                        )
+                        if progress.log_path.as_os_str().is_empty() {
+                            "esc hide (keeps running) · log path unavailable from this Daemon"
+                                .to_owned()
+                        } else {
+                            format!(
+                                "esc hide (keeps running) · log on Daemon host: {}",
+                                progress.log_path.display()
+                            )
+                        }
                     } else {
                         format!(
                             "esc hide (keeps running) · log: {}",

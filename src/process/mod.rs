@@ -413,7 +413,7 @@ impl OwnedProcessGroup {
 pub(crate) struct OwnedProcessTree<'a> {
     root: &'a OwnedProcessGroup,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    members: HashMap<u32, (String, platform::ProcessHandle)>,
+    members: HashMap<u32, platform::ProcessHandle>,
 }
 
 impl<'a> OwnedProcessTree<'a> {
@@ -434,8 +434,15 @@ impl<'a> OwnedProcessTree<'a> {
         self.root.exited()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
+            let root = PrimeProcessIdentity {
+                pid: self.root.id(),
+                start_id: String::new(),
+            };
+            let samples = platform::owned_process_tree_samples(self.root)?;
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+            // Prune after sampling so an observed replacement cannot hide behind an exited handle.
             let mut failure = None;
-            self.members.retain(|_, (_, handle)| {
+            self.members.retain(|_, handle| {
                 if failure.is_some() {
                     return true;
                 }
@@ -450,31 +457,15 @@ impl<'a> OwnedProcessTree<'a> {
             if let Some(error) = failure {
                 return Err(error);
             }
-            let root = PrimeProcessIdentity {
-                pid: self.root.id(),
-                start_id: String::new(),
-            };
-            let samples = platform::owned_process_tree_samples(self.root)?;
-            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
             for (sample, selected) in samples.into_iter().zip(selected) {
                 let identity = sample.identity;
-                if !selected || identity.pid == root.pid {
+                if !selected || identity.pid == root.pid || self.members.contains_key(&identity.pid)
+                {
                     continue;
                 }
-                if let Some((start_id, handle)) = self.members.get(&identity.pid) {
-                    if start_id == &identity.start_id {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        handle.physically_exited()?,
-                        "owned descendant {} changed identity before settlement",
-                        identity.pid
-                    );
-                    self.members.remove(&identity.pid);
-                }
-                if let Some(handle) = platform::ProcessHandle::capture_owned(&identity)? {
-                    self.members
-                        .insert(identity.pid, (identity.start_id, handle));
+                if let Some(handle) = platform::ProcessHandle::capture_owned(&identity, self.root)?
+                {
+                    self.members.insert(identity.pid, handle);
                 }
             }
             Ok(())
@@ -488,9 +479,10 @@ impl<'a> OwnedProcessTree<'a> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             settle_process_handles(
-                self.members.values().map(|(_, handle)| handle),
+                self.members.values(),
                 grace,
                 platform::ProcessHandle::physically_exited,
+                platform::ProcessHandle::signal_owned,
             )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1649,6 +1641,7 @@ impl CapturedProcessTree {
                 self.handles.iter().flatten(),
                 grace,
                 platform::ProcessHandle::exited,
+                |handle, signal, _| handle.signal(signal),
             )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1664,12 +1657,13 @@ fn settle_process_handles<'a>(
     handles: impl Iterator<Item = &'a platform::ProcessHandle> + Clone,
     grace: Duration,
     exited: impl Fn(&platform::ProcessHandle) -> anyhow::Result<bool>,
+    signal: impl Fn(&platform::ProcessHandle, i32, Instant) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    for handle in handles.clone() {
-        handle.signal(libc::SIGTERM)?;
-    }
     let term_deadline = Instant::now() + grace;
     let kill_deadline = term_deadline + Duration::from_secs(5);
+    for handle in handles.clone() {
+        signal(handle, libc::SIGTERM, kill_deadline)?;
+    }
     let mut killed = false;
     loop {
         let mut live = false;
@@ -1682,7 +1676,7 @@ fn settle_process_handles<'a>(
         let now = Instant::now();
         if now >= term_deadline && !killed {
             for handle in handles.clone() {
-                handle.signal(libc::SIGKILL)?;
+                signal(handle, libc::SIGKILL, kill_deadline)?;
             }
             killed = true;
         }
@@ -1703,7 +1697,12 @@ pub(crate) fn fence_processes(
                 handles.push(handle);
             }
         }
-        settle_process_handles(handles.iter(), grace, platform::ProcessHandle::exited)
+        settle_process_handles(
+            handles.iter(),
+            grace,
+            platform::ProcessHandle::exited,
+            |handle, signal, _| handle.signal(signal),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

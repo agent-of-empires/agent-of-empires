@@ -126,7 +126,7 @@ fn stage(
                         .is_some()
                     {
                         let retained = staging.keep();
-                        tracing::error!(path = %retained.display(), %error, "plugin staging retained for recovery");
+                        tracing::error!(target: "plugin.install", path = %retained.display(), %error, "plugin staging retained for recovery");
                     }
                     return Err(error);
                 }

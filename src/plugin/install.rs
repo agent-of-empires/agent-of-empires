@@ -86,15 +86,16 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
             }
             Err(path_error) => {
                 RECOVERY_STATE.lock().unknown_root = true;
-                tracing::error!(%path_error, "plugin recovery root unavailable; manual recovery is required before restarting");
+                tracing::error!(target: "plugin.install", %path_error, "plugin recovery root unavailable; manual recovery is required before restarting");
                 None
             }
         };
-        let cause = format!("{error:#}\n");
-        tracing::error!(error = %cause.trim_end(), "plugin mutation ownership retained for recovery");
+        let mut cause = crate::logging::redact(&format!("{error:#}"));
+        tracing::error!(target: "plugin.install", error = %cause, "plugin mutation ownership retained for recovery");
+        cause.push('\n');
         if let Some(marker) = marker {
             if let Err(persist_error) = std::fs::write(marker, cause) {
-                tracing::error!(%persist_error, "plugin recovery marker could not be persisted; manual recovery is required before restarting");
+                tracing::error!(target: "plugin.install", %persist_error, "plugin recovery marker could not be persisted; manual recovery is required before restarting");
             }
         }
     }
@@ -2928,6 +2929,63 @@ else:
             .unwrap()
             .contains("building acme.budget"));
         assert!(begin_operation().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_diagnostics_redact_both_filtered_trace_and_marker() {
+        for persist in [true, false] {
+            let _home = isolate_app_dir();
+            let root = crate::session::get_app_dir().unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let marker = root.join(".plugin-recovery-required");
+            if !persist {
+                std::fs::create_dir(&marker).unwrap();
+            }
+            let logs = tempfile::NamedTempFile::new().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter("off,plugin.install=error")
+                .with_ansi(false)
+                .with_writer(logs.reopen().unwrap())
+                .finish();
+            let result: Result<()> = Err(super::super::execution::RecoveryRequired(
+                "command-pid=42 termination unproven".into(),
+            )
+            .into());
+            let result = result.context(
+                "build https://alice:private-password@example.test/?token=private-token ghp_privatebaretoken",
+            );
+            tracing::subscriber::with_default(subscriber, || log_recovery(&result));
+            let trace = std::fs::read_to_string(logs.path()).unwrap();
+            assert!(
+                trace.contains("command-pid=42") && trace.contains("[REDACTED]"),
+                "{trace}"
+            );
+            for secret in [
+                "alice",
+                "private-password",
+                "private-token",
+                "ghp_privatebaretoken",
+            ] {
+                assert!(!trace.contains(secret), "{trace}");
+            }
+            if persist {
+                let saved = std::fs::read_to_string(&marker).unwrap();
+                assert!(
+                    saved.contains("command-pid=42") && saved.contains("[REDACTED]"),
+                    "{saved}"
+                );
+                for secret in [
+                    "alice",
+                    "private-password",
+                    "private-token",
+                    "ghp_privatebaretoken",
+                ] {
+                    assert!(!saved.contains(secret), "{saved}");
+                }
+            }
+            assert!(check_recovery_evidence().is_err());
+        }
     }
 
     #[tokio::test]

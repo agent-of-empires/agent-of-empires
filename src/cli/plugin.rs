@@ -451,7 +451,9 @@ async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
                     if !response.log.tail.is_empty() {
                         eprintln!("{}", response.log.tail);
                     }
-                    eprintln!("Full log on Daemon host: {}", response.log.path);
+                    if !response.log.path.is_empty() {
+                        eprintln!("Full log on Daemon host: {}", response.log.path);
+                    }
                     bail!("Plugin job {id} failed: {error}");
                 }
             }
@@ -573,6 +575,62 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             serve.abort();
             let _ = serve.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn older_job_logs_preserve_running_and_terminal_outcomes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for failed in [false, true] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            let router = Router::new()
+                .route("/api/sessions", get(|| async { Json(serde_json::json!([])) }))
+                .route("/api/plugins/jobs/legacy-job", get(move || {
+                    let polls = observed.clone();
+                    async move {
+                        let running = polls.fetch_add(1, Ordering::SeqCst) == 0;
+                        let status = if running {
+                            serde_json::json!({"state":"running"})
+                        } else if failed {
+                            serde_json::json!({"state":"failed","error":"legacy-build-failure"})
+                        } else {
+                            serde_json::json!({"state":"succeeded"})
+                        };
+                        Json(serde_json::json!({
+                            "job": {
+                                "id":"legacy-job", "kind":"update", "target":"acme.legacy",
+                                "status":status, "started_at":1, "finished_at":if running {None} else {Some(2)},
+                            },
+                            "log": {
+                                "exists":true, "tail":"legacy-build-output",
+                                "lines_returned":1, "truncated":false,
+                            },
+                        }))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _endpoint = crate::session::test_support::EnvGuard::set(&[
+                ("AOE_DAEMON_URL", format!("http://{address}")),
+                ("AOE_DAEMON_TOKEN", String::new()),
+                ("AOE_DAEMON_PASSPHRASE", String::new()),
+            ]);
+            let endpoint = crate::acp::client::require_daemon().await.unwrap();
+            let client = HttpClient::new(endpoint).unwrap();
+            let result = observe_job(&client, "legacy-job").await;
+            server.abort();
+            let _ = server.await;
+            if failed {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("legacy-build-failure"), "{error}");
+                assert!(!error.contains("outcome unknown"), "{error}");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
         }
     }
 

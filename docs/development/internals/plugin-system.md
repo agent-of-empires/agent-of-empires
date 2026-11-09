@@ -28,9 +28,13 @@ Sources are local paths or GitHub references. Installation stages content in the
 budget across Git and approved builds. A private spawn-only owned-child wrapper
 keeps the direct child unreaped, reserving its original PGID through settlement.
 Its ephemeral descendant tree borrows that custody instead of requiring a
-historical root audit token across exec. Descendants retain their native signal
-authority; token obsolescence is not physical exit. Recovered trees and runners
-remain birth-bound. Physically exited history is pruned through a PID index.
+historical root audit token across exec. Owned macOS descendants retain the
+kernel's exec-stable physical birth ID after parent-birth ancestry proof.
+Observation distinguishes that birth from the execution token; each signal
+checks a fresh audit token against the retained birth. Previously admitted
+escaped descendants remain owned across exec. Recovered trees and runners
+keep their original identity fences. Physically exited history is pruned
+through a PID index.
 Tree and target metadata roll back together; the old tree remains until config
 and lock writes commit. Unproven settlement/restoration or post-commit backup
 cleanup retains exclusion, evidence and an in-process recovery fence, including
