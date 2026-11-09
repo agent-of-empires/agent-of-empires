@@ -13770,16 +13770,18 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 let prepared = if explicit {
                     None
                 } else {
-                    crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                    Some(crate::server::acp_reconciler::resolve_continuation(&state, &id)
                         .await
-                        .unwrap()
+                        .unwrap())
                 };
                 let generation = row.lifecycle_generation + u64::from(case == "superseded");
+                let submission = state.session_service.prompt_submission(&id).await;
                 let selected = lifecycle::continue_interrupted_prompt(
-                    &state, &id, generation, resets_at, explicit, prepared,
+                    &state, &id, generation, resets_at, explicit, &submission, prepared,
                 )
                 .await
                 .unwrap();
+                drop(submission);
                 match case {
                     "parked" => {
                         assert!(
@@ -13839,17 +13841,17 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
                 .find(|row| row.id == id)
                 .unwrap()
                 .lifecycle_generation;
-            let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
-                .await
-                .unwrap();
             let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
             let mut barrier = state.session_service.arm_install_barrier();
             let helper = {
                 let state = state.clone();
                 let id = id.clone();
                 tokio::spawn(async move {
+                    let submission = state.session_service.prompt_submission(&id).await;
+                    let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                        .await.unwrap();
                     lifecycle::continue_interrupted_prompt(
-                        &state, &id, generation, resets_at, false, prepared,
+                        &state, &id, generation, resets_at, false, &submission, Some(prepared),
                     )
                     .await
                 })
@@ -13903,7 +13905,7 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
                 .await
                 .unwrap();
             assert!(
-                prepared.is_some(),
+                prepared.prompt.is_some(),
                 "the actual interrupted request must be recoverable"
             );
             let budget = state
@@ -13919,15 +13921,18 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
                  BEGIN SELECT RAISE(ABORT, 'forced quota breadcrumb write failure'); END;",
                 )
                 .unwrap();
+            let submission = state.session_service.prompt_submission(&id).await;
             let result = lifecycle::continue_interrupted_prompt(
                 &state,
                 &id,
                 row.lifecycle_generation,
                 chrono::Utc::now(),
                 false,
-                prepared,
+                &submission,
+                Some(prepared),
             )
             .await;
+            drop(submission);
             assert!(matches!(
                 result,
                 Err(crate::acp::supervisor::SupervisorError::NativeStoreUnavailable)

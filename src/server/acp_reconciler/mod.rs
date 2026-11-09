@@ -22,7 +22,7 @@ use crate::session::Instance;
 #[cfg(test)]
 pub(crate) use rate_limit::install_rate_limit_continuation;
 pub(crate) use rate_limit::{
-    install_prepared_continuation, resolve_continuation, ContinuationOutcome,
+    install_prepared_continuation, resolve_continuation, ContinuationOutcome, PreparedContinuation,
 };
 pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::ensure_rate_limit_worker;

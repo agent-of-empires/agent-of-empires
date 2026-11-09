@@ -122,7 +122,7 @@ An indeterminate creation still finalizes its idempotency key: its durable statu
 
 Post-hook creation failures release namespace, submission and mutation guards before rollback cleanup re-enters them.
 
-An ACP account restart keeps its quota breadcrumb and interrupted-turn selection inside the same prompt-submission guard.
+An ACP account restart captures the qualified original quota state and interrupted-turn selection before retiring its worker. It publishes the quota breadcrumb under the current generation and prompt-submission guard before installing either a replacement worker or a pending turn. A failed journal write preserves existing pending intent and cannot create a new pending turn, install a worker or authorize autonomous input.
 
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 

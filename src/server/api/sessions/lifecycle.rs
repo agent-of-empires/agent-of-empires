@@ -2878,6 +2878,11 @@ fn reserve_structured_restart(
     Ok((native, reserved, binding))
 }
 
+struct PreparedQuotaRestart {
+    resets_at: chrono::DateTime<chrono::Utc>,
+    continuation: Option<crate::server::acp_reconciler::PreparedContinuation>,
+}
+
 struct StructuredRestartLaunch {
     generation: u64,
     started: Instance,
@@ -2889,6 +2894,7 @@ struct StructuredRestartLaunch {
     wake: Option<String>,
     reservation: Option<crate::acp::supervisor::ResumeReservation>,
     reason: &'static str,
+    quota: Option<PreparedQuotaRestart>,
 }
 
 /// Without auto-resume a terminal launch starts a fresh conversation and still reports success,
@@ -2931,9 +2937,9 @@ pub(super) async fn continue_interrupted_prompt(
     generation: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     explicit_wake: bool,
-    prepared: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
+    submission: &tokio::sync::OwnedMutexGuard<()>,
+    prepared: Option<crate::server::acp_reconciler::PreparedContinuation>,
 ) -> Result<bool, crate::acp::supervisor::SupervisorError> {
-    let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
             && row.lifecycle_generation == generation
@@ -2951,7 +2957,6 @@ pub(super) async fn continue_interrupted_prompt(
     if explicit_wake {
         // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
         // now newer work may have been installed, and it must survive.
-        drop(submission);
         return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
@@ -2965,8 +2970,8 @@ pub(super) async fn continue_interrupted_prompt(
     let outcome = crate::server::acp_reconciler::install_prepared_continuation(
         state,
         id,
-        &submission,
-        prepared,
+        submission,
+        prepared.ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?,
     )
     .await?;
     Ok(pending_before
@@ -2999,24 +3004,10 @@ async fn finish_structured_restart(
             wake,
             reservation,
             reason: _,
+            quota,
         } = launch;
-        // Read before the spawn: the new worker's session assignment retires the park.
-        let resumes_rate_limit = if account_swap {
-            match crate::server::api::acp::rate_limit_resume_probe(state, id).await? {
-                crate::acp::event_store::ControlKnowledge::Known(marker) => marker,
-                crate::acp::event_store::ControlKnowledge::Indeterminate => {
-                    return Err(crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into());
-                }
-            }
-        } else {
-            None
-        };
+        let quota = if account_swap { quota } else { None };
         let wake_requested = wake.is_some();
-        let prepared_continuation = if resumes_rate_limit.is_some() && !wake_requested {
-            crate::server::acp_reconciler::resolve_continuation(state, id).await?
-        } else {
-            None
-        };
         let mut reservation = match reservation {
             Some(reservation) => reservation,
             None => supervisor.reserve_spawn(id, crate::acp::supervisor::ResumeKind::Spawn,
@@ -3089,7 +3080,14 @@ async fn finish_structured_restart(
     .await??;
         // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
         // under the submission authority, so the new worker cannot drain it before the wake.
-        discard_stale_continuation(state, id, resumes_rate_limit.is_some(), wake_requested).await;
+        discard_stale_continuation(state, id, quota.is_some(), wake_requested).await;
+        let continued = match quota {
+            Some(prepared) => continue_interrupted_prompt(
+                state, id, generation, prepared.resets_at, wake_requested,
+                &submission, prepared.continuation,
+            ).await?,
+            None => false,
+        };
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -3129,14 +3127,6 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
-        let continued = match resumes_rate_limit {
-            Some(resets_at) => {
-                continue_interrupted_prompt(
-                    state, id, generation, resets_at, wake_requested, prepared_continuation,
-                ).await?
-            }
-            None => false,
-        };
         let wake = if continued { String::new() } else { wake };
         if !wake.is_empty() {
             let state = state.clone();
@@ -3419,6 +3409,38 @@ async fn prepare_agent_session_inner(
         }
         _ => {}
     }
+    let quota = if let Some(body) = restart.as_ref().filter(|body| {
+        instance.is_structured() && body.tool.as_deref().is_some_and(|tool|
+            tool != instance.tool && matches!(
+                crate::session::conversation_carry::classify(
+                    &instance, body.profile.as_deref().unwrap_or(&instance.source_profile), tool,
+                ),
+                crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+            ))
+    }) {
+        let marker = match crate::server::api::acp::rate_limit_resume_probe(&state, &id).await {
+            Ok(crate::acp::event_store::ControlKnowledge::Known(marker)) => marker,
+            Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) =>
+                return structured_lifecycle_error(&state, crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into()),
+            Err(error) => return structured_lifecycle_error(&state, error.into()),
+        };
+        match marker {
+            Some(resets_at) => {
+                let continuation = if body.wake_message.is_some() {
+                    None
+                } else {
+                    match crate::server::acp_reconciler::resolve_continuation(&state, &id).await {
+                        Ok(prepared) => Some(prepared),
+                        Err(error) => return structured_lifecycle_error(&state, error.into()),
+                    }
+                };
+                Some(PreparedQuotaRestart { resets_at, continuation })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let mut resume_reservation = None;
     if instance.is_structured()
         && matches!(restart_origin, RestartOrigin::Explicit)
@@ -3913,6 +3935,7 @@ async fn prepare_agent_session_inner(
                     wake: requested_wake_message,
                     reservation: resume_reservation,
                     reason,
+                    quota,
                 },
             )
             .await;
