@@ -73,8 +73,8 @@ pub struct NamedVolumeMount {
     pub container_path: String,
 }
 
-/// `Inherit` passes the value through the process environment (`-e KEY`) so secrets stay
-/// out of `ps`; `Literal` emits `-e KEY=VALUE`.
+/// `Inherit` holds a value read from the host and `Literal` one set by configuration; see
+/// [`docker_env_args`] for how each reaches the runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnvEntry {
     Inherit { key: String, value: String },

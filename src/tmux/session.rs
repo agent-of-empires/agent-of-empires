@@ -2423,21 +2423,25 @@ const _: () = assert!(
     SCOPED_LAUNCH_FD != 3 && SCOPED_LAUNCH_FD != crate::session::environment::CONTAINER_EXEC_ENV_FD
 );
 
-/// Set by the launch shell itself, or read-only in it. tmux `-e` could hand
-/// these to a shell that ignored them; a script export would instead pin a
-/// stale `PWD` or abort a POSIX-mode shell.
-const SHELL_OWNED_ENV_KEYS: &[&str] = &[
+/// Set per pane by tmux or by the launch shell. A script export would run after
+/// them, pointing the pane at an outer tmux, pinning a stale `PWD`, or, for the
+/// identity names under zsh, calling `setuid`.
+const PANE_OWNED_ENV_KEYS: &[&str] = &[
     "_",
-    "BASHOPTS",
-    "BASH_VERSINFO",
+    "COLORTERM",
+    "EGID",
     "EUID",
+    "GID",
     "IFS",
     "OLDPWD",
-    "PPID",
     "PWD",
-    "SHELLOPTS",
     "SHLVL",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMUX",
+    "TMUX_PANE",
     "UID",
+    "USERNAME",
 ];
 
 /// Host env pairs as launch-script exports. Values stay off tmux's argv, which
@@ -2445,7 +2449,7 @@ const SHELL_OWNED_ENV_KEYS: &[&str] = &[
 pub(super) fn launch_script_env(pairs: Vec<(String, String)>) -> Vec<PaneEnvMutation> {
     pairs
         .into_iter()
-        .filter(|(key, _)| !SHELL_OWNED_ENV_KEYS.contains(&key.as_str()))
+        .filter(|(key, _)| !PANE_OWNED_ENV_KEYS.contains(&key.as_str()))
         .map(|(key, value)| PaneEnvMutation::set(key, value))
         .collect()
 }
@@ -2495,7 +2499,10 @@ impl EphemeralEnvFile {
             }
             match mutation {
                 PaneEnvMutation::Set { key, value } => {
-                    writeln!(file, "export {}={}", key, shell_escape_script_word(value))?;
+                    // A read-only name aborts zsh and POSIX-mode bash, so try it in a
+                    // subshell first. Builtins only: the value never reaches an argv.
+                    let export = format!("export {}={}", key, shell_escape_script_word(value));
+                    writeln!(file, "if ({export}) 2>/dev/null; then {export}; fi")?;
                 }
                 PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
             }
@@ -5303,10 +5310,19 @@ mod tests {
     }
 
     #[test]
-    fn test_launch_script_env_skips_variables_the_shell_owns() {
+    fn test_launch_script_env_skips_variables_the_pane_owns() {
         let pair = |key: &str| (key.to_string(), "host-value".to_string());
         assert_eq!(
-            launch_script_env(vec![pair("PWD"), pair("UID"), pair("DISPLAY"), pair("_")]),
+            launch_script_env(vec![
+                pair("PWD"),
+                pair("UID"),
+                pair("DISPLAY"),
+                pair("_"),
+                pair("TMUX"),
+                pair("TMUX_PANE"),
+                pair("TERM_PROGRAM"),
+                pair("COLORTERM"),
+            ]),
             [PaneEnvMutation::set(
                 "DISPLAY".to_string(),
                 "host-value".to_string()
@@ -5364,6 +5380,39 @@ mod tests {
         }
         drop(file);
         assert!(!path.exists(), "failure guard must clean up the channel");
+    }
+
+    #[test]
+    fn test_protected_env_file_survives_read_only_names_in_every_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        for shell in ["sh", "bash", "zsh"] {
+            let Ok(shell) = which::which(shell) else {
+                continue;
+            };
+            let shell = shell.to_string_lossy().into_owned();
+            let _env = crate::session::test_support::EnvGuard::set(&[("SHELL", shell.as_str())]);
+            let output = temp.path().join("seen");
+            let mut file = EphemeralEnvFile::create(
+                &["PPID", "ARGC", "status", "path", "GOOD_VALUE"]
+                    .map(|key| PaneEnvMutation::set(key.to_string(), "9".to_string())),
+                &[],
+            )
+            .unwrap();
+            let command = format!(
+                "printf '%s' \"$GOOD_VALUE\" > {}",
+                shell_escape_script_word(&output.to_string_lossy())
+            );
+            let wrapper = file.wrap_command(Some(&command), None).unwrap();
+            let run = std::process::Command::new("sh")
+                .args(["-c", &wrapper])
+                .output()
+                .unwrap();
+            assert!(run.status.success(), "{shell}: {run:?}");
+            assert_eq!(std::fs::read_to_string(&output).unwrap(), "9", "{shell}");
+            assert!(file.wait_until_consumed(Duration::ZERO), "{shell}");
+            file.disarm();
+            std::fs::remove_file(output).unwrap();
+        }
     }
 
     #[test]
