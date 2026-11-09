@@ -383,7 +383,8 @@ impl PaneBirthInventory {
                 .binary_search_by(|old| old.identity.pane_id.cmp(&pane.identity.pane_id))
                 .ok()
                 .map(|index| &prior.panes[index]);
-            anyhow::ensure!(pane.birth.is_some() && old.is_some_and(|old|
+            // Capture represents a proven dead pane with None; live panes require a birth.
+            anyhow::ensure!(old.is_some_and(|old|
                 old.identity.pane_pid == pane.identity.pane_pid && old.birth == pane.birth),
                 "unrecorded terminal birth may still exist; close its exact pane explicitly in tmux before selecting a target");
         }
@@ -1313,6 +1314,67 @@ mod tests {
     fn attach_return_hint_names_both_keys_inside_tmux() {
         assert_eq!(attach_return_hint_for(true), "L (or d)");
         assert_eq!(attach_return_hint_for(false), "d");
+    }
+
+    #[test]
+    fn birth_inventory_accepts_only_unchanged_preexisting_panes() {
+        let birth = |id: &str| crate::process::ProcessBirthIdentity {
+            boot_id: "inventory-test-boot".into(),
+            start_id: id.into(),
+        };
+        for case in [
+            "dead-with-pid",
+            "dead-without-pid",
+            "dead-pid-changed",
+            "dead-pid-disappeared",
+            "new-pane",
+            "server-birth-changed",
+            "socket-changed",
+            "alive-unchanged",
+            "alive-birth-changed",
+            "alive-to-dead",
+            "dead-to-alive",
+        ] {
+            let alive = case.starts_with("alive-");
+            let prior = PaneBirthInventory {
+                socket: "/tmp/inventory-test.sock".into(),
+                server: Some(crate::session::TmuxServerIdentity {
+                    socket: "/tmp/inventory-test.sock".into(),
+                    pid: 7001,
+                    birth: birth("server"),
+                }),
+                panes: vec![InventoriedPane {
+                    identity: crate::session::LegacyToolIdentity {
+                        session_id: "$1".into(),
+                        pane_id: "%1".into(),
+                        pane_pid: (case != "dead-without-pid").then_some(7002),
+                    },
+                    birth: alive.then(|| birth("pane")),
+                }],
+            };
+            let mut current = prior.clone();
+            match case {
+                "dead-pid-changed" => current.panes[0].identity.pane_pid = Some(7003),
+                "dead-pid-disappeared" => current.panes[0].identity.pane_pid = None,
+                "new-pane" => current.panes[0].identity.pane_id = "%2".into(),
+                "server-birth-changed" => {
+                    current.server.as_mut().unwrap().birth = birth("other-server")
+                }
+                "socket-changed" => current.socket.push_str("-other"),
+                "alive-birth-changed" => current.panes[0].birth = Some(birth("other-pane")),
+                "alive-to-dead" => current.panes[0].birth = None,
+                "dead-to-alive" => current.panes[0].birth = Some(birth("pane")),
+                _ => {}
+            }
+            assert_eq!(
+                current.ensure_only_preexisting_live_panes(&prior).is_ok(),
+                matches!(
+                    case,
+                    "dead-with-pid" | "dead-without-pid" | "alive-unchanged"
+                ),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -2399,6 +2461,26 @@ mod pane_probe_tests {
         );
         assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "1");
         assert!(session.exists_live());
+
+        // A corpse that already existed in both complete inventories is not a
+        // new birth, and still cannot be consumed by the old live receipt.
+        let prior = capture_pane_birth_inventory(
+            Some(&expected.server.socket),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap();
+        let dead = prior
+            .panes
+            .iter()
+            .find(|pane| pane.identity.pane_id == expected.identity.pane_id)
+            .expect("the existing corpse remains in the complete inventory");
+        assert!(dead.birth.is_none());
+        let current = capture_pane_birth_inventory(
+            Some(&expected.server.socket),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap();
+        current.ensure_only_preexisting_live_panes(&prior).unwrap();
     }
 
     #[test]
