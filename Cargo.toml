@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.22.2"
+version = "1.22.3"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Agent of Empires Contributors"]
@@ -200,6 +200,10 @@ schemars = { version = "1", features = ["chrono04"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
