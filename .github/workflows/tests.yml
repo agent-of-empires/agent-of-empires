@@ -126,7 +126,7 @@ jobs:
           cargo test --features web,e2e-tests \
             --test integration -- daemon_core_web_optional plugin_install
           cargo test --features web,e2e-tests --lib -- \
-            server::assets:: tui::dialogs::serve::qr_seam
+            server::assets:: tui::dialogs::serve::tests::held_work_leaves_keys_clicks_ticks_and_render_usable
       # macOS reaches its per-user temp root through a symlink, so a test that
       # compares `TempDir::path()` against a path that has been through
       # `canonicalize()` or a reported cwd passes on Linux and fails there.
