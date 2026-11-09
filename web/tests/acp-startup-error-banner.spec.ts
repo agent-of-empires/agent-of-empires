@@ -56,7 +56,7 @@ test("Use Terminal view confirms through the switch-view dialog, in keyboard ord
   // The banner only opens the confirmation; the switch waits for it.
   expect(disables).toEqual([]);
   const capture = testInfo.outputPath("runtime-startup-refusal-terminal-confirmation.png");
-  await page.screenshot({ path: capture, fullPage: true });
+  await page.screenshot({ path: capture, fullPage: true, animations: "disabled" });
   await testInfo.attach("runtime-startup-refusal-terminal-confirmation", { path: capture, contentType: "image/png" });
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(dialog).toBeHidden();
