@@ -218,21 +218,7 @@ test("account swap refuses a failed durable quota breadcrumb without replaying N
   const row = async () => (await listSessions(serve.baseUrl)).find((entry) => entry.id === sessionId)!;
   const before = await row();
   expect(typeof before.acp_session_id).toBe("string");
-  await expect.poll(async () => (await row()).agent_session_id).toBe(before.acp_session_id);
-  const nativeLog = () => readFileSync(join(serve.home, "fake-acp.log"), "utf8");
-  const inputs = () =>
-    nativeLog()
-      .split("\n")
-      .filter((line) => line.includes("session/prompt prompt="))
-      .map((line) => JSON.parse(line.split("session/prompt prompt=")[1]!));
-  expect(inputs()).toEqual([[expect.objectContaining({ type: "text", text: original })]]);
   const app = appDirFor(serve.home, serve.env.XDG_CONFIG_HOME!, process.env.AOE_E2E_BINARY!);
-  const dbPath = join(app, "acp_events.db");
-  expect(existsSync(dbPath)).toBe(true);
-  const db = new DatabaseSync(dbPath);
-  const originalRows = db
-    .prepare("SELECT seq,event_json FROM acp_events WHERE session_id=? ORDER BY seq")
-    .all(sessionId);
   const stored = () => {
     const profiles = join(app, "profiles");
     const records = readdirSync(profiles).flatMap((profile) => {
@@ -246,6 +232,33 @@ test("account swap refuses a failed durable quota breadcrumb without replaying N
     expect(record).toBeDefined();
     return record!;
   };
+  expect(before.context_resume).toMatchObject({ state: "available" });
+  await expect.poll(stored).toMatchObject({
+    acp_session_id: before.acp_session_id,
+    agent_session_binding: {
+      session_id: before.acp_session_id,
+      provenance: "observed",
+      execution: {
+        agent: "claude",
+        filesystem: "host",
+        cwd: before.project_path,
+        stores: [join(serve.home, ".claude")],
+      },
+    },
+  });
+  const nativeLog = () => readFileSync(join(serve.home, "fake-acp.log"), "utf8");
+  const inputs = () =>
+    nativeLog()
+      .split("\n")
+      .filter((line) => line.includes("session/prompt prompt="))
+      .map((line) => JSON.parse(line.split("session/prompt prompt=")[1]!));
+  expect(inputs()).toEqual([[expect.objectContaining({ type: "text", text: original })]]);
+  const dbPath = join(app, "acp_events.db");
+  expect(existsSync(dbPath)).toBe(true);
+  const db = new DatabaseSync(dbPath);
+  const originalRows = db
+    .prepare("SELECT seq,event_json FROM acp_events WHERE session_id=? ORDER BY seq")
+    .all(sessionId);
   expect(stored().pending_initial_turn).toBeUndefined();
   db.exec(
     `CREATE TRIGGER quota_breadcrumb_io_failure BEFORE INSERT ON acp_events
