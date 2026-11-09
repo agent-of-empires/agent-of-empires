@@ -121,6 +121,16 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
     let mut project_override_cache = ProjectRegistryCache::new();
     let acp_registry = crate::acp::AgentRegistry::with_defaults();
+    let worker_agent_keys = state
+        .acp_supervisor
+        .worker_agent_keys(
+            scoped_instances
+                .iter()
+                .filter(|inst| inst.is_structured())
+                .map(|inst| inst.id.clone())
+                .collect(),
+        )
+        .await;
 
     // Overlay custom-agent ACP capability; built-ins were resolved in the
     // constructor. Distinct `(profile, project_path)` pairs resolve once via
@@ -140,8 +150,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
         if inst.is_structured() {
             use crate::acp::supervisor::SessionAgent;
-            let agent = match state.acp_supervisor.worker_agent_key(&inst.id).await {
-                Some(key) => SessionAgent::Worker(key),
+            let agent = match worker_agent_keys.get(&inst.id) {
+                Some(key) => SessionAgent::Worker(key.clone()),
                 None => SessionAgent::Next {
                     tool: inst.tool.clone(),
                     explicit: inst.agent_name.clone(),

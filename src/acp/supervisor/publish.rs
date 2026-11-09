@@ -257,6 +257,42 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.worker_agent(session_id).await.map(|(key, ..)| key)
     }
 
+    /// [`Self::worker_agent_key`] for each of `session_ids` that has one, under one workers lock,
+    /// reading registry records off the runtime.
+    pub(crate) async fn worker_agent_keys(
+        &self,
+        session_ids: Vec<String>,
+    ) -> std::collections::HashMap<String, String> {
+        let mut keys = std::collections::HashMap::new();
+        let mut unresolved = Vec::new();
+        {
+            let workers = self.workers.lock().await;
+            for id in session_ids {
+                match workers.get(&id).map(|handle| &handle.kind) {
+                    Some(WorkerKind::Runner { spawn_config }) => {
+                        keys.insert(id, spawn_config.agent_key.clone());
+                    }
+                    _ => unresolved.push(id),
+                }
+            }
+        }
+        let recorded = tokio::task::spawn_blocking(move || {
+            unresolved
+                .into_iter()
+                .filter_map(|id| match crate::process::worker_registry::load(&id) {
+                    Ok(Some(record)) if !record.agent_key.is_empty() => {
+                        Some((id, record.agent_key))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        keys.extend(recorded);
+        keys
+    }
+
     /// The session's agent registry key, else `claude` for records that predate the key.
     pub(super) async fn agent_key_for_session(&self, session_id: &str) -> String {
         self.worker_agent_key(session_id)

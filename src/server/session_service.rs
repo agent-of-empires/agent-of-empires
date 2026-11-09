@@ -2261,7 +2261,7 @@ impl SessionService {
                     tool: inst.tool.clone(),
                     explicit: inst.agent_name.clone(),
                 },
-                inst.effective_profile(),
+                inst.source_profile.clone(),
                 std::path::PathBuf::from(&inst.project_path),
             )
         };
