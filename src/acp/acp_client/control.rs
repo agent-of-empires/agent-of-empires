@@ -2368,6 +2368,7 @@ pub(super) fn prompt_outcome_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::event_sender::EventScope;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
