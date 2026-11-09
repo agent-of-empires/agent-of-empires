@@ -575,6 +575,12 @@ reservation returns `409`, and a missing conversation or incompatible provider
 returns `400`. CityHall mode refuses canonical forks with `403`. An idempotent
 replay still succeeds when the parent row has since been removed.
 
+At creation admission, an `import_acp_session_id` found already owned is refused
+with `400 create_failed` and the safe message “Import source is already owned by
+an AoE session”. Frozen cleanup ownership covers all tools' current and parked
+ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
+remain sanitized rather than exposing their internal causes.
+
 **Worktree fields**
 
 | Field | Notes |
@@ -737,6 +743,11 @@ Each page binds its events, coverage, and identity to one database snapshot.
 A mismatched identity returns `409`: discard the staged pages and restart the
 read. Keep the previous complete transcript visible if the replacement read fails.
 
+Raw retained pages preserve the scanned rows and cursor; backward pages need not
+start at a turn boundary. Keep reducer state across forward retained pages.
+Ordinary backward replay, including `view=rows`, still trims a leading partial
+turn when older rows remain.
+
 ## Native session freshness and disconnection
 
 The Daemon owns native session status. The experimental TUI consumes its
@@ -880,15 +891,28 @@ Send all original consent fields: `expected_profile`, `expected_generation`,
 `409 lifecycle_superseded`; a fresh lifecycle owner or an already admitted orphan
 cleanup returns `409 lifecycle_locked`. Completed Trash and failed-purge records
 are not eligible.
-Keep the original native runtime epoch with the consent fields. A replacement
-runtime requires fresh confirmation.
+Send exactly one `aoe-runtime-epoch` header matching the native runtime that
+issued the consent fields. Missing, duplicate, or stale epochs return
+`409 runtime_epoch_mismatch` before mutation admission. A replacement runtime
+requires fresh confirmation.
 
 Before removing the visible row, the daemon durably retains its original runtime
 evidence and cleanup protection. This ownership does not authorize purge recovery,
 hooks, process termination, filesystem deletion, or resource reclamation. Later
 purge attempts cannot bypass it if removal of the visible row was interrupted.
+A retry after journal commit but before row removal reuses the original retained
+owner for the same profile, generation and Trash operation. It does not capture
+new resources or append another owner; conflicting retained authority is refused.
+
 Other sessions cannot adopt its captured current or parked native conversations.
 Retained ownership blocks profile rename/deletion, even after the row is gone.
+The retained fence also covers later conversation IDs published in the original,
+attested agent/filesystem/history-store namespace. Unknown namespace evidence
+fails closed; proven distinct stores remain independent. The fence has no TTL
+and is not released merely because a publisher PID is absent. Retry, Restore,
+and native launch refuse an interrupted visible row with a committed retained
+tombstone. These conflicts return the finite `native_conversation_retained`
+error code and do not stop runtimes or reveal retained metadata.
 The session cannot be restored through Trash afterward.
 
 Success returns `204` with a native runtime cursor. Refresh the canonical session

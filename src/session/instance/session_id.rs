@@ -1282,6 +1282,7 @@ mod tests {
         const SID: &str = "11111111-2222-4333-8444-555555555555";
         let root = tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile_path =
             crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();

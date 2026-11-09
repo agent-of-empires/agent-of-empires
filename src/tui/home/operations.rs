@@ -844,6 +844,14 @@ impl HomeView {
     }
     /// Preserve the shelf's collapsed state; teardown and relocation remain daemon-owned.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
+            self.flash_status("Runtime unavailable; reopen Trash controls");
+            return;
+        };
+        self.trash_session_by_id_at_epoch(id, epoch);
+    }
+
+    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())
@@ -851,10 +859,6 @@ impl HomeView {
             return;
         };
         let generation = instance.lifecycle_generation;
-        let Some(expected_epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
-            self.flash_status("Runtime unavailable; reopen Trash controls");
-            return;
-        };
         let profile = instance.source_profile.clone();
         if let Err(error) = self.session_feed.submit_request(
             id.to_owned(),

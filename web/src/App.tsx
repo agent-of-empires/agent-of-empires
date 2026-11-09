@@ -40,7 +40,7 @@ import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntrie
 import { buildPluginPageActions } from "./lib/pluginPages";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -104,7 +104,6 @@ import {
   setSessionArchive,
   setSessionSnooze,
   trashSession,
-  restoreSession,
   retryTrashSession,
   forgetTrashRecord,
   fetchPlugins,
@@ -453,12 +452,17 @@ function AppContent({
         ),
     });
   }, [injectSession, focusMode]);
-  // Trash is a whole-workspace concern, so it is derived here from the
-  // authoritative unsliced workspace list rather than reconstructed from the
-  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
-  // every one of its sessions is trashed, and Restore/Delete then cover all of
-  // them. See #2533.
-  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+  // A mixed workspace exposes only its trashed sessions in recovery controls.
+  const trashedWorkspaces = useMemo(
+    () =>
+      workspaces
+        .map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.filter((session) => session.trashed_at != null),
+        }))
+        .filter((workspace) => workspace.sessions.length > 0),
+    [workspaces],
+  );
   // The list omits the trash, so a link to a trashed session finds no row until the trash is loaded.
   const openedSessionId = focusSessionId ?? activeSessionId;
   useEffect(() => {
@@ -1401,12 +1405,10 @@ function AppContent({
     });
   };
 
-  // Restore a trashed workspace from the sidebar Trash section (#2489).
-  // Restores every session in the workspace (a workspace only lands in Trash
-  // when all of its sessions are trashed), not just the first.
+  // Restore only the trashed sessions supplied by the recovery surface.
   const handleRestoreSession = useCallback(
-    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
-    [applySession],
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySessionMutation, notify: toastBus.handler }),
+    [applySessionMutation],
   );
 
   const handleRetryTrash = useCallback(
@@ -1955,6 +1957,10 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
+          if (forgetTrashTarget) {
+            setForgetTrashTarget(null);
+            return true;
+          }
           if (deletingSessions.length > 0) {
             setDeletingSessions([]);
             return;
@@ -1990,6 +1996,7 @@ function AppContent({
         toggleRightDock,
         showPalette,
         deletingSessions,
+        forgetTrashTarget,
         stoppingSessionId,
         showSettings,
         handleCloseSettings,
@@ -2006,30 +2013,29 @@ function AppContent({
     serverAboutLoaded,
   );
 
-  // Palette triage toggles for the active session. "snooze" needs a duration,
-  // so it opens the shared modal; the rest are argless server toggles that
-  // apply the returned snapshot immediately (re-bucketing without waiting for
-  // the poll) and surface a toast on failure.
   const handleSessionStateAction = useCallback(
     async (id: string, action: SessionStateAction) => {
       if (action === "snooze") {
         setSnoozeTargetId(id);
         return;
       }
-      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+      if (action === "untrash") {
+        await handleRestoreSession([id]);
+        return;
+      }
+      const run: Record<Exclude<SessionStateAction, "snooze" | "untrash">, () => Promise<SessionResponse | null>> = {
         pin: () => setSessionPin(id, true),
         unpin: () => setSessionPin(id, false),
         archive: () => setSessionArchive(id, true),
         unarchive: () => setSessionArchive(id, false),
         unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
-        untrash: () => restoreSession(id),
       };
       const result = await run[action]();
       if (result) applySession(result);
       else reportError(`Failed to ${action} session`);
     },
-    [applySession],
+    [applySession, handleRestoreSession],
   );
 
   const commandActions = useCommandActions({
@@ -2548,6 +2554,7 @@ function AppContent({
     !showHelp &&
     !showAbout &&
     !showPalette &&
+    !forgetTrashTarget &&
     !projectForm;
   // First-run theme choice is phase one of onboarding. It decides on the same
   // settled-dashboard gate as the tour, then the tour follows once the modal

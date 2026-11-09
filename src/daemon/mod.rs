@@ -192,6 +192,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::TrashIncomplete) => {
             "Trash is in progress or unfinished; if interrupted, retry `aoe rm <id>` before another lifecycle action".into()
         }
+        Some(ApiErrorCode::NativeConversationRetained) => {
+            "Conversation belongs to retained cleanup ownership. Use a proven separate native store; restarting the daemon or stopping the old process does not release ownership.".into()
+        }
         Some(ApiErrorCode::LifecycleSuperseded) => {
             "Session changed after it was selected; it may be partly processed, refresh and check before retrying".into()
         }
@@ -1053,6 +1056,7 @@ impl DaemonClient {
                 Some(
                     ApiErrorCode::LifecycleLocked
                         | ApiErrorCode::TrashIncomplete
+                        | ApiErrorCode::NativeConversationRetained
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::SandboxMigrationDeferred
@@ -1965,6 +1969,30 @@ mod tests {
         );
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
+    }
+
+    #[tokio::test]
+    async fn retained_conversation_refusal_has_safe_actionable_client_feedback() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/{id}/stop", 409,
+            vec![(ERROR_CODE_HEADER, "native_conversation_retained")],
+            r#"{"error":"secret native path /private/retained/store and unrestricted diagnostics"}"#,
+            tx,
+        ).await;
+        let client = DaemonClient::new(&base, None).unwrap();
+        let error = client
+            .mutate_session("retained", &SessionMutation::Stop, "epoch-1")
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, DaemonClientError::Status {
+            code: Some(ApiErrorCode::NativeConversationRetained), body, ..
+        } if body.is_empty()));
+        let message = error.to_string();
+        assert!(message.contains("retained cleanup ownership"), "{message}");
+        assert!(message.contains("separate native store"), "{message}");
+        assert!(!message.contains("/private/"));
+        assert!(!message.contains("unrestricted diagnostics"));
     }
 
     #[tokio::test]

@@ -1156,6 +1156,7 @@ mod tests {
     fn cleared_bare_wrapper_launch_does_not_invent_a_managed_identity() {
         let temp = tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", temp.path().to_path_buf()),
             ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),

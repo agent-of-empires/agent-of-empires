@@ -1440,6 +1440,31 @@ fn trash_management_retry_finishes_or_keeps_unverified_files() {
             .then_some(())
             .ok_or_else(|| format!("unverified retry not settled: {row}"))
     });
+    h.wait_for_processed_mutations();
+    h.send_keys("Escape");
+    trash_management_menu(&mut h, "RetryUnverified");
+    h.send_keys("Enter");
+    crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        let rows = h.read_sessions();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == failed_id)
+            .unwrap();
+        (row["lifecycle_generation"] == failed_generation + 2
+            && row["lifecycle_reservation"]["op"] == "trash")
+            .then_some(())
+            .ok_or_else(|| format!("second unverified retry not settled: {row}"))
+    });
+    h.wait_for_processed_mutations();
+    let before_purge = h.read_sessions();
+    let refused = h.run_cli(&["rm", "--purge", &failed_id]);
+    assert!(
+        !refused.status.success(),
+        "unfinished Trash must not grant purge authority"
+    );
+    assert_eq!(h.read_sessions(), before_purge);
     record_trash_management(&h, "trash-retry-unverified");
     for path in [complete_file, failed_file] {
         assert_eq!(std::fs::read(path).unwrap(), b"retained files");
@@ -1548,6 +1573,7 @@ fn trash_forget_confirmation_rejects_concurrent_retry_before_keyboard_or_mouse_c
             h.send_keys("Left");
             h.send_keys("Enter");
         }
+        h.wait_for_processed_mutations();
         let rows = h.read_sessions();
         let row = rows
             .as_array()
@@ -1625,6 +1651,7 @@ fn trash_forget_confirmation_expires_across_daemon_restart_with_unchanged_row() 
             h.send_keys("Left");
             h.send_keys("Enter");
         }
+        h.wait_for_processed_mutations();
         let rows = h.read_sessions();
         let row = rows
             .as_array()

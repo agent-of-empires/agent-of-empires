@@ -24,7 +24,10 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions, ready = 
 
       if (matched.preventDefault) e.preventDefault();
       if (matched.stopPropagation) e.stopPropagation();
-      getActions()[matched.shortcut.action]();
+      if (getActions()[matched.shortcut.action]() === true) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
     };
 
     // Capture phase: xterm.js stops propagation of Cmd/Ctrl combos.

@@ -127,21 +127,17 @@ pub(crate) fn persist_session_to_storage(
 }
 
 impl Instance {
-    pub(super) fn guard_retained_native_conversation(
+    pub(super) fn check_retained_native_conversation(
         &self,
-        stores: crate::session::storage::CaptureStorage<'_>,
+        storage: &crate::session::Storage,
         session_id: &str,
         source: Option<&crate::session::ExecutionBinding>,
-    ) -> Result<ConversationReadLock> {
-        stores.with_store(&self.source_profile, |storage| {
-            let guard = ConversationReadLock::acquire(storage.storage(), session_id)?;
-            anyhow::ensure!(
-                !CleanupOwners::load_for(storage.storage())?
-                    .blocks_conversation(&self.id, session_id, source),
-                crate::session::purge_owners::ConversationOwnershipRetained
-            );
-            Ok(guard)
-        })
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !CleanupOwners::load_for(storage)?.blocks_conversation(&self.id, session_id, source),
+            crate::session::purge_owners::ConversationOwnershipRetained
+        );
+        Ok(())
     }
 
     /// Consume an explicit OMP resume pin only after the matching launch
@@ -156,6 +152,7 @@ impl Instance {
         if !is_valid_session_id(session_id) {
             return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         }
+        let _conversation_lock = ConversationReadLock::acquire(storage.storage(), session_id)?;
         storage.update(|instances, _groups| {
             let Some(instance) = instances
                 .iter_mut()
@@ -163,6 +160,17 @@ impl Instance {
             else {
                 return Err(LifecycleReservationError::Superseded.into());
             };
+            let source = instance
+                .active_execution
+                .as_ref()
+                .map(|execution| &execution.binding);
+            if CleanupOwners::load_for(storage.storage())?.blocks_conversation(
+                instance_id,
+                session_id,
+                source,
+            ) {
+                return Ok(CaptureCommit::unapplied(SidWrite::OwnershipConflict));
+            }
             let intent_matches = matches!(
                 &instance.resume_intent,
                 ResumeIntent::Use(pinned) if pinned == session_id
@@ -2042,55 +2050,415 @@ mod tests {
     #[test]
     #[serial]
     fn forgotten_conversations_refuse_capture_and_resume_pin_transfer() {
-        use crate::session::instance::PriorToolSession;
-        use crate::session::{LifecycleOperation, LifecycleReservation};
+        use crate::session::instance::{ActiveExecution, PriorToolSession};
+        use crate::session::{
+            ConversationBinding, ConversationProvenance, ExecutionBinding, LifecycleOperation,
+            LifecycleReservation,
+        };
         for parked in [false, true] {
             for pin in [false, true] {
-                let profile = "forgotten-conversation";
+                for namespace in ["same", "different", "unknown"] {
+                    let profile = "forgotten-conversation";
+                    let (temp, _home, storage) = seeded(profile, &[]);
+                    let root = crate::session::get_app_dir().unwrap();
+                    crate::session::purge_owners::initialize(&root).unwrap();
+                    crate::tmux::tool_retirement::initialize(&root).unwrap();
+                    let execution = |name: &str| ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![temp.path().join(name)],
+                        configuration: Vec::new(),
+                        cwd: temp.path().into(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                        exported_default_store: None,
+                    };
+                    let bound = |source: ExecutionBinding| ConversationBinding {
+                        session_id: VALID_SID.into(),
+                        execution: Some(source),
+                        provenance: ConversationProvenance::Asserted,
+                        transcript_path: None,
+                    };
+                    let owner_binding = execution("retained-store");
+                    let mut owner = make_inst(profile, "forgotten");
+                    owner.project_path = temp.path().join("owner").to_str().unwrap().into();
+                    std::fs::create_dir(&owner.project_path).unwrap();
+                    owner.terminal_scopes = Some(Vec::new());
+                    owner.active_execution = Some(ActiveExecution {
+                        launch_id: "original".into(),
+                        binding: owner_binding.clone(),
+                        capture: None,
+                        container: None,
+                    });
+                    if parked {
+                        owner.prior_tool_session_ids.insert(
+                            "claude".into(),
+                            PriorToolSession {
+                                agent_session_id: Some(VALID_SID.into()),
+                                agent_session_binding: Some(bound(owner_binding)),
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        owner.set_agent_conversation(
+                            Some(VALID_SID.into()),
+                            Some(bound(owner_binding)),
+                            None,
+                        );
+                    }
+                    owner.trash();
+                    owner.lifecycle_generation = 4;
+                    owner.lifecycle_reservation = Some(LifecycleReservation {
+                        op: LifecycleOperation::Trash,
+                        generation: 4,
+                        at: chrono::Utc::now() - chrono::Duration::hours(1),
+                    });
+                    let source = match namespace {
+                        "same" => Some(execution("retained-store")),
+                        "different" => Some(execution("separate-store")),
+                        _ => None,
+                    };
+                    let mut claimant = make_inst(profile, "claimant");
+                    claimant.project_path = temp.path().join("claimant").to_str().unwrap().into();
+                    std::fs::create_dir(&claimant.project_path).unwrap();
+                    claimant.active_execution = source.clone().map(|binding| ActiveExecution {
+                        launch_id: "claimant".into(),
+                        binding,
+                        capture: None,
+                        container: None,
+                    });
+                    if pin {
+                        claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
+                        claimant.resume_binding = source.clone().map(bound);
+                    }
+                    seed(profile, &[&owner, &claimant]);
+                    let registry_before = std::fs::read(storage.sessions_path()).unwrap();
+                    let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
+                    let journal_before = std::fs::read(&journal_path).unwrap();
+                    let held = ConversationReadLock::acquire(&storage, VALID_SID).unwrap();
+                    assert!(
+                        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
+                            .unwrap_err()
+                            .is::<ConversationOwnershipBusy>()
+                    );
+                    assert_eq!(
+                        std::fs::read(storage.sessions_path()).unwrap(),
+                        registry_before
+                    );
+                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+                    drop(held);
+                    crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+                    storage
+                        .update(|rows, _| {
+                            rows.retain(|row| row.id != owner.id);
+                            Ok(())
+                        })
+                        .unwrap();
+                    let before = std::fs::read(storage.sessions_path()).unwrap();
+                    let expected = claimant.conversation_state();
+                    if pin {
+                        claimant.set_agent_conversation(
+                            Some(VALID_SID.into()),
+                            source.clone().map(bound),
+                            None,
+                        );
+                        claimant.identity_publisher_launched = true;
+                        let _ = claimant.persist_session_id_with_storage(&storage, &expected);
+                    } else {
+                        let mut captured = observation(VALID_SID);
+                        captured.execution = claimant.active_execution.clone();
+                        if let Some(source) = source {
+                            captured.scope_to(source);
+                        }
+                        let outcome = persist_session_with_storage(
+                            &storage,
+                            &claimant.id,
+                            &captured,
+                            &expected,
+                        )
+                        .outcome;
+                        assert_eq!(
+                            outcome,
+                            if namespace == "different" {
+                                SidWrite::Applied
+                            } else {
+                                SidWrite::OwnershipConflict
+                            }
+                        );
+                    }
+                    assert_eq!(
+                        disk_sid(profile, &claimant.id).as_deref(),
+                        (namespace == "different").then_some(VALID_SID),
+                        "{namespace}, parked={parked}, pin={pin}"
+                    );
+                    if namespace != "different" {
+                        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn hard_linked_hermes_stores_refuse_exact_and_late_conversation_adoption() {
+        use crate::session::deletion::DeletionRequest;
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{ConversationBinding, ConversationProvenance};
+        let (temp, _home, storage) = seeded("hermes-owner", &[]);
+        let root = crate::session::get_app_dir().unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "HERMES_HOME",
+            "HERMES_MANAGED_DIR",
+            "TERMINAL_ENV",
+            "TERMINAL_CWD",
+        ]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "hermes",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let mut bindings = Vec::new();
+        let mut original = None;
+        for (index, profile) in ["hermes-owner", "hermes-alias", "hermes-separate"]
+            .iter()
+            .enumerate()
+        {
+            let store = temp.path().join(profile);
+            std::fs::create_dir(&store).unwrap();
+            if index == 1 {
+                std::fs::hard_link(original.as_ref().unwrap(), store.join("state.db")).unwrap();
+            } else {
+                drop(crate::session::instance::test_helpers::create_hermes_database(&store));
+                if index == 0 {
+                    original = Some(store.join("state.db"));
+                }
+            }
+            let config =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let environment = vec![format!(
+                "HERMES_MANAGED_DIR={}",
+                temp.path().join("managed").display()
+            )];
+            std::fs::write(
+                config,
+                format!(
+                    "environment={}\n[session.agent_config_dir]\nhermes={:?}\n",
+                    serde_json::to_string(&environment).unwrap(),
+                    store.to_str().unwrap(),
+                ),
+            )
+            .unwrap();
+            let mut row = make_inst(profile, profile);
+            row.project_path = temp.path().to_str().unwrap().into();
+            row.tool = "hermes".into();
+            bindings.push(row.resolve_native_execution(None).unwrap().binding);
+        }
+        assert_ne!(bindings[0].stores, bindings[1].stores);
+        let mut owner = make_inst("hermes-owner", "original Hermes publisher");
+        owner.project_path = temp.path().to_str().unwrap().into();
+        owner.tool = "hermes".into();
+        owner.terminal_scopes = Some(Vec::new());
+        owner.active_execution = Some(ActiveExecution {
+            launch_id: "original Hermes".into(),
+            binding: bindings[0].clone(),
+            capture: None,
+            container: None,
+        });
+        owner.set_agent_conversation(
+            Some(VALID_SID.into()),
+            Some(ConversationBinding {
+                session_id: VALID_SID.into(),
+                execution: Some(bindings[0].clone()),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        let request = DeletionRequest {
+            session_id: owner.id.clone(),
+            instance: owner.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: true,
+        };
+        let pending = crate::session::purge_owners::PurgeOwner::record_plan(
+            &storage,
+            &owner,
+            owner.lifecycle_generation,
+            Some(&request),
+            None,
+            crate::session::purge_owners::PurgeCapture::new(&owner).unwrap(),
+        )
+        .unwrap();
+        drop(pending);
+        for retained in [false, true] {
+            if retained {
+                owner
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now() - chrono::Duration::hours(1),
+                    )
+                    .unwrap();
+                owner.trash();
+                crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+            }
+            let sid = if retained {
+                "late-hermes-conversation"
+            } else {
+                VALID_SID
+            };
+            for (binding, allowed) in [(&bindings[1], false), (&bindings[2], true)] {
+                let mut claimant = make_inst("hermes-owner", "new claimant");
+                claimant.tool = "hermes".into();
+                claimant.active_execution = Some(ActiveExecution {
+                    launch_id: "new Hermes".into(),
+                    binding: binding.clone(),
+                    capture: None,
+                    container: None,
+                });
+                seed("hermes-owner", &[&claimant]);
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                let mut publication = observation(sid);
+                publication.execution = claimant.active_execution.clone();
+                publication.scope_to(binding.clone());
+                let result = persist_session_with_storage(
+                    &storage,
+                    &claimant.id,
+                    &publication,
+                    &claimant.conversation_state(),
+                );
+                assert_eq!(
+                    result.outcome,
+                    if allowed {
+                        SidWrite::Applied
+                    } else {
+                        SidWrite::OwnershipConflict
+                    }
+                );
+                assert_eq!(
+                    disk_sid("hermes-owner", &claimant.id).as_deref(),
+                    allowed.then_some(sid)
+                );
+                if !allowed {
+                    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn retained_publishers_fence_late_ids_for_their_durable_qualified_namespaces() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{
+            ConversationBinding, ConversationProvenance, ExecutionBinding, LifecycleOperation,
+        };
+        for (tool, parked, attested) in [
+            ("claude", false, true),
+            ("claude", true, true),
+            ("company-claude", false, true),
+            ("company-claude", true, true),
+            ("company-claude", true, false),
+        ] {
+            for namespace in ["same", "alias", "different", "unknown"] {
+                let profile = "publisher-fence";
                 let (temp, _home, storage) = seeded(profile, &[]);
                 let root = crate::session::get_app_dir().unwrap();
-                crate::session::purge_owners::initialize(&root).unwrap();
                 crate::tmux::tool_retirement::initialize(&root).unwrap();
-                let mut owner = make_inst(profile, "forgotten");
-                owner.project_path = temp.path().join("owner").to_str().unwrap().into();
-                std::fs::create_dir(&owner.project_path).unwrap();
-                owner.terminal_scopes = Some(Vec::new());
-                if parked {
-                    owner.prior_tool_session_ids.insert(
-                        "claude".into(),
-                        PriorToolSession {
-                            agent_session_id: Some(VALID_SID.into()),
-                            ..Default::default()
-                        },
-                    );
-                } else {
-                    owner.agent_session_id = Some(VALID_SID.into());
-                }
-                owner.trash();
-                owner.lifecycle_generation = 4;
-                owner.lifecycle_reservation = Some(LifecycleReservation {
-                    op: LifecycleOperation::Trash,
-                    generation: 4,
-                    at: chrono::Utc::now() - chrono::Duration::hours(1),
+                let original_store = temp.path().join("original-store");
+                let other_store = temp.path().join("other-store");
+                std::fs::create_dir(&original_store).unwrap();
+                std::fs::create_dir(&other_store).unwrap();
+                let alias = temp.path().join("store-alias");
+                std::os::unix::fs::symlink(&original_store, &alias).unwrap();
+                let binding = |store: &std::path::Path| ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: vec![store.to_owned()],
+                    configuration: Vec::new(),
+                    cwd: temp.path().into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                };
+                let mut owner = make_inst(profile, "retained publisher");
+                owner.project_path = temp.path().to_str().unwrap().into();
+                owner.tool = tool.into();
+                owner.command = "claude".into();
+                owner.active_execution = Some(ActiveExecution {
+                    launch_id: "original-publisher".into(),
+                    binding: binding(&original_store),
+                    capture: None,
+                    container: None,
                 });
-                let mut claimant = make_inst(profile, "claimant");
-                claimant.project_path = temp.path().join("claimant").to_str().unwrap().into();
-                std::fs::create_dir(&claimant.project_path).unwrap();
+                owner.acp_session_id = Some(VALID_SID.into());
+                owner.agent_session_binding = attested.then(|| ConversationBinding {
+                    session_id: VALID_SID.into(),
+                    execution: Some(binding(&original_store)),
+                    provenance: ConversationProvenance::Observed,
+                    transcript_path: None,
+                });
+                if parked {
+                    owner.swap_tool("pi");
+                    owner.command = "pi".into();
+                    let mut current = binding(&temp.path().join("pi-store"));
+                    current.agent = "pi".into();
+                    owner.active_execution = Some(ActiveExecution {
+                        launch_id: "current-pi-publisher".into(),
+                        binding: current,
+                        capture: None,
+                        container: None,
+                    });
+                }
+                owner.terminal_scopes = Some(vec![
+                    crate::process::worker_registry::ScopeOwnership::Owned {
+                        unit: "aoe-test-retained-publisher.scope".into(),
+                    },
+                ]);
+                owner
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now() - chrono::Duration::hours(1),
+                    )
+                    .unwrap();
+                owner.trash();
+                let mut claimant = make_inst(profile, "late claimant");
+                claimant.project_path = temp.path().to_str().unwrap().into();
+                let source = match namespace {
+                    "same" => Some(binding(&original_store)),
+                    "alias" => Some(binding(&alias)),
+                    "different" => Some(binding(&other_store)),
+                    _ => None,
+                };
+                claimant.active_execution = source.as_ref().map(|binding| ActiveExecution {
+                    launch_id: "claimant".into(),
+                    binding: binding.clone(),
+                    capture: None,
+                    container: None,
+                });
                 seed(profile, &[&owner, &claimant]);
-                let registry_before = std::fs::read(storage.sessions_path()).unwrap();
-                let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
-                let journal_before = std::fs::read(&journal_path).unwrap();
-                let held = ConversationReadLock::acquire(&storage, VALID_SID).unwrap();
-                let refused =
-                    crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
-                        .unwrap_err();
-                assert!(refused.is::<ConversationOwnershipBusy>());
-                assert_eq!(
-                    std::fs::read(storage.sessions_path()).unwrap(),
-                    registry_before
-                );
-                assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
-                drop(held);
+                if attested {
+                    let namespace_guard =
+                        crate::session::purge_owners::ConversationReadLock::namespace(&storage)
+                            .unwrap();
+                    let target = namespace_guard.conversation(&storage, VALID_SID).unwrap();
+                    drop(namespace_guard);
+                    let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
+                    let journal = std::fs::read(&journal_path).unwrap();
+                    let error =
+                        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
+                            .unwrap_err();
+                    assert!(error.is::<crate::session::purge_owners::ConversationOwnershipBusy>());
+                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+                    drop(target);
+                }
                 crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
                 storage
                     .update(|rows, _| {
@@ -2098,27 +2466,44 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
+                // The surviving publisher can create this previously unrecorded conversation.
+                let late = "019342ab-1234-7def-8901-abcdef012346";
+                let transcript = original_store.join(format!("{late}.jsonl"));
+                std::fs::write(&transcript, b"late retained conversation").unwrap();
                 let before = std::fs::read(storage.sessions_path()).unwrap();
-                let expected = claimant.conversation_state();
-                if pin {
-                    claimant.agent_session_id = Some(VALID_SID.into());
-                    claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
-                    let _ = claimant.persist_session_id_with_storage(&storage, &expected);
-                    assert!(claimant.agent_session_id.is_none());
-                    assert_eq!(claimant.resume_intent, expected.intent);
+                let mut publication = observation(late);
+                publication.execution = claimant.active_execution.clone();
+                if let Some(source) = source.clone() {
+                    publication.scope_to(source);
+                }
+                let outcome = persist_session_with_storage(
+                    &storage,
+                    &claimant.id,
+                    &publication,
+                    &claimant.conversation_state(),
+                )
+                .outcome;
+                if namespace == "different" && attested {
+                    assert_eq!(outcome, SidWrite::Applied);
+                    assert_eq!(disk_sid(profile, &claimant.id).as_deref(), Some(late));
                 } else {
                     assert_eq!(
-                        persist_session_with_storage(
-                            &storage,
-                            &claimant.id,
-                            &observation(VALID_SID),
-                            &expected
-                        )
-                        .outcome,
-                        SidWrite::OwnershipConflict
+                        outcome,
+                        SidWrite::OwnershipConflict,
+                        "{namespace}, tool={tool}, parked={parked}, attested={attested}"
                     );
+                    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
                 }
-                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                let reloaded = CleanupOwners::load(&root).unwrap();
+                assert!(reloaded.blocks_conversation(&owner.id, late, source.as_ref()));
+                assert_eq!(
+                    std::fs::read(transcript).unwrap(),
+                    b"late retained conversation"
+                );
+                assert!(crate::session::purge_owners::protection(&storage, None)
+                    .unwrap()
+                    .iter()
+                    .any(|protection| protection.references_path(temp.path())));
             }
         }
     }

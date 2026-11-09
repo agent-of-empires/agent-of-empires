@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useSessions } from "./useSessions";
 import * as api from "../lib/api";
+import { restoreSessions } from "../lib/trashActions";
 import type { SessionResponse } from "../lib/types";
 
 describe("useSessions / loaded sentinel", () => {
@@ -81,6 +82,37 @@ describe("useSessions / pushed status", () => {
     act(() => result.current.applyPushedStatus("a", "Waiting", cursor(3n)));
     act(() => result.current.applySessionMutation({ session: row("a", "Running", "renamed"), cursor: cursor(2n) }));
     expect(result.current.sessions[0]).toMatchObject({ status: "Waiting", title: "renamed" });
+  });
+
+  it("keeps a newer Restore receipt over a late Retry without fencing unrelated rows", async () => {
+    const { result, resolvers, row, envelope } = mountWithReads();
+    const pending = { ...row("a", "Stopped"), trashed_at: "2026-01-01T00:00:00Z", lifecycle_generation: 2 };
+    await act(async () => resolvers[0]!(envelope([pending, row("b", "Stopped")], 1n)));
+    const retry = Promise.withResolvers<api.SessionMutation>();
+    const lateRetry = retry.promise.then((mutation) => result.current.applySessionMutation(mutation));
+    const restored = { ...pending, trashed_at: null, lifecycle_generation: 3 };
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify(restored), {
+        headers: { "content-type": "application/json", "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "5" },
+      }),
+    );
+    await act(async () => {
+      expect(
+        await restoreSessions(["a"], { applySessionMutation: result.current.applySessionMutation, notify: null }),
+      ).toBe(true);
+    });
+    await act(async () => {
+      retry.resolve({ session: pending, cursor: cursor(2n) });
+      await lateRetry;
+    });
+    expect(result.current.sessions.find((session) => session.id === "a")).toMatchObject({
+      trashed_at: null,
+      lifecycle_generation: 3,
+    });
+    act(() =>
+      result.current.applySessionMutation({ session: row("b", "Stopped", "unrelated edit"), cursor: cursor(3n) }),
+    );
+    expect(result.current.sessions.find((session) => session.id === "b")!.title).toBe("unrelated edit");
   });
 
   it("applies a push to a row whose own observation is older, whatever another row's receipt advanced", async () => {

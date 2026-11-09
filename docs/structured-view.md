@@ -184,6 +184,12 @@ backfills that leave sequence bounds unchanged, and preserves focus and scroll
 position. Read failures keep the last loaded content visible with an error.
 Content, size, or theme changes clear the previous text selection.
 
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for the storage and migration contract.
+
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if their original session, profile, lifecycle generation,
 or runtime epoch changes. Restore and permanent deletion never target a
@@ -193,12 +199,23 @@ An unfinished Trash transition offers **Retry Trash** in the TUI context menu an
 web Trash controls. A fresh owner remains busy; an unverified retained checkout
 can still prevent completion. Retry is an explicit management action, never part
 of opening the transcript.
+The TUI command palette exposes Restore, Retry Trash, and Forget record using
+the same lifecycle-gated actions as the context menu. Opening Trash confirmation
+captures its runtime epoch; a daemon replacement invalidates the confirmation.
+Trash remains read-only without discarding untargeted pending composer paste.
+Web recovery lists unfinished members of mixed live/Trash workspaces separately.
+It never retries or restores a live sibling. Restore receipts keep their native
+revision so a late older Retry cannot replace the restored row.
 
 If the location cannot be verified, **Forget record…** opens a separate
 confirmation. A daemon restart or concurrent Trash transition invalidates that
 confirmation. Files remain on disk, and AoE retains runtime evidence and cleanup
 protection without running hooks or stopping processes. Retained ownership blocks
 profile rename/deletion. The forgotten session cannot be restored through Trash.
+Same-namespace native imports, captures, and launches may remain refused after
+the row disappears. Proven separate native stores remain usable; unknown
+ownership fails closed. This protection survives daemon restart and has no
+automatic expiry. Stopping the old process does not release ownership.
 See the [forget-record contract](api.md#post-apisessionsidtrashforget).
 
 The reader shows retained ACP history, including events

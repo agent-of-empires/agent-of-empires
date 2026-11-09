@@ -19,6 +19,7 @@ pub(super) struct LaunchEnvironment {
 }
 
 pub(super) struct PreparedLaunch {
+    pub(super) namespace_lock: crate::session::purge_owners::ConversationReadLock,
     pub(super) command: Option<String>,
     pub(super) is_existing: bool,
     pub(super) omp_capture_plan: Option<OmpCapturePlan>,
@@ -906,6 +907,10 @@ impl Instance {
         execution.map(|execution| (execution, None))
     }
 
+    pub(super) fn may_publish_native_conversation(&self) -> bool {
+        self.default_selector_backend().is_some() || self.source_capture_backend().is_some()
+    }
+
     #[cfg(test)]
     pub(super) fn prepare_launch_command(
         &mut self,
@@ -920,6 +925,26 @@ impl Instance {
         stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
+        let namespace_lock = stores.with_store(&self.source_profile, |storage| {
+            crate::session::purge_owners::ConversationReadLock::namespace(storage.storage())
+        })?;
+        self.prepare_admitted_launch_command_in(stores, expected_conversation, namespace_lock)
+    }
+
+    fn prepare_admitted_launch_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
+        expected_conversation: ConversationState,
+        namespace_lock: crate::session::purge_owners::ConversationReadLock,
+    ) -> Result<PreparedLaunch> {
+        stores.with_store(&self.source_profile, |storage| {
+            anyhow::ensure!(
+                !crate::session::purge_owners::CleanupOwners::load_for(storage.storage())?
+                    .retains_session(&self.id),
+                crate::session::purge_owners::ConversationOwnershipRetained
+            );
+            Ok(())
+        })?;
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
                 crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(
@@ -954,8 +979,22 @@ impl Instance {
                     ));
             let mut handoff_prior = None;
             let (execution, unpinned) = self.resolve_launch_routing()?;
+            if execution.is_some() || self.may_publish_native_conversation() {
+                stores.with_store(&self.source_profile, |storage| {
+                    anyhow::ensure!(
+                        !crate::session::purge_owners::CleanupOwners::load_for(storage.storage())?
+                            .blocks_publisher(
+                                &self.id,
+                                execution.as_ref().map(|execution| &execution.binding),
+                            ),
+                        crate::session::purge_owners::ConversationOwnershipRetained
+                    );
+                    Ok(())
+                })?;
+            }
             if let Some(execution) = execution.as_ref() {
-                handoff_prior = self.hand_off_prime_fork_parent(execution, stores)?;
+                handoff_prior =
+                    self.hand_off_prime_fork_parent(execution, stores, &namespace_lock)?;
                 if validate_target {
                     self.validate_conversation_target(
                         &execution.binding,
@@ -1052,6 +1091,7 @@ impl Instance {
             && !fork_mints_child
             && self.stored_fork_child().is_some();
         Ok(PreparedLaunch {
+            namespace_lock,
             command,
             is_existing,
             omp_capture_plan,
@@ -1105,8 +1145,11 @@ impl Instance {
             );
         }
         self.absorb_published_prime_session(publication);
-        let mut refreshed =
-            self.prepare_launch_command_in(stores, prepared.expected_conversation)?;
+        let mut refreshed = self.prepare_admitted_launch_command_in(
+            stores,
+            prepared.expected_conversation,
+            prepared.namespace_lock,
+        )?;
         refreshed.require_conversation_publication |= prepared.require_conversation_publication;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
         Ok(refreshed)
@@ -2338,6 +2381,7 @@ mod tests {
     fn unknown_opencode_routes_refuse_preparation_and_preserve_the_conversation() {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let version_file = home.path().join("native-version");
         let help_file = home.path().join("native-help");
         let script = format!(
@@ -2478,6 +2522,7 @@ mod tests {
     fn default_known_target_attempts_moved_context_without_rebinding() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", root.path().to_str().unwrap()),
             ("CODEX_HOME", root.path().join("codex-a").to_str().unwrap()),
@@ -2774,6 +2819,7 @@ mod tests {
     fn sandboxed_assertion_keeps_the_native_container_store() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let profile = "sandbox-asserted-store";
@@ -2864,6 +2910,7 @@ mod tests {
         let _omp_env = crate::session::test_support::EnvGuard::unset(
             &crate::session::capture::OMP_STORE_ENV_KEYS,
         );
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
@@ -2946,6 +2993,7 @@ mod tests {
     fn migration_unattributed_pins_resume_against_configured_store() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         // $HOME is the last store fallback, so pin it to the fixture root.
         let _env = EnvGuard::set(&[("HOME", root.path().to_str().unwrap())]);
         let _unset = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
@@ -3095,6 +3143,7 @@ mod tests {
     #[serial_test::serial]
     fn a_recorded_claude_store_overrides_a_repointed_agent_config_dir() {
         let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let stub = tempfile::tempdir().unwrap();
         let _claude = crate::session::test_support::install_login_shell_path_command(
             stub.path(),
@@ -3486,6 +3535,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp.path());
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = tool_instance("codex", project.to_str().unwrap());
@@ -3650,6 +3700,7 @@ mod tests {
     fn default_codex_resume_without_attested_policy_requires_a_verified_rollout() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let store = temp.path().join(".codex");
         let day = store.join("sessions/2026/11/06");
         std::fs::create_dir_all(&day).unwrap();
@@ -4211,6 +4262,7 @@ mod tests {
     fn a_sandboxed_launch_carries_no_agent_name() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let profile = "sandbox-agent-name";

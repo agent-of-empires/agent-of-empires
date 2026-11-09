@@ -88,6 +88,57 @@ Per-ID mutation exclusion stays shared with every held or queued operation. Reus
 
 Live owner references include missing descendants and symlink traversal dependencies. Permission errors, symlink loops and non-directory traversal refuse cleanup instead of being treated as absent owners.
 
+### Forgotten Trash ownership
+
+Forget requires exactly one matching runtime epoch and consent for the original
+profile, generation, Trash timestamp and lifecycle identity. Its durable retained
+owner precedes visible-row removal. A leftover same-ID row after interruption is
+a tombstone, not Restore, Retry or launch authority.
+Retrying Forget for that same profile, generation, Trash lifecycle identity and
+reservation reuses the durable owner without recapturing changed runtime resources
+or rewriting the journal. Conflicting or duplicate retained authority is refused.
+
+
+Retained publisher fences use the original active execution and each parked
+conversation's own qualified agent, filesystem domain and native stores. Current
+configuration and cwd cannot prove a separate namespace. Host store aliases
+compare device/inode identity for existing stores and canonical paths for missing
+leaves; unknown evidence overlaps conservatively. No TTL, daemon
+restart or PID absence releases these fences because unrecorded late SIDs can
+still name retained files.
+Parked ACP-only publishers retain namespace exclusion even when no native selector
+was captured. An attested Claude binding also covers Claude tool aliases; this
+does not reinterpret unrelated Pi ACP IDs as native conversation IDs.
+
+
+Native admission takes the app-global namespace read lock before preparation
+and checks the resolved namespace before native preassignment, fork or adoption.
+The prepared launch retains that guard through spawn; Prime refresh reuses it.
+An unresolved namespace for a native-capable publisher fails closed before
+side-effectful preparation; ordinary shell commands are not native publishers.
+
+Forget takes its exclusive lock and sorted exclusive conversation locks before
+journal installation. Acquisition is nonblocking under lifecycle and registry
+exclusion. Native inventory includes asserted targets, current and parked native
+IDs, and compatible Claude ACP IDs with their own bindings. ACP import separately
+excludes every current and parked ACP ID, including ordinary pending purge owners
+whose visible rows are gone. Prime fork handoff checks both parent and destination
+under the existing read admission guard.
+
+Confirmed orphan removal holds identity, catalogue transition, app-root registry
+and profile registry exclusion through its final check. Registry slots compare
+resolved physical identity before locking an app-root alias twice. Every complete
+row contributes project, pre-Trash, holding, workspace and branch references;
+both primary and additional journal protection contribute too. An exact regular
+file at `.aoe-trash` is preserved as an obstruction with conservative lexical
+holding protection. Other traversal errors still refuse cleanup.
+
+TUI confirmation and palette requests retain original targets and runtime epochs.
+Tests dequeue the actual captured command before dispatching it through the real
+router; expected fixtures are assertions, never substitute operations. Web Restore
+receipts use per-row revisions so an older Retry cannot overwrite restored state.
+Forget consumes capture-phase Escape before viewer listeners and defers onboarding.
+
 ## Who owns the state
 
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:
@@ -111,13 +162,41 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Retained history consistency
+
+Retained page identity combines the event-store incarnation with the session
+revision. Every append or replacement invalidates the complete snapshot.
+Bounds and identity are read in one SQLite transaction; independent indexed
+first/last lookups avoid scanning payloads for metadata. A stale identity reaches
+the HTTP client as a conflict, while coherent successful pages carrying different
+identities are rejected as inconsistent metadata. Neither may publish mixed rows.
+Unchanged incomplete histories retain their identity for cheap refresh probes.
+
+File-backed retained reads reuse the independent query-only search reader, not
+the event writer. Identity, bounds and raw rows share one read transaction; commit
+and release the reader before JSON decoding. Private memory and temporary
+databases use their original connection and still release it before decoding.
+Raw retained pages preserve scanned rows and cursors without turn alignment.
+Forward retained replay keeps reducer state across pages.
+
+Migration 54 installs identity only when `acp_events` exists. An existing empty
+database defers to the normal EventStore opener, which creates schema before
+identity. Corruption and access failures are not empty-database cases. Backward
+cursors remain strict within SQLite's signed sequence range; a larger unsigned
+cursor includes the maximum stored signed sequence rather than dropping it.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
 
 Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
 
-A cold open loads recent-first rather than folding from seq 0 before first paint. `GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N` returns the events closest below `before`, aligned to a user-turn boundary so a page never seams a split turn. The client renders the tail immediately and, on a long session, also pulls a small `since=0` prefix for the pinned handshake snapshot (capabilities, slash palette, agent and model) the composer needs. Scrolling to the top pages older history, prepending with the scroll position frozen; each page is fetched twice, once for frames and once for `view=rows`, and a failure on either leg abandons the page rather than advancing the cursor.
+An interactive cold open loads recent-first rather than folding from seq 0.
+Ordinary backward replay, including `view=rows`, trims a leading partial turn
+when older rows remain. The client paints the tail and pulls a small `since=0`
+prefix for the composer's handshake state. Scrolling to the top prepends older
+history with the scroll position frozen. Each page fetches both frames and rows;
+failure on either leg abandons the page without advancing its cursor.
 
 If context restoration fails (the agent's stored session is gone) the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`: a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided), pre-filled into the composer and never auto-sent.
 

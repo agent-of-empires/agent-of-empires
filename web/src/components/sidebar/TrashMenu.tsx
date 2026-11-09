@@ -391,7 +391,12 @@ function TrashRow({
         pendingSessions.map((session) => {
           const target = trashRecoveryTarget(session, runtimeEpoch);
           return target ? (
-            <TrashRecoveryRow key={session.id} target={target} onRetry={onRetryTrash} onForget={onForgetTrash} />
+            <TrashRecoveryRow
+              key={`${session.id}:${target.epoch}:${target.expected_generation}`}
+              target={target}
+              onRetry={onRetryTrash}
+              onForget={onForgetTrash}
+            />
           ) : (
             <p key={session.id} className="mt-2 text-xs text-text-secondary">
               Recovery of {session.title} needs a current session identity.
@@ -412,10 +417,15 @@ function TrashRecoveryRow({
   onForget: (target: TrashRecoveryTarget) => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const retry = async () => {
+  const pointerTarget = useRef<TrashRecoveryTarget | null>(null);
+  const retry = async (event: React.MouseEvent<HTMLButtonElement>) => {
+    const captured = event.detail === 0 ? target : pointerTarget.current;
+    pointerTarget.current = null;
+    if (!captured || captured.epoch !== target.epoch || captured.expected_generation !== target.expected_generation)
+      return;
     setBusy(true);
     try {
-      await onRetry(target);
+      await onRetry(captured);
     } finally {
       setBusy(false);
     }
@@ -426,6 +436,12 @@ function TrashRecoveryRow({
       <div className="mt-1 flex flex-wrap gap-2">
         <button
           type="button"
+          onPointerDown={() => {
+            pointerTarget.current = target;
+          }}
+          onPointerCancel={() => {
+            pointerTarget.current = null;
+          }}
           onClick={retry}
           disabled={busy}
           className={`${ACTION} border-surface-700/50 text-text-secondary hover:bg-surface-700/40 disabled:opacity-50`}

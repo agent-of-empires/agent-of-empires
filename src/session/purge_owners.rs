@@ -546,6 +546,19 @@ impl CleanupOwners {
             })
     }
 
+    pub(crate) fn blocks_publisher(
+        &self,
+        instance_id: &str,
+        source: Option<&super::ExecutionBinding>,
+    ) -> bool {
+        self.0.owners.iter().any(|owner| match &owner.purpose {
+            Some(OwnerPurpose::Retained { instance, .. }) => {
+                instance.id == instance_id || publisher_overlaps(instance, source)
+            }
+            _ => false,
+        })
+    }
+
     pub(crate) fn blocks_conversation(
         &self,
         instance_id: &str,
@@ -553,25 +566,163 @@ impl CleanupOwners {
         source: Option<&super::ExecutionBinding>,
     ) -> bool {
         let owns = |id: Option<&str>, binding: Option<&super::ConversationBinding>| {
-            id == Some(session_id) && super::capture::owner_excludes(source, binding, session_id)
+            id == Some(session_id)
+                && match (source, binding.filter(|binding| binding.is_known())) {
+                    (Some(source), Some(owner)) => owner
+                        .execution
+                        .as_ref()
+                        .is_none_or(|owner| namespaces_overlap(owner, source)),
+                    _ => true,
+                }
         };
-        self.frozen_instances().any(|peer| {
-            peer.id != instance_id
-                && (owns(
-                    peer.agent_session_id.as_deref(),
-                    peer.agent_session_binding.as_ref(),
-                ) || peer.prior_tool_session_ids.values().any(|parked| {
-                    owns(
-                        parked.agent_session_id.as_deref(),
-                        parked.agent_session_binding.as_ref(),
-                    )
-                }))
+        self.0.owners.iter().any(|owner| {
+            let retained = matches!(owner.purpose, Some(OwnerPurpose::Retained { .. }));
+            let peer = match &owner.purpose {
+                Some(OwnerPurpose::Retained { instance, .. }) => instance.as_ref(),
+                Some(OwnerPurpose::Purge) => match &owner.request {
+                    Some(request) => &request.instance,
+                    None => return false,
+                },
+                None => return false,
+            };
+            if retained && (peer.id == instance_id || publisher_overlaps(peer, source)) {
+                return true;
+            }
+            (retained || peer.id != instance_id)
+                && conversation_inventory(peer)
+                    .into_iter()
+                    .any(|(id, binding)| owns(Some(id), binding))
         })
     }
 
-    pub(crate) fn protections(&self) -> impl Iterator<Item = &CleanupProtection> {
-        self.0.owners.iter().map(|owner| &owner.protection)
+    pub(crate) fn blocks_acp_import(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        source: Option<&super::ExecutionBinding>,
+    ) -> bool {
+        self.frozen_instances().any(|row| {
+            row.acp_session_id.as_deref() == Some(session_id)
+                || row
+                    .prior_tool_session_ids
+                    .values()
+                    .any(|parked| parked.acp_session_id.as_deref() == Some(session_id))
+        }) || self.blocks_conversation(instance_id, session_id, source)
     }
+
+    pub(crate) fn protections(&self) -> impl Iterator<Item = &CleanupProtection> {
+        self.0.owners.iter().flat_map(|owner| {
+            std::iter::once(&owner.protection).chain(owner.additional_protection.as_ref())
+        })
+    }
+}
+
+fn conversation_inventory(row: &Instance) -> Vec<(&str, Option<&super::ConversationBinding>)> {
+    let claude_binding = |binding: Option<&super::ConversationBinding>| {
+        binding
+            .filter(|binding| binding.is_known())
+            .and_then(|binding| binding.execution.as_ref())
+            .is_some_and(|execution| execution.agent == "claude")
+    };
+    let mut ids = Vec::new();
+    if let Some(id) = row.agent_session_id.as_deref() {
+        ids.push((id, row.agent_session_binding.as_ref()));
+    }
+    if let Some((id, binding, _)) = row.conversation_target() {
+        ids.push((id, binding));
+    }
+    if row.tool == "claude"
+        || row
+            .active_execution
+            .as_ref()
+            .is_some_and(|active| active.binding.agent == "claude")
+        || claude_binding(row.agent_session_binding.as_ref())
+    {
+        if let Some(id) = row.acp_session_id.as_deref() {
+            ids.push((id, row.agent_session_binding.as_ref()));
+        }
+    }
+    for (tool, parked) in &row.prior_tool_session_ids {
+        if let Some(id) = parked.agent_session_id.as_deref() {
+            ids.push((id, parked.agent_session_binding.as_ref()));
+        }
+        if tool == "claude" || claude_binding(parked.agent_session_binding.as_ref()) {
+            if let Some(id) = parked.acp_session_id.as_deref() {
+                ids.push((id, parked.agent_session_binding.as_ref()));
+            }
+        }
+    }
+    ids
+}
+
+fn publisher_overlaps(row: &Instance, source: Option<&super::ExecutionBinding>) -> bool {
+    let Some(source) = source else {
+        return true;
+    };
+    let Some(active) = row.active_execution.as_ref() else {
+        return true;
+    };
+    namespaces_overlap(&active.binding, source)
+        || row.prior_tool_session_ids.values().any(|parked| {
+            if parked.agent_session_id.is_none() && parked.acp_session_id.is_none() {
+                return false;
+            }
+            parked
+                .agent_session_binding
+                .as_ref()
+                .filter(|binding| binding.is_known())
+                .and_then(|binding| binding.execution.as_ref())
+                .is_none_or(|owner| namespaces_overlap(owner, source))
+        })
+}
+
+fn namespaces_overlap(owner: &super::ExecutionBinding, source: &super::ExecutionBinding) -> bool {
+    if owner.agent.is_empty()
+        || source.agent.is_empty()
+        || owner.filesystem.is_empty()
+        || source.filesystem.is_empty()
+    {
+        return true;
+    }
+    if owner.agent != source.agent || owner.filesystem != source.filesystem {
+        return false;
+    }
+    if owner.stores.is_empty() || source.stores.is_empty() {
+        return true;
+    }
+    owner.stores.iter().any(|left| {
+        source.stores.iter().any(|right| {
+            if owner.filesystem == "host" {
+                match (std::fs::metadata(left), std::fs::metadata(right)) {
+                    (Ok(left), Ok(right)) => {
+                        crate::process::metadata_identity(&left)
+                            == crate::process::metadata_identity(&right)
+                    }
+                    (left_metadata, right_metadata)
+                        if left_metadata
+                            .as_ref()
+                            .err()
+                            .is_none_or(|error| error.kind() == std::io::ErrorKind::NotFound)
+                            && right_metadata.as_ref().err().is_none_or(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) =>
+                    {
+                        match (
+                            super::capture::canonicalize_allowing_missing_leaf(left),
+                            super::capture::canonicalize_allowing_missing_leaf(right),
+                        ) {
+                            (Some(left), Some(right)) => left == right,
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                }
+            } else {
+                crate::git::template::lexical_normalize(left)
+                    == crate::git::template::lexical_normalize(right)
+            }
+        })
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -583,13 +734,30 @@ pub(crate) struct ConversationOwnershipBusy;
 pub(crate) struct ConversationOwnershipRetained;
 
 pub(crate) struct ConversationReadLock {
-    _file: std::fs::File,
+    _namespace: std::fs::File,
+    _file: Option<std::fs::File>,
 }
 
 impl ConversationReadLock {
+    pub(crate) fn namespace(storage: &Storage) -> Result<Self> {
+        Ok(Self {
+            _namespace: lock_namespace(storage, false)?,
+            _file: None,
+        })
+    }
+
+    pub(crate) fn conversation(
+        &self,
+        storage: &Storage,
+        session_id: &str,
+    ) -> Result<std::fs::File> {
+        lock_conversation(storage, session_id, false)
+    }
+
     pub(crate) fn acquire(storage: &Storage, session_id: &str) -> Result<Self> {
         Ok(Self {
-            _file: lock_conversation(storage, session_id, false)?,
+            _namespace: lock_namespace(storage, false)?,
+            _file: Some(lock_conversation(storage, session_id, false)?),
         })
     }
 }
@@ -626,6 +794,29 @@ fn lock_conversation(
         return Err(error.into());
     }
     Ok(file)
+}
+
+fn lock_namespace(storage: &Storage, exclusive: bool) -> Result<std::fs::File> {
+    let profile = storage
+        .sessions_path()
+        .parent()
+        .context("profile directory missing")?;
+    let root = AnchoredDir::open(app_dir_for_profile_dir(profile))?;
+    let (file, _) = root
+        .bind_file(".retained-publisher-admission".as_ref())?
+        .open_sidecar()?;
+    let result = if exclusive {
+        fs2::FileExt::try_lock_exclusive(&file)
+    } else {
+        fs2::FileExt::try_lock_shared(&file)
+    };
+    match result {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(ConversationOwnershipBusy.into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn open(root: &Path) -> Result<ResolvedDataFile> {
@@ -954,21 +1145,50 @@ pub(crate) fn migrate_retained_ownership(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn retained_transition_recorded(
+    journal: &Journal,
+    storage: &Storage,
+    row: &Instance,
+) -> Result<bool> {
+    let mut retained = journal.owners.iter().filter(|owner| {
+        owner.session_id == row.id && matches!(owner.purpose, Some(OwnerPurpose::Retained { .. }))
+    });
+    let Some(owner) = retained.next() else {
+        return Ok(false);
+    };
+    let Some(OwnerPurpose::Retained { instance, .. }) = owner.purpose.as_ref() else {
+        unreachable!("filtered retained owner");
+    };
+    anyhow::ensure!(
+        retained.next().is_none()
+            && owner.profile == storage.profile()
+            && owner.generation == row.lifecycle_generation
+            && instance.trashed_at == row.trashed_at
+            && instance.trash_lifecycle_id == row.trash_lifecycle_id
+            && instance.lifecycle_reservation == row.lifecycle_reservation,
+        super::LifecycleReservationError::Superseded
+    );
+    Ok(true)
+}
+
 /// The caller holds identity and lifecycle exclusion through removal of the visible row.
 pub(crate) fn retain_forgotten_trash(storage: &Storage, row: &Instance) -> Result<()> {
     anyhow::ensure!(
         row.has_pending_trash() && row.failed_purge_forced().is_none(),
         "Trash transition is not an unfinished Trash-only record"
     );
-    let mut conversations: Vec<_> = row
-        .agent_session_id
-        .as_deref()
+    let _namespace = lock_namespace(storage, true)?;
+    let file = open_for(storage)?;
+    {
+        let (lock, path) = file.open_sidecar()?;
+        let _guard = acquire_open_storage_flock(lock, &path)?;
+        if retained_transition_recorded(&decode(file.read()?.as_deref())?, storage, row)? {
+            return Ok(());
+        }
+    }
+    let mut conversations: Vec<_> = conversation_inventory(row)
         .into_iter()
-        .chain(
-            row.prior_tool_session_ids
-                .values()
-                .filter_map(|parked| parked.agent_session_id.as_deref()),
-        )
+        .map(|(id, _)| id)
         .collect();
     conversations.sort_unstable();
     conversations.dedup();
@@ -977,10 +1197,12 @@ pub(crate) fn retain_forgotten_trash(storage: &Storage, row: &Instance) -> Resul
         .map(|id| lock_conversation(storage, id, true))
         .collect::<Result<_>>()?;
     let capture = PurgeCapture::new(row)?;
-    let file = open_for(storage)?;
     let (lock, path) = file.open_sidecar()?;
     let _guard = acquire_open_storage_flock(lock, &path)?;
     let mut journal = decode(file.read()?.as_deref())?;
+    if retained_transition_recorded(&journal, storage, row)? {
+        return Ok(());
+    }
     let mut instance = row.clone();
     instance.source_profile = storage.profile().to_owned();
     journal.owners.push(Owner {
@@ -1428,7 +1650,7 @@ pub(crate) fn protection(
         .owners
         .into_iter()
         .filter(|owner| Some(owner.token.as_str()) != except)
-        .map(|owner| owner.protection)
+        .flat_map(|owner| std::iter::once(owner.protection).chain(owner.additional_protection))
         .collect())
 }
 
@@ -1569,6 +1791,101 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn forget_locks_asserted_target_before_committing_and_fences_later_adoption() -> Result<()> {
+        use crate::session::{ConversationBinding, ConversationProvenance, ResumeIntent};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        initialize(&root)?;
+        let storage = Storage::new_unwatched("asserted")?;
+        let mut row = Instance::new("asserted target", root.to_str().unwrap());
+        row.source_profile = "asserted".into();
+        row.terminal_scopes = Some(Vec::new());
+        let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        row.resume_intent = ResumeIntent::Fork { from: sid.into() };
+        row.resume_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: None,
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )?;
+        row.trash();
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let journal = std::fs::read(root.join(FILE_NAME))?;
+        let registry = std::fs::read(storage.sessions_path())?;
+        // Hold only the target lock, not the namespace lock, to discriminate the inventory.
+        let held = lock_conversation(&storage, sid, false)?;
+        assert!(retain_forgotten_trash(&storage, &row).is_err());
+        drop(held);
+        assert_eq!(std::fs::read(root.join(FILE_NAME))?, journal);
+        assert_eq!(std::fs::read(storage.sessions_path())?, registry);
+        retain_forgotten_trash(&storage, &row)?;
+        assert!(CleanupOwners::load(&root)?.blocks_conversation("another-row", sid, None));
+        let retained = std::fs::read(root.join(FILE_NAME))?;
+        let new_resources = tempfile::tempdir()?;
+        let mut same_transition = row.clone();
+        same_transition.project_path = new_resources.path().to_str().unwrap().into();
+        retain_forgotten_trash(&storage, &same_transition)?;
+        assert_eq!(std::fs::read(root.join(FILE_NAME))?, retained);
+        for conflict in ["generation", "trash_identity", "timestamp", "reservation"] {
+            let mut superseded = row.clone();
+            match conflict {
+                "generation" => {
+                    superseded.lifecycle_generation += 1;
+                    superseded
+                        .lifecycle_reservation
+                        .as_mut()
+                        .unwrap()
+                        .generation += 1;
+                }
+                "trash_identity" => {
+                    superseded.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string())
+                }
+                "timestamp" => {
+                    superseded.trashed_at = superseded
+                        .trashed_at
+                        .map(|at| at - chrono::Duration::seconds(1))
+                }
+                _ => {
+                    superseded.lifecycle_reservation.as_mut().unwrap().at -=
+                        chrono::Duration::seconds(1)
+                }
+            }
+            assert!(
+                retain_forgotten_trash(&storage, &superseded)
+                    .unwrap_err()
+                    .is::<crate::session::LifecycleReservationError>(),
+                "{conflict}"
+            );
+            assert_eq!(std::fs::read(root.join(FILE_NAME))?, retained);
+        }
+        let other_profile = Storage::new_unwatched("other-retained-profile")?;
+        assert!(retain_forgotten_trash(&other_profile, &row)
+            .unwrap_err()
+            .is::<crate::session::LifecycleReservationError>());
+        assert_eq!(std::fs::read(root.join(FILE_NAME))?, retained);
+        let mut duplicate: serde_json::Value = serde_json::from_slice(&retained)?;
+        let mut second = duplicate["owners"][0].clone();
+        second["token"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        duplicate["owners"].as_array_mut().unwrap().push(second);
+        let duplicate = serde_json::to_vec(&duplicate)?;
+        std::fs::write(root.join(FILE_NAME), &duplicate)?;
+        assert!(retain_forgotten_trash(&storage, &row)
+            .unwrap_err()
+            .is::<crate::session::LifecycleReservationError>());
+        assert_eq!(std::fs::read(root.join(FILE_NAME))?, duplicate);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn forgotten_trash_keeps_files_profile_and_runtime_authority_without_authorizing_purge(
     ) -> Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
@@ -1588,7 +1905,11 @@ mod tests {
         std::fs::write(&sentinel, b"original files")?;
         let mut row = Instance::new("forgotten", checkout.to_str().unwrap());
         row.source_profile = "kept".into();
-        row.terminal_scopes = Some(Vec::new());
+        row.terminal_scopes = Some(vec![
+            crate::process::worker_registry::ScopeOwnership::Owned {
+                unit: "aoe-test-forgotten-terminal.scope".into(),
+            },
+        ]);
         row.worktree_info = Some(crate::session::WorktreeInfo {
             branch: "saved-work".into(),
             main_repo_path: main_repo.to_str().unwrap().into(),
@@ -1613,6 +1934,8 @@ mod tests {
         prior_row.project_path = older_checkout.to_str().unwrap().into();
         let prior = PurgeOwner::record(&storage, &prior_row, PurgeCapture::new(&prior_row)?)?;
         let prior_token = prior.token().to_owned();
+        let obstruction = root.join(".aoe-trash");
+        std::fs::write(&obstruction, b"user-owned obstruction")?;
         let safe_capture = PurgeCapture::new(&row)?;
         let worker_path = crate::process::worker_registry::record_path(&row.id)?;
         std::fs::create_dir_all(worker_path.parent().unwrap())?;
@@ -1669,6 +1992,8 @@ mod tests {
         assert_eq!(std::fs::read(root.join(FILE_NAME))?, journal_bytes);
         assert_eq!(std::fs::read(&worker_path)?, worker_bytes);
         assert_eq!(std::fs::read(&sentinel)?, b"original files");
+        assert_eq!(std::fs::read(&obstruction)?, b"user-owned obstruction");
+        assert!(CleanupOwners::load(&root)?.retains_session(&row.id));
         Ok(())
     }
 

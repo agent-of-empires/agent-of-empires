@@ -3000,9 +3000,15 @@ export async function forgetTrashRecord(
 
 /** Restore a trashed session (#2489): clears `trashed_at`, returning it to
  *  its prior bucket with its transcript and metadata intact. */
-export async function restoreSession(id: string): Promise<SessionResponse | null> {
+export async function restoreSession(id: string): Promise<SessionMutation | null> {
   try {
-    return withMoveWarning(await sessionUpdate(id, "restore", jsonInit("POST")), (o) => stringField(o, "warning"));
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`, jsonInit("POST"));
+    const mutation = await sessionMutation(response);
+    if (!mutation) return null;
+    return {
+      ...mutation,
+      session: withMoveWarning(mutation.session, (outcome) => stringField(outcome, "warning"))!,
+    };
   } catch {
     return null;
   }

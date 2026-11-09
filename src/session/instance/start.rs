@@ -699,7 +699,25 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
-        let _conversation_lock = if prepared.is_existing || prepared.fork_mints_child {
+        let cleanup_owners =
+            crate::session::purge_owners::CleanupOwners::load_for(storage.storage())?;
+        anyhow::ensure!(
+            !cleanup_owners.retains_session(&self.id)
+                && (!(prepared.execution.is_some() || self.may_publish_native_conversation())
+                    || !cleanup_owners.blocks_publisher(
+                        &self.id,
+                        prepared
+                            .execution
+                            .as_ref()
+                            .map(|execution| &execution.binding),
+                    )),
+            crate::session::purge_owners::ConversationOwnershipRetained
+        );
+        let _conversation_lock = if prepared.execution.is_some()
+            && (prepared.is_existing
+                || prepared.fork_mints_child
+                || self.agent_session_id.is_some())
+        {
             let target = prepared
                 .canonical_conversation
                 .as_ref()
@@ -714,16 +732,18 @@ impl Instance {
                 })
                 .or(self.agent_session_id.as_deref())
                 .context("Native conversation target is unavailable")?;
-            Some(
-                self.guard_retained_native_conversation(
-                    CaptureStorage::Scoped(storage),
-                    target,
-                    prepared
-                        .execution
-                        .as_ref()
-                        .map(|execution| &execution.binding),
-                )?,
-            )
+            let guard = prepared
+                .namespace_lock
+                .conversation(storage.storage(), target)?;
+            self.check_retained_native_conversation(
+                storage.storage(),
+                target,
+                prepared
+                    .execution
+                    .as_ref()
+                    .map(|execution| &execution.binding),
+            )?;
+            Some(guard)
         } else {
             None
         };
@@ -1488,11 +1508,12 @@ mod tests {
         const PARENT: &str = "ses_parent00000000000000000000000";
         const CHILD: &str = "ses_child000000000000000000000000";
         const SEED: &str = "ses_seed0000000000000000000000000";
-        for (fail_adoption, fail_final, peer_pin) in [
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
+        for (fail_adoption, fail_final, peer_pin, retained_parent) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
         ] {
             let logs = crate::session::test_support::LogCapture::start();
             let directory = tempfile::tempdir().unwrap();
@@ -1558,7 +1579,10 @@ else:
                 format!("FORK_RECORD={}", record.display()),
                 format!("FORK_COUNT={}", forks.display()),
             ];
-            std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
+            let write_environment = |environment: &[String]| {
+                std::fs::write(&config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(environment).unwrap()))
+            };
+            write_environment(&environment).unwrap();
             let mut instance = tool_instance("opencode", project.to_str().unwrap());
             instance.source_profile = profile.into();
             let parent = instance.asserted_resume_binding(PARENT, None).unwrap();
@@ -1571,6 +1595,120 @@ else:
                 instance.tmux_session().unwrap().name(),
             );
             seed_disk_for_sidecar_test(profile, &instance);
+            if retained_parent {
+                let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+                let mut owner = tool_instance("opencode", project.to_str().unwrap());
+                owner.source_profile = profile.into();
+                owner.active_execution = Some(crate::session::instance::ActiveExecution {
+                    launch_id: "retained-parent".into(),
+                    binding: parent.execution.clone().unwrap(),
+                    capture: None,
+                    container: None,
+                });
+                owner.set_agent_conversation(Some(PARENT.into()), Some(parent.clone()), None);
+                owner.terminal_scopes = Some(Vec::new());
+                owner
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now() - chrono::Duration::hours(1),
+                    )
+                    .unwrap();
+                owner.trash();
+                crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+                let registry = std::fs::read(storage.sessions_path()).unwrap();
+                let before = instance.conversation_state();
+                let error = instance
+                    .prepare_launch_command(before.clone())
+                    .err()
+                    .expect("retained parent must refuse preparation");
+                assert!(
+                    error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
+                    "{error:#}"
+                );
+                assert_eq!(instance.conversation_state(), before);
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), registry);
+                assert!(
+                    !forks.exists(),
+                    "refused preparation must not request a native fork"
+                );
+                assert!(!record.exists());
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM session_v2 WHERE id = ?1",
+                            [CHILD],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some(SEED)
+                );
+                instance.set_agent_conversation(None, None, None);
+                instance.resume_intent = ResumeIntent::Cleared;
+                instance.resume_binding = None;
+                let mut unsupported_environment = environment.clone();
+                unsupported_environment.push("OPENCODE_CONFIG_CONTENT={}".into());
+                write_environment(&unsupported_environment).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows[0] = instance.clone();
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(
+                    instance.resolve_launch_execution().unwrap().is_none(),
+                    "the unsupported native configuration must exercise unknown execution"
+                );
+                let before = instance.conversation_state();
+                let registry = std::fs::read(storage.sessions_path()).unwrap();
+                let error = instance
+                    .prepare_launch_command(before.clone())
+                    .err()
+                    .expect("unknown-source native preparation must refuse retained ownership");
+                assert!(
+                    error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
+                    "{error:#}"
+                );
+                assert_eq!(instance.conversation_state(), before);
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), registry);
+                let error = instance
+                    .start_with_size_opts_in(None, false, &storage, true, None)
+                    .unwrap_err();
+                assert!(
+                    error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
+                    "{error:#}"
+                );
+                assert!(storage.load().unwrap()[0].agent_session_id.is_none());
+                assert!(!forks.exists() && !record.exists());
+                assert!(!instance.tmux_session().unwrap().exists_live());
+                let mut shell = tool_instance("shell", project.to_str().unwrap());
+                shell.source_profile = profile.into();
+                shell.command = "printf shell".into();
+                assert!(!shell.may_publish_native_conversation());
+                assert!(
+                    shell
+                        .prepare_launch_command(shell.conversation_state())
+                        .is_ok(),
+                    "an unrelated shell must remain usable"
+                );
+                let separate = directory.path().join("separate.db");
+                std::fs::copy(&database, &separate).unwrap();
+                let mut separate_environment = environment.clone();
+                separate_environment.retain(|entry| !entry.starts_with("OPENCODE_DB="));
+                separate_environment.push(format!("OPENCODE_DB={}", separate.display()));
+                write_environment(&separate_environment).unwrap();
+                assert!(
+                    instance
+                        .prepare_launch_command(instance.conversation_state())
+                        .is_ok(),
+                    "a proven separate native store must remain usable"
+                );
+                continue;
+            }
             let _helper = frozen_test_helper(
                 directory.path(),
                 "store_fork_requires_durable_publication_and_preserves_recovery_and_peer_pins",
@@ -2049,84 +2187,93 @@ else:
     fn forgotten_conversation_cannot_be_launched_by_another_terminal_session() {
         use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
         use crate::session::{LifecycleReservation, Storage};
-        let root = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_home(root.path());
-        let _env = crate::session::test_support::EnvGuard::unset(&[
-            "TMUX",
-            "TMUX_PANE",
-            "CLAUDE_CONFIG_DIR",
-            "AOE_DAEMON_URL",
-        ])
-        .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
-        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
-        let marker = root.path().join("agent-started");
-        let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf started > {}\n",
-            crate::session::environment::shell_escape(marker.to_str().unwrap())
-        );
-        let _agent = crate::session::test_support::install_login_shell_path_command(
-            root.path(),
-            "claude",
-            &script,
-        );
-        crate::session::config::update_config(|config| {
-            config.systemd.enabled = false;
-            config.session.smart_rename = false;
-        })
-        .unwrap();
-        crate::session::config::update_app_state(|state| {
-            state.has_acknowledged_agent_hooks = true;
-        })
-        .unwrap();
-        let profile = "forgotten-launch";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let owner_path = root.path().join("owner");
-        let claimant_path = root.path().join("claimant");
-        std::fs::create_dir(&owner_path).unwrap();
-        std::fs::create_dir(&claimant_path).unwrap();
-        let sid = "11111111-2222-4333-8444-555555555555";
-        let mut owner = tool_instance("claude", owner_path.to_str().unwrap());
-        owner.source_profile = profile.into();
-        owner.agent_session_id = Some(sid.into());
-        owner.terminal_scopes = Some(Vec::new());
-        owner.trash();
-        owner.lifecycle_generation = 4;
-        owner.lifecycle_reservation = Some(LifecycleReservation {
-            op: LifecycleOperation::Trash,
-            generation: 4,
-            at: chrono::Utc::now() - chrono::Duration::hours(1),
-        });
-        let mut claimant = tool_instance("claude", claimant_path.to_str().unwrap());
-        claimant.source_profile = profile.into();
-        seed_claude_transcript(&mut claimant, sid);
-        claimant.resume_intent = ResumeIntent::Use(sid.into());
-        claimant.resume_binding = claimant.agent_session_binding.clone();
-        storage
-            .update(|rows, _| {
-                rows.extend([owner.clone(), claimant.clone()]);
-                Ok(())
+        for written in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(root.path());
+            let _env = crate::session::test_support::EnvGuard::unset(&[
+                "TMUX",
+                "TMUX_PANE",
+                "CLAUDE_CONFIG_DIR",
+                "AOE_DAEMON_URL",
+            ])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let marker = root.path().join("agent-started");
+            let script = format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf started > {}\n",
+                crate::session::environment::shell_escape(marker.to_str().unwrap())
+            );
+            let _agent = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                &script,
+            );
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
             })
             .unwrap();
-        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
-        storage
-            .update(|rows, _| {
-                rows.retain(|row| row.id != owner.id);
-                Ok(())
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
             })
             .unwrap();
-        let error = claimant
-            .start_with_size_opts_in(None, true, &storage, true, None)
-            .unwrap_err();
-        assert!(
-            error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
-            "unexpected launch refusal: {error:#}"
-        );
-        assert!(!marker.exists());
-        assert!(!claimant.tmux_session().unwrap().exists_live());
-        assert_eq!(
-            storage.load().unwrap()[0].agent_session_id.as_deref(),
-            Some(sid)
-        );
+            let profile = "forgotten-launch";
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let owner_path = root.path().join("owner");
+            let claimant_path = root.path().join("claimant");
+            std::fs::create_dir(&owner_path).unwrap();
+            std::fs::create_dir(&claimant_path).unwrap();
+            let sid = "11111111-2222-4333-8444-555555555555";
+            let mut owner = tool_instance("claude", owner_path.to_str().unwrap());
+            owner.source_profile = profile.into();
+            owner.agent_session_id = Some(sid.into());
+            owner.terminal_scopes = Some(Vec::new());
+            owner.trash();
+            owner.lifecycle_generation = 4;
+            owner.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Trash,
+                generation: 4,
+                at: chrono::Utc::now() - chrono::Duration::hours(1),
+            });
+            let mut claimant = tool_instance("claude", claimant_path.to_str().unwrap());
+            claimant.source_profile = profile.into();
+            if written {
+                seed_claude_transcript(&mut claimant, sid);
+                claimant.resume_intent = ResumeIntent::Use(sid.into());
+                claimant.resume_binding = claimant.agent_session_binding.clone();
+            } else {
+                claimant.agent_session_id = Some(sid.into());
+                claimant.resume_intent = ResumeIntent::Default;
+            }
+            storage
+                .update(|rows, _| {
+                    rows.extend([owner.clone(), claimant.clone()]);
+                    Ok(())
+                })
+                .unwrap();
+            crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != owner.id);
+                    Ok(())
+                })
+                .unwrap();
+            let error = claimant
+                .start_with_size_opts_in(None, true, &storage, true, None)
+                .unwrap_err();
+            assert!(
+                error.is::<crate::session::purge_owners::ConversationOwnershipRetained>(),
+                "unexpected launch refusal: {error:#}"
+            );
+            assert!(!marker.exists());
+            assert!(!claimant.tmux_session().unwrap().exists_live());
+            assert_eq!(
+                storage.load().unwrap()[0].agent_session_id.as_deref(),
+                Some(sid)
+            );
+        }
     }
 }

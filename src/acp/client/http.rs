@@ -1579,6 +1579,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_endpoint_returns_raw_conflict_for_stale_identity() {
+        use crate::acp::state::Event;
+        use axum::{routing::get, Router};
+        let instance = crate::session::Instance::new("stale retained identity", "/tmp");
+        let id = instance.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        state
+            .acp_event_store
+            .record(&id, 1, &Event::ThinkingStarted)
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/sessions/{id}/acp/replay",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let initial: serde_json::Value = http
+            .get(&url)
+            .query(&[("view", "retained")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        state
+            .acp_event_store
+            .record(&id, 2, &Event::ThinkingEnded)
+            .unwrap();
+        let response = http
+            .get(&url)
+            .query(&[
+                ("view", "retained"),
+                (
+                    "history_identity",
+                    initial["history_identity"].as_str().unwrap(),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_client_rejects_two_successful_pages_with_distinct_identities() {
+        use axum::{routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/api/sessions/{id}/acp/replay", get({
+            let calls = Arc::clone(&calls);
+            move || {
+                let page = calls.fetch_add(1, Ordering::SeqCst);
+                async move { axum::Json(serde_json::json!({
+                    "frames": [{"session_id": "fixture", "seq": page + 1, "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
+                    "lost": false, "highest_seq": 2, "lowest_seq": 1,
+                    "next_cursor": page + 1, "has_more": page == 0,
+                    "history_identity": if page == 0 { "first-snapshot" } else { "different-snapshot" }
+                })) }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = client
+            .replay_retained_paged("fixture", 1)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(error, HttpError::Server { status, .. } if status == StatusCode::CONFLICT)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn retained_replay_rejects_content_changes_during_pagination() {
         use crate::acp::{protocol::ReplayQuery, state::Event};
         use axum::{

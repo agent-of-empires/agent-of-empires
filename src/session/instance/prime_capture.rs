@@ -605,6 +605,7 @@ impl Instance {
         &mut self,
         execution: &super::execution::NativeExecution,
         stores: CaptureStorage<'_>,
+        namespace_lock: &crate::session::purge_owners::ConversationReadLock,
     ) -> anyhow::Result<Option<ConversationState>> {
         let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
             return Ok(None);
@@ -612,11 +613,20 @@ impl Instance {
         let Some((parent, parent_sessions)) = self.prime_fork_parent_handoff(execution)? else {
             return Ok(None);
         };
-        let _conversation_lock = self.guard_retained_native_conversation(
-            stores,
-            &parent.session_id,
-            Some(&execution.binding),
-        )?;
+        let _conversation_lock = stores.with_store(&self.source_profile, |storage| {
+            let guard = namespace_lock.conversation(storage.storage(), &parent.session_id)?;
+            self.check_retained_native_conversation(
+                storage.storage(),
+                &parent.session_id,
+                Some(&execution.binding),
+            )?;
+            self.check_retained_native_conversation(
+                storage.storage(),
+                &parent.session_id,
+                parent.execution.as_ref(),
+            )?;
+            Ok(guard)
+        })?;
         crate::session::capture::hand_off_prime_root_transcript(
             parent_sessions,
             &plan.store,
@@ -1066,7 +1076,7 @@ mod tests {
             path
         };
 
-        let parent = sandboxed("prime-fork-parent");
+        let mut parent = sandboxed("prime-fork-parent");
         let parent_plan = plan_of(&parent);
         let parent_transcript = write_transcript(&parent_plan, parent_id);
         let parent_bytes = std::fs::read(&parent_transcript).unwrap();
@@ -1176,6 +1186,7 @@ mod tests {
 
         write_transcript(&child_plan, child_id);
         child.adopt_conversation_state(prepared.canonical_conversation.unwrap());
+        drop(prepared.namespace_lock);
         child.resume_intent = ResumeIntent::Default;
         child.resume_binding = None;
         child.set_agent_conversation(Some(child_id.into()), None, None);
@@ -1188,6 +1199,50 @@ mod tests {
             "{command}"
         );
         assert!(!command.contains(parent_id), "{command}");
+
+        // Destination is disjoint; only checking it would wrongly allow copying retained input.
+        std::fs::remove_file(&target).unwrap();
+        parent.active_execution = Some(crate::session::instance::ActiveExecution {
+            launch_id: "retained-prime-parent".into(),
+            binding: parent_binding.clone(),
+            capture: None,
+            container: None,
+        });
+        parent.agent_session_id = Some(parent_id.into());
+        parent.agent_session_binding = Some(ConversationBinding {
+            session_id: parent_id.into(),
+            execution: Some(parent_binding),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        parent.terminal_scopes = Some(Vec::new());
+        parent
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        parent.trash();
+        let storage = crate::session::Storage::new_unwatched("prime-fork-handoff").unwrap();
+        let journal_path = crate::session::get_app_dir()
+            .unwrap()
+            .join(crate::session::purge_owners::FILE_NAME);
+        let journal = std::fs::read(&journal_path).unwrap();
+        let busy =
+            crate::session::purge_owners::retain_forgotten_trash(&storage, &parent).unwrap_err();
+        assert!(busy.is::<crate::session::purge_owners::ConversationOwnershipBusy>());
+        assert_eq!(std::fs::read(journal_path).unwrap(), journal);
+        drop(restarted);
+        crate::session::purge_owners::retain_forgotten_trash(&storage, &parent).unwrap();
+        child.adopt_conversation_state(before);
+        let error = child
+            .prepare_launch_command(child.conversation_state())
+            .err()
+            .expect("retained parent store must refuse a cross-store fork");
+        assert!(format!("{error:#}").contains("retained"), "{error:#}");
+        assert!(!target.exists(), "refusal must precede destination copy");
+        assert_eq!(std::fs::read(parent_transcript).unwrap(), parent_bytes);
     }
 
     #[test]
@@ -1300,6 +1355,7 @@ mod tests {
         use crate::session::{ManagedResumeRefused, ResumeIntent};
 
         let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
         for (intent, recorded_sid, extra_args, refused) in [
             (ResumeIntent::Default, Some(sid), "", true),

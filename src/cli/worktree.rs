@@ -1,6 +1,6 @@
 //! `agent-of-empires worktree` command implementation
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -347,19 +347,49 @@ pub(crate) fn remove_confirmed_worktrees(
     if let Some(hook) = AFTER_PROFILE_LISTING.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
+    let app_registry = crate::session::get_app_dir()?
+        .canonicalize()?
+        .join("sessions.json");
+    let root_registry = if app_registry.try_exists()? {
+        let root = crate::session::anchored_fs::ResolvedDataFile::open(&app_registry)?;
+        let mut shared = false;
+        for storage in &storages {
+            let path = storage.sessions_path();
+            let parent = path
+                .parent()
+                .context("Registry directory missing")?
+                .canonicalize()?;
+            let registry = crate::session::anchored_fs::ResolvedDataFile::open(
+                &parent.join(path.file_name().context("Registry leaf missing")?),
+            )?;
+            shared |= root.same_target(&registry)?;
+        }
+        if shared {
+            None
+        } else {
+            Some(crate::session::LockedDataFile::open(&app_registry)?)
+        }
+    } else {
+        None
+    };
     crate::session::with_storages_locked(&storages, || {
         let owners =
             crate::session::purge_owners::CleanupOwners::load(&crate::session::get_app_dir()?)?;
-        let mut session_paths = Vec::new();
+        let mut protection = crate::session::path_identity::CleanupProtection::default();
+        if let Some(registry) = &root_registry {
+            let content = registry.read()?.context("App-root registry disappeared")?;
+            let rows: Vec<Instance> = serde_json::from_str(&content)?;
+            protection.extend(&rows)?;
+        }
         for storage in &storages {
-            for inst in storage.load_instances_complete()? {
-                let path = PathBuf::from(&inst.project_path);
-                session_paths.extend(path.canonicalize().ok());
-                session_paths.push(path);
-            }
+            protection.extend(&storage.load_instances_complete()?)?;
         }
         let (kept, free): (Vec<_>, Vec<_>) = orphans.iter().cloned().partition(|wt| {
-            session_paths.iter().any(|path| path.starts_with(&wt.path))
+            protection.references_path(&wt.path)
+                || wt
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| protection.references_branch(&git_wt.repo_path, branch))
                 || retained_worktree_owner(&owners, git_wt, wt)
         });
         for wt in &kept {
@@ -787,6 +817,92 @@ mod tests {
             std::fs::read(Path::new(&uncommitted.project_path).join("payload")).unwrap(),
             b"retained"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn confirmed_cleanup_keeps_complete_app_root_and_additional_owners() -> Result<()> {
+        use crate::session::purge_owners::{PurgeCapture, PurgeOwner};
+        for root_alias in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+            let app = crate::session::get_app_dir()?;
+            crate::session::purge_owners::initialize(&app)?;
+            let storage = Storage::new_unwatched("owners")?;
+            let main = tmp.path().join("main");
+            let repo = git2::Repository::init(&main)?;
+            let signature = git2::Signature::now("Test", "test@example.com")?;
+            let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+            repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+            let git = GitWorktree::new(main.clone())?;
+            let mut paths = Vec::new();
+            for name in ["pre-trash", "workspace", "branch", "additional", "free"] {
+                let path = tmp.path().join(name);
+                git.create_worktree(name, &path, true, None)?;
+                std::fs::write(path.join("sentinel"), name)?;
+                paths.push(path.canonicalize()?);
+            }
+            let (orphans, _) = find_orphaned_worktrees(&[], &git)?;
+            assert_eq!(orphans.len(), 5);
+            let mut root_row =
+                Instance::new("root owner", tmp.path().join("elsewhere").to_str().unwrap());
+            root_row.pre_trash_project_path = Some(paths[0].to_string_lossy().into_owned());
+            root_row.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "workspace".into(),
+                workspace_dir: paths[1].to_string_lossy().into_owned(),
+                repos: Vec::new(),
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: false,
+            });
+            root_row.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "branch".into(),
+                main_repo_path: main.to_string_lossy().into_owned(),
+                managed_by_aoe: false,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            if root_alias {
+                storage.update(|rows, _| {
+                    rows.push(root_row.clone());
+                    Ok(())
+                })?;
+                std::os::unix::fs::symlink(storage.sessions_path(), app.join("sessions.json"))?;
+            } else {
+                std::fs::write(
+                    app.join("sessions.json"),
+                    serde_json::to_vec(&vec![root_row])?,
+                )?;
+            }
+            let mut purge_row =
+                Instance::new("pending purge", tmp.path().join("purge").to_str().unwrap());
+            purge_row.terminal_scopes = Some(Vec::new());
+            let additional_row = Instance::new("additional owner", paths[3].to_str().unwrap());
+            let additional =
+                crate::session::path_identity::CleanupProtection::new([&additional_row])?;
+            let _owner = PurgeOwner::record_plan(
+                &storage,
+                &purge_row,
+                purge_row.lifecycle_generation,
+                None,
+                Some(&additional),
+                PurgeCapture::new(&purge_row)?,
+            )?;
+            assert_eq!(
+                remove_confirmed_worktrees(&git, &orphans, &HashSet::new())?,
+                1
+            );
+            for (index, name) in ["pre-trash", "workspace", "branch", "additional"]
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    std::fs::read_to_string(paths[index].join("sentinel"))?,
+                    *name
+                );
+            }
+            assert!(!paths[4].exists());
+        }
+        Ok(())
     }
 
     #[test]

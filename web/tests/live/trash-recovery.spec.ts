@@ -62,6 +62,17 @@ function pendingTrash(title: string, unverified: boolean) {
   return { fixture, seedFn };
 }
 
+async function retryThroughApi(baseUrl: string, fixture: { id: string; profile: string }, generation: number) {
+  const source = await fetch(`${baseUrl}/api/sessions`);
+  const epoch = source.headers.get("aoe-runtime-epoch");
+  if (!epoch) throw new Error("The native runtime epoch is missing");
+  return fetch(`${baseUrl}/api/sessions/${fixture.id}/trash`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "aoe-runtime-epoch": epoch },
+    body: JSON.stringify({ kill_pane: true, expected_profile: fixture.profile, expected_generation: generation }),
+  });
+}
+
 for (const unverified of [false, true]) {
   test(`Trash retry ${unverified ? "retains unverified files and remains recoverable" : "completes a recoverable transition"}`, async ({
     page,
@@ -91,6 +102,58 @@ for (const unverified of [false, true]) {
       await expect(row.getByTestId("sidebar-trash-retry")).toBeEnabled();
       await expect(row.getByTestId("sidebar-trash-forget")).toBeVisible();
       await expect(row.getByTestId("sidebar-trash-purge")).toHaveCount(0);
+      await page.evaluate(() => {
+        const state = Object.assign(window, { retryPosts: 0 });
+        const original = window.fetch;
+        window.fetch = (...args) => {
+          const url = args[0] instanceof Request ? args[0].url : String(args[0]);
+          if (args[1]?.method === "POST" && new URL(url, location.href).pathname.endsWith("/trash"))
+            state.retryPosts += 1;
+          return original(...args);
+        };
+      });
+      const retry = row.getByTestId("sidebar-trash-retry");
+      const originalButton = (await retry.elementHandle())!;
+      const box = (await retry.boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      const concurrent = await retryThroughApi(serve.baseUrl, fixture, Number(before.lifecycle_generation) + 1);
+      expect(concurrent.status).toBe(200);
+      await originalButton.waitForElementState("hidden");
+      await page.mouse.up();
+      expect(await page.evaluate(() => ("retryPosts" in window ? window.retryPosts : undefined))).toBe(0);
+      const second = page.waitForResponse(
+        (result) =>
+          new URL(result.url()).pathname === `/api/sessions/${fixture.id}/trash` &&
+          result.request().method() === "POST",
+      );
+      await retry.click();
+      expect((await second).status()).toBe(200);
+      await expect
+        .poll(
+          async () =>
+            (await listSessions(serve.baseUrl)).find((candidate) => candidate.id === fixture.id)?.lifecycle_generation,
+        )
+        .toBe(Number(before.lifecycle_generation) + 3);
+      await expect(retry).toBeEnabled();
+      await expect(row.getByTestId("sidebar-trash-forget")).toBeVisible();
+      const retained = (await listSessions(serve.baseUrl)).find((candidate) => candidate.id === fixture.id)!;
+      expect(retained.lifecycle_reservation).toMatchObject({
+        op: "trash",
+        generation: Number(before.lifecycle_generation) + 3,
+      });
+      const source = await fetch(`${serve.baseUrl}/api/sessions`);
+      const epoch = source.headers.get("aoe-runtime-epoch");
+      if (!epoch) throw new Error("The native runtime epoch is missing");
+      const purge = await fetch(`${serve.baseUrl}/api/sessions/${fixture.id}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json", "aoe-runtime-epoch": epoch },
+        body: JSON.stringify({}),
+      });
+      expect(purge.status).toBe(409);
+      const afterPurge = (await listSessions(serve.baseUrl)).find((candidate) => candidate.id === fixture.id)!;
+      expect(afterPurge.lifecycle_generation).toBe(retained.lifecycle_generation);
+      expect(afterPurge.lifecycle_reservation).toEqual(retained.lifecycle_reservation);
     } else {
       await expect(row.getByTestId("sidebar-trash-retry")).toHaveCount(0);
       await expect(row.getByTestId("sidebar-trash-restore")).toBeVisible();

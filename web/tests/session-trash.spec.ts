@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor, waitForResponseBody } from "./helpers/mockedTest";
 import type { Locator, Page } from "@playwright/test";
 import {
   confirmDelete,
@@ -10,6 +10,13 @@ import {
   trashRows,
   trashToggle,
 } from "./helpers/trashMocks";
+import {
+  diffFilesResponse,
+  diffFileResponse,
+  mockDiffFiles,
+  mockDiffFileContents,
+  openDiffFile,
+} from "./helpers/diffMocks";
 
 test.use({ viewport: { width: 1280, height: 720 } });
 
@@ -366,3 +373,101 @@ test.describe("Delete active session", () => {
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });
 });
+
+test("mixed workspace recovery targets only its unfinished Trash member", async ({ page }) => {
+  const shared = { projectPath: "/tmp/mixed-recovery", branch: "main", groupPath: "/tmp" };
+  const handle = await installTrashMocks(
+    page,
+    [
+      { ...shared, id: "mixed-pending", title: "pending member", trashed: true, pendingTrash: true },
+      { ...shared, id: "mixed-live", title: "live member", trashed: false },
+    ],
+    { groupAxis: true },
+  );
+  await page.goto("/session/mixed-live");
+  const live = page.getByRole("navigation", { name: "Sessions sidebar" }).locator('a[href="/session/mixed-live"]');
+  await expect(live).toBeVisible();
+  await openTrash(page);
+  const pending = trashRows(page).filter({ hasText: "pending member" });
+  await expect(pending).toBeVisible();
+  await expect(trashRows(page).filter({ hasText: "live member" })).toHaveCount(0);
+  await pending.getByTestId("sidebar-trash-retry").click();
+  await expect.poll(() => handle.trashedIds).toEqual(["mixed-pending"]);
+  await expect(pending.getByTestId("sidebar-trash-retry")).toBeEnabled();
+  await expect(live).toBeVisible();
+  await expect(page).toHaveURL(/\/session\/mixed-live/);
+  expect(handle.restoredIds).toEqual([]);
+  expect(handle.deletedIds).toEqual([]);
+  await pending.getByTestId("sidebar-trash-forget").click();
+  await expect(page.getByTestId("forget-trash-dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("forget-trash-dialog")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/session\/mixed-live/);
+});
+
+test("Forget Escape leaves the actual underlying file viewer open", async ({ page }) => {
+  await installTrashMocks(page, [
+    { id: "viewer-live", title: "viewer live", projectPath: "/tmp/viewer", trashed: false },
+    { id: "viewer-pending", title: "viewer pending", projectPath: "/tmp/pending", trashed: true, pendingTrash: true },
+  ]);
+  const file = { path: "recovery.txt" };
+  await mockDiffFiles(page, diffFilesResponse([file]));
+  await mockDiffFileContents(page, diffFileResponse(file, "before\n", "VIEWER-SURVIVES-ESCAPE\n"));
+  await page.goto("/session/viewer-live");
+  await openDiffFile(page, "recovery.txt");
+  const content = page.getByText("VIEWER-SURVIVES-ESCAPE", { exact: false }).first();
+  await expect(content).toBeVisible();
+  await openTrash(page);
+  await trashRows(page).filter({ hasText: "viewer pending" }).getByTestId("sidebar-trash-forget").click();
+  await expect(page.getByTestId("forget-trash-dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("forget-trash-dialog")).toHaveCount(0);
+  await expect(content).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(content).toBeHidden();
+});
+
+for (const welcomeSeen of [false, true]) {
+  test(`Forget defers actual App ${welcomeSeen ? "tour" : "welcome"} until its confirmation closes`, async ({
+    page,
+  }) => {
+    await installTrashMocks(page, [
+      {
+        id: "onboarding-pending",
+        title: "onboarding pending",
+        projectPath: "/tmp/pending",
+        trashed: true,
+        pendingTrash: true,
+      },
+    ]);
+    await page.addInitScript((seen) => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      if (seen) localStorage.setItem("aoe-welcome-seen", "1");
+    }, welcomeSeen);
+    const { promise: settingsGate, resolve: releaseSettings } = Promise.withResolvers<void>();
+    await page.route("**/api/settings", async (route) => {
+      await settingsGate;
+      await route.fulfill({ json: { app_state: { has_seen_web_tour: false } } });
+    });
+    await page.route("**/api/app-state/web-tour-seen", (route) => route.fulfill({ json: { ok: true } }));
+    await page.goto("/");
+    await openTrash(page);
+    await trashRows(page).filter({ hasText: "onboarding pending" }).getByTestId("sidebar-trash-forget").click();
+    const confirmation = page.getByTestId("forget-trash-dialog");
+    await expect(confirmation).toBeVisible();
+    const response = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/settings");
+    releaseSettings();
+    await (await response).finished();
+    await waitForResponseBody(page, "/api/settings");
+    const tour = page.getByRole("alertdialog", { name: "Search and commands", exact: true });
+    const welcome = page.getByRole("heading", { name: "Welcome to Agent of Empires" });
+    await observeFor(page, 1500, async () => {
+      await expect(confirmation).toBeVisible();
+      await expect(tour).toHaveCount(0);
+      await expect(welcome).toHaveCount(0);
+    });
+    await page.keyboard.press("Escape");
+    await expect(confirmation).toHaveCount(0);
+    await expect(welcomeSeen ? tour : welcome).toBeVisible();
+  });
+}

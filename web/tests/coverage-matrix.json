@@ -13,7 +13,40 @@
         "web/src/components/sidebar/TrashMenu.tsx",
         "web/src/components/ForgetTrashDialog.tsx"
       ],
-      "notes": "Real-daemon Retry completes recoverable Trash and keeps unverified files protected. Separate mouse and keyboard Forget confirmations remove only the visible record and preserve files and durable cleanup ownership. A concurrent retry closes stale confirmation before keyboard or mouse consent can issue Forget."
+      "notes": "Real-daemon Retry completes recoverable Trash and keeps unverified files protected across repeated failures. Web and TUI controls retry the failed generation again; pending reservation and files survive, and purge still refuses. A pointer press retains its original generation across concurrent Retry and cannot retarget the replacement button. Separate mouse and keyboard Forget confirmations remove only the visible record and preserve files and durable cleanup ownership. A concurrent retry closes stale confirmation before keyboard or mouse consent can issue Forget."
+    },
+    {
+      "id": "trash.mixed-workspace-recovery",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/sidebar/TrashMenu.tsx",
+        "web/src/components/ForgetTrashDialog.tsx"
+      ],
+      "notes": "An unfinished Trash member remains reachable beside a live workspace sibling. Retry targets only the pending member; Forget Escape preserves the active live session route."
+    },
+    {
+      "id": "trash.forget-overlay-priority",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/ForgetTrashDialog.tsx"],
+      "notes": "Real App Escape closes Forget without closing the underlying file viewer. Delayed first-run settings resolve while Forget remains open; welcome and tour start only after its confirmation closes."
+    },
+    {
+      "id": "trash.restore-receipt-ordering",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useSessions.test.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts",
+        "src/lib/__tests__/trashActions.test.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": ["web/src/App.tsx", "web/src/components/ForgetTrashDialog.tsx"],
+      "notes": "Restore consumes its native receipt and wins over a late older Retry without fencing unrelated rows. Mixed-workspace restore excludes live members. Consumed recovery Escape prevents later viewer listeners from closing the underlying surface."
     },
     {
       "id": "settings.dialog-escape",

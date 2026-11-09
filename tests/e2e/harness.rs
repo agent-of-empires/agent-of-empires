@@ -1334,6 +1334,12 @@ last_seen_version = "{}"
         self.wait_for_timeout(" aoe ", Duration::from_secs(30));
     }
 
+    /// Observe input processing, then await every mutation admitted by that input.
+    pub fn wait_for_processed_mutations(&self) {
+        self.synchronize_input();
+        self.wait_for_runtime_ready();
+    }
+
     /// Wait until the runtime is connected, has applied every change this TUI sent, and grants
     /// native interaction (what the footer once called "Runtime ready"). The TUI reports it in
     /// `AOE_E2E_RUNTIME_STATE`, which every TUI this harness spawns writes.

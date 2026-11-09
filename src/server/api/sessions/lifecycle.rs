@@ -746,6 +746,11 @@ pub async fn trash_session(
         let store: &dyn crate::session::SessionStore = native;
         let title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+        anyhow::ensure!(
+            !crate::session::purge_owners::CleanupOwners::load_for(store.storage())?
+                .retains_session(&worker_id),
+            crate::session::purge_owners::ConversationOwnershipRetained
+        );
         let instance = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
@@ -1067,6 +1072,11 @@ pub async fn restore_session(
             let _lifecycle = store
                 .storage()
                 .acquire_instance_lifecycle_lock(&worker_id)?;
+            anyhow::ensure!(
+                !crate::session::purge_owners::CleanupOwners::load_for(store.storage())?
+                    .retains_session(&worker_id),
+                crate::session::purge_owners::ConversationOwnershipRetained
+            );
             let claimed = store.update(|rows, _| {
                 let row = rows
                     .iter()
@@ -1476,11 +1486,15 @@ pub(crate) fn lifecycle_rejection(
         _ => {}
     }
     if error.is::<crate::session::purge_owners::ConversationOwnershipRetained>() {
-        return Some(api_error(
-            StatusCode::CONFLICT,
-            "native_conversation_retained",
-            error.to_string(),
-        ));
+        let code = crate::daemon::ApiErrorCode::NativeConversationRetained;
+        return Some((
+            code.status(),
+            code.header(),
+            Json(serde_json::json!({
+                "error": code.as_str(),
+                "message": "Conversation belongs to retained cleanup ownership; use a proven separate native store.",
+            })),
+        ).into_response());
     }
     if let Some(blocked) = error
         .downcast_ref::<LifecycleTargetError>()

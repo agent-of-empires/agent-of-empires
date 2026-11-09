@@ -1,15 +1,21 @@
 // Trash, restore, and confirmed-deletion transitions.
 
 import { deleteWorkspace, restoreSession, trashSession } from "./api";
-import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashForgetConsent, TrashPurgeConsent } from "./api";
+import type {
+  DeleteSessionOptions,
+  DeleteWorkspaceResult,
+  SessionMutation,
+  TrashForgetConsent,
+  TrashPurgeConsent,
+} from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
 const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
 
-/** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
+/** Restore only trashed members of the workspace containing `sessionId`; live siblings stay untouched. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
   const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
-  return ws ? ws.sessions.map((s) => s.id) : [sessionId];
+  return ws ? ws.sessions.filter((session) => session.trashed_at != null).map((session) => session.id) : [sessionId];
 }
 
 export interface Notifier {
@@ -216,13 +222,16 @@ export async function deleteWorkspaceSessions(
 }
 
 /** Returns true iff all succeeded. */
-export async function restoreSessions(ids: string[], deps: TrashDeps): Promise<boolean> {
+export async function restoreSessions(
+  ids: string[],
+  deps: { applySessionMutation: (mutation: SessionMutation) => void; notify: Notifier | null },
+): Promise<boolean> {
   let anyFailed = false;
   for (const id of ids) {
     const res = await restoreSession(id);
     if (res) {
-      deps.applySession(res);
-      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
+      deps.applySessionMutation(res);
+      res.session.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
     }

@@ -85,6 +85,10 @@ pub(crate) struct CliDuplicateSession(anyhow::Error);
 #[error("CLI creation committed, but finalization was not confirmed")]
 pub(crate) struct CliCreationOutcomeUnknown;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Import source is already owned by an AoE session")]
+pub(crate) struct ImportSourceAlreadyOwned;
+
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
 /// while a plain build failure stays `400`. Mirrors the existing
@@ -283,13 +287,8 @@ pub(crate) async fn spawn_structured_session(
                     row.acp_session_id.as_deref() == Some(import_id)
                         || row.agent_session_id.as_deref() == Some(import_id)
                 })
-                    && !cleanup_owners.frozen_instances().any(|row| {
-                        row.acp_session_id.as_deref() == Some(import_id)
-                            || row.prior_tool_session_ids.values()
-                                .any(|parked| parked.acp_session_id.as_deref() == Some(import_id))
-                    })
-                    && !cleanup_owners.blocks_conversation(&instance.id, import_id, source),
-                "import source is already owned by an AoE session"
+                    && !cleanup_owners.blocks_acp_import(&instance.id, import_id, source),
+                ImportSourceAlreadyOwned
             );
         }
         anyhow::ensure!(

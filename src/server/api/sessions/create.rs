@@ -1741,6 +1741,10 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
         return ("create_failed", duplicate.to_string());
     }
+    if let Some(owned) = e.downcast_ref::<crate::server::session_spawn::ImportSourceAlreadyOwned>()
+    {
+        return ("create_failed", owned.to_string());
+    }
     use crate::containers::error::DockerError;
     use crate::session::builder::BuildRefusal;
     use crate::session::config::repo_config::HookFailed;

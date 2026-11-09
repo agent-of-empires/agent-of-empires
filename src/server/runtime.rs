@@ -519,19 +519,23 @@ pub(super) async fn epoch_gate(
         .headers()
         .get_all(crate::daemon::RUNTIME_EPOCH_HEADER)
         .iter();
-    if let Some(epoch) = epochs.next() {
-        if epochs.next().is_some() || epoch.as_bytes() != state.runtime.epoch.as_bytes() {
-            let code = crate::daemon::ApiErrorCode::RuntimeEpochMismatch;
-            return (
-                code.status(),
-                code.header(),
-                Json(serde_json::json!({
-                    "error": code.as_str(),
-                    "message": "Reconnect before sending changes to this daemon.",
-                })),
-            )
-                .into_response();
-        }
+    let epoch = epochs.next();
+    let requires_epoch = request.method() == axum::http::Method::POST
+        && request.uri().path().ends_with("/trash/forget");
+    if epochs.next().is_some()
+        || epoch.is_some_and(|epoch| epoch.as_bytes() != state.runtime.epoch.as_bytes())
+        || (requires_epoch && epoch.is_none())
+    {
+        let code = crate::daemon::ApiErrorCode::RuntimeEpochMismatch;
+        return (
+            code.status(),
+            code.header(),
+            Json(serde_json::json!({
+                "error": code.as_str(),
+                "message": "Reconnect before sending changes to this daemon.",
+            })),
+        )
+            .into_response();
     }
     next.run(request).await
 }
