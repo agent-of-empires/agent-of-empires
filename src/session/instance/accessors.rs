@@ -477,12 +477,17 @@ impl Instance {
         ) {
             return None;
         }
-        let agent = resolved_agent_for(&self.effective_profile(), &self.tool, &self.detect_as)?;
-        if crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
-            .session
-            .agent_execution_as
-            .contains_key(&self.tool)
+        let profile = self.effective_profile();
+        let config = crate::plugin::agent_integration::effective_session(&profile)?;
+        // Only a declaration for this same name is the collision this helper
+        // gives up on: a distinct custom wrapper keeps its pane-scoped capture.
+        if config.custom_agent_selected(&self.tool)
+            && crate::plugin::agent_integration::declares_tool(&self.tool)
         {
+            return None;
+        }
+        let agent = resolved_agent_for(&profile, &self.tool, &self.detect_as)?;
+        if config.agent_execution_as.contains_key(&self.tool) {
             return None;
         }
         let command = self.get_tool_command();
@@ -926,6 +931,52 @@ mod tests {
             created_at: Utc::now(),
             base_branch: None,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_distinct_custom_wrapper_keeps_pane_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let _plugin = crate::session::instance::test_helpers::install_omp_test_plugin();
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("work-claude".into(), "work-claude".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("work-claude".into(), "claude".into());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        // A custom command aliased to a provider is not a declaration of that
+        // provider's tool, so it keeps the pane-scoped capture it had before.
+        let mut wrapper = Instance::new("custom wrapper", temp.path().to_str().unwrap());
+        wrapper.tool = "work-claude".into();
+        wrapper.detect_as = "claude".into();
+        let agent = wrapper
+            .legacy_default_selector_agent()
+            .expect("a distinct configured wrapper keeps its pane-scoped capture");
+        assert_eq!(agent.name, "claude");
+
+        // The same name declared by a plugin is the collision: the custom
+        // command is a different program, so the helper gives up.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("omp".into(), "omp".into());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        let mut collision = Instance::new("custom collision", temp.path().to_str().unwrap());
+        collision.tool = "omp".into();
+        assert!(
+            collision.legacy_default_selector_agent().is_none(),
+            "a declaration for the same name does not describe the custom command"
+        );
     }
 
     #[test]

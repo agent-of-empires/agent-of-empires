@@ -28,8 +28,221 @@ use crate::{hooks::dir_guard, session::Instance};
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(15);
 
+/// The program a launch command runs, by basename so an absolute path and a
+/// bare command name compare equal.
+fn program(command: &str) -> Option<String> {
+    let words = shell_words::split(command).ok()?;
+    // A leading assignment still names `env`, and the wrapped program is what
+    // runs, so start at the first non-assignment word.
+    let mut words = words
+        .iter()
+        .map(String::as_str)
+        .skip_while(|word| is_assignment(word));
+    let executable = words.next()?;
+    // `env FOO=1 tool` runs `tool`, so the wrapper is transparent to ownership.
+    if basename(executable) != "env" {
+        return Some(basename(executable));
+    }
+    env_program(words)
+}
+
+/// `env` long options that take their argument as a separate word, so the word
+/// after one of them is still `env`'s argument rather than the program it runs.
+const ENV_ARGUMENT_OPTIONS: [&str; 5] =
+    ["--unset", "--chdir", "--split-string", "--argv0", "--path"];
+
+fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut options_ended = false;
+    while let Some(word) = words.next() {
+        if is_assignment(word) {
+            continue;
+        }
+        if options_ended {
+            return Some(basename(word));
+        }
+        if word == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !word.starts_with('-') || word == "-" {
+            return Some(basename(word));
+        }
+        // `env -S 'acme --serve'` runs the command line it splits, so the
+        // remaining words belong to that command, not to `env`.
+        if let Some(split) = split_string_operand(word, &mut words) {
+            let split = shell_words::split(&split).ok()?;
+            return env_program(split.iter().map(String::as_str));
+        }
+        if word.starts_with("--") {
+            if ENV_ARGUMENT_OPTIONS.contains(&word) {
+                words.next();
+            } else if !word.contains('=') && !ENV_FLAG_OPTIONS.contains(&word) {
+                // An option this parser does not model may take the next word as
+                // its operand, so the wrapped program is unknowable.
+                return None;
+            }
+            continue;
+        }
+        // Short options cluster, and an operand-taking flag takes the rest of
+        // the cluster or the next word: `-iu NAME` unsets NAME.
+        let flags = &word[1..];
+        let mut index = 0;
+        while let Some(flag) = flags[index..].chars().next() {
+            index += flag.len_utf8();
+            match flag {
+                'i' | '0' | 'v' => {}
+                'S' => {
+                    let operand = if index == flags.len() {
+                        words.next()?.to_string()
+                    } else {
+                        flags[index..].to_string()
+                    };
+                    let split = shell_words::split(&operand).ok()?;
+                    return env_program(split.iter().map(String::as_str));
+                }
+                'u' | 'C' | 'P' | 'a' => {
+                    if index == flags.len() {
+                        words.next();
+                    }
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    None
+}
+
+/// `env` long options that never take an operand.
+const ENV_FLAG_OPTIONS: [&str; 3] = ["--ignore-environment", "--null", "--debug"];
+
+/// The command line `-S`/`--split-string` carries, inline or as the next word.
+fn split_string_operand<'a>(
+    word: &'a str,
+    words: &mut impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    if word == "-S" || word == "--split-string" {
+        return words.next().map(str::to_string);
+    }
+    word.strip_prefix("--split-string=")
+        .or_else(|| word.strip_prefix("-S").filter(|rest| !rest.is_empty()))
+        .map(str::to_string)
+}
+
+fn is_assignment(word: &str) -> bool {
+    // Shell assignments are identifier names: `--split-string=acme` is an option
+    // and `./not-acme=1` is a program.
+    word.split_once('=').is_some_and(|(name, _)| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn basename(executable: &str) -> String {
+    std::path::Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable)
+        .to_string()
+}
+
+/// A session's effective configuration, resolved once so one poll does not
+/// re-read the config files for every ownership helper.
+pub(crate) struct EffectiveSession {
+    pub(crate) config: crate::session::config::SessionConfig,
+    /// False when the profile file could not be read. Ownership then fails
+    /// closed: a transient read error must not hand a custom session to a
+    /// plugin.
+    profile_read: bool,
+}
+
+impl EffectiveSession {
+    pub(crate) fn load(profile: &str) -> Self {
+        let global = crate::session::Config::load_or_warn();
+        if profile.is_empty() {
+            return Self {
+                config: global.session,
+                profile_read: true,
+            };
+        }
+        match crate::session::config::profile_config::load_profile_config(profile) {
+            Ok(overrides) => Self {
+                config: crate::session::config::profile_config::merge_configs(global, &overrides)
+                    .session,
+                profile_read: true,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "plugin.agents",
+                    profile,
+                    %error,
+                    "reading the profile config failed; plugin ownership stays off for this session"
+                );
+                Self {
+                    config: global.session,
+                    profile_read: false,
+                }
+            }
+        }
+    }
+
+    /// Whether this configuration selects `tool` as a custom agent. A blank
+    /// command defers to the plugin-provided agent.
+    fn custom_selected(&self, tool: &str) -> bool {
+        self.config.custom_agent_selected(tool)
+    }
+}
+
+/// The session's effective configuration, with its profile overrides applied.
+/// `None` when the profile could not be read: consumers then treat plugin
+/// declarations as unavailable instead of reading the global fallback.
+impl EffectiveSession {
+    /// The configuration pane detection may consult. A profile read failure
+    /// withholds plugin declarations instead of falling back to the global
+    /// configuration, which knows nothing about a profile-only custom agent.
+    pub(crate) fn detection_config(&self) -> Option<&crate::session::config::SessionConfig> {
+        self.profile_read.then_some(&self.config)
+    }
+}
+
+pub(crate) fn effective_session(profile: &str) -> Option<crate::session::config::SessionConfig> {
+    let effective = EffectiveSession::load(profile);
+    effective.profile_read.then_some(effective.config)
+}
+
+/// A custom agent owns the session under its own name only. A distinct session
+/// explicitly aliased to a declared tool keeps the provider's ownership even
+/// when a custom agent also uses that tool name.
+fn custom_shadowed(instance: &Instance, effective: &EffectiveSession, tool: &str) -> bool {
+    !effective.profile_read || (tool == instance.tool && effective.custom_selected(tool))
+}
+
+/// Whether this session launches the program the declaration names. A
+/// configured custom agent can share a declared tool's name while running
+/// another command, and the declaration does not describe it.
+fn launches_declared(
+    instance: &Instance,
+    effective: &EffectiveSession,
+    entry: &AgentIntegrationContribution,
+) -> bool {
+    if !effective.profile_read || effective.custom_selected(&instance.tool) {
+        return false;
+    }
+    let declared = entry
+        .command
+        .as_deref()
+        .and_then(program)
+        .unwrap_or_else(|| entry.tool.clone());
+    program(instance.get_tool_command()).is_some_and(|launched| launched == declared)
+}
+
 fn provider<'a>(
     registry: &'a super::PluginRegistry,
+    instance: &Instance,
+    effective: &EffectiveSession,
     tool: &str,
 ) -> Result<Option<&'a super::LoadedPlugin>> {
     let mut matches = registry.active().filter(|plugin| {
@@ -42,7 +255,14 @@ fn provider<'a>(
                 .manifest
                 .agent_integrations
                 .iter()
-                .any(|entry| entry.tool == tool)
+                // An explicit detection alias deliberately reads the provider's
+                // report; only the session's own tool can be shadowed by a
+                // custom command that happens to share its name.
+                .any(|entry| {
+                    entry.tool == tool
+                        && (entry.tool != instance.tool
+                            || launches_declared(instance, effective, entry))
+                })
     });
     let selected = matches.next();
     ensure!(
@@ -255,11 +475,23 @@ fn eligible(instance: &Instance) -> bool {
 /// after that, so an outgoing alias cannot hand another tool's report to the
 /// session.
 pub fn status_configured(instance: &Instance, tool: &str) -> bool {
-    eligible(instance) && status_owned(tool)
+    status_configured_with(
+        instance,
+        &EffectiveSession::load(&instance.source_profile),
+        tool,
+    )
+}
+
+fn status_configured_with(instance: &Instance, effective: &EffectiveSession, tool: &str) -> bool {
+    eligible(instance) && !custom_shadowed(instance, effective, tool) && declared_owns(tool)
 }
 
 /// Whether an approved integration owns replies, even when its report is unavailable.
 pub fn replies_configured(instance: &Instance) -> bool {
+    replies_configured_with(instance, &EffectiveSession::load(&instance.source_profile))
+}
+
+fn replies_configured_with(instance: &Instance, effective: &EffectiveSession) -> bool {
     eligible(instance)
         && super::registry().active().any(|plugin| {
             plugin
@@ -267,11 +499,11 @@ pub fn replies_configured(instance: &Instance) -> bool {
                 .capabilities
                 .iter()
                 .any(|c| c.as_str() == "session.integration")
-                && plugin
-                    .manifest
-                    .agent_integrations
-                    .iter()
-                    .any(|entry| entry.tool == instance.tool && entry.replies)
+                && plugin.manifest.agent_integrations.iter().any(|entry| {
+                    entry.tool == instance.tool
+                        && entry.replies
+                        && launches_declared(instance, effective, entry)
+                })
         })
 }
 
@@ -290,6 +522,13 @@ pub(crate) struct IntegrationStatus {
 }
 
 pub(crate) fn integration_status(instance: &Instance) -> IntegrationStatus {
+    integration_status_with(instance, &EffectiveSession::load(&instance.source_profile))
+}
+
+pub(crate) fn integration_status_with(
+    instance: &Instance,
+    effective: &EffectiveSession,
+) -> IntegrationStatus {
     let pane_tool = crate::tmux::status_rules::detection_tool(
         &instance.source_profile,
         &instance.tool,
@@ -301,12 +540,12 @@ pub(crate) fn integration_status(instance: &Instance) -> IntegrationStatus {
     // provider drive this session.
     let owner = [instance.tool.as_str(), pane_tool.as_str()]
         .into_iter()
-        .find(|tool| status_configured(instance, tool))
+        .find(|tool| status_configured_with(instance, effective, tool))
         .map(str::to_owned);
     let configured = owner.is_some();
     let snapshot = owner
         .as_deref()
-        .and_then(|tool| provider_snapshot(instance, tool));
+        .and_then(|tool| provider_snapshot_with(instance, effective, tool));
     IntegrationStatus {
         tool: owner.unwrap_or_else(|| pane_tool.clone()),
         pane_tool,
@@ -319,8 +558,20 @@ fn provider_snapshot(instance: &Instance, tool: &str) -> Option<AgentIntegration
     if !eligible(instance) {
         return None;
     }
+    provider_snapshot_with(
+        instance,
+        &EffectiveSession::load(&instance.source_profile),
+        tool,
+    )
+}
+
+fn provider_snapshot_with(
+    instance: &Instance,
+    effective: &EffectiveSession,
+    tool: &str,
+) -> Option<AgentIntegrationSnapshot> {
     let registry = super::registry();
-    let plugin = provider(&registry, tool).ok()??;
+    let plugin = provider(&registry, instance, effective, tool).ok()??;
     read_report(&instance.id, tool, plugin).ok().flatten()
 }
 
@@ -358,6 +609,9 @@ struct DeclaredAgent {
     status: bool,
 }
 
+/// The declaration a plugin publishes for `tool`, independent of any session's
+/// configuration: whether a custom agent owns that name is a per-session
+/// decision its consumers make from their effective configuration.
 fn declared_for(registry: &super::PluginRegistry, tool: &str) -> Option<DeclaredAgent> {
     let mut candidates = registry.active().flat_map(|plugin| {
         plugin
@@ -390,7 +644,7 @@ fn declared_for(registry: &super::PluginRegistry, tool: &str) -> Option<Declared
 /// whose executable is the whole prefix.
 pub(crate) fn declared_launch_words(tool: &str) -> Option<(Vec<String>, usize)> {
     let (registry, generation) = super::registry_with_generation();
-    let declared = declared_agent_in(&registry, generation, tool)?;
+    let declared = declared_agent_in_snapshot(&registry, generation, tool)?;
     if !std::ptr::eq(declared, crate::agents::get_agent(tool)?) {
         return None;
     }
@@ -414,10 +668,27 @@ pub(crate) fn clear_declared_agent_cache() {
 /// effect once the matching core entry is deleted.
 pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
     let (registry, generation) = super::registry_with_generation();
-    declared_agent_in(&registry, generation, tool)
+    declared_agent_in_snapshot(&registry, generation, tool)
 }
 
-fn declared_agent_in(
+/// The agent whose reply contract `tool` uses.
+///
+/// A profile that cannot be read resolves built-ins only: a plugin declaration
+/// is owned by the effective configuration, so a same-name custom wrapper must
+/// not inherit its fallback keys.
+pub(crate) fn reply_agent(
+    config: Option<&crate::session::config::SessionConfig>,
+    tool: &str,
+) -> Option<&'static AgentDef> {
+    match config {
+        Some(config) => crate::agents::get_agent_in(config, tool),
+        None => crate::agents::resolve_builtin_tool_name(tool).and_then(crate::agents::get_agent),
+    }
+}
+
+/// Resolve [`declared_agent`] against one registry snapshot, so the cached entry
+/// and its generation describe the same reload.
+fn declared_agent_in_snapshot(
     registry: &super::PluginRegistry,
     generation: u64,
     tool: &str,
@@ -439,8 +710,37 @@ fn declared_agent_in(
     resolved
 }
 
+/// A declared tool as the session's effective configuration sees it. A custom
+/// command configured under the same name is a different program.
+pub(crate) fn declared_agent_in(
+    config: &crate::session::config::SessionConfig,
+    tool: &str,
+) -> Option<&'static AgentDef> {
+    if config.custom_agent_selected(tool) {
+        return None;
+    }
+    declared_agent(tool)
+}
+
 /// Whether an approved provider integration owns status for `tool`, a detection identity.
-pub(crate) fn status_owned(tool: &str) -> bool {
+pub(crate) fn status_owned(profile: &str, tool: &str) -> bool {
+    let effective = EffectiveSession::load(profile);
+    effective.profile_read && !effective.custom_selected(tool) && declared_owns(tool)
+}
+
+/// Whether an approved integration declares this exact tool name.
+pub(crate) fn declares_tool(tool: &str) -> bool {
+    super::registry().active().any(|plugin| {
+        plugin
+            .manifest
+            .agent_integrations
+            .iter()
+            .any(|entry| entry.tool == tool)
+    })
+}
+
+/// Whether an approved integration declares `tool`, ignoring custom agents.
+fn declared_owns(tool: &str) -> bool {
     let registry = super::registry();
     let owned = registry.active().any(|plugin| {
         plugin
@@ -988,7 +1288,8 @@ pub fn respond(
         "session does not support provider integration replies"
     );
     let registry = super::registry();
-    let plugin = provider(&registry, &instance.tool)?
+    let effective = EffectiveSession::load(&instance.source_profile);
+    let plugin = provider(&registry, instance, &effective, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
     let current = read_report(&instance.id, &instance.tool, plugin)?
         .context("provider integration report is unavailable")?;
@@ -1039,6 +1340,64 @@ pub fn respond(
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn env_wrapper_resolves_the_wrapped_program() {
+        assert_eq!(program("acme --serve").as_deref(), Some("acme"));
+        assert_eq!(program("/usr/bin/acme").as_deref(), Some("acme"));
+        assert_eq!(program("env FOO=1 acme --serve").as_deref(), Some("acme"));
+        assert_eq!(
+            program("env FOO=1 /usr/local/bin/acme").as_deref(),
+            Some("acme")
+        );
+        // A leading assignment still names `env`, and the wrapped program is
+        // what runs.
+        assert_eq!(program("A=1 env acme --serve").as_deref(), Some("acme"));
+        assert_eq!(
+            program("A=1 env B=2 /usr/local/bin/acme").as_deref(),
+            Some("acme")
+        );
+        // `env` options and their arguments are not the program it runs.
+        assert_eq!(program("env -i acme --serve").as_deref(), Some("acme"));
+        assert_eq!(program("env -u FOO acme").as_deref(), Some("acme"));
+        assert_eq!(program("env -u FOO -i acme").as_deref(), Some("acme"));
+        assert_eq!(program("env --unset=FOO acme").as_deref(), Some("acme"));
+        assert_eq!(program("env -C /tmp acme").as_deref(), Some("acme"));
+        assert_eq!(program("env -- acme").as_deref(), Some("acme"));
+        // -S carries the command line itself, so it must neither be skipped
+        // nor let a later word stand in for the program it names.
+        assert_eq!(program("env -S 'acme --serve'").as_deref(), Some("acme"));
+        assert_eq!(
+            program("env -S 'other --serve' acme").as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            program("env --split-string='acme --serve'").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(program("env -Sacme").as_deref(), Some("acme"));
+        // Short options cluster, and an operand-taking flag keeps its operand.
+        assert_eq!(program("env -iu FOO acme").as_deref(), Some("acme"));
+        assert_eq!(
+            program("env -iu acme other --serve").as_deref(),
+            Some("other")
+        );
+        assert_eq!(program("env -iSacme --serve").as_deref(), Some("acme"));
+        // An option this parser does not model leaves the program unknowable.
+        assert_eq!(program("env -Z acme"), None);
+        assert_eq!(program("env --frobnicate acme"), None);
+        // `-a` sets argv[0] and consumes its operand; the next word runs.
+        assert_eq!(
+            program("env -a acme other --serve").as_deref(),
+            Some("other")
+        );
+        assert_eq!(program("env -a acme acme --serve").as_deref(), Some("acme"));
+        assert_eq!(program("env --argv0 acme other").as_deref(), Some("other"));
+        assert_eq!(program("env -S"), None);
+        assert_eq!(program("env -i"), None);
+        assert_eq!(program("env"), None);
+    }
+
     #[test]
     fn catalog_suppresses_duplicate_provider_and_custom_or_builtin_collisions() {
         let entries = unique_candidates(
@@ -1214,6 +1573,42 @@ mod tests {
         assert_eq!(
             override_status(true, false, Some(super::AgentIntegrationStatus::Error)),
             Some(Status::Error)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_profile_leaves_plugin_declarations_unavailable() {
+        let _plugin = crate::session::install_omp_test_plugin();
+        let profile = "unreadable-profile";
+        let dir = crate::session::get_profile_dir_path(profile).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[session]\ncustom_agents = 7\n").unwrap();
+        crate::plugin::reload_registry();
+
+        assert!(
+            effective_session(profile).is_none(),
+            "an unreadable profile has no effective configuration"
+        );
+        assert!(
+            !super::status_owned(profile, "omp"),
+            "a plugin does not own a session whose profile could not be read"
+        );
+        assert!(
+            crate::plugin::agent_integration::EffectiveSession::load(profile)
+                .detection_config()
+                .is_none(),
+            "a read failure withholds the configuration pane detection would read"
+        );
+        assert_ne!(
+            crate::tmux::detect_status_from_content_unowned(profile, "esc to interrupt", "claude"),
+            crate::session::Status::Idle,
+            "a read failure withholds declarations, not built-in detectors"
+        );
+        assert_eq!(
+            crate::tmux::detect_status_from_content_unowned(profile, "", "omp"),
+            crate::session::Status::Idle,
+            "pane detection reads no declaration without the session configuration"
         );
     }
 
@@ -1439,7 +1834,7 @@ mode = "native_only"
         );
 
         let agent = crate::agents::get_agent("acme-helper").expect("plugin agent resolves");
-        assert!(status_owned("acme-helper"));
+        assert!(status_owned("", "acme-helper"));
         assert_eq!(
             agent.container_env,
             &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]
@@ -1502,6 +1897,255 @@ SHADOW_ONLY = "1"
 
     #[test]
     #[serial_test::serial]
+    fn configured_custom_agent_name_resolves_no_plugin_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.shadowed", "acme-shared", true, true, "");
+        install_declared_integration("acme.unguarded", "acme-declared", true, true, "");
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "acme-shared".to_string(),
+                "acme-wrapper --serve".to_string(),
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        // The declaration stays in the catalog; the session's effective
+        // configuration decides that the configured custom command is not it.
+        assert!(declared_agent("acme-shared").is_some());
+        let effective = crate::session::Config::load_or_warn().session;
+        assert!(declared_agent_in(&effective, "acme-shared").is_none());
+        assert!(crate::agents::get_agent_in(&effective, "acme-shared").is_none());
+        let mut shadowed = Instance::new("acme-shadowed-session", "/tmp/acme-shadowed");
+        shadowed.tool = "acme-shared".into();
+        shadowed.command = "acme-wrapper --serve".into();
+        shadowed.status = crate::session::Status::Running;
+        assert!(!status_configured(&shadowed, "acme-shared"));
+        assert!(!replies_configured(&shadowed));
+        assert!(super::snapshot(&shadowed).is_none());
+
+        // Positive control: the declared tool still resolves its declarations.
+        assert!(declared_agent("acme-declared").is_some());
+        let mut declared = Instance::new("acme-declared-session", "/tmp/acme-declared");
+        declared.tool = "acme-declared".into();
+        declared.status = crate::session::Status::Running;
+        assert!(status_configured(&declared, "acme-declared"));
+        assert!(replies_configured(&declared));
+
+        // A blank custom selection defers to the plugin, so it owns nothing and
+        // the declaration still describes the tool.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("acme-declared".to_string(), "   ".to_string());
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(declared_agent("acme-declared").is_some());
+        assert!(status_configured(&declared, "acme-declared"));
+
+        // A custom wrapper whose path basename matches the plugin CLI is still
+        // the custom agent, so neither the integration nor the status gate may
+        // claim it.
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "acme-shared".to_string(),
+                "/opt/custom/acme-shared --custom-mode".to_string(),
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+        let mut colliding = Instance::new("acme-colliding", "/tmp/acme-colliding");
+        colliding.tool = "acme-shared".into();
+        colliding.command = "/opt/custom/acme-shared --custom-mode".into();
+        colliding.status = crate::session::Status::Running;
+        assert!(!status_configured(&colliding, "acme-shared"));
+        assert!(!replies_configured(&colliding));
+        // Implicit execution and selector resolution must not resurrect the
+        // declaration, or launch generation would append its yolo flags to the
+        // custom command.
+        assert!(colliding.resolved_agent().is_none());
+        assert!(!status_owned("", "acme-shared"));
+        assert_ne!(
+            crate::tmux::detect_status_from_content_in("", "esc to interrupt", "acme-shared"),
+            crate::session::Status::Unknown
+        );
+
+        // A profile or repo config can name a custom agent the global plugin
+        // registry never saw; the session's own config still excludes it.
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .custom_agents
+            .insert("acme-declared".into(), "acme-wrapper --serve".to_string());
+        assert!(
+            crate::session::config::container_config::resolve_active_agent(
+                "acme-declared",
+                None,
+                &session
+            )
+            .is_none()
+        );
+        let resolved = crate::session::config::container_config::resolve_active_agent(
+            "acme-declared",
+            None,
+            &crate::session::config::SessionConfig::default(),
+        )
+        .expect("the declared tool keeps its declaration");
+        assert_eq!(resolved.name, "acme-declared");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declarations_follow_the_effective_config_without_a_registry_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.declared-config", "acme-config", true, true, "");
+
+        let declared = crate::agents::get_agent("acme-config").expect("declared agent resolves");
+        let mut config = crate::session::config::SessionConfig::default();
+        assert!(super::declared_agent_in(&config, "acme-config")
+            .is_some_and(|agent| std::ptr::eq(agent, declared)));
+        assert!(crate::agents::get_agent_in(&config, "acme-config").is_some());
+
+        // A profile or repo config can name a custom agent the global registry
+        // never saw, and no reload is involved.
+        config
+            .custom_agents
+            .insert("acme-config".into(), "acme-wrapper --serve".into());
+        assert!(super::declared_agent_in(&config, "acme-config").is_none());
+        assert!(crate::agents::get_agent_in(&config, "acme-config").is_none());
+
+        // A blank entry defers to the plugin, so the declaration is back.
+        config
+            .custom_agents
+            .insert("acme-config".into(), "   ".into());
+        assert!(super::declared_agent_in(&config, "acme-config").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ownership_reads_custom_config_without_a_registry_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.live-config", "acme-live", true, true, "");
+
+        let mut instance = Instance::new("acme-live-session", "/tmp");
+        instance.tool = "acme-live".into();
+        instance.status = crate::session::Status::Running;
+        assert!(status_configured(&instance, "acme-live"));
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("acme-live".into(), "acme-wrapper --serve".into());
+        })
+        .unwrap();
+        // Nothing reloaded the registry: the decision must read configuration
+        // rather than a cached custom-name set.
+        assert!(!status_configured(&instance, "acme-live"));
+        assert!(!replies_configured(&instance));
+
+        crate::session::update_config(|config| {
+            config.session.custom_agents.remove("acme-live");
+        })
+        .unwrap();
+        assert!(status_configured(&instance, "acme-live"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_custom_agents_decide_ownership_with_the_effective_config() {
+        const PROFILE: &str = "acme-ownership-profile";
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.profile-owner", "acme-profile", true, true, "");
+
+        let dir = crate::session::get_profile_dir_path(PROFILE).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |custom: &str| {
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("[session]\ncustom_agents = {{ acme-profile = \"{custom}\" }}\n"),
+            )
+            .unwrap();
+        };
+
+        let mut instance = Instance::new("acme-profile-owner", "/tmp");
+        instance.tool = "acme-profile".into();
+        instance.source_profile = PROFILE.into();
+        instance.status = crate::session::Status::Running;
+
+        // A profile-only custom command is absent from the global registry, but
+        // the session's effective configuration still excludes the declaration.
+        write("acme-wrapper --serve");
+        assert!(!status_configured(&instance, "acme-profile"));
+        assert!(!replies_configured(&instance));
+
+        // A blank profile override defers to the declaration again.
+        write("   ");
+        assert!(status_configured(&instance, "acme-profile"));
+        assert!(replies_configured(&instance));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_profile_config_keeps_plugins_from_claiming_the_session() {
+        const PROFILE: &str = "acme-unreadable-profile";
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration("acme.unreadable-config", "acme-unreadable", true, true, "");
+
+        let dir = crate::session::get_profile_dir_path(PROFILE).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "custom_agents = [oops").unwrap();
+
+        let mut instance = Instance::new("acme-unreadable-session", "/tmp");
+        instance.tool = "acme-unreadable".into();
+        instance.source_profile = PROFILE.into();
+        instance.status = crate::session::Status::Running;
+
+        // A transient or malformed read must not hand a custom session to the
+        // plugin.
+        assert!(!status_configured(&instance, "acme-unreadable"));
+        assert!(!replies_configured(&instance));
+        assert!(!status_owned(PROFILE, "acme-unreadable"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn reply_fallback_resolves_when_the_integration_does_not_own_replies() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
@@ -1532,6 +2176,44 @@ deny = [{ kind = "literal", value = "n" }]
             Some(&[KeyToken::Named("Down"), KeyToken::Named("Enter")][..])
         );
         assert_eq!(response.deny, &[KeyToken::Literal("n")]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_profile_resolves_builtins_and_rejects_plugin_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_declared_integration(
+            "acme.reply",
+            "acme-reply",
+            false,
+            false,
+            r#"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+allow_always = [{ kind = "named", value = "Down" }, { kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+"#,
+        );
+
+        let declared = reply_agent(
+            Some(&crate::session::config::SessionConfig::default()),
+            "acme-reply",
+        )
+        .expect("the effective configuration owns the declaration");
+        assert!(declared.permission_response.is_some());
+        assert!(reply_agent(None, "acme-reply").is_none());
+
+        assert!(reply_agent(None, "claude")
+            .expect("a built-in keeps its replies")
+            .permission_response
+            .is_some());
     }
 
     #[test]
@@ -1595,7 +2277,11 @@ deny = [{ kind = "literal", value = "n" }]
         install_test_integration("acme.integration-two", "shared-agent");
 
         let registry = super::super::PluginRegistry::load(&crate::session::Config::load_or_warn());
-        let error = match provider(&registry, "shared-agent") {
+        let mut instance = Instance::new("shared-agent-claim", "/tmp");
+        instance.tool = "shared-agent".into();
+        instance.command = "shared-agent".into();
+        let effective = EffectiveSession::load("");
+        let error = match provider(&registry, &instance, &effective, "shared-agent") {
             Err(error) => error,
             Ok(_) => panic!("duplicate integration claims must be rejected"),
         };
@@ -1973,6 +2659,15 @@ deny = [{ kind = "literal", value = "n" }]
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
         let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
         install_test_integration("acme.alias-provider", "acme-provider");
+        // A custom agent with the target's name must not shadow a distinct
+        // session explicitly aliased to that tool.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("acme-provider".into(), "acme-wrapper --serve".into());
+        })
+        .unwrap();
         let mut config = crate::session::Config::default();
         config
             .session
@@ -1997,23 +2692,30 @@ deny = [{ kind = "literal", value = "n" }]
         )
         .unwrap();
 
-        let integration = integration_status(&instance);
+        let integration =
+            integration_status_with(&instance, &EffectiveSession::load(&instance.source_profile));
         assert!(integration.configured);
         assert_eq!(
             integration.snapshot.map(|snapshot| snapshot.status),
             Some(AgentIntegrationStatus::Waiting)
         );
-        assert!(status_owned("acme-provider"));
         assert!(
-            !status_owned(&instance.tool),
-            "the custom name owns nothing"
+            !status_owned(&instance.source_profile, "acme-provider"),
+            "a name-based lookup still sees the custom agent"
+        );
+        assert!(
+            !status_owned(&instance.source_profile, &instance.tool),
+            "the distinct session name owns nothing"
         );
 
         // With no report the alias still owns status, so the poll reads Unknown.
         let mut unreported = Instance::new("alias-status-unreported", "/tmp");
         unreported.tool = "my-acme".into();
         unreported.source_profile = PROFILE.into();
-        let absent = integration_status(&unreported);
+        let absent = integration_status_with(
+            &unreported,
+            &EffectiveSession::load(&unreported.source_profile),
+        );
         assert!(absent.configured);
         assert!(absent.snapshot.is_none());
         assert_eq!(

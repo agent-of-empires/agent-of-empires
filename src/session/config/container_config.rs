@@ -2141,7 +2141,7 @@ pub(crate) fn resolve_active_agent(
     command: Option<&str>,
     session_config: &super::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
-    resolve_executed_agent(tool, command, session_config).or_else(|| {
+    let resolved = resolve_executed_agent(tool, command, session_config).or_else(|| {
         // Legacy status-only provisioning never grants native conversation authority.
         if session_config.agent_execution_as.contains_key(tool) {
             return None;
@@ -2150,7 +2150,21 @@ pub(crate) fn resolve_active_agent(
             Some(name) => crate::agents::get_agent(name),
             None => crate::agents::get_agent(tool),
         }
-    })
+    });
+    // A configured custom command owns its name, so a declaration for that same
+    // name does not describe it. An explicit `agent_execution_as` is the
+    // caller's assertion that it does, and discarding it would also discard the
+    // declared environment. A distinctly named alias still applies.
+    if session_config.custom_agent_selected(tool)
+        && !session_config.agent_execution_as.contains_key(tool)
+        && resolved.is_some_and(|agent| {
+            crate::plugin::agent_integration::declared_agent(tool)
+                .is_some_and(|declared| std::ptr::eq(declared, agent))
+        })
+    {
+        return None;
+    }
+    resolved
 }
 
 fn resolve_executed_agent(

@@ -2986,7 +2986,8 @@ impl App {
                     .is_some_and(|i| !i.is_empty());
 
                 if has_instruction
-                    && crate::agents::get_agent(&instance.tool)
+                    && crate::plugin::agent_integration::effective_session(&instance.source_profile)
+                        .and_then(|config| crate::agents::get_agent_in(&config, &instance.tool))
                         .is_none_or(|a| a.instruction_flag.is_none())
                 {
                     let config = Config::load_or_warn();

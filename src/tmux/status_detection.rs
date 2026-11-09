@@ -11,15 +11,45 @@ use super::utils::strip_ansi;
 pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -> Status {
     // An approved provider integration owns status; a missing report is not
     // permission to reinterpret the pane.
-    if crate::plugin::agent_integration::status_owned(tool) {
+    if crate::plugin::agent_integration::status_owned(profile, tool) {
         return Status::Unknown;
     }
+    detect_status_from_content_unowned(profile, content, tool)
+}
+
+/// Pane detection for a caller that already decided no integration owns the
+/// session, so a plugin tool name cannot reassert ownership from the registry.
+pub fn detect_status_from_content_unowned(profile: &str, content: &str, tool: &str) -> Status {
+    detect_status_from_content_unowned_with(
+        profile,
+        crate::plugin::agent_integration::effective_session(profile).as_ref(),
+        content,
+        tool,
+    )
+}
+
+/// Pane detection for a caller that already resolved the session's config.
+pub fn detect_status_from_content_unowned_with(
+    profile: &str,
+    config: Option<&crate::session::config::SessionConfig>,
+    content: &str,
+    tool: &str,
+) -> Status {
     // capture-pane runs with -e, so colors would split plain substring matches.
     let clean = strip_ansi(content);
     if let Some(status) = super::status_rules::detect(profile, tool, &clean) {
         return status;
     }
-    crate::agents::get_agent(tool)
+    // A custom command configured under a declared tool's name is a different
+    // program, so pane detection reads the declaration only when the session's
+    // effective configuration leaves that name to the plugin.
+    let agent = match config {
+        Some(config) => crate::agents::get_agent_in(config, tool),
+        // A read failure withholds plugin declarations only: a built-in still
+        // describes its own pane.
+        None => crate::agents::resolve_builtin_tool_name(tool).and_then(crate::agents::get_agent),
+    };
+    agent
         .map(|a| (a.detect_status)(&clean))
         .unwrap_or(Status::Idle)
 }

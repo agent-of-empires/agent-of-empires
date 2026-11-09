@@ -1852,7 +1852,9 @@ impl Instance {
         let direct = AGENTS
             .iter()
             .find(|agent| agent.binary == program)
-            .or_else(|| crate::agents::get_agent(tool).filter(|agent| agent.binary == program));
+            .or_else(|| {
+                crate::agents::get_agent_in(config, tool).filter(|agent| agent.binary == program)
+            });
         let declared = config
             .agent_execution_as
             .get(tool)
@@ -1861,7 +1863,7 @@ impl Instance {
                     .context("agent_execution_as names an unknown builtin")
             })
             .transpose()?;
-        let logical = crate::agents::get_agent(tool);
+        let logical = crate::agents::get_agent_in(config, tool);
         let actual = direct.or(declared).context(
             "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
             .context(ManagedResumeCause::WrapperContractRequired)?;

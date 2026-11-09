@@ -7343,12 +7343,16 @@ impl HomeView {
             return;
         }
 
-        let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
-        else {
-            self.info_dialog = Some(InfoDialog::new(
-                "Not Supported",
-                &format!("{} doesn't support quick permission responses yet.", tool),
-            ));
+        let config = crate::plugin::agent_integration::effective_session(&inst.source_profile);
+        let response = crate::plugin::agent_integration::reply_agent(config.as_ref(), &tool)
+            .and_then(|a| a.permission_response);
+        let Some(response) = response else {
+            let message = if config.is_none() {
+                format!("The profile for {tool} could not be read, so no response was sent.")
+            } else {
+                format!("{tool} doesn't support quick permission responses yet.")
+            };
+            self.info_dialog = Some(InfoDialog::new("Not Supported", &message));
             return;
         };
         self.session_dialog_target = self.selected_dialog_target();

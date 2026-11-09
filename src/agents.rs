@@ -1520,6 +1520,18 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
         .or_else(|| crate::plugin::agent_integration::declared_agent(name))
 }
 
+/// The catalog as the session's effective configuration sees it: a custom
+/// command configured under a declared tool's name is not that tool.
+pub fn get_agent_in(
+    config: &crate::session::config::SessionConfig,
+    name: &str,
+) -> Option<&'static AgentDef> {
+    AGENTS
+        .iter()
+        .find(|a| a.name == name)
+        .or_else(|| crate::plugin::agent_integration::declared_agent_in(config, name))
+}
+
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)

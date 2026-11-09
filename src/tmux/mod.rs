@@ -23,7 +23,10 @@ pub use detect::{HookObservation, Observation, ObservationKey};
 pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub use status_detection::{detect_status_from_content_in, DetectionPlan};
+pub use status_detection::{
+    detect_status_from_content_in, detect_status_from_content_unowned,
+    detect_status_from_content_unowned_with, DetectionPlan,
+};
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
 pub use tool_session::ToolSession;
 pub(crate) use tool_session::{LegacyToolScope, LegacyToolUnavailable};

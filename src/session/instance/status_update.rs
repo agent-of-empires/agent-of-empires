@@ -258,7 +258,10 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
-        let integration = crate::plugin::agent_integration::integration_status(self);
+        let effective =
+            crate::plugin::agent_integration::EffectiveSession::load(&self.source_profile);
+        let integration =
+            crate::plugin::agent_integration::integration_status_with(self, &effective);
         let integration_configured = integration.configured;
         let integration_snapshot = integration.snapshot;
         let pane_tool = integration.pane_tool;
@@ -387,7 +390,12 @@ impl Instance {
                 })
             }
         } else {
-            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool)
+            tmux::detect_status_from_content_unowned_with(
+                &self.source_profile,
+                effective.detection_config(),
+                &pane_content,
+                &pane_tool,
+            )
         };
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",

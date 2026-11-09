@@ -163,9 +163,10 @@ impl HomeView {
             ));
             return;
         }
-        let Some(response) =
-            crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
-        else {
+        let config = crate::plugin::agent_integration::effective_session(&inst.source_profile);
+        let response = crate::plugin::agent_integration::reply_agent(config.as_ref(), &inst.tool)
+            .and_then(|a| a.permission_response);
+        let Some(response) = response else {
             return;
         };
         let Some(tokens) = permission_response_tokens(&response, choice) else {
