@@ -125,6 +125,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
+        // Before any await or store, so an idle stop cannot claim the worker in between.
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
@@ -188,6 +190,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             &Event::UserDiffCommentsPrompt {
@@ -685,6 +688,51 @@ mod tests {
             let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
             self.held.lock().unwrap().push((seq, held));
         }
+    }
+
+    /// Records the running epoch's admission count as each prompt event is stored.
+    #[derive(Default)]
+    struct AdmissionProbeSink {
+        lease: std::sync::OnceLock<crate::acp::runner_lifecycle::Lease>,
+        seen: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl BroadcastSink for AdmissionProbeSink {
+        fn publish(&self, _: &str, _: u64, event: &Event) {
+            if matches!(
+                event,
+                Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+            ) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(self.lease.get().unwrap().admissions());
+            }
+        }
+    }
+
+    /// An idle stop claimed between a prompt's persistence and its admission
+    /// count would stop the worker the prompt was just recorded for (#5048), so
+    /// the count must already stand when the event is stored.
+    #[tokio::test]
+    async fn prompts_are_admitted_before_they_are_stored() {
+        let sink = std::sync::Arc::new(AdmissionProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        sup.test_insert_worker("s-1").await;
+        sink.lease.set(sup.running_lease("s-1").unwrap()).unwrap();
+
+        sup.publish_user_prompt("s-1", "typed".into()).await;
+        sup.publish_user_diff_comments_prompt(
+            "s-1",
+            String::new(),
+            String::new(),
+            false,
+            Vec::new(),
+            "review".into(),
+        )
+        .await;
+
+        assert_eq!(*sink.seen.lock().unwrap(), [1, 2]);
     }
 
     #[tokio::test]

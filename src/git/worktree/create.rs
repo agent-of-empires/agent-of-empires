@@ -681,13 +681,47 @@ pub(super) mod tests {
     #[test]
     fn create_worktree_turns_fetch_and_hook_failures_into_warnings() {
         use std::os::unix::fs::PermissionsExt;
-        let (dir, _repo) = init_repo();
+        const CHILD: &str = "AOE_WORKTREE_HOOK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!(
+                        "{module}::create_worktree_turns_fetch_and_hook_failures_into_warnings"
+                    ),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS");
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap()
+            .expect("worktree hook test child timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (dir, repo) = init_repo();
         let bogus = dir.path().join("does-not-exist.git");
         run_git(
             dir.path(),
             &["remote", "add", "origin", bogus.to_str().unwrap()],
         );
         let hook = dir.path().join(".git/hooks/post-checkout");
+        repo.config()
+            .unwrap()
+            .set_str("core.hooksPath", hook.parent().unwrap().to_str().unwrap())
+            .unwrap();
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         std::fs::write(
             &hook,

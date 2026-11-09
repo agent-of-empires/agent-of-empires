@@ -6,12 +6,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 jobs:
   record:
     name: Record E2E Tests
     if: github.event.label.name == 'needs-recording'
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-record-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 45
     permissions:
       contents: write

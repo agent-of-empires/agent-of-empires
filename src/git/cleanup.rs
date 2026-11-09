@@ -1078,6 +1078,16 @@ mod tests {
     fn init_repo_with_commit() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        let excludes = dir.path().join(".git/empty-excludes");
+        std::fs::write(&excludes, "").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["config", "--file"])
+            .arg(dir.path().join(".git/config"))
+            .arg("core.excludesfile")
+            .arg(&excludes)
+            .status()
+            .unwrap()
+            .success());
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = {
             let mut index = repo.index().unwrap();
