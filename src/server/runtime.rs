@@ -456,6 +456,7 @@ impl NativeRuntime {
             authorize(local, Capability::NativeInteraction);
         RuntimeInfo {
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            app_version: Some(env!("CARGO_PKG_VERSION").into()),
             cli_creation: true,
             epoch: self.epoch.clone(),
             namespace: self.namespace.clone(),
@@ -1140,6 +1141,7 @@ mod tests {
                     .runtime
                     .info(&state, authorization.as_ref(), &snapshot.value);
                 let encoded = serde_json::to_string(&info).unwrap();
+                assert_eq!(info.app_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
                 assert!(!encoded.contains("SECRET_DIAGNOSTIC_PAYLOAD_DO_NOT_RENDER"));
                 assert_eq!(!info.owner_diagnostics.is_empty(), owner);
                 if !owner {

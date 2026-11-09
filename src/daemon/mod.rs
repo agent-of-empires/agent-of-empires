@@ -1478,6 +1478,7 @@ mod tests {
             owner_diagnostics: Vec::new(),
             owner_instance_id: None,
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            app_version: None,
             cli_creation: true,
             epoch: "native-epoch".into(),
             namespace: root.path().to_str().unwrap().into(),
