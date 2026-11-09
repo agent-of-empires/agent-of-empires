@@ -1482,6 +1482,7 @@ mod tests {
                         session_id: "s-1".into(),
                         seq,
                         event: Arc::new(event),
+                        native_subject: None,
                         worker_generation: None,
                         sidebar_status: None,
                     },
