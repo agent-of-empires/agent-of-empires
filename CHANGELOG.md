@@ -10,6 +10,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **session:** Preserve live restarts and applied-but-unconfirmed launches. Accept a final Pi or Prime capture only when its own durable compare-and-set advances the admitted selection; retain concurrent pins and hook changes.
 - **session:** Keep OMP confirmation bindings identical in memory and storage while advancing only the matching launch's capture witness.
+- **session:** Reject stale capture snapshots before they reserve a restarted or replaced session, preserving its lifecycle generation and newly selected conversation.
+- **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
 
 ### Security
 
