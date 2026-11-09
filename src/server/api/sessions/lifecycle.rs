@@ -2931,7 +2931,8 @@ pub(super) async fn continue_interrupted_prompt(
     generation: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     explicit_wake: bool,
-) -> bool {
+    prepared: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
+) -> Result<bool, crate::acp::supervisor::SupervisorError> {
     let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
@@ -2940,18 +2941,18 @@ pub(super) async fn continue_interrupted_prompt(
             && row.ensure_startable().is_ok()
     });
     if !current {
-        return false;
+        return Ok(false);
     }
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resets_at, true);
+        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     if explicit_wake {
         // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
         // now newer work may have been installed, and it must survive.
         drop(submission);
-        return false;
+        return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
     let pending_before = state
@@ -2961,13 +2962,18 @@ pub(super) async fn continue_interrupted_prompt(
         .iter()
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
-    let outcome =
-        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission).await;
-    pending_before
+    let outcome = crate::server::acp_reconciler::install_prepared_continuation(
+        state,
+        id,
+        &submission,
+        prepared,
+    )
+    .await?;
+    Ok(pending_before
         || matches!(
             outcome,
             ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
-        )
+        ))
 }
 
 async fn finish_structured_restart(
@@ -2996,11 +3002,21 @@ async fn finish_structured_restart(
         } = launch;
         // Read before the spawn: the new worker's session assignment retires the park.
         let resumes_rate_limit = if account_swap {
-            crate::server::api::acp::rate_limit_resume_probe(state, id).await
+            match crate::server::api::acp::rate_limit_resume_probe(state, id).await? {
+                crate::acp::event_store::ControlKnowledge::Known(marker) => marker,
+                crate::acp::event_store::ControlKnowledge::Indeterminate => {
+                    return Err(crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into());
+                }
+            }
         } else {
             None
         };
         let wake_requested = wake.is_some();
+        let prepared_continuation = if resumes_rate_limit.is_some() && !wake_requested {
+            crate::server::acp_reconciler::resolve_continuation(state, id).await?
+        } else {
+            None
+        };
         let mut reservation = match reservation {
             Some(reservation) => reservation,
             None => supervisor.reserve_spawn(id, crate::acp::supervisor::ResumeKind::Spawn,
@@ -3115,7 +3131,9 @@ async fn finish_structured_restart(
         .await?;
         let continued = match resumes_rate_limit {
             Some(resets_at) => {
-                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
+                continue_interrupted_prompt(
+                    state, id, generation, resets_at, wake_requested, prepared_continuation,
+                ).await?
             }
             None => false,
         };
@@ -3187,6 +3205,12 @@ async fn finish_structured_restart(
         Err(error) => {
             if let Some(response) = lifecycle_rejection(state, &error) {
                 return response;
+            }
+            if let Some(cause) = error.downcast_ref::<crate::acp::supervisor::SupervisorError>() {
+                return crate::server::api::acp::supervisor_error_response(
+                    "structured restart refused",
+                    cause,
+                );
             }
             if let Some(response) = sandbox_migration_response(state, id, &error).await {
                 return response;

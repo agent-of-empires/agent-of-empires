@@ -95,7 +95,7 @@ pub(crate) enum ContinuationOutcome {
     SupersededByQueue,
 }
 
-async fn resolve_continuation(
+pub(crate) async fn resolve_continuation(
     state: &Arc<AppState>,
     id: &str,
 ) -> Result<Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>, SupervisorError> {
@@ -134,7 +134,7 @@ pub(crate) async fn install_rate_limit_continuation(
     install_prepared_continuation(state, id, submission, prepared).await
 }
 
-async fn install_prepared_continuation(
+pub(crate) async fn install_prepared_continuation(
     state: &Arc<AppState>,
     id: &str,
     _submission: &tokio::sync::OwnedMutexGuard<()>,
