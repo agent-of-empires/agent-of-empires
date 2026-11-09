@@ -44,10 +44,10 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const restart = line.getByRole("button", { name: "Restart Claude Code" });
   await expect(restart).toHaveCount(0);
 
-  // The line says the composer is open; a prompt the daemon accepts now is stopped by a restart.
+  // The line says the composer is open; a prompt the daemon accepts now is carried across the restarts.
   const composer = page.locator('textarea[name="input"]');
   await composer.fill(PROMPT);
-  // Stop and the caption are optimistic; the response proves the daemon took the prompt before Restart.
+  // Stop is optimistic; the response proves the daemon took the prompt before Restart.
   const admitted = page.waitForResponse(
     (r) => r.url().endsWith("/acp/prompt") && r.request().postDataJSON()?.text === PROMPT,
   );
@@ -61,9 +61,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   await expect(stopButton).toBeVisible();
 
   await page.clock.fastForward(31_000);
-  await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(
-    "Restarting stops the message you sent. Send it again once Claude Code is ready.",
-  );
+  await expect(restart).toBeVisible();
   const restarted = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
   const res = await restarted;
@@ -71,16 +69,12 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   expect(res.status(), await res.text()).toBe(200);
 
   // The restart's own stop has reached this dashboard, and the replacement is stuck as well.
-  await expect(stopButton).toHaveCount(0, { timeout: 15_000 });
   await expect.poll(stalls, { timeout: 30_000 }).toBe(2);
   await expect(line).toBeVisible();
+  await expect(stopButton).toBeVisible();
   await expect(page.getByText("Structured view worker stopped")).toHaveCount(0);
   await expect(restart).toHaveCount(0);
   await page.clock.fastForward(31_000);
-  // The restart's stop unmounted the line before the restart answered; the stopped message is still named.
-  await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(
-    "The message you sent was stopped. Send it again once Claude Code is ready.",
-  );
   const again = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
   expect((await again).status()).toBe(200);
@@ -98,37 +92,17 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   expect(status).not.toBe("error");
   await expect(page.getByText(PROMPT)).toBeVisible();
   await expect(composer).toBeEnabled();
-  // The transcript's row for that empty turn doesn't carry the stop reason, so the event log is the check.
+  // The event log is the check: the carried prompt is sent once and its turn is never stopped by a restart.
   const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
     ({ event }) => event,
   );
-  const sent = events.findIndex((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
-  expect(sent).toBeGreaterThanOrEqual(0);
-  const after = events.slice(sent + 1);
-  const stop = after.findIndex((e) => "Stopped" in e);
-  expect(after[stop]).toEqual({ Stopped: { reason: "user_stopped" } });
-  // The replacement's initialize can log before the stop does; nothing else may.
-  expect(after.slice(0, stop).every((e) => "AuthStatusUpdated" in e || "PromptCapabilities" in e)).toBe(true);
+  const sent = events.filter((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
+  expect(sent).toHaveLength(1);
+  const after = events.slice(events.indexOf(sent[0]!) + 1);
   expect(after.some((e) => "AcpSessionAssigned" in e)).toBe(true);
-  expect(deliveries()).toBe(0);
-
-  // The caption's advice: sending again reaches the replacement once, counted after its turn ends.
-  await composer.fill(PROMPT);
-  await composer.press("Enter");
-  await expect
-    .poll(
-      async () => {
-        const log = (
-          JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]
-        ).map(({ event }) => event);
-        const resent = log.findLastIndex((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
-        return (
-          resent > sent &&
-          log.slice(resent).some((e) => (e.Stopped as { reason?: string } | undefined)?.reason === "prompt_complete")
-        );
-      },
-      { timeout: 15_000 },
-    )
-    .toBe(true);
-  expect(deliveries()).toBe(1);
+  const stopped = after.filter((e) => "Stopped" in e);
+  expect(stopped).not.toContainEqual({ Stopped: { reason: "user_stopped" } });
+  expect(stopped[0]).toEqual({ Stopped: { reason: "prompt_complete" } });
+  await expect.poll(deliveries, { timeout: 15_000 }).toBe(1);
+  await expect(stopButton).toHaveCount(0);
 });

@@ -346,7 +346,7 @@ describe("a restart of a start in progress", () => {
   });
   const stop = (seq: number, reason = "user_stopped") => frame(seq, { Stopped: { reason } });
   // Acknowledges a restart requested before any of these frames.
-  const restarted: Action = { kind: "restart_started", epoch: 0, stoppedSent: false };
+  const restarted: Action = { kind: "restart_started", epoch: 0 };
   const assigned = (seq: number) => frame(seq, { AcpSessionAssigned: { acp_session_id: "acp-2" } });
   it.each<[string, Action[], boolean, boolean]>([
     ["its stop applied first doesn't read as a stopped Worker", [stop(1), restarted], false, true],
@@ -381,26 +381,7 @@ describe("a restart of a start in progress", () => {
     expect([state.workerStopped, state.restartInFlight]).toEqual([workerStopped, restartInFlight]);
   });
 
-  const stoppedSent: Action = { kind: "restart_started", epoch: 0, stoppedSent: true };
-  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500.", stoppedSent: true };
-  it.each<[string, Action[], boolean]>([
-    ["a restart that stopped the sent prompt remembers it", [stop(1), stoppedSent], true],
-    ["a later restart that stopped nothing keeps it", [stoppedSent, restarted], true],
-    ["sending again clears it", [stoppedSent, frame(1, { UserPromptSent: { text: "hi" } })], false],
-    [
-      "an acknowledgement after a startup error still records it",
-      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), stoppedSent],
-      true,
-    ],
-    [
-      "a failure after a startup error still records it",
-      [stop(1), frame(2, { AgentStartupError: { message: "boom" } }), failed],
-      true,
-    ],
-  ])("%s", (_label, actions, expected) => {
-    expect(run(empty(), ...actions).restartStoppedSent).toBe(expected);
-  });
-
+  const failed: Action = { kind: "restart_failed", epoch: 0, message: "Server returned 500." };
   it.each<[string, Action[], string | null, boolean]>([
     ["a failure after its stop keeps the stop and names the reason", [stop(1), failed], "Server returned 500.", true],
     ["a failure after the restart already ended is ignored", [stop(1), assigned(2), failed], null, false],
