@@ -15,6 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 permissions:
   contents: read
@@ -60,7 +63,7 @@ jobs:
         with:
           manifest-key: test-${{ matrix.leg }}
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        if: matrix.leg != 'web-e2e'
+        if: matrix.leg == 'core-rest'
         with:
           tool: cargo-nextest
       - name: Install tmux
@@ -187,26 +190,17 @@ jobs:
           test -S "$XDG_RUNTIME_DIR/systemd/private"
           cargo nextest run --test integration --no-tests=fail \
             serve_dynamic_profile_rewire::permanent_scratch_delete_cancels_an_unanswered_initialize
-      # bare-core keeps OpenSSL/SQLite vendoring across flag corners:
-      # default-plugins off for lib/bin and selected lifecycle e2e tests (the
-      # web leg covers the rest), then flag on/web off for all-targets.
-      # e2e-tests includes its target in that compile sweep.
+      # bare-core: selected lifecycle e2e tests without `web` (the web-e2e leg
+      # covers the rest). `default-plugins` is an empty compat flag, so lib and
+      # bin tests here would repeat core-rest.
       - name: Build tests (bare core)
         if: matrix.leg == 'bare-core'
-        run: |
-          cargo nextest run --no-default-features --features vendored --lib --bins --no-run
-          cargo test --no-default-features --features vendored,e2e-tests --test e2e --no-run
-      - name: Cargo test (bare core, lib + bins)
-        if: matrix.leg == 'bare-core'
-        run: cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
+        run: cargo test --no-default-features --features vendored,e2e-tests --test e2e --no-run
       - name: Cargo test (bare core, selected e2e)
         if: matrix.leg == 'bare-core'
         run: |
           cargo test --no-default-features --features vendored,e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
-      - name: Cargo check (bare core + default-plugins, all targets)
-        if: matrix.leg == 'bare-core'
-        run: cargo check --no-default-features --features vendored,default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate
       # regression in build.rs fails here rather than silently reintroducing

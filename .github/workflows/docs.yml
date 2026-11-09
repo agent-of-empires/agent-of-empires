@@ -23,6 +23,11 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
+env:
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
+
 jobs:
   build:
     runs-on: ubuntu-latest
