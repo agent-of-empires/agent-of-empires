@@ -4000,9 +4000,14 @@ exec sleep 60
             );
             let requested = root.path().join("actual-missing-query-finished");
             let ready = root.path().join("second-actor-corpse-ready");
+            let stdout = root.path().join("original-inventory.stdout");
+            let stderr = root.path().join("original-inventory.stderr");
             let actor_request = requested.clone();
             let actor_ready = ready.clone();
             let actor_row = instance.clone();
+            let actor_name = name.clone();
+            let actor_sentinel = sentinel.name().to_owned();
+            let actor_stdout = stdout.clone();
             let actor = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !actor_request.exists() {
@@ -4012,7 +4017,38 @@ exec sleep 60
                     );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                let (guard, observation) = observed_dead_resume_fixture(&actor_row);
+                let inventory = std::fs::read_to_string(&actor_stdout).unwrap();
+                assert!(inventory.lines().any(|line| {
+                    line.split('|').next() == Some(actor_sentinel.as_str())
+                }), "the successful real inventory must contain the sentinel: {inventory}");
+                assert!(!inventory.lines().any(|line| {
+                    line.split('|').next() == Some(actor_name.as_str())
+                }), "the saved real inventory must predate the new corpse: {inventory}");
+                let guard = TmuxTestSession::from_name(&actor_name);
+                let mut args = vec![
+                    "new-session".into(), "-d".into(), "-P".into(), "-F".into(),
+                    "#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{socket_path}".into(),
+                    "-s".into(), actor_name.clone(), "-c".into(),
+                    actor_row.project_path.clone(), "exec sleep 60".into(),
+                ];
+                let target = format!("={actor_name}:");
+                crate::tmux::utils::append_remain_on_exit_args(&mut args, &target);
+                crate::tmux::utils::append_pane_base_index_args(&mut args, &target);
+                crate::tmux::append_session_kind_args(
+                    &mut args, &target, crate::tmux::SessionKind::Agent,
+                );
+                // Create a real marked pane without publishing a newer Rust inventory.
+                let output = crate::tmux::tmux_command().args(&args).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let observation = crate::tmux::utils::created_pane_observation(&output.stdout)
+                    .unwrap();
+                crate::tmux::test_helpers::wait_for_pane_command(
+                    &observation.identity.pane_id, "sleep",
+                );
+                assert!(crate::tmux::tmux_command()
+                    .args(["send-keys", "-t", &observation.identity.pane_id, "C-c"])
+                    .status().unwrap().success());
+                crate::tmux::test_helpers::wait_for_pane_dead(&observation.identity.pane_id);
                 let peer = shared.then(|| add_live_probe_peer(&observation.identity.pane_id));
                 std::fs::write(
                     &actor_ready,
@@ -4025,12 +4061,9 @@ exec sleep 60
             std::fs::create_dir(&bin).unwrap();
             let shim = bin.join("tmux");
             let quote = crate::session::environment::shell_escape_script_word;
-            let target = format!("={name}:");
-            let stdout = root.path().join("original-query.stdout");
-            let stderr = root.path().join("original-query.stderr");
             std::fs::write(&shim, format!(
-                "#!/bin/sh\nMATCH=; for arg do [ \"$arg\" != {} ] || MATCH=1; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" >{} 2>{}; R=$?\nif [ \"$R\" -ne 0 ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nfi\ncat {}; cat {} >&2; exit \"$R\"\nfi\nexec {} \"$@\"\n",
-                quote(&target), quote(&requested.to_string_lossy()),
+                "#!/bin/sh\nMATCH=; PREV=; PREV2=; for arg do\nif [ \"$PREV2\" = list-sessions ] && [ \"$PREV\" = -F ] && [ \"$arg\" = '#{{session_name}}|#{{session_activity}}|#{{@aoe_kind}}' ]; then MATCH=1; fi\nPREV2=$PREV; PREV=$arg\ndone\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" >{} 2>{}; R=$?\nif [ \"$R\" -eq 0 ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nfi\ncat {}; cat {} >&2; exit \"$R\"\nfi\nexec {} \"$@\"\n",
+                quote(&requested.to_string_lossy()),
                 quote(&real_tmux.to_string_lossy()), quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()),
                 quote(&requested.to_string_lossy()), quote(&ready.to_string_lossy()),
                 quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
@@ -4043,10 +4076,14 @@ exec sleep 60
                 ready.exists(),
                 "the actual corpse predates the second public probe"
             );
-            assert_eq!(std::fs::read(&stdout).unwrap(), b"");
-            assert!(std::fs::read_to_string(&stderr)
-                .unwrap()
-                .contains("can't find session:"));
+            let inventory = std::fs::read_to_string(&stdout).unwrap();
+            assert!(inventory.lines().any(|line| {
+                line.split('|').next() == Some(sentinel.name())
+            }));
+            assert!(!inventory.lines().any(|line| {
+                line.split('|').next() == Some(name.as_str())
+            }));
+            assert!(std::fs::read(&stderr).unwrap().is_empty());
             if let Some((peer_pane, pid, birth)) = peer {
                 assert!(
                     crate::process::process_birth_is_live(pid, &birth).unwrap(),
@@ -4565,6 +4602,10 @@ exec sleep 60
     #[test]
     #[serial]
     fn revival_retains_replacement_between_dead_observation_and_capture_return() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
         use crate::tmux::test_helpers::{only_pane_id, pane_field, TmuxTestSession};
         use std::os::unix::fs::PermissionsExt;
         crate::tmux::test_helpers::require_tmux!();
@@ -4572,6 +4613,13 @@ exec sleep 60
         for replacement_dead in [false, true] {
             let root = tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+                root.path(),
+                concat!(
+                    module_path!(),
+                    "::revival_retains_replacement_between_dead_observation_and_capture_return"
+                ),
+            );
             let _env = isolate_resume_environment(root.path());
             crate::session::config::update_config(|config| {
                 config.systemd.enabled = false;
@@ -4602,9 +4650,12 @@ exec sleep 60
             let name = instance.tmux_session().unwrap().name().to_owned();
             let requested = root.path().join("real-dead-observation-finished");
             let ready = root.path().join("replacement-ready");
+            let stdout = root.path().join("real-dead-observation.stdout");
+            let count = root.path().join("exact-old-pane-observations");
             let actor_request = requested.clone();
             let actor_ready = ready.clone();
             let actor_row = instance.clone();
+            let actor_stdout = stdout.clone();
             let old_pane = old.identity.pane_id.clone();
             let actor = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4615,6 +4666,10 @@ exec sleep 60
                     );
                     std::thread::yield_now();
                 }
+                let receipt = std::fs::read_to_string(&actor_stdout).unwrap();
+                let fields: Vec<_> = receipt.trim_end().splitn(9, '|').collect();
+                assert_eq!(fields[3], old_pane);
+                assert_eq!(fields[6], "1", "the held receipt must describe the old real corpse");
                 assert!(crate::tmux::tmux_command()
                     .args(["kill-pane", "-t", &old_pane])
                     .status()
@@ -4643,25 +4698,39 @@ exec sleep 60
                     );
                     (guard, replacement)
                 };
-                std::fs::write(&actor_ready, b"replacement physically installed").unwrap();
-                (guard, replacement)
+                let native_birth = if replacement_dead {
+                    None
+                } else {
+                    let pid = replacement.identity.pane_pid.unwrap();
+                    let birth = crate::process::process_birth_identity(pid).unwrap().unwrap();
+                    assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+                    Some((pid, birth))
+                };
+                assert!(crate::process::process_birth_is_live(
+                    replacement.server.pid, &replacement.server.birth,
+                ).unwrap());
+                std::fs::write(&actor_ready, b"replacement identity and kernel birth captured")
+                    .unwrap();
+                (guard, replacement, native_birth)
             });
             let bin = root.path().join("tmux-race");
             std::fs::create_dir(&bin).unwrap();
             let shim = bin.join("tmux");
-            let stdout = root.path().join("real-dead-observation.stdout");
             let quote = crate::session::environment::shell_escape_script_word;
+            let format = "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}";
             std::fs::write(&shim, format!(
-                "#!/bin/sh\nMATCH=; for arg do case \"$arg\" in '#{{n:socket_path}}|'*) MATCH=1 ;; esac; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" > {}; R=$?\n[ \"$R\" -eq 0 ] || exit \"$R\"\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\ncat {}; exit \"$R\"\nfi\nexec {} \"$@\"\n",
-                quote(&requested.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
-                quote(&stdout.to_string_lossy()), quote(&requested.to_string_lossy()),
-                quote(&ready.to_string_lossy()), quote(&stdout.to_string_lossy()),
-                quote(&real_tmux.to_string_lossy()),
+                "#!/bin/sh\nCOMMAND=; TARGET=; FORMAT=; PREV=; for arg do\n[ \"$arg\" != display-message ] || COMMAND=1\nif [ \"$PREV\" = -t ] && [ \"$arg\" = {} ]; then TARGET=1; fi\n[ \"$arg\" != {} ] || FORMAT=1\nPREV=$arg\ndone\nif [ -n \"$COMMAND\" ] && [ -n \"$TARGET\" ] && [ -n \"$FORMAT\" ] && [ ! -e {} ]; then\nCOUNT=0; if [ -f {} ]; then read -r COUNT < {}; fi\nCOUNT=$((COUNT + 1)); printf '%s\\n' \"$COUNT\" > {}\nif [ \"$COUNT\" -eq 2 ]; then\n{} \"$@\" > {}; R=$?\n[ \"$R\" -eq 0 ] || exit \"$R\"\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\ncat {}; exit \"$R\"\nfi\nfi\nexec {} \"$@\"\n",
+                quote(&old.identity.pane_id), quote(format),
+                quote(&requested.to_string_lossy()), quote(&count.to_string_lossy()),
+                quote(&count.to_string_lossy()), quote(&count.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()), quote(&stdout.to_string_lossy()),
+                quote(&requested.to_string_lossy()), quote(&ready.to_string_lossy()),
+                quote(&stdout.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
             )).unwrap();
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
             let _path = crate::session::test_support::path_prepended(&bin);
             let result = instance.ensure_pane_ready();
-            let (_replacement_guard, replacement) = actor.join().unwrap();
+            let (_replacement_guard, replacement, native_birth) = actor.join().unwrap();
             assert!(
                 matches!(
                     result,
@@ -4669,8 +4738,11 @@ exec sleep 60
                 ),
                 "{result:?}"
             );
+            assert_eq!(std::fs::read_to_string(count).unwrap().trim(), "2");
             assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
             assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
+            assert_eq!(pane_field(&replacement.identity.pane_id, "#{pane_pid}"),
+                replacement.identity.pane_pid.unwrap().to_string());
             assert_eq!(
                 pane_field(&replacement.identity.pane_id, "#{pane_dead}"),
                 if replacement_dead { "1" } else { "0" }
@@ -4678,11 +4750,31 @@ exec sleep 60
             assert!(std::fs::read_to_string(stdout)
                 .unwrap()
                 .contains(&old.identity.pane_id));
-            if !replacement_dead {
-                let pid = replacement.identity.pane_pid.unwrap();
-                assert!(crate::process::process_birth_identity(pid)
-                    .unwrap()
-                    .is_some());
+            assert!(crate::process::process_birth_is_live(
+                replacement.server.pid, &replacement.server.birth,
+            ).unwrap());
+            if let Some((pid, birth)) = native_birth.as_ref() {
+                assert!(crate::process::process_birth_is_live(*pid, birth).unwrap(),
+                    "the actor-captured replacement birth must survive the refusal");
+            }
+            // A separate operation may observe the replacement; the refused operation may not.
+            let generation = storage.load().unwrap()[0].lifecycle_generation;
+            let positive = instance.ensure_pane_ready().unwrap();
+            if replacement_dead {
+                assert!(matches!(positive,
+                    crate::session::EnsureReadyOutcome::Started
+                        | crate::session::EnsureReadyOutcome::Respawned
+                ), "{positive:?}");
+                let pane = only_pane_id(&name);
+                assert_ne!(pane, replacement.identity.pane_id);
+                crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+                assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+            } else {
+                assert_eq!(positive, crate::session::EnsureReadyOutcome::AlreadyAlive);
+                assert_eq!(storage.load().unwrap()[0].lifecycle_generation, generation);
+                let (pid, birth) = native_birth.as_ref().unwrap();
+                assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
+                assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
             }
         }
     }
@@ -4953,14 +5045,28 @@ exec sleep 60
     #[serial]
     #[serial(hook_base)]
     fn omp_pin_confirmation_during_grace_keeps_only_the_captured_launch_owner() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
         if !crate::tmux::test_helpers::tmux_available() {
             return;
         }
         const SID: &str = "11111111-2222-4333-8444-555555555555";
         const PEER_SID: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
-        for change in ["confirmed", "repinned", "generation", "execution"] {
+        let python = which::which("python3").unwrap();
+        for (change, with_witness) in ["confirmed", "repinned", "generation", "execution"]
+            .into_iter().flat_map(|change| [false, true].map(|with_witness| (change, with_witness)))
+        {
             let root = tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+                root.path(),
+                concat!(
+                    module_path!(),
+                    "::omp_pin_confirmation_during_grace_keeps_only_the_captured_launch_owner"
+                ),
+            );
             let _env = isolate_resume_environment(root.path());
             let (_hooks, _base, _hook_root) = crate::hooks::test_support::BaseGuard::ready();
             crate::session::config::update_config(|config| {
@@ -4968,10 +5074,20 @@ exec sleep 60
                 config.session.smart_rename = false;
             })
             .unwrap();
+            let ready = root.path().join("actual-native-ready.json");
+            let input = root.path().join("actual-native-input");
+            let native = format!(
+                "#!{}\nimport json,os,sys\nif len(sys.argv)>1 and sys.argv[1] in ('--help','--version'): sys.exit(1)\nrecord={{'pid':os.getpid(),'argv':sys.argv[1:],'execution':os.environ.get({}),'generation':os.environ.get({})}}\np={}\nwith open(p+'.tmp','w') as f: json.dump(record,f)\nos.replace(p+'.tmp',p)\nwhile True:\n data=os.read(0,4096)\n if not data: break\n with open({},'ab') as f: f.write(data)\n",
+                python.display(),
+                serde_json::to_string(crate::hooks::SESSION_SOURCE_ENV).unwrap(),
+                serde_json::to_string(crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY).unwrap(),
+                serde_json::to_string(&ready.to_string_lossy()).unwrap(),
+                serde_json::to_string(&input.to_string_lossy()).unwrap(),
+            );
             let _omp = crate::session::test_support::install_login_shell_path_command(
                 root.path(),
                 "omp",
-                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+                &native,
             );
             let project = root.path().join("project");
             let store = root.path().join("store");
@@ -5008,6 +5124,20 @@ exec sleep 60
             let profile = instance.source_profile.clone();
             let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
             let callback_observed = observed.clone();
+            let born = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let birth_observed = born.clone();
+            let _birth_observer = super::super::start::test_support::FinalizeObserver::install(
+                instance.id.clone(), move |row, phase| {
+                    if matches!(phase, super::super::start::test_support::FinalizePhase::Before) {
+                        assert!(birth_observed.borrow().is_none());
+                        *birth_observed.borrow_mut() = Some(std::sync::Arc::clone(
+                            row.agent_pane.physical.as_ref().expect("the original birth receipt"),
+                        ));
+                    }
+                },
+            );
+            let callback_born = born.clone();
+            let callback_input = input.clone();
             POST_SHELL_OBSERVER.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |session| {
                     let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
@@ -5021,12 +5151,39 @@ exec sleep 60
                         row.omp_capture_generation.as_deref(),
                         Some(metadata.launch_id.as_str())
                     );
+                    let original = std::sync::Arc::clone(
+                        callback_born.borrow().as_ref().expect("birth precedes confirmation"),
+                    );
+                    assert_eq!(crate::tmux::test_helpers::only_pane_id(session.name()),
+                        original.identity.pane_id);
+                    let deadline = std::time::Instant::now() + RESUME_PROBE_MAX;
+                    while !ready.exists() {
+                        assert!(std::time::Instant::now() < deadline,
+                            "the actual Native child must publish argv/tokens/PID before confirmation");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    let native: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+                    let args = native["argv"].as_array().unwrap();
+                    let expected = shell_words::split(&build_resume_flags("omp", SID, true)).unwrap();
+                    assert!(!expected.is_empty());
+                    assert!(args.windows(expected.len()).any(|words| {
+                        words.iter().zip(&expected).all(|(word, expected)| word.as_str() == Some(expected.as_str()))
+                    }), "{native}");
+                    assert_eq!(native["execution"].as_str(), Some(active.launch_id.as_str()));
+                    assert_eq!(native["generation"].as_str(), Some(metadata.launch_id.as_str()));
+                    assert_ne!(active.launch_id, metadata.launch_id);
+                    let pid = u32::try_from(native["pid"].as_u64().unwrap()).unwrap();
+                    let birth = crate::process::process_birth_identity(pid).unwrap().unwrap();
+                    assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+                    assert!(!callback_input.exists(), "confirmation must not inject Native input");
+                    let mut selection = with_witness.then(|| row.native_preparation_selection().unwrap());
                     let confirmation = Instance::persist_omp_pin_confirmation(
                         &storage,
                         &row.id,
                         SID,
                         &metadata.launch_id,
-                        None,
+                        selection.as_mut(),
                     )
                     .unwrap();
                     assert_eq!(
@@ -5037,6 +5194,12 @@ exec sleep 60
                         storage.load().unwrap()[0].resume_intent,
                         ResumeIntent::Default
                     );
+                    let confirmed = storage.load().unwrap().remove(0);
+                    assert_eq!(confirmed.resume_binding, row.resume_binding,
+                        "confirmation consumes only the pin intent, not its durable context");
+                    if let Some(selection) = selection {
+                        assert_eq!(selection, confirmed.native_preparation_selection().unwrap());
+                    }
                     storage
                         .update(|rows, _| {
                             let row = rows
@@ -5062,14 +5225,7 @@ exec sleep 60
                             Ok(())
                         })
                         .unwrap();
-                    let pane = crate::tmux::test_helpers::only_pane_id(session.name());
-                    let pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
-                        .parse()
-                        .unwrap();
-                    let birth = crate::process::process_birth_identity(pid)
-                        .unwrap()
-                        .unwrap();
-                    *callback_observed.borrow_mut() = Some((pane, pid, birth));
+                    *callback_observed.borrow_mut() = Some((original, pid, birth));
                 }));
             });
             let _observer = PostShellObserver;
@@ -5085,17 +5241,29 @@ exec sleep 60
                         cause: LaunchIndeterminateCause::OwnershipUnproven,
                     }
                 },
-                "{change}"
+                "{change}, witness={with_witness}"
             );
             let observed = observed.borrow();
-            let (pane, pid, birth) = observed
+            let (original, pid, birth) = observed
                 .as_ref()
                 .expect("confirmation must occur during the post-shell grace");
             assert_eq!(
                 crate::tmux::test_helpers::only_pane_id(session.name()),
-                *pane
+                original.identity.pane_id
             );
             assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
+            assert!(std::sync::Arc::ptr_eq(
+                instance.agent_pane.physical.as_ref().expect("the original physical receipt remains"),
+                original,
+            ));
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&original.identity.pane_id, "#{pane_pid}"),
+                original.identity.pane_pid.unwrap().to_string(),
+            );
+            assert!(crate::process::process_birth_is_live(
+                original.server.pid, &original.server.birth,
+            ).unwrap());
+            assert!(!input.exists(), "the grace result must not replay Native input");
             let row = storage.load().unwrap().remove(0);
             assert_eq!(row.resume_probe_failed_sid, None);
             assert_eq!(
