@@ -4,6 +4,26 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.22.3](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.3) - 2026-11-08
+
+
+
+### Bug Fixes
+
+- **web:** Add retry and dismiss to the pipe contention notice in [#5448](https://github.com/agent-of-empires/agent-of-empires/pull/5448) by [@njbrake](https://github.com/njbrake) ([`919c802`](https://github.com/agent-of-empires/agent-of-empires/commit/919c802936604214b99747908dc0fc797eb17577))
+- **acp:** Release the local prompt waiter when the cost-orphan grace ends a turn in [#5474](https://github.com/agent-of-empires/agent-of-empires/pull/5474) by [@cwrau](https://github.com/cwrau) ([`7eb478e`](https://github.com/agent-of-empires/agent-of-empires/commit/7eb478ecdf19c82a452b926a887a16308db3d589))
+- **acp:** Keep a queued continuation when the prompt is refused before publish in [#5434](https://github.com/agent-of-empires/agent-of-empires/pull/5434) by [@Seluj78](https://github.com/Seluj78) ([`f114d47`](https://github.com/agent-of-empires/agent-of-empires/commit/f114d471c27d54cad0b96da4aa04116bea7a4e0f))
+- **session:** Resume verified Codex rollouts without attested policy in [#5446](https://github.com/agent-of-empires/agent-of-empires/pull/5446) by [@njbrake](https://github.com/njbrake) ([`0863574`](https://github.com/agent-of-empires/agent-of-empires/commit/08635740048b3a086913ce99fc23324d56774242))
+- **session:** Resume sandboxed Codex sessions from a verified private store in [#5484](https://github.com/agent-of-empires/agent-of-empires/pull/5484) by [@njbrake](https://github.com/njbrake) ([`7d51451`](https://github.com/agent-of-empires/agent-of-empires/commit/7d514512c8ddfb3116f30eaaadd934c94ba32545))
+
+
+### Features
+
+- **tui:** Configure paired terminal split sizing in [#5381](https://github.com/agent-of-empires/agent-of-empires/pull/5381) by [@athal7](https://github.com/athal7) ([`278c115`](https://github.com/agent-of-empires/agent-of-empires/commit/278c11580627a6e0bab21509a7289f380f99c857))
+- **session:** Switch Claude accounts with restart --tool and acp switch-account in [#5449](https://github.com/agent-of-empires/agent-of-empires/pull/5449) by [@cwrau](https://github.com/cwrau) ([`428570e`](https://github.com/agent-of-empires/agent-of-empires/commit/428570ebb7bcf54de8bcb8bd7ccf2cf2414ad21c))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.22.2...v1.22.3
 ## [1.22.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.2) - 2026-11-08
 
 
