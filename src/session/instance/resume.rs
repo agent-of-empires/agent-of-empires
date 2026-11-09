@@ -58,6 +58,8 @@ pub enum ManagedResumeCause {
     PiTranscriptBindingRequired,
     #[error("OMP exact transcript binding is missing")]
     OmpTranscriptBindingRequired,
+    #[error("Codex conversation cannot be verified in this context")]
+    CodexConversationUnverified,
     #[error("native execution context cannot be attested")]
     ExecutionContextUnattested,
 }
@@ -70,6 +72,7 @@ impl ManagedResumeCause {
             Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
             Self::PiTranscriptBindingRequired => "pi_transcript_binding_required",
             Self::OmpTranscriptBindingRequired => "omp_transcript_binding_required",
+            Self::CodexConversationUnverified => "codex_conversation_unverified",
             Self::ExecutionContextUnattested => "execution_context_unattested",
         }
     }
@@ -92,6 +95,17 @@ impl ManagedResumeCause {
             ),
             Self::PiTranscriptBindingRequired => transcript_recovery_message!("Pi"),
             Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
+            Self::CodexConversationUnverified => concat!(
+                "Managed resume refused: cannot verify this Codex conversation here.\n",
+                "It needs a rollout recording this ID and project, in a sandbox's private store\n",
+                "or on a host session with no session.agent_config_dir, Codex profile, or\n",
+                "alternate store routing. A store over AoE's scan limit cannot be verified.\n",
+                "Conversation preserved. Restore that context, then retry.\n",
+                "Or copy agent_session_id from aoe session show <session> --json and\n",
+                "continue inside Codex (AoE drops this association):\n",
+                "aoe session set-session-id <session> \"\"\n",
+                "Restart, then run /resume <native-id> once Codex is idle."
+            ),
             Self::ExecutionContextUnattested => recovery_message!(
                 "Managed resume refused: execution context cannot be attested.\n\
                  Restore the original agent configuration and store."
@@ -104,6 +118,8 @@ impl ManagedResumeCause {
             *cause
         } else if error.is::<super::execution::UnattestedOpenCodeSchema>() {
             Self::OpenCodeSchemaUnattested
+        } else if error.is::<super::execution::UnattestedCodexPolicy>() {
+            Self::CodexConversationUnverified
         } else {
             Self::ExecutionContextUnattested
         }
@@ -1667,11 +1683,11 @@ mod tests {
         }
     }
 
-    fn owned_probe_fields(output: &std::process::Output) -> (&str, [&str; 9]) {
+    fn owned_probe_fields(output: &std::process::Output) -> (&str, [&str; 10]) {
         let text = std::str::from_utf8(&output.stdout).unwrap().trim_end();
         let (length, data) = text.split_once('|').unwrap();
         let (socket, suffix) = data.split_at(length.parse().unwrap());
-        let mut parts = suffix.strip_prefix('|').unwrap().splitn(9, '|');
+        let mut parts = suffix.strip_prefix('|').unwrap().splitn(10, '|');
         (socket, std::array::from_fn(|_| parts.next().unwrap()))
     }
 
@@ -2014,7 +2030,7 @@ mod tests {
                             replace_owned_probe_fields(output, &[(3, &other_pid)]);
                         }
                         "expiry" => {
-                            replace_owned_probe_fields(output, &[(7, "sh"), (8, "")]);
+                            replace_owned_probe_fields(output, &[(8, "sh"), (9, "")]);
                         }
                         "superseded" | "same_sid_assertion" | "concurrent_status" => {
                             if sample != 1 {

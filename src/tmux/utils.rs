@@ -443,7 +443,7 @@ pub(crate) fn probe_owned_pane(
     let mut command = crate::tmux::tmux_query_command_for_socket(&expected.server.socket);
     command.args([
         "display-message", "-p", "-t", &expected.identity.pane_id,
-        "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{session_windows}|#{window_panes}|#{pane_current_command}|#{pane_start_command}",
+        "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{session_windows}|#{window_panes}|#{window_linked}|#{pane_current_command}|#{pane_start_command}",
     ]);
     let output = deadline.run(&mut command)?;
     #[cfg(test)]
@@ -470,14 +470,19 @@ pub(crate) fn probe_owned_pane(
         .get(length..)
         .and_then(|rest| rest.strip_prefix('|'))
         .ok_or_else(|| anyhow::anyhow!("malformed tmux socket field"))?;
-    let mut parts = suffix.splitn(9, '|');
-    let fields: [Option<&str>; 9] = std::array::from_fn(|_| parts.next());
-    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(windows), Some(panes), Some(command), Some(start_command)] =
+    let mut parts = suffix.splitn(10, '|');
+    let fields: [Option<&str>; 10] = std::array::from_fn(|_| parts.next());
+    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(windows), Some(panes), Some(linked), Some(command), Some(start_command)] =
         fields
     else {
         bail!("malformed tmux pane observation");
     };
-    let exclusive = (windows.parse::<u32>()?, panes.parse::<u32>()?) == (1, 1);
+    let linked = match linked {
+        "0" => false,
+        "1" => true,
+        _ => bail!("inconclusive tmux window sharing"),
+    };
+    let exclusive = (windows.parse::<u32>()?, panes.parse::<u32>()?) == (1, 1) && !linked;
     let pid: u32 = server_pid.parse()?;
     let probe = classify_pane_probe(true, dead, &[]);
     anyhow::ensure!(
@@ -519,30 +524,30 @@ pub(crate) fn remove_owned_dead_pane(
 /// Remove only the captured exclusive pane, with topology checked in the same tmux command.
 pub(crate) fn remove_owned_pane(
     expected: &crate::session::LegacyToolObservation,
-    require_dead: bool,
+    expected_dead: bool,
 ) -> Result<()> {
     let identity = &expected.identity;
     let literal = crate::tmux::Session::tmux_format_literal;
     let session = format!("#{{==:#{{session_id}},{}}}", literal(&identity.session_id));
     let pane = format!("#{{==:#{{pane_id}},{}}}", literal(&identity.pane_id));
-    let process = match identity.pane_pid {
-        Some(pid) => format!(
-            "#{{||:#{{==:#{{pane_pid}},{pid}}},#{{&&:#{{==:#{{pane_dead}},1}},#{{==:#{{pane_pid}},}}}}}}"
+    let process = match (identity.pane_pid, expected_dead) {
+        (Some(pid), false) => format!(
+            "#{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}}"
+        ),
+        (Some(pid), true) => format!(
+            "#{{&&:#{{==:#{{pane_dead}},1}},#{{||:#{{==:#{{pane_pid}},{pid}}},#{{==:#{{pane_pid}},}}}}}}"
         ),
         // A legacy corpse has no live process identity. Require it to remain a corpse.
-        None => "#{&&:#{==:#{pane_dead},1},#{==:#{pane_pid},}}".to_owned(),
-    };
-    let process = if require_dead {
-        format!("#{{&&:{process},#{{==:#{{pane_dead}},1}}}}")
-    } else {
-        process
+        (None, true) => "#{&&:#{==:#{pane_dead},1},#{==:#{pane_pid},}}".to_owned(),
+        (None, false) => bail!("live pane process identity unavailable"),
     };
     let server = format!(
         "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{socket_path}},{}}}}}",
         expected.server.pid,
         literal(&expected.server.socket)
     );
-    let exclusive = "#{&&:#{==:#{session_windows},1},#{==:#{window_panes},1}}";
+    let exclusive =
+        "#{&&:#{==:#{session_windows},1},#{&&:#{==:#{window_panes},1},#{==:#{window_linked},0}}}";
     let condition =
         format!("#{{&&:#{{&&:{session},{pane}}},#{{&&:#{{&&:{process},{server}}},{exclusive}}}}}");
     let target = crate::tmux::Session::tmux_command_string_literal(&identity.session_id);
@@ -2091,6 +2096,49 @@ mod pane_probe_tests {
             ),
             "0"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_pane_guard_refuses_a_captured_pane_that_exited() {
+        use crate::tmux::test_helpers::{pane_field, wait_for_pane_dead, TmuxTestSession};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let instance =
+            crate::session::Instance::new("live-to-corpse", root.path().to_str().unwrap());
+        let session = instance.tmux_session().unwrap();
+        let _pane = TmuxTestSession::from_name(session.name());
+        let expected = create_observed_test_pane(&instance, root.path());
+        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "0");
+        assert!(expected.identity.pane_pid.is_some());
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &expected.identity.pane_id,
+                "remain-on-exit",
+                "on",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(crate::tmux::tmux_command()
+            .args(["send-keys", "-t", &expected.identity.pane_id, "C-c"])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(&expected.identity.pane_id);
+
+        let removed = remove_owned_pane(&expected, false);
+        assert!(
+            removed.is_err(),
+            "a live-process authorization must not consume a corpse: {removed:?}"
+        );
+        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "1");
+        assert!(session.exists_live());
     }
 
     #[test]
