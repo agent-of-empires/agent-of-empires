@@ -1801,6 +1801,34 @@ mod tests {
     #[test]
     fn naming_reprobes_success_without_losing_context_failure_cooldown() {
         use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AOE_NAMING_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!(
+                        "{module}::naming_reprobes_success_without_losing_context_failure_cooldown"
+                    ),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap()
+            .expect("naming probe test child timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("claude");
         let response = directory.path().join("help");

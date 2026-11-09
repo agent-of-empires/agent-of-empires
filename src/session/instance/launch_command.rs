@@ -1,6 +1,8 @@
 //! Building the shell command a session launches with.
 
+use super::execution::{UnattestedCodexPolicy, UnpinnedCodexLaunch};
 use super::*;
+use crate::session::capture::CodexRolloutScanLimit;
 
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
@@ -30,6 +32,11 @@ pub(super) struct PreparedLaunch {
     /// Relocated and store-adopted conversations require durable confirmation.
     pub(super) require_conversation_publication: bool,
 }
+
+type LaunchRouting = (
+    Option<super::execution::NativeExecution>,
+    Option<UnpinnedCodexLaunch>,
+);
 
 fn prepared_fork_mints_child(
     agent: Option<&'static crate::agents::AgentDef>,
@@ -173,14 +180,21 @@ fn apply_no_daemon_flag(
     agent: Option<&crate::agents::AgentDef>,
     inst: &Instance,
     execution: Option<&super::execution::NativeExecution>,
+    unpinned: Option<&UnpinnedCodexLaunch>,
 ) {
     let Some(agent) = agent else {
         return;
     };
-    let Some(execution) = execution.filter(|execution| {
-        execution.inputs.container.is_none() && execution.agent.name == agent.name
-    }) else {
-        return;
+    let (program, probe) = match (execution, unpinned) {
+        (Some(execution), _)
+            if execution.inputs.container.is_none() && execution.agent.name == agent.name =>
+        {
+            (&execution.program, execution.host_command())
+        }
+        (None, Some(unpinned)) if agent.name == "codex" => {
+            (&unpinned.program, unpinned.host_command())
+        }
+        _ => return,
     };
     let Some(invocation) = parse_launch_command(inst.get_tool_command()) else {
         return;
@@ -191,13 +205,13 @@ fn apply_no_daemon_flag(
     let Ok(mut words) = shell_words::split(cmd) else {
         return;
     };
-    if words.first().map(String::as_str) != execution.program.to_str() {
+    if words.first().map(String::as_str) != program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&execution.host_command(), options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(&probe, options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
@@ -816,8 +830,42 @@ impl Instance {
     pub(super) fn resolve_launch_execution(
         &self,
     ) -> Result<Option<super::execution::NativeExecution>> {
+        self.resolve_launch_routing()
+            .map(|(execution, _)| execution)
+    }
+
+    /// The unpinned routing a verified rollout admits despite `error`, if any.
+    fn verified_codex_resume_routing(
+        &self,
+        error: &anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> Result<Option<LaunchRouting>, CodexRolloutScanLimit> {
+        if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding)? {
+            return Ok(Some((None, Some(store.clone()))));
+        }
+        Ok(self
+            .sandboxed_codex_resume_admitted(error, sid, binding)?
+            .then_some((None, None)))
+    }
+
+    /// The execution to pin, or for an unpinned launch the executable and
+    /// routing that keep it on the store its conversation was verified in. An
+    /// admitted sandbox has neither: its container already routes to its store.
+    fn resolve_launch_routing(&self) -> Result<LaunchRouting> {
         let target = self.conversation_target();
-        match (self.resolve_native_execution(target), target) {
+        let mut resolved = self.resolve_native_execution(target);
+        if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
+            match self.verified_codex_resume_routing(error, sid, binding) {
+                Ok(Some(routing)) => {
+                    tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
+                    return Ok(routing);
+                }
+                Ok(None) => {}
+                Err(limit) => resolved = Err(UnattestedCodexPolicy::from(limit).into()),
+            }
+        }
+        let execution = match (resolved, target) {
             (Ok(execution), _) => Ok(Some(execution)),
             (Err(error), Some((sid, binding, explicit)))
                 if explicit
@@ -829,10 +877,14 @@ impl Instance {
                     return Err(error);
                 }
                 let cause = ManagedResumeCause::from_error(&error);
+                let recovery = if cause == ManagedResumeCause::CodexConversationUnverified {
+                    format!("restore a verifiable context, or clear it with aoe session set-session-id {} \"\", restart, and run /resume {sid} in Codex", self.id)
+                } else {
+                    format!("restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)", self.id)
+                };
                 Err(error
                     .context(format!(
-                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
-                        self.id
+                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; {recovery}"
                     ))
                     .context(ManagedResumeRefused(cause)))
             }
@@ -850,7 +902,8 @@ impl Instance {
                 tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                 Ok(None)
             }
-        }
+        };
+        execution.map(|execution| (execution, None))
     }
 
     #[cfg(test)]
@@ -900,7 +953,7 @@ impl Instance {
                         ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
                     ));
             let mut handoff_prior = None;
-            let execution = self.resolve_launch_execution()?;
+            let (execution, unpinned) = self.resolve_launch_routing()?;
             if let Some(execution) = execution.as_ref() {
                 handoff_prior = self.hand_off_prime_fork_parent(execution, stores)?;
                 if validate_target {
@@ -939,6 +992,7 @@ impl Instance {
             let parts = self.build_launch_command_in(
                 stores,
                 execution.as_ref(),
+                unpinned.as_ref(),
                 &mut expected_conversation,
             )?;
             if (managed || parts.is_existing) && validate_target {
@@ -1067,13 +1121,20 @@ impl Instance {
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         let file_watch = crate::file_watch::FileWatchService::noop();
-        self.build_launch_command_in(CaptureStorage::Profiles(&file_watch), execution, expected)
+        self.build_launch_command_in(
+            CaptureStorage::Profiles(&file_watch),
+            execution,
+            None,
+            expected,
+        )
     }
 
+    /// `unpinned` applies to a host launch only when `execution` is absent.
     pub(super) fn build_launch_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
@@ -1169,6 +1230,7 @@ impl Instance {
             let launch_cmd = self.freeze_native_invocation(
                 self.get_launch_command(),
                 execution,
+                None,
                 launch_context,
             )?;
             let base_cmd = if self.extra_args.is_empty() {
@@ -1301,7 +1363,8 @@ impl Instance {
                 },
             }
         } else {
-            let mut result = self.build_host_command_in(stores, agent, execution, expected)?;
+            let mut result =
+                self.build_host_command_in(stores, agent, execution, unpinned, expected)?;
             result.launch_env.pane = if execution.is_none() {
                 crate::session::environment::resolve_host_environment_pairs(
                     &self.resolved_host_environment(),
@@ -1331,6 +1394,7 @@ impl Instance {
             CaptureStorage::Profiles(&file_watch),
             agent,
             execution,
+            None,
             expected,
         )
     }
@@ -1340,6 +1404,7 @@ impl Instance {
         stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
         let fallback_identity = execution
@@ -1354,6 +1419,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
+            unpinned,
             expected,
         )
     }
@@ -1372,6 +1438,7 @@ impl Instance {
             agent,
             identity_extension,
             execution,
+            None,
             expected,
         )
     }
@@ -1382,8 +1449,13 @@ impl Instance {
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
+        let routing = execution
+            .map(|execution| execution.routing.as_slice())
+            .or(unpinned.map(|unpinned| unpinned.routing.as_slice()))
+            .unwrap_or_default();
         let host_command = agent
             .filter(|agent| agent.spans_agent_generations)
             .and_then(|agent| self.host_agent_command(agent, execution));
@@ -1434,6 +1506,7 @@ impl Instance {
                     let mut cmd = self.freeze_native_invocation(
                         a.launch_base_command(),
                         execution,
+                        unpinned,
                         launch_context,
                     )?;
                     if let Some((ref flag, _)) = identity_extension {
@@ -1479,7 +1552,7 @@ impl Instance {
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-                    apply_no_daemon_flag(&mut cmd, agent, self, execution);
+                    apply_no_daemon_flag(&mut cmd, agent, self, execution, unpinned);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!(
                         "{}{}",
@@ -1516,7 +1589,7 @@ impl Instance {
                             Some(wrap_command_ignore_suspend(
                                 &command,
                                 &self.project_path,
-                                execution.map_or(&[], |execution| execution.routing.as_slice()),
+                                routing,
                                 execution
                                     .map_or(&[], |execution| execution.case_insensitive_routing),
                             ))
@@ -1536,8 +1609,12 @@ impl Instance {
                 }),
             }
         } else {
-            let mut cmd =
-                self.freeze_native_invocation(self.command.clone(), execution, launch_context)?;
+            let mut cmd = self.freeze_native_invocation(
+                self.command.clone(),
+                execution,
+                unpinned,
+                launch_context,
+            )?;
             if let Some((ref flag, _)) = identity_extension {
                 cmd.push_str(flag);
             }
@@ -1573,7 +1650,7 @@ impl Instance {
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-            apply_no_daemon_flag(&mut cmd, agent, self, execution);
+            apply_no_daemon_flag(&mut cmd, agent, self, execution, unpinned);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!(
                 "{}{}",
@@ -1609,7 +1686,7 @@ impl Instance {
                     Some(wrap_command_ignore_suspend(
                         &command,
                         &self.project_path,
-                        execution.map_or(&[], |execution| execution.routing.as_slice()),
+                        routing,
                         execution.map_or(&[], |execution| execution.case_insensitive_routing),
                     ))
                 },
@@ -2432,7 +2509,7 @@ mod tests {
             if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
                 assert_eq!(
                     format!("{:#}", asserted.unwrap_err()),
-                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
+                    "aoe session set-session-id cannot bind a Codex conversation in this context; clear it with set-session-id <session> \"\", restart, and run /resume <native-id> in Codex: Codex managed preferences cannot be attested by the local file contract"
                 );
                 continue;
             }
@@ -2784,6 +2861,9 @@ mod tests {
     fn managed_resume_refuses_unattestable_execution_without_changing_identity() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _omp_env = crate::session::test_support::EnvGuard::unset(
+            &crate::session::capture::OMP_STORE_ENV_KEYS,
+        );
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
@@ -3395,6 +3475,426 @@ mod tests {
         );
     }
 
+    /// Sandboxes share the host fallback only through their private store.
+    #[test]
+    #[serial_test::serial]
+    fn default_sandboxed_codex_resume_requires_a_verified_private_store() {
+        use super::super::test_helpers::{
+            admit_sandbox_fixture, install_container_transport, test_sandbox,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("codex", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("codex-5477", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/codex"),
+        )
+        .unwrap();
+        let store = inst.sandbox_capture_store_dir().unwrap();
+        std::fs::write(
+            store.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let day = store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = |sid: &str, cwd: &str| {
+            std::fs::write(
+                day.join(format!("rollout-2026-11-08T12-00-00-{sid}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":\"{cwd}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let local = "01a1bbfe-4006-73e2-849e-139baf24402c";
+        let foreign = "01a1bbfe-4006-73e2-849e-139baf24402d";
+        let unknown = "01a1bbfe-4006-73e2-849e-139baf24402e";
+        rollout(local, "/workspace/project");
+        rollout(foreign, "/workspace/other");
+        let with_sid = |sid: &str| {
+            let mut inst = inst.clone();
+            inst.agent_session_id = Some(sid.into());
+            inst
+        };
+
+        let mut admitted = with_sid(local);
+        assert!(admitted.resolve_launch_execution().unwrap().is_none());
+        admitted.preflight_resume_launch().unwrap();
+        let prepared = admitted
+            .prepare_launch_command(admitted.conversation_state())
+            .unwrap();
+        assert!(prepared.is_existing);
+        let command = prepared.command.unwrap();
+        assert!(command.contains(&format!("resume {local}")), "{command}");
+
+        let binding = |session_id: &str, agent: &str, stores: Vec<PathBuf>| {
+            let mut binding = ConversationBinding::unknown(session_id);
+            binding.execution = Some(crate::session::ExecutionBinding {
+                agent: agent.into(),
+                stores,
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: "/workspace/project".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            });
+            binding
+        };
+        let private = store.canonicalize().unwrap();
+        let mut bound = with_sid(local);
+        bound.agent_session_binding = Some(binding(local, "codex", vec![private.clone()]));
+        assert!(bound.resolve_launch_execution().unwrap().is_none());
+
+        let refused = |inst: Instance| {
+            let error = inst.resolve_launch_execution().err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                ManagedResumeCause::CodexConversationUnverified,
+                "{error:#}"
+            );
+        };
+        refused(with_sid(foreign));
+        refused(with_sid(unknown));
+        let mut elsewhere = with_sid(local);
+        elsewhere.agent_session_binding =
+            Some(binding(local, "codex", vec![temp.path().join("shared")]));
+        refused(elsewhere);
+        let mut other_agent = with_sid(local);
+        other_agent.agent_session_binding = Some(binding(local, "claude", vec![private]));
+        refused(other_agent);
+        let mut legacy = with_sid(local);
+        legacy.sandbox_store_generation = 1;
+        assert!(legacy.sandbox_capture_store_dir().is_none());
+        refused(legacy);
+        // A resolved home outside the private store refuses, though the rollout is there.
+        let routed_home = project.join(".codex");
+        std::fs::create_dir_all(&routed_home).unwrap();
+        std::fs::copy(store.join("auth.json"), routed_home.join("auth.json")).unwrap();
+        let mut routed = with_sid(local);
+        routed.sandbox_info.as_mut().unwrap().extra_env =
+            Some(vec!["CODEX_HOME=/workspace/project/.codex".into()]);
+        refused(routed);
+        // An explicit target stays on the attested path.
+        let mut explicit = inst.clone();
+        explicit.resume_intent = ResumeIntent::Use(local.into());
+        assert!(explicit.resolve_launch_execution().is_err());
+
+        let limited = crate::session::capture::with_codex_admission_scan_limit(2, || {
+            with_sid(local).resolve_launch_execution().err().unwrap()
+        });
+        let chain = format!("{limited:#}");
+        assert_eq!(
+            limited.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+            ManagedResumeCause::CodexConversationUnverified,
+            "{chain}"
+        );
+        assert!(chain.contains("more than 2 entries"), "{chain}");
+        assert!(!chain.contains("ChatGPT"), "{chain}");
+
+        // A declared store is still a private child; a wrapper may not resume at all.
+        let declared_dir = temp.path().join("declared");
+        let profile = "codex-5477-declared";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "[session.agent_execution_as]\nmy-codex-wrapper = \"codex\"\n\
+                 [session.agent_config_dir]\ncodex = {dir:?}\nmy-codex-wrapper = {dir:?}\n",
+                dir = declared_dir.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut declared = with_sid(local);
+        declared.source_profile = profile.into();
+        admit_sandbox_fixture(&declared);
+        let config = declared.build_container_config_for_test().unwrap();
+        let _declared_transport =
+            install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        let declared_store = declared.sandbox_capture_store_dir().unwrap();
+        assert!(declared_store.starts_with(&declared_dir));
+        let declared_day = declared_store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&declared_day).unwrap();
+        std::fs::copy(store.join("auth.json"), declared_store.join("auth.json")).unwrap();
+        let name = format!("rollout-2026-11-08T12-00-00-{local}.jsonl");
+        std::fs::copy(day.join(&name), declared_day.join(&name)).unwrap();
+        assert!(declared.resolve_launch_execution().unwrap().is_none());
+
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/my-codex-wrapper"),
+        )
+        .unwrap();
+        let mut wrapped = declared.clone();
+        wrapped.tool = "my-codex-wrapper".into();
+        wrapped.command = "my-codex-wrapper".into();
+        refused(wrapped.clone());
+        let conversation = wrapped.conversation_state();
+        assert!(wrapped.prepare_launch_command(conversation).is_err());
+        assert_eq!(wrapped.agent_session_id.as_deref(), Some(local));
+    }
+
+    /// A ChatGPT login and a macOS host both hit the unreadable-policy refusal.
+    #[test]
+    #[serial_test::serial]
+    fn default_codex_resume_without_attested_policy_requires_a_verified_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let store = temp.path().join(".codex");
+        let day = store.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            store.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[("CODEX_HOME", &store), ("CODEX_SQLITE_HOME", &store)]);
+        // The login shell's startup files compete for the executable and the store.
+        let ran = temp.path().join("ran");
+        let install = |dir: &str, help: &str| {
+            let dir = temp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; *) printf '%s\\n' \"$0\" \"$PWD\" \"$CODEX_HOME\" \"$CODEX_SQLITE_HOME\" \"${{CODEX_EXEC_SERVER_URL-unset}}\" \"$*\" > {};; esac\nexit 0\n",
+                    shell_escape(help),
+                    shell_escape(ran.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        let probed = install("probed", "      --no-daemon  Run without the daemon");
+        let login = install("login", "      --model <MODEL>");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::write(
+            temp.path().join(".profile"),
+            format!(
+                "export PATH={}:$PATH CODEX_HOME={elsewhere} CODEX_SQLITE_HOME={elsewhere} CODEX_EXEC_SERVER_URL=ws://elsewhere\n",
+                shell_escape(login.to_str().unwrap()),
+                elsewhere = shell_escape(elsewhere.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let path = format!("{}:/usr/bin:/bin", probed.display());
+        let _path = EnvGuard::set(&[("PATH", path.as_str()), ("SHELL", "/bin/sh")]);
+        crate::agents::forget_agent_help_for_test();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let local = "11111111-2222-4333-8444-555555555551";
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{local}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{local}\",\"cwd\":{:?}}}}}\n",
+                project.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let instance = |sid: &str| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = Some(sid.into());
+            inst
+        };
+
+        let mut admitted = instance(local);
+        assert!(admitted.resolve_launch_execution().unwrap().is_none());
+        admitted.preflight_resume_launch().unwrap();
+        let prepared = admitted
+            .prepare_launch_command(admitted.conversation_state())
+            .unwrap();
+        assert!(prepared.is_existing);
+        let command = prepared.command.unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", temp.path())
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        let ran = std::fs::read_to_string(&ran).unwrap();
+        let [program, cwd, home, sqlite, exec_server, args] =
+            <[&str; 6]>::try_from(ran.lines().collect::<Vec<_>>()).unwrap();
+        let canonical_store = store.canonicalize().unwrap();
+        assert_eq!(Path::new(program), probed.join("codex"), "{command}");
+        assert_eq!(
+            Path::new(cwd).canonicalize().unwrap(),
+            project.canonicalize().unwrap()
+        );
+        assert_eq!(
+            [Path::new(home), Path::new(sqlite)],
+            [canonical_store.as_path(); 2]
+        );
+        assert_eq!(exec_server, "unset");
+        let words = shell_words::split(args).unwrap();
+        assert!(
+            words.windows(2).any(|pair| pair == ["resume", local]),
+            "{words:?}"
+        );
+        assert_eq!(
+            words.iter().filter(|word| *word == "--no-daemon").count(),
+            1,
+            "{words:?}"
+        );
+
+        let other_store = temp.path().join("other-store");
+        std::fs::create_dir_all(&other_store).unwrap();
+        // The bound execution decides before the rollout does.
+        let bound = |agent: &str, store: &Path, filesystem: &str| {
+            let mut bound = ConversationBinding::unknown(local);
+            bound.provenance = ConversationProvenance::Observed;
+            bound.execution = Some(ExecutionBinding {
+                agent: agent.into(),
+                stores: vec![store.to_path_buf()],
+                configuration: Vec::new(),
+                cwd: project.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: filesystem.into(),
+                exported_default_store: None,
+            });
+            let mut inst = instance(local);
+            inst.agent_session_binding = Some(bound);
+            inst
+        };
+        let mut other_conversation = bound("codex", &canonical_store, "host");
+        if let Some(binding) = other_conversation.agent_session_binding.as_mut() {
+            binding.session_id = "11111111-2222-4333-8444-555555555552".into();
+        }
+        for inst in [
+            bound("codex", &other_store, "host"),
+            bound("codex", &canonical_store, "container"),
+            bound("claude", &canonical_store, "host"),
+            other_conversation,
+        ] {
+            let error = inst.resolve_launch_execution().err().unwrap();
+            let chain = format!("{error:#}");
+            assert_eq!(
+                error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                ManagedResumeCause::CodexConversationUnverified,
+                "{chain}"
+            );
+            assert!(chain.contains("/resume"), "{chain}");
+            assert!(!chain.contains("rebind"), "{chain}");
+        }
+        let advice = ManagedResumeCause::CodexConversationUnverified.message();
+        assert!(advice.contains("set-session-id <session> \"\""), "{advice}");
+        assert!(
+            advice.contains("aoe session show <session> --json"),
+            "{advice}"
+        );
+        assert!(
+            !advice.contains("set-session-id <session> <native-id>"),
+            "{advice}"
+        );
+
+        // An explicit target stays on the attested path.
+        let mut explicit = tool_instance("codex", project.to_str().unwrap());
+        explicit.resume_intent = ResumeIntent::Use(local.into());
+        assert!(explicit.resolve_launch_execution().is_err());
+
+        let refused_cause = |inst: Instance| {
+            inst.resolve_launch_execution()
+                .err()
+                .unwrap()
+                .downcast_ref::<ManagedResumeRefused>()
+                .unwrap()
+                .0
+        };
+        // Credential surfaces leave the local rollout decisive on every platform;
+        // routing AoE cannot read does not.
+        let config = store.join("config.toml");
+        let auth = store.join("auth.json");
+        let chatgpt = std::fs::read(&auth).unwrap();
+        std::fs::write(&config, "cli_auth_credentials_store = \"keyring\"\n").unwrap();
+        assert!(instance(local)
+            .resolve_launch_execution()
+            .unwrap()
+            .is_none());
+        std::fs::remove_file(&config).unwrap();
+        std::fs::remove_file(&auth).unwrap();
+        assert!(instance(local)
+            .resolve_launch_execution()
+            .unwrap()
+            .is_none());
+        std::fs::write(&auth, chatgpt).unwrap();
+        let project_config = project.join(".codex/config.toml");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        let keyring = "cli_auth_credentials_store = \"keyring\"\n";
+        let remote = "[experimental_thread_store]\ntype = \"remote\"\n";
+        for (user, in_project) in [
+            ("profile = \"work\"\n".to_string(), ""),
+            (remote.to_string(), ""),
+            (format!("{keyring}{remote}"), ""),
+            (keyring.to_string(), "profile = \"work\"\n"),
+            (keyring.to_string(), remote),
+        ] {
+            std::fs::write(&config, &user).unwrap();
+            std::fs::write(&project_config, in_project).unwrap();
+            assert_eq!(
+                refused_cause(instance(local)),
+                ManagedResumeCause::CodexConversationUnverified,
+                "{user}{in_project}"
+            );
+            let error = instance(local)
+                .resolve_native_execution(None)
+                .err()
+                .unwrap();
+            assert!(
+                !format!("{error:#}").contains("keyring"),
+                "routing must be what refuses: {error:#}"
+            );
+        }
+        std::fs::remove_file(&config).unwrap();
+        std::fs::remove_file(&project_config).unwrap();
+
+        // A wrapper's lookup is its own, whatever the rollout says.
+        let mut wrapper = instance(local);
+        wrapper.command = "my-codex-wrapper".into();
+        assert_ne!(
+            refused_cause(wrapper),
+            ManagedResumeCause::CodexConversationUnverified
+        );
+
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            let preferences = &super::super::execution::CODEX_MANAGED_PREFERENCES_PRESENT;
+            preferences.with(|present| present.set(true));
+            let cause = refused_cause(instance(local));
+            preferences.with(|present| present.set(false));
+            assert_eq!(cause, ManagedResumeCause::CodexConversationUnverified);
+        }
+
+        // An unpinned launch would not read a declared store.
+        let path = crate::session::config::profile_config::get_profile_config_path(
+            &admitted.effective_profile(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("[session.agent_config_dir]\ncodex = {store:?}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            refused_cause(instance(local)),
+            ManagedResumeCause::CodexConversationUnverified
+        );
+    }
+
     /// After `--` the flag would be a second positional, not the option.
     #[test]
     #[serial_test::serial]
@@ -3433,6 +3933,7 @@ mod tests {
             Some(execution.agent),
             &codex,
             Some(&execution),
+            None,
         );
         let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();
@@ -3446,6 +3947,7 @@ mod tests {
             Some(execution.agent),
             &codex,
             Some(&execution),
+            None,
         );
         let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();

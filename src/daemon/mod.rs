@@ -185,6 +185,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
+        Some(ApiErrorCode::AccountSwapUnavailable) => "Account swap refused, nothing changed. The target must be another account (a tool with its own `agent_config_dir`) of the same agent, the session needs a recorded Claude conversation and a launch that can carry it, and a terminal session needs `auto_resume_on_restart` on for the target profile".into(),
         Some(ApiErrorCode::LifecycleLocked) => {
             "Session is busy with another operation; nothing changed, retry when it finishes".into()
         }

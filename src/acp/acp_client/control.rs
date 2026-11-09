@@ -7,7 +7,7 @@ use agent_client_protocol::v1::schema::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -40,6 +40,10 @@ pub(super) struct DaemonControlClient {
     sessions_established: AtomicU64,
     sessions_replayed: watch::Sender<u64>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
+    /// Released waiters whose `PromptStarted` has not arrived. The runner
+    /// starts prompts in order, so the next that many starts belong to them.
+    /// Only touched under the `completion` lock.
+    abandoned_starts: Arc<AtomicUsize>,
     /// A matched local outcome held until the crate reaches its
     /// [`PromptCompletedMarker`], or until one of the reader's relays fails.
     settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
@@ -230,6 +234,19 @@ impl DaemonControlClient {
         }
     }
 
+    /// Drop a local waiter the daemon abandons before the runner completes the
+    /// turn, so the next local prompt is not refused as a duplicate. The
+    /// runner's late `PromptCompleted` for the abandoned id is then ignored.
+    pub(super) fn release_local_prompt(&self) {
+        let mut completion = self.completion.lock().expect("completion mutex poisoned");
+        if let PromptCompletion::Pending { prompt_req_id, .. } = &*completion {
+            if prompt_req_id.is_none() {
+                self.abandoned_starts.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            *completion = PromptCompletion::LocalIdle;
+        }
+    }
+
     /// Registers the completion waiter before sending the `Prompt` frame.
     pub(super) async fn prompt(
         &self,
@@ -353,6 +370,8 @@ pub(super) async fn connect_runner_control_v3(
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
     let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
     let reader_completion = completion.clone();
+    let abandoned_starts = Arc::new(AtomicUsize::new(0));
+    let reader_abandoned_starts = abandoned_starts.clone();
     let settled = Arc::new(std::sync::Mutex::new(None));
     let reader_settled = settled.clone();
     let reader_session = session_label.clone();
@@ -379,7 +398,10 @@ pub(super) async fn connect_runner_control_v3(
                 }
                 Ok(Some((ControlBody::PromptStarted { prompt_req_id }, _))) => {
                     let mut completion = reader_completion.lock().expect("completion mutex poisoned");
-                    if let PromptCompletion::Pending { prompt_req_id: id @ None, .. } = &mut *completion {
+                    let abandoned = reader_abandoned_starts.load(AtomicOrdering::Relaxed);
+                    if abandoned > 0 {
+                        reader_abandoned_starts.store(abandoned - 1, AtomicOrdering::Relaxed);
+                    } else if let PromptCompletion::Pending { prompt_req_id: id @ None, .. } = &mut *completion {
                         *id = Some(prompt_req_id);
                     }
                 }
@@ -684,6 +706,7 @@ pub(super) async fn connect_runner_control_v3(
             sessions_established: AtomicU64::new(0),
             sessions_replayed: watch::Sender::new(0),
             completion,
+            abandoned_starts,
             settled,
             raw_fd,
         }),
@@ -1011,6 +1034,54 @@ mod tests {
         peer.completed(9, "cancelled").await;
         peer.drain().await;
         assert_eq!(completion.await.unwrap(), end("cancelled"));
+        peer.assert_local_terminal_ownership();
+    }
+
+    #[tokio::test]
+    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
+        let mut peer = PromptControlPeer::new().await;
+        let abandoned = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
+            .await;
+        peer.drain().await;
+        peer.client.release_local_prompt();
+        assert!(abandoned.await.is_err(), "released waiter aborts");
+
+        let mut next = peer.prompt().await;
+        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
+            .await;
+        // The abandoned turn's completion must not resolve the new waiter.
+        peer.completed(5, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        peer.completed(6, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(next.await.unwrap(), end("end_turn"));
+        peer.assert_local_terminal_ownership();
+    }
+
+    #[tokio::test]
+    async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
+        let mut peer = PromptControlPeer::new().await;
+        let abandoned = peer.prompt().await;
+        // Released before its PromptStarted arrived.
+        peer.client.release_local_prompt();
+        assert!(abandoned.await.is_err(), "released waiter aborts");
+
+        let mut next = peer.prompt().await;
+        // The abandoned prompt's delayed start must not bind the next waiter.
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
+            .await;
+        peer.completed(5, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
+            .await;
+        peer.completed(6, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(next.await.unwrap(), end("end_turn"));
         peer.assert_local_terminal_ownership();
     }
 

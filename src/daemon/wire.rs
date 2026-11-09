@@ -400,6 +400,9 @@ pub struct RestartSessionBody {
     /// Refuse, under the lifecycle locks, a session that is no longer Idle.
     #[serde(default)]
     pub only_if_idle: bool,
+    /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_account_carry: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

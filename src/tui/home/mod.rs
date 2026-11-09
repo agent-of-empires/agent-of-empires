@@ -437,6 +437,7 @@ pub struct HomeView {
 
     pub(super) preview_timings: PreviewTimings,
     pub(super) preview_scroll_offset: u16,
+    pub(super) preview_explicit_tail: bool,
     pub(super) preview_area: Rect,
     /// Output sub-rect of `preview_area` (minus the info header); tmux panes are sized to it.
     pub(super) preview_pane_area: Rect,
@@ -501,6 +502,7 @@ pub struct HomeView {
     pub(super) preview_autoscroll_at: Option<std::time::Instant>,
 
     pub(super) preview_selection: Option<PreviewSelection>,
+    pub(super) preview_click_seed: Option<u16>,
 
     /// Copy text is read from the next frame's buffer; after `draw` returns the buffers are swapped.
     pub(super) preview_copy_pending: bool,
@@ -511,6 +513,9 @@ pub struct HomeView {
 
     /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
     pub(super) split_terminal: bool,
+    pub(super) split_terminal_height_percent: u16,
+    pub(super) split_terminal_min_width: u16,
+    pub(super) split_terminal_min_height: u16,
     /// Captures whichever split half is not focused; the focused half uses
     /// `preview_capture_worker` like a single preview.
     pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,

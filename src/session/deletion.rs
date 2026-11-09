@@ -6660,7 +6660,8 @@ mod tests {
             let (_tmp, main_repo, worktree_path, instance) =
                 build_sandboxed_worktree("feature/dirty-no-force");
 
-            std::fs::write(worktree_path.join("uncommitted.log"), "important").unwrap();
+            std::fs::write(worktree_path.join("uncommitted.txt"), "important").unwrap();
+            assert!(crate::git::cleanup::dirty_worktree_message(&worktree_path).is_some());
 
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
@@ -6702,7 +6703,7 @@ mod tests {
                 err
             );
             assert!(
-                err.contains("uncommitted.log"),
+                err.contains("uncommitted.txt"),
                 "error should list the dirty path: {}",
                 err
             );
@@ -6711,7 +6712,7 @@ mod tests {
                 "worktree dir must survive a refused dirty delete"
             );
             assert!(
-                worktree_path.join("uncommitted.log").exists(),
+                worktree_path.join("uncommitted.txt").exists(),
                 "uncommitted user data must survive a refused dirty delete"
             );
             assert!(
