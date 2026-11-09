@@ -1,7 +1,8 @@
 //! Building the shell command a session launches with.
 
-use super::execution::UnpinnedCodexLaunch;
+use super::execution::{UnattestedCodexPolicy, UnpinnedCodexLaunch};
 use super::*;
+use crate::session::capture::CodexRolloutScanLimit;
 
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
@@ -31,6 +32,11 @@ pub(super) struct PreparedLaunch {
     /// Relocated and store-adopted conversations require durable confirmation.
     pub(super) require_conversation_publication: bool,
 }
+
+type LaunchRouting = (
+    Option<super::execution::NativeExecution>,
+    Option<UnpinnedCodexLaunch>,
+);
 
 fn prepared_fork_mints_child(
     agent: Option<&'static crate::agents::AgentDef>,
@@ -828,20 +834,35 @@ impl Instance {
             .map(|(execution, _)| execution)
     }
 
-    /// The execution to pin, or for an unpinned launch the executable and
-    /// routing that keep it on the store its conversation was verified in.
-    fn resolve_launch_routing(
+    /// The unpinned routing a verified rollout admits despite `error`, if any.
+    fn verified_codex_resume_routing(
         &self,
-    ) -> Result<(
-        Option<super::execution::NativeExecution>,
-        Option<UnpinnedCodexLaunch>,
-    )> {
+        error: &anyhow::Error,
+        sid: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> Result<Option<LaunchRouting>, CodexRolloutScanLimit> {
+        if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding)? {
+            return Ok(Some((None, Some(store.clone()))));
+        }
+        Ok(self
+            .sandboxed_codex_resume_admitted(error, sid, binding)?
+            .then_some((None, None)))
+    }
+
+    /// The execution to pin, or for an unpinned launch the executable and
+    /// routing that keep it on the store its conversation was verified in. An
+    /// admitted sandbox has neither: its container already routes to its store.
+    fn resolve_launch_routing(&self) -> Result<LaunchRouting> {
         let target = self.conversation_target();
-        let resolved = self.resolve_native_execution(target);
+        let mut resolved = self.resolve_native_execution(target);
         if let (Err(error), Some((sid, binding, false))) = (&resolved, target) {
-            if let Some(store) = Self::unpinned_codex_resume_store(error, sid, binding) {
-                tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
-                return Ok((None, Some(store.clone())));
+            match self.verified_codex_resume_routing(error, sid, binding) {
+                Ok(Some(routing)) => {
+                    tracing::info!(target: "session.store", error = %error, "resuming a verified Codex rollout without a pinned execution");
+                    return Ok(routing);
+                }
+                Ok(None) => {}
+                Err(limit) => resolved = Err(UnattestedCodexPolicy::from(limit).into()),
             }
         }
         let execution = match (resolved, target) {
@@ -3452,6 +3473,175 @@ mod tests {
             1,
             "the profile selects a newer install: {command}"
         );
+    }
+
+    /// Sandboxes share the host fallback only through their private store.
+    #[test]
+    #[serial_test::serial]
+    fn default_sandboxed_codex_resume_requires_a_verified_private_store() {
+        use super::super::test_helpers::{
+            admit_sandbox_fixture, install_container_transport, test_sandbox,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("codex", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("codex-5477", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/codex"),
+        )
+        .unwrap();
+        let store = inst.sandbox_capture_store_dir().unwrap();
+        std::fs::write(
+            store.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let day = store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = |sid: &str, cwd: &str| {
+            std::fs::write(
+                day.join(format!("rollout-2026-11-08T12-00-00-{sid}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\",\"cwd\":\"{cwd}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let local = "01a1bbfe-4006-73e2-849e-139baf24402c";
+        let foreign = "01a1bbfe-4006-73e2-849e-139baf24402d";
+        let unknown = "01a1bbfe-4006-73e2-849e-139baf24402e";
+        rollout(local, "/workspace/project");
+        rollout(foreign, "/workspace/other");
+        let with_sid = |sid: &str| {
+            let mut inst = inst.clone();
+            inst.agent_session_id = Some(sid.into());
+            inst
+        };
+
+        let mut admitted = with_sid(local);
+        assert!(admitted.resolve_launch_execution().unwrap().is_none());
+        admitted.preflight_resume_launch().unwrap();
+        let prepared = admitted
+            .prepare_launch_command(admitted.conversation_state())
+            .unwrap();
+        assert!(prepared.is_existing);
+        let command = prepared.command.unwrap();
+        assert!(command.contains(&format!("resume {local}")), "{command}");
+
+        let binding = |session_id: &str, agent: &str, stores: Vec<PathBuf>| {
+            let mut binding = ConversationBinding::unknown(session_id);
+            binding.execution = Some(crate::session::ExecutionBinding {
+                agent: agent.into(),
+                stores,
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: "/workspace/project".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            });
+            binding
+        };
+        let private = store.canonicalize().unwrap();
+        let mut bound = with_sid(local);
+        bound.agent_session_binding = Some(binding(local, "codex", vec![private.clone()]));
+        assert!(bound.resolve_launch_execution().unwrap().is_none());
+
+        let refused = |inst: Instance| {
+            let error = inst.resolve_launch_execution().err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+                ManagedResumeCause::CodexConversationUnverified,
+                "{error:#}"
+            );
+        };
+        refused(with_sid(foreign));
+        refused(with_sid(unknown));
+        let mut elsewhere = with_sid(local);
+        elsewhere.agent_session_binding =
+            Some(binding(local, "codex", vec![temp.path().join("shared")]));
+        refused(elsewhere);
+        let mut other_agent = with_sid(local);
+        other_agent.agent_session_binding = Some(binding(local, "claude", vec![private]));
+        refused(other_agent);
+        let mut legacy = with_sid(local);
+        legacy.sandbox_store_generation = 1;
+        assert!(legacy.sandbox_capture_store_dir().is_none());
+        refused(legacy);
+        // A resolved home outside the private store refuses, though the rollout is there.
+        let routed_home = project.join(".codex");
+        std::fs::create_dir_all(&routed_home).unwrap();
+        std::fs::copy(store.join("auth.json"), routed_home.join("auth.json")).unwrap();
+        let mut routed = with_sid(local);
+        routed.sandbox_info.as_mut().unwrap().extra_env =
+            Some(vec!["CODEX_HOME=/workspace/project/.codex".into()]);
+        refused(routed);
+        // An explicit target stays on the attested path.
+        let mut explicit = inst.clone();
+        explicit.resume_intent = ResumeIntent::Use(local.into());
+        assert!(explicit.resolve_launch_execution().is_err());
+
+        let limited = crate::session::capture::with_codex_admission_scan_limit(2, || {
+            with_sid(local).resolve_launch_execution().err().unwrap()
+        });
+        let chain = format!("{limited:#}");
+        assert_eq!(
+            limited.downcast_ref::<ManagedResumeRefused>().unwrap().0,
+            ManagedResumeCause::CodexConversationUnverified,
+            "{chain}"
+        );
+        assert!(chain.contains("more than 2 entries"), "{chain}");
+        assert!(!chain.contains("ChatGPT"), "{chain}");
+
+        // A declared store is still a private child; a wrapper may not resume at all.
+        let declared_dir = temp.path().join("declared");
+        let profile = "codex-5477-declared";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "[session.agent_execution_as]\nmy-codex-wrapper = \"codex\"\n\
+                 [session.agent_config_dir]\ncodex = {dir:?}\nmy-codex-wrapper = {dir:?}\n",
+                dir = declared_dir.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut declared = with_sid(local);
+        declared.source_profile = profile.into();
+        admit_sandbox_fixture(&declared);
+        let config = declared.build_container_config_for_test().unwrap();
+        let _declared_transport =
+            install_container_transport(temp.path(), "codex-5477", &config.volumes);
+        let declared_store = declared.sandbox_capture_store_dir().unwrap();
+        assert!(declared_store.starts_with(&declared_dir));
+        let declared_day = declared_store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&declared_day).unwrap();
+        std::fs::copy(store.join("auth.json"), declared_store.join("auth.json")).unwrap();
+        let name = format!("rollout-2026-11-08T12-00-00-{local}.jsonl");
+        std::fs::copy(day.join(&name), declared_day.join(&name)).unwrap();
+        assert!(declared.resolve_launch_execution().unwrap().is_none());
+
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/my-codex-wrapper"),
+        )
+        .unwrap();
+        let mut wrapped = declared.clone();
+        wrapped.tool = "my-codex-wrapper".into();
+        wrapped.command = "my-codex-wrapper".into();
+        refused(wrapped.clone());
+        let conversation = wrapped.conversation_state();
+        assert!(wrapped.prepare_launch_command(conversation).is_err());
+        assert_eq!(wrapped.agent_session_id.as_deref(), Some(local));
     }
 
     /// A ChatGPT login and a macOS host both hit the unreadable-policy refusal.
