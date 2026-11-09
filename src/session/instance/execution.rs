@@ -3083,7 +3083,7 @@ impl Instance {
         else {
             return Ok(command);
         };
-        let mut words = freeze_launch_words(&command, &execution.program)?;
+        let mut words = freeze_launch_words(&command, program)?;
         // A shared service may have opened a different database.
         if execution.is_some_and(|execution| execution.agent.name == "opencode") {
             match launch_context.generation() {
