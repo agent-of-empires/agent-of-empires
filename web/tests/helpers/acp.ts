@@ -1,17 +1,8 @@
 import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fakeAcpScriptPath, listSessions, seedSessionViaAoeAdd, type ServeHandle } from "./aoeServe";
 import type { ServeOptions } from "./liveTest";
-
-/** Write a one-line Claude transcript under `~/.claude/projects/<dir>/<sid>.jsonl`. */
-export function seedTranscript(home: string, projectDirName: string, sid: string, cwd: string, text: string) {
-  const dir = join(home, ".claude", "projects", projectDirName);
-  mkdirSync(dir, { recursive: true });
-  mkdirSync(cwd, { recursive: true });
-  const line = JSON.stringify({ type: "user", cwd, message: { role: "user", content: [{ type: "text", text }] } });
-  writeFileSync(join(dir, `${sid}.jsonl`), `${line}\n`);
-}
 
 function debugLogPath(home: string): string | undefined {
   // Linux resolves the app dir under XDG_CONFIG_HOME; macOS/Windows under the legacy dot dir.

@@ -4350,8 +4350,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"],
-      "notes": "Also exercises public account-swap restart after a genuine held Native load. A selective real SQLite quota-breadcrumb failure must reject the operation without installing or replaying continuation/default wake input, preserve the captured Native peer/SID and original rows, and allow only the next explicit prompt; positive recovery is captured and attached by path."
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
       "id": "story.rate-limit-reset-across-turns",

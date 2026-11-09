@@ -2568,13 +2568,14 @@ pub(super) async fn discard_stale_continuation(
 /// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
 /// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
 /// disarms the auto-resume budget exactly once.
+/// A failed durable breadcrumb aborts the restart rather than authorizing its default wake.
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     explicit_wake: bool,
-) -> bool {
+) -> anyhow::Result<bool> {
     let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
@@ -2583,18 +2584,18 @@ pub(super) async fn continue_interrupted_prompt(
             && row.ensure_startable().is_ok()
     });
     if !current {
-        return false;
+        return Ok(false);
     }
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resets_at, true);
+        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     if explicit_wake {
         // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
         // now newer work may have been installed, and it must survive.
         drop(submission);
-        return false;
+        return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
     let pending_before = state
@@ -2605,12 +2606,13 @@ pub(super) async fn continue_interrupted_prompt(
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
     let outcome =
-        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission).await;
-    pending_before
+        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission)
+            .await;
+    Ok(pending_before
         || matches!(
             outcome,
             ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
-        )
+        ))
 }
 
 async fn finish_structured_restart(
@@ -2753,7 +2755,7 @@ async fn finish_structured_restart(
         .await?;
         let continued = match resumes_rate_limit {
             Some(resets_at) => {
-                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
+                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await?
             }
             None => false,
         };
