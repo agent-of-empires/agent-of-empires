@@ -1574,6 +1574,14 @@
       ]
     },
     {
+      "id": "acp.explicit-start-after-stop",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-worker-api.spec.ts"],
+      "components": ["src/server/api/sessions/lifecycle.rs", "src/server/acp_reconciler/mod.rs"],
+      "notes": "Explicit start after a daemon restart resumes a deliberately stopped structured worker without a queued prompt."
+    },
+    {
       "id": "acp.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",
