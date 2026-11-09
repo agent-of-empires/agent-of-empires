@@ -181,7 +181,7 @@ export function useAcpSession(
     [sessionId, requireNativeInput],
   );
 
-  // Throws on failure so the card re-enables and the same nonce can be resubmitted.
+
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;
