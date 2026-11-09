@@ -1115,7 +1115,7 @@ mod tests {
     #[serial_test::serial]
     fn prime_stop_flushes_the_owned_root_before_disposal_and_retains_failed_publication_evidence() {
         use std::os::unix::fs::PermissionsExt;
-        for conflict in [false, true] {
+        for (conflict, with_witness) in [(false, false), (false, true), (true, false), (true, true)] {
             let temp = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
             let project = temp.path().join("project");
@@ -1214,6 +1214,22 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            if with_witness {
+                let _lifecycle = storage.acquire_instance_lifecycle_lock(&instance.id).unwrap();
+                let mut selection = instance.native_preparation_selection().unwrap();
+                let original_selection = selection;
+                instance.stop_and_flush_poller_lifecycle_locked(&storage, Some(&mut selection)).unwrap();
+                let durable = storage.load().unwrap().remove(0);
+                if conflict {
+                    assert_eq!(selection, original_selection, "a refused CAS cannot advance admission");
+                } else {
+                    assert_ne!(selection, original_selection);
+                    assert_eq!(selection, durable.native_preparation_selection().unwrap());
+                    assert_eq!(selection, instance.native_preparation_selection().unwrap());
+                }
+                assert!(runtime.directory.exists(), "final capture does not dispose the Native route");
+                assert!(!at_shutdown.exists(), "capture is not Native shutdown authority");
+            }
             let result = instance.stop();
             if conflict {
                 assert!(result.is_err());
