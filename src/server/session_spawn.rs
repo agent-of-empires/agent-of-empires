@@ -701,18 +701,18 @@ pub(crate) async fn spawn_structured_session(
                         revival: start_admission
                             .as_ref()
                             .and_then(|admission| admission.revival_target()),
+                        start_admission,
                         title_lock,
                         lifecycle_lock,
                     },
                 )
-                .map(|reservation| (reservation, start_admission))
             })();
             drop(guard);
             drop(submission);
             drop(namespace);
             reservation
         };
-        let (launch_reservation, start_admission) = match launch_reservation {
+        let launch_reservation = match launch_reservation {
             Ok(reservation) => reservation,
             Err(error) => {
                 if error.is::<crate::session::LaunchIndeterminateCause>() {
@@ -772,7 +772,6 @@ pub(crate) async fn spawn_structured_session(
                         resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
                         restart: false,
                         conversation_carry: None,
-                        start_admission,
                     },
                     launch_reservation,
                     Ok(()),

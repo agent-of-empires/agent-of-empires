@@ -1699,180 +1699,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn applied_but_unconfirmed_publication_preserves_the_owned_birth() -> Result<()> {
-        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
-            crate::process::exec_frozen_environment()?;
-            return Ok(());
-        }
-        if !crate::tmux::test_helpers::tmux_available() {
-            return Ok(());
-        }
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-        struct CommitThenFail<'a> {
-            inner: &'a crate::session::Storage,
-            armed: Arc<AtomicBool>,
-        }
-        impl crate::session::SessionStore for CommitThenFail<'_> {
-            fn storage(&self) -> &crate::session::Storage {
-                self.inner
-            }
-            fn load(&self) -> Result<Vec<Instance>> {
-                crate::session::SessionStore::load(self.inner)
-            }
-            fn check_available(&self) -> Result<()> {
-                crate::session::SessionStore::check_available(self.inner)
-            }
-            fn configuration(
-                &self,
-                profile: Option<&str>,
-            ) -> Result<crate::session::config::Config> {
-                crate::session::SessionStore::configuration(self.inner, profile)
-            }
-            fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
-                crate::session::SessionStore::commit(self.inner, mutation)?;
-                if self.armed.swap(false, Ordering::SeqCst) {
-                    return Err(crate::session::SessionCommitApplied.into());
-                }
-                Ok(())
-            }
-            fn managed_capture_store_is_exclusive(
-                &self,
-                current: &Instance,
-                backend: crate::agents::SessionCaptureBackend,
-                current_store: &std::path::Path,
-            ) -> Result<bool> {
-                crate::session::SessionStore::managed_capture_store_is_exclusive(
-                    self.inner,
-                    current,
-                    backend,
-                    current_store,
-                )
-            }
-            fn commit_sandbox_checkpoint(
-                &self,
-                checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<
-                    '_,
-                >,
-            ) -> Result<()> {
-                crate::session::SessionStore::commit_sandbox_checkpoint(self.inner, checkpoint)
-            }
-            fn migrate_sandbox_store(
-                &self,
-                id: &str,
-                runtime: &crate::containers::ContainerRuntime,
-            ) -> Result<()> {
-                crate::session::SessionStore::migrate_sandbox_store(self.inner, id, runtime)
-            }
-        }
-        let root = tempfile::tempdir()?;
-        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
-        crate::session::config::update_app_state(|state| {
-            state.has_acknowledged_agent_hooks = true
-        })?;
-        crate::session::config::update_config(|config| {
-            config.systemd.enabled = false;
-            config.session.agent_status_hooks = false;
-            config.session.smart_rename = false;
-        })?;
-        let ready = root.path().join("native-ready");
-        let script = format!(
-            "printf READY > {}; exec sleep 60",
-            crate::session::environment::shell_escape_script_word(&ready.to_string_lossy()),
-        );
-        let mut instance = Instance::new("uncertain publication", root.path().to_str().unwrap());
-        instance.source_profile = "uncertain-publication".into();
-        instance.tool = "bash".into();
-        instance.command = format!(
-            "/bin/sh -c {}",
-            crate::session::environment::shell_escape_script_word(&script)
-        );
-        instance.resume_intent = ResumeIntent::Cleared;
-        let storage = crate::session::Storage::new_unwatched(&instance.source_profile)?;
-        storage.update(|rows, _| {
-            rows.push(instance.clone());
-            Ok(())
-        })?;
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
-            crate::tmux::Session::generate_name(&instance.id, &instance.title),
-        );
-        let _helper = frozen_test_helper(
-            root.path(),
-            concat!(
-                module_path!(),
-                "::applied_but_unconfirmed_publication_preserves_the_owned_birth",
-            ),
-        );
-        let title = crate::session::acquire_session_title_lock(&instance.id)?;
-        let lifecycle = storage.acquire_instance_lifecycle_lock(&instance.id)?;
-        let generation = instance.acquire_lifecycle_reservation(
-            &storage,
-            LifecycleOperation::Launch,
-            Some(Status::Starting),
-        )?;
-        let mut prepared = instance.prepare_launch_command_in(
-            CaptureStorage::Scoped(&storage),
-            instance.conversation_state(),
-        )?;
-        prepared.require_conversation_publication = true;
-        let armed = Arc::new(AtomicBool::new(false));
-        let arm = armed.clone();
-        let _observer =
-            test_support::FinalizeObserver::install(instance.id.clone(), move |_, phase| {
-                if matches!(phase, test_support::FinalizePhase::Before) {
-                    arm.store(true, Ordering::SeqCst);
-                }
-            });
-        let store = CommitThenFail {
-            inner: &storage,
-            armed,
-        };
-        let error = instance
-            .spawn_prepared_launch(None, &store, prepared)
-            .err()
-            .expect("applied commit error must remain unconfirmed");
-        assert_eq!(
-            error.downcast_ref::<LaunchPublicationFailure>(),
-            Some(&LaunchPublicationFailure::Unconfirmed)
-        );
-        assert!(
-            !store.armed.load(Ordering::SeqCst),
-            "post-commit fault must have fired"
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() {
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "native birth did not acknowledge startup"
-            );
-            std::thread::yield_now();
-        }
-        let (physical, state, _) = crate::tmux::utils::observe_pane(
-            instance.agent_pane.tmux_session.as_deref().unwrap(),
-            &crate::tmux::TmuxCommandDeadline::new(),
-        )?
-        .expect("uncertain publication must retain its owned native birth");
-        assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
-        assert_eq!(instance.agent_pane.physical.as_deref(), Some(&physical));
-        let durable = storage.load_instances_complete()?.remove(0);
-        assert_eq!(durable.resume_intent, ResumeIntent::Default);
-        assert!(durable.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation));
-        instance.commit_lifecycle_status(
-            &storage,
-            LifecycleOperation::Launch,
-            generation,
-            Status::Error,
-        )?;
-        drop(lifecycle);
-        drop(title);
-        instance.kill_clean_in(&storage)?;
-        Ok(())
-    }
 
     #[cfg(unix)]
     #[test]
@@ -2065,14 +1891,75 @@ mod tests {
             return;
         }
         use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct CommitThenFail<'a> {
+            inner: &'a crate::session::Storage,
+            armed: Arc<AtomicBool>,
+        }
+        impl crate::session::SessionStore for CommitThenFail<'_> {
+            fn storage(&self) -> &crate::session::Storage {
+                self.inner
+            }
+            fn load(&self) -> Result<Vec<Instance>> {
+                crate::session::SessionStore::load(self.inner)
+            }
+            fn check_available(&self) -> Result<()> {
+                crate::session::SessionStore::check_available(self.inner)
+            }
+            fn configuration(
+                &self,
+                profile: Option<&str>,
+            ) -> Result<crate::session::config::Config> {
+                crate::session::SessionStore::configuration(self.inner, profile)
+            }
+            fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
+                crate::session::SessionStore::commit(self.inner, mutation)?;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    return Err(crate::session::SessionCommitApplied.into());
+                }
+                Ok(())
+            }
+            fn managed_capture_store_is_exclusive(
+                &self,
+                current: &Instance,
+                backend: crate::agents::SessionCaptureBackend,
+                current_store: &std::path::Path,
+            ) -> Result<bool> {
+                crate::session::SessionStore::managed_capture_store_is_exclusive(
+                    self.inner,
+                    current,
+                    backend,
+                    current_store,
+                )
+            }
+            fn commit_sandbox_checkpoint(
+                &self,
+                checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<
+                    '_,
+                >,
+            ) -> Result<()> {
+                crate::session::SessionStore::commit_sandbox_checkpoint(self.inner, checkpoint)
+            }
+            fn migrate_sandbox_store(
+                &self,
+                id: &str,
+                runtime: &crate::containers::ContainerRuntime,
+            ) -> Result<()> {
+                crate::session::SessionStore::migrate_sandbox_store(self.inner, id, runtime)
+            }
+        }
         const PARENT: &str = "ses_parent00000000000000000000000";
         const CHILD: &str = "ses_child000000000000000000000000";
         const SEED: &str = "ses_seed0000000000000000000000000";
-        for (fail_adoption, fail_final, peer_pin) in [
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
+        for (fail_adoption, fail_final, peer_pin, commit_applied) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
         ] {
             let logs = crate::session::test_support::LogCapture::start();
             let directory = tempfile::tempdir().unwrap();
@@ -2143,7 +2030,13 @@ else:
                 format!("FORK_RECORD={}", record.display()),
                 format!("FORK_COUNT={}", forks.display()),
             ];
-            std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
+            std::fs::write(&config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
+            let hook_log = directory.path().join("launch-hooks");
+            let hook = format!("/bin/sh -c {}", crate::session::environment::shell_escape_script_word(
+                &format!("printf 'hook\\n' >> {}", crate::session::environment::shell_escape_script_word(&hook_log.to_string_lossy()))));
+            use std::io::Write;
+            writeln!(std::fs::OpenOptions::new().append(true).open(&config).unwrap(),
+                "\n[hooks]\non_launch={}", serde_json::to_string(&[hook]).unwrap()).unwrap();
             let mut instance = tool_instance("opencode", project.to_str().unwrap());
             instance.source_profile = profile.into();
             let parent = instance.asserted_resume_binding(PARENT, None).unwrap();
@@ -2168,6 +2061,8 @@ else:
             let expected_parent = parent.clone();
             let invocations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let captured_invocations = invocations.clone();
+            let applied_fault = Arc::new(AtomicBool::new(false));
+            let arm = applied_fault.clone();
             let observer = test_support::FinalizeObserver::install(
                 instance.id.clone(),
                 move |instance, phase| {
@@ -2203,6 +2098,9 @@ else:
                         .unwrap();
                     assert!(census.status.success(), "{census:?}");
                     let first = captured_invocations.borrow().is_empty();
+                    if commit_applied && first {
+                        arm.store(true, Ordering::SeqCst);
+                    }
                     captured_invocations
                         .borrow_mut()
                         .push(String::from_utf8(census.stdout).unwrap());
@@ -2272,7 +2170,18 @@ else:
                 fail_adoption,
                 fail_final,
             );
-            let result = if fail_adoption {
+            let result = if commit_applied {
+                let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+                let store = CommitThenFail { inner: &storage, armed: applied_fault.clone() };
+                let outcome = instance.orchestrate_resume_launch_in(
+                    &store, None, false, false,
+                    resume::ResumeLaunchOptions { resume_policy: resume::ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
+                ).map(|_| ());
+                assert!(!applied_fault.load(Ordering::SeqCst), "real post-commit fault must fire");
+                assert_eq!(outcome.as_ref().unwrap_err().downcast_ref::<LaunchPublicationFailure>(),
+                    Some(&LaunchPublicationFailure::Unconfirmed));
+                outcome
+            } else if fail_adoption {
                 instance.restart_with_size_opts(None, false).map(|_| ())
             } else {
                 instance.start_with_size_opts(None, false).map(|_| ())
@@ -2282,11 +2191,14 @@ else:
                 "case ({fail_adoption}, {fail_final}, {peer_pin}): {result:?}\n{}",
                 logs.contents()
             );
-            assert_eq!(result.is_ok(), !fail_final && !peer_pin, "{result:?}");
+            assert_eq!(result.is_ok(), !fail_final && !peer_pin && !commit_applied, "{result:?}");
             let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let disk = storage.load().unwrap().remove(0);
-            if fail_final || peer_pin {
-                if peer_pin {
+            // These fixture writes applied the desired child before confirmation failed.
+            // Never derive the preservation expectation from the caller's result.
+            let unconfirmed = commit_applied || (fail_final && !fail_adoption);
+            if fail_final || peer_pin || commit_applied {
+                if peer_pin || unconfirmed {
                     assert_eq!(invocations.borrow().len(), 1, "{:?}", invocations.borrow());
                     let (pane, native_pid, native_birth, generation) =
                         physical.borrow_mut().take().unwrap();
@@ -2313,8 +2225,14 @@ else:
                         crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
                     );
                     assert_eq!(disk.lifecycle_generation, generation);
-                    assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
-                    assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
+                    if peer_pin {
+                        assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
+                        assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
+                    } else {
+                        assert_eq!(disk.agent_session_binding.as_ref().unwrap().session_id, CHILD);
+                        assert_eq!(disk.agent_session_id.as_deref(), Some(CHILD));
+                        assert_eq!(disk.resume_intent, ResumeIntent::Default);
+                    }
                     assert!(!record.with_extension("json.input").exists());
                     let births = || {
                         std::fs::read_to_string(record.with_extension("json.births"))
@@ -2356,6 +2274,27 @@ else:
                         initial_births,
                         "retry must not invoke another native agent"
                     );
+                    if commit_applied {
+                        assert_eq!(std::fs::read_to_string(&hook_log).unwrap(), "hook\n");
+                        std::fs::remove_file(&record).unwrap();
+                        std::fs::remove_file(record.with_extension("json.pid")).unwrap();
+                        let restarted = instance.orchestrate_resume_launch_in(
+                            &storage, None, false, false,
+                            resume::ResumeLaunchOptions { resume_policy: resume::ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
+                        ).unwrap();
+                        assert_eq!(restarted, StartOutcome::Resumed);
+                        assert!(!crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                        let new_births = births();
+                        assert_eq!(new_births.len(), 2, "{new_births:?}");
+                        let new_pid = u32::try_from(new_births[1]["pid"].as_u64().unwrap()).unwrap();
+                        let new_birth = crate::process::process_birth_identity(new_pid).unwrap().unwrap();
+                        assert!(crate::process::process_birth_is_live(new_pid, &new_birth).unwrap());
+                        let after_restart = storage.load().unwrap().remove(0);
+                        assert_eq!(after_restart.lifecycle_generation, generation + 1);
+                        assert_eq!(after_restart.agent_session_id.as_deref(), Some(CHILD));
+                        assert_eq!(std::fs::read_to_string(&hook_log).unwrap(), "hook\nhook\n");
+                        assert!(!record.with_extension("json.input").exists());
+                    }
                 } else {
                     assert!(
                         !instance.tmux_session().unwrap().exists(),
@@ -2366,6 +2305,9 @@ else:
                 if peer_pin {
                     assert_eq!(disk.agent_session_id.as_deref(), Some(PARENT));
                     assert_eq!(disk.resume_intent, ResumeIntent::Use(PARENT.into()));
+                } else if unconfirmed {
+                    assert_eq!(disk.agent_session_id.as_deref(), Some(CHILD));
+                    assert_eq!(disk.resume_intent, ResumeIntent::Default);
                 } else if fail_adoption {
                     assert_eq!(disk.agent_session_id.as_deref(), Some(SEED));
                     assert_eq!(

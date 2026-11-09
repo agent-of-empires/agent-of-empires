@@ -35,6 +35,7 @@ impl Instance {
     pub(crate) fn flush_published_conversation(
         &self,
         storage: &dyn crate::session::SessionStore,
+        mut selection: Option<&mut [u8; 32]>,
     ) -> Option<SidWrite> {
         let observation = if self.prime_runtime().is_some() {
             match self.prime_root_publication(true)? {
@@ -49,24 +50,36 @@ impl Instance {
                         return None;
                     }
                     let expected = self.conversation_state();
-                    return Some(
-                        storage
-                            .update(|rows, _| {
-                                let Some(row) = rows.iter_mut().find(|row| row.id == self.id)
-                                else {
-                                    return Ok(SidWrite::Failed);
-                                };
-                                if !expected.matches(row) {
+                    let mut next_selection = None;
+                    let outcome = storage
+                        .update(|rows, _| {
+                            let Some(row) = rows.iter_mut().find(|row| row.id == self.id) else {
+                                return Ok(SidWrite::Failed);
+                            };
+                            if let Some(expected) = selection.as_deref() {
+                                if row.native_preparation_selection()? != *expected {
                                     return Ok(SidWrite::Skipped);
                                 }
-                                if !row.resume_intent.is_default() {
-                                    return Ok(SidWrite::PinnedForeign);
-                                }
-                                row.set_agent_conversation(None, None, None);
-                                Ok(SidWrite::Applied)
-                            })
-                            .unwrap_or(SidWrite::Failed),
-                    );
+                            }
+                            if !expected.matches(row) {
+                                return Ok(SidWrite::Skipped);
+                            }
+                            if !row.resume_intent.is_default() {
+                                return Ok(SidWrite::PinnedForeign);
+                            }
+                            row.set_agent_conversation(None, None, None);
+                            if selection.is_some() {
+                                next_selection = Some(row.native_preparation_selection()?);
+                            }
+                            Ok(SidWrite::Applied)
+                        })
+                        .unwrap_or(SidWrite::Failed);
+                    if outcome == SidWrite::Applied {
+                        if let (Some(selection), Some(next)) = (selection, next_selection) {
+                            *selection = next;
+                        }
+                    }
+                    return Some(outcome);
                 }
             }
         } else {
@@ -75,12 +88,7 @@ impl Instance {
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
-        let outcome = super::sid_persist::persist_session_with_storage(
-            storage,
-            &self.id,
-            &observation,
-            &self.conversation_state(),
-        )
+        let outcome = super::sid_persist::persist_session_with_storage(storage, &self.id, &observation, &self.conversation_state(), selection.as_deref_mut())
         .outcome;
         if outcome != SidWrite::Skipped {
             return Some(outcome);
@@ -93,12 +101,7 @@ impl Instance {
             return Some(SidWrite::Failed);
         };
         Some(
-            super::sid_persist::persist_session_with_storage(
-                storage,
-                &self.id,
-                &observation,
-                &retry.conversation_state(),
-            )
+            super::sid_persist::persist_session_with_storage(storage, &self.id, &observation, &retry.conversation_state(), selection.as_deref_mut())
             .outcome,
         )
     }
@@ -593,7 +596,7 @@ impl Instance {
                 current.lifecycle_reservation_is_owned(LifecycleOperation::Stop, generation),
                 "Session changed during stop; resources retained"
             );
-            let flushed = current.flush_published_conversation(&storage);
+            let flushed = current.flush_published_conversation(&storage, None);
             if current.prime_runtime().is_some()
                 && matches!(flushed, Some(SidWrite::Failed | SidWrite::Skipped))
             {

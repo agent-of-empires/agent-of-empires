@@ -3402,6 +3402,7 @@ async fn prepare_agent_session_inner(
             crate::session::LaunchReservation {
                 generation: started.lifecycle_generation,
                 revival,
+                start_admission,
                 title_lock,
                 lifecycle_lock,
             },
@@ -3413,7 +3414,6 @@ async fn prepare_agent_session_inner(
                 started,
                 native,
                 (account_swap, conversation_carry),
-                start_admission,
             )),
             None,
         ))
@@ -3432,7 +3432,7 @@ async fn prepare_agent_session_inner(
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((reservation, mut started, native, conversation_carry, start_admission)))) => {
+        Ok(Ok(Some((reservation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
                 let generation = reservation.generation;
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
@@ -3452,7 +3452,6 @@ async fn prepare_agent_session_inner(
                     native,
                     hooks,
                     conversation_carry,
-                    start_admission,
                 )))
             })
             .await
@@ -3462,7 +3461,7 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((reservation, started, native, hooks, carry, _))))
+        Ok(Ok(Some((reservation, started, native, hooks, carry))))
             if started.is_structured() =>
         {
             return finish_structured_restart(
@@ -3498,7 +3497,6 @@ async fn prepare_agent_session_inner(
             native,
             hooks,
             conversation_carry,
-            start_admission,
         )))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
@@ -3514,7 +3512,6 @@ async fn prepare_agent_session_inner(
                         },
                         restart: preparation == AgentPreparation::Restart,
                         conversation_carry: conversation_carry.1,
-                        start_admission,
                     },
                     reservation,
                     hooks,

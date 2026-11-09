@@ -898,7 +898,7 @@ pub(crate) fn attach_planned(
     // commit. Flush it first so the durable recheck sees the row as it will
     // stand at the commit.
     if refreshed.moves_session {
-        match fresh.flush_published_conversation(storage) {
+        match fresh.flush_published_conversation(storage, None) {
             Some(crate::session::SidWrite::Applied) | None => {}
             // The flush read this row's own publication and the owner keeps the
             // sid, so the refusal is final: no publication of ours is waiting.
@@ -1077,12 +1077,7 @@ pub(crate) fn resume_after_conversion(
                         None,
                         false,
                         false,
-                        super::ResumeLaunchOptions {
-                            resume_policy: super::ResumeAttemptPolicy::HonorAutoResumeSetting,
-                            restart: true,
-                            conversation_carry: None,
-                            start_admission: None,
-                        },
+                        super::ResumeLaunchOptions { resume_policy: super::ResumeAttemptPolicy::HonorAutoResumeSetting, restart: true, conversation_carry: None },
                     )
                 };
                 match outcome {

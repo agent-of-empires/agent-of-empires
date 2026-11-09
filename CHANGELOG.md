@@ -6,6 +6,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Unreleased
 
+### Bug Fixes
+
+- **session:** Preserve live restarts and applied-but-unconfirmed launches. Accept a final Pi or Prime capture only when its own durable compare-and-set advances the admitted selection; retain concurrent pins and hook changes.
+
 ### Security
 
 - **sqlite:** Upgrade rusqlite to 0.41 so vendored builds use SQLite 3.54 or newer, fixing uninitialized-memory disclosure from crafted database/WAL pairs ([RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459)). Builds using system SQLite require a patched system library.

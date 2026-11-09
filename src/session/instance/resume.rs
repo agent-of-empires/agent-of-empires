@@ -142,6 +142,7 @@ pub(crate) enum ResumeAttemptPolicy {
 pub(crate) struct LaunchReservation {
     pub(crate) generation: u64,
     pub(crate) revival: Option<RevivalTarget>,
+    pub(crate) start_admission: Option<NativeStartAdmission>,
     pub(crate) title_lock: crate::session::storage::StorageFlock,
     pub(crate) lifecycle_lock: crate::session::storage::StorageFlock,
 }
@@ -155,6 +156,7 @@ pub(crate) struct RevivalTarget {
 pub(crate) struct PreparedLaunchReservation {
     pub(crate) generation: u64,
     pub(super) revival: Option<RevivalTarget>,
+    pub(crate) start_admission: Option<NativeStartAdmission>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -242,6 +244,18 @@ impl NativeStartAdmission {
         Ok(())
     }
 
+    fn verify_store_context(
+        &self,
+        instance: &Instance,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        self.verify_context(instance)?;
+        let row = storage.load()?.into_iter()
+            .find(|row| row.id == instance.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        self.verify_context(&row)
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let unchanged = match self.revival.as_ref() {
@@ -293,7 +307,6 @@ pub(crate) struct ResumeLaunchOptions {
     pub(crate) resume_policy: ResumeAttemptPolicy,
     pub(crate) restart: bool,
     pub(crate) conversation_carry: Option<ConversationCarry>,
-    pub(crate) start_admission: Option<NativeStartAdmission>,
 }
 
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
@@ -393,7 +406,6 @@ impl Instance {
                 resume_policy,
                 restart: true,
                 conversation_carry: None,
-                start_admission: None,
             },
         )
     }
@@ -418,7 +430,6 @@ impl Instance {
                 resume_policy: ResumeAttemptPolicy::HonorAutoResumeSetting,
                 restart: true,
                 conversation_carry,
-                start_admission: None,
             },
         )
     }
@@ -587,7 +598,6 @@ impl Instance {
                 resume_policy,
                 restart: false,
                 conversation_carry: None,
-                start_admission: None,
             },
         )
     }
@@ -638,17 +648,14 @@ impl Instance {
         }
         self.ensure_startable()?;
         let mut live_observed = false;
+        let mut start_admission = None;
         let captured = if options.restart {
             self.capture_revival_target()
         } else {
-            let admission = match options.start_admission.take() {
-                Some(admission) => Ok(Some(admission)),
-                None => self.admit_native_start(),
-            };
-            admission.map(|admission| match admission {
+            self.admit_native_start().map(|admission| match admission {
                 Some(admission) => {
                     let revival = admission.revival_target();
-                    options.start_admission = Some(admission);
+                    start_admission = Some(admission);
                     revival
                 }
                 None => {
@@ -666,10 +673,11 @@ impl Instance {
                 };
             }
         };
-        if live_observed
-            || revival
-                .as_ref()
-                .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Alive)
+        if !options.restart
+            && (live_observed
+                || revival
+                    .as_ref()
+                    .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Alive))
         {
             return Ok(match self.positive_pane_readiness() {
                 Ok(true) => StartOutcome::Fresh,
@@ -711,6 +719,7 @@ impl Instance {
             LaunchReservation {
                 generation,
                 revival,
+                start_admission,
                 title_lock,
                 lifecycle_lock,
             },
@@ -789,8 +798,8 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
-        self.stop_and_flush_poller_lifecycle_locked(storage)?;
-        self.capture_omp_before_restart(storage)
+        self.stop_and_flush_poller_lifecycle_locked(storage, None)?;
+        self.capture_omp_before_restart(storage, None)
     }
 
     pub(crate) fn discard_reserved_restart_container(
@@ -814,17 +823,32 @@ impl Instance {
         let LaunchReservation {
             generation,
             revival,
+            mut start_admission,
             title_lock,
             lifecycle_lock,
         } = reservation;
-        if restart || revival.is_some() {
-            let capture = self
-                .stop_and_flush_poller_lifecycle_locked(storage)
-                .and_then(|()| self.capture_omp_before_restart(storage));
-            if let Err(error) = capture {
-                self.fail_reserved_launch(storage, generation, &error, None, None);
-                return Err(error);
+        let captured = (|| -> Result<()> {
+            if let Some(admission) = start_admission.as_ref() {
+                admission.verify_store_context(self, storage)?;
             }
+            if restart || revival.is_some() {
+                self.stop_and_flush_poller_lifecycle_locked(
+                    storage,
+                    start_admission.as_mut().map(|admission| &mut admission.selection),
+                )?;
+                self.capture_omp_before_restart(
+                    storage,
+                    start_admission.as_mut().map(|admission| &mut admission.selection),
+                )?;
+            }
+            if let Some(admission) = start_admission.as_ref() {
+                admission.verify_store_context(self, storage)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = captured {
+            self.fail_reserved_launch(storage, generation, &error, None, None);
+            return Err(error);
         }
 
         drop(lifecycle_lock);
@@ -832,6 +856,7 @@ impl Instance {
         Ok(PreparedLaunchReservation {
             generation,
             revival,
+            start_admission,
         })
     }
 
@@ -874,6 +899,7 @@ impl Instance {
         let PreparedLaunchReservation {
             generation,
             revival,
+            start_admission,
         } = reservation;
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
@@ -881,7 +907,6 @@ impl Instance {
             resume_policy,
             restart,
             conversation_carry,
-            start_admission,
         } = options;
         if !restart || start_admission.is_some() {
             let admitted = start_admission
@@ -1382,6 +1407,124 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn first_pi_ensure_accepts_own_final_capture_but_not_a_hook_selection_change() -> Result<()> {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let python = which::which("python3")?;
+        let (_hooks, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir()?;
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.agent_status_hooks = false;
+        })?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        const BEFORE: &str = "22f13307-461c-4161-908e-95a247fac750";
+        const FINAL: &str = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        const FOREIGN: &str = "53c04d61-6476-4d29-a6aa-f4b254d2b0b4";
+        for (same_sid, foreign_hook) in [(true, false), (false, false), (false, true)] {
+            let label = format!("pi-first-ensure-{same_sid}-{foreign_hook}");
+            let argv = home.path().join(format!("{label}.argv"));
+            let pid_file = home.path().join(format!("{label}.pid"));
+            let input = home.path().join(format!("{label}.input"));
+            let hook_log = home.path().join(format!("{label}.hooks"));
+            let native = format!(
+                "#!{}\nimport json,os,sys\nif '--help' in sys.argv: print('--session --session-id --fork');sys.exit(0)\nif '--version' in sys.argv: print('0.59.1');sys.exit(0)\nopen({},'w').write(str(os.getpid()))\np={}\nopen(p+'.tmp','w').write(json.dumps(sys.argv[1:]))\nos.replace(p+'.tmp',p)\nwhile True:\n data=os.read(0,4096)\n if not data: break\n with open({},'ab') as log: log.write(data)\n",
+                python.display(), serde_json::to_string(&pid_file.to_string_lossy())?,
+                serde_json::to_string(&argv.to_string_lossy())?,
+                serde_json::to_string(&input.to_string_lossy())?,
+            );
+            let _path = crate::session::test_support::install_login_shell_path_command(
+                home.path(), "pi", &native,
+            );
+            let mut row = Instance::new(&label, home.path().to_str().unwrap());
+            row.source_profile = label.clone();
+            row.tool = "pi".into();
+            row.agent_session_id = Some(if same_sid { FINAL } else { BEFORE }.into());
+            let storage = crate::session::Storage::new_unwatched(&label)?;
+            storage.update(|rows, _| { rows.push(row.clone()); Ok(()) })?;
+            let transcript = crate::session::instance::test_helpers::publish_host_pi_transcript(
+                &row.id, FINAL, home.path(),
+            );
+            let sessions = crate::session::get_profile_dir(&label)?.join("sessions.json");
+            let hook_path = home.path().join(format!("{label}.hook.py"));
+            let mutation = if foreign_hook {
+                format!(
+                    "p={}\nrows=json.load(open(p))\nfor row in rows:\n if row['id']=={}:\n  row['resume_intent']=json.loads({})\n  row['resume_binding']=None\nopen(p+'.peer','w').write(json.dumps(rows))\nos.replace(p+'.peer',p)\n",
+                    serde_json::to_string(&sessions.to_string_lossy())?,
+                    serde_json::to_string(&row.id)?,
+                    serde_json::to_string(&serde_json::to_string(&ResumeIntent::Use(FOREIGN.into()))?)?,
+                )
+            } else { String::new() };
+            std::fs::write(&hook_path, format!(
+                "import json,os\nwith open({},'a') as log: log.write('hook\\n')\n{}",
+                serde_json::to_string(&hook_log.to_string_lossy())?, mutation,
+            ))?;
+            let hook = format!("{} {}",
+                crate::session::environment::shell_escape_script_word(&python.to_string_lossy()),
+                crate::session::environment::shell_escape_script_word(&hook_path.to_string_lossy()));
+            let config = crate::session::config::profile_config::get_profile_config_path(&label)?;
+            std::fs::write(config, format!("[hooks]\non_launch={}\n", serde_json::to_string(&[hook])?))?;
+            let name = row.tmux_session()?.name().to_owned();
+            let _pane = TmuxTestSession::from_name(&name);
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args(["-f","/dev/null","new-session","-d","-s",&name,"sleep 60"])
+                .output()?.status.success());
+            // Keep a real dead pane, not an absent name or prepared marker.
+            // remain-on-exit must be configured before the terminating command.
+            let pane = only_pane_id(&name);
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args(["set-option","-t",&name,"remain-on-exit","on"])
+                .output()?.status.success());
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args(["respawn-pane","-k","-t",&pane,"exit 17"])
+                .output()?.status.success());
+            wait_for_pane_dead(&pane);
+            let original = crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?.0;
+            let result = row.orchestrate_resume_launch_in(
+                &storage, None, false, false,
+                ResumeLaunchOptions { resume_policy: ResumeAttemptPolicy::Allow, restart: false, conversation_carry: None },
+            );
+            assert_eq!(std::fs::read_to_string(&hook_log)?, "hook\n");
+            let durable = storage.load_instances_complete()?.remove(0);
+            assert_eq!(durable.agent_session_id.as_deref(), Some(FINAL));
+            assert_eq!(durable.pi_session_path.as_deref(), transcript.to_str());
+            assert_eq!(durable.lifecycle_generation, 1);
+            if foreign_hook {
+                assert!(result.as_ref().is_err_and(|error| error.is::<LifecycleReservationError>()), "{result:?}");
+                assert_eq!(durable.resume_intent, ResumeIntent::Use(FOREIGN.into()));
+                assert!(!argv.exists() && !pid_file.exists() && !input.exists());
+                let retained = crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                assert_eq!(retained.0, original);
+                assert_eq!(retained.1, crate::tmux::utils::PaneProbe::Dead);
+            } else {
+                assert_eq!(result?, StartOutcome::Resumed);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !argv.exists() {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "actual Pi child has not published argv");
+                    std::thread::yield_now();
+                }
+                let args: Vec<String> = serde_json::from_slice(&std::fs::read(&argv)?)?;
+                assert!(args.windows(2).any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()));
+                let pid = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
+                let birth = crate::process::process_birth_identity(pid)?.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                assert!(crate::process::process_birth_is_live(pid, &birth)?);
+                assert!(!input.exists());
+                row.kill_clean_in(&storage)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_start_context_rejects_changed_selection_and_row_reuse() -> Result<()> {
         let original = Instance::new("preparation context", "/tmp/preparation-context");
@@ -1532,15 +1675,11 @@ mod tests {
             .finish_reserved_launch(
                 &storage,
                 None,
-                ResumeLaunchOptions {
-                    resume_policy: ResumeAttemptPolicy::Allow,
-                    restart: true,
-                    conversation_carry: None,
-                    start_admission: None,
-                },
+                ResumeLaunchOptions { resume_policy: ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
                 PreparedLaunchReservation {
                     generation,
                     revival: None,
+                    start_admission: None,
                 },
                 Ok(()),
             )
@@ -4814,6 +4953,7 @@ exec sleep 60
                         &row.id,
                         SID,
                         &metadata.launch_id,
+                        None,
                     )
                     .unwrap();
                     assert_eq!(

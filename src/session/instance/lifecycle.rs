@@ -774,6 +774,8 @@ impl Instance {
             !error.is::<super::kill::RuntimeRemovedCleanupFailed>()
                 && !error.is::<crate::session::NativeStoreUnavailable>()
                 && !error.is::<crate::session::SessionCommitApplied>()
+                && error.downcast_ref::<super::start::LaunchPublicationFailure>()
+                    != Some(&super::start::LaunchPublicationFailure::Unconfirmed)
                 && (probe.expected.matches_launch_observation(row)
                     || prior.is_some_and(|prior| prior.matches(row)))
         });
