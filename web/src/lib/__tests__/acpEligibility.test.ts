@@ -48,5 +48,10 @@ describe("acpAdapterMissing", () => {
     expect(structuredAvailable("claude", { acp_create_ready: false }, host)).toBe(false);
     expect(structuredAvailable("claude", { acp_create_ready: true }, host)).toBe(true);
     expect(structuredAvailable("aider", { acp_capable: false, acp_create_ready: true }, host)).toBe(false);
+    expect(structuredAvailable("claude", { acp_allowed: false, acp_create_ready: true }, host)).toBe(false);
+    expect(structuredAvailable("claude", { acp_create_ready: false }, { ...host, sandboxEnabled: true })).toBe(true);
+    expect(
+      structuredAvailable("claude", { acp_create_ready: false }, { ...host, commandOverride: "my-wrapper acp" }),
+    ).toBe(true);
   });
 });

@@ -790,11 +790,22 @@ export function SessionWizard({
         await handleSubmit({}, true);
         return;
       }
-      case "launch_without_sandbox":
+      case "launch_without_sandbox": {
+        const sent = state.data;
+        const agent = agents.find((a) => a.name === sent.tool);
         handleChange("sandboxEnabled", false);
+        // On the host a missing adapter turns Structured into Terminal, so show that rather than send it.
+        if (
+          sent.useStructuredView &&
+          structuredAvailable(sent.tool, agent, sent) &&
+          !structuredAvailable(sent.tool, agent, { ...sent, sandboxEnabled: false })
+        ) {
+          return;
+        }
         // A relaunch, not a retry: handleSubmit sends it under a new key.
         await handleSubmit({ sandboxEnabled: false });
         return;
+      }
       case "change_image":
         setPanel("sandbox");
         return;

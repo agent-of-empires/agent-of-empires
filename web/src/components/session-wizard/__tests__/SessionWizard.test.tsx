@@ -1583,6 +1583,24 @@ describe("SessionWizard create failures", () => {
     expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
   });
 
+  it("Launch without Sandbox turns the Sandbox off without sending when the host has no adapter for Structured view", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("claude", { acp_create_ready: false })]);
+    createSession.mockResolvedValueOnce(
+      failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),
+    );
+    sandboxed();
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(payload(0).view).toBe("structured");
+    fireEvent.click(screen.getByTestId("create-failure-launch_without_sandbox"));
+    await act(async () => {});
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("create-failure")).toBeNull();
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByTestId("wizard-view-row").textContent).toContain("ACP adapter not installed");
+  });
+
   it("a failed hook shows the message as sent and its last output, with no Sandbox action", async () => {
     let finish!: (r: unknown) => void;
     createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
