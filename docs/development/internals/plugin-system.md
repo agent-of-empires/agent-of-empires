@@ -27,6 +27,8 @@ Sources are local paths or GitHub references. Installation stages content in the
 `execution.rs` gives preparation/application one fixed two-hour wall-clock
 budget across Git and approved builds. A private spawn-only owned-child wrapper
 keeps the direct child unreaped, reserving its original PGID through settlement.
+Signal failures retain custody through bounded observation; success requires
+physical child exit and no executing original-group member.
 Its ephemeral descendant tree borrows that custody instead of requiring a
 historical root audit token across exec. Owned macOS descendants retain the
 kernel's exec-stable physical birth ID after parent-birth ancestry proof.

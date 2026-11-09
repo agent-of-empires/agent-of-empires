@@ -358,22 +358,35 @@ impl OwnedProcessGroup {
     }
 
     pub(crate) fn settle(&mut self, grace: Duration) -> anyhow::Result<()> {
+        self.settle_with_signal(grace, Self::signal)
+    }
+
+    fn settle_with_signal(
+        &mut self,
+        grace: Duration,
+        mut signal: impl FnMut(&Self, i32) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
         let settled = || -> anyhow::Result<bool> {
-            Ok(self.exited()? && !runner_group_executing(self.id())?)
+            Ok(self
+                .exited()
+                .context("could not observe original child exit")?
+                && !runner_group_executing(self.id())
+                    .context("could not observe original process group")?)
         };
         if settled()? {
             self.settled = true;
             return Ok(());
         }
-        if let Err(error) = self.signal(libc::SIGTERM) {
-            if settled()? {
-                self.settled = true;
-                return Ok(());
-            }
-            return Err(error);
-        }
         let term_deadline = Instant::now() + grace;
         let kill_deadline = term_deadline + Duration::from_secs(5);
+        let mut signal_error = signal(self, libc::SIGTERM).err().map(|error| {
+            error.context(format!(
+                "could not send SIGTERM to original process group {}",
+                self.id()
+            ))
+        });
         let mut killed = false;
         loop {
             if settled()? {
@@ -382,19 +395,22 @@ impl OwnedProcessGroup {
             }
             let now = Instant::now();
             if now >= term_deadline && !killed {
-                if let Err(error) = self.signal(libc::SIGKILL) {
-                    if settled()? {
-                        self.settled = true;
-                        return Ok(());
+                if let Err(error) = signal(self, libc::SIGKILL) {
+                    if signal_error.is_none() {
+                        signal_error = Some(error.context(format!(
+                            "could not send SIGKILL to original process group {}",
+                            self.id()
+                        )));
                     }
-                    return Err(error);
                 }
                 killed = true;
             }
-            anyhow::ensure!(
-                now < kill_deadline,
-                "owned process group termination unproven"
-            );
+            if now >= kill_deadline {
+                return Err(match signal_error {
+                    Some(error) => error.context("owned process group termination unproven"),
+                    None => anyhow::anyhow!("owned process group termination unproven"),
+                });
+            }
             std::thread::sleep(WAIT_POLL_INTERVAL);
         }
     }
@@ -2080,6 +2096,78 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_signal_errors_require_physical_settlement() {
+        use std::io::BufRead;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        struct Original {
+            group: Option<OwnedProcessGroup>,
+            input: Option<std::process::ChildStdin>,
+        }
+        impl Drop for Original {
+            fn drop(&mut self) {
+                drop(self.input.take());
+                if let Some(mut group) = self.group.take() {
+                    if group.settle(Duration::ZERO).is_ok() {
+                        let _ = group.reap();
+                    } else {
+                        std::mem::forget(group);
+                    }
+                }
+            }
+        }
+
+        for completes in [true, false] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release; exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null());
+            let mut original = Original {
+                group: Some(OwnedProcessGroup::spawn(&mut command).unwrap()),
+                input: None,
+            };
+            original.input = original.group.as_mut().unwrap().child.stdin.take();
+            let mut ready = String::new();
+            std::io::BufReader::new(reader)
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let Original { group, input } = &mut original;
+            let group = group.as_mut().unwrap();
+            let result = group.settle_with_signal(Duration::ZERO, |_, signal| {
+                if completes && signal == libc::SIGKILL {
+                    drop(input.take());
+                }
+                Err(Errno::EPERM.into())
+            });
+            if completes {
+                result.unwrap();
+                assert!(group.exited().unwrap());
+                assert!(!runner_group_executing(group.id()).unwrap());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(!group.exited().unwrap());
+                assert!(runner_group_executing(group.id()).unwrap());
+            }
+            drop(input.take());
+            group.settle(Duration::ZERO).unwrap();
+            let status = original.group.take().unwrap().reap().unwrap();
+            if completes {
+                assert!(status.success());
+            }
+        }
+    }
 
     #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
