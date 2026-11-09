@@ -1251,6 +1251,12 @@ pub(crate) fn recorded_launch() -> Option<ServeLaunch> {
     managed_launch(daemon_pid()?).ok()
 }
 
+/// Whether the TUI may restart the local Daemon in place: the rule that gates
+/// the startup migration offer, for a Daemon with a replayable launch record.
+pub(crate) fn local_daemon_restartable() -> bool {
+    crate::cli::migrate::offer_allowed(true, recorded_launch().is_some())
+}
+
 /// Whether the verified daemon already runs `passphrase`.
 pub(crate) fn daemon_runs_passphrase(passphrase: &str) -> bool {
     recorded_launch()
@@ -1621,11 +1627,9 @@ pub(crate) async fn ensure_local_daemon(
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let existing = match daemon_status() {
         DaemonStatus::Verified(pid) => {
-            anyhow::ensure!(
-                transaction.try_lifetime()?.is_none(),
-                "Running daemon (PID {pid}) predates this build's local runtime transport. \
-                 Run `aoe serve --restart` with the new binary, or stop it through its manager"
-            );
+            if transaction.try_lifetime()?.is_some() {
+                return Err(crate::daemon::LocalRuntimeError::PredatesTransport { pid }.into());
+            }
             Some(pid)
         }
         DaemonStatus::Unverified => {
@@ -2023,12 +2027,21 @@ async fn migrate_managed_launch(
     transaction: crate::daemon::lifecycle::Transaction,
     full: bool,
 ) -> Result<crate::daemon::lifecycle::Transaction> {
+    migrate_managed_launch_reporting(transaction, full, crate::cli::migrate::stderr_reporter())
+        .await
+}
+
+async fn migrate_managed_launch_reporting(
+    transaction: crate::daemon::lifecycle::Transaction,
+    full: bool,
+    reporter: crate::migrations::progress::Reporter,
+) -> Result<crate::daemon::lifecycle::Transaction> {
     tokio::task::spawn_blocking(move || {
         crate::migrations::ensure_schema_supported()?;
         if full {
             let serve = try_lock_serve()?.context("serve or migration is still running")?;
             crate::migrations::run_migrations_under_exclusion(
-                Some(crate::cli::migrate::stderr_reporter()),
+                Some(reporter),
                 false,
                 &transaction,
                 &serve,
@@ -2051,6 +2064,28 @@ pub(crate) async fn restart_daemon_with_receipt(
     override_args: Option<ServeArgs>,
     announce: bool,
 ) -> Result<ServeLaunch> {
+    replay_managed_launch(override_args, announce, None).await
+}
+
+/// `aoe serve --restart` for the TUI, which must not write to the terminal it owns.
+pub(crate) async fn restart_daemon_for_tui(
+    progress: crate::migrations::progress::Reporter,
+) -> Result<()> {
+    replay_managed_launch(None, false, Some(progress))
+        .await
+        .map(|_| ())
+}
+
+async fn replay_managed_launch(
+    override_args: Option<ServeArgs>,
+    announce: bool,
+    progress: Option<crate::migrations::progress::Reporter>,
+) -> Result<ServeLaunch> {
+    let stage = |message: &str| {
+        if let Some(progress) = &progress {
+            progress(crate::migrations::progress::Event::Step(message.to_owned()));
+        }
+    };
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let Some(pid) = daemon_pid() else {
         bail!(
@@ -2078,8 +2113,14 @@ pub(crate) async fn restart_daemon_with_receipt(
         println!("Restarting aoe serve daemon (PID {pid})…");
     }
     tracing::info!(target: "serve.lifecycle", old_pid = pid, "restarting daemon");
+    stage("Stopping the old Daemon");
     stop_daemon_locked(&transaction, announce).await?;
-    let transaction = migrate_managed_launch(transaction, true).await?;
+    stage("Applying data migrations");
+    let reporter = progress
+        .clone()
+        .unwrap_or_else(crate::cli::migrate::stderr_reporter);
+    let transaction = migrate_managed_launch_reporting(transaction, true, reporter).await?;
+    stage("Starting the new Daemon");
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
     let new_pid = daemon_pid().context("Restart successor is unavailable")?;
     tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");

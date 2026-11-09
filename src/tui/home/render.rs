@@ -1093,6 +1093,7 @@ impl HomeView {
             if self.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected {
                 frame.render_widget(Clear, area);
                 crate::tui::dialogs::ConnectionsView::offline(
+                    self.offline_attention,
                     self.runtime_failure_reason.as_deref(),
                     matches!(
                         self.dashboard_launch,

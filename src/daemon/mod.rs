@@ -142,10 +142,38 @@ pub(crate) enum LocalRuntimeError {
     Client(#[from] DaemonClientError),
     #[error("Local daemon protocol {actual} does not match {expected}; run `aoe serve --restart`")]
     Protocol { expected: u16, actual: u16 },
+    #[error(
+        "Running daemon (PID {pid}) predates this build's local runtime transport. \
+         Run `aoe serve --restart` with the new binary, or stop it through its manager"
+    )]
+    PredatesTransport { pid: u32 },
     #[error("Local daemon owner or namespace does not match")]
     Identity,
     #[error("Local daemon profile '{0}' is unavailable")]
     ProfileUnavailable(String),
+}
+
+/// How a reachable local Daemon's protocol differs from this client's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtocolSkew {
+    pub(crate) daemon_older: bool,
+    pub(crate) summary: String,
+}
+
+impl LocalRuntimeError {
+    pub(crate) fn protocol_skew(&self) -> Option<ProtocolSkew> {
+        match *self {
+            Self::Protocol { expected, actual } => Some(ProtocolSkew {
+                daemon_older: actual < expected,
+                summary: format!("Daemon protocol {actual}, this aoe {expected}"),
+            }),
+            Self::PredatesTransport { .. } => Some(ProtocolSkew {
+                daemon_older: true,
+                summary: "Daemon predates this aoe's local connection".to_owned(),
+            }),
+            Self::Client(_) | Self::Identity | Self::ProfileUnavailable(_) => None,
+        }
+    }
 }
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {

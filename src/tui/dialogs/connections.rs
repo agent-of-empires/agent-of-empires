@@ -12,6 +12,13 @@ use crate::tui::styles::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAttention {
     Offline,
+    /// An older local Daemon this aoe can restart in place.
+    Outdated,
+    /// An older Daemon that something other than this aoe has to restart.
+    OutdatedManual,
+    DaemonNewer,
+    Restarting,
+    RestartFailed,
     OutcomeUnknown,
     ReadOnly,
     NativeUnavailable,
@@ -22,6 +29,10 @@ impl DaemonAttention {
     pub fn footer_label(self) -> &'static str {
         match self {
             DaemonAttention::Offline => "Daemon offline",
+            DaemonAttention::Outdated | DaemonAttention::OutdatedManual => "Daemon outdated",
+            DaemonAttention::DaemonNewer => "Daemon newer",
+            DaemonAttention::Restarting => "Daemon restarting",
+            DaemonAttention::RestartFailed => "Restart failed",
             DaemonAttention::OutcomeUnknown => "Runtime outcome unknown",
             DaemonAttention::ReadOnly => "Unavailable",
             DaemonAttention::NativeUnavailable => "Native unavailable",
@@ -32,13 +43,44 @@ impl DaemonAttention {
     pub fn is_problem(self) -> bool {
         matches!(
             self,
-            DaemonAttention::Offline | DaemonAttention::OutcomeUnknown
+            DaemonAttention::Offline
+                | DaemonAttention::Outdated
+                | DaemonAttention::OutdatedManual
+                | DaemonAttention::DaemonNewer
+                | DaemonAttention::RestartFailed
+                | DaemonAttention::OutcomeUnknown
         )
+    }
+
+    /// Whether this state replaces the home screen, because no Daemon is serving it.
+    fn is_takeover(self) -> bool {
+        !matches!(
+            self,
+            DaemonAttention::OutcomeUnknown
+                | DaemonAttention::ReadOnly
+                | DaemonAttention::NativeUnavailable
+        )
+    }
+
+    /// The r key's button and footer hint; `None` while a restart is running.
+    fn action(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            DaemonAttention::Outdated => Some(("Restart Daemon", " restart  ")),
+            DaemonAttention::OutdatedManual | DaemonAttention::DaemonNewer => {
+                Some(("Check again", " check again  "))
+            }
+            DaemonAttention::Restarting => None,
+            _ => Some(("Reconnect", " reconnect  ")),
+        }
     }
 
     fn status(self) -> &'static str {
         match self {
             DaemonAttention::Offline => "Not responding",
+            DaemonAttention::Outdated | DaemonAttention::OutdatedManual => "Outdated",
+            DaemonAttention::DaemonNewer => "Newer than this aoe",
+            DaemonAttention::Restarting => "Restarting",
+            DaemonAttention::RestartFailed => "Restart failed",
             DaemonAttention::OutcomeUnknown => "Outcome unknown",
             DaemonAttention::ReadOnly => "Read-only",
             DaemonAttention::NativeUnavailable => "Native unavailable",
@@ -49,6 +91,19 @@ impl DaemonAttention {
         match self {
             DaemonAttention::Offline => {
                 "Your Sessions keep running in tmux, but the list can't update until it's back."
+            }
+            DaemonAttention::Outdated => {
+                "It's from before your last aoe upgrade and must restart to match. Your Sessions keep running in tmux."
+            }
+            DaemonAttention::OutdatedManual => {
+                "aoe didn't start this Daemon, so restart it from its terminal or service manager, then check again."
+            }
+            DaemonAttention::DaemonNewer => {
+                "A newer aoe started this Daemon. Update this aoe, then check again."
+            }
+            DaemonAttention::Restarting => "Your Sessions keep running in tmux.",
+            DaemonAttention::RestartFailed => {
+                "Your Sessions keep running in tmux. Reconnect checks where the Daemon stands."
             }
             DaemonAttention::OutcomeUnknown => {
                 "A change was sent, but whether it applied isn't known yet. Check the list before you retry it."
@@ -114,7 +169,7 @@ impl ConnectionsView {
 
     /// The home screen's takeover while the Daemon can't be reached. `launch_failed`: a Web
     /// dashboard start hidden with Esc failed, and Enter shows why.
-    pub fn offline(reason: Option<&str>, launch_failed: bool) -> Self {
+    pub fn offline(attention: DaemonAttention, reason: Option<&str>, launch_failed: bool) -> Self {
         let web = if launch_failed {
             WebState::Failed
         } else {
@@ -122,7 +177,7 @@ impl ConnectionsView {
         };
         Self {
             reason: reason.map(str::to_owned),
-            ..Self::new(Some(DaemonAttention::Offline), web)
+            ..Self::new(Some(attention), web)
         }
     }
 
@@ -152,7 +207,7 @@ impl ConnectionsView {
     }
 
     fn offline_takeover(&self) -> bool {
-        self.daemon == Some(DaemonAttention::Offline)
+        self.daemon.is_some_and(DaemonAttention::is_takeover)
     }
 
     /// Enter on the Web dashboard row submits; the Daemon row has nothing to open.
@@ -300,24 +355,32 @@ impl ConnectionsView {
             }
             if row == Row::Daemon && self.offline_takeover() {
                 lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::styled("[ ", key),
-                    Span::styled("r", key),
-                    Span::styled(" Reconnect ]", key),
-                ]));
-                lines.push(Line::raw(""));
+                if let Some((button, _)) = self.daemon.and_then(DaemonAttention::action) {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.clone()),
+                        Span::styled("[ ", key),
+                        Span::styled("r", key),
+                        Span::styled(format!(" {button} ]"), key),
+                    ]));
+                    lines.push(Line::raw(""));
+                }
             }
         }
         lines.push(Line::raw(""));
-        let hints: Vec<(&str, &str)> = if self.offline_takeover() && self.web == WebState::Failed {
-            vec![
-                ("r", " reconnect  "),
-                ("Enter", " why it didn't start  "),
-                ("q", " quit"),
-            ]
-        } else if self.offline_takeover() {
-            vec![("r", " reconnect  "), ("q", " quit")]
+        let takeover_hint = self
+            .daemon
+            .filter(|_| self.offline_takeover())
+            .map(DaemonAttention::action);
+        let hints: Vec<(&str, &str)> = if let Some(hint) = takeover_hint {
+            match hint.map(|(_, hint)| hint) {
+                None => vec![("Ctrl+C", " quit without waiting")],
+                Some(hint) if self.web == WebState::Failed => vec![
+                    ("r", hint),
+                    ("Enter", " why it didn't start  "),
+                    ("q", " quit"),
+                ],
+                Some(hint) => vec![("r", hint), ("q", " quit")],
+            }
         } else if self.rows().len() > 1 {
             vec![
                 ("\u{2191}\u{2193}", " move  "),
@@ -385,9 +448,55 @@ mod tests {
         } else {
             "API server"
         };
-        let offline = || ConnectionsView::offline(Some("connection refused"), false);
+        let offline = || {
+            ConnectionsView::offline(DaemonAttention::Offline, Some("connection refused"), false)
+        };
         // (view, text shown, text absent)
-        let cases: [(ConnectionsView, &[&str], &[&str]); 8] = [
+        let takeover = |attention, reason| ConnectionsView::offline(attention, Some(reason), false);
+        let cases: [(ConnectionsView, &[&str], &[&str]); 13] = [
+            // A reachable older Daemon is not "not responding", and the fix is a restart.
+            (
+                takeover(DaemonAttention::Outdated, "Daemon protocol 3, this aoe 4"),
+                &[
+                    "Outdated",
+                    "Daemon protocol 3, this aoe 4",
+                    "[ r Restart Daemon ]",
+                    "r restart",
+                    "q quit",
+                ],
+                &["Not responding", "Reconnect", "Check again"],
+            ),
+            // Nothing this aoe may restart: instructions, and r only re-checks.
+            (
+                takeover(
+                    DaemonAttention::OutdatedManual,
+                    "Daemon protocol 3, this aoe 4",
+                ),
+                &["Outdated", "service manager", "[ r Check again ]"],
+                &["Not responding", "Restart Daemon"],
+            ),
+            (
+                takeover(
+                    DaemonAttention::DaemonNewer,
+                    "Daemon protocol 5, this aoe 4",
+                ),
+                &[
+                    "Newer than this aoe",
+                    "Update this aoe",
+                    "[ r Check again ]",
+                ],
+                &["Not responding", "Restart Daemon"],
+            ),
+            (
+                takeover(DaemonAttention::Restarting, "Applying data migrations"),
+                &["Restarting", "Applying data migrations", "Ctrl+C quit"],
+                &["[ r", "q quit"],
+            ),
+            (
+                takeover(DaemonAttention::RestartFailed, "bind failed"),
+                &["Restart failed", "bind failed", "[ r Reconnect ]"],
+                &["Restart Daemon"],
+            ),
             // Healthy: no Daemon row and one row, so no move hint.
             (
                 ConnectionsView::new(None, WebState::Off),
@@ -416,7 +525,11 @@ mod tests {
             ),
             // The takeover after a hidden start failed: its row and how to see why.
             (
-                ConnectionsView::offline(Some("connection refused"), true),
+                ConnectionsView::offline(
+                    DaemonAttention::Offline,
+                    Some("connection refused"),
+                    true,
+                ),
                 &[
                     "Didn't start \u{00B7} Enter shows why",
                     "why it didn't start",
@@ -457,6 +570,7 @@ mod tests {
         // A detail one cell wider than the space under the indent wraps its last cell, not cuts it.
         let fill = "x".repeat(51);
         let text = screen(&mut ConnectionsView::offline(
+            DaemonAttention::Offline,
             Some(&format!("{fill}Q")),
             false,
         ));
