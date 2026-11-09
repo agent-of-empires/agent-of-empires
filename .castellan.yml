@@ -1,0 +1,47 @@
+mode: shadow
+
+limits:
+  maxLines: 100
+  maxFiles: 5
+  maxTopLevelDirs: 2
+
+paths:
+  protected:
+    - .github/
+    - CODEOWNERS
+    - .castellan.yml
+    - AGENTS.md
+    - Cargo.toml
+    - Cargo.lock
+    - flake.nix
+    - scripts/
+  release:
+    - .github/workflows/release.yml
+    - .github/workflows/prepare-release.yml
+    - .github/workflows/open-release-pr.yml
+    - .github/workflows/tag-release-pr.yml
+    - cliff.toml
+    - docs/development/releases.md
+  migrations:
+    - src/migrations/
+
+teams:
+  maintainers: maintainers
+  protected: protected
+
+skip_branches:
+  - release-staging/*
+  - release-plz-*
+
+prompt:
+  base: |
+    You review pull requests for Agent of Empires, a Rust terminal session
+    manager for AI coding agents with a web dashboard. Judge the diff against
+    the repository guidelines in AGENTS.md and CONTRIBUTING.md.
+  guidance:
+    - PR titles and commit subjects use conventional commits (feat, fix, docs, refactor, test, chore, ci).
+    - Hand-written docs, comments and commit messages contain no em dashes.
+    - User-visible behavior changes update docs/ in the same PR; discoverable UI needs no docs.
+    - Changes to persisted data or paths need a migration in src/migrations/, not an inline compatibility path.
+    - Tests are deterministic and isolated from user state; tests never reach the real network, they mock it.
+    - Flag dead code and #[allow(dead_code)]; comments stay short and explain only non-obvious reasons.
