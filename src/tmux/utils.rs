@@ -921,13 +921,6 @@ pub(crate) fn probe_owned_pane_readiness(
     )
 }
 
-/// Remove a positively identified live birth, without targeting a mutable name.
-pub(crate) fn remove_owned_live_pane(
-    expected: &crate::session::LegacyToolObservation,
-) -> Result<()> {
-    remove_owned_pane(expected, false)
-}
-
 fn first_window_pane_ids_classified(
     session_name: &str,
     deadline: &crate::tmux::TmuxCommandDeadline,
