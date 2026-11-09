@@ -111,7 +111,9 @@ impl CapturePollerSlot {
     /// Stopped handles remain useful to their owner's final drain, not as replacement watchers.
     fn running_handle(&self, held: Held<'_>) -> Option<&Arc<Mutex<SessionPoller>>> {
         self.handle.as_ref().filter(|handle| {
-            let poller = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let poller = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             poller.serves(held.tool, held.execution) && poller.is_running()
         })
     }
@@ -231,7 +233,6 @@ impl CapturePollerSlot {
     }
 }
 
-
 #[cfg(test)]
 impl CapturePollerSlot {
     pub(crate) fn set_retry_after(&mut self, retry_after: Option<Instant>) {
@@ -302,7 +303,6 @@ mod tests {
         empty.settle(Held::new("claude", None));
         assert!(empty.handle().is_none());
     }
-
 
     fn running_slot(tool: &str, execution: Option<ActiveExecution>) -> CapturePollerSlot {
         let mut poller = SessionPoller::new("tmux".into(), tool.into(), execution);

@@ -2283,36 +2283,36 @@ mod tests {
                         .expect("lost ownership must retain explicit finalization debt");
                     assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
                 } else {
-                let outcome = result.unwrap();
-                if fault == "cached_absence" {
-                    assert_eq!(
-                        outcome,
-                        if resumed {
-                            StartOutcome::Resumed
-                        } else {
-                            StartOutcome::Fresh
-                        }
-                    );
-                } else {
-                    let cause = match fault {
-                        "lookup_timeout"
-                        | "pane_timeout"
-                        | "dead_recheck_timeout"
-                        | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
-                        "expiry" => LaunchIndeterminateCause::StabilizationExpired,
-                        "superseded" | "same_sid_assertion" | "replacement" | "rename_only"
-                        | "server_changed" | "dead_recheck_owner" | "pane_pid_missing"
-                        | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
-                        _ => LaunchIndeterminateCause::ObservationFailed,
-                    };
-                    assert_eq!(
-                        outcome,
-                        StartOutcome::Indeterminate { cause },
-                        "private launch diagnostics:\n{}",
-                        logs.contents()
-                    );
-                    assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
-                }
+                    let outcome = result.unwrap();
+                    if fault == "cached_absence" {
+                        assert_eq!(
+                            outcome,
+                            if resumed {
+                                StartOutcome::Resumed
+                            } else {
+                                StartOutcome::Fresh
+                            }
+                        );
+                    } else {
+                        let cause = match fault {
+                            "lookup_timeout"
+                            | "pane_timeout"
+                            | "dead_recheck_timeout"
+                            | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
+                            "expiry" => LaunchIndeterminateCause::StabilizationExpired,
+                            "same_sid_assertion" | "replacement" | "rename_only"
+                            | "server_changed" | "dead_recheck_owner" | "pane_pid_missing"
+                            | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
+                            _ => LaunchIndeterminateCause::ObservationFailed,
+                        };
+                        assert_eq!(
+                            outcome,
+                            StartOutcome::Indeterminate { cause },
+                            "private launch diagnostics:\n{}",
+                            logs.contents()
+                        );
+                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
+                    }
                 }
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);

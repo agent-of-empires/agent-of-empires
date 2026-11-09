@@ -1931,15 +1931,20 @@ else:
                     .expect("the invoked native agent owns a real pane");
                     assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
                     assert!(exclusive);
-                    let native_pid = std::fs::read_to_string(launch_record.with_extension("json.pid"))
-                        .unwrap()
-                        .parse::<u32>()
-                        .unwrap();
+                    let native_pid =
+                        std::fs::read_to_string(launch_record.with_extension("json.pid"))
+                            .unwrap()
+                            .parse::<u32>()
+                            .unwrap();
                     let native_birth = crate::process::process_birth_identity(native_pid)
                         .unwrap()
                         .expect("the ready native child has a kernel birth");
-                    *captured.borrow_mut() =
-                        Some((pane, native_pid, native_birth, instance.lifecycle_generation));
+                    *captured.borrow_mut() = Some((
+                        pane,
+                        native_pid,
+                        native_birth,
+                        instance.lifecycle_generation,
+                    ));
                     if fail_adoption {
                         assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
                         assert!(matches!(instance.resume_intent, ResumeIntent::Fork { .. }));
@@ -2005,7 +2010,9 @@ else:
                     assert_eq!(retained, pane);
                     assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
                     assert!(exclusive);
-                    assert!(crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                    assert!(
+                        crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
+                    );
                     assert_eq!(disk.lifecycle_generation, generation);
                     assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
                     assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
@@ -2028,7 +2035,9 @@ else:
                         .0,
                         pane
                     );
-                    assert!(crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                    assert!(
+                        crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
+                    );
                     assert!(!record.with_extension("json.input").exists());
                 } else {
                     assert!(

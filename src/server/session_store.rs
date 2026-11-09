@@ -1014,7 +1014,10 @@ mod tests {
                 if offer == "foreign-empty" {
                     started.tool = "claude".into();
                 }
-                crate::server::test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    "test",
+                    vec![row.clone()],
+                );
                 let watcher = file_watch.clone();
                 let state = crate::server::test_support::build_test_app_state_configured(
                     vec![row],
