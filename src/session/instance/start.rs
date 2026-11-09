@@ -1941,9 +1941,9 @@ else:
                         .unwrap();
                     assert!(census.status.success(), "{census:?}");
                     let first = captured_invocations.borrow().is_empty();
-                    captured_invocations.borrow_mut().push(
-                        String::from_utf8(census.stdout).unwrap()
-                    );
+                    captured_invocations
+                        .borrow_mut()
+                        .push(String::from_utf8(census.stdout).unwrap());
                     let owned = crate::tmux::utils::probe_owned_pane(
                         instance.tmux_session().unwrap().name(),
                         &pane,
@@ -1967,12 +1967,12 @@ else:
                         .unwrap()
                         .expect("the ready native child has a kernel birth");
                     if first {
-                    *captured.borrow_mut() = Some((
-                        pane,
-                        native_pid,
-                        native_birth,
-                        instance.lifecycle_generation,
-                    ));
+                        *captured.borrow_mut() = Some((
+                            pane,
+                            native_pid,
+                            native_birth,
+                            instance.lifecycle_generation,
+                        ));
                     }
                     if fail_adoption {
                         assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
@@ -2063,7 +2063,10 @@ else:
                     };
                     let initial_births = births();
                     assert_eq!(initial_births.len(), 1, "{initial_births:?}");
-                    assert_eq!(initial_births[0]["pid"].as_u64(), Some(u64::from(native_pid)));
+                    assert_eq!(
+                        initial_births[0]["pid"].as_u64(),
+                        Some(u64::from(native_pid))
+                    );
                     assert_eq!(
                         instance.start_with_size_opts(None, false).unwrap(),
                         LaunchSidOutcome::Skipped,
@@ -2086,7 +2089,11 @@ else:
                         crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
                     );
                     assert!(!record.with_extension("json.input").exists());
-                    assert_eq!(births(), initial_births, "retry must not invoke another native agent");
+                    assert_eq!(
+                        births(),
+                        initial_births,
+                        "retry must not invoke another native agent"
+                    );
                 } else {
                     assert!(
                         !instance.tmux_session().unwrap().exists(),

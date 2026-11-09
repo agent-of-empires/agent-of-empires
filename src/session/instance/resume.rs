@@ -1907,8 +1907,7 @@ mod tests {
                 let _case = CaseContext { resumed, fault };
                 let logs = crate::session::test_support::LogCapture::start();
                 let dead_first = fault == "dead" || fault.starts_with("dead_");
-                let expects_peer_publication =
-                    matches!(fault, "superseded" | "dead_recheck_owner");
+                let expects_peer_publication = matches!(fault, "superseded" | "dead_recheck_owner");
                 let root = tempdir().unwrap();
                 let _app = crate::session::test_support::isolate_app_dir_at(root.path());
                 let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
@@ -2327,7 +2326,10 @@ mod tests {
                     assert_eq!(stored.resume_intent, ResumeIntent::Use(SID.into()));
                     assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(SID));
                 } else {
-                    assert_eq!(stored.conversation_state(), canonical_before.conversation_state());
+                    assert_eq!(
+                        stored.conversation_state(),
+                        canonical_before.conversation_state()
+                    );
                     assert_eq!(
                         stored.resume_probe_failed_sid.as_deref(),
                         if fault == "superseded"
@@ -2413,10 +2415,13 @@ mod tests {
                         .expect("lost ownership retains explicit finalization debt");
                     assert_eq!(pending.generation, canonical_before.lifecycle_generation);
                     assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
-                    assert!(matches!(
-                        error.downcast_ref::<LifecycleReservationError>(),
-                        Some(LifecycleReservationError::Superseded)
-                    ), "{error:#}");
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<LifecycleReservationError>(),
+                            Some(LifecycleReservationError::Superseded)
+                        ),
+                        "{error:#}"
+                    );
                 } else {
                     let outcome = result.unwrap();
                     if fault == "cached_absence" {
@@ -2436,8 +2441,9 @@ mod tests {
                             | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
                             "expiry" => LaunchIndeterminateCause::StabilizationExpired,
                             "same_sid_assertion" | "replacement" | "rename_only"
-                            | "server_changed" | "pane_pid_missing"
-                            | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
+                            | "server_changed" | "pane_pid_missing" | "dead_pid_changed" => {
+                                LaunchIndeterminateCause::OwnershipUnproven
+                            }
                             _ => LaunchIndeterminateCause::ObservationFailed,
                         };
                         assert_eq!(
