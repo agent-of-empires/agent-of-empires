@@ -421,23 +421,6 @@ impl Instance {
         crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)
     }
 
-    /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.
-    /// Rechecks the stored row under the lifecycle lock, which CLI archive and trash also take;
-    /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
-    /// call this after it.
-    pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
-        let storage = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        )?;
-        let lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
-        let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) else {
-            return Err(SessionGone.into());
-        };
-        row.ensure_startable()?;
-        Ok(lock)
-    }
-
     /// Wait up to three seconds for a newly born live pane to leave its boot shell.
     /// Missing, dead, unknown and still-settling panes remain indeterminate.
     pub(crate) fn wait_for_pane_ready(&self) -> Result<(), LaunchIndeterminateCause> {
