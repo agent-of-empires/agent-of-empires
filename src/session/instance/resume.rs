@@ -4831,8 +4831,10 @@ exec sleep 60
                     "the actor-captured replacement birth must survive the refusal"
                 );
             }
-            assert!(!argv.exists() && !pid_file.exists(),
-                "the refused original operation must not invoke or replay Native work");
+            assert!(
+                !argv.exists() && !pid_file.exists(),
+                "the refused original operation must not invoke or replay Native work"
+            );
             // A separate operation may observe the replacement; the refused operation may not.
             let generation = storage.load().unwrap()[0].lifecycle_generation;
             let positive = instance.ensure_pane_ready().unwrap();
@@ -4855,19 +4857,33 @@ exec sleep 60
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 let args = std::fs::read_to_string(&argv).unwrap();
-                assert!(args.lines().zip(args.lines().skip(1))
-                    .any(|(arg, value)| arg == "--resume" && value == SID), "{args}");
-                let pid = std::fs::read_to_string(&pid_file).unwrap().trim().parse::<u32>().unwrap();
-                let birth = crate::process::process_birth_identity(pid).unwrap().unwrap();
+                assert!(
+                    args.lines()
+                        .zip(args.lines().skip(1))
+                        .any(|(arg, value)| arg == "--resume" && value == SID),
+                    "{args}"
+                );
+                let pid = std::fs::read_to_string(&pid_file)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                let birth = crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .unwrap();
                 assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
-                let receipt = instance.agent_pane.physical.as_ref()
+                let receipt = instance
+                    .agent_pane
+                    .physical
+                    .as_ref()
                     .expect("the positive launch retains its own physical birth receipt");
                 assert_eq!(receipt.identity.pane_id, pane);
                 let pane_pid = receipt.identity.pane_pid.unwrap();
                 let mut ancestor = pid;
                 while ancestor != pane_pid && ancestor > 1 {
                     ancestor = crate::process::parent_and_argv0(ancestor)
-                        .expect("the actual Native child has its original pane ancestry").0;
+                        .expect("the actual Native child has its original pane ancestry")
+                        .0;
                 }
                 assert_eq!(ancestor, pane_pid);
                 assert!(storage.load().unwrap()[0].lifecycle_generation > generation);
@@ -4878,8 +4894,10 @@ exec sleep 60
                 let (pid, birth) = native_birth.as_ref().unwrap();
                 assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
                 assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
-                assert!(!argv.exists() && !pid_file.exists(),
-                    "the live positive no-op must not invoke a second Native child");
+                assert!(
+                    !argv.exists() && !pid_file.exists(),
+                    "the live positive no-op must not invoke a second Native child"
+                );
             }
         }
     }
