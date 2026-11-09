@@ -4,8 +4,8 @@
 //
 // Destructive vs benign:
 //   - Benign: single-tap "Allow" / "Always" / "Deny" trio.
-//   - Destructive: "Allow" requires an 800ms hold (haptic on touch),
-//     swipe is reserved for dismiss-only and never approves.
+//   - Destructive: "Allow" requires an 800ms hold by pointer, touch, or
+//     Space/Enter (haptic on touch); swipe never approves.
 //
 // A `choice` approval is a third shape: the daemon classified the
 // agent's options as a list of answers rather than a permission
@@ -17,7 +17,7 @@
 // Submitting disables actions until the hook confirms resolution or rejects
 // to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
@@ -132,6 +132,8 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
     }, LONG_PRESS_MS);
   };
 
+  // Releasing retires the generation as well as the timers, so an
+  // ambiguous multi-touch resolves nothing rather than the wrong thing.
   const cancelLongPress = useCallback(() => {
     holdGeneration.current += 1;
     clearHoldTimers();
@@ -151,6 +153,41 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
       decisionAllowedRef.current = false;
     };
   }, [decisionsEnabled, clearHoldTimers]);
+
+  // A key or button released after the window lost focus never reaches the
+  // card, so losing the window or hiding the page ends any hold in progress.
+  useEffect(() => {
+    if (held === null) return;
+    const onVisibility = () => {
+      if (document.hidden) cancelLongPress();
+    };
+    window.addEventListener("blur", cancelLongPress);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("blur", cancelLongPress);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [held, cancelLongPress]);
+
+  // Space or Enter held on a focused button is the keyboard hold. Key
+  // repeat would restart it, so only the first keydown counts; release,
+  // button blur and window blur cancel it like lifting a finger.
+  const isHoldKey = (e: KeyboardEvent) => e.key === " " || e.key === "Enter";
+  const holdKeyDown = (e: KeyboardEvent, key: string, run: () => void) => {
+    if (!isHoldKey(e)) return;
+    e.preventDefault();
+    if (!e.repeat) startLongPress(key, run);
+  };
+  const holdKeyUp = (e: KeyboardEvent) => {
+    if (!isHoldKey(e)) return;
+    e.preventDefault();
+    cancelLongPress();
+  };
+
+  const submitting = phase === "submitting";
+  const blocked = !decisionsEnabled;
+  // Native authority, offline state, and submission all disable native decisions.
+  const blockedClass = submitting ? "cursor-wait opacity-60" : blocked ? "cursor-not-allowed opacity-50" : "";
 
   return (
     <div
@@ -203,9 +240,7 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
 
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
-      {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">Could not submit approval. Tap to retry.</p>
-      )}
+      {phase === "rolled-back" && <p className="px-3 pt-2 text-rose-400 text-xs">Could not submit. Try again.</p>}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
       {approval.plan && (
@@ -223,7 +258,7 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
         <PlanModal
           plan={approval.plan}
           canDecide={canDecide}
-          submitting={phase === "submitting"}
+          submitting={submitting}
           offline={offline}
           options={isChoice ? options : undefined}
           onDecide={(decision, optionId) => void submit(decision, optionId)}
@@ -245,11 +280,11 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
                   "relative w-full overflow-hidden rounded-md border",
                   "px-3 py-2 text-left text-xs font-medium text-text-primary break-words",
                   needsHold
-                    ? "border-rose-900/60 bg-rose-950/30 hover:border-rose-700"
-                    : "border-surface-700 bg-surface-800 hover:border-brand-600/60 hover:bg-brand-700/10",
-                  phase === "submitting" ? "cursor-wait opacity-60" : "",
+                    ? "border-rose-900/60 bg-rose-950/30 enabled:hover:border-rose-700"
+                    : "border-surface-700 bg-surface-800 enabled:hover:border-brand-600/60 enabled:hover:bg-brand-700/10",
+                  blockedClass,
                 ].join(" ")}
-                disabled={!decisionsEnabled}
+                disabled={blocked}
                 // Mouse-leave and touch-cancel abort the hold, so a slip
                 // never runs a destructive answer.
                 onClick={needsHold ? undefined : pick}
@@ -259,6 +294,9 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
                 onTouchStart={needsHold ? () => startLongPress(option.option_id, pick) : undefined}
                 onTouchEnd={needsHold ? cancelLongPress : undefined}
                 onTouchCancel={needsHold ? cancelLongPress : undefined}
+                onKeyDown={needsHold ? (e) => holdKeyDown(e, option.option_id, pick) : undefined}
+                onKeyUp={needsHold ? holdKeyUp : undefined}
+                onBlur={needsHold ? cancelLongPress : undefined}
               >
                 <span className="relative z-10">{option.name}</span>
                 {needsHold && (
@@ -280,19 +318,22 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
             type="button"
             className={[
               "relative flex flex-1 items-center justify-center gap-1.5 overflow-hidden",
-              "rounded-md text-white text-xs font-medium py-2 px-3",
-              phase === "submitting" ? "bg-rose-700 opacity-70 cursor-wait" : "bg-rose-600 hover:bg-rose-500",
+              "rounded-md bg-rose-600 text-white text-xs font-medium py-2 px-3 enabled:hover:bg-rose-500",
+              blockedClass,
             ].join(" ")}
-            disabled={!decisionsEnabled}
+            disabled={blocked}
             onMouseDown={() => startLongPress("allow", () => void submit("Allow"))}
             onMouseUp={cancelLongPress}
             onMouseLeave={cancelLongPress}
             onTouchStart={() => startLongPress("allow", () => void submit("Allow"))}
             onTouchEnd={cancelLongPress}
             onTouchCancel={cancelLongPress}
+            onKeyDown={(e) => holdKeyDown(e, "allow", () => void submit("Allow"))}
+            onKeyUp={holdKeyUp}
+            onBlur={cancelLongPress}
           >
             <Check className="h-3.5 w-3.5 relative z-10" />
-            <span className="relative z-10">{phase === "submitting" ? "Approving…" : "Hold to allow"}</span>
+            <span className="relative z-10">{submitting ? "Approving…" : "Hold to allow"}</span>
             <span
               className="absolute inset-0 bg-rose-400 origin-left"
               style={{ transform: `scaleX(${(held === "allow" ? progress : 0) / 100})` }}
@@ -305,10 +346,10 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
               type="button"
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
-                "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
+                "rounded-md bg-brand-600 text-white text-xs font-medium py-2 px-3 enabled:hover:bg-brand-500",
+                blockedClass,
               ].join(" ")}
-              disabled={!decisionsEnabled}
+              disabled={blocked}
               onClick={() => void submit("Allow")}
             >
               <Check className="h-3.5 w-3.5" />
@@ -320,12 +361,10 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
                 "flex items-center justify-center gap-1.5",
                 "rounded-md border border-surface-700 bg-surface-800",
                 "text-xs font-medium text-text-secondary py-2 px-3",
-                "hover:bg-surface-700",
-                phase === "submitting" && "opacity-60 cursor-wait",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              disabled={!decisionsEnabled}
+                "enabled:hover:bg-surface-700",
+                blockedClass,
+              ].join(" ")}
+              disabled={blocked}
               onClick={() => void submit("AllowAlways")}
               title={offline ? OFFLINE_TITLE : "Allow this tool for the whole session"}
             >
@@ -340,12 +379,10 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
             "flex items-center justify-center gap-1.5",
             "rounded-md border border-surface-700 bg-surface-800",
             "text-xs font-medium text-text-secondary py-2 px-3",
-            "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
-            phase === "submitting" && "opacity-60 cursor-wait",
-          ]
-            .filter(Boolean)
-            .join(" ")}
-          disabled={!decisionsEnabled}
+            "enabled:hover:border-rose-700/60 enabled:hover:bg-rose-950/30 enabled:hover:text-rose-300",
+            blockedClass,
+          ].join(" ")}
+          disabled={blocked}
           // Dismiss answers nothing, so it cancels rather than denying:
           // a Deny would be mapped onto the first reject-kind option and
           // sent as the user's answer. See #3741.
