@@ -5869,7 +5869,7 @@ mod restart_wake_tests {
     async fn explicit_restart_keeps_existing_pending_when_quota_publication_fails() {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(
+            let live = crate::server::test_support::managed_control_session(
                 scope, "restart-quota-publication-io",
             ).await;
             live.park("original interrupted work").await;
@@ -5878,10 +5878,18 @@ mod restart_wake_tests {
             state.session_service.set_pending_initial_turn(
                 &id, "existing pending work".into(), Vec::new(),
             ).await;
+            let resets_at = match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
+                .await.unwrap()
+            {
+                crate::acp::event_store::ControlKnowledge::Known(Some(resets_at)) => resets_at,
+                marker => panic!("expected the original quota marker, got {marker:?}"),
+            };
+            // A real restart retires the original before reserving a replacement; detaching
+            // alone correctly refuses Spawn while that retained physical owner stays alive.
+            live.client.shutdown().await.unwrap();
             let requests = live.native.requests();
             let frontier = state.acp_event_store.highest_seq(&id);
             let budget = state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
-            live.client = scope.adopt_with(live.client, false, || async {
                 assert!(!state.acp_supervisor.is_running(&id).await);
                 let preparation_state = state.clone();
                 let target = id.clone();
@@ -5907,7 +5915,7 @@ mod restart_wake_tests {
                     generation, started, native, hooks: Ok(()), account_swap: true,
                     carry: None, wake: Some("explicit replacement wake".into()),
                     reservation: None, reason: "user",
-                    quota: Some(PreparedQuotaRestart { resets_at: chrono::Utc::now(), continuation: None }),
+                    quota: Some(PreparedQuotaRestart { resets_at, continuation: None }),
                 }).await;
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
                 let current = state.instances.read().await.iter()
@@ -5927,8 +5935,6 @@ mod restart_wake_tests {
                 state.acp_event_store.test_conn().execute_batch(
                     "DROP TRIGGER fail_explicit_restart_quota",
                 ).unwrap();
-            }).await;
-            live.client.stop_session().await;
         })).await;
     }
 }
