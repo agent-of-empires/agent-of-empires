@@ -714,14 +714,19 @@ mod tests {
     fn capture_selection_witness_requires_an_applied_confirmed_cas() {
         struct CommitThenFail<'a>(&'a Storage);
         impl crate::session::SessionStore for CommitThenFail<'_> {
-            fn storage(&self) -> &Storage { self.0 }
+            fn storage(&self) -> &Storage {
+                self.0
+            }
             fn load(&self) -> Result<Vec<Instance>> {
                 crate::session::SessionStore::load(self.0)
             }
             fn check_available(&self) -> Result<()> {
                 crate::session::SessionStore::check_available(self.0)
             }
-            fn configuration(&self, profile: Option<&str>) -> Result<crate::session::config::Config> {
+            fn configuration(
+                &self,
+                profile: Option<&str>,
+            ) -> Result<crate::session::config::Config> {
                 crate::session::SessionStore::configuration(self.0, profile)
             }
             fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
@@ -729,20 +734,30 @@ mod tests {
                 Err(crate::session::SessionCommitApplied.into())
             }
             fn managed_capture_store_is_exclusive(
-                &self, current: &Instance, backend: crate::agents::SessionCaptureBackend,
+                &self,
+                current: &Instance,
+                backend: crate::agents::SessionCaptureBackend,
                 current_store: &std::path::Path,
             ) -> Result<bool> {
                 crate::session::SessionStore::managed_capture_store_is_exclusive(
-                    self.0, current, backend, current_store,
+                    self.0,
+                    current,
+                    backend,
+                    current_store,
                 )
             }
             fn commit_sandbox_checkpoint(
-                &self, checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
+                &self,
+                checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<
+                    '_,
+                >,
             ) -> Result<()> {
                 crate::session::SessionStore::commit_sandbox_checkpoint(self.0, checkpoint)
             }
             fn migrate_sandbox_store(
-                &self, id: &str, runtime: &crate::containers::ContainerRuntime,
+                &self,
+                id: &str,
+                runtime: &crate::containers::ContainerRuntime,
             ) -> Result<()> {
                 crate::session::SessionStore::migrate_sandbox_store(self.0, id, runtime)
             }
@@ -759,20 +774,30 @@ mod tests {
             let mut witness = inst.native_preparation_selection().unwrap();
             let original = witness;
             if case == "foreign-before-cas" {
-                storage.update(|rows, _| {
-                    rows[0].extra_args = "--peer-selection".into();
-                    Ok(())
-                }).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows[0].extra_args = "--peer-selection".into();
+                        Ok(())
+                    })
+                    .unwrap();
             }
             let path = format!("/tmp/transcript_{VALID_SID}.jsonl");
             let observed = crate::session::poller::SessionIdObservation::instance_sidecar(
-                VALID_SID.into(), Some(path),
+                VALID_SID.into(),
+                Some(path),
             );
             let failing = CommitThenFail(&storage);
-            let store: &dyn crate::session::SessionStore =
-                if case == "applied-io" { &failing } else { &storage };
+            let store: &dyn crate::session::SessionStore = if case == "applied-io" {
+                &failing
+            } else {
+                &storage
+            };
             let commit = persist_session_with_storage(
-                store, &inst.id, &observed, &inst.conversation_state(), Some(&mut witness),
+                store,
+                &inst.id,
+                &observed,
+                &inst.conversation_state(),
+                Some(&mut witness),
             );
             let durable = storage.load().unwrap().remove(0);
             match case {
@@ -943,7 +968,8 @@ mod tests {
         let observed =
             crate::session::poller::SessionIdObservation::instance_sidecar(VALID_SID.into(), None);
         assert_eq!(
-            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected, None).outcome,
+            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected, None)
+                .outcome,
             SidWrite::Skipped
         );
         assert!(storage.load().unwrap()[0].agent_session_id.is_none());
@@ -1019,7 +1045,8 @@ mod tests {
             let expected = inst.conversation_state();
 
             assert_eq!(
-                persist_session_with_storage(&storage, &inst.id, &observed, &expected, None).outcome,
+                persist_session_with_storage(&storage, &inst.id, &observed, &expected, None)
+                    .outcome,
                 SidWrite::Applied,
                 "{case}"
             );
@@ -1057,8 +1084,14 @@ mod tests {
         let expected = inst.conversation_state();
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected, None)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(OTHER_SID),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::PinnedForeign
         );
         let disk = storage.load().unwrap();
@@ -1066,8 +1099,14 @@ mod tests {
         assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected, None)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(VALID_SID),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::Applied,
             "the pin must still accept its own conversation"
         );
@@ -1687,8 +1726,14 @@ mod tests {
         let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
         let expected = storage.load().unwrap()[0].conversation_state();
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected, None)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(next_sid),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::Applied
         );
         assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(next_sid));

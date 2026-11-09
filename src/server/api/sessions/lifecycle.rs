@@ -3461,9 +3461,7 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((reservation, started, native, hooks, carry))))
-            if started.is_structured() =>
-        {
+        Ok(Ok(Some((reservation, started, native, hooks, carry)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
@@ -3491,13 +3489,7 @@ async fn prepare_agent_session_inner(
     let mut restart_identity = None;
     let adoption_state = state.clone();
     let result = match hooked {
-        Ok(Ok(Some((
-            reservation,
-            mut started,
-            native,
-            hooks,
-            conversation_carry,
-        )))) => {
+        Ok(Ok(Some((reservation, mut started, native, hooks, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
                 let generation = reservation.generation;

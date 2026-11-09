@@ -88,7 +88,13 @@ impl Instance {
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
-        let outcome = super::sid_persist::persist_session_with_storage(storage, &self.id, &observation, &self.conversation_state(), selection.as_deref_mut())
+        let outcome = super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &self.conversation_state(),
+            selection.as_deref_mut(),
+        )
         .outcome;
         if outcome != SidWrite::Skipped {
             return Some(outcome);
@@ -101,7 +107,13 @@ impl Instance {
             return Some(SidWrite::Failed);
         };
         Some(
-            super::sid_persist::persist_session_with_storage(storage, &self.id, &observation, &retry.conversation_state(), selection.as_deref_mut())
+            super::sid_persist::persist_session_with_storage(
+                storage,
+                &self.id,
+                &observation,
+                &retry.conversation_state(),
+                selection.as_deref_mut(),
+            )
             .outcome,
         )
     }

@@ -452,7 +452,13 @@ fn drain_and_persist_session_ids_inner(
                 let SessionIdGuard::OmpGeneration(generation) = &update.observation.guard else {
                     unreachable!("OMP pin confirmations require a generation guard");
                 };
-                Instance::persist_omp_pin_confirmation(storage, &update.id, &update.sid, generation, selection.as_deref_mut())
+                Instance::persist_omp_pin_confirmation(
+                    storage,
+                    &update.id,
+                    &update.sid,
+                    generation,
+                    selection.as_deref_mut(),
+                )
             } else {
                 persist_conversation_observation_to_store(
                     storage,
@@ -563,7 +569,11 @@ fn drain_and_persist_session_ids_inner(
                 } if update.observation.pi_session_path.as_deref() == Some(path.as_str())
             );
             if path_committed_with_sid
-                || stores.persist_pi_observation(inst, &update.observation, selection.as_deref_mut())?
+                || stores.persist_pi_observation(
+                    inst,
+                    &update.observation,
+                    selection.as_deref_mut(),
+                )?
             {
                 acknowledge_poller_observation(inst, &update.observation);
             }
@@ -585,7 +595,13 @@ fn drain_and_persist_session_ids_inner(
             inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
             inst.omp_capture_generation = rb.disk_omp_capture_generation.clone();
             if let Some(update) = update {
-                if !stale_same_sid && stores.persist_pi_observation(inst, &update.observation, selection.as_deref_mut())? {
+                if !stale_same_sid
+                    && stores.persist_pi_observation(
+                        inst,
+                        &update.observation,
+                        selection.as_deref_mut(),
+                    )?
+                {
                     acknowledge_poller_observation(inst, &update.observation);
                 }
             }

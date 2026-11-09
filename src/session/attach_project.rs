@@ -1077,7 +1077,11 @@ pub(crate) fn resume_after_conversion(
                         None,
                         false,
                         false,
-                        super::ResumeLaunchOptions { resume_policy: super::ResumeAttemptPolicy::HonorAutoResumeSetting, restart: true, conversation_carry: None },
+                        super::ResumeLaunchOptions {
+                            resume_policy: super::ResumeAttemptPolicy::HonorAutoResumeSetting,
+                            restart: true,
+                            conversation_carry: None,
+                        },
                     )
                 };
                 match outcome {

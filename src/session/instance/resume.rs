@@ -250,7 +250,9 @@ impl NativeStartAdmission {
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
         self.verify_context(instance)?;
-        let row = storage.load()?.into_iter()
+        let row = storage
+            .load()?
+            .into_iter()
             .find(|row| row.id == instance.id)
             .ok_or(LifecycleReservationError::Superseded)?;
         self.verify_context(&row)
@@ -834,11 +836,15 @@ impl Instance {
             if restart || revival.is_some() {
                 self.stop_and_flush_poller_lifecycle_locked(
                     storage,
-                    start_admission.as_mut().map(|admission| &mut admission.selection),
+                    start_admission
+                        .as_mut()
+                        .map(|admission| &mut admission.selection),
                 )?;
                 self.capture_omp_before_restart(
                     storage,
-                    start_admission.as_mut().map(|admission| &mut admission.selection),
+                    start_admission
+                        .as_mut()
+                        .map(|admission| &mut admission.selection),
                 )?;
             }
             if let Some(admission) = start_admission.as_ref() {
@@ -1409,7 +1415,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
-    async fn first_pi_ensure_accepts_own_final_capture_but_not_a_hook_selection_change() -> Result<()> {
+    async fn first_pi_ensure_accepts_own_final_capture_but_not_a_hook_selection_change(
+    ) -> Result<()> {
         use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
         if !crate::tmux::test_helpers::tmux_available() {
             return Ok(());
@@ -1442,16 +1449,23 @@ mod tests {
                 serde_json::to_string(&input.to_string_lossy())?,
             );
             let _path = crate::session::test_support::install_login_shell_path_command(
-                home.path(), "pi", &native,
+                home.path(),
+                "pi",
+                &native,
             );
             let mut row = Instance::new(&label, home.path().to_str().unwrap());
             row.source_profile = label.clone();
             row.tool = "pi".into();
             row.agent_session_id = Some(if same_sid { FINAL } else { BEFORE }.into());
             let storage = crate::session::Storage::new_unwatched(&label)?;
-            storage.update(|rows, _| { rows.push(row.clone()); Ok(()) })?;
+            storage.update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })?;
             let transcript = crate::session::instance::test_helpers::publish_host_pi_transcript(
-                &row.id, FINAL, home.path(),
+                &row.id,
+                FINAL,
+                home.path(),
             );
             let sessions = crate::session::get_profile_dir(&label)?.join("sessions.json");
             let hook_path = home.path().join(format!("{label}.hook.py"));
@@ -1462,36 +1476,70 @@ mod tests {
                     serde_json::to_string(&row.id)?,
                     serde_json::to_string(&serde_json::to_string(&ResumeIntent::Use(FOREIGN.into()))?)?,
                 )
-            } else { String::new() };
-            std::fs::write(&hook_path, format!(
-                "import json,os\nwith open({},'a') as log: log.write('hook\\n')\n{}",
-                serde_json::to_string(&hook_log.to_string_lossy())?, mutation,
-            ))?;
-            let hook = format!("{} {}",
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &hook_path,
+                format!(
+                    "import json,os\nwith open({},'a') as log: log.write('hook\\n')\n{}",
+                    serde_json::to_string(&hook_log.to_string_lossy())?,
+                    mutation,
+                ),
+            )?;
+            let hook = format!(
+                "{} {}",
                 crate::session::environment::shell_escape_script_word(&python.to_string_lossy()),
-                crate::session::environment::shell_escape_script_word(&hook_path.to_string_lossy()));
+                crate::session::environment::shell_escape_script_word(&hook_path.to_string_lossy())
+            );
             let config = crate::session::config::profile_config::get_profile_config_path(&label)?;
-            std::fs::write(config, format!("[hooks]\non_launch={}\n", serde_json::to_string(&[hook])?))?;
+            std::fs::write(
+                config,
+                format!("[hooks]\non_launch={}\n", serde_json::to_string(&[hook])?),
+            )?;
             let name = row.tmux_session()?.name().to_owned();
             let _pane = TmuxTestSession::from_name(&name);
             anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["-f","/dev/null","new-session","-d","-s",&name,"sleep 60"])
-                .output()?.status.success());
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &name,
+                    "sleep 60"
+                ])
+                .output()?
+                .status
+                .success());
             // Keep a real dead pane, not an absent name or prepared marker.
             // remain-on-exit must be configured before the terminating command.
             let pane = only_pane_id(&name);
             anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["set-option","-t",&name,"remain-on-exit","on"])
-                .output()?.status.success());
+                .args(["set-option", "-t", &name, "remain-on-exit", "on"])
+                .output()?
+                .status
+                .success());
             anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["respawn-pane","-k","-t",&pane,"exit 17"])
-                .output()?.status.success());
+                .args(["respawn-pane", "-k", "-t", &pane, "exit 17"])
+                .output()?
+                .status
+                .success());
             wait_for_pane_dead(&pane);
-            let original = crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
-                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?.0;
+            let original =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?
+                    .0;
             let result = row.orchestrate_resume_launch_in(
-                &storage, None, false, false,
-                ResumeLaunchOptions { resume_policy: ResumeAttemptPolicy::Allow, restart: false, conversation_carry: None },
+                &storage,
+                None,
+                false,
+                false,
+                ResumeLaunchOptions {
+                    resume_policy: ResumeAttemptPolicy::Allow,
+                    restart: false,
+                    conversation_carry: None,
+                },
             );
             assert_eq!(std::fs::read_to_string(&hook_log)?, "hook\n");
             let durable = storage.load_instances_complete()?.remove(0);
@@ -1499,24 +1547,38 @@ mod tests {
             assert_eq!(durable.pi_session_path.as_deref(), transcript.to_str());
             assert_eq!(durable.lifecycle_generation, 1);
             if foreign_hook {
-                assert!(result.as_ref().is_err_and(|error| error.is::<LifecycleReservationError>()), "{result:?}");
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.is::<LifecycleReservationError>()),
+                    "{result:?}"
+                );
                 assert_eq!(durable.resume_intent, ResumeIntent::Use(FOREIGN.into()));
                 assert!(!argv.exists() && !pid_file.exists() && !input.exists());
-                let retained = crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
-                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                let retained = crate::tmux::utils::observe_pane(
+                    &name,
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                )?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
                 assert_eq!(retained.0, original);
                 assert_eq!(retained.1, crate::tmux::utils::PaneProbe::Dead);
             } else {
                 assert_eq!(result?, StartOutcome::Resumed);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !argv.exists() {
-                    anyhow::ensure!(std::time::Instant::now() < deadline, "actual Pi child has not published argv");
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "actual Pi child has not published argv"
+                    );
                     std::thread::yield_now();
                 }
                 let args: Vec<String> = serde_json::from_slice(&std::fs::read(&argv)?)?;
-                assert!(args.windows(2).any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()));
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()));
                 let pid = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
-                let birth = crate::process::process_birth_identity(pid)?.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                let birth = crate::process::process_birth_identity(pid)?
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
                 assert!(crate::process::process_birth_is_live(pid, &birth)?);
                 assert!(!input.exists());
                 row.kill_clean_in(&storage)?;
@@ -1675,7 +1737,11 @@ mod tests {
             .finish_reserved_launch(
                 &storage,
                 None,
-                ResumeLaunchOptions { resume_policy: ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
+                ResumeLaunchOptions {
+                    resume_policy: ResumeAttemptPolicy::Allow,
+                    restart: true,
+                    conversation_carry: None,
+                },
                 PreparedLaunchReservation {
                     generation,
                     revival: None,

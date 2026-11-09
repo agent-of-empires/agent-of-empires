@@ -471,7 +471,13 @@ impl Instance {
         else {
             return Ok(());
         };
-        let commit = super::sid_persist::persist_session_with_storage(storage, &self.id, &observation, &self.conversation_state(), selection);
+        let commit = super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &self.conversation_state(),
+            selection,
+        );
         match commit.outcome {
             SidWrite::Applied => {
                 self.apply_conversation_observation(&observation);

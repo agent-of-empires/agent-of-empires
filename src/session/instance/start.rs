@@ -1699,7 +1699,6 @@ mod tests {
         }
     }
 
-
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -2032,11 +2031,25 @@ else:
             ];
             std::fs::write(&config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
             let hook_log = directory.path().join("launch-hooks");
-            let hook = format!("/bin/sh -c {}", crate::session::environment::shell_escape_script_word(
-                &format!("printf 'hook\\n' >> {}", crate::session::environment::shell_escape_script_word(&hook_log.to_string_lossy()))));
+            let hook = format!(
+                "/bin/sh -c {}",
+                crate::session::environment::shell_escape_script_word(&format!(
+                    "printf 'hook\\n' >> {}",
+                    crate::session::environment::shell_escape_script_word(
+                        &hook_log.to_string_lossy()
+                    )
+                ))
+            );
             use std::io::Write;
-            writeln!(std::fs::OpenOptions::new().append(true).open(&config).unwrap(),
-                "\n[hooks]\non_launch={}", serde_json::to_string(&[hook]).unwrap()).unwrap();
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&config)
+                    .unwrap(),
+                "\n[hooks]\non_launch={}",
+                serde_json::to_string(&[hook]).unwrap()
+            )
+            .unwrap();
             let mut instance = tool_instance("opencode", project.to_str().unwrap());
             instance.source_profile = profile.into();
             let parent = instance.asserted_resume_binding(PARENT, None).unwrap();
@@ -2172,14 +2185,34 @@ else:
             );
             let result = if commit_applied {
                 let storage = crate::session::Storage::new_unwatched(profile).unwrap();
-                let store = CommitThenFail { inner: &storage, armed: applied_fault.clone() };
-                let outcome = instance.orchestrate_resume_launch_in(
-                    &store, None, false, false,
-                    resume::ResumeLaunchOptions { resume_policy: resume::ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
-                ).map(|_| ());
-                assert!(!applied_fault.load(Ordering::SeqCst), "real post-commit fault must fire");
-                assert_eq!(outcome.as_ref().unwrap_err().downcast_ref::<LaunchPublicationFailure>(),
-                    Some(&LaunchPublicationFailure::Unconfirmed));
+                let store = CommitThenFail {
+                    inner: &storage,
+                    armed: applied_fault.clone(),
+                };
+                let outcome = instance
+                    .orchestrate_resume_launch_in(
+                        &store,
+                        None,
+                        false,
+                        false,
+                        resume::ResumeLaunchOptions {
+                            resume_policy: resume::ResumeAttemptPolicy::Allow,
+                            restart: true,
+                            conversation_carry: None,
+                        },
+                    )
+                    .map(|_| ());
+                assert!(
+                    !applied_fault.load(Ordering::SeqCst),
+                    "real post-commit fault must fire"
+                );
+                assert_eq!(
+                    outcome
+                        .as_ref()
+                        .unwrap_err()
+                        .downcast_ref::<LaunchPublicationFailure>(),
+                    Some(&LaunchPublicationFailure::Unconfirmed)
+                );
                 outcome
             } else if fail_adoption {
                 instance.restart_with_size_opts(None, false).map(|_| ())
@@ -2191,7 +2224,11 @@ else:
                 "case ({fail_adoption}, {fail_final}, {peer_pin}): {result:?}\n{}",
                 logs.contents()
             );
-            assert_eq!(result.is_ok(), !fail_final && !peer_pin && !commit_applied, "{result:?}");
+            assert_eq!(
+                result.is_ok(),
+                !fail_final && !peer_pin && !commit_applied,
+                "{result:?}"
+            );
             let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let disk = storage.load().unwrap().remove(0);
             // These fixture writes applied the desired child before confirmation failed.
@@ -2229,7 +2266,10 @@ else:
                         assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
                         assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
                     } else {
-                        assert_eq!(disk.agent_session_binding.as_ref().unwrap().session_id, CHILD);
+                        assert_eq!(
+                            disk.agent_session_binding.as_ref().unwrap().session_id,
+                            CHILD
+                        );
                         assert_eq!(disk.agent_session_id.as_deref(), Some(CHILD));
                         assert_eq!(disk.resume_intent, ResumeIntent::Default);
                     }
@@ -2278,16 +2318,31 @@ else:
                         assert_eq!(std::fs::read_to_string(&hook_log).unwrap(), "hook\n");
                         std::fs::remove_file(&record).unwrap();
                         std::fs::remove_file(record.with_extension("json.pid")).unwrap();
-                        let restarted = instance.orchestrate_resume_launch_in(
-                            &storage, None, false, false,
-                            resume::ResumeLaunchOptions { resume_policy: resume::ResumeAttemptPolicy::Allow, restart: true, conversation_carry: None },
-                        ).unwrap();
+                        let restarted = instance
+                            .orchestrate_resume_launch_in(
+                                &storage,
+                                None,
+                                false,
+                                false,
+                                resume::ResumeLaunchOptions {
+                                    resume_policy: resume::ResumeAttemptPolicy::Allow,
+                                    restart: true,
+                                    conversation_carry: None,
+                                },
+                            )
+                            .unwrap();
                         assert_eq!(restarted, StartOutcome::Resumed);
-                        assert!(!crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                        assert!(
+                            !crate::process::process_birth_is_live(native_pid, &native_birth)
+                                .unwrap()
+                        );
                         let new_births = births();
                         assert_eq!(new_births.len(), 2, "{new_births:?}");
-                        let new_pid = u32::try_from(new_births[1]["pid"].as_u64().unwrap()).unwrap();
-                        let new_birth = crate::process::process_birth_identity(new_pid).unwrap().unwrap();
+                        let new_pid =
+                            u32::try_from(new_births[1]["pid"].as_u64().unwrap()).unwrap();
+                        let new_birth = crate::process::process_birth_identity(new_pid)
+                            .unwrap()
+                            .unwrap();
                         assert!(crate::process::process_birth_is_live(new_pid, &new_birth).unwrap());
                         let after_restart = storage.load().unwrap().remove(0);
                         assert_eq!(after_restart.lifecycle_generation, generation + 1);

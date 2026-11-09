@@ -881,7 +881,12 @@ impl Instance {
                 "could not persist final conversation publication"
             )),
             _ if self.capture_poller.handle().is_some() => {
-                let mut drained = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(std::slice::from_mut(self), storage, selection.as_deref_mut());
+                let mut drained =
+                    crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                        std::slice::from_mut(self),
+                        storage,
+                        selection.as_deref_mut(),
+                    );
                 #[cfg(test)]
                 if let Some(hook) = take_after_final_pi_drain_hook() {
                     hook(self);
@@ -894,7 +899,12 @@ impl Instance {
                         inst.observation_is_current_pi_path(observation)
                     });
                 if retry_pi_path {
-                    let retried = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(std::slice::from_mut(self), storage, selection.as_deref_mut());
+                    let retried =
+                        crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                            std::slice::from_mut(self),
+                            storage,
+                            selection.as_deref_mut(),
+                        );
                     if drained.is_ok() {
                         drained = retried;
                     }
@@ -923,7 +933,10 @@ impl Instance {
                 self.native_preparation_selection()? == *expected,
                 super::LifecycleReservationError::Superseded
             );
-            let row = storage.load()?.into_iter().find(|row| row.id == self.id)
+            let row = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == self.id)
                 .ok_or(super::LifecycleReservationError::Superseded)?;
             anyhow::ensure!(
                 row.native_preparation_selection()? == *expected,
@@ -1345,8 +1358,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn final_pi_drain_advances_only_its_own_selection_witness() {
-        use std::sync::{Arc, Mutex};
         use crate::session::poller::{SessionIdObservation, SessionPoller};
+        use std::sync::{Arc, Mutex};
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -1359,14 +1372,22 @@ mod tests {
             inst.tool = "pi".into();
             inst.agent_session_id = Some(if same_sid { FINAL } else { OLD }.into());
             let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
-            storage.update(|rows, _| { rows.push(inst.clone()); Ok(()) }).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
             let transcript = publish_host_pi_transcript(&inst.id, FINAL, home.path());
             let observation = inst.final_publication_observation().unwrap();
             let poller = SessionPoller::new(
-                format!("test-tmux-{}", inst.id), inst.tool.clone(), inst.active_execution.clone(),
+                format!("test-tmux-{}", inst.id),
+                inst.tool.clone(),
+                inst.active_execution.clone(),
             );
             poller.inject_test_observation(&inst.id, observation);
-            inst.capture_poller.set_handle(Some(Arc::new(Mutex::new(poller))));
+            inst.capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(poller))));
             let mut selection = inst.native_preparation_selection().unwrap();
             let original = selection;
             let hook_profile = profile.clone();
@@ -1378,17 +1399,23 @@ mod tests {
                     peer.update(|rows, _| {
                         rows[0].resume_intent = crate::session::ResumeIntent::Use(OLD.into());
                         Ok(())
-                    }).unwrap();
+                    })
+                    .unwrap();
                 }
                 // Exercise the second, final Pi path drain with the same witness.
-                let mut observation = SessionIdObservation::instance_sidecar(
-                    FINAL.into(), Some(hook_path),
-                );
+                let mut observation =
+                    SessionIdObservation::instance_sidecar(FINAL.into(), Some(hook_path));
                 observation.execution = current.active_execution.clone();
-                current.capture_poller.handle().unwrap().lock().unwrap()
+                current
+                    .capture_poller
+                    .handle()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
                     .inject_test_observation(&current.id, observation);
             });
-            let result = inst.stop_and_flush_poller_lifecycle_locked(&storage, Some(&mut selection));
+            let result =
+                inst.stop_and_flush_poller_lifecycle_locked(&storage, Some(&mut selection));
             let durable = storage.load().unwrap().remove(0);
             assert_ne!(selection, original, "own capture must advance the witness");
             assert_eq!(durable.pi_session_path.as_deref(), transcript.to_str());
@@ -1397,7 +1424,10 @@ mod tests {
                 // Reloading a foreign pin must not re-seal the admitted selection.
                 assert_ne!(selection, durable.native_preparation_selection().unwrap());
                 assert!(result.is_err(), "{result:?}");
-                assert_eq!(durable.resume_intent, crate::session::ResumeIntent::Use(OLD.into()));
+                assert_eq!(
+                    durable.resume_intent,
+                    crate::session::ResumeIntent::Use(OLD.into())
+                );
             } else {
                 result.unwrap();
                 assert_eq!(selection, durable.native_preparation_selection().unwrap());
