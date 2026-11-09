@@ -1219,7 +1219,10 @@ mod tests {
             let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
             assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
             assert_eq!(disk[0].resume_binding, original_resume_binding);
-            assert_eq!(instances[0].conversation_state(), disk[0].conversation_state());
+            assert_eq!(
+                instances[0].conversation_state(),
+                disk[0].conversation_state()
+            );
             if with_witness {
                 assert_ne!(selection, original_selection);
                 assert_eq!(selection, disk[0].native_preparation_selection().unwrap());
