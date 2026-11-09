@@ -183,6 +183,12 @@ Content, size, or theme changes clear the previous text selection.
 Missing ranges do not trigger repeated transcript reloads while retained content
 is unchanged.
 
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for the storage and migration contract.
+
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation
 changes. Restore and permanent deletion never target a replacement selection.

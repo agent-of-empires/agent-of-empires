@@ -110,13 +110,18 @@ impl EventStore {
         }
         let table = self.schema.events_table();
         let (highest, lowest): (Option<i64>, Option<i64>) = tx.query_row(
-            &format!("SELECT MAX(seq), MIN(seq) FROM {table} WHERE session_id = ?1"),
+            &format!(
+                "SELECT
+                   (SELECT seq FROM {table} WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1),
+                   (SELECT seq FROM {table} WHERE session_id = ?1 ORDER BY seq ASC LIMIT 1)"
+            ),
             [session_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let highest_seq = highest.map(u64::try_from).transpose()?.unwrap_or(0);
         let lowest_seq = lowest.map(u64::try_from).transpose()?;
         let (comparison, order, cursor) = match before {
+            Some(before) if before > i64::MAX as u64 => ("<=", "DESC", before),
             Some(before) => ("<", "DESC", before),
             None => (">", "ASC", since),
         };
@@ -211,6 +216,31 @@ fn is_user_turn_boundary(ev: &Event) -> bool {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    #[test]
+    fn backward_cursors_above_sqlite_max_include_maximum_sequence() {
+        let (_tmp, store) = open_store(0);
+        let max = i64::MAX as u64;
+        store
+            .record("boundary", max - 1, &Event::ThinkingStarted)
+            .unwrap();
+        store
+            .record("boundary", max, &Event::ThinkingEnded)
+            .unwrap();
+        for (cursor, expected) in [
+            (max, vec![max - 1]),
+            (max + 1, vec![max - 1, max]),
+            (u64::MAX, vec![max - 1, max]),
+        ] {
+            assert_eq!(seqs(&store.replay_before("boundary", cursor)), expected);
+            let (page, _) = store
+                .retained_page("boundary", 0, Some(cursor), 10, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(seqs(&page.events), expected);
+            assert!(!page.has_more);
+        }
+    }
 
     #[test]
     fn forward_pages_reassemble_the_full_replay() {
