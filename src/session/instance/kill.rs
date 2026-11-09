@@ -198,7 +198,10 @@ impl Instance {
             let panes = crate::tmux::batch_pane_metadata()?;
             let (_, metadata) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
                 .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-            let identity = crate::tmux::ToolSession::legacy_identity(metadata)?;
+            let mut identity = crate::tmux::ToolSession::legacy_identity(metadata)?;
+            if metadata.pane_dead {
+                identity.pane_pid = metadata.pane_pid;
+            }
             let processes = if metadata.pane_dead {
                 None
             } else {

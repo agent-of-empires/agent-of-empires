@@ -1393,8 +1393,18 @@ mod tests {
             let foreign = std::rc::Rc::new(std::cell::Cell::new(None));
             let captured_foreign = foreign.clone();
             let profile = instance.source_profile.clone();
-            let _boundary =
-                crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(move |_| {
+            let _boundary = crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(
+                move |expected| {
+                    let raw_pid = pane_field(&expected.identity.pane_id, "#{pane_pid}");
+                    let observed_pid = if raw_pid.is_empty() {
+                        None
+                    } else {
+                        Some(raw_pid.parse::<u32>().unwrap())
+                    };
+                    assert_eq!(
+                        expected.identity.pane_pid, observed_pid,
+                        "corpse cleanup must preserve its real displayed PID without live handles",
+                    );
                     if superseded {
                         let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
                         let generation = storage
@@ -1414,7 +1424,8 @@ mod tests {
                             .unwrap();
                         captured_foreign.set(Some(generation));
                     }
-                });
+                },
+            );
             let refusal = instance.start_with_size_opts(None, true).unwrap_err();
             assert!(refusal.is::<LaunchIndeterminateCause>(), "{refusal:#}");
             assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());

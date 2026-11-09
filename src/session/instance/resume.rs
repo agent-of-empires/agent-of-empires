@@ -3385,8 +3385,8 @@ mod tests {
         instance.source_profile = "revival-split-race".into();
         let sid = "11111111-2222-4333-8444-555555555555";
         instance.agent_session_id = Some(sid.into());
-        seed_claude_transcript(&mut instance, sid);
         let _agent = install_fake_claude(root.path(), "#!/bin/sh\nexec sleep 60\n");
+        seed_claude_transcript(&mut instance, sid);
         let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
         storage
             .update(|rows, _| {
@@ -3443,8 +3443,8 @@ mod tests {
             instance.source_profile = "shared-dead-probe".into();
             let sid = "11111111-2222-4333-8444-555555555555";
             instance.agent_session_id = Some(sid.into());
-            seed_claude_transcript(&mut instance, sid);
             let _agent = install_fake_claude(root.path(), "#!/bin/sh\nexec sleep 60\n");
+            seed_claude_transcript(&mut instance, sid);
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
             storage
                 .update(|rows, _| {
