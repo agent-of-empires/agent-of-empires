@@ -105,6 +105,9 @@ jobs:
       # measured 336s -> 114s pinned to 4 cores, with identical results.
       # Raise this only with evidence; 4+ starts trading wall for flake risk on
       # the tests that wait on an ACP handshake.
+      - name: Build tests (web, e2e)
+        if: matrix.leg == 'web-e2e'
+        run: cargo test --features web,e2e-tests --test e2e --test integration --lib --no-run
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         env:
@@ -147,6 +150,9 @@ jobs:
       # skipped here while every non-e2e test binary stays auto-discovered.
       # nextest runs one process per test and the test binaries concurrently,
       # so no test can pass on state an earlier one left behind.
+      - name: Build tests (default features)
+        if: matrix.leg == 'core-rest'
+        run: cargo nextest run --no-run
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
         # Echo the temp root so a silently-dropped TMPDIR is visible in the log
@@ -185,13 +191,22 @@ jobs:
       # default-plugins off for lib/bin and selected lifecycle e2e tests (the
       # web leg covers the rest), then flag on/web off for all-targets.
       # e2e-tests includes its target in that compile sweep.
-      - name: Cargo test (bare core, no default features)
+      - name: Build tests (bare core)
         if: matrix.leg == 'bare-core'
         run: |
-          cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
+          cargo nextest run --no-default-features --features vendored --lib --bins --no-run
+          cargo test --no-default-features --features vendored,e2e-tests --test e2e --no-run
+      - name: Cargo test (bare core, lib + bins)
+        if: matrix.leg == 'bare-core'
+        run: cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
+      - name: Cargo test (bare core, selected e2e)
+        if: matrix.leg == 'bare-core'
+        run: |
           cargo test --no-default-features --features vendored,e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
-          cargo check --no-default-features --features vendored,default-plugins,e2e-tests --all-targets
+      - name: Cargo check (bare core + default-plugins, all targets)
+        if: matrix.leg == 'bare-core'
+        run: cargo check --no-default-features --features vendored,default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate
       # regression in build.rs fails here rather than silently reintroducing
@@ -340,6 +355,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Build tests (macOS)
+        run: |
+          cargo nextest run --features e2e-tests --lib --bins --test integration --no-run
+          cargo test --features e2e-tests --test e2e --no-run
       - name: Cargo test (macOS, lib + bins)
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
@@ -377,9 +396,12 @@ jobs:
       # Nothing ran it before, so both of its test files could rot unnoticed;
       # it rides this job because Node is already set up here. Seconds to run,
       # and it is deliberately not part of the coverage upload below.
+      - name: Install aoe-agent adapter dependencies
+        working-directory: acp-worker/aoe-agent
+        run: npm ci
       - name: aoe-agent adapter tests
         working-directory: acp-worker/aoe-agent
-        run: npm ci && npm test
+        run: npm test
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
