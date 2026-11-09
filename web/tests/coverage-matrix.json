@@ -226,7 +226,7 @@
       "risk": "medium",
       "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
-      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it."
+      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it. Retry reconnects; a per-session dismissal persists until a grid transport or a user-initiated reconnect."
     },
     {
       "id": "terminal.live-alt-screen-scroll",
@@ -1976,7 +1976,10 @@
         "src/hooks/useSessions.test.ts",
         "src/hooks/__tests__/useOrphanSweep.test.tsx",
         "src/hooks/useLastSessionRestore.test.tsx",
-        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/__tests__/TrashReadFailed.test.tsx",
+        "tests/session-trash-read-failure.spec.ts",
+        "tests/plugin-pages.spec.ts"
       ],
       "components": [
         "web/src/hooks/useSessions.ts",
@@ -1985,9 +1988,10 @@
         "web/src/lib/api.ts",
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/TrashReadFailed.tsx",
         "web/src/components/sidebar/TrashMenu.tsx"
       ],
-      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
+      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. A failed or timed-out trash read keeps the known rows and, for an opened session the list does not carry, shows an error with Retry instead of the skeleton or a gone screen; the next read that lands clears it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
     },
     {
       "id": "sidebar.trash-row-context-menu",
@@ -2799,6 +2803,7 @@
     },
     {
       "id": "acp.history-window",
+      "notes": "Warm-cache tests hold catch-up after cached messages are readable, verify the same rendered window survives completion, and exercise reconnect without new events. Canonical overlap updates do not discard the loaded prefix or reset the oldest cursor.",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": [
@@ -2911,6 +2916,7 @@
       "risk": "medium",
       "specs": [
         "tests/diff.spec.ts",
+        "src/lib/snippetHighlighter.themes.test.ts",
         "src/components/diff/find/findMatches.test.ts",
         "src/components/diff/find/changedLines.test.ts",
         "src/components/diff/find/FindBar.test.tsx",
@@ -2920,6 +2926,7 @@
       ],
       "components": [
         "web/src/components/diff/find/FindBar.tsx",
+        "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
       ]
     },
@@ -4051,6 +4058,14 @@
         "web/src/lib/sidebarAxis.ts"
       ],
       "notes": "Where the grouping draws repository headers (By repo, By organization, By repo and group) the section is \"Projects, no sessions\" and lists unpinned Projects without a live group; By group draws none, so it is \"Projects\" and lists every registered Project once, pinned or with live sessions included, a pinned row marked ◆ (#5065). Compact is \"Projects\" on every axis. The per-axis rule is axisDrawsRepoHeaders, a Record over SidebarAxis."
+    },
+    {
+      "id": "story.settings-paired-terminal-sizing",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"],
+      "notes": "Terminal UI sizing controls expose bounds and global scope and save sparse numeric patches."
     },
     {
       "id": "story.settings-tmux-select",

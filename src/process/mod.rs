@@ -273,9 +273,13 @@ pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
+pub(crate) use platform::{codex_managed_preferences_present, HAS_CODEX_MANAGED_PREFERENCES};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn codex_managed_preferences_present() -> bool {
+    true
+}
 
 /// System memory + agent-count sampling for the TUI diagnostics strip.
 pub(crate) mod metrics;
