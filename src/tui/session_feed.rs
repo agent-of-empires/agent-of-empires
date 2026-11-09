@@ -4717,6 +4717,7 @@ mod tests {
             Invalidation::Presence(PanePresence::Dead),
             Invalidation::Presence(PanePresence::Unknown),
             Invalidation::TargetName(None),
+            Invalidation::TargetName(Some("")),
             Invalidation::TargetName(Some("another-owned-target")),
         ] {
             let target = AuxiliaryTarget::Tool {
@@ -4821,10 +4822,11 @@ mod tests {
             let ready = prepared.result.try_recv().unwrap();
             assert_eq!(
                 ready.is_ok(),
-                matches!(
-                    invalidation,
-                    Invalidation::None | Invalidation::TargetName(_)
-                ),
+                matches!(invalidation, Invalidation::None)
+                    || matches!(
+                        invalidation,
+                        Invalidation::TargetName(Some(name)) if !name.is_empty()
+                    ),
                 "{invalidation:?}"
             );
             assert!(feed.can_submit("session"));

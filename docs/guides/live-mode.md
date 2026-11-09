@@ -63,6 +63,8 @@ Preparation also retains its original row and physical profile before it waits. 
 
 The original selected-context digest and physical profile are captured before a send waits for admission. A title or tmux-name change alone does not revoke an otherwise unchanged live physical owner: captured input and Agent readiness query the original server/session/pane IDs, not a newly resolved name. A transport that actually closes still refuses delivery without replay.
 
+An applied live target must still publish a non-empty tmux label together with its physical observation. A renamed label can retain the same physical owner; an absent or empty label is an unqualified target and refuses the waiting preparation, even when an older snapshot carried the physical observation.
+
 After launch exclusions are reacquired, the internal Created receipt retains its own physical observation and is checked against durable creation/generation, never a replacement seen through a stale daemon cache. Created is not a public `/ensure` status: HTTP returns `restarted` after launch and `alive` when reusing the captured runtime.
 
 If required conversation publication is known to have been refused after a new native birth, cleanup is limited to that owned birth under its current reservation and creation/generation fences; peer conversation pins are preserved. An uncertain commit is different: the exact bound store must be reconciled, and a possibly applied or unreadable publication does not authorize destroying the native runtime or replaying the request.
