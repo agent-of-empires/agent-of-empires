@@ -239,6 +239,34 @@ describe("ApprovalCard decisions", () => {
       expect(onResolve).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ["keyboard", "window blur"],
+      ["mouse", "window blur"],
+      ["keyboard", "page hidden"],
+    ])("cancels a %s hold on %s, where the release never reaches the card", (input, end) => {
+      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+      const onResolve = mount(makeApproval({ destructive: true }));
+      const button = screen.getByRole("button", { name: /Hold to allow/ });
+      if (input === "keyboard") fireEvent.keyDown(button, { key: " " });
+      else fireEvent.mouseDown(button);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      fireEvent(document, new Event("visibilitychange"));
+      expect(fill(button)).toBeGreaterThan(0);
+      if (end === "window blur") fireEvent.blur(window);
+      else {
+        hidden.mockReturnValue(true);
+        fireEvent(document, new Event("visibilitychange"));
+      }
+      expect(fill(button)).toBe(0);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+      hidden.mockRestore();
+    });
+
     it("can hold again after a rejected submit", async () => {
       const onResolve = mount(
         makeApproval({ destructive: true }),

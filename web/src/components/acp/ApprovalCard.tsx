@@ -81,7 +81,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     [onResolve],
   );
 
-  const clearHoldTimers = () => {
+  const clearHoldTimers = useCallback(() => {
     if (pressTimer.current) {
       clearTimeout(pressTimer.current);
       pressTimer.current = null;
@@ -90,7 +90,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       clearInterval(progressTimer.current);
       progressTimer.current = null;
     }
-  };
+  }, []);
 
   // `held` names the button currently under a hold, so a destructive
   // answer list can put the ring on whichever option is being pressed
@@ -131,16 +131,31 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 
   // Releasing retires the generation as well as the timers, so an
   // ambiguous multi-touch resolves nothing rather than the wrong thing.
-  const cancelLongPress = () => {
+  const cancelLongPress = useCallback(() => {
     holdGeneration.current += 1;
     clearHoldTimers();
     setHeld(null);
     setProgress(0);
-  };
+  }, [clearHoldTimers]);
+
+  // A key or button released after the window lost focus never reaches the
+  // card, so losing the window or hiding the page ends any hold in progress.
+  useEffect(() => {
+    if (held === null) return;
+    const onVisibility = () => {
+      if (document.hidden) cancelLongPress();
+    };
+    window.addEventListener("blur", cancelLongPress);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("blur", cancelLongPress);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [held, cancelLongPress]);
 
   // Space or Enter held on a focused button is the keyboard hold. Key
-  // repeat would restart it, so only the first keydown counts; release and
-  // blur cancel it like lifting a finger.
+  // repeat would restart it, so only the first keydown counts; release,
+  // button blur and window blur cancel it like lifting a finger.
   const isHoldKey = (e: KeyboardEvent) => e.key === " " || e.key === "Enter";
   const holdKeyDown = (e: KeyboardEvent, key: string, run: () => void) => {
     if (!isHoldKey(e)) return;

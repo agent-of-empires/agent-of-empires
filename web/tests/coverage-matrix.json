@@ -3627,7 +3627,15 @@
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
       "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
-      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release and blur cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
+      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release, button blur, window blur, and page hiding cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
+    },
+    {
+      "id": "acp.approval-hold-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-approval-hold.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"],
+      "notes": "In Chromium, a completed Space/Enter hold submits once and its release adds nothing; release, Tab, window blur, or page hiding before 800ms submits nothing."
     },
     {
       "id": "acp.plan-modal",
@@ -3635,7 +3643,7 @@
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
       "components": ["web/src/components/acp/PlanModal.tsx", "web/src/components/Dialog.tsx"],
-      "notes": "At 390px an answer list wraps the footer so Close, every answer, and Dismiss stay inside the panel."
+      "notes": "On a short 390px screen an answer list wraps inside a bounded, scrollable footer; every action stays inside the panel and Dismiss is reachable by scrolling."
     },
     {
       "id": "acp.markdown",

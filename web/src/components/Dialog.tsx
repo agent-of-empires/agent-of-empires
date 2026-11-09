@@ -56,7 +56,10 @@ export function Dialog({
         <div id={`${id}-desc`} className={bodyClassName}>
           {children}
         </div>
-        <div className="flex flex-wrap justify-end gap-3 px-5 py-3 border-t border-surface-700">{footer}</div>
+        {/* A wrapped footer scrolls within its bound so its last action stays reachable on short screens. */}
+        <div className="flex flex-wrap justify-end gap-3 px-5 py-3 border-t border-surface-700 max-h-[40vh] overflow-y-auto">
+          {footer}
+        </div>
       </div>
     </div>
   );

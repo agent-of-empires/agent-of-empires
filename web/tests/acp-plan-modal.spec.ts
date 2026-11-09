@@ -160,26 +160,54 @@ test("a plan file link closes the modal and leaves Tab alone while the approval 
   await expect(page.getByRole("alertdialog", { includeHidden: true })).toHaveCount(1);
 });
 
-test.describe("phone width", () => {
-  test.use({ viewport: { width: 390, height: 844 } });
+test.describe("short phone", () => {
+  test.use({ viewport: { width: 390, height: 560 } });
 
-  test("an answer list wraps the footer so every decision stays on screen", async ({ page }) => {
-    const answers = ["Yes, and auto-accept edits", "Yes, and manually approve edits", "No, keep planning"];
+  test("a long answer list scrolls the footer so the last action stays reachable", async ({ page }) => {
+    const answers = [
+      "Yes, and auto-accept edits",
+      "Yes, and manually approve edits",
+      "Yes, but only for this file",
+      "Yes, after running the tests",
+      "No, revise the plan first",
+      "No, keep planning",
+    ];
     const choice = {
       ...approval,
       choice: true,
       options: answers.map((name, i) => ({ option_id: `o-${i}`, name, kind: "allow_once" })),
     };
     const mock = await mockAcpSession(page, { title: TITLE, reducedState: { pending_approvals: [choice] } });
+    const decisions: unknown[] = [];
+    await page.route("**/api/sessions/*/acp/approvals/**", (r) => {
+      decisions.push(r.request().postDataJSON());
+      return r.fulfill({ json: {} });
+    });
     await openStructuredSession(page, mock);
     await page.getByRole("button", { name: "View plan" }).click();
     const dialog = page.getByRole("dialog", { name: "Plan" });
     const panel = (await dialog.locator("> div").boundingBox())!;
+    expect(panel.y + panel.height).toBeLessThanOrEqual(560);
     for (const name of ["Close", ...answers, "Dismiss"]) {
       const box = (await dialog.getByRole("button", { name, exact: true }).boundingBox())!;
       expect(box.x, name).toBeGreaterThanOrEqual(panel.x);
       expect(box.x + box.width, name).toBeLessThanOrEqual(panel.x + panel.width);
       expect(box.height, name).toBeLessThan(60);
     }
+
+    // The list overflows its bounded footer; wheeling over it brings Dismiss fully into view.
+    const footer = dialog.locator("> div > div").last();
+    expect(await footer.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+    const dismiss = dialog.getByRole("button", { name: "Dismiss", exact: true });
+    await expect(dismiss).not.toBeInViewport({ ratio: 1 });
+    await footer.hover();
+    await page.mouse.wheel(0, 1000);
+    await expect(dismiss).toBeInViewport({ ratio: 1 });
+    const bounds = (await footer.boundingBox())!;
+    const box = (await dismiss.boundingBox())!;
+    expect(box.y).toBeGreaterThanOrEqual(bounds.y);
+    expect(box.y + box.height).toBeLessThanOrEqual(bounds.y + bounds.height);
+    await dismiss.click();
+    await expect.poll(() => decisions).toEqual([{ decision: "Cancelled" }]);
   });
 });
