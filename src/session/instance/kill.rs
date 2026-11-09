@@ -112,7 +112,7 @@ impl Instance {
                 &self.id,
                 &observation,
                 &retry.conversation_state(),
-                selection.as_deref_mut(),
+                selection,
             )
             .outcome,
         )
