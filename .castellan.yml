@@ -45,3 +45,14 @@ prompt:
     - Changes to persisted data or paths need a migration in src/migrations/, not an inline compatibility path.
     - Tests are deterministic and isolated from user state; tests never reach the real network, they mock it.
     - Flag dead code and #[allow(dead_code)]; comments stay short and explain only non-obvious reasons.
+    - A new config field needs parity in toml, the TUI settings screen (FieldKey, SettingField, apply and clear arms, the matching *ConfigOverride, merge_configs) and the web SettingsView input with a test.
+    - A new migration must be registered in src/migrations/mod.rs with CURRENT_VERSION bumped, be idempotent, and log with tracing::info.
+    - Changes under src/cli/ regenerate docs/cli/reference.md; a new docs page is added to website/scripts/sync-docs.mjs and docsNav.ts.
+    - Every tracing macro carries an explicit target, uses field captures instead of format!, logs hot loops at trace, and never logs tokens, passphrases or credentialed URLs.
+    - Debug and release namespaces stay separate: no hardcoded app dir, aoe_ session prefix or port 8080/8081; secret files in the app dir are written with mode 0600.
+    - Cross-platform: use dirs::home_dir and std::env::temp_dir instead of reading HOME or hardcoding /tmp, join paths with PathBuf, and keep cfg(target_os) code in src/process/.
+    - Trust boundaries: WebSocket and mutating endpoints check auth and read-only mode, no user input is templated into shell or tmux strings, and sandbox bypass flags are never defaulted on.
+    - Web changes under web/src/ ship a Playwright or Vitest test and a coverage-matrix mapping; web logging uses clog with a web.client target, never console.log.
+    - New dependencies pin the latest stable release unless the PR justifies the older pin.
+    - Tmux tests use aoe_test_ or aoe_e2e_ session names and serial where they touch shared state; tests clean up and never read or write real user state.
+    - Flag features that belong in a plugin rather than core, and PRs that mix unrelated areas.
