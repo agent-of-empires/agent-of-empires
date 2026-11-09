@@ -933,6 +933,57 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_start_rearms_a_stopped_session_without_a_queue() {
+        use crate::session::Status;
+        use axum::{
+            extract::{Path, State},
+            response::IntoResponse,
+        };
+
+        let id = "sess-explicit-start";
+        let (_home, state, _project) = test_fixtures::test_state(id);
+        let stopped = {
+            let mut instances = state.instances.write().await;
+            instances[0].status = Status::Stopped;
+            instances[0].clone()
+        };
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &stopped.source_profile,
+            vec![stopped.clone()],
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut tick = test_fixtures::Tick::default();
+        tick.run(&state).await;
+        assert!(
+            tick.attempted.contains(id),
+            "stopped admission was attempted"
+        );
+        assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+
+        let response = crate::server::api::sessions::start_session(
+            State(Arc::clone(&state)),
+            Path(id.to_string()),
+            Ok(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tick.run(&state).await;
+        assert_eq!(
+            test_fixtures::startup_errors(&state, id),
+            1,
+            "explicit start must retry the fake agent without a queued prompt"
+        );
+        tick.run(&state).await;
+        assert_eq!(
+            test_fixtures::startup_errors(&state, id),
+            1,
+            "one explicit start must not create a retry loop"
+        );
+    }
+
     /// A launch-prep race (here: memory and disk disagree on the row) must not
     /// pin the session out of the resume set, or a queued prompt never drains.
     #[tokio::test]
