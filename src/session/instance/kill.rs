@@ -647,13 +647,24 @@ mod tests {
         assert_eq!(
             pane_field(
                 pane,
-                "#{session_windows}|#{window_panes}|#{window_linked_sessions}"
+                "#{session_windows}|#{window_panes}|#{window_linked}|#{window_linked_sessions}"
             ),
-            "1|1|2",
-            "one pane/window is shared by two real sessions"
+            "1|1|1|1",
+            "window_linked detects sharing even when linked_sessions counts one session group"
         );
         let context = pane_field(pane, "#{session_id}");
         let alias_id = pane_field(&format!("={}:", alias_session.name()), "#{session_id}");
+        let window = pane_field(pane, "#{window_id}");
+        let links = crate::tmux::tmux_command()
+            .args(["list-windows", "-a", "-F", "#{session_id}|#{window_id}"])
+            .output()
+            .unwrap();
+        assert!(links.status.success());
+        let links = std::str::from_utf8(&links.stdout).unwrap();
+        let owner_link = format!("{}|{window}", physical.identity.session_id);
+        let alias_link = format!("{alias_id}|{window}");
+        assert!(links.lines().any(|link| link == owner_link));
+        assert!(links.lines().any(|link| link == alias_link));
         let instance = if context == physical.identity.session_id {
             &owner
         } else {
