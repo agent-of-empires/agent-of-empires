@@ -2428,7 +2428,8 @@ mod tests {
         let observed = sup.running_lease(id).unwrap();
         sup.test_respawn_worker(id).await;
         assert!(matches!(
-            sup.shutdown_idle(id, Some(&observed)).await,
+            sup.shutdown_idle(id, Some((&observed, observed.admissions())))
+                .await,
             Err(SupervisorError::Superseded(_))
         ));
         assert_eq!(sup.take_unassigned_prompts(id).len(), 1);

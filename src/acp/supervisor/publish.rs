@@ -27,8 +27,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             reason: "user_stopped".into(),
         };
         for _ in 0..STOPPED_APPEND_ATTEMPTS {
-            let seq = next_seq(&self.next_seqs, session_id);
-            if self.sink.publish_persisted(session_id, seq, &event) {
+            if publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+                self.sink.publish_persisted(session_id, seq, &event)
+            }) {
                 return;
             }
         }

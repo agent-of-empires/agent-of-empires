@@ -443,11 +443,13 @@ impl AcpClient {
 
     /// Logs each prompt as its text plus `mime:data` per image attachment. An
     /// adapter still in `session/new` holds prompts until `released` is set;
-    /// the next command then logs them.
+    /// the next command then logs them. `received` logs each prompt on arrival,
+    /// so a test can tell a prompt delivered early from one released later.
     #[cfg(test)]
     pub fn fake_for_test_prompt_recording(
         session_id: AcpSessionId,
         prompts: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
+        received: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
         released: Arc<AtomicBool>,
     ) -> (Self, mpsc::Sender<Event>) {
         let mut held = Vec::new();
@@ -457,7 +459,7 @@ impl AcpClient {
                     Some(ContentBlock::Text(text)) => text.text.clone(),
                     _ => String::new(),
                 };
-                let attachments = blocks
+                let attachments: Vec<String> = blocks
                     .iter()
                     .filter_map(|block| match block {
                         ContentBlock::Image(image) => {
@@ -466,6 +468,10 @@ impl AcpClient {
                         _ => None,
                     })
                     .collect();
+                received
+                    .lock()
+                    .expect("received log")
+                    .push((text.clone(), attachments.clone()));
                 held.push((text, attachments));
             }
             if released.load(std::sync::atomic::Ordering::SeqCst) {
