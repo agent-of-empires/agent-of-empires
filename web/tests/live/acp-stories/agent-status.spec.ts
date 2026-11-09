@@ -1,6 +1,6 @@
 // Agent status surfaces: rate-limit parking, plan progress, and startup failures.
 
-import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
@@ -14,6 +14,7 @@ import {
   replayFrames,
   script,
   sessionIdByTitle,
+  seedTranscript,
   startAcpSession,
   waitForReplayContains,
 } from "../../helpers/acp";
@@ -247,6 +248,13 @@ test("account swap refuses a failed durable quota breadcrumb without replaying N
       },
     },
   });
+  seedTranscript(
+    serve.home,
+    realpathSync(before.project_path).replace(/[^a-zA-Z0-9-]/g, "-"),
+    before.acp_session_id!,
+    before.project_path,
+    original,
+  );
   const nativeLog = () => readFileSync(join(serve.home, "fake-acp.log"), "utf8");
   const inputs = () =>
     nativeLog()

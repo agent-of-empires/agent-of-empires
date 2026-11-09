@@ -1,10 +1,10 @@
 // Conversation identity: driven resets, importing Claude sessions, and keeping context across view switches.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
-import { postAcp, postPrompt, replayFrames, seedAcpSession, waitForAcpReady } from "../helpers/acp";
+import { postAcp, postPrompt, replayFrames, seedAcpSession, seedTranscript, waitForAcpReady } from "../helpers/acp";
 
 // A unit variant serializes as a bare string, others as a single-key object.
 type FrameEvent = string | Record<string, { acp_session_id?: string; reason?: string }>;
@@ -79,15 +79,6 @@ for (const c of [
       await expect.poll(persistedAcpSessionId, { timeout: 15_000, intervals: [250] }).toBe(freshId);
     }
   });
-}
-
-/** Write a one-line Claude transcript under `~/.claude/projects/<dir>/<sid>.jsonl`. */
-function seedTranscript(home: string, projectDirName: string, sid: string, cwd: string, text: string) {
-  const dir = join(home, ".claude", "projects", projectDirName);
-  mkdirSync(dir, { recursive: true });
-  mkdirSync(cwd, { recursive: true });
-  const line = JSON.stringify({ type: "user", cwd, message: { role: "user", content: [{ type: "text", text }] } });
-  writeFileSync(join(dir, `${sid}.jsonl`), `${line}\n`);
 }
 
 const replayText = async (serve: ServeHandle, sessionId: string) => {
