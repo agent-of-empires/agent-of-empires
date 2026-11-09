@@ -834,6 +834,12 @@ mod tests {
                 want,
                 "{env:?} {leaf} {id}"
             );
+            let qualified = inst.join(format!("status.{source}"));
+            if env == Some(source) && leaf == format!("session_id.{source}") && id == own {
+                assert_eq!(std::fs::read_to_string(qualified).unwrap(), format!("{own}|running"));
+            } else {
+                assert!(!qualified.exists(), "only the matching current host launch may publish readiness");
+            }
         }
     }
 

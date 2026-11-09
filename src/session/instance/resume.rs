@@ -4078,6 +4078,91 @@ exec sleep 60
         (guard, observation)
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn revival_retains_replacement_between_dead_observation_and_capture_return() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::tmux::test_helpers::{only_pane_id, pane_field, TmuxTestSession};
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for replacement_dead in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            }).unwrap();
+            let mut instance = Instance::new("dead-observation-replaced", root.path().to_str().unwrap());
+            instance.source_profile = "dead-observation-replaced".into();
+            instance.command = "exec sleep 60".into();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage.update(|rows, _| { rows.push(instance.clone()); Ok(()) }).unwrap();
+            let sentinel = TmuxTestSession::new("dead-observation-server-sentinel");
+            crate::tmux::Session::from_name(sentinel.name())
+                .create(root.path().to_str().unwrap(), Some("exec sleep 60"), &instance.source_profile)
+                .unwrap();
+            let (_old_guard, old) = observed_dead_resume_fixture(&instance);
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let requested = root.path().join("real-dead-observation-finished");
+            let ready = root.path().join("replacement-ready");
+            let actor_request = requested.clone();
+            let actor_ready = ready.clone();
+            let actor_row = instance.clone();
+            let old_pane = old.identity.pane_id.clone();
+            let actor = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !actor_request.exists() {
+                    assert!(std::time::Instant::now() < deadline, "physical dead observation must complete");
+                    std::thread::yield_now();
+                }
+                assert!(crate::tmux::tmux_command().args(["kill-pane", "-t", &old_pane])
+                    .status().unwrap().success());
+                let (guard, replacement) = if replacement_dead {
+                    observed_dead_resume_fixture(&actor_row)
+                } else {
+                    let session = actor_row.tmux_session().unwrap();
+                    let guard = TmuxTestSession::from_name(session.name());
+                    let replacement = session.create_with_size_env_and_container_env(
+                        &actor_row.project_path, Some("exec sleep 60"), None,
+                        &actor_row.source_profile, &[], &[], None,
+                    ).unwrap().unwrap();
+                    crate::tmux::test_helpers::wait_for_pane_command(&replacement.identity.pane_id, "sleep");
+                    (guard, replacement)
+                };
+                std::fs::write(&actor_ready, b"replacement physically installed").unwrap();
+                (guard, replacement)
+            });
+            let bin = root.path().join("tmux-race");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let stdout = root.path().join("real-dead-observation.stdout");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nMATCH=; for arg do case \"$arg\" in '#{{n:socket_path}}|'*) MATCH=1 ;; esac; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" > {}; R=$?\n[ \"$R\" -eq 0 ] || exit \"$R\"\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\ncat {}; exit \"$R\"\nfi\nexec {} \"$@\"\n",
+                quote(&requested.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+                quote(&stdout.to_string_lossy()), quote(&requested.to_string_lossy()),
+                quote(&ready.to_string_lossy()), quote(&stdout.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let result = instance.ensure_pane_ready();
+            let (_replacement_guard, replacement) = actor.join().unwrap();
+            assert!(matches!(result, Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })), "{result:?}");
+            assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
+            assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
+            assert_eq!(pane_field(&replacement.identity.pane_id, "#{pane_dead}"), if replacement_dead { "1" } else { "0" });
+            assert!(std::fs::read_to_string(stdout).unwrap().contains(&old.identity.pane_id));
+            if !replacement_dead {
+                let pid = replacement.identity.pane_pid.unwrap();
+                assert!(crate::process::process_birth_identity(pid).unwrap().is_some());
+            }
+        }
+    }
+
     fn add_live_probe_peer(pane: &str) -> (String, u32, crate::process::ProcessBirthIdentity) {
         let output = crate::tmux::tmux_command()
             .args([

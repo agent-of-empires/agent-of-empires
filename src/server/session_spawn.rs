@@ -785,11 +785,11 @@ pub(crate) async fn spawn_structured_session(
         drop(submission);
         drop(namespace);
         if let Err(error) = post_hooks {
-            if error.is::<crate::session::LaunchFinalizationPending>() {
+            if let Some(pending) = error.downcast_ref::<crate::session::LaunchFinalizationPending>() {
                 native.defer_lifecycle_release(
                     instance.id.clone(),
                     crate::session::LifecycleRelease::IndeterminateLaunch,
-                    generation,
+                    pending.generation,
                     None,
                 );
                 return Err(error);

@@ -3033,6 +3033,62 @@ mod tests {
             );
             assert_eq!(crate::process::process_birth_identity(pid)?, Some(birth));
             recovered.runtime.work.drain().await;
+        } else {
+            use clap::Parser;
+            #[derive(Parser)]
+            struct SessionCli {
+                #[command(subcommand)]
+                command: crate::cli::session::SessionCommands,
+            }
+            state.runtime.work.drain().await;
+            let storage = crate::session::Storage::open_unwatched("default")?;
+            let old_key = handoff_key(&durable)?;
+            let old_pane = crate::tmux::test_helpers::only_pane_id(&name);
+            let old_pid = crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
+            let old_birth = crate::process::process_birth_identity(old_pid)?
+                .expect("unproven birth still names a real live process");
+            storage.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == source.id).unwrap();
+                row.terminal_handoff.as_mut().unwrap().stage = HandoffStage::ProjectionCleanupOwed;
+                Ok(())
+            })?;
+            let select_fresh = || SessionCli::try_parse_from([
+                "aoe-session", "set-session-id", source.id.as_str(), "",
+            ]);
+            assert!(crate::cli::session::run("default", select_fresh()?.command).await.is_err());
+            assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
+            let refused = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            assert_eq!(handoff_key(&refused)?, old_key);
+            assert_eq!(refused.terminal_handoff.as_ref().unwrap().stage, HandoffStage::ProjectionCleanupOwed);
+            drop(_path);
+            anyhow::ensure!(
+                crate::tmux::tmux_command().args(["kill-pane", "-t", &old_pane]).output()?.status.success(),
+                "operator must explicitly close the exact unproven pane"
+            );
+            assert!(crate::tmux::agent_pane_metadata_in(&crate::tmux::batch_pane_metadata()?, &source.id, &source.title)?.is_none());
+            crate::cli::session::run("default", select_fresh()?.command).await?;
+            let selected = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            let renewed = selected.terminal_handoff.as_ref().unwrap();
+            assert_eq!(renewed.id, old_key.id);
+            assert!(renewed.generation > old_key.generation);
+            assert_eq!(renewed.target_generation, renewed.generation);
+            assert_eq!(renewed.stage, HandoffStage::TerminalLaunchOwed);
+            assert!(matches!(renewed.context, HandoffContext::Discard));
+            assert!(renewed.launch.as_ref().unwrap().receipt.is_none());
+            assert!(events.replay_from(&source.id, 0).iter().any(|(seq, _)| *seq == sentinel));
+            let response = terminal_handoff_request(state.clone(), source.id.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let completed = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            assert!(completed.terminal_handoff.is_none());
+            assert!(completed.lifecycle_reservation.is_none());
+            assert!(completed.lifecycle_generation > renewed.generation);
+            let new_pane = crate::tmux::test_helpers::only_pane_id(&name);
+            assert_ne!(new_pane, old_pane);
+            let repeat = terminal_handoff_request(state.clone(), source.id.clone()).await;
+            assert_eq!(repeat.status(), StatusCode::OK);
+            assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), new_pane);
+            assert!(events.replay_from(&source.id, 0).is_empty());
+            state.runtime.work.drain().await;
         }
         Ok(())
     }
