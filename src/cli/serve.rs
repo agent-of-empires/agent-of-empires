@@ -557,15 +557,19 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
         LaunchMode::Tcp
     };
     args.resolve_launch(Some(requested))?;
-    match daemon_status() {
+    match tokio::task::spawn_blocking(daemon_status).await? {
         DaemonStatus::Verified(pid) if pid != std::process::id() => {
             transaction = migrate_managed_launch(transaction, false).await?;
-            let launch = managed_launch(pid)?;
+            let launch = tokio::task::spawn_blocking(move || managed_launch(pid)).await??;
             if !launch.core_only || args.core_only || args.daemon_child {
                 return Err(daemon_running_error(pid));
             }
             validate_launch_args(profile, args).await?;
-            let passphrase = recall_serve_passphrase(&launch)?;
+            let (launch, passphrase) = tokio::task::spawn_blocking(move || {
+                let passphrase = recall_serve_passphrase(&launch)?;
+                Ok::<_, anyhow::Error>((launch, passphrase))
+            })
+            .await??;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
             tracing::info!(
                 target: "serve.lifecycle",
@@ -1735,7 +1739,10 @@ pub(crate) async fn start_dashboard_for_tui(
             validate_launch_args(profile, &args).await?;
             drop(lock);
             start_daemon(profile, &args, &transaction, false).await?;
-            managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
+            tokio::task::spawn_blocking(|| {
+                managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)
+            })
+            .await??
         };
         Ok::<_, anyhow::Error>(launch)
     }
@@ -1752,13 +1759,13 @@ async fn connect_owned_dashboard(
     predecessor_epoch: Option<&str>,
     launch: ServeLaunch,
 ) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
-    let target = (|| {
+    let target = async {
         anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
         let instance = launch
             .instance_id
             .as_deref()
             .context("Successor instance proof is missing")?;
-        let target = tui_control_target()?;
+        let target = tokio::task::spawn_blocking(tui_control_target).await??;
         anyhow::ensure!(
             target.process.as_ref().is_some_and(|(pid, _, owner)| {
                 *pid == launch.pid && owner.as_deref() == Some(instance)
@@ -1766,7 +1773,8 @@ async fn connect_owned_dashboard(
             "Dashboard successor identity changed before reconnect"
         );
         Ok::<_, anyhow::Error>(target)
-    })()
+    }
+    .await
     .map_err(|error| TuiDashboardLaunchFailure {
         error,
         target: None,
@@ -1796,7 +1804,7 @@ async fn connect_owned_dashboard(
         );
         let client = endpoint.daemon_client()?;
         anyhow::ensure!(
-            tui_control_target()? == target,
+            tokio::task::spawn_blocking(tui_control_target).await?? == target,
             "Dashboard successor identity changed before observation"
         );
         Ok::<_, anyhow::Error>((connection, client))
@@ -1825,7 +1833,7 @@ async fn start_daemon(
     let profile = resolved_profile.as_deref().unwrap_or(profile);
 
     let _state_lock = lock_serve_state()?;
-    if let Some(existing) = daemon_pid() {
+    if let Some(existing) = tokio::task::spawn_blocking(daemon_pid).await? {
         bail!("aoe serve daemon already running (PID {existing}); not starting another");
     }
     let exe = std::env::current_exe()?;
@@ -2003,21 +2011,30 @@ async fn start_daemon(
     let log = stdio_redirect_path()
         .map(|p| format!(" See {}.", p.display()))
         .unwrap_or_default();
+    let owner = std::sync::Arc::new((launch.instance_id, birth));
     let ready = await_daemon_ready(
         pid,
         &log,
         tokio::time::Instant::now() + readiness,
         || Ok(child.try_wait()?),
         || {
-            Box::pin(async {
-                client.local_daemon_ready(pid).await.unwrap_or(false)
-                    && daemon_pid() == Some(pid)
-                    && launch
-                        .instance_id
-                        .as_deref()
-                        .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
-                    && crate::process::process_birth_identity(pid)
-                        .is_ok_and(|current| current.as_ref() == Some(&birth))
+            let owner = std::sync::Arc::clone(&owner);
+            let client = &client;
+            Box::pin(async move {
+                if !client.local_daemon_ready(pid).await.unwrap_or(false) {
+                    return false;
+                }
+                tokio::task::spawn_blocking(move || {
+                    let (instance_id, birth) = owner.as_ref();
+                    daemon_pid() == Some(pid)
+                        && instance_id
+                            .as_deref()
+                            .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                        && crate::process::process_birth_identity(pid)
+                            .is_ok_and(|current| current.as_ref() == Some(birth))
+                })
+                .await
+                .is_ok_and(|ready| ready)
             })
         },
     )
@@ -2133,7 +2150,7 @@ async fn restart_under_transaction(
     override_args: Option<ServeArgs>,
     announce: bool,
 ) -> Result<ServeLaunch> {
-    let Some(pid) = daemon_pid() else {
+    let Some(pid) = tokio::task::spawn_blocking(daemon_pid).await? else {
         bail!(
             "No running aoe serve daemon to restart.\n\
              Start one with: aoe serve --daemon"
@@ -2141,8 +2158,12 @@ async fn restart_under_transaction(
     };
     let transaction = migrate_managed_launch(transaction, false).await?;
 
-    let launch = managed_launch(pid)?;
-    let predecessor_passphrase = recall_serve_passphrase(&launch)?;
+    let (launch, predecessor_passphrase) = tokio::task::spawn_blocking(move || {
+        let launch = managed_launch(pid)?;
+        let passphrase = recall_serve_passphrase(&launch)?;
+        Ok::<_, anyhow::Error>((launch, passphrase))
+    })
+    .await??;
     let mut args = match override_args {
         Some(requested) => launch.overlay_tui_args(requested),
         None => launch.to_serve_args(None),
@@ -2162,9 +2183,12 @@ async fn restart_under_transaction(
     stop_daemon_locked(&transaction, announce).await?;
     let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
-    let new_pid = daemon_pid().context("Restart successor is unavailable")?;
-    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");
-    managed_launch(new_pid)
+    let successor = tokio::task::spawn_blocking(|| {
+        managed_launch(daemon_pid().context("Restart successor is unavailable")?)
+    })
+    .await??;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid = successor.pid, "daemon restarted");
+    Ok(successor)
 }
 
 fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
@@ -2273,7 +2297,9 @@ impl TuiControlLease {
     ) -> Result<Self> {
         let transaction = tui_lifecycle_transaction(cancel).await?;
         anyhow::ensure!(
-            !cancel.is_cancelled() && tui_control_target()? == target,
+            !cancel.is_cancelled()
+                && tokio::task::spawn_blocking(tui_control_target).await?? == target
+                && !cancel.is_cancelled(),
             "Daemon identity changed before control admission; preserving its successor"
         );
         Ok(Self {
@@ -2467,9 +2493,16 @@ async fn stop_daemon_locked(
         .context("Daemon exited before its physical identity could be captured; retry stop")?;
     let process = crate::process::CapturedProcess::capture(pid as u32, &birth)?
         .context("Daemon incarnation changed before shutdown; preserving serve state")?;
-    match inspect_daemon_process(pid) {
+    let (identity, contradicts) = tokio::task::spawn_blocking(move || {
+        let identity = inspect_daemon_process(pid);
+        let contradicts = matches!(identity, DaemonProcessIdentity::Verified)
+            && serve_launch_contradicts(pid as u32);
+        (identity, contradicts)
+    })
+    .await?;
+    match identity {
         DaemonProcessIdentity::Verified => {
-            if serve_launch_contradicts(pid as u32) {
+            if contradicts {
                 bail!(
                     "PID {} is an aoe serve process, but not the daemon recorded in \
                      serve.launch (recycled PID); preserving serve state.",
@@ -3926,6 +3959,266 @@ mod tests {
         )
         .await?;
         lease.stop().await?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tui_control_inspection_keeps_the_async_executor_reactive() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+        use std::os::unix::process::CommandExt;
+
+        let python = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import os,sys; print(os.path.realpath(sys.executable))",
+            ])
+            .output();
+        let Ok(python) = python else {
+            eprintln!("python3 unavailable; skipping process-inspection fixture");
+            return Ok(());
+        };
+        anyhow::ensure!(
+            python.status.success(),
+            "python3 fixture interpreter failed"
+        );
+        let python = String::from_utf8(python.stdout)?.trim().to_owned();
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("AOE_TUI_PS_TEST_CHILD").is_none() {
+            let available = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                    "true",
+                ])
+                .output();
+            if !available.is_ok_and(|output| output.status.success()) {
+                eprintln!(
+                    "private process namespace unavailable; skipping process-inspection fixture"
+                );
+                return Ok(());
+            }
+            let name = format!(
+                "{}::tui_control_inspection_keeps_the_async_executor_reactive",
+                module_path!().split_once("::").unwrap().1
+            );
+            let output = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe()?)
+                .args(["--exact", &name, "--nocapture"])
+                .env("AOE_TUI_PS_TEST_CHILD", "1")
+                .env("TMPDIR", "/tmp")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "private process-inspection fixture failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let map = std::fs::read_to_string("/proc/self/uid_map")?;
+            anyhow::ensure!(
+                std::process::id() == 1
+                    && map
+                        .lines()
+                        .all(|line| line.split_whitespace().last() == Some("1")),
+                "process-inspection fixture requires its private namespaces"
+            );
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["-t", "tmpfs", "-o", "mode=0700", "tmpfs", "/tmp"])
+                    .status()?
+                    .success(),
+                "could not create a trusted private runtime directory"
+            );
+            let jail = std::path::Path::new("/tmp/process-inspection-root");
+            std::fs::create_dir(jail)?;
+            let interpreter_root = std::path::Path::new(&python)
+                .components()
+                .nth(1)
+                .context("fixture interpreter has no absolute root")?
+                .as_os_str();
+            for name in ["usr", "bin", "lib", "lib64", "etc", "dev", "proc", "home"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .chain(std::iter::once(interpreter_root))
+            {
+                let destination = jail.join(name);
+                if destination.exists() {
+                    continue;
+                }
+                std::fs::create_dir(&destination)?;
+                anyhow::ensure!(
+                    std::process::Command::new("mount")
+                        .arg("--rbind")
+                        .arg(std::path::Path::new("/").join(name))
+                        .arg(&destination)
+                        .status()?
+                        .success(),
+                    "could not bind private fixture dependency {name:?}"
+                );
+            }
+            std::fs::create_dir(jail.join("tmp"))?;
+            std::fs::create_dir(jail.join("run"))?;
+            nix::unistd::chroot(jail)?;
+            std::env::set_current_dir("/")?;
+        }
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        struct ProcMask(std::path::PathBuf);
+        #[cfg(target_os = "linux")]
+        impl Drop for ProcMask {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount").arg(&self.0).status();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::TempDir::new_in("/tmp")?;
+        let fifo = fixture.path().join("serve");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let child = ChildGuard(
+            std::process::Command::new("cat")
+                .arg0("aoe")
+                .arg("serve")
+                .current_dir(fixture.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+        );
+        let birth = crate::process::process_birth_identity(child.0.id())?
+            .context("fixture has no kernel birth identity")?;
+        let target = TuiControlTarget {
+            process: Some((child.0.id(), birth, None)),
+        };
+        std::fs::write(pid_file_path()?, child.0.id().to_string())?;
+        #[cfg(target_os = "linux")]
+        let _mask = {
+            let proc = std::path::PathBuf::from(format!("/proc/{}", child.0.id()));
+            let shadow = fixture.path().join("proc");
+            std::fs::create_dir(&shadow)?;
+            std::fs::copy(proc.join("stat"), shadow.join("stat"))?;
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["--bind"])
+                    .arg(&shadow)
+                    .arg(&proc)
+                    .status()?
+                    .success(),
+                "could not isolate the fixture's process-inspection fallback"
+            );
+            ProcMask(proc)
+        };
+        let started_path = fixture.path().join("started.sock");
+        let started = UnixDatagram::bind(&started_path)?;
+        started.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let release_path = fixture.path().join("release");
+        nix::unistd::mkfifo(
+            &release_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_path)?;
+        let program = fixture.path().join("ps");
+        std::fs::write(&program, format!(
+            "#!{python}\nimport os,socket\ns=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)\ns.sendto(str(os.getpid()).encode(),{started_path:?})\nwith open({release_path:?}) as gate: gate.readline()\nprint('aoe serve')\n",
+        ))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let mut path = vec![fixture.path().to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let _path =
+            crate::session::test_support::EnvGuard::set(&[("PATH", std::env::join_paths(path)?)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        for cancel_during_inspection in [false, true] {
+            let started = started.try_clone()?;
+            let mut release = release.try_clone()?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_worker = cancel.clone();
+            let (wake, entered) = tokio::sync::oneshot::channel();
+            let (ticked, tick) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || -> Result<(bool, bool)> {
+                let mut bytes = [0; 32];
+                let observed = started.recv(&mut bytes).ok().and_then(|length| {
+                    std::str::from_utf8(&bytes[..length])
+                        .ok()?
+                        .parse::<i32>()
+                        .ok()
+                });
+                let _ = wake.send(());
+                let progressed = tick
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                let alive = observed.is_some_and(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                });
+                if cancel_during_inspection {
+                    cancel_worker.cancel();
+                }
+                release.write_all(b"continue\n")?;
+                Ok((observed.is_some(), progressed && alive))
+            });
+            let result = runtime.block_on(async {
+                let ticker = tokio::spawn(async move {
+                    let _ = entered.await;
+                    let _ = ticked.send(());
+                });
+                let result = TuiControlLease::prepare(target.clone(), &cancel).await;
+                ticker.await.unwrap();
+                result
+            });
+            let (entered, responsive) = observer.join().unwrap()?;
+            assert!(
+                entered,
+                "retained ps fixture was not entered: {:?}",
+                result.as_ref().err().map(|error| format!("{error:#}"))
+            );
+            assert!(
+                responsive,
+                "executor progressed only after the retained ps exited"
+            );
+            match result {
+                Ok(lease) => {
+                    assert!(!cancel_during_inspection);
+                    assert_eq!(lease.target, target);
+                }
+                Err(error) => assert!(cancel_during_inspection, "{error:#}"),
+            }
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.0.id() as i32), None).is_ok()
+        );
         Ok(())
     }
 }

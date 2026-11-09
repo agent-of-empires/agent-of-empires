@@ -234,7 +234,7 @@ impl ServeLaunchRequest {
             unreachable!();
         };
         args.passphrase = self.passphrase.clone();
-        let result = crate::cli::serve::start_dashboard_for_tui(
+        let mut result = crate::cli::serve::start_dashboard_for_tui(
             &profile,
             args,
             predecessor_epoch.as_deref(),
@@ -247,7 +247,28 @@ impl ServeLaunchRequest {
         }
         // A failed reconnect can follow a successor that already runs the new passphrase.
         if let Some(passphrase) = self.passphrase {
-            if result.is_ok() || crate::cli::serve::daemon_runs_passphrase(&passphrase) {
+            let (passphrase, running) = if result.is_ok() {
+                (passphrase, true)
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    let running = crate::cli::serve::daemon_runs_passphrase(&passphrase);
+                    (passphrase, running)
+                })
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        if let Err(failure) = &mut result {
+                            let _ = std::fmt::Write::write_fmt(
+                                &mut failure.message,
+                                format_args!("\nCould not verify the rotated passphrase: {error}"),
+                            );
+                        }
+                        return result;
+                    }
+                }
+            };
+            if running {
                 save_passphrase_to_disk(&passphrase);
             }
         }
