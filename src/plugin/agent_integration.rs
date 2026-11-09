@@ -385,23 +385,20 @@ fn declared_agent_in(
     generation: u64,
     tool: &str,
 ) -> Option<&'static AgentDef> {
-    if let Some((cached_generation, cached)) = DECLARED_AGENT_CACHE
+    let mut cache = DECLARED_AGENT_CACHE
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(tool)
-        .copied()
-    {
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((cached_generation, cached)) = cache.get(tool).copied() {
         if cached_generation == generation {
             return cached;
         }
     }
+    // Resolve under the lock so concurrent misses publish one canonical value:
+    // `declared_launch_words` compares this identity by pointer. The entry also
+    // carries the generation it resolved against, so a lookup that raced a
+    // reload is discarded instead of outliving it.
     let resolved = declared_for(registry, tool).map(build_declared_agent);
-    // The entry carries the generation of the snapshot it resolved against, so a
-    // lookup that raced a reload is discarded instead of outliving it.
-    DECLARED_AGENT_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(tool.to_string(), (generation, resolved));
+    cache.insert(tool.to_string(), (generation, resolved));
     resolved
 }
 
@@ -1329,6 +1326,17 @@ command = "ACME_TOKEN=local acme-helper --serve"
             ))
         );
         assert_eq!(declared_launch_words("claude"), None);
+        // One canonical identity per tool and generation: the launch words are
+        // keyed on pointer equality with the catalog entry.
+        let declared = declared_agent("acme-helper").expect("declared agent");
+        assert!(std::ptr::eq(
+            declared,
+            crate::agents::get_agent("acme-helper").expect("catalog entry")
+        ));
+        assert!(std::ptr::eq(
+            declared,
+            declared_agent("acme-helper").unwrap()
+        ));
     }
 
     #[test]

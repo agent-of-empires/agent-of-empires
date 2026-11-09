@@ -1903,8 +1903,9 @@ impl Instance {
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
         let command = self.get_tool_command();
-        let assignments = aoe_plugin_api::agent_integration::launch_prefix(command)
-            .map_or(0, |(_, assignments)| assignments);
+        // A command with no executable is not a managed launch; the argument
+        // scan below still reports the unsupported shape.
+        let assignments = shell_launch_prefix(command).map_or(0, |(_, assignments)| assignments);
         let mut words =
             shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
         words.extend(
@@ -1940,9 +1941,7 @@ impl Instance {
             "managed conversation requires an immutable container execution identity"
         );
         let command = self.get_tool_command();
-        let (_, assignments) = aoe_plugin_api::agent_integration::launch_prefix(command)
-            .context("native launch must start with a literal executable")?;
-        let words = shell_words::split(command)?;
+        let (words, assignments) = shell_launch_prefix(command)?;
         let program = inputs.resolve_program(
             words
                 .get(assignments)
@@ -3098,12 +3097,39 @@ impl Instance {
     }
 }
 
+/// The shell-decoded words of a native launch command, and how many leading
+/// `NAME=value` words the shell reads as assignments.
+///
+/// Native commands come from user configuration, so quoting is allowed and the
+/// shell decodes it before launching. Callers refuse active shell syntax first,
+/// so these are the words the launch runs.
+fn shell_launch_prefix(command: &str) -> Result<(Vec<String>, usize)> {
+    let words =
+        shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
+    let assignments = words
+        .iter()
+        .take_while(|word| {
+            word.split_once('=')
+                .is_some_and(|(key, _)| valid_assignment_key(key))
+        })
+        .count();
+    anyhow::ensure!(
+        words.get(assignments).is_some(),
+        "native launch must start with an executable"
+    );
+    Ok((words, assignments))
+}
+
+fn valid_assignment_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Split a literal launch command and swap in the resolved executable, keeping
 /// any leading environment assignments in front of it.
 fn freeze_launch_words(command: &str, program: &std::path::Path) -> Result<Vec<String>> {
-    let (_, assignments) = aoe_plugin_api::agent_integration::launch_prefix(command)
-        .context("native program is missing")?;
-    let mut words = shell_words::split(command)?;
+    let (mut words, assignments) = shell_launch_prefix(command)?;
     *words
         .get_mut(assignments)
         .context("native program is missing")? = program
@@ -3850,6 +3876,28 @@ mod tests {
         assert_eq!(
             freeze_launch_words("omp --model x", program).expect("literal launch"),
             vec!["/resolved/omp", "--model", "x"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_preparation_accepts_a_shell_quoted_executable() {
+        use crate::session::instance::test_helpers::tool_instance;
+        let temp = tempfile::tempdir().unwrap();
+        let mut instance = tool_instance("claude", temp.path().to_str().unwrap());
+        instance.command = "PATH=/opt/agents/bin 'claude'".into();
+        let agent = crate::agents::get_agent("claude").expect("built-in agent");
+        assert_eq!(instance.managed_user_argv(agent).unwrap(), None);
+
+        let program = std::path::Path::new("/resolved/my tools/claude");
+        assert_eq!(
+            freeze_launch_words("PATH=/opt/agents/bin \"claude\" --verbose", program)
+                .expect("quoted launch"),
+            vec![
+                "PATH=/opt/agents/bin",
+                "/resolved/my tools/claude",
+                "--verbose"
+            ]
         );
     }
 
