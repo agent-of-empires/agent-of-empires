@@ -111,6 +111,22 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Retained history consistency
+
+Retained page identity combines the event-store incarnation with the session
+revision. Every append or replacement invalidates the complete snapshot.
+Bounds and identity are read in one SQLite transaction; independent indexed
+first/last lookups avoid scanning payloads for metadata. A stale identity reaches
+the HTTP client as a conflict, while coherent successful pages carrying different
+identities are rejected as inconsistent metadata. Neither may publish mixed rows.
+Unchanged incomplete histories retain their identity for cheap refresh probes.
+
+Migration 54 installs identity only when `acp_events` exists. An existing empty
+database defers to the normal EventStore opener, which creates schema before
+identity. Corruption and access failures are not empty-database cases. Backward
+cursors remain strict within SQLite's signed sequence range; a larger unsigned
+cursor includes the maximum stored signed sequence rather than dropping it.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.

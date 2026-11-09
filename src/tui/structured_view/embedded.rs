@@ -39,7 +39,6 @@ pub enum EmbeddedEvent {
 }
 
 const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const RETAINED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct RetainedTextCache {
     width: u16,
@@ -67,7 +66,6 @@ pub struct RetainedView {
     known_coverage: Vec<(u64, u64)>,
     known_incomplete: bool,
     next_read: Instant,
-    next_recheck: Instant,
     message: String,
 }
 
@@ -115,7 +113,6 @@ impl RetainedView {
             known_coverage: Vec::new(),
             known_incomplete: false,
             next_read: now,
-            next_recheck: now,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
         };
         let Some(endpoint) = endpoint else {
@@ -164,11 +161,7 @@ impl RetainedView {
         };
         let http = state.http.clone();
         let id = self.session_id.clone();
-        let known_identity = if self.known_incomplete && Instant::now() >= self.next_recheck {
-            None
-        } else {
-            self.known_identity.clone()
-        };
+        let known_identity = self.known_identity.clone();
         let (tx, result) = tokio::sync::oneshot::channel();
         self.result = result;
         self.load = Some(tokio::spawn(async move {
@@ -226,12 +219,6 @@ impl RetainedView {
                 self.known_identity = Some(replay.history_identity);
                 self.known_coverage = replay.coverage;
                 self.known_incomplete = replay.incomplete;
-                self.next_recheck = now
-                    + if changed {
-                        RETAINED_REFRESH_INTERVAL
-                    } else {
-                        RETAINED_RECHECK_INTERVAL
-                    };
                 if !changed {
                     return false;
                 }
@@ -1710,15 +1697,9 @@ mod retained_tests {
             .unwrap();
         assert!(refresh(&mut view).await);
         assert!(view.message.contains("incomplete"));
-        let rechecked_at = Instant::now();
-        view.next_recheck = rechecked_at;
         assert!(
             !refresh(&mut view).await,
-            "unchanged authoritative replay must preserve selection"
-        );
-        assert!(
-            view.next_recheck >= rechecked_at + RETAINED_RECHECK_INTERVAL,
-            "stable gaps must not cause full replays at every metadata poll"
+            "unchanged identity probe must preserve selection"
         );
         state
             .acp_event_store
@@ -1731,7 +1712,6 @@ mod retained_tests {
                 },
             )
             .unwrap();
-        view.next_recheck = Instant::now();
         assert!(refresh(&mut view).await);
         assert!(prepared_text(&mut view, 80)
             .to_string()
