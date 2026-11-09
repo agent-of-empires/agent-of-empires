@@ -435,6 +435,45 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
+    /// A status read of this session's pane taken now, through its detection manifest, for
+    /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
+    /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is
+    /// used when it covers the manifest's scope. Returns the detected status (`None` for an
+    /// agent-owned viewer) and the rule that decided it.
+    pub(crate) fn detect_pane_now(
+        &self,
+        profile: &str,
+        session: &tmux::Session,
+        reuse: Option<(&str, usize)>,
+    ) -> Option<(Option<Status>, &'static str)> {
+        let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
+        let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
+        let plan = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)?;
+        let policy = plan.capture_policy();
+        let fresh = match reuse {
+            Some((_, lines)) if policy.scope.can_reuse(lines) => None,
+            _ => session.capture_pane(policy.scope.lines()).ok(),
+        };
+        let content = match (fresh.as_deref(), reuse) {
+            (Some(fresh), _) => fresh,
+            (None, Some((reused, _))) => reused,
+            (None, None) => "",
+        };
+        let hook =
+            crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&self.id),
+            });
+        let title = tmux::utils::pane_title(session.name()).unwrap_or_default();
+        let owned = !policy.observe_ownership
+            || self.live_pane_owned(session, None, session.is_pane_dead());
+        let observation = tmux::Observation::new(&title, hook, owned);
+        let clean = tmux::utils::strip_ansi(content);
+        let detection = plan.detect(&clean, &observation);
+        Some((detection.status, detection.rule))
+    }
+
     pub(crate) fn live_pane_owned(
         &self,
         session: &tmux::Session,

@@ -316,6 +316,16 @@ impl McpServer {
         let Some(message) = terminal_text(params.message) else {
             return Err(tool_error("invalid_request", "The message is empty"));
         };
+        // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so an MCP caller
+        // never types into a pane that is waiting on a person. HTTP `POST /send` is left as is:
+        // a person at the dashboard sees the pane.
+        if self.terminal_pane_waiting(&id).await {
+            return Err(tool_error(
+                "waiting",
+                "The agent is waiting on a dialog or question in its terminal; a person answers \
+                 it there. Nothing was typed.",
+            ));
+        }
         if let Err(e) =
             send_terminal_message(&self.state.session_service, &id, message.clone(), true).await
         {
@@ -424,6 +434,25 @@ impl McpServer {
     }
 
     /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
+    /// Whether a terminal session's pane shows a dialog or question waiting on a person, read
+    /// once, without waiting.
+    async fn terminal_pane_waiting(&self, id: &str) -> bool {
+        let instance = self
+            .state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || pane_readiness(&instance) == PaneReadiness::Waiting)
+            .await
+            .unwrap_or(false)
+    }
+
     async fn publish(&self) {
         if let Err(error) = self.state.runtime.publish(&self.state).await {
             tracing::debug!(target: "server.runtime", %error, "runtime publish after MCP mutation failed");
@@ -521,50 +550,19 @@ async fn wait_for_input_prompt(
     }
 }
 
-/// One fresh capture of the agent's pane, decided by its detection manifest (as `aoe session
-/// show` does). Agents without a manifest have no prompt rule to trust, so they never read as
+/// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
+/// show` reads it. Agents without a manifest have no prompt rule to trust, so they never read as
 /// at their prompt.
 fn pane_readiness(instance: &Instance) -> PaneReadiness {
-    let profile = instance.source_profile.as_str();
     let Ok(session) = instance.tmux_session() else {
         return PaneReadiness::Gone;
     };
     if !session.exists() || session.is_pane_dead() {
         return PaneReadiness::Gone;
     }
-    let alias = crate::tmux::status_rules::effective_detect_as(
-        profile,
-        &instance.tool,
-        &instance.detect_as,
-    );
-    let manifest_tool = if alias.is_empty() {
-        instance.tool.as_str()
-    } else {
-        alias.as_ref()
-    };
-    let rules_tool =
-        crate::tmux::status_rules::detection_tool(profile, &instance.tool, &instance.detect_as);
-    let Some(plan) = crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
-    else {
-        return PaneReadiness::NotYet;
-    };
-    let Ok(content) = session.capture_pane(plan.capture_policy().scope.lines()) else {
-        return PaneReadiness::NotYet;
-    };
-    let hook = crate::hooks::read_hook_status(&instance.id).map(|status| {
-        crate::tmux::detect::HookObservation {
-            status,
-            age: crate::hooks::read_hook_status_age(&instance.id),
-        }
-    });
-    let title = crate::tmux::utils::pane_title(session.name()).unwrap_or_default();
-    let owned = !plan.capture_policy().observe_ownership
-        || instance.live_pane_owned(&session, None, session.is_pane_dead());
-    let observation = crate::tmux::Observation::new(&title, hook, owned);
-    let detection = plan.detect(&crate::tmux::utils::strip_ansi(&content), &observation);
-    match detection.status {
-        Some(Status::Waiting) => PaneReadiness::Waiting,
-        Some(Status::Idle) if detection.rule != "no_rule" => PaneReadiness::AtPrompt,
+    match instance.detect_pane_now(&instance.source_profile, &session, None) {
+        Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
+        Some((Some(Status::Idle), rule)) if rule != "no_rule" => PaneReadiness::AtPrompt,
         _ => PaneReadiness::NotYet,
     }
 }
@@ -692,7 +690,8 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         PromptSubmitError::SessionNotFound
         | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
         PromptSubmitError::WorkerNotReady
-        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady) => tool_error(
+        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady)
+        | PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish) => tool_error(
             "busy",
             "The session's agent is not ready yet; try again shortly",
         ),

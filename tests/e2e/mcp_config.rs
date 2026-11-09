@@ -697,12 +697,12 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
     });
 }
 
-/// A terminal `create_session` never types its prompt into a dialog: with Claude's folder-trust
-/// question on screen it reports `blocked_waiting`, and the agent receives no keystroke at all,
-/// so no Enter can accept trust for the folder.
+/// Neither a terminal `create_session` prompt nor `send` is typed into a dialog: with Claude's
+/// folder-trust question on screen the create reports `blocked_waiting`, `send` is refused with
+/// `waiting`, and the agent receives no keystroke at all, so no Enter can accept the folder.
 #[test]
 #[parallel]
-fn mcp_create_session_leaves_a_prompt_unsent_while_claude_asks_to_trust_the_folder() {
+fn mcp_never_types_into_claudes_folder_trust_dialog() {
     crate::harness::require_tmux!();
     let mut h = TuiTestHarness::new("mcp_trust_dialog");
     // Stands in for `claude` on a folder it has never seen: it shows the trust dialog, then
@@ -741,6 +741,22 @@ fn mcp_create_session_leaves_a_prompt_unsent_while_claude_asks_to_trust_the_fold
                 .as_str()
                 .unwrap_or("")
                 .contains("dialog"),
+            "{body}"
+        );
+        let id = created["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let send = json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "send", "arguments": {"session_id": id, "message": "1"}},
+        });
+        let (status, body) = rpc(&url, &[], send).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["isError"], true, "{body}");
+        assert_eq!(
+            body["result"]["structuredContent"]["code"], "waiting",
             "{body}"
         );
         // A late keystroke would still land within this window.
