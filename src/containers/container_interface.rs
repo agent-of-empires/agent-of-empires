@@ -103,7 +103,7 @@ pub struct RuntimeEnvArgs {
     pub argv: Vec<String>,
     /// Set these on the spawning `Command`; `-e KEY` reads them from there.
     pub inherit: Vec<(String, String)>,
-    /// Deliver these through [`TargetEnvFile`], which argv names as an env-file.
+    /// Deliver these through `TargetEnvFile`, which argv names as an env-file.
     pub target_env: Vec<(String, String)>,
 }
 
