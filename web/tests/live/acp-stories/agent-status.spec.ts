@@ -177,4 +177,8 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   await expect(body).toHaveText(/Loading log|Could not load log|No log output yet|Log file exists but is empty|.+/);
   await page.getByTestId("acp-agent-log-refresh").click();
   await expect(body).toBeVisible({ timeout: 5_000 });
+  await expect(body).not.toContainText("Loading log");
+  const capture = test.info().outputPath("startup-native-binary-disclosure.png");
+  await page.screenshot({ path: capture, fullPage: true });
+  await test.info().attach("startup-native-binary-disclosure", { path: capture, contentType: "image/png" });
 });
